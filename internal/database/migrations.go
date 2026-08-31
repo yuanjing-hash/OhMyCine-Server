@@ -7,12 +7,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/yuanjing-hash/ohmycine/server/internal/authz"
-	"github.com/yuanjing-hash/ohmycine/server/internal/classification"
-	"github.com/yuanjing-hash/ohmycine/server/internal/models"
-	"github.com/yuanjing-hash/ohmycine/server/internal/organization"
-	"github.com/yuanjing-hash/ohmycine/server/internal/plugins/packagefs"
-	storagefs "github.com/yuanjing-hash/ohmycine/server/internal/storage"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/authz"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/classification"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/organization"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/plugins/packagefs"
+	storagefs "github.com/yuanjing-hash/OhMyCine-Server/internal/storage"
 	"gorm.io/gorm"
 )
 

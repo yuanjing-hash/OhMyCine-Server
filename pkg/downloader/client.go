@@ -7,7 +7,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/yuanjing-hash/ohmycine/server/pkg/cloud"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud"
 )
 
 const (

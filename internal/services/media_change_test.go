@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
-	"github.com/yuanjing-hash/ohmycine/server/internal/models"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
 	"gorm.io/gorm"
 )
 

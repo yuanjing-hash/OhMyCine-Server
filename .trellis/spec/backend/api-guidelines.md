@@ -132,4 +132,4 @@ Default mode is structural sync only:
 
 ## OpenAPI
 
-When `server/api/openapi.yaml` exists, update it in the same task as API behavior changes. Keep examples redacted and aligned with SQLite default configuration.
+When `api/openapi.yaml` exists, update it in the same task as API behavior changes. Keep examples redacted and aligned with SQLite default configuration.

@@ -70,9 +70,9 @@ if (-not $SkipBuild) {
         $env:CGO_ENABLED = '0'
         $buildArguments = @('build', '-tags', 'webui')
         if (-not [String]::IsNullOrWhiteSpace($applicationToken)) {
-            $buildArguments += @('-ldflags', "-X=github.com/yuanjing-hash/ohmycine/server/pkg/metadata/tmdb.BuiltinReadAccessToken=$applicationToken")
+            $buildArguments += @('-ldflags', "-X=github.com/yuanjing-hash/OhMyCine-Server/pkg/metadata/tmdb.BuiltinReadAccessToken=$applicationToken")
         } elseif (-not [String]::IsNullOrWhiteSpace($applicationApiKey)) {
-            $buildArguments += @('-ldflags', "-X=github.com/yuanjing-hash/ohmycine/server/pkg/metadata/tmdb.BuiltinAPIKey=$applicationApiKey")
+            $buildArguments += @('-ldflags', "-X=github.com/yuanjing-hash/OhMyCine-Server/pkg/metadata/tmdb.BuiltinAPIKey=$applicationApiKey")
         }
         $buildArguments += @('-o', $binary, './cmd/server')
         Invoke-Checked $go $buildArguments 'Server build failed'

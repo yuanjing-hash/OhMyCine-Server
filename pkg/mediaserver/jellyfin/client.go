@@ -6,8 +6,8 @@ import (
 	"net/url"
 	"strings"
 
-	"github.com/yuanjing-hash/ohmycine/server/pkg/mediaserver"
-	"github.com/yuanjing-hash/ohmycine/server/pkg/mediaserver/emby"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/mediaserver"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/mediaserver/emby"
 )
 
 type Config struct {

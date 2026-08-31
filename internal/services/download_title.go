@@ -8,8 +8,8 @@ import (
 	"strings"
 	"unicode"
 
-	"github.com/yuanjing-hash/ohmycine/server/internal/medialibrary"
-	downloadpkg "github.com/yuanjing-hash/ohmycine/server/pkg/downloader"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/medialibrary"
+	downloadpkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/downloader"
 )
 
 var (

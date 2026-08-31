@@ -20,11 +20,11 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
-	"github.com/yuanjing-hash/ohmycine/server/internal/credential"
-	serverlog "github.com/yuanjing-hash/ohmycine/server/internal/logging"
-	"github.com/yuanjing-hash/ohmycine/server/internal/models"
-	sitepkg "github.com/yuanjing-hash/ohmycine/server/pkg/site"
-	"github.com/yuanjing-hash/ohmycine/server/pkg/site/builtin"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/credential"
+	serverlog "github.com/yuanjing-hash/OhMyCine-Server/internal/logging"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
+	sitepkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/site"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/site/builtin"
 	"gorm.io/gorm"
 )
 

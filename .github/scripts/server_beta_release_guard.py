@@ -12,7 +12,6 @@ from pathlib import Path
 VERSION_RE = re.compile(r"^v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_WORKFLOW = ROOT / ".github" / "workflows" / "server-beta-release.yml"
-DEFAULT_PLAYER_WORKFLOW = ROOT / ".github" / "workflows" / "player-beta-release.yml"
 
 
 def normalize_version(raw: str) -> tuple[str, str]:
@@ -24,32 +23,13 @@ def normalize_version(raw: str) -> tuple[str, str]:
     return version, f"server-v{version}"
 
 
-def push_tag_patterns(path: Path) -> list[str]:
-    patterns: list[str] = []
-    in_tags = False
-    for line in path.read_text(encoding="utf-8").splitlines():
-        indent = len(line) - len(line.lstrip())
-        stripped = line.strip()
-        if indent == 4 and stripped == "tags:":
-            in_tags = True
-            continue
-        if in_tags and indent <= 4 and stripped:
-            break
-        if in_tags and indent == 6 and stripped.startswith("-"):
-            patterns.append(stripped[1:].strip().strip("\"'"))
-    return patterns
-
-
-def verify_workflow(
-    path: Path = DEFAULT_WORKFLOW, player_path: Path = DEFAULT_PLAYER_WORKFLOW
-) -> list[str]:
+def verify_workflow(path: Path = DEFAULT_WORKFLOW) -> list[str]:
     text = path.read_text(encoding="utf-8")
-    player_tag_patterns = push_tag_patterns(player_path)
     required = {
         "manual dispatch only": "workflow_dispatch:" in text and "\n  push:" not in text,
         "normalized namespaced tag": "server_beta_release_guard.py resolve-version" in text,
-        "Player tag trigger excludes Server namespace": bool(player_tag_patterns)
-        and all(pattern.startswith("v") for pattern in player_tag_patterns),
+        "repository is Server-only": "player-beta-release.yml" not in text
+        and "github.com/yuanjing-hash/OhMyCine-Server" in text,
         "concurrency uses normalized tag": "group: server-release-${{ needs.resolve.outputs.tag_name }}" in text,
         "develop source is checked twice": text.count("git fetch --force --prune origin develop") >= 2
         and text.count("refs/remotes/origin/develop") >= 2,

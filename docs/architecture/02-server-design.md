@@ -1633,7 +1633,7 @@ CREATE TABLE media (
 
 -- 实际实现使用显式 schema_migrations 维护以下认证/RBAC表：
 -- users, roles, permissions, user_roles, role_permissions, sessions, audit_logs。
--- 完整约束以 server/internal/database/migrations.go 为准，包括唯一 owner 部分索引、
+-- 完整约束以 internal/database/migrations.go 为准，包括唯一 owner 部分索引、
 -- 复合主键、外键、session 过期/撤销索引和审计索引。
 
 -- ========================================

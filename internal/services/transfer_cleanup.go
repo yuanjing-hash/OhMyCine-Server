@@ -12,11 +12,11 @@ import (
 	"strings"
 	"time"
 
-	serverlog "github.com/yuanjing-hash/ohmycine/server/internal/logging"
-	"github.com/yuanjing-hash/ohmycine/server/internal/medialibrary"
-	"github.com/yuanjing-hash/ohmycine/server/internal/models"
-	cloudpkg "github.com/yuanjing-hash/ohmycine/server/pkg/cloud"
-	downloadpkg "github.com/yuanjing-hash/ohmycine/server/pkg/downloader"
+	serverlog "github.com/yuanjing-hash/OhMyCine-Server/internal/logging"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/medialibrary"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
+	cloudpkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud"
+	downloadpkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/downloader"
 	"gorm.io/gorm"
 )
 

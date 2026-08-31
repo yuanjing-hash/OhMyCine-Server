@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yuanjing-hash/ohmycine/server/internal/models"
-	"github.com/yuanjing-hash/ohmycine/server/pkg/cloud"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud"
 )
 
 type resolvingDirectoryDriver struct {

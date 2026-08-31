@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/yuanjing-hash/ohmycine/server/pkg/discovery"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/discovery"
 )
 
 const (
@@ -102,7 +102,7 @@ func (p *Provider) get(ctx context.Context, endpoint string, query url.Values) (
 	}
 	request.Header.Set("Accept", "application/json")
 	request.Header.Set("Referer", "https://m.douban.com/")
-	request.Header.Set("User-Agent", "OhMyCine/1.0 (+https://github.com/yuanjing-hash/OhMyCine)")
+	request.Header.Set("User-Agent", "OhMyCine-Server/1.0 (+https://github.com/yuanjing-hash/OhMyCine-Server)")
 	response, err := p.http.Do(request)
 	if err != nil {
 		return nil, discovery.ErrUnavailable

@@ -11,9 +11,9 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
-	"github.com/yuanjing-hash/ohmycine/server/internal/models"
-	cloudpkg "github.com/yuanjing-hash/ohmycine/server/pkg/cloud"
-	downloadpkg "github.com/yuanjing-hash/ohmycine/server/pkg/downloader"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
+	cloudpkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud"
+	downloadpkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/downloader"
 )
 
 func configurePan115CleanupPackage(t *testing.T, fixture *cloudTransferFixture, withListener bool) {

@@ -10,7 +10,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/yuanjing-hash/ohmycine/server/pkg/downloader"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/downloader"
 )
 
 func TestClientSubmitTelemetryAndSafeControls(t *testing.T) {

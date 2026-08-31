@@ -8,9 +8,9 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/yuanjing-hash/ohmycine/server/internal/models"
-	cloudpkg "github.com/yuanjing-hash/ohmycine/server/pkg/cloud"
-	"github.com/yuanjing-hash/ohmycine/server/pkg/downloader"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
+	cloudpkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/downloader"
 )
 
 type routeReadCloudDriver struct{ *fakeMutationCloudDriver }

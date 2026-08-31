@@ -85,9 +85,6 @@ jobs:
     concurrency:
       group: server-release-${{ needs.resolve.outputs.tag_name }}
       cancel-in-progress: false
-    defaults:
-      run:
-        working-directory: server
     env:
       VERSION: ${{ needs.resolve.outputs.version }}
       TAG_NAME: ${{ needs.resolve.outputs.tag_name }}
@@ -103,18 +100,18 @@ jobs:
         with:
           node-version: "22"
           cache: npm
-          cache-dependency-path: server/webui/package-lock.json
+          cache-dependency-path: webui/package-lock.json
 
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
           go-version: "1.23"
           cache-dependency-path: |
-            server/go.sum
-            server/webui/go.sum
+            go.sum
+            webui/go.sum
 
       - name: Build embedded Web UI
-        working-directory: server/webui
+        working-directory: webui
         run: |
           npm ci
           npm run permissions:check
@@ -137,7 +134,6 @@ jobs:
         uses: golangci/golangci-lint-action@v7
         with:
           version: v2.4.0
-          working-directory: server
 
       - name: Build and package embedded-WebUI Server archives
         env:
@@ -155,8 +151,8 @@ jobs:
             exit 1
           fi
 
-          tmdb_ldflags="-X=github.com/yuanjing-hash/ohmycine/server/pkg/metadata/tmdb.BuiltinReadAccessToken=${OHMYCINE_TMDB_READ_ACCESS_TOKEN}"
-          release_root="../dist/server-beta/${TAG_NAME}"
+          tmdb_ldflags="-X=github.com/yuanjing-hash/OhMyCine-Server/pkg/metadata/tmdb.BuiltinReadAccessToken=${OHMYCINE_TMDB_READ_ACCESS_TOKEN}"
+          release_root="dist/server-beta/${TAG_NAME}"
           windows_dir="${release_root}/OhMyCine-Server-v${VERSION}-windows-x64"
           linux_dir="${release_root}/OhMyCine-Server-v${VERSION}-linux-x64"
           mkdir -p "$windows_dir" "$linux_dir"
@@ -165,8 +161,8 @@ jobs:
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -tags webui -trimpath -ldflags "${tmdb_ldflags} -s -w" -o "${linux_dir}/ohmycine-server" ./cmd/server
           cp README.md "${windows_dir}/README.md"
           cp README.md "${linux_dir}/README.md"
-          cp ../LICENSE "${windows_dir}/LICENSE"
-          cp ../LICENSE "${linux_dir}/LICENSE"
+          cp LICENSE "${windows_dir}/LICENSE"
+          cp LICENSE "${linux_dir}/LICENSE"
 
           windows_asset="OhMyCine-Server-v${VERSION}-windows-x64.zip"
           linux_asset="OhMyCine-Server-v${VERSION}-linux-x64.tar.gz"

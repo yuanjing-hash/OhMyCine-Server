@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yuanjing-hash/ohmycine/server/pkg/cloud"
-	"github.com/yuanjing-hash/ohmycine/server/pkg/downloader"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/downloader"
 )
 
 type fakeDriver struct {

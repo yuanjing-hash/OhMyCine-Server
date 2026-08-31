@@ -21,9 +21,9 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/rs/zerolog"
-	"github.com/yuanjing-hash/ohmycine/server/internal/credential"
-	"github.com/yuanjing-hash/ohmycine/server/internal/models"
-	"github.com/yuanjing-hash/ohmycine/server/internal/plugins/contract"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/credential"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/plugins/contract"
 	"golang.org/x/net/publicsuffix"
 	"gorm.io/gorm"
 )

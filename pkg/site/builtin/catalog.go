@@ -6,12 +6,12 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/yuanjing-hash/ohmycine/server/pkg/site"
-	"github.com/yuanjing-hash/ohmycine/server/pkg/site/btapi"
-	"github.com/yuanjing-hash/ohmycine/server/pkg/site/bthtml"
-	"github.com/yuanjing-hash/ohmycine/server/pkg/site/btrss"
-	"github.com/yuanjing-hash/ohmycine/server/pkg/site/pttime"
-	"github.com/yuanjing-hash/ohmycine/server/pkg/site/torznab"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/site"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/site/btapi"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/site/bthtml"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/site/btrss"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/site/pttime"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/site/torznab"
 	"golang.org/x/net/idna"
 )
 

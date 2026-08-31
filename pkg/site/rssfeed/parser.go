@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/yuanjing-hash/ohmycine/server/pkg/site"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/site"
 )
 
 var magnetPattern = regexp.MustCompile(`(?i)magnet:\?[^\s<"']+`)

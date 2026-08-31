@@ -9,9 +9,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/yuanjing-hash/ohmycine/server/internal/authz"
-	"github.com/yuanjing-hash/ohmycine/server/internal/classification"
-	"github.com/yuanjing-hash/ohmycine/server/internal/models"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/authz"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/classification"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
 	"golang.org/x/text/cases"
 	"golang.org/x/text/unicode/norm"
 	"gorm.io/gorm"

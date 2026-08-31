@@ -1,4 +1,4 @@
-module github.com/yuanjing-hash/ohmycine/server
+module github.com/yuanjing-hash/OhMyCine-Server
 
 go 1.23.0
 
@@ -12,7 +12,7 @@ require (
 	github.com/robfig/cron/v3 v3.0.1
 	github.com/rs/zerolog v1.33.0
 	github.com/tetratelabs/wazero v1.9.0
-	github.com/yuanjing-hash/ohmycine/server/webui v0.0.0
+	github.com/yuanjing-hash/OhMyCine-Server/webui v0.0.0
 	golang.org/x/crypto v0.41.0
 	golang.org/x/net v0.43.0
 	golang.org/x/sys v0.35.0
@@ -23,7 +23,7 @@ require (
 	modernc.org/sqlite v1.34.5
 )
 
-replace github.com/yuanjing-hash/ohmycine/server/webui => ./webui
+replace github.com/yuanjing-hash/OhMyCine-Server/webui => ./webui
 
 require (
 	github.com/aead/ecdh v0.2.0 // indirect

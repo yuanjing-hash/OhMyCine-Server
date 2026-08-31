@@ -8,11 +8,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yuanjing-hash/ohmycine/server/internal/authz"
-	"github.com/yuanjing-hash/ohmycine/server/internal/credential"
-	"github.com/yuanjing-hash/ohmycine/server/internal/database"
-	"github.com/yuanjing-hash/ohmycine/server/internal/models"
-	"github.com/yuanjing-hash/ohmycine/server/internal/plugins/hostapi"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/authz"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/credential"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/database"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/plugins/hostapi"
 )
 
 func TestCredentialRevealAllowlistAuditAndCustomMetadataOnly(t *testing.T) {

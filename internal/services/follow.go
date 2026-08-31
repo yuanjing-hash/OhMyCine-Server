@@ -10,11 +10,11 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/yuanjing-hash/ohmycine/server/internal/authz"
-	"github.com/yuanjing-hash/ohmycine/server/internal/medialibrary"
-	"github.com/yuanjing-hash/ohmycine/server/internal/models"
-	downloadpkg "github.com/yuanjing-hash/ohmycine/server/pkg/downloader"
-	"github.com/yuanjing-hash/ohmycine/server/pkg/site/builtin"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/authz"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/medialibrary"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
+	downloadpkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/downloader"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/site/builtin"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )

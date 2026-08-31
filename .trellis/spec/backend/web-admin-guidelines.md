@@ -14,7 +14,7 @@
 ### 2. Signatures
 
 - Permission code: lowercase stable `<resource>.<action>` string such as `users.read`, `roles.assign`, or `connections.test`.
-- Canonical catalog: `server/internal/authz/catalog.json`; TypeScript constants are generated into `server/webui/src/auth/generated-permissions.ts`.
+- Canonical catalog: `internal/authz/catalog.json`; TypeScript constants are generated into `webui/src/auth/generated-permissions.ts`.
 - Core tables: `users`, `roles`, `permissions`, `user_roles`, `role_permissions`, `sessions`, and `audit_logs`.
 - Browser session cookie: high-entropy opaque token; SQLite stores only its SHA-256 hash.
 - Session fields include idle and absolute expiry plus revocation state.
@@ -26,7 +26,7 @@
   - `GET /api/v1/auth/me`
   - `GET /api/v1/auth/csrf`
 - Administration APIs use the standard response envelope and stable application error codes.
-- `server/webui` is a nested Go module referenced by the root Server module with a local `require` + `replace`; this prevents `go test ./...` from traversing frontend `node_modules`.
+- `webui` is a nested Go module referenced by the root Server module with a local `require` + `replace`; this prevents `go test ./...` from traversing frontend `node_modules`.
 - Production SPA fallback runs only for extensionless `GET`/`HEAD` browser navigations whose `Accept` header explicitly includes `text/html`; it serves `index.html` with `Cache-Control: no-store` so a rebuilt embedded Server cannot retain an older application shell. Content-hashed assets remain immutable.
 
 ### 3. Contracts
@@ -41,7 +41,7 @@
 - The shared Web UI API client may recover a stale session-bound CSRF token only when a mutating request receives HTTP 403 with stable `error_code=CSRF_INVALID`. It clears the token only if it is still the value used by that failed request, singleflights `GET /api/v1/auth/csrf`, and replays the same mutation exactly once. Other 403 responses are never replayed and continue through the normal forbidden/permission refresh path.
 - Authentication/setup responses use `Cache-Control: no-store`. Password reset requires the actor's current password; password changes and account disablement revoke affected sessions.
 - Production Web UI assets are built before `go build -tags webui`. Default Go builds/tests must not require `dist` to exist. SPA fallback applies only to explicit HTML navigation. Exact or nested `/api`, `/ws`, `/proxy`, and `/assets` paths, file-like paths with extensions, non-HTML clients, and non-`GET`/`HEAD` requests return real 404 responses instead of `index.html`.
-- The root Server module and `server/webui` module must each keep a tidy `go.mod`/`go.sum`. The root module's Go directive must satisfy dependency minimums; currently this is Go 1.23+.
+- The root Server module and `webui` module must each keep a tidy `go.mod`/`go.sum`. The root module's Go directive must satisfy dependency minimums; currently this is Go 1.23+.
 - AI Provider 模型读取成功后使用可搜索的管理端模态选择器展示全部规范化 ID/显示名称；整行选择只回填表单，不自动保存。列表读取失败必须保持当前模型和关闭状态，列表过大/响应无效显示列表语义的安全错误，并保留手动输入能力。
 
 ### 4. Validation & Error Matrix
@@ -83,8 +83,8 @@
 
 - Backend integration tests must cover first-owner setup, concurrent/closed setup, login/session/CSRF, viewer authorization, permission refresh, self/owner protection, last-administrator protection, and privilege-escalation rejection.
 - Web API client tests must cover stale-token refresh plus one replay, concurrent refresh singleflight, and a non-CSRF 403 with zero replay.
-- Run from `server/`: `go test ./...`, `go vet ./...`, `go build ./cmd/server`, `go build -tags webui ./cmd/server`, and `go mod verify`.
-- Run from `server/webui/`: `go test .`, `go mod verify`, `npm run permissions:check`, `npm run typecheck`, `npm run lint`, and `npm run build`.
+- Run from the repository root: `go test ./...`, `go vet ./...`, `go build ./cmd/server`, `go build -tags webui ./cmd/server`, and `go mod verify`.
+- Run from `webui/`: `go test .`, `go mod verify`, `npm run permissions:check`, `npm run typecheck`, `npm run lint`, and `npm run build`.
 - `go list ./...` from the root Server module must list only OhMyCine Server packages and must not include packages from `node_modules`.
 - The permission generation check must fail on duplicate/invalid permission codes or generated TypeScript identifier collisions.
 - Review browser responses for cookie flags, `Cache-Control: no-store`, stable error codes, CSP/security headers, and no credential/session leakage.
@@ -256,24 +256,24 @@ await api(`/api/v1/filesystem/directories?token=${encodeURIComponent(item.token)
 
 ### 1. Scope / Trigger
 
-- Trigger: changing `server/start.sh`, runtime directories, embedded Web UI startup, local production defaults, or startup documentation.
+- Trigger: changing `start.sh`, runtime directories, embedded Web UI startup, local production defaults, or startup documentation.
 - Applies to Bash dependency discovery, npm/Go builds, SQLite placement, environment overrides, process signals, and Git ignore rules.
 
 ### 2. Signatures
 
-- Command: `server/start.sh [--skip-build|--help]`.
-- Default runtime root: `server/.runtime/`.
-- Default binary: `server/.runtime/bin/ohmycine-server`.
-- Default database: `server/.runtime/data/ohmycine.db`.
+- Command: `./start.sh [--skip-build|--help]`.
+- Default runtime root: `.runtime/`.
+- Default binary: `.runtime/bin/ohmycine-server`.
+- Default database: `.runtime/data/ohmycine.db`.
 - Runtime overrides: `OMC_RUNTIME_DIR`, `OMC_BINARY_PATH`, `OMC_DATABASE_PATH`, `OMC_ENV`, `OMC_SERVER_HOST`, `OMC_SERVER_PORT`, `OMC_PUBLIC_ORIGIN`, and `OMC_COOKIE_SECURE`.
 - Default build order: Web UI dependency check → `npm run build` → `go build -tags webui` → foreground `exec`.
 
 ### 3. Contracts
 
-- Resolve every default/relative path against the physical `server/` directory, not the caller's current directory.
+- Resolve every default/relative path against the physical repository root, not the caller's current directory.
 - Default startup uses `OMC_ENV=production`, an embedded Web UI, wildcard listening on port 3000, a loopback advertised origin, and one foreground Go process. The launcher must use `exec` so Ctrl+C, systemd, and container signals reach the Server directly.
 - Runtime data is persistent. The launcher must never delete, reset, replace, or silently migrate an existing database outside normal Server migrations.
-- `server/.runtime/`, `webui/dist/`, `webui/node_modules/`, generated binaries, and SQLite journal/WAL/SHM files are Git-ignored.
+- `.runtime/`, `webui/dist/`, `webui/node_modules/`, generated binaries, and SQLite journal/WAL/SHM files are Git-ignored.
 - Run `npm ci` only when `node_modules` is absent or the committed lockfile differs from the stored dependency stamp. Never use an untrusted Windows `node.exe`/`npm` from WSL.
 - `--skip-build` requires an existing executable binary and reuses it without modifying the binary or database.
 - User-provided `OMC_*` values take precedence. Wildcard listen addresses map to loopback only for the default browser origin; LAN/domain/reverse-proxy use requires an explicit exact `OMC_PUBLIC_ORIGIN`.
@@ -285,7 +285,7 @@ await api(`/api/v1/filesystem/directories?token=${encodeURIComponent(item.token)
 
 | Condition | Required behavior |
 |---|---|
-| Launcher invoked outside `server/` | Resolve the same runtime, Web UI, binary, and database paths |
+| Launcher invoked outside the repository root | Resolve the same runtime, Web UI, binary, and database paths |
 | Path contains spaces | Quote paths and complete dependency/build/start steps normally |
 | `--help` | Print usage and create no `.runtime` files |
 | `--skip-build` without a binary | Fail clearly; do not create a database |
@@ -298,7 +298,7 @@ await api(`/api/v1/filesystem/directories?token=${encodeURIComponent(item.token)
 
 ### 5. Good/Base/Bad Cases
 
-- Good: `./server/start.sh` from the repository root builds once, stores the binary/database under `server/.runtime`, serves the UI and API on one port, and stops cleanly with Ctrl+C.
+- Good: `./start.sh` builds once, stores the binary/database under `.runtime`, serves the UI and API on one port, and stops cleanly with Ctrl+C.
 - Good: a later `./start.sh --skip-build` preserves the database inode and binary modification time.
 - Base: an operator overrides port/database paths through environment variables while retaining safe loopback defaults.
 - Bad: the script starts the Server in the background, writes a PID file, and leaves an orphan process after the shell exits.
@@ -306,7 +306,7 @@ await api(`/api/v1/filesystem/directories?token=${encodeURIComponent(item.token)
 
 ### 6. Tests Required
 
-- Run `bash -n server/start.sh` and `server/start.sh --help`; assert help creates no runtime directory.
+- Run `bash -n start.sh` and `./start.sh --help`; assert help creates no runtime directory.
 - Invoke from a different current directory and from a path containing spaces.
 - Perform a full startup on an isolated port, poll `/api/v1/health`, request `/`, and terminate the exact launcher/Server PID.
 - Repeat with `--skip-build`; assert binary modification time and database identity are unchanged.

@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/yuanjing-hash/ohmycine/server/pkg/mediaserver"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/mediaserver"
 )
 
 const maxProbeResponseBytes = 1 << 20

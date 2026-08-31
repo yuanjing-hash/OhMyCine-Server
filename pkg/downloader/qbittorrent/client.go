@@ -17,7 +17,7 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/yuanjing-hash/ohmycine/server/pkg/downloader"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/downloader"
 )
 
 const (

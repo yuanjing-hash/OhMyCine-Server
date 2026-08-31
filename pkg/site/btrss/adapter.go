@@ -13,8 +13,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/yuanjing-hash/ohmycine/server/pkg/site"
-	"github.com/yuanjing-hash/ohmycine/server/pkg/site/rssfeed"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/site"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/site/rssfeed"
 )
 
 const (
@@ -319,7 +319,7 @@ func controlledClient(config site.Config) (*http.Client, *url.URL, error) {
 func normalizedUserAgent(value string) string {
 	value = strings.TrimSpace(value)
 	if value == "" || len(value) > 256 || strings.ContainsAny(value, "\x00\r\n") {
-		return "OhMyCine/1.0 (+https://github.com/yuanjing-hash/OhMyCine)"
+		return "OhMyCine-Server/1.0 (+https://github.com/yuanjing-hash/OhMyCine-Server)"
 	}
 	return value
 }

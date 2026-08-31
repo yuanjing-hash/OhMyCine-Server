@@ -16,9 +16,9 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/rs/zerolog"
-	"github.com/yuanjing-hash/ohmycine/server/internal/authz"
-	"github.com/yuanjing-hash/ohmycine/server/internal/database"
-	"github.com/yuanjing-hash/ohmycine/server/internal/models"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/authz"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/database"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
 )
 
 func strmManagementFixture(t *testing.T) (*STRMManagementService, *QueueService, Actor, models.MediaLibrary, string) {

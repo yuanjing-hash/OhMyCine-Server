@@ -519,7 +519,7 @@ Post-import garbage cleanup is a narrower system-owned staging operation, not pe
 - Service tests cover name/root normalization, duplicate preflight and unique-race mapping, stable safe errors, capabilities, audit redaction, and delete-config-only behavior.
 - Router tests cover authentication plus independent denial for list/create/update/delete/test permissions; frontend tests cover route/navigation/action visibility from generated constants.
 - Windows PowerShell 5 live/API tests that send non-ASCII names or paths must encode `ConvertTo-Json` output with `[Text.Encoding]::UTF8.GetBytes(...)` and declare `application/json; charset=utf-8`. Passing a Unicode JSON `String` directly to `Invoke-RestMethod -Body` may use the system code page and falsely surface a valid directory as `storage_unreadable`.
-- Run `server/test.ps1`, `go build -tags webui ./cmd/server`, root and Web UI `go mod verify`, and `git diff --check`.
+- Run `./test.ps1`, `go build -tags webui ./cmd/server`, root and Web UI `go mod verify`, and `git diff --check`.
 
 ### 7. Wrong vs Correct
 

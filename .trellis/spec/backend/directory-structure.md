@@ -23,7 +23,7 @@ The repository is design-first and some directories may still be placeholders. D
 Target Server layout:
 
 ```text
-server/
+OhMyCine-Server/
 ├── cmd/
 │   └── server/              # main.go and process bootstrap only
 ├── internal/
@@ -54,7 +54,7 @@ server/
 
 CLI code follows the same Go conventions and may reuse safe code from shared `pkg/` packages.
 
-`server/webui` is intentionally a nested Go module. The root Server module uses a local `require` + `replace` for its SPA serving package so root `go test ./...` and `go list ./...` do not traverse Go example sources shipped inside frontend `node_modules`. Do not remove this boundary without proving the root Go quality commands remain isolated from frontend dependencies.
+`webui` is intentionally a nested Go module. The root Server module uses a local `require` + `replace` for its SPA serving package so root `go test ./...` and `go list ./...` do not traverse Go example sources shipped inside frontend `node_modules`. Do not remove this boundary without proving the root Go quality commands remain isolated from frontend dependencies.
 
 ---
 

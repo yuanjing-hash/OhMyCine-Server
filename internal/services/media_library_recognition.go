@@ -10,11 +10,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/yuanjing-hash/ohmycine/server/internal/classification"
-	"github.com/yuanjing-hash/ohmycine/server/internal/medialibrary"
-	"github.com/yuanjing-hash/ohmycine/server/internal/mediarecognition"
-	"github.com/yuanjing-hash/ohmycine/server/internal/models"
-	"github.com/yuanjing-hash/ohmycine/server/pkg/metadata/tmdb"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/classification"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/medialibrary"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/mediarecognition"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/metadata/tmdb"
 )
 
 var mediaRecognitionGlobalGate = make(chan struct{}, 8)

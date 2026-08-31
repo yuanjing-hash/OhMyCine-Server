@@ -11,9 +11,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/yuanjing-hash/ohmycine/server/internal/authz"
-	"github.com/yuanjing-hash/ohmycine/server/internal/config"
-	"github.com/yuanjing-hash/ohmycine/server/internal/models"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/authz"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/config"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
 	"golang.org/x/crypto/bcrypt"
 	"gorm.io/gorm"
 )

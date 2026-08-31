@@ -12,7 +12,7 @@
 - Environment: `OMC_CREDENTIAL_MASTER_KEY` is an optional Base64-encoded 32-byte key; `OMC_CREDENTIAL_KEY_FILE` is the explicit/generated key-file path. The generated default is `credentials.key` beside the SQLite database.
 - Tables: `downloaders`, singleton `download_settings`, `download_tasks`, and private `transfer_tasks`; every DownloadTask has exactly one durable download `jobs` row and at most one idempotent transfer task/job.
 - Migration v23 adds private `download_tasks.target_storage_type`, `target_connection_id`, `target_provider_root_id`, and `transfer_tasks.cloud_state_json`. The private 115 manifest file shape includes provider item/parent IDs and SHA1; no public DTO reuses that shape.
-- Required provider contract: `Client.Test`, `Submit`, `Get`, and `Cancel(ctx, taskID, deleteData)` under `server/pkg/downloader`. Pause and resume use optional `Pauser`/`Resumer` capabilities; metadata-capable downloaders additionally implement `Categories`, `EnsureCategory`, `UpdateCategory(ctx, name, savePath)`, `SetCategory`, and `Manifest`. Capabilities include `native_offline` and `output_constraint=none|local_staging|provider_storage`.
+- Required provider contract: `Client.Test`, `Submit`, `Get`, and `Cancel(ctx, taskID, deleteData)` under `pkg/downloader`. Pause and resume use optional `Pauser`/`Resumer` capabilities; metadata-capable downloaders additionally implement `Categories`, `EnsureCategory`, `UpdateCategory(ctx, name, savePath)`, `SetCategory`, and `Manifest`. Capabilities include `native_offline` and `output_constraint=none|local_staging|provider_storage`.
 - Management routes: `GET/POST /api/v1/downloaders`, `PATCH/DELETE /api/v1/downloaders/:id`, and `POST /api/v1/downloaders/:id/test`.
 - Download routes: `GET /api/v1/downloads?scope=active|history|all`, `POST /api/v1/downloads`, `POST /api/v1/downloads/:id/cancel`, and `DELETE /api/v1/downloads/:id`; public source kinds are `url`, `torrent`, and `115_share`. `provider_item` is an internal-only adoption source and HTTP must reject it.
 - Migration v26 adds `media_libraries.ingest_*`, `download_tasks.staging_provider_directory_id`, `download_tasks.ingest_source_key`, and `download_tasks.source_origin=user|share|provider_ingest`. The non-empty ingest key has a partial unique index and is never a public identifier.
@@ -221,7 +221,7 @@
 - Seeding tests cover safe disabled defaults, optimistic settings revision, policy snapshots, qBittorrent ratio/seeding-time/uploaded mapping, copy versus symlink `deleteData`, move task-only cleanup, threshold `all|any`, provider task-not-found idempotency, retry retention, and safe public DTOs.
 - HTTP tests cover auth/RBAC/no-store, visible configured staging path, picker reopening at that path, directory-token-only staging update, optimistic revision, source-size limits, owner/all visibility, redacted operational responses, and stable safe errors.
 - Web tests cover magnet/URL versus torrent mode, target MediaLibrary/automatic order, route summary and transfer phase, 4 MiB client guard, encrypted-credential UX, global toast lifetime, downloader task aggregation, unknown telemetry, task controls, responsive layout, and light/dark themes.
-- Run `go test ./...`, `go vet ./...`, `go build ./cmd/server`, `go build -tags webui ./cmd/server`, Web UI test/typecheck/lint/build, and Windows `server/test.ps1`.
+- Run `go test ./...`, `go vet ./...`, `go build ./cmd/server`, `go build -tags webui ./cmd/server`, Web UI test/typecheck/lint/build, and Windows `./test.ps1`.
 
 ### 7. Wrong vs Correct
 

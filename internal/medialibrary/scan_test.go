@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	cloudpkg "github.com/yuanjing-hash/ohmycine/server/pkg/cloud"
+	cloudpkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud"
 )
 
 type scanCloudDriver struct {

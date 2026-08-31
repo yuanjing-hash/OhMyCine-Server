@@ -5,11 +5,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yuanjing-hash/ohmycine/server/internal/authz"
-	"github.com/yuanjing-hash/ohmycine/server/internal/models"
-	"github.com/yuanjing-hash/ohmycine/server/pkg/cloud"
-	"github.com/yuanjing-hash/ohmycine/server/pkg/downloader"
-	"github.com/yuanjing-hash/ohmycine/server/pkg/downloader/pan115offline"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/authz"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/downloader"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/downloader/pan115offline"
 )
 
 func TestPan115OfflineDownloaderReusesConnectionStorage(t *testing.T) {

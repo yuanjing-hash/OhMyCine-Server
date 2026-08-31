@@ -1,10 +1,10 @@
 # Server Admin Web UI Contract
 
-> Executable visual and interaction rules for `server/webui`. The Server console is an information-dense administration surface and does not inherit the Player's Cinema OS presentation.
+> Executable visual and interaction rules for `webui`. The Server console is an information-dense administration surface and does not inherit the Player's Cinema OS presentation.
 
 ## Scope and Trigger
 
-Apply this contract whenever a task adds or changes a view, layout, dialog, shared control, theme token, or browser-local presentation preference under `server/webui`.
+Apply this contract whenever a task adds or changes a view, layout, dialog, shared control, theme token, or browser-local presentation preference under `webui`.
 
 ## Theme Signatures
 
@@ -29,7 +29,7 @@ toggleTheme(): void
 - Both authenticated and unauthenticated surfaces expose the same keyboard-accessible theme toggle with a label that states the current theme and target action.
 - Colors and elevation use semantic CSS variables such as canvas, surface, border, text, accent, status, focus, and shadow tokens. Page templates may use layout utilities but must not assemble dark-only palettes from `bg-white/*`, `border-white/*`, `text-slate-*`, gradients, glow, or backdrop blur.
 - Both palettes use a conventional administration style: opaque surfaces, clear 1px borders, compact spacing, small radii, restrained shadows, stable blue emphasis, and Chinese-first information hierarchy.
-- Player-only Cinema OS rules (artwork-first layout, liquid glass, dark-only chrome) do not apply to `server/webui`.
+- Player-only Cinema OS rules (artwork-first layout, liquid glass, dark-only chrome) do not apply to `webui`.
 - AI 模型列表使用页面内模态选择器：成功读取后才打开，搜索覆盖模型 ID/显示名称，整行选择只回填而不自动保存；失败保留当前模型。选择器必须使用语义主题 token，并覆盖加载、空列表、无匹配、当前选择、Escape/遮罩/关闭按钮、焦点约束和关闭后焦点恢复。
 - Profile 命名编辑器把 `电影 /` 与 `电视剧 /` 显示为不可编辑固定根，只编辑根内模板，并明确自动分类按“媒体类型 → 类型内分类”组织。前端默认值包含完整固定根，但 Server 仍是规范化与权限边界。
 
@@ -53,7 +53,7 @@ toggleTheme(): void
 ## Tests Required
 
 - Unit-test invalid/missing preference fallback, persistence, root attribute, and `color-scheme` application.
-- Run `npm run test`, `npm run typecheck`, `npm run lint`, and `npm run build` from `server/webui`.
+- Run `npm run test`, `npm run typecheck`, `npm run lint`, and `npm run build` from `webui`.
 - For a visual-system change, browser-smoke an unauthenticated page and an authenticated page in both themes, reload after switching, and assert no console warning/error.
 - Search the changed Server UI for accidental gradients, backdrop blur/glass, glow, and dark-only color utilities; review every intentional match.
 - Check keyboard focus, accessible toggle labels, disabled/error/warning/success states, and responsive drawer/dialog presentation.

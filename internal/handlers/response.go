@@ -6,10 +6,10 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/rs/zerolog"
-	serverlog "github.com/yuanjing-hash/ohmycine/server/internal/logging"
-	"github.com/yuanjing-hash/ohmycine/server/internal/middleware"
-	"github.com/yuanjing-hash/ohmycine/server/internal/services"
-	"github.com/yuanjing-hash/ohmycine/server/pkg/metadata/tmdb"
+	serverlog "github.com/yuanjing-hash/OhMyCine-Server/internal/logging"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/middleware"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/services"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/metadata/tmdb"
 )
 
 type response struct {

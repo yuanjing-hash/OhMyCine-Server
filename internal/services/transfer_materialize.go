@@ -15,11 +15,11 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/yuanjing-hash/ohmycine/server/internal/medialibrary"
-	"github.com/yuanjing-hash/ohmycine/server/internal/models"
-	storagefs "github.com/yuanjing-hash/ohmycine/server/internal/storage"
-	cloudpkg "github.com/yuanjing-hash/ohmycine/server/pkg/cloud"
-	downloadpkg "github.com/yuanjing-hash/ohmycine/server/pkg/downloader"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/medialibrary"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
+	storagefs "github.com/yuanjing-hash/OhMyCine-Server/internal/storage"
+	cloudpkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud"
+	downloadpkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/downloader"
 )
 
 const (

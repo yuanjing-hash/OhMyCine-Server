@@ -14,10 +14,10 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/yuanjing-hash/ohmycine/server/internal/models"
-	"github.com/yuanjing-hash/ohmycine/server/internal/plugins/contract"
-	"github.com/yuanjing-hash/ohmycine/server/internal/plugins/hostapi"
-	downloadpkg "github.com/yuanjing-hash/ohmycine/server/pkg/downloader"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/plugins/contract"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/plugins/hostapi"
+	downloadpkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/downloader"
 	"gorm.io/gorm"
 )
 

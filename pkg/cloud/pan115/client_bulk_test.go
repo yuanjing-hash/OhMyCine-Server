@@ -8,7 +8,7 @@ import (
 	"time"
 
 	pan115sdk "github.com/SheltonZhu/115driver/pkg/driver"
-	"github.com/yuanjing-hash/ohmycine/server/pkg/cloud"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud"
 	"golang.org/x/time/rate"
 )
 

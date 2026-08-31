@@ -1,59 +1,40 @@
-# Frontend Development Guidelines
+# Server Web UI Development Guidelines
 
-> Long-lived implementation rules for OhMyCine Player, Hub UI, and TypeScript frontend code.
+> Long-lived implementation rules for the Vue administration console under `webui/`.
 
 ---
 
 ## Overview
 
-OhMyCine Player is the primary user-facing app and must be independently useful without Server. Frontend work should prioritize the Player independent-first experience: local/remote playback, DataSource abstraction, Cinema OS UI, local metadata scraping, and Player-side AI recommendations.
-
-Server-connected pages are optional enhancement surfaces and must show clear disabled/placeholder states when Server is not connected.
-
----
+The Server Web UI is an information-dense administration surface for the automation engine. It is not the Player application and does not inherit Player-only Cinema OS or native playback rules.
 
 ## Pre-Development Checklist
 
-Before changing frontend code or Player design:
-
-1. Confirm the feature does not make basic playback depend on Server.
-2. Use Vue 3 Composition API with `<script setup>`.
-3. Keep shared state in Pinia stores and reusable behavior in composables.
-4. Keep all media sources behind the common DataSource interface.
-5. Use UnoCSS and CSS variables for Cinema OS styling.
-6. Store credentials in OS secure storage when available; do not write secrets to ordinary config files.
-7. If feature completion status changes, update `docs/architecture/06-roadmap.md` in the same task.
-8. Existing Player work is to be adopted as current state and continued, not rewritten during Trellis migration tasks.
-
----
+1. Read [Server Admin Web UI](./server-admin-ui.md) before changing any view, dialog, navigation item or theme token.
+2. Keep API and permission contracts synchronized with the Go backend and generated permission catalog.
+3. Use Vue 3 Composition API and strict TypeScript; keep reusable logic outside large view components.
+4. Never persist credentials, signed URLs, provider headers or local absolute paths in browser storage.
+5. Update `docs/architecture/08-server-web-ui-design.md` when administration flows or boundaries change.
 
 ## Guidelines Index
 
 | Guide | Description | Status |
 |-------|-------------|--------|
-| [Directory Structure](./directory-structure.md) | Player/Tauri/Vue layout and module boundaries | Active |
-| [Component Guidelines](./component-guidelines.md) | Vue component, layout, Cinema OS, accessibility rules | Active |
-| [Composable Guidelines](./hook-guidelines.md) | `use*` composables, Tauri events, data fetching | Active |
-| [State Management](./state-management.md) | Pinia stores, config, playback and server state | Active |
-| [Type Safety](./type-safety.md) | TypeScript, DataSource types, runtime validation | Active |
-| [Quality Guidelines](./quality-guidelines.md) | Lint/typecheck/build and forbidden patterns | Active |
-| [Server Admin Web UI](./server-admin-ui.md) | Server console theme, tokens, accessibility, and visual verification | Active |
-| [Danmaku Contract](./danmaku.md) | API, privacy, lifecycle, rendering, and cross-platform controls | Active |
-| [Server Online Media](./server-online-media.md) | Generic online libraries, paged history, progress sync, stream variants, and plugin danmaku priority | Active |
-| [Player Download and Offline Media](./download-offline.md) | Stable download identity, scheduler, offline package, attachment, local-first playback, and deletion contracts | Active |
-
----
+| [Server Admin Web UI](./server-admin-ui.md) | Console layout, dialogs, accessibility and verification | Active |
+| [Server Online Media](./server-online-media.md) | Online libraries, history, progress and stream boundaries | Active |
 
 ## Quality Check
 
-A frontend change is not complete until the relevant commands pass when the component exists:
+Run from `webui/`:
 
-- `npm run typecheck`
-- `npm run lint`
-- `npm run build`
-
-For Rust/Tauri backend changes, also run the relevant Cargo checks when configured.
-
----
+```text
+npm run permissions:check
+npm run test
+npm run typecheck
+npm run lint
+npm run build
+go mod verify
+go test .
+```
 
 **Language**: Trellis spec files are written in English. Product-facing architecture docs may remain Chinese.

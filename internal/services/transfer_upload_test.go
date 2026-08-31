@@ -14,10 +14,10 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/rs/zerolog"
-	"github.com/yuanjing-hash/ohmycine/server/internal/models"
-	"github.com/yuanjing-hash/ohmycine/server/internal/plugins/contract"
-	cloudpkg "github.com/yuanjing-hash/ohmycine/server/pkg/cloud"
-	downloadpkg "github.com/yuanjing-hash/ohmycine/server/pkg/downloader"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/plugins/contract"
+	cloudpkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud"
+	downloadpkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/downloader"
 	"gorm.io/gorm"
 )
 

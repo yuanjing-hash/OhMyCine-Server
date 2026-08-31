@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yuanjing-hash/ohmycine/server/pkg/site"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/site"
 )
 
 func fixture(t *testing.T, name string) []byte {

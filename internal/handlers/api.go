@@ -9,9 +9,9 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/rs/zerolog"
-	"github.com/yuanjing-hash/ohmycine/server/internal/config"
-	"github.com/yuanjing-hash/ohmycine/server/internal/middleware"
-	"github.com/yuanjing-hash/ohmycine/server/internal/services"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/config"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/middleware"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/services"
 )
 
 type API struct {

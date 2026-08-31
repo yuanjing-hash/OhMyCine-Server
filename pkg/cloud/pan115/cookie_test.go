@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yuanjing-hash/ohmycine/server/pkg/cloud"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud"
 )
 
 func TestParseCookieNormalizesAllowlistAndDropsOtherFields(t *testing.T) {

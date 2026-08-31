@@ -13,8 +13,8 @@ import (
 
 	"golang.org/x/net/html"
 
-	"github.com/yuanjing-hash/ohmycine/server/pkg/site"
-	"github.com/yuanjing-hash/ohmycine/server/pkg/site/btrss"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/site"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/site/btrss"
 )
 
 const maxHTMLBytes = 4 << 20
@@ -313,7 +313,7 @@ func requestHTML(ctx context.Context, client *http.Client, target string) ([]byt
 		return nil, site.ErrUnavailable
 	}
 	request.Header.Set("Accept", "text/html,application/xhtml+xml")
-	request.Header.Set("User-Agent", "OhMyCine/1.0 (+https://github.com/yuanjing-hash/OhMyCine)")
+	request.Header.Set("User-Agent", "OhMyCine-Server/1.0 (+https://github.com/yuanjing-hash/OhMyCine-Server)")
 	response, err := client.Do(request)
 	if err != nil {
 		return nil, site.ErrUnavailable

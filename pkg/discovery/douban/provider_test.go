@@ -9,7 +9,7 @@ import (
 	"testing"
 	"unicode/utf8"
 
-	"github.com/yuanjing-hash/ohmycine/server/pkg/discovery"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/discovery"
 )
 
 func TestProviderParsesBoundedPublicWebResponse(t *testing.T) {

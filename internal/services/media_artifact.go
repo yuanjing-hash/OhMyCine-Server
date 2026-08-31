@@ -19,12 +19,12 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/rs/zerolog"
-	serverlog "github.com/yuanjing-hash/ohmycine/server/internal/logging"
-	"github.com/yuanjing-hash/ohmycine/server/internal/medialibrary"
-	"github.com/yuanjing-hash/ohmycine/server/internal/models"
-	storagefs "github.com/yuanjing-hash/ohmycine/server/internal/storage"
-	cloudpkg "github.com/yuanjing-hash/ohmycine/server/pkg/cloud"
-	"github.com/yuanjing-hash/ohmycine/server/pkg/metadata/nfo"
+	serverlog "github.com/yuanjing-hash/OhMyCine-Server/internal/logging"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/medialibrary"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
+	storagefs "github.com/yuanjing-hash/OhMyCine-Server/internal/storage"
+	cloudpkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/metadata/nfo"
 	"gorm.io/gorm"
 )
 

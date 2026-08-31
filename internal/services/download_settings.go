@@ -6,11 +6,11 @@ import (
 	"math"
 	"time"
 
-	"github.com/yuanjing-hash/ohmycine/server/internal/authz"
-	"github.com/yuanjing-hash/ohmycine/server/internal/directory"
-	"github.com/yuanjing-hash/ohmycine/server/internal/medialibrary"
-	"github.com/yuanjing-hash/ohmycine/server/internal/models"
-	storagefs "github.com/yuanjing-hash/ohmycine/server/internal/storage"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/authz"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/directory"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/medialibrary"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
+	storagefs "github.com/yuanjing-hash/OhMyCine-Server/internal/storage"
 	"gorm.io/gorm"
 )
 

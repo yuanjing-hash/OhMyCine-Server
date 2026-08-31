@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/yuanjing-hash/ohmycine/server/internal/services"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/services"
 )
 
 //go:embed artwork/*.png

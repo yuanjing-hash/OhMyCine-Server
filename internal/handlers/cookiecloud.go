@@ -8,8 +8,8 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
-	"github.com/yuanjing-hash/ohmycine/server/internal/middleware"
-	"github.com/yuanjing-hash/ohmycine/server/internal/services"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/middleware"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/services"
 )
 
 func (a *API) CookieCloudRoot(c *gin.Context) {

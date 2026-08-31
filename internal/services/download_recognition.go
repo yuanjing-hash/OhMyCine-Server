@@ -7,10 +7,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/yuanjing-hash/ohmycine/server/internal/authz"
-	"github.com/yuanjing-hash/ohmycine/server/internal/models"
-	downloadpkg "github.com/yuanjing-hash/ohmycine/server/pkg/downloader"
-	"github.com/yuanjing-hash/ohmycine/server/pkg/metadata/tmdb"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/authz"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
+	downloadpkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/downloader"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/metadata/tmdb"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )

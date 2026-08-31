@@ -2,8 +2,13 @@
 /data/
 /webui/dist/
 /webui/node_modules/
+/dist/
+**/__pycache__/
+**/*.pyc
 /server
+/server.exe
 /ohmycine-server
+/ohmycine-server.exe
 *.db
 *.db-journal
 *.db-shm

@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/yuanjing-hash/ohmycine/server/internal/plugins/contract"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/plugins/contract"
 )
 
 type roundTripFunc func(*http.Request) (*http.Response, error)

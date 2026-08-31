@@ -12,6 +12,9 @@ on:
       - "cli/**"
       - ".github/workflows/cli.yml"
 
+permissions:
+  contents: read
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -51,7 +54,7 @@ jobs:
 
       - name: Lint
         if: steps.scaffold.outputs.ready == 'true'
-        uses: golangci/golangci-lint-action@v6
+        uses: golangci/golangci-lint-action@v7
         with:
-          version: latest
+          version: v2.4.0
           working-directory: cli

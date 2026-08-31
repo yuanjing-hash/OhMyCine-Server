@@ -12,8 +12,8 @@ import (
 	"strings"
 	"time"
 
-	serverlog "github.com/yuanjing-hash/ohmycine/server/internal/logging"
-	"github.com/yuanjing-hash/ohmycine/server/internal/plugins/contract"
+	serverlog "github.com/yuanjing-hash/OhMyCine-Server/internal/logging"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/plugins/contract"
 )
 
 const (

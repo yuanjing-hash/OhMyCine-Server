@@ -6,7 +6,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/yuanjing-hash/ohmycine/server/pkg/site"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/site"
 )
 
 func TestYTSAndEZTVAPISearchProducePrivateMagnetIdentities(t *testing.T) {

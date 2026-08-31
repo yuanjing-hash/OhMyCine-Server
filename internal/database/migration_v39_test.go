@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yuanjing-hash/ohmycine/server/internal/models"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
 )
 
 func TestMigrateMediaRefreshNotifyIsAdditiveIdempotentAndConstrained(t *testing.T) {

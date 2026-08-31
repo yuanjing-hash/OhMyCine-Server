@@ -35,7 +35,7 @@ Use this contract for Server jobs that perform discrete, restart-safe automation
 - Exercise concurrency caps, resource fairness, complete-lane reorder conflicts, stale leases, checkpoint persistence, action-version rejection, retry promotion, expired-lease recovery, coalescing generation and running interrupt acknowledgement.
 - Exercise an empty Scheduler registry and assert that queued jobs remain queued with zero attempts. Also place more than 64 jobs for a capacity-blocked resource ahead of another runnable resource to prevent bounded candidate scans from reintroducing provider starvation.
 - Verify operator grants read/control/respond/reorder; viewer receives no task-center permission; policy mutation remains administrator-only by default.
-- Run repeated queue service tests, HTTP RBAC tests, Web UI test/typecheck/lint/build, embedded build and the Windows `server/test.ps1` gate.
+- Run repeated queue service tests, HTTP RBAC tests, Web UI test/typecheck/lint/build, embedded build and the Windows `./test.ps1` gate.
 
 ## Scheduler registry example
 

@@ -13,12 +13,12 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
-	"github.com/yuanjing-hash/ohmycine/server/internal/authz"
-	"github.com/yuanjing-hash/ohmycine/server/internal/credential"
-	"github.com/yuanjing-hash/ohmycine/server/internal/database"
-	"github.com/yuanjing-hash/ohmycine/server/internal/models"
-	"github.com/yuanjing-hash/ohmycine/server/pkg/cloud"
-	"github.com/yuanjing-hash/ohmycine/server/pkg/cloud/pan115"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/authz"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/credential"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/database"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud/pan115"
 	"gorm.io/gorm"
 )
 

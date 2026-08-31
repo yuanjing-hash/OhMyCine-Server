@@ -111,8 +111,8 @@ Do not hold database transactions while making slow external network calls. Pers
 ### 2. Signatures
 
 - Database entry point: `database.Open(path string) (*gorm.DB, error)`.
-- Windows launch: `server/start.ps1 [-SkipBuild]`.
-- Windows quality gate: `server/test.ps1 [-CheckDependenciesOnly] [-SkipWebUi] [-SkipGoQuality] [-SkipHealthCheck]`.
+- Windows launch: `./start.ps1 [-SkipBuild]`.
+- Windows quality gate: `./test.ps1 [-CheckDependenciesOnly] [-SkipWebUi] [-SkipGoQuality] [-SkipHealthCheck]`.
 - System Go bootstrap package: exact winget ID `GoLang.Go`.
 
 ### 3. Contracts
@@ -120,7 +120,7 @@ Do not hold database transactions while making slow external network calls. Pers
 - Keep GORM as the ORM and `gorm.io/driver/sqlite` as the dialect layer, but register the pure-Go `modernc.org/sqlite` database/sql driver with `DriverName: "sqlite"`.
 - Build and test Server with `CGO_ENABLED=0`.
 - File-backed databases enable `foreign_keys(1)`, `busy_timeout(5000)`, `journal_mode(WAL)`, and `_txlock=immediate` through the modernc DSN. In-memory tests enable foreign keys, busy timeout, and the same immediate transaction mode without WAL. Immediate write reservation prevents a GORM read-then-write transaction from failing instantly with `SQLITE_BUSY_SNAPSHOT` when a scheduler write commits between its reads and first mutation; normal writer contention still waits under the bounded busy timeout.
-- Windows persistent runtime state defaults to `server/.runtime/windows/{bin,data,logs}`. Test databases and process output use unique children of `server/.runtime/windows/tests/`.
+- Windows persistent runtime state defaults to `.runtime/windows/{bin,data,logs}`. Test databases and process output use unique children of `.runtime/windows/tests/`.
 - If compatible Go is absent, `start.ps1` installs the official system package with `winget install --id GoLang.Go --exact`; it must not download a repository-local portable Go or install a C compiler.
 - Default Server binding remains `127.0.0.1`; tests use a dynamically allocated loopback port.
 
@@ -148,7 +148,7 @@ Do not hold database transactions while making slow external network calls. Pers
 - Database tests assert `PRAGMA foreign_keys = 1`, `PRAGMA journal_mode = wal`, and that a read-then-write transaction retains its snapshot while a competing writer waits and resumes after commit.
 - HTTP integration tests close the GORM underlying `*sql.DB` so Windows can remove `t.TempDir()` files.
 - PowerShell contract test asserts the exact winget arguments and rejects cleanup of the tests root and sibling paths.
-- Full `server/test.ps1` runs frontend permission/test/typecheck/lint/build, `CGO_ENABLED=0` Go test/vet/build, and a real isolated health probe.
+- Full `./test.ps1` runs frontend permission/test/typecheck/lint/build, `CGO_ENABLED=0` Go test/vet/build, and a real isolated health probe.
 - `git check-ignore` must cover Windows EXE, DB/WAL/SHM, logs, unique test data, `webui/node_modules`, and `webui/dist`.
 
 ### 7. Wrong vs Correct

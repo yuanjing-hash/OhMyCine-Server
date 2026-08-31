@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/yuanjing-hash/ohmycine/server/pkg/metadata/tmdb"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/metadata/tmdb"
 )
 
 func TestRenderMovieIsDeterministicAndCredentialFree(t *testing.T) {

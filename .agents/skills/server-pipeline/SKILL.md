@@ -200,7 +200,6 @@ Use WebSocket events for progress/status changes such as:
 Use only after the Server project exists:
 
 ```bash
-cd server
 go mod download
 go run ./cmd/server
 go test ./...
@@ -210,14 +209,12 @@ golangci-lint run
 Run a single Go test:
 
 ```bash
-cd server
 go test ./internal/services -run TestName
 ```
 
 Docker when files exist:
 
 ```bash
-cd server
 docker compose up -d
 ```
 

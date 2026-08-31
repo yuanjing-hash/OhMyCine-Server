@@ -6,8 +6,8 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/yuanjing-hash/ohmycine/server/internal/mediarecognition"
-	downloadpkg "github.com/yuanjing-hash/ohmycine/server/pkg/downloader"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/mediarecognition"
+	downloadpkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/downloader"
 )
 
 const minimumAutomaticTransferVideoBytes int64 = 16 * 1024 * 1024

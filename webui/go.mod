@@ -1,4 +1,4 @@
-module github.com/yuanjing-hash/ohmycine/server/webui
+module github.com/yuanjing-hash/OhMyCine-Server/webui
 
 go 1.23.0
 

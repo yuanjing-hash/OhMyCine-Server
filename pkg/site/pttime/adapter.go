@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/yuanjing-hash/ohmycine/server/pkg/site"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/site"
 	"golang.org/x/net/html"
 )
 
@@ -204,10 +204,10 @@ func controlledClient(config site.Config) (*http.Client, *url.URL, error) {
 func normalizedUserAgent(value string) string {
 	value = strings.TrimSpace(value)
 	if value == "" {
-		return "OhMyCine/1.0 (+https://github.com/yuanjing-hash/OhMyCine)"
+		return "OhMyCine-Server/1.0 (+https://github.com/yuanjing-hash/OhMyCine-Server)"
 	}
 	if len(value) > 256 || strings.ContainsAny(value, "\x00\r\n") {
-		return "OhMyCine/1.0 (+https://github.com/yuanjing-hash/OhMyCine)"
+		return "OhMyCine-Server/1.0 (+https://github.com/yuanjing-hash/OhMyCine-Server)"
 	}
 	return value
 }

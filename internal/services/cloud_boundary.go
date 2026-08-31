@@ -5,7 +5,7 @@ import (
 	"errors"
 	"strings"
 
-	cloudpkg "github.com/yuanjing-hash/ohmycine/server/pkg/cloud"
+	cloudpkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud"
 )
 
 const maxCloudBoundaryDepth = 128

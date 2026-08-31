@@ -1,4 +1,4 @@
-# OhMyCine 设计文档索引
+# OhMyCine Server 设计文档索引
 
 > THE NORTH STAR OF YOUR CINEMA
 
@@ -7,12 +7,10 @@
 | 编号 | 文档 | 说明 |
 |------|------|------|
 | 00 | [索引](00-index.md) | 本文件 |
-| 01 | [产品架构总览](01-overview.md) | 产品愿景、系统架构、技术选型、部署模式 |
+| 01 | [生态与 Server 架构总览](01-overview.md) | 组件边界、系统架构、技术选型、部署模式 |
 | 02 | [Server后端设计](02-server-design.md) | 媒体流水线(发现→下载→转移→入库)、三层架构、追更、302代理、STRM管理、API设计、数据库 |
-| 03 | [Player播放器设计](03-player-design.md) | Tauri+Vue前端、libmpv集成、DataSource抽象层、自动刮削、AI推荐、Cinema OS UI |
-| 04 | [Hub插件市场设计](04-hub-design.md) | 插件规范、安装流程、Hub网站 |
 | 05 | [CLI命令行设计](05-cli-design.md) | omc命令体系、Shell补全 |
-| 06 | [开发路线图](06-roadmap.md) | 4阶段开发计划、里程碑、风险评估 |
+| 06 | [Server 开发路线图](06-roadmap.md) | Server/CLI 当前状态、后续能力和质量门禁 |
 | 07 | [安全设计](07-security-design.md) | 威胁模型、凭据存储、302代理、配置同步、插件与部署安全 |
 | 08 | [Server Web UI 设计](08-server-web-ui-design.md) | 管理端导航、顶栏、混合型仪表盘、权限可见性与响应式规则 |
 
@@ -22,10 +20,10 @@
 
 ```
 OhMyCine
-├── Player    — 跨平台播放器 (Tauri v2 + Vue 3 + libmpv)
-├── Server    — 媒体流水线后端 (Go + Gin + GORM + SQLite)
-├── Hub       — 插件市场 (VitePress)
-└── omc       — 命令行工具 (Go + Cobra)
+├── Player    — https://github.com/yuanjing-hash/OhMyCine
+├── Server    — 本仓库，媒体流水线后端 (Go + Gin + GORM + SQLite)
+├── omc       — 本仓库，命令行工具 (Go + Cobra)
+└── Plugins   — https://github.com/yuanjing-hash/OhMyCine-Plugins
 ```
 
 ### 核心技术选型

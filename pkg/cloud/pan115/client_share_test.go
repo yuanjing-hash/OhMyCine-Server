@@ -7,7 +7,7 @@ import (
 	"testing"
 
 	pan115sdk "github.com/SheltonZhu/115driver/pkg/driver"
-	"github.com/yuanjing-hash/ohmycine/server/pkg/cloud"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud"
 )
 
 type shareTestSDK struct {

@@ -6,12 +6,12 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/rs/zerolog"
-	"github.com/yuanjing-hash/ohmycine/server/internal/authz"
-	"github.com/yuanjing-hash/ohmycine/server/internal/config"
-	"github.com/yuanjing-hash/ohmycine/server/internal/handlers"
-	"github.com/yuanjing-hash/ohmycine/server/internal/middleware"
-	"github.com/yuanjing-hash/ohmycine/server/internal/services"
-	"github.com/yuanjing-hash/ohmycine/server/webui"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/authz"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/config"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/handlers"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/middleware"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/services"
+	"github.com/yuanjing-hash/OhMyCine-Server/webui"
 )
 
 func New(cfg config.Config, api *handlers.API, auth *services.AuthService, log zerolog.Logger) *gin.Engine {

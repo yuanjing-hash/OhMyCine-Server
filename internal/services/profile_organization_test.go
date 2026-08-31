@@ -3,8 +3,8 @@ package services
 import (
 	"testing"
 
-	"github.com/yuanjing-hash/ohmycine/server/internal/models"
-	downloadpkg "github.com/yuanjing-hash/ohmycine/server/pkg/downloader"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
+	downloadpkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/downloader"
 )
 
 func TestNormalizeMediaTypeDirectoryTemplate(t *testing.T) {

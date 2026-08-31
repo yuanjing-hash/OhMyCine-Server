@@ -24,9 +24,9 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
-	"github.com/yuanjing-hash/ohmycine/server/internal/models"
-	"github.com/yuanjing-hash/ohmycine/server/internal/plugins/contract"
-	"github.com/yuanjing-hash/ohmycine/server/internal/plugins/hostapi"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/plugins/contract"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/plugins/hostapi"
 	"gorm.io/gorm"
 )
 

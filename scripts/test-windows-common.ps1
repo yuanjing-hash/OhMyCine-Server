@@ -85,8 +85,8 @@ foreach ($unsafePath in @($testsRoot, ($testsRoot + '-sibling\contract-test'))) 
     if (-not $rejected) { throw "Unsafe cleanup path was accepted: $unsafePath" }
 }
 
-$linkerTarget = 'github.com/yuanjing-hash/ohmycine/server/pkg/metadata/tmdb.BuiltinReadAccessToken'
-$apiKeyLinkerTarget = 'github.com/yuanjing-hash/ohmycine/server/pkg/metadata/tmdb.BuiltinAPIKey'
+$linkerTarget = 'github.com/yuanjing-hash/OhMyCine-Server/pkg/metadata/tmdb.BuiltinReadAccessToken'
+$apiKeyLinkerTarget = 'github.com/yuanjing-hash/OhMyCine-Server/pkg/metadata/tmdb.BuiltinAPIKey'
 $windowsStart = Get-Content -LiteralPath (Join-Path $script:ServerDirectory 'start.ps1') -Raw
 $linuxStart = Get-Content -LiteralPath (Join-Path $script:ServerDirectory 'start.sh') -Raw
 $windowsTest = Get-Content -LiteralPath (Join-Path $script:ServerDirectory 'test.ps1') -Raw

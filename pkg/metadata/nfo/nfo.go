@@ -7,7 +7,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/yuanjing-hash/ohmycine/server/pkg/metadata/tmdb"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/metadata/tmdb"
 )
 
 var ErrSnapshotIncomplete = errors.New("metadata snapshot is incomplete")

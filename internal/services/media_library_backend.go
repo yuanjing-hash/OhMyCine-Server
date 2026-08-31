@@ -7,9 +7,9 @@ import (
 	"time"
 
 	"github.com/fsnotify/fsnotify"
-	"github.com/yuanjing-hash/ohmycine/server/internal/medialibrary"
-	"github.com/yuanjing-hash/ohmycine/server/internal/models"
-	cloudpkg "github.com/yuanjing-hash/ohmycine/server/pkg/cloud"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/medialibrary"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
+	cloudpkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud"
 )
 
 // MediaLibraryScanRequest contains only provider-neutral library scan facts.

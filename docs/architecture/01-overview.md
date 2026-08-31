@@ -2,6 +2,8 @@
 
 > THE NORTH STAR OF YOUR CINEMA
 
+本文件保留生态级接口背景；本仓库只实现 Server 与 `omc` CLI。Player 源码和专属文档位于 [OhMyCine](https://github.com/yuanjing-hash/OhMyCine)，官方插件、Plugin SDK 与 Hub 位于 [OhMyCine-Plugins](https://github.com/yuanjing-hash/OhMyCine-Plugins)。三个仓库通过版本化 HTTP/WebSocket、Plugin Registry 和 Release 产物协作，不使用跨仓库相对源码依赖。
+
 ## 1. 产品愿景
 
 OhMyCine 是一个**开源、全平台、自托管**的家庭影院生态系统。

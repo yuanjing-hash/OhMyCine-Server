@@ -12,13 +12,13 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/yuanjing-hash/ohmycine/server/internal/authz"
-	serverlog "github.com/yuanjing-hash/ohmycine/server/internal/logging"
-	"github.com/yuanjing-hash/ohmycine/server/internal/models"
-	"github.com/yuanjing-hash/ohmycine/server/internal/plugins/contract"
-	"github.com/yuanjing-hash/ohmycine/server/internal/plugins/packagefs"
-	pluginrepository "github.com/yuanjing-hash/ohmycine/server/internal/plugins/repository"
-	pluginruntime "github.com/yuanjing-hash/ohmycine/server/internal/plugins/runtime"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/authz"
+	serverlog "github.com/yuanjing-hash/OhMyCine-Server/internal/logging"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/plugins/contract"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/plugins/packagefs"
+	pluginrepository "github.com/yuanjing-hash/OhMyCine-Server/internal/plugins/repository"
+	pluginruntime "github.com/yuanjing-hash/OhMyCine-Server/internal/plugins/runtime"
 	"gorm.io/gorm"
 )
 

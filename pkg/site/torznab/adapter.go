@@ -12,9 +12,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/yuanjing-hash/ohmycine/server/pkg/site"
-	"github.com/yuanjing-hash/ohmycine/server/pkg/site/btrss"
-	"github.com/yuanjing-hash/ohmycine/server/pkg/site/rssfeed"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/site"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/site/btrss"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/site/rssfeed"
 )
 
 const (

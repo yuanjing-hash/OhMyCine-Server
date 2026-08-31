@@ -9,8 +9,8 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/yuanjing-hash/ohmycine/server/internal/mediarecognition"
-	"github.com/yuanjing-hash/ohmycine/server/internal/organization"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/mediarecognition"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/organization"
 )
 
 const (

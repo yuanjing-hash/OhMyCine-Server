@@ -12,8 +12,8 @@ import (
 	"testing"
 
 	"github.com/rs/zerolog"
-	"github.com/yuanjing-hash/ohmycine/server/internal/models"
-	sitepkg "github.com/yuanjing-hash/ohmycine/server/pkg/site"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
+	sitepkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/site"
 )
 
 func TestCookieCloudLocalReceiveAndSyncUpdatesMatchingSite(t *testing.T) {

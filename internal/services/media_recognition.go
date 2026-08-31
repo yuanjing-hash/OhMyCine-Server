@@ -8,10 +8,10 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/yuanjing-hash/ohmycine/server/internal/classification"
-	"github.com/yuanjing-hash/ohmycine/server/internal/mediarecognition"
-	"github.com/yuanjing-hash/ohmycine/server/pkg/aiprovider"
-	"github.com/yuanjing-hash/ohmycine/server/pkg/metadata/tmdb"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/classification"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/mediarecognition"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/aiprovider"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/metadata/tmdb"
 )
 
 var builtinProcessorCache = struct {

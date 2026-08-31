@@ -10,8 +10,8 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
-	serverlog "github.com/yuanjing-hash/ohmycine/server/internal/logging"
-	"github.com/yuanjing-hash/ohmycine/server/internal/models"
+	serverlog "github.com/yuanjing-hash/OhMyCine-Server/internal/logging"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
 )
 
 type WorkerResult struct {

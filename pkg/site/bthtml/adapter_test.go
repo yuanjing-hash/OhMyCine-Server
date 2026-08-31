@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/yuanjing-hash/ohmycine/server/pkg/site"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/site"
 )
 
 type renderedStub struct {

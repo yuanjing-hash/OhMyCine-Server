@@ -7,9 +7,9 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/rs/zerolog"
-	"github.com/yuanjing-hash/ohmycine/server/internal/authz"
-	"github.com/yuanjing-hash/ohmycine/server/internal/models"
-	cloudpkg "github.com/yuanjing-hash/ohmycine/server/pkg/cloud"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/authz"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
+	cloudpkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud"
 )
 
 func TestDefaultIngestLibrarySwitchIsConnectionUniqueAndRequiredByListener(t *testing.T) {

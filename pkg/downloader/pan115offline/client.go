@@ -7,8 +7,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/yuanjing-hash/ohmycine/server/pkg/cloud"
-	"github.com/yuanjing-hash/ohmycine/server/pkg/downloader"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/downloader"
 )
 
 var Capabilities = downloader.Capabilities{Cancel: true, DeleteData: true, DownloadSpeed: false, UploadSpeed: false, ETA: true, NativeOffline: true, ShareReceive: true, OutputConstraint: downloader.OutputConstraintProviderStorage}

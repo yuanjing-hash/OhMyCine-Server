@@ -6,9 +6,9 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/yuanjing-hash/ohmycine/server/internal/authz"
-	"github.com/yuanjing-hash/ohmycine/server/internal/middleware"
-	"github.com/yuanjing-hash/ohmycine/server/internal/services"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/authz"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/middleware"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/services"
 )
 
 func (a *API) PlayerMediaChanges(c *gin.Context) {

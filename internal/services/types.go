@@ -3,8 +3,8 @@ package services
 import (
 	"sort"
 
-	"github.com/yuanjing-hash/ohmycine/server/internal/authz"
-	"github.com/yuanjing-hash/ohmycine/server/internal/models"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/authz"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
 )
 
 // Actor is the authenticated authorization context used by policy-aware services.

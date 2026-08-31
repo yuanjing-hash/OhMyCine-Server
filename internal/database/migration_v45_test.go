@@ -4,7 +4,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/yuanjing-hash/ohmycine/server/internal/models"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
 )
 
 func TestMigrateCompletedDownloadManifestIsPrivateAdditiveAndIdempotent(t *testing.T) {

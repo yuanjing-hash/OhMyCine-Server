@@ -9,9 +9,9 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/yuanjing-hash/ohmycine/server/internal/authz"
-	"github.com/yuanjing-hash/ohmycine/server/internal/models"
-	mediaserverpkg "github.com/yuanjing-hash/ohmycine/server/pkg/mediaserver"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/authz"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
+	mediaserverpkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/mediaserver"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )

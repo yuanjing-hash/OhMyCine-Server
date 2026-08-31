@@ -9,7 +9,7 @@
 .trellis/workspace/*/journal-*.md merge=union
 
 # Keep generated and executable cross-platform sources deterministic.
-server/webui/src/auth/generated-permissions.ts text eol=lf
-server/internal/authz/catalog.json text eol=lf
+webui/src/auth/generated-permissions.ts text eol=lf
+internal/authz/catalog.json text eol=lf
 *.sh text eol=lf
 *.ps1 text eol=crlf

@@ -158,7 +158,7 @@ Profile detail adds `builtin_recognition_packs`, `recognition_rules` and the fou
 - PT/Nyaa regressions use untouched production-shaped titles at both the pure parser and shared `recognizeMedia` service entry. They cover dotted codec/channel tokens, complete seasons, title-first and group-first brackets, Japanese/Chinese/English aliases, episode ranges/counts and release-group placement; a parser-only green test cannot prove the Profile packs and TMDB query budget compose correctly.
 - Same-name TMDB conflict regressions preserve the real search/detail response shape, exercise candidate-order reversal and multiple episode numbers, and assert that missing provider fields remain missing. They also prove that equally complete identities remain ambiguous and that extreme popularity/votes cannot overturn a different title, media type, strong year or known episode-range conflict. The ranking engine version, WebUI recognition-session version and frozen benchmark report must change together whenever this decision contract changes.
 - Migration tests preserve legacy library templates, split distinct combinations, reuse identical combinations and remain idempotent.
-- Full `server/test.ps1` plus isolated browser smoke for default read-only, copy, edit/revision and both themes.
+- Full `./test.ps1` plus isolated browser smoke for default read-only, copy, edit/revision and both themes.
 
 ## 7. Wrong vs Correct
 

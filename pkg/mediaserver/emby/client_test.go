@@ -8,7 +8,7 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/yuanjing-hash/ohmycine/server/pkg/mediaserver"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/mediaserver"
 )
 
 func TestProbeUsesHeaderCredentialAndNeverFollowsRedirect(t *testing.T) {

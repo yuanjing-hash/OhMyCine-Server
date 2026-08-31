@@ -12,8 +12,8 @@ import (
 	"strings"
 	"time"
 
-	storagefs "github.com/yuanjing-hash/ohmycine/server/internal/storage"
-	cloudpkg "github.com/yuanjing-hash/ohmycine/server/pkg/cloud"
+	storagefs "github.com/yuanjing-hash/OhMyCine-Server/internal/storage"
+	cloudpkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud"
 )
 
 const (

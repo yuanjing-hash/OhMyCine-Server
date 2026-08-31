@@ -7,7 +7,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/yuanjing-hash/ohmycine/server/internal/models"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
 )
 
 type transferRouteKind string

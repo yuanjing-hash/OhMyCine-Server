@@ -25,7 +25,7 @@ OhMyCine Server 一键前台启动
   .runtime/data/ohmycine.db     持久化 SQLite 数据库
 
 可覆盖的环境变量：
-  OMC_RUNTIME_DIR    脚本运行目录（默认 server/.runtime）
+  OMC_RUNTIME_DIR    脚本运行目录（默认仓库根目录下的 .runtime）
   OMC_BINARY_PATH    Server 二进制路径（默认在运行目录的 bin/ 下）
   OMC_DATABASE_PATH  SQLite 路径（默认在运行目录的 data/ 下）
   OMC_LOG_DIR        结构化运行日志目录（默认在运行目录的 logs/ 下）
@@ -229,9 +229,9 @@ else
     cd -- "${SERVER_DIR}"
     build_args=(build -tags webui)
     if [[ -n "${TMDB_BUILD_TOKEN}" ]]; then
-      build_args+=(-ldflags "-X=github.com/yuanjing-hash/ohmycine/server/pkg/metadata/tmdb.BuiltinReadAccessToken=${TMDB_BUILD_TOKEN}")
+      build_args+=(-ldflags "-X=github.com/yuanjing-hash/OhMyCine-Server/pkg/metadata/tmdb.BuiltinReadAccessToken=${TMDB_BUILD_TOKEN}")
     elif [[ -n "${TMDB_BUILD_API_KEY}" ]]; then
-      build_args+=(-ldflags "-X=github.com/yuanjing-hash/ohmycine/server/pkg/metadata/tmdb.BuiltinAPIKey=${TMDB_BUILD_API_KEY}")
+      build_args+=(-ldflags "-X=github.com/yuanjing-hash/OhMyCine-Server/pkg/metadata/tmdb.BuiltinAPIKey=${TMDB_BUILD_API_KEY}")
     fi
     build_args+=(-o "${BINARY_PATH}" ./cmd/server)
     "${GO_BIN}" "${build_args[@]}"

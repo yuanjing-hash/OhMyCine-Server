@@ -2,13 +2,14 @@
 
 当前 Server 提供独立 Web 管理端、数据源与媒体库、下载/整理流水线、STRM 与签名 302、Emby 播放网关、用户权限、审计和结构化运行日志。
 
+本仓库是 OhMyCine 的独立 Server/CLI 仓库。Player 位于 [OhMyCine](https://github.com/yuanjing-hash/OhMyCine)，官方插件、Plugin SDK 与 Hub 位于 [OhMyCine-Plugins](https://github.com/yuanjing-hash/OhMyCine-Plugins)。历史 Server Release 仍保留在原仓库；拆分后的新版本从本仓库发布。
+
 ## 推荐启动方式（Windows PowerShell）
 
-Windows 本地开发优先使用系统自带的 Windows PowerShell 5.1 或更高版本。可以从仓库根目录或 `server/` 目录调用：
+Windows 本地开发优先使用系统自带的 Windows PowerShell 5.1 或更高版本，在仓库根目录运行：
 
 ```powershell
-.\server\start.ps1
-# 或：cd server; .\start.ps1
+.\start.ps1
 ```
 
 脚本先检查 Node.js/npm，并优先复用 PATH 中满足 `go.mod` 的 Go。Go 缺失或版本过低时，它通过 Windows Package Manager 精确安装官方系统级 `GoLang.Go` 包；安装可能显示 UAC，失败会明确终止，不会下载便携 Go、写入仓库工具链或调用 Docker。安装完成后只刷新当前脚本进程的 PATH。
@@ -18,9 +19,9 @@ Windows 本地开发优先使用系统自带的 Windows PowerShell 5.1 或更高
 首次运行按 lockfile 执行 `npm ci`，构建 Web UI 与带 `webui` tag 的 EXE，然后以前台方式启动；Ctrl+C 可停止。持久运行数据默认隔离在：
 
 ```text
-server/.runtime/windows/bin/ohmycine-server.exe
-server/.runtime/windows/data/ohmycine.db
-server/.runtime/windows/config/server.json
+.runtime/windows/bin/ohmycine-server.exe
+.runtime/windows/data/ohmycine.db
+.runtime/windows/config/server.json
 ```
 
 Windows 可以把不敏感的监听配置写入 `.runtime/windows/config/server.json`：
@@ -59,15 +60,14 @@ Web UI、STRM 和 Emby 302 网关共用主程序的 3000 端口，不需要为�
 现有 WSL/Linux 入口继续保留，可执行一条命令安装或复用 Web UI 依赖、构建管理端、构建带内嵌 Web UI 的 Server 二进制，并以前台正式模式启动：
 
 ```bash
-cd server
 ./start.sh
 ```
 
-也可以从任意当前目录直接调用脚本，例如在仓库根目录运行 `./server/start.sh`。首次启动完成后访问 `http://127.0.0.1:3000` 创建 owner。脚本默认把可长期复用的运行文件放在：
+也可以从任意当前目录通过绝对路径调用脚本。首次启动完成后访问 `http://127.0.0.1:3000` 创建 owner。脚本默认把可长期复用的运行文件放在：
 
 ```text
-server/.runtime/bin/ohmycine-server
-server/.runtime/data/ohmycine.db
+.runtime/bin/ohmycine-server
+.runtime/data/ohmycine.db
 ```
 
 这些运行产物均已被 Git 忽略。脚本不会删除、重置或覆盖已有数据库；需要空数据库做测试时，请显式指定一个独立的临时 `OMC_DATABASE_PATH`，不要清理现有运行目录。
@@ -125,7 +125,7 @@ $env:OMC_SERVER_PORT = '3300'
 
 | 环境变量 | `start.sh` 默认值 | 说明 |
 |---|---|---|
-| `OMC_RUNTIME_DIR` | `server/.runtime` | 脚本的二进制和数据运行目录 |
+| `OMC_RUNTIME_DIR` | `.runtime` | 脚本的二进制和数据运行目录 |
 | `OMC_BINARY_PATH` | `.runtime/bin/ohmycine-server` | 构建或复用的 Server 二进制路径 |
 | `OMC_SERVER_HOST` | `0.0.0.0` | 监听地址；仅表示绑定全部接口 |
 | `OMC_SERVER_PORT` | `3000` | 监听端口 |
@@ -149,13 +149,13 @@ OMC_SERVER_PORT=3300 ./start.sh
 
 手动开发模式仍使用 Server 内部默认值，并额外支持 `OMC_DEV_ORIGIN`（默认 `http://127.0.0.1:5173`）作为 Vite 开发来源。
 
-Windows 可运行 `powershell -ExecutionPolicy Bypass -File .\scripts\setup-ffmpeg.ps1`，把经过固定 SHA-256 校验的 FFmpeg 安装到 gitignored 的 `server/.runtime/windows/tools/ffmpeg`。脚本不修改系统 `PATH`、不安装到系统目录，也不会覆盖现有隔离工具；正式部署也可以通过 `OMC_FFMPEG_PATH` 指向管理员审核的 FFmpeg。
+Windows 可运行 `powershell -ExecutionPolicy Bypass -File .\scripts\setup-ffmpeg.ps1`，把经过固定 SHA-256 校验的 FFmpeg 安装到 gitignored 的 `.runtime/windows/tools/ffmpeg`。脚本不修改系统 `PATH`、不安装到系统目录，也不会覆盖现有隔离工具；正式部署也可以通过 `OMC_FFMPEG_PATH` 指向管理员审核的 FFmpeg。
 
 TMDB 有效凭据优先级为：Web UI 加密自定义凭据 → 运行时部署凭据 → 正式构建内置应用凭据。每一级都显式区分 `read_access_token`（Bearer）和 `api_key`（v3 query），不按内容猜测；同一级的两个环境变量不能同时配置。清除自定义凭据会回到下一级；API 永远只返回 `custom/deployment/builtin/none` 来源与安全类型，不回显密文。默认 API 是 `https://api.tmdb.org/3`，仅 DNS、连接或超时错误回退 `https://api.themoviedb.org/3`；任何 HTTP 响应均不回退。自定义 API 和图片 HTTPS 前缀必须在设置页分别测试成功后才会保存。
 
 脚本默认监听 `0.0.0.0`，但默认对外来源仍是回环地址。IPv6 地址可以写成 `::1` 或 `[::1]`，脚本会使用 Go 监听所需的方括号形式。监听 `0.0.0.0` 或 `::` 时，默认浏览器来源分别仍为 `http://127.0.0.1:<端口>` 和 `http://[::1]:<端口>`；从局域网主机名、域名或反向代理访问时，必须将 `OMC_PUBLIC_ORIGIN` 显式设为浏览器实际使用的精确来源。公网部署还必须使用 HTTPS 反向代理；不要把默认配置直接暴露到公网。
 
-`OMC_RUNTIME_DIR`、`OMC_BINARY_PATH`、`OMC_DATABASE_PATH` 和 `OMC_LOG_DIR` 的相对路径均以 `server/` 为基准，因此从任意当前目录调用脚本时行为一致。只有默认的 `server/.runtime/` 运行目录由仓库规则自动忽略；若覆盖到仓库内的其它路径，请自行确认不会误提交运行数据。
+`OMC_RUNTIME_DIR`、`OMC_BINARY_PATH`、`OMC_DATABASE_PATH` 和 `OMC_LOG_DIR` 的相对路径均以仓库根目录为基准，因此从任意当前目录调用脚本时行为一致。只有默认的 `.runtime/` 运行目录由仓库规则自动忽略；若覆盖到仓库内的其它路径，请自行确认不会误提交运行数据。
 
 运行日志默认同时写入 stdout 与 `runtime.jsonl`，单文件 20 MiB 后切割并 gzip 压缩；默认最多保留 10 个历史分片、30 天且总量不超过 500 MiB，任一条件先触发即清理最旧分片。管理员可以在日志中心调整安全范围内的策略，但物理目录始终由部署环境控制。运行日志与 SQLite 审计日志相互独立。
 

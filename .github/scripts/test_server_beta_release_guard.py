@@ -54,14 +54,16 @@ class WorkflowTests(unittest.TestCase):
             path.write_text(source, encoding="utf-8")
             self.assertIn("lint action supports v2 and version is pinned", guard.verify_workflow(path))
 
-    def test_server_tag_cannot_match_player_tag_trigger(self) -> None:
-        source = guard.DEFAULT_PLAYER_WORKFLOW.read_text(encoding="utf-8")
-        source = source.replace('- "v*.*.*"', '- "*v*.*.*"')
+    def test_detects_old_monorepo_module_path(self) -> None:
+        source = guard.DEFAULT_WORKFLOW.read_text(encoding="utf-8")
+        source = source.replace(
+            "github.com/yuanjing-hash/OhMyCine-Server",
+            "github.com/yuanjing-hash/ohmycine/server",
+        )
         with tempfile.TemporaryDirectory() as directory:
-            player_path = Path(directory) / "player.yml"
-            player_path.write_text(source, encoding="utf-8")
-            failures = guard.verify_workflow(guard.DEFAULT_WORKFLOW, player_path)
-            self.assertIn("Player tag trigger excludes Server namespace", failures)
+            path = Path(directory) / "workflow.yml"
+            path.write_text(source, encoding="utf-8")
+            self.assertIn("repository is Server-only", guard.verify_workflow(path))
 
 
 if __name__ == "__main__":

@@ -14,9 +14,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yuanjing-hash/ohmycine/server/internal/models"
-	"github.com/yuanjing-hash/ohmycine/server/internal/plugins/contract"
-	pluginrepository "github.com/yuanjing-hash/ohmycine/server/internal/plugins/repository"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/plugins/contract"
+	pluginrepository "github.com/yuanjing-hash/OhMyCine-Server/internal/plugins/repository"
 )
 
 type fakePluginAssets struct {

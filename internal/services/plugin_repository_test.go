@@ -10,10 +10,10 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
-	"github.com/yuanjing-hash/ohmycine/server/internal/authz"
-	"github.com/yuanjing-hash/ohmycine/server/internal/models"
-	"github.com/yuanjing-hash/ohmycine/server/internal/plugins/contract"
-	pluginrepository "github.com/yuanjing-hash/ohmycine/server/internal/plugins/repository"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/authz"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/plugins/contract"
+	pluginrepository "github.com/yuanjing-hash/OhMyCine-Server/internal/plugins/repository"
 )
 
 type fakePluginRegistryFetcher struct {
