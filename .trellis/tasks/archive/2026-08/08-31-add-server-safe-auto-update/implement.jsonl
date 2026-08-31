@@ -1,0 +1,8 @@
+{"_example": "Fill with {\"file\": \"<path>\", \"reason\": \"<why>\"}. Put spec/research files only — no code paths. Run `python .trellis/scripts/get_context.py --mode packages` to list available specs. Delete this line once real entries are added."}
+{"file": ".trellis/spec/backend/index.md", "reason": "Server 分层与质量入口"}
+{"file": ".trellis/spec/backend/api-guidelines.md", "reason": "管理员更新 API、鉴权和 no-store 契约"}
+{"file": ".trellis/spec/backend/security-guidelines.md", "reason": "固定更新源、网络、路径和自替换安全边界"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "稳定错误码与安全响应"}
+{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "运行日志和审计脱敏"}
+{"file": ".trellis/spec/frontend/index.md", "reason": "Server WebUI 入口"}
+{"file": ".trellis/spec/frontend/server-admin-ui.md", "reason": "设置页交互与权限规范"}
