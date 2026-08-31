@@ -9,7 +9,7 @@ import (
 )
 
 func TestGoContractConsumesSharedSDKOnlineMediaFixture(t *testing.T) {
-	fixturePath := filepath.Join("..", "..", "..", "..", "plugin-sdk", "fixtures", "online-media.v1.json")
+	fixturePath := filepath.Join("testdata", "online-media.v1.json")
 	payload, err := os.ReadFile(fixturePath)
 	if err != nil {
 		t.Fatal(err)

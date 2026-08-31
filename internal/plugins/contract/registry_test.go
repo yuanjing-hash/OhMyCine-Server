@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
-	"runtime"
 	"testing"
 )
 
@@ -101,12 +100,7 @@ func TestCompareVersionsUsesSemanticPrereleaseOrdering(t *testing.T) {
 
 func readRegistryFixture(t *testing.T) []byte {
 	t.Helper()
-	_, current, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("runtime.Caller failed")
-	}
-	root := filepath.Clean(filepath.Join(filepath.Dir(current), "..", "..", "..", ".."))
-	data, err := os.ReadFile(filepath.Join(root, "plugin-sdk", "fixtures", "repository", "ohmycine-plugin-registry.v1.json"))
+	data, err := os.ReadFile(filepath.Join("testdata", "ohmycine-plugin-registry.v1.json"))
 	if err != nil {
 		t.Fatal(err)
 	}

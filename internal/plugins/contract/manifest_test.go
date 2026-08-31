@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 )
@@ -61,12 +60,7 @@ func TestParseManifestRejectsOversizedInput(t *testing.T) {
 
 func readSharedFixture(t *testing.T) []byte {
 	t.Helper()
-	_, current, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("runtime.Caller failed")
-	}
-	root := filepath.Clean(filepath.Join(filepath.Dir(current), "..", "..", "..", ".."))
-	data, err := os.ReadFile(filepath.Join(root, "plugin-sdk", "fixtures", "static-site", "plugin.json"))
+	data, err := os.ReadFile(filepath.Join("testdata", "plugin.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
