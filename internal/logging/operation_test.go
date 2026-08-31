@@ -26,6 +26,8 @@ func TestOperationForHTTPRouteCoversImplementedModules(t *testing.T) {
 		"/api/v1/settings/ai-recognition/test":                       OperationAIRecognitionConfiguration,
 		"/api/v1/settings/sites/cookiecloud/sync":                    OperationCookieCloud,
 		"/api/v1/runtime-logs/facets":                                OperationRuntimeLogging,
+		"/api/v1/system/update":                                      OperationServerUpdate,
+		"/api/v1/system/update/check":                                OperationServerUpdate,
 		"/api/v1/plugin-repositories/:id/refresh":                    OperationPluginRepository,
 		"/api/v1/plugins/marketplace":                                OperationPluginRepository,
 		"/proxy/strm/:opaque":                                        OperationSignedProxy,

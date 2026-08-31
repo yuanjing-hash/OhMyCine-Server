@@ -5,6 +5,7 @@ import { Permissions } from '@/auth/generated-permissions'
 import AIModelPickerDialog from '@/components/AIModelPickerDialog.vue'
 import DirectoryPickerDialog from '@/components/DirectoryPickerDialog.vue'
 import SecretInput from '@/components/SecretInput.vue'
+import ServerUpdatePanel from '@/components/ServerUpdatePanel.vue'
 import { credentialLoader } from '@/credentials'
 import { useAuthStore } from '@/stores/auth'
 import { notify } from '@/toast'
@@ -197,6 +198,7 @@ onMounted(load)
 <template>
   <section class="mx-auto max-w-5xl">
     <div><h1 class="m-0 text-3xl font-800">系统设置</h1><p class="page-description mt-2 max-w-3xl">集中管理下载、调度与运行参数。下载器连接和最终媒体库在各自页面维护。</p></div>
+    <ServerUpdatePanel v-if="auth.can(Permissions.SystemAdmin)" />
     <div v-if="loading" class="text-subtle mt-6">正在读取系统设置…</div>
     <form v-else-if="settings" class="panel mt-6" @submit.prevent="save">
       <div class="flex flex-wrap items-start justify-between gap-4"><div><h2 class="m-0 text-lg">下载暂存目录</h2><p class="text-subtle mb-0 mt-1 text-sm">qBittorrent 先下载到这里；下载完成后，后续刮削与转移流水线再决定最终媒体库。</p></div><span :class="settings.configured ? 'status-chip status-chip--ready' : 'status-chip status-chip--warning'">{{ settings.configured ? '已配置' : '待配置' }}</span></div>

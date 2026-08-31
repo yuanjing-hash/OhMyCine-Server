@@ -502,6 +502,14 @@ Server 运行日志在 stdout 与文件分流前执行同一套结构化脱敏�
 - 便携模式只把 NSIS 目标目录设置为当前 EXE 目录，不删除 `portable.flag`、`data`、`cache` 或 `logs`，也不把便携配置迁入标准目录。
 - 私钥丢失后不能仅替换应用内公钥来修复已安装客户端；必须保护并备份原私钥。
 
+### 10.7 Server 自更新信任边界
+
+- Server 只读取固定 `yuanjing-hash/OhMyCine-Server` 的 GitHub Release，接受严格 `server-vX.Y.Z`、当前 `GOOS/GOARCH` 的固定资产名和唯一 `SHA256SUMS.txt` 条目。所有 API、资产和每次重定向都必须是 HTTPS 且命中固定 GitHub/Release Asset host allowlist；限制连接/总超时、跳转次数、JSON/checksum 正文和归档大小。
+- SHA-256 校验完成前不得提取或替换。ZIP/tar.gz 解析拒绝绝对路径、盘符/UNC、`..`、符号链接/硬链接、设备、重复目标、错误二进制名和解包大小越界，只把唯一目标 Server 二进制写入 runtime 专用 staging。
+- helper 计划只位于 `<runtime>/updates`，目标只能是当前 Server 可执行文件。替换前保存唯一旧二进制备份；新进程必须通过本机 health 检查，否则终止新进程、恢复备份并重启旧版本。数据库、配置、credential key、插件、缓存、日志、媒体路径及 runtime 其它文件永远不能成为更新目标或清理范围。
+- 四个更新 API 必须同时经过登录会话、CSRF、`system.admin` route middleware 和 service policy；检查/安装单飞，通道 revision 使用 CAS。审计和运行日志只记录 actor、通道、版本、阶段、结果和稳定错误码，不返回或记录本地绝对路径、下载 URL、GitHub 正文、环境变量或 helper 私有计划。
+- `OMC_UPDATE_MODE=managed`、容器、不支持的平台和不可安全替换的安装只报告 deployment-managed 并禁用安装；Server 不调用 Docker、systemd、包管理器或 Git。当前 SHA-256 清单与归档来自同一 Release，不是独立签名根；未来可增加签名清单，但不能降低现有固定来源、资产契约和哈希校验。
+
 ## 11. 插件与 Hub 安全
 
 插件系统是长期能力，但安全边界需要提前设计。

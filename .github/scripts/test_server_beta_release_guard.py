@@ -54,6 +54,24 @@ class WorkflowTests(unittest.TestCase):
             path.write_text(source, encoding="utf-8")
             self.assertIn("lint action supports v2 and version is pinned", guard.verify_workflow(path))
 
+    def test_detects_missing_linker_build_identity(self) -> None:
+        source = guard.DEFAULT_WORKFLOW.read_text(encoding="utf-8")
+        source = source.replace(
+            "-X=github.com/yuanjing-hash/OhMyCine-Server/internal/buildinfo.Version=${VERSION}",
+            "-X=github.com/yuanjing-hash/OhMyCine-Server/internal/buildinfo.Version=dev",
+        )
+        source = source.replace(
+            "-X=github.com/yuanjing-hash/OhMyCine-Server/internal/buildinfo.Commit=${GITHUB_SHA}",
+            "",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "workflow.yml"
+            path.write_text(source, encoding="utf-8")
+            failures = guard.verify_workflow(path)
+            self.assertIn("strict build version is injected", failures)
+            self.assertIn("build commit is injected", failures)
+            self.assertIn("development build identity in release", failures)
+
     def test_detects_old_monorepo_module_path(self) -> None:
         source = guard.DEFAULT_WORKFLOW.read_text(encoding="utf-8")
         source = source.replace(

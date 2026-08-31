@@ -1238,6 +1238,14 @@ users ──< user_roles >── roles ──< role_permissions >── permissi
 └──────────────────────────────────────────────────────────────────┘
 ```
 
+### 15.2 Server 安全更新
+
+系统设置页为具备 `system.admin` 的管理员提供独立 Server 更新面板。状态接口显示 linker 注入的当前版本/commit、Beta 或 Stable 通道、最新版本、上次检查时间、运行阶段和安全错误码；开发构建明确显示 `dev`，不能伪装成可比较的正式版本。Beta 从官方 prerelease 与正式 Release 中选择最新版本，Stable 只接受正式 Release；Stable 暂无版本时不回退到 Beta。
+
+更新源固定为 `yuanjing-hash/OhMyCine-Server`，平台资产名由严格的 `server-vX.Y.Z` 与 `windows|linux/amd64` 契约决定。Server 在有界 HTTPS/GitHub 主机范围内下载归档和 `SHA256SUMS.txt`，校验目标资产唯一 SHA-256，并从拒绝绝对路径、`..`、链接、重复目标和超限内容的归档中只提取 Server 二进制。状态、计划、staging 和旧二进制备份全部位于当前 runtime 的 `updates/`；更新器只替换当前可执行文件，数据库、配置、凭据、插件、缓存、日志及媒体目录都不进入替换集合。
+
+Windows 与 Linux 都由 staging 中的新二进制以内部 helper 模式等待旧 PID 退出后执行备份、替换、重启和 loopback health 检查。新版本启动或健康检查失败时，helper 停止失败进程、恢复旧二进制并重启旧版本；状态必须明确落到 `failed` 或 `rolled_back`，不能返回假成功。容器、`OMC_UPDATE_MODE=managed`、不支持的平台和不可替换/只读安装显示“由部署方式管理”，保留检查能力但禁用安装，不调用 Docker、systemd、包管理器或 Git。
+
 ## 16. REST API 设计
 
 ### 16.1 API 端点总览
@@ -1382,6 +1390,10 @@ POST   /api/v1/settings/metadata/test        # 使用有效凭据和当前 API �
 POST   /api/v1/settings/metadata/test-token  # 候选 API Key/Read Token 测试成功后 CAS 保存
 POST   /api/v1/settings/metadata/test-api    # 测试成功后启用 API HTTPS 前缀
 POST   /api/v1/settings/metadata/test-image  # 测试成功后启用图片 HTTPS 前缀
+GET    /api/v1/system/update                 # system.admin；当前版本、通道与安全更新状态
+POST   /api/v1/system/update/check           # system.admin；检查固定官方 Server Release
+PATCH  /api/v1/system/update/settings        # system.admin；CAS 更新 beta/stable 通道
+POST   /api/v1/system/update/install         # system.admin；校验、替换、重启、健康检查与回滚
 
 # ====== 配置同步 (Player ↔ Server) ======
 POST   /api/v1/sync/push                     # Player推送数据源配置

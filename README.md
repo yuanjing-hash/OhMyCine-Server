@@ -137,6 +137,7 @@ $env:OMC_SERVER_PORT = '3300'
 | `OMC_TMDB_API_KEY` | 未设置 | 运行时部署级 TMDB v3 API Key；与 `OMC_TMDB_READ_ACCESS_TOKEN` 互斥，优先级相同 |
 | `OMC_FFMPEG_PATH` | 自动发现隔离目录或 `PATH` | 可选 FFmpeg 可执行文件；只用于 Server 固定参数的 DASH 音视频合流 |
 | `OMC_CLOAKBROWSER_COMPANION_URL` | 未设置 | 可选的本机 CloakBrowser companion 根地址，例如 `http://127.0.0.1:9222`；仅允许 loopback。用户须从官方渠道显式安装并接受其许可，OhMyCine 不下载或分发浏览器二进制 |
+| `OMC_UPDATE_MODE` | 自动检测 | 设为 `managed` 时保留官方版本检查但禁用进程内安装；适用于 Docker、NAS 套件、只读目录或由外部工具管理的部署 |
 | `OMC_ENV` | `production` | `development` / `production` |
 | `OMC_PUBLIC_ORIGIN` | `http://127.0.0.1:3000`（默认端口） | Web UI、STRM 与 Emby 网关使用的精确对外来源；不得使用通配监听地址 |
 | `OMC_COOKIE_SECURE` | 随 public origin 推导 | HTTPS 生产环境应为 `true` |
@@ -158,6 +159,12 @@ TMDB 有效凭据优先级为：Web UI 加密自定义凭据 → 运行时部署
 `OMC_RUNTIME_DIR`、`OMC_BINARY_PATH`、`OMC_DATABASE_PATH` 和 `OMC_LOG_DIR` 的相对路径均以仓库根目录为基准，因此从任意当前目录调用脚本时行为一致。只有默认的 `.runtime/` 运行目录由仓库规则自动忽略；若覆盖到仓库内的其它路径，请自行确认不会误提交运行数据。
 
 运行日志默认同时写入 stdout 与 `runtime.jsonl`，单文件 20 MiB 后切割并 gzip 压缩；默认最多保留 10 个历史分片、30 天且总量不超过 500 MiB，任一条件先触发即清理最旧分片。管理员可以在日志中心调整安全范围内的策略，但物理目录始终由部署环境控制。运行日志与 SQLite 审计日志相互独立。
+
+## Server 更新
+
+官方 Release 构建会注入与 `server-vX.Y.Z` 标签一致的版本；普通本地构建显示 `dev`。具备 `system.admin` 的管理员可以在“系统设置 → Server 更新”选择 Beta（包含预发布）或 Stable（仅正式版），检查固定官方仓库并执行一次完整的“下载、SHA-256 校验、备份、替换、重启、健康检查、失败回滚”。Stable 没有正式 Release 时不会使用 Beta 代替。
+
+更新过程只替换当前 Server 可执行文件。下载、计划、状态和旧版本备份位于当前 `.runtime/**/updates/`；数据库、配置、凭据、插件、缓存和日志不会被覆盖。Docker、`OMC_UPDATE_MODE=managed`、只读/不可替换安装和不支持的平台会显示“由部署方式管理”，请继续通过镜像、NAS 套件或原安装工具升级。`dev` 构建可以检查新版本，但首个支持自更新的官方版本需要手工安装。
 
 ## 验证
 

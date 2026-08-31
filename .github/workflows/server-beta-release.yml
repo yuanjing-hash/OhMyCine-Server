@@ -153,13 +153,14 @@ jobs:
           fi
 
           tmdb_ldflags="-X=github.com/yuanjing-hash/OhMyCine-Server/pkg/metadata/tmdb.BuiltinReadAccessToken=${OHMYCINE_TMDB_READ_ACCESS_TOKEN}"
+          build_ldflags="-X=github.com/yuanjing-hash/OhMyCine-Server/internal/buildinfo.Version=${VERSION} -X=github.com/yuanjing-hash/OhMyCine-Server/internal/buildinfo.Commit=${GITHUB_SHA}"
           release_root="dist/server-beta/${TAG_NAME}"
           windows_dir="${release_root}/OhMyCine-Server-v${VERSION}-windows-x64"
           linux_dir="${release_root}/OhMyCine-Server-v${VERSION}-linux-x64"
           mkdir -p "$windows_dir" "$linux_dir"
 
-          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -tags webui -trimpath -ldflags "${tmdb_ldflags} -s -w" -o "${windows_dir}/ohmycine-server.exe" ./cmd/server
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -tags webui -trimpath -ldflags "${tmdb_ldflags} -s -w" -o "${linux_dir}/ohmycine-server" ./cmd/server
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -tags webui -trimpath -ldflags "${tmdb_ldflags} ${build_ldflags} -s -w" -o "${windows_dir}/ohmycine-server.exe" ./cmd/server
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -tags webui -trimpath -ldflags "${tmdb_ldflags} ${build_ldflags} -s -w" -o "${linux_dir}/ohmycine-server" ./cmd/server
           cp README.md "${windows_dir}/README.md"
           cp README.md "${linux_dir}/README.md"
           cp LICENSE "${windows_dir}/LICENSE"

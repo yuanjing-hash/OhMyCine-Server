@@ -217,3 +217,48 @@ const saved = await put<MediaLibraryDetail>(payloadFromDraft(draft))
 draft = draftFromLibrary(saved) // tokens cleared
 baseline = mediaLibraryDraftFingerprint(draft, storage)
 ```
+
+## Scenario: Server Safe-Update Administration
+
+### 1. Scope / Trigger
+
+- Trigger: changing the Settings update panel, `/api/v1/system/update*` DTOs, release-channel selection, install progress, or restart recovery.
+
+### 2. Signatures
+
+```ts
+type ServerUpdateChannel = 'beta' | 'stable'
+type ServerUpdatePhase = 'idle' | 'checking' | 'available' | 'downloading' | 'ready' | 'waiting_for_exit' | 'replacing' | 'restarting' | 'verifying' | 'succeeded' | 'failed' | 'rolled_back'
+
+GET   /api/v1/system/update
+POST  /api/v1/system/update/check
+PATCH /api/v1/system/update/settings { channel, revision }
+POST  /api/v1/system/update/install  { target_version }
+```
+
+### 3. Contracts
+
+- Render and request the update panel only with `system.admin`. UI permission filtering is not the API authorization boundary.
+- Display current/latest version, channel, last check and phase. Keep Stable empty when no stable Release exists; never substitute a Beta result.
+- Respect `install_enabled` and `deployment_managed`. Managed, development, unsupported and unreplaceable installs retain Check but disable Install with an explicit reason.
+- Guard every state request with a monotonic generation. A stale response or unmounted component cannot replace current status, error or busy state.
+- After Install is accepted, tolerate connection failures and poll boundedly. Recovery requires `current_version === requested target_version` and a non-active phase; do not accept the old process's pre-shutdown response. Stop immediately on `failed|rolled_back`, refresh auth bootstrap after recovery, and expose a manual recovery message after timeout.
+- Show only stable localized error labels. Do not display release URLs, response bodies, environment values, local paths or helper plans.
+
+### 4. Validation & Error Matrix
+
+| Condition | Required behavior |
+| --- | --- |
+| Missing `system.admin` | Omit panel and make zero update API requests |
+| Container/managed/read-only install | Show deployment guidance; Check stays usable and Install stays disabled |
+| Stable has no Release | Show no latest version and no install action; do not widen to Beta |
+| Old process responds before exit | Keep waiting because its version differs from the target |
+| Requests fail during restart | Treat as expected transient disconnect and continue bounded polling |
+| New process reports target version and terminal phase | Refresh auth/bootstrap and display success |
+| New/old process reports failed or rolled_back | Stop polling and display the safe error code label |
+| Polling expires | Restore controls and show refresh/deployment diagnostics, never claim success |
+
+### 5. Tests Required
+
+- Unit/component tests cover permission omission, exact request bodies, managed deployment, install enablement, request-generation staleness, old-response rejection, disconnect tolerance, successful recovery, rollback and responsive summary/control layout.
+- Run permissions check, WebUI tests, typecheck, lint and production build.

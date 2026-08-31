@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -21,6 +23,7 @@ import (
 	pluginrepository "github.com/yuanjing-hash/OhMyCine-Server/internal/plugins/repository"
 	pluginruntime "github.com/yuanjing-hash/OhMyCine-Server/internal/plugins/runtime"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/services"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/updater"
 	cloudpkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud/pan115"
 	downloadpkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/downloader"
@@ -32,6 +35,12 @@ import (
 )
 
 func main() {
+	if handled, exitCode := runUpdateHelper(os.Args); handled {
+		if exitCode != 0 {
+			os.Exit(exitCode)
+		}
+		return
+	}
 	cfg, err := config.Load()
 	if err != nil {
 		panic(err)
@@ -180,7 +189,22 @@ func main() {
 	transfers.SetSeedingService(seeding)
 	seeding.SetStagingCleanup(transfers.CleanupAfterSeeding)
 	downloads.SetTransferService(transfers)
+	updateStop := make(chan struct{}, 1)
+	runtimeDirectory, err := resolveUpdateRuntimeDirectory(cfg)
+	if err != nil {
+		logging.OperationServerUpdate.Event(log.Fatal()).Str("error_code", updater.CodePersistence).Msg(logging.OperationServerUpdate.Message("更新运行目录初始化失败"))
+	}
+	updateService, err := services.NewUpdateService(runtimeDirectory, fmt.Sprintf("http://127.0.0.1:%d/api/v1/health", cfg.Port), audit, logManager.Logger("server", "update"), func() {
+		select {
+		case updateStop <- struct{}{}:
+		default:
+		}
+	})
+	if err != nil {
+		logging.OperationServerUpdate.Event(log.Fatal()).Str("error_code", services.ErrorCode(err)).Msg(logging.OperationServerUpdate.Message("更新服务初始化失败"))
+	}
 	api := handlers.NewAPI(cfg, auth, admin, audit, storages, directories, profiles, log)
+	api.SetUpdateService(updateService)
 	api.SetConnectionService(connections)
 	api.SetCredentialRevealService(credentialReveal)
 	api.SetSignedProxyService(signedProxy)
@@ -287,9 +311,48 @@ func main() {
 	}()
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
-	<-stop
+	select {
+	case <-stop:
+	case <-updateStop:
+		logging.OperationServerUpdate.Event(log.Info()).Msg(logging.OperationServerUpdate.Message("更新包已就绪，开始优雅停机"))
+	}
+	signal.Stop(stop)
 	shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	_ = server.Shutdown(shutdown)
 	logging.OperationServerLifecycle.Event(log.Info()).Msg(logging.OperationServerLifecycle.Message("OhMyCine Server 已停止"))
+}
+
+func runUpdateHelper(arguments []string) (bool, int) {
+	if len(arguments) < 2 || arguments[1] != updater.HelperFlag {
+		return false, 0
+	}
+	if len(arguments) != 3 || strings.TrimSpace(arguments[2]) == "" {
+		_, _ = fmt.Fprintln(os.Stderr, updater.CodePlanInvalid)
+		return true, 2
+	}
+	if err := updater.RunHelper(context.Background(), arguments[2], updater.HelperOptions{}); err != nil {
+		_, _ = fmt.Fprintln(os.Stderr, updater.ErrorCode(err))
+		return true, 1
+	}
+	return true, 0
+}
+
+func resolveUpdateRuntimeDirectory(cfg config.Config) (string, error) {
+	if configured := strings.TrimSpace(os.Getenv("OMC_RUNTIME_DIR")); configured != "" {
+		resolved, err := filepath.Abs(configured)
+		if err != nil {
+			return "", err
+		}
+		return filepath.Clean(resolved), nil
+	}
+	databasePath, err := filepath.Abs(cfg.DatabasePath)
+	if err != nil {
+		return "", err
+	}
+	directory := filepath.Dir(filepath.Clean(databasePath))
+	if strings.EqualFold(filepath.Base(directory), "data") {
+		directory = filepath.Dir(directory)
+	}
+	return directory, nil
 }

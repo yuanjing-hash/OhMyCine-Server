@@ -9,7 +9,8 @@
 - [x] `omc` CLI 归属 Server 仓库。
 - [x] Server CI 独立执行 Go、WebUI、权限漂移和 Release Guard 门禁。
 - [x] Server Beta 使用 `server-vX.Y.Z` 命名空间并只从最新远端 `develop` 发布。
-- [ ] 提供受签名清单约束的 Server 自动更新与安全回滚。
+- [x] 提供固定官方 Release、SHA-256 校验、原子替换、健康检查与失败回滚的 Server 管理员自更新。
+- [~] 使用下一组真实官方 Beta 资产完成 Windows/Linux 跨版本升级与回滚演练。
 - [ ] 增加 Stable 发布、容器镜像和 NAS 部署验证。
 
 ## 媒体流水线

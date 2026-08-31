@@ -310,3 +310,37 @@ export interface SeedingTaskSummary {
   ratio: number | null; seeded_seconds: number | null; uploaded_bytes: number | null; last_sampled_at: string | null
   last_error_code: string; created_at: string; updated_at: string; finished_at: string | null
 }
+
+export type ServerUpdateChannel = 'beta' | 'stable'
+export type ServerUpdatePhase =
+  | 'idle'
+  | 'checking'
+  | 'available'
+  | 'downloading'
+  | 'ready'
+  | 'waiting_for_exit'
+  | 'replacing'
+  | 'restarting'
+  | 'verifying'
+  | 'succeeded'
+  | 'failed'
+  | 'rolled_back'
+
+/** Public-safe projection returned by the Server update API. */
+export interface ServerUpdateStatus {
+  current_version: string
+  current_commit: string
+  official_build: boolean
+  comparable: boolean
+  channel: ServerUpdateChannel
+  revision: number
+  latest_version?: string
+  update_available: boolean
+  install_enabled: boolean
+  deployment_managed: boolean
+  managed_reason?: string
+  phase: ServerUpdatePhase
+  target_version?: string
+  error_code?: string
+  last_checked_at?: string
+}

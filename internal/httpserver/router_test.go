@@ -51,6 +51,30 @@ type testEnvelope struct {
 	Data    json.RawMessage `json:"data"`
 }
 
+func TestServerUpdateRoutesSetNoStoreBeforeAuthentication(t *testing.T) {
+	client := newTestClient(t)
+	for _, item := range []struct {
+		method string
+		path   string
+	}{
+		{http.MethodGet, "/api/v1/system/update"},
+		{http.MethodPost, "/api/v1/system/update/check"},
+		{http.MethodPatch, "/api/v1/system/update/settings"},
+		{http.MethodPost, "/api/v1/system/update/install"},
+	} {
+		request := httptest.NewRequest(item.method, item.path, nil)
+		if item.method != http.MethodGet {
+			request.Header.Set("Origin", "http://localhost:3000")
+			request.Header.Set("Content-Type", "application/json")
+		}
+		response := httptest.NewRecorder()
+		client.router.ServeHTTP(response, request)
+		if response.Code != http.StatusUnauthorized || response.Header().Get("Cache-Control") != "no-store" {
+			t.Fatalf("%s %s status=%d cache=%q", item.method, item.path, response.Code, response.Header().Get("Cache-Control"))
+		}
+	}
+}
+
 func TestBuiltInLibraryArtworkIsPublicInertRaster(t *testing.T) {
 	client := newTestClient(t)
 	request := httptest.NewRequest(http.MethodGet, "/api/v1/assets/library-covers/library-local.png", nil)

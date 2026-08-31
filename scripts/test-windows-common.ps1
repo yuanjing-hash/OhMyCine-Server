@@ -90,14 +90,20 @@ $apiKeyLinkerTarget = 'github.com/yuanjing-hash/OhMyCine-Server/pkg/metadata/tmd
 $windowsStart = Get-Content -LiteralPath (Join-Path $script:ServerDirectory 'start.ps1') -Raw
 $linuxStart = Get-Content -LiteralPath (Join-Path $script:ServerDirectory 'start.sh') -Raw
 $windowsTest = Get-Content -LiteralPath (Join-Path $script:ServerDirectory 'test.ps1') -Raw
-$manualBuild = Get-Content -LiteralPath (Join-Path (Split-Path $script:ServerDirectory -Parent) '.github\workflows\manual-build.yml') -Raw
-foreach ($contract in @($windowsStart, $linuxStart, $manualBuild)) {
+$serverRelease = Get-Content -LiteralPath (Join-Path $script:ServerDirectory '.github\workflows\server-beta-release.yml') -Raw
+foreach ($contract in @($windowsStart, $linuxStart)) {
     if (-not $contract.Contains('OHMYCINE_TMDB_READ_ACCESS_TOKEN') -or -not $contract.Contains($linkerTarget) -or -not $contract.Contains('OHMYCINE_TMDB_API_KEY') -or -not $contract.Contains($apiKeyLinkerTarget)) {
         throw 'TMDB dual application credential linker injection contract is missing.'
     }
     if (-not $contract.Contains('A-Za-z0-9._~-') -or -not $contract.Contains('4096')) {
         throw 'TMDB linker credential length/character validation contract is missing.'
     }
+}
+if (-not $serverRelease.Contains('OHMYCINE_TMDB_READ_ACCESS_TOKEN') -or -not $serverRelease.Contains($linkerTarget)) {
+    throw 'Official Server artifact TMDB read-access-token linker injection contract is missing.'
+}
+if (-not $serverRelease.Contains('A-Za-z0-9._~-') -or -not $serverRelease.Contains('4096')) {
+    throw 'Official Server artifact TMDB linker credential validation contract is missing.'
 }
 if (-not $windowsStart.Contains("SetEnvironmentVariable('OHMYCINE_TMDB_READ_ACCESS_TOKEN', `$null, 'Process')") -or -not $windowsStart.Contains("SetEnvironmentVariable('OHMYCINE_TMDB_API_KEY', `$null, 'Process')") -or -not $linuxStart.Contains('unset OHMYCINE_TMDB_READ_ACCESS_TOKEN OHMYCINE_TMDB_API_KEY')) {
     throw 'Build-only TMDB credentials are not removed before Server runtime.'
@@ -110,12 +116,12 @@ foreach ($name in @('OHMYCINE_TMDB_READ_ACCESS_TOKEN', 'OHMYCINE_TMDB_API_KEY', 
 if ($windowsStart.IndexOf("SetEnvironmentVariable('OHMYCINE_TMDB_READ_ACCESS_TOKEN', `$null, 'Process')") -gt $windowsStart.IndexOf('Install-WebUiDependencies') -or $windowsStart.IndexOf("SetEnvironmentVariable('OHMYCINE_TMDB_API_KEY', `$null, 'Process')") -gt $windowsStart.IndexOf('Install-WebUiDependencies') -or $linuxStart.IndexOf('unset OHMYCINE_TMDB_READ_ACCESS_TOKEN OHMYCINE_TMDB_API_KEY') -gt $linuxStart.IndexOf('NPM_BIN=')) {
     throw 'Build-only TMDB credential remains exported while Web UI dependencies or assets are built.'
 }
-foreach ($contract in @($windowsStart, $linuxStart, $manualBuild)) {
+foreach ($contract in @($windowsStart, $linuxStart, $serverRelease)) {
     if ($contract -match 'Builtin(ReadAccessToken|APIKey)[^\r\n]*OMC_TMDB_(READ_ACCESS_TOKEN|API_KEY)') {
         throw 'Runtime deployment TMDB credential was wired into linker injection.'
     }
 }
-if (-not $manualBuild.Contains('TMDB credential GitHub Secret is required for the official Server artifact')) {
+if (-not $serverRelease.Contains('OHMYCINE_TMDB_READ_ACCESS_TOKEN is required for official Server artifacts')) {
     throw 'Official Server artifact does not fail closed when the TMDB Secret is absent.'
 }
 

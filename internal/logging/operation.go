@@ -66,6 +66,7 @@ var (
 	OperationDiscoverySearch            = Operation{"discovery_search", "资源搜索"}
 	OperationPTSiteManagement           = Operation{"pt_site_management", "PT站点管理"}
 	OperationCookieCloud                = Operation{"cookiecloud_sync", "CookieCloud同步"}
+	OperationServerUpdate               = Operation{"server_update", "服务更新"}
 )
 
 func (o Operation) Event(event *zerolog.Event) *zerolog.Event {
@@ -134,6 +135,8 @@ func OperationForHTTPRoute(route string) Operation {
 		return OperationCookieCloud
 	case strings.HasPrefix(route, "/settings"):
 		return OperationSystemSettings
+	case strings.HasPrefix(route, "/system/update"):
+		return OperationServerUpdate
 	case strings.HasPrefix(route, "/runtime-logs"):
 		return OperationRuntimeLogging
 	case strings.HasPrefix(route, "/plugin-repositories"), route == "/plugins/marketplace":

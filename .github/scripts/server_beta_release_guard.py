@@ -46,6 +46,8 @@ def verify_workflow(path: Path = DEFAULT_WORKFLOW) -> list[str]:
         )
         == 1,
         "embedded webui is mandatory": text.count("go build -tags webui") == 2,
+        "strict build version is injected": "internal/buildinfo.Version=${VERSION}" in text,
+        "build commit is injected": "internal/buildinfo.Commit=${GITHUB_SHA}" in text,
         "windows archive is built": "windows-x64.zip" in text,
         "linux archive is built": "linux-x64.tar.gz" in text,
         "checksum manifest is built": "SHA256SUMS.txt" in text and "sha256sum" in text,
@@ -79,6 +81,7 @@ def verify_workflow(path: Path = DEFAULT_WORKFLOW) -> list[str]:
         "Player release dependency": "Existing Player beta release",
         "Player tag namespace": "refs/tags/v${",
         "legacy API-key build secret": "OHMYCINE_TMDB_API_KEY",
+        "development build identity in release": "internal/buildinfo.Version=dev",
         "Player asset path": "player/",
     }
 

@@ -765,3 +765,33 @@ validatePublicRenderedTarget(request)
 page := fetcher.Fetch(ctx, request)
 validateRenderedFinalURL(page.FinalURL, request.AllowedHosts)
 ```
+
+## Scenario: Server Self-Update Trust Boundary
+
+### 1. Scope / Trigger
+
+- Trigger: changing build version injection, official Release selection, update networking/archive handling, helper replacement/rollback, update APIs, or deployment-managed detection.
+
+### 2. Signatures
+
+```text
+repository = yuanjing-hash/OhMyCine-Server
+tag = server-vX.Y.Z
+runtime update root = <runtime>/updates
+GET|POST|PATCH /api/v1/system/update* requires system.admin
+```
+
+### 3. Contracts
+
+- Accept only strict official tags, exact platform asset names and the target asset's single SHA-256 entry. Beta may select prerelease or stable; Stable selects stable only. Ignore drafts and reject malformed/duplicate assets.
+- Validate HTTPS and the exact GitHub/Release Asset host allowlist on the initial URL and every bounded redirect. Bound time, redirect count, JSON/checksum body and archive bytes; never expose upstream bodies or URLs.
+- Verify SHA-256 before extraction. ZIP/tar.gz extraction rejects absolute/drive/UNC paths, traversal, links, devices, duplicates, wrong executable names and decompression/file-size limits; extract only the one Server candidate.
+- Keep settings, public state, private plan, staging and bounded backups under `<runtime>/updates`. The replacement target is exactly the current executable; database, config, credentials, plugins, cache, logs, media and every other runtime item are immutable sentinels for updater tests.
+- A staged candidate helper waits for the exact old PID, backs up/replaces/starts/probes health, and restores/restarts the old executable on failure. Never publish succeeded before health passes; preserve stable failed/rolled_back facts.
+- Route middleware and service policy both require `system.admin`; mutations require CSRF, channel settings use revision CAS, and checking/installing are singleflight. Audit only actor, channel/version, phase/result and stable error code.
+- Containers, explicit `OMC_UPDATE_MODE=managed`, unsupported platforms and unreplaceable executables report deployment-managed. Never invoke Docker, systemd, package managers or Git.
+
+### 4. Tests Required
+
+- Cover strict version/channel selection, fixed hosts/redirects/limits, checksum mismatch, archive adversarial cases, helper success and each rollback boundary, runtime sentinel preservation, permission/CSRF/no-store/singleflight/CAS, DTO redaction and managed deployment.
+- Release guards must prove linker version identity and exact immutable assets for Windows/Linux official binaries.

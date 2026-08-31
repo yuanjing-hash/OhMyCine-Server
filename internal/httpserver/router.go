@@ -3,6 +3,7 @@ package httpserver
 import (
 	"net/http"
 	"os"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/rs/zerolog"
@@ -21,6 +22,12 @@ func New(cfg config.Config, api *handlers.API, auth *services.AuthService, log z
 	router := gin.New()
 	_ = router.SetTrustedProxies(nil)
 	router.Use(gin.Recovery(), middleware.RequestID(), middleware.SecurityHeaders(), middleware.Logger(log))
+	router.Use(func(c *gin.Context) {
+		if c.Request.URL.Path == "/api/v1/system/update" || strings.HasPrefix(c.Request.URL.Path, "/api/v1/system/update/") {
+			c.Header("Cache-Control", "no-store")
+		}
+		c.Next()
+	})
 	router.Any("/proxy/strm/:opaque", api.SignedSTRMProxy)
 	router.Any("/emby/:gateway", api.EmbyGateway)
 	router.Any("/emby/:gateway/*path", api.EmbyGateway)
@@ -278,6 +285,13 @@ func New(cfg config.Config, api *handlers.API, auth *services.AuthService, log z
 	aiSettingsAPI.PATCH("", middleware.RequirePermission(authz.PermissionSettingsUpdate), api.UpdateAIRecognitionSettings)
 	aiSettingsAPI.POST("/test", middleware.RequirePermission(authz.PermissionSettingsUpdate), api.TestAIRecognitionSettings)
 	aiSettingsAPI.POST("/models", middleware.RequirePermission(authz.PermissionSettingsUpdate), api.AIRecognitionModels)
+
+	updateAPI := v1.Group("/system/update")
+	updateAPI.Use(middleware.NoStore(), middleware.Auth(auth, api.CookieName()), middleware.CSRF(auth))
+	updateAPI.GET("", middleware.RequirePermission(authz.PermissionSystemAdmin), api.UpdateStatus)
+	updateAPI.POST("/check", middleware.RequirePermission(authz.PermissionSystemAdmin), api.CheckUpdate)
+	updateAPI.PATCH("/settings", middleware.RequirePermission(authz.PermissionSystemAdmin), api.UpdateUpdateSettings)
+	updateAPI.POST("/install", middleware.RequirePermission(authz.PermissionSystemAdmin), api.InstallUpdate)
 
 	runtimeLogs := v1.Group("/runtime-logs")
 	runtimeLogs.Use(middleware.NoStore(), middleware.Auth(auth, api.CookieName()), middleware.CSRF(auth))
