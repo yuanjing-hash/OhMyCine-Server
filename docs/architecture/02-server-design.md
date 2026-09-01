@@ -1732,6 +1732,16 @@ Server NFO/JPG + library reconciliation
 
 Bilibili 的站点 API、登录态、分页、签名、播放与下载解析全部位于插件包。Server 核心只处理标准 operation、权限、DTO、任务和安全网关，删除或停用 Bilibili 插件不能影响本地、115、Emby/Jellyfin、PT 等核心功能。
 
+## 18.1 媒体库结构诊断、修复与元数据编辑
+
+MediaLibrary 的扫描器仍以只读索引为默认边界；目录写入必须经过独立的结构修复服务。首次完整扫描结束后，Server 使用与 Transfer 相同的 Profile、固定 `电影` / `电视剧` 根和命名模板生成诊断计划，只记录 `healthy/issues/failed` 状态并提示管理员，不自动移动已有内容。管理员可显式提交全库修复或由作品 opaque token 提交单作品修复；如果旧作品未主动修复，新内容入库前必须先同步修复同 TMDB 作品，失败时阻止形成第二套目录。
+
+结构修复由 provider-neutral `StructurePlanner` 与严格 `MediaLibraryStructureBackend` registry 组成。本地和 115 backend 只负责在各自存储语义中执行同一不可变计划：视频、字幕、NFO 和图片作为关联资产一起移动；目标冲突一律停止；旧目录只有在仍位于媒体库根内且已经为空时才能删除。完成后只唤醒现有 LibrarySupervisor 重新扫描，不创建第二套 watcher。计划、provider identity、原始 work key 与 checkpoint 是服务内部状态，不进入浏览器 DTO。
+
+媒体清单的完整元数据编辑以一个作品的全部 recognition 为事务边界。可编辑字段包含标题、日期、简介、标语、状态、评分、时长、季集统计、类型/国家/语言/工作室、导演/编剧/演员和受验证的 TMDB 图片；TMDB ID、媒体类型及外部身份不接受浏览器修改。保存时先乐观校验全部 recognition revision，再在同一事务中更新 recognition 与 entry，只推进一次 artifact generation 和 media change；任一季或记录发生并发变化时整次回滚。手动识别、重新刮削和清除人工匹配继续复用既有识别器边界。
+
+下载新建页支持一行一个 URL、磁力或 115 分享的批量请求，最多 50 条，去空行并保序去重。batch handler 对每条输入复用单条 `Submit` 的权限、路由预览、下载器兼容、凭据加密、审计与队列逻辑，并按原输入索引返回逐条成功/失败；响应不回显原始链接。页面轮询只更新任务事实，只有下载器或来源类型实际变化时才重取路线，不能覆盖用户正在编辑的下载器、目标库、来源或文本。
+
 ## 19. 配置文件格式
 
 ```yaml

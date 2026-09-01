@@ -3,9 +3,11 @@ package handlers
 import (
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/middleware"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/services"
 )
 
@@ -43,6 +45,35 @@ type mediaLibraryPayload struct {
 	IngestDownloaderID       string   `json:"ingest_downloader_id"`
 	IngestRelativeRoot       string   `json:"ingest_relative_root"`
 	IngestRelativeRootToken  string   `json:"ingest_relative_root_token"`
+}
+
+// mediaLibraryStructureRepairResponse is the browser-safe projection of a
+// repair run. Work keys, provider identities and persisted plans stay inside
+// the service boundary.
+type mediaLibraryStructureRepairResponse struct {
+	ID             string     `json:"id"`
+	JobID          *string    `json:"job_id,omitempty"`
+	LibraryID      uint       `json:"library_id"`
+	Scope          string     `json:"scope"`
+	Generation     uint64     `json:"generation"`
+	Phase          string     `json:"phase"`
+	IssueCount     int        `json:"issue_count"`
+	TotalItems     int        `json:"total_items"`
+	ProcessedItems int        `json:"processed_items"`
+	LastErrorCode  string     `json:"last_error_code"`
+	CreatedAt      time.Time  `json:"created_at"`
+	UpdatedAt      time.Time  `json:"updated_at"`
+	FinishedAt     *time.Time `json:"finished_at,omitempty"`
+}
+
+func mediaLibraryStructureRepairDTO(item models.MediaLibraryStructureRepair) mediaLibraryStructureRepairResponse {
+	return mediaLibraryStructureRepairResponse{
+		ID: item.ID, JobID: item.JobID, LibraryID: item.LibraryID, Scope: item.Scope,
+		Generation: item.Generation, Phase: item.Phase, IssueCount: item.IssueCount,
+		TotalItems: item.TotalItems, ProcessedItems: item.ProcessedItems,
+		LastErrorCode: item.LastErrorCode, CreatedAt: item.CreatedAt,
+		UpdatedAt: item.UpdatedAt, FinishedAt: item.FinishedAt,
+	}
 }
 
 func (a *API) ReorderMediaLibraries(c *gin.Context) {
@@ -354,6 +385,39 @@ func (a *API) MediaLibraryCatalogDetail(c *gin.Context) {
 	}
 	success(c, http.StatusOK, detail)
 }
+
+func (a *API) MediaLibraryCatalogMetadata(c *gin.Context) {
+	actor, _ := middleware.ActorFrom(c)
+	id, ok := pathID(c)
+	if !ok {
+		return
+	}
+	document, err := a.libraries.CatalogMetadata(c.Request.Context(), actor, id, c.Param("work"))
+	if err != nil {
+		writeError(c, a.log, err)
+		return
+	}
+	success(c, http.StatusOK, document)
+}
+
+func (a *API) UpdateMediaLibraryCatalogMetadata(c *gin.Context) {
+	actor, _ := middleware.ActorFrom(c)
+	id, ok := pathID(c)
+	if !ok {
+		return
+	}
+	var payload services.MediaMetadataUpdateInput
+	if err := strictJSON(c, &payload); err != nil {
+		writeError(c, a.log, invalid("媒体库元数据无效", err))
+		return
+	}
+	document, err := a.libraries.UpdateCatalogMetadata(c.Request.Context(), actor, id, c.Param("work"), payload, middleware.RequestContextFrom(c))
+	if err != nil {
+		writeError(c, a.log, err)
+		return
+	}
+	success(c, http.StatusOK, document)
+}
 func (a *API) MediaLibraryCatalogCandidates(c *gin.Context) {
 	actor, _ := middleware.ActorFrom(c)
 	id, ok := pathID(c)
@@ -469,6 +533,66 @@ func (a *API) MediaLibraryRuns(c *gin.Context) {
 		return
 	}
 	success(c, http.StatusOK, gin.H{"list": items, "total": len(items)})
+}
+
+func (a *API) MediaLibraryStructure(c *gin.Context) {
+	actor, _ := middleware.ActorFrom(c)
+	id, ok := pathID(c)
+	if !ok {
+		return
+	}
+	result, err := a.libraryStructure.Diagnostics(c.Request.Context(), actor, id)
+	if err != nil {
+		writeError(c, a.log, err)
+		return
+	}
+	success(c, http.StatusOK, result)
+}
+
+func (a *API) RepairMediaLibraryStructure(c *gin.Context) {
+	actor, _ := middleware.ActorFrom(c)
+	id, ok := pathID(c)
+	if !ok {
+		return
+	}
+	var payload struct {
+		WorkID string `json:"work_id"`
+	}
+	if err := strictJSON(c, &payload); err != nil {
+		writeError(c, a.log, invalid("媒体库修复参数无效", err))
+		return
+	}
+	var repair models.MediaLibraryStructureRepair
+	var err error
+	if payload.WorkID == "" {
+		repair, err = a.libraryStructure.EnqueueRepair(c.Request.Context(), actor, id, "", middleware.RequestContextFrom(c))
+	} else {
+		repair, err = a.libraryStructure.EnqueueWorkRepair(c.Request.Context(), actor, id, payload.WorkID, middleware.RequestContextFrom(c))
+	}
+	if err != nil {
+		writeError(c, a.log, err)
+		return
+	}
+	success(c, http.StatusAccepted, mediaLibraryStructureRepairDTO(repair))
+}
+
+func (a *API) MediaLibraryStructureRepairs(c *gin.Context) {
+	actor, _ := middleware.ActorFrom(c)
+	id, ok := pathID(c)
+	if !ok {
+		return
+	}
+	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "20"))
+	items, err := a.libraryStructure.Repairs(actor, id, limit)
+	if err != nil {
+		writeError(c, a.log, err)
+		return
+	}
+	list := make([]mediaLibraryStructureRepairResponse, 0, len(items))
+	for _, item := range items {
+		list = append(list, mediaLibraryStructureRepairDTO(item))
+	}
+	success(c, http.StatusOK, gin.H{"list": list, "total": len(list)})
 }
 
 func mediaPageQuery(c *gin.Context, legacyLimit bool) (services.MediaPageQuery, error) {

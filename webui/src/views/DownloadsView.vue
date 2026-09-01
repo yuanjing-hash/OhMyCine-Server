@@ -8,7 +8,7 @@ import DownloadRouteTargetPicker from '@/components/DownloadRouteTargetPicker.vu
 import MediaReorganizationDialog from '@/components/MediaReorganizationDialog.vue'
 import SecretInput from '@/components/SecretInput.vue'
 import { credentialLoader } from '@/credentials'
-import { beginDownloadRetry, canCancelDownloadPipeline, downloadErrorMessage, downloadProviderStatusLabel, downloadStatusClass, downloadStatusLabel, formatBytes, formatETA, formatProgress, formatSampleTime, isDownloadHistoryTask, reconcileDownloadRetries, summarizeDownloaderTasks, torrentToBase64, type DownloadManagementSection, type DownloadRetryPresentations, type DownloadSourceMode } from '@/downloads'
+import { beginDownloadRetry, canCancelDownloadPipeline, downloadErrorMessage, downloadProviderStatusLabel, downloadStatusClass, downloadStatusLabel, formatBytes, formatETA, formatProgress, formatSampleTime, isDownloadHistoryTask, parseDownloadSourceLines, reconcileDownloadRetries, summarizeDownloaderTasks, torrentToBase64, type DownloadManagementSection, type DownloadRetryPresentations, type DownloadSourceMode } from '@/downloads'
 import { previewDownloadRoutes, routeTargetByID, type DownloadRoutePreview } from '@/download-routes'
 import { useAuthStore } from '@/stores/auth'
 import { notify } from '@/toast'
@@ -37,6 +37,7 @@ const sourceMode = ref<DownloadSourceMode>('url')
 const submitForm = ref({ downloaderID: '', mediaLibraryID: 0, displayName: '', priority: 0, sourceURL: '', torrent: null as File | null })
 const routePreview = ref<DownloadRoutePreview | null>(null)
 const routePreviewLoading = ref(false)
+const routePreviewKey = ref('')
 let routePreviewRequest: AbortController | null = null
 const activeSection = ref<DownloadManagementSection>(readSection())
 const activeTotal = ref(0)
@@ -134,12 +135,21 @@ async function load(showLoading = true, quiet = false) {
   } catch (reason) { if (!quiet) notify(message(reason), 'error') } finally { if (showLoading) loading.value = false }
 }
 
-async function loadRoutePreview() {
+async function loadRoutePreview(force = false) {
+  const key = `${submitForm.value.downloaderID}\u0000${sourceMode.value === 'share' ? '115_share' : sourceMode.value}`
+  if (!force && routePreview.value && routePreviewKey.value === key) {
+    if (submitForm.value.mediaLibraryID !== 0 && !routeTargetByID(routePreview.value, submitForm.value.mediaLibraryID)?.enabled) submitForm.value.mediaLibraryID = 0
+    return
+  }
   routePreviewRequest?.abort()
   routePreviewRequest = null
-  routePreview.value = null
-  submitForm.value.mediaLibraryID = 0
-  if (!submitForm.value.downloaderID) return
+  const selectedLibraryID = submitForm.value.mediaLibraryID
+  if (!submitForm.value.downloaderID) {
+    routePreview.value = null
+    routePreviewKey.value = ''
+    submitForm.value.mediaLibraryID = 0
+    return
+  }
   const controller = new AbortController()
   routePreviewRequest = controller
   routePreviewLoading.value = true
@@ -148,7 +158,11 @@ async function loadRoutePreview() {
       downloader_id: submitForm.value.downloaderID,
       source_kind: sourceMode.value === 'share' ? '115_share' : sourceMode.value,
     }, controller.signal)
-    if (!controller.signal.aborted) routePreview.value = preview
+    if (!controller.signal.aborted) {
+      routePreview.value = preview
+      routePreviewKey.value = key
+      submitForm.value.mediaLibraryID = routeTargetByID(preview, selectedLibraryID)?.enabled ? selectedLibraryID : 0
+    }
   } catch (reason) {
     if (!controller.signal.aborted) notify(message(reason), 'error')
   } finally {
@@ -242,24 +256,33 @@ function selectTorrent(event: Event) { submitForm.value.torrent = (event.target 
 
 async function submitDownload() {
   if (!submitForm.value.downloaderID) { notify('请先添加并启用一个下载器', 'warning'); return }
-  const nativeOffline = selectedDownloader.value?.type === 'pan115_offline'
   if (!selectedRoute.value?.enabled || !selectedTarget.value) { notify('请选择一条 Server 已确认可执行的入库路线', 'warning'); return }
   saving.value = true
   try {
+    let submitted = 0
     const payload: Record<string, unknown> = { downloader_id: submitForm.value.downloaderID, display_name: submitForm.value.displayName, priority: submitForm.value.priority }
     payload.media_library_id = submitForm.value.mediaLibraryID
     if (sourceMode.value === 'url' || sourceMode.value === 'share') {
-      if (!submitForm.value.sourceURL.trim()) throw new Error('请粘贴磁力链接或 HTTP(S) URL')
-      Object.assign(payload, { source_kind: sourceMode.value === 'share' ? '115_share' : 'url', source_url: submitForm.value.sourceURL.trim() })
+      const parsed = parseDownloadSourceLines(submitForm.value.sourceURL)
+      if (!parsed.sources.length) throw new Error('请粘贴磁力链接或 HTTP(S) URL')
+      const response = await api<{ submitted: number; failed: number; results: Array<{ index: number; task?: DownloadTaskSummary; error_code?: string; message?: string }> }>('/api/v1/downloads/batch', { method: 'POST', body: JSON.stringify({ ...payload, source_kind: sourceMode.value === 'share' ? '115_share' : 'url', sources: parsed.sources }) })
+      const failedIndexes = new Set(response.results.filter(item => !item.task).map(item => item.index))
+      submitForm.value.sourceURL = parsed.sources.filter((_, index) => failedIndexes.has(index)).join('\n')
+      submitted = response.submitted
+      const duplicateMessage = parsed.duplicateCount ? `，已忽略 ${parsed.duplicateCount} 个重复链接` : ''
+      if (response.failed > 0) notify(`已入队 ${response.submitted} 个，失败 ${response.failed} 个${duplicateMessage}；失败链接已保留`, response.submitted > 0 ? 'warning' : 'error')
+      else notify(`已入队 ${response.submitted} 个下载任务${duplicateMessage}`, 'success')
     } else {
       const file = submitForm.value.torrent
       if (!file || !file.name.toLowerCase().endsWith('.torrent') || file.size < 1 || file.size > 4 * 1024 * 1024) throw new Error('请选择 4 MiB 以内的 .torrent 文件')
       Object.assign(payload, { source_kind: 'torrent', torrent_filename: file.name, torrent_base64: torrentToBase64(new Uint8Array(await file.arrayBuffer())) })
+      await api<DownloadTaskSummary>('/api/v1/downloads', { method: 'POST', body: JSON.stringify(payload) })
+      submitted = 1
+      notify('种子下载任务已进入统一暂存队列', 'success')
     }
-    await api<DownloadTaskSummary>('/api/v1/downloads', { method: 'POST', body: JSON.stringify(payload) })
-    submitForm.value.displayName = ''; submitForm.value.sourceURL = ''; submitForm.value.torrent = null
+    if (submitted === 0) return
+    submitForm.value.displayName = ''; submitForm.value.torrent = null
     if (fileInput.value) fileInput.value.value = ''
-    notify(sourceMode.value === 'share' ? '115 分享转存已入队，内容会进入下载器任务目录并自动识别整理' : nativeOffline ? '任务已进入 115 原生离线下载队列，完成后会自动云端整理入库' : '下载任务已进入统一暂存队列', 'success')
     await selectSection('active')
   } catch (reason) { notify(message(reason), 'error') } finally { saving.value = false; await load(false, true) }
 }
@@ -488,7 +511,7 @@ onBeforeUnmount(() => { if (refreshTimer !== undefined) window.clearInterval(ref
 
     <form v-if="activeSection === 'create' && auth.can(Permissions.DownloadsCreate)" id="download-panel-create" class="panel mt-6" role="tabpanel" aria-labelledby="download-tab-create" @submit.prevent="submitDownload">
       <div class="flex flex-wrap items-start justify-between gap-3"><div><h2 class="m-0 text-lg">新建下载任务</h2><p class="text-subtle mb-0 mt-1 text-xs">选择 115 下载器后，可在同一表单内选择离线下载或分享转存；两者共用下载器目录并使用独立 omc-* 任务子目录。</p></div><div class="flex flex-wrap gap-2" role="radiogroup" aria-label="下载来源"><label class="btn-secondary" :class="{ 'semantic-list-item--selected': sourceMode === 'url' }"><input v-model="sourceMode" class="sr-only" type="radio" value="url" />{{ selectedDownloader?.type === 'pan115_offline' ? '离线下载' : '磁力 / URL' }}</label><label v-if="selectedDownloader?.type !== 'pan115_offline'" class="btn-secondary" :class="{ 'semantic-list-item--selected': sourceMode === 'torrent' }"><input v-model="sourceMode" class="sr-only" type="radio" value="torrent" />上传种子</label><label v-if="selectedDownloader?.type === 'pan115_offline' && selectedDownloader.capabilities.share_receive" class="btn-secondary" :class="{ 'semantic-list-item--selected': sourceMode === 'share' }"><input v-model="sourceMode" class="sr-only" type="radio" value="share" />分享转存</label></div></div>
-      <div class="mt-5 grid gap-4 md:grid-cols-2"><div><label class="label">下载器</label><select v-model="submitForm.downloaderID" class="input" required><option value="" disabled>请选择</option><option v-for="item in enabledDownloaders" :key="item.id" :value="item.id">{{ item.name }} · {{ item.type === 'pan115_offline' ? '115 离线' : item.type }}</option></select></div><DownloadRouteTargetPicker v-model="submitForm.mediaLibraryID" :preview="routePreview" :loading="routePreviewLoading" /><div v-if="selectedDownloader?.type === 'pan115_offline'" class="semantic-inset p-3 text-sm md:col-span-2"><span class="text-subtle block text-xs">115 下载目录</span><strong>{{ selectedDownloader.storage_name }} · {{ selectedDownloader.provider_directory_path || '/' }}</strong><span class="text-subtle mt-1 block text-xs">{{ sourceMode === 'share' ? '分享内容会转存到独立 omc-* 任务子目录，完成后自动识别整理。' : '离线任务会写入独立 omc-* 任务子目录，完成后按媒体库规则自动整理。' }}</span></div><div><label class="label">任务名称（可选）</label><input v-model="submitForm.displayName" class="input" maxlength="256" placeholder="留空时使用安全的通用名称" /></div><div><label class="label">队列优先级</label><input v-model.number="submitForm.priority" class="input" type="number" min="-100" max="100" /></div><div v-if="sourceMode === 'url' || sourceMode === 'share'" class="md:col-span-2"><label class="label">{{ sourceMode === 'share' ? '115 分享链接（需包含提取码）' : '磁力链接或 HTTP(S) URL' }}</label><textarea v-model="submitForm.sourceURL" class="input min-h-24 font-mono text-xs" required autocomplete="off" spellcheck="false" :placeholder="sourceMode === 'share' ? 'https://115.com/s/...?password=...' : 'magnet:?xt=... 或 https://...'" /></div><div v-else class="md:col-span-2"><label class="label">种子文件</label><input ref="fileInput" class="input" type="file" accept=".torrent,application/x-bittorrent" required @change="selectTorrent" /></div></div>
+      <div class="mt-5 grid gap-4 md:grid-cols-2"><div><label class="label">下载器</label><select v-model="submitForm.downloaderID" class="input" required><option value="" disabled>请选择</option><option v-for="item in enabledDownloaders" :key="item.id" :value="item.id">{{ item.name }} · {{ item.type === 'pan115_offline' ? '115 离线' : item.type }}</option></select></div><DownloadRouteTargetPicker v-model="submitForm.mediaLibraryID" :preview="routePreview" :loading="routePreviewLoading" /><div v-if="selectedDownloader?.type === 'pan115_offline'" class="semantic-inset p-3 text-sm md:col-span-2"><span class="text-subtle block text-xs">115 下载目录</span><strong>{{ selectedDownloader.storage_name }} · {{ selectedDownloader.provider_directory_path || '/' }}</strong><span class="text-subtle mt-1 block text-xs">{{ sourceMode === 'share' ? '分享内容会转存到独立 omc-* 任务子目录，完成后自动识别整理。' : '离线任务会写入独立 omc-* 任务子目录，完成后按媒体库规则自动整理。' }}</span></div><div><label class="label">任务名称（可选）</label><input v-model="submitForm.displayName" class="input" maxlength="256" placeholder="留空时使用安全的通用名称" /></div><div><label class="label">队列优先级</label><input v-model.number="submitForm.priority" class="input" type="number" min="-100" max="100" /></div><div v-if="sourceMode === 'url' || sourceMode === 'share'" class="md:col-span-2"><label class="label">{{ sourceMode === 'share' ? '115 分享链接（每行一个，需包含提取码）' : '磁力链接或 HTTP(S) URL（每行一个）' }}</label><textarea v-model="submitForm.sourceURL" class="input min-h-24 font-mono text-xs" required autocomplete="off" spellcheck="false" :placeholder="sourceMode === 'share' ? '每行一个：\nhttps://115.com/s/...?password=...' : '每行一个，最多 50 个：\nmagnet:?xt=...\nhttps://...'" /><p class="text-subtle mb-0 mt-2 text-xs">空行会忽略，完全相同的链接只提交一次；部分失败时仅保留失败行。</p></div><div v-else class="md:col-span-2"><label class="label">种子文件</label><input ref="fileInput" class="input" type="file" accept=".torrent,application/x-bittorrent" required @change="selectTorrent" /></div></div>
       <div v-if="selectedTarget" class="semantic-inset mt-4 grid gap-3 p-4 text-sm sm:grid-cols-2 lg:grid-cols-4">
         <div><span class="text-subtle block text-xs">最终媒体库</span><strong>{{ selectedTarget.name }}</strong></div>
         <div><span class="text-subtle block text-xs">分类规则</span><strong>{{ selectedTarget.profile_name }} · r{{ selectedTarget.profile_revision }}</strong></div>

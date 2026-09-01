@@ -600,8 +600,47 @@ type MediaLibrary struct {
 	DirtyGeneration           uint64     `gorm:"not null;default:0" json:"dirty_generation"`
 	ReclassificationDue       bool       `gorm:"not null;default:false" json:"reclassification_due"`
 	ContentRevision           uint64     `gorm:"not null;default:0" json:"content_revision"`
+	StructureStatus           string     `gorm:"size:32;not null;default:'pending';index" json:"structure_status"`
+	StructureIssueCount       int        `gorm:"not null;default:0" json:"structure_issue_count"`
+	StructureErrorCode        string     `gorm:"size:96;not null;default:''" json:"structure_error_code"`
+	StructureCheckedAt        *time.Time `json:"structure_checked_at,omitempty"`
 	CreatedAt                 time.Time  `json:"created_at"`
 	UpdatedAt                 time.Time  `json:"updated_at"`
+}
+
+const (
+	MediaLibraryStructurePending    = "pending"
+	MediaLibraryStructureHealthy    = "healthy"
+	MediaLibraryStructureIssues     = "issues"
+	MediaLibraryStructureRepairing  = "repairing"
+	MediaLibraryStructureFailed     = "failed"
+	MediaLibraryStructureScopeFull  = "full"
+	MediaLibraryStructureScopeWork  = "work"
+	MediaLibraryStructurePhaseQueue = "queued"
+)
+
+// MediaLibraryStructureRepair is the durable authority for one diagnostic or
+// repair run. PlanJSON and StateJSON contain private provider identities and
+// must never be returned by handlers or copied into audit metadata.
+type MediaLibraryStructureRepair struct {
+	ID              string     `gorm:"primaryKey;size:36" json:"id"`
+	OwnerID         uint       `gorm:"not null;index" json:"owner_id"`
+	JobID           *string    `gorm:"size:36;uniqueIndex" json:"job_id,omitempty"`
+	LibraryID       uint       `gorm:"not null;index:idx_media_library_structure_repairs_library,priority:1" json:"library_id"`
+	Scope           string     `gorm:"size:16;not null" json:"scope"`
+	WorkKey         string     `gorm:"size:80;not null;default:'';index" json:"-"`
+	RuleFingerprint string     `gorm:"size:64;not null" json:"-"`
+	Generation      uint64     `gorm:"not null" json:"generation"`
+	PlanJSON        string     `gorm:"type:text;not null" json:"-"`
+	StateJSON       string     `gorm:"type:text;not null;default:'{}'" json:"-"`
+	Phase           string     `gorm:"size:24;not null;index" json:"phase"`
+	IssueCount      int        `gorm:"not null;default:0" json:"issue_count"`
+	TotalItems      int        `gorm:"not null;default:0" json:"total_items"`
+	ProcessedItems  int        `gorm:"not null;default:0" json:"processed_items"`
+	LastErrorCode   string     `gorm:"size:96;not null;default:''" json:"last_error_code"`
+	CreatedAt       time.Time  `gorm:"not null;index:idx_media_library_structure_repairs_library,priority:2,sort:desc" json:"created_at"`
+	UpdatedAt       time.Time  `gorm:"not null" json:"updated_at"`
+	FinishedAt      *time.Time `json:"finished_at,omitempty"`
 }
 
 const (

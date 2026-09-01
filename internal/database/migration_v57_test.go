@@ -36,7 +36,7 @@ func TestMigrationV57NormalizesFuturePolicyWithoutChangingFrozenTasks(t *testing
 		t.Fatal(err)
 	}
 	library := models.MediaLibrary{Name: "v57", NameNormalized: "v57-library-" + uuid.NewString(), StorageID: storage.ID, ProfileID: profile.ID, ProfileRevision: profile.Revision, RelativeRoot: "/", TransferMode: models.MediaLibraryTransferMove, ConflictPolicy: models.MediaLibraryConflictAsk, MovieDirectoryTemplate: "{category}/{title}", MovieFilenameTemplate: "{title}", TVDirectoryTemplate: "电影/{category}/{title}/Season {season:02}", TVFilenameTemplate: "{title} - S{season:02}E{episode:02}", Enabled: false, Recursive: true, VideoExtensionsJSON: `[]`, IgnorePatternsJSON: `[]`, Status: models.MediaLibraryStatusDisabled, CreatedAt: now, UpdatedAt: now}
-	if err := db.Create(&library).Error; err != nil {
+	if err := db.Omit("StructureStatus", "StructureIssueCount", "StructureErrorCode", "StructureCheckedAt").Create(&library).Error; err != nil {
 		t.Fatal(err)
 	}
 	owner := models.User{Username: "v57", UsernameNormalized: "v57-" + uuid.NewString(), DisplayName: "v57", PasswordHash: "x", Status: models.UserStatusActive, CreatedAt: now, UpdatedAt: now}

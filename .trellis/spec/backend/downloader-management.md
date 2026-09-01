@@ -370,3 +370,10 @@ task.IdentitySource = recognition.Source
 task.IdentityLocked = recognition.Source == "manual"
 // Confidence ranks and labels; only structural/file safety can stop Transfer.
 ```
+
+## Bounded manual batch submission
+
+- Manual URL, magnet and share submission may accept at most 50 non-empty, order-preserving deduplicated lines.
+- The batch service invokes the existing single-item `Submit` path for every line so permissions, downloader/source compatibility, route snapshots, encryption, audit and queue semantics cannot diverge.
+- Results retain input indexes and safe error codes but never echo source text or ciphertext. One failed line does not roll back successful independent submissions.
+- Service and Web UI tests cover whitespace, duplicates, limits, partial success and source redaction.

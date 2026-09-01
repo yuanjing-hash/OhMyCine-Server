@@ -363,6 +363,32 @@ func TestDownloadDisablesSeedingPolicyForNonSeedingProvider(t *testing.T) {
 	}
 }
 
+func TestDownloadSubmitBatchKeepsPartialResultsIndexedAndPrivate(t *testing.T) {
+	downloads, downloaders, _, actor, client := downloadFixture(t)
+	if err := downloaders.registry.Register(models.DownloaderTypeFake, downloadpkg.Capabilities{Cancel: true}, func(downloadpkg.Config) (downloadpkg.Client, error) { return client, nil }); err != nil {
+		t.Fatal(err)
+	}
+	provider, err := downloaders.Create(actor, DownloaderInput{Name: "Batch provider", Type: models.DownloaderTypeFake, Enabled: true}, RequestContext{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	private := "magnet:?xt=urn:btih:batch-private"
+	result, err := downloads.SubmitBatch(context.Background(), actor, SubmitDownloadBatchInput{DownloaderID: provider.ID, SourceKind: downloadpkg.SourceURL, Sources: []string{private, "not-a-download-url", private}}, RequestContext{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Submitted != 1 || result.Failed != 2 || len(result.Results) != 3 || result.Results[0].Task == nil || result.Results[1].ErrorCode == "" || result.Results[2].ErrorCode == "" {
+		t.Fatalf("result=%+v", result)
+	}
+	raw, err := json.Marshal(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), private) {
+		t.Fatal("batch response leaked a private source URL")
+	}
+}
+
 func configureDownloadStaging(t *testing.T, queue *QueueService, storageID uint) {
 	t.Helper()
 	var storage models.Storage

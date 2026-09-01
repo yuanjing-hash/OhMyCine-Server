@@ -41,10 +41,10 @@ func TestMigrationV56AddsRouteSnapshotsAndFreezesOneDefaultIngestLibrary(t *test
 	}
 	libraryA := legacyV56Library("A", storage.ID, profile.ID, 20, true, now)
 	libraryB := legacyV56Library("B", storage.ID, profile.ID, 10, false, now)
-	if err := db.Omit("DefaultIngestConnectionID").Create(&libraryA).Error; err != nil {
+	if err := db.Omit("DefaultIngestConnectionID", "StructureStatus", "StructureIssueCount", "StructureErrorCode", "StructureCheckedAt").Create(&libraryA).Error; err != nil {
 		t.Fatal(err)
 	}
-	if err := db.Omit("DefaultIngestConnectionID").Create(&libraryB).Error; err != nil {
+	if err := db.Omit("DefaultIngestConnectionID", "StructureStatus", "StructureIssueCount", "StructureErrorCode", "StructureCheckedAt").Create(&libraryB).Error; err != nil {
 		t.Fatal(err)
 	}
 	downloader := models.Downloader{ID: uuid.NewString(), OwnerID: owner.ID, Name: "115", NameNormalized: "v56-downloader-" + uuid.NewString(), Type: models.DownloaderTypePan115Offline, StorageID: &storage.ID, ProviderDirectoryID: "downloads", AutoListenLifeEvents: true, Enabled: true, CapabilitiesJSON: `{}`, CreatedAt: now, UpdatedAt: now}
@@ -60,7 +60,7 @@ func TestMigrationV56AddsRouteSnapshotsAndFreezesOneDefaultIngestLibrary(t *test
 		t.Fatal(err)
 	}
 	libraryBConnection := legacyV56Library("B connection", storageB.ID, profile.ID, 30, false, now)
-	if err := db.Omit("DefaultIngestConnectionID").Create(&libraryBConnection).Error; err != nil {
+	if err := db.Omit("DefaultIngestConnectionID", "StructureStatus", "StructureIssueCount", "StructureErrorCode", "StructureCheckedAt").Create(&libraryBConnection).Error; err != nil {
 		t.Fatal(err)
 	}
 	ownerID := owner.ID

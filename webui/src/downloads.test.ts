@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
-import { beginDownloadRetry, canCancelDownloadPipeline, downloadErrorMessage, downloadProviderStatusLabel, downloadStatusClass, downloadStatusLabel, formatBytes, formatETA, formatProgress, isDownloadHistoryTask, reconcileDownloadRetries, summarizeDownloaderTasks, torrentToBase64 } from '@/downloads'
+import { beginDownloadRetry, canCancelDownloadPipeline, downloadErrorMessage, downloadProviderStatusLabel, downloadStatusClass, downloadStatusLabel, formatBytes, formatETA, formatProgress, isDownloadHistoryTask, parseDownloadSourceLines, reconcileDownloadRetries, summarizeDownloaderTasks, torrentToBase64 } from '@/downloads'
 import type { DownloadTaskSummary } from '@/types/api'
 
 const task = { job_status: 'queued' } as DownloadTaskSummary
@@ -17,6 +17,13 @@ describe('download presentation', () => {
     expect(formatETA(3661)).toBe('1 小时 2 分钟')
     expect(downloadStatusLabel(task)).toBe('排队中')
     expect(torrentToBase64(new Uint8Array([0, 1, 2]))).toBe('AAEC')
+  })
+  it('parses newline-delimited download sources without duplicating a task', () => {
+    expect(parseDownloadSourceLines(' magnet:?xt=1\r\n\nhttps://example.test/a\nmagnet:?xt=1 ')).toEqual({
+      sources: ['magnet:?xt=1', 'https://example.test/a'],
+      duplicateCount: 1,
+    })
+    expect(() => parseDownloadSourceLines('a\nb\nc', 2)).toThrow('一次最多提交 2 个链接')
   })
   it('shows the safe preclassification stage while a worker is active', () => {
     expect(downloadStatusLabel({ job_status: 'running', phase: 'metadata' } as DownloadTaskSummary)).toBe('获取 metadata')

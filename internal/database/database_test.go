@@ -320,7 +320,7 @@ func TestArtifactAutoCleanupMigrationBackfillsHistoricalRuns(t *testing.T) {
 		t.Fatal(err)
 	}
 	library := models.MediaLibrary{Name: "Cleanup library", NameNormalized: "cleanup-library", StorageID: storage.ID, ProfileID: profile.ID, ProfileRevision: profile.Revision, RelativeRoot: "/", Enabled: true, Recursive: true, FullScanIntervalHours: 24, IncrementalMinutes: 15, VideoExtensionsJSON: `[".mkv"]`, STRMAssetExtraExtensionsJSON: `[]`, IgnorePatternsJSON: `[]`, MetadataLanguage: "zh-CN", MetadataRegion: "CN", MatchStrategy: "balanced", ProviderRatePerSecond: 100, ProviderConcurrency: 2, MetadataRatePerSecond: 5, MetadataConcurrency: 1, Status: models.MediaLibraryStatusListening, CreatedAt: now, UpdatedAt: now}
-	if err := db.Omit("ArtifactCleanupRemoved", "ArtifactCleanupError", "ArtifactCleanupAt", "ContentRevision", "DefaultIngestConnectionID").Create(&library).Error; err != nil {
+	if err := db.Omit("ArtifactCleanupRemoved", "ArtifactCleanupError", "ArtifactCleanupAt", "ContentRevision", "DefaultIngestConnectionID", "StructureStatus", "StructureIssueCount", "StructureErrorCode", "StructureCheckedAt").Create(&library).Error; err != nil {
 		t.Fatal(err)
 	}
 	for _, item := range []struct {
@@ -535,8 +535,8 @@ func TestMigrateUpgradesAuthFoundationDatabaseToStorageFoundation(t *testing.T) 
 	if err := db.Table("schema_migrations").Order("version").Pluck("version", &versions).Error; err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(versions, []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59}) {
-		t.Fatalf("migration versions=%v, want [1..59]", versions)
+	if !reflect.DeepEqual(versions, []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60}) {
+		t.Fatalf("migration versions=%v, want [1..60]", versions)
 	}
 	if !db.Migrator().HasTable(&models.PlayerPlaybackHistory{}) || !db.Migrator().HasTable(&models.PlayerPlaybackHistoryRevision{}) {
 		t.Fatal("player playback history sync tables missing after upgrade")
@@ -1191,7 +1191,7 @@ func TestPersistentQueueMigrationPoliciesRBACAndForeignKeys(t *testing.T) {
 		}
 	}
 	var policies int64
-	if err := db.Model(&models.QueuePolicy{}).Count(&policies).Error; err != nil || policies != 13 {
+	if err := db.Model(&models.QueuePolicy{}).Count(&policies).Error; err != nil || policies != 14 {
 		t.Fatalf("policies=%d err=%v", policies, err)
 	}
 	var downloadPolicy models.QueuePolicy

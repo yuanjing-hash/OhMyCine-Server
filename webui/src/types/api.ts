@@ -186,6 +186,7 @@ export interface MediaLibraryDetail {
   status: MediaLibraryStatus; status_error_code: string; next_retry_at: string | null
   last_scan_at: string | null; last_successful_scan_at: string | null; baseline_generation: number; dirty_generation: number
   reclassification_due: boolean; entry_count: number; created_at: string; updated_at: string
+  structure_status: 'pending' | 'healthy' | 'issues' | 'repairing' | 'failed'; structure_issue_count: number; structure_error_code: string; structure_checked_at: string | null
   sort_order: number; transfer_mode: 'move' | 'copy' | 'symlink'; conflict_policy: 'ask' | 'overwrite' | 'skip' | 'rename'
   movie_directory_template: string; movie_filename_template: string
   tv_directory_template: string; tv_filename_template: string
@@ -223,6 +224,20 @@ export interface MediaCatalogDeletionPreview {
   relative_paths: string[]; strm_impact_count: number; missing_count: number; warnings: string[]; confirmation_token: string; expires_at: string
 }
 export interface MediaCatalogDeletionResult { deleted: boolean; removed_files: number; missing_files: number }
+export interface MediaLibraryStructureIssue { code: string; kind: 'video' | 'sidecar'; title?: string; current_path?: string; expected_path?: string; repairable: boolean }
+export interface MediaLibraryStructureDiagnostics { library_id: number; status: MediaLibraryDetail['structure_status']; issue_count: number; unrecognized: number; checked_at: string; issues: MediaLibraryStructureIssue[] }
+export interface MediaLibraryStructureRepair { id: string; job_id?: string; library_id: number; scope: 'full' | 'work'; generation: number; phase: 'queued' | 'executing' | 'reconciling' | 'completed' | 'failed'; issue_count: number; total_items: number; processed_items: number; last_error_code: string; created_at: string; updated_at: string; finished_at?: string }
+export interface TMDBGenre { id: number; name: string }
+export interface TMDBCompany { tmdb_id: number; name: string }
+export interface TMDBPerson { tmdb_id: number; name: string; character?: string; job?: string; profile_path?: string }
+export interface MediaMetadataEditable {
+  title: string; original_title: string; release_date: string; overview: string; tagline: string; status: string
+  vote_average: number; vote_count: number; runtime_minutes: number; season_count: number; episode_count: number
+  genres: TMDBGenre[]; production_countries: string[]; origin_countries: string[]; original_language: string; spoken_languages: string[]
+  studios: TMDBCompany[]; directors: TMDBPerson[]; writers: TMDBPerson[]; cast: TMDBPerson[]; poster_path: string; backdrop_path: string
+}
+export interface MediaMetadataImageOption { path: string; url: string }
+export interface MediaMetadataDocument { library_id: number; work_id: string; revision: number; tmdb_id: number; media_type: 'movie' | 'tv'; manual_override: boolean; editable: MediaMetadataEditable; poster_options: MediaMetadataImageOption[]; backdrop_options: MediaMetadataImageOption[] }
 export interface MediaRecognitionSummary {
   token: string; status: 'matched' | 'unrecognized'; error_code: string; title: string; media_type: 'movie' | 'tv' | ''
   release_year?: number; tmdb_id?: number; confidence?: number; category_name: string; manual_override: boolean

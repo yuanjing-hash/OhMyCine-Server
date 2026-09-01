@@ -50,6 +50,7 @@ type MediaLibraryService struct {
 	lifeEventMu       sync.Mutex
 	lifeEvents        map[string]downloaderLifeEventCandidate
 	backends          *MediaLibraryBackendRegistry
+	structure         *MediaLibraryStructureService
 }
 
 // MediaLibraryIngestEnqueuer is the narrow boundary from provider directory
@@ -161,6 +162,9 @@ func (s *MediaLibraryService) SetArtifactService(artifacts *MediaArtifactService
 func (s *MediaLibraryService) SetMediaChangeService(changes *MediaChangeService) {
 	s.changes = changes
 }
+func (s *MediaLibraryService) SetStructureService(structure *MediaLibraryStructureService) {
+	s.structure = structure
+}
 func (s *MediaLibraryService) Start(ctx context.Context) error {
 	var libraries []models.MediaLibrary
 	if err := s.db.Where("enabled = ?", true).Find(&libraries).Error; err != nil {
@@ -238,6 +242,7 @@ func (s *MediaLibraryService) Create(ctx context.Context, actor Actor, input Med
 	if err != nil {
 		return MediaLibraryDetail{}, err
 	}
+	record.StructureStatus = models.MediaLibraryStructurePending
 	transactionErr := s.db.Transaction(func(tx *gorm.DB) error {
 		var maxOrder int
 		if err := tx.Model(&models.MediaLibrary{}).Select("COALESCE(MAX(sort_order), 0)").Scan(&maxOrder).Error; err != nil {
@@ -302,6 +307,18 @@ func (s *MediaLibraryService) Update(ctx context.Context, actor Actor, id uint, 
 		record.DirtyGeneration = existing.DirtyGeneration
 		record.LastScanAt = existing.LastScanAt
 		record.LastSuccessfulScanAt = existing.LastSuccessfulScanAt
+		record.StructureStatus = existing.StructureStatus
+		record.StructureIssueCount = existing.StructureIssueCount
+		record.StructureErrorCode = existing.StructureErrorCode
+		record.StructureCheckedAt = existing.StructureCheckedAt
+	} else {
+		record.StructureStatus = models.MediaLibraryStructurePending
+	}
+	if libraryRuleFingerprint(existing) != libraryRuleFingerprint(record) {
+		record.StructureStatus = models.MediaLibraryStructurePending
+		record.StructureIssueCount = 0
+		record.StructureErrorCode = ""
+		record.StructureCheckedAt = nil
 	}
 	record.SortOrder = existing.SortOrder
 	if record.Enabled {
@@ -1061,6 +1078,20 @@ func (s *MediaLibraryService) stopSupervisor(id uint) {
 		}
 		s.mu.Unlock()
 	}
+}
+
+// RequestReconcile coalesces a post-mutation catalog refresh into the existing
+// listener. It never starts a second scanner for the same library.
+func (s *MediaLibraryService) RequestReconcile(id uint) {
+	s.mu.Lock()
+	handle, ok := s.supervisors[id]
+	if ok {
+		select {
+		case handle.wake <- struct{}{}:
+		default:
+		}
+	}
+	s.mu.Unlock()
 }
 
 func (s *MediaLibraryService) supervise(ctx context.Context, id uint, wake <-chan struct{}) {
@@ -1876,6 +1907,11 @@ func (s *MediaLibraryService) reconcile(ctx context.Context, id uint, kind strin
 	if s.artifacts != nil && mediaLibraryArtifactGenerationRequired(kind, run, metadataProjectionChanged) {
 		if err := s.artifacts.ScheduleGeneration(id, generation); err != nil {
 			serverlog.OperationMediaArtifact.Event(s.log.Error()).Uint("library_id", id).Uint64("generation", generation).Str("error_code", "artifact_schedule_failed").Msg(serverlog.OperationMediaArtifact.Message("入队失败"))
+		}
+	}
+	if s.structure != nil && !run.Partial {
+		if _, err := s.structure.Diagnose(ctx, id, ""); err != nil {
+			serverlog.OperationLibraryEventScan.Event(s.log.Warn()).Uint("library_id", id).Str("error_code", CodeMediaLibraryStructureDiagnosisFailed).Msg(serverlog.OperationLibraryEventScan.Message("目录结构诊断失败"))
 		}
 	}
 	return run, nil
