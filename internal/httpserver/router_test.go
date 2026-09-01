@@ -248,6 +248,7 @@ func newTestClient(t *testing.T) *testClient {
 	api.SetDiscoveryService(discovery)
 	coverage := services.NewMediaCoverageService(db, metadataSettings)
 	api.SetMediaCoverageService(coverage)
+	api.SetPlayerHistoryService(services.NewPlayerHistoryService(db))
 	follows := services.NewFollowService(db, audit, queue, coverage, authorization)
 	api.SetFollowService(follows)
 	libraries.SetMetadataSettingsService(metadataSettings)
@@ -730,6 +731,11 @@ func TestPlayerDeviceAuthenticationIsRevocableAndIsolatedFromBrowserAdmin(t *tes
 	}
 	if err := json.Unmarshal(bootstrapEnvelope.Data, &bootstrap); err != nil || bootstrap.MediaLibraryCount != 1 {
 		t.Fatalf("Player bootstrap count invalid err=%v data=%s", err, bootstrapEnvelope.Data)
+	}
+	historyBody := map[string]any{"cursor": 0, "changes": []map[string]any{{"sync_key": strings.Repeat("a", 64), "source_kind": "server", "source_locator": "http://127.0.0.1:3000", "source_id": "server-a", "media_identity": "entry|1|work|2", "title": "Movie", "position": 120, "duration": 1000, "completed": false, "updated_at": 2000}}}
+	status, historyEnvelope, historyHeaders := client.playerRequest(t, http.MethodPost, "/api/v1/player/history/sync", login.AccessToken, historyBody)
+	if status != http.StatusOK || historyHeaders.Get("Cache-Control") != "no-store" || !bytes.Contains(historyEnvelope.Data, []byte(`"sync_key":"`+strings.Repeat("a", 64)+`"`)) || bytes.Contains(historyEnvelope.Data, []byte("user_id")) {
+		t.Fatalf("Player history sync status=%d data=%s", status, historyEnvelope.Data)
 	}
 	status, librariesEnvelope, _ := client.playerRequest(t, http.MethodGet, "/api/v1/player/media-libraries", login.AccessToken, nil)
 	if status != http.StatusOK || bytes.Contains(librariesEnvelope.Data, []byte(`"root_path"`)) || bytes.Contains(librariesEnvelope.Data, []byte(`"relative_root"`)) {

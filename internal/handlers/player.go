@@ -98,8 +98,30 @@ func (a *API) PlayerBootstrap(c *gin.Context) {
 		"server": gin.H{"name": "OhMyCine Server", "api_version": "v1"},
 		"user":   services.CurrentUserFromActor(actor), "device": playerDeviceDTO(device),
 		"media_library_count": mediaLibraryCount,
-		"capabilities":        []string{"media_catalog", "direct_stream"}, "emby_instances": embyInstances,
+		"capabilities":        []string{"media_catalog", "direct_stream", "playback_history_sync", "discovery_search", "download_control"}, "emby_instances": embyInstances,
 	})
+}
+
+func (a *API) PlayerHistorySync(c *gin.Context) {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 2<<20)
+	var payload struct {
+		Cursor  uint64                         `json:"cursor"`
+		Changes []services.PlayerHistoryChange `json:"changes"`
+	}
+	if err := strictJSON(c, &payload); err != nil {
+		writeError(c, a.log, invalid("播放历史同步参数无效", err))
+		return
+	}
+	if a.playerHistory == nil {
+		writeError(c, a.log, &services.AppError{Code: services.CodeInvalidRequest, Message: "Server 暂不支持播放历史同步"})
+		return
+	}
+	result, err := a.playerHistory.Sync(mustActor(c), payload.Cursor, payload.Changes)
+	if err != nil {
+		writeError(c, a.log, err)
+		return
+	}
+	success(c, http.StatusOK, result)
 }
 
 func (a *API) PlayerDevices(c *gin.Context) {

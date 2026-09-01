@@ -47,6 +47,7 @@ type API struct {
 	libraryArtwork        *services.LibraryArtworkService
 	discovery             *services.DiscoveryService
 	mediaCoverage         *services.MediaCoverageService
+	playerHistory         *services.PlayerHistoryService
 	follows               *services.FollowService
 	sites                 *services.SiteService
 	cookieCloud           *services.CookieCloudService
@@ -99,6 +100,9 @@ func (a *API) SetLibraryArtworkService(service *services.LibraryArtworkService) 
 func (a *API) SetDiscoveryService(service *services.DiscoveryService) { a.discovery = service }
 func (a *API) SetMediaCoverageService(service *services.MediaCoverageService) {
 	a.mediaCoverage = service
+}
+func (a *API) SetPlayerHistoryService(service *services.PlayerHistoryService) {
+	a.playerHistory = service
 }
 func (a *API) SetFollowService(service *services.FollowService)           { a.follows = service }
 func (a *API) SetSiteService(service *services.SiteService)               { a.sites = service }
