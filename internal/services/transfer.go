@@ -37,6 +37,7 @@ type TransferService struct {
 	downloader              *DownloaderService
 	connections             *ConnectionService
 	mediaChanges            *MediaChangeService
+	structure               *MediaLibraryStructureService
 	verifyCompletedManifest func(context.Context, *models.DownloadTask, downloadpkg.Manifest) (downloadpkg.Manifest, error)
 }
 
@@ -54,6 +55,9 @@ func (s *TransferService) SetDownloaderService(downloader *DownloaderService) {
 }
 func (s *TransferService) SetMediaChangeService(changes *MediaChangeService) {
 	s.mediaChanges = changes
+}
+func (s *TransferService) SetMediaLibraryStructureService(structure *MediaLibraryStructureService) {
+	s.structure = structure
 }
 func (s *TransferService) SetConnectionService(connections *ConnectionService) {
 	s.connections = connections
@@ -307,6 +311,11 @@ func (w *TransferWorker) Run(ctx context.Context, runtime JobRuntime, job Claime
 		manifest = verifiedManifest
 		task.ManifestJSON = string(raw)
 		task.TotalFiles = len(verifiedManifest.Files)
+	}
+	if w.service.structure != nil && download.ScrapeTMDBID != nil {
+		if err := w.service.structure.EnsureWorkLayout(ctx, task.OwnerID, task.LibraryID, *download.ScrapeTMDBID, download.ScrapeMediaType); err != nil {
+			return w.fail(task, CodeMediaLibraryStructureApplyFailed, "已有作品目录修复失败，未继续写入新内容")
+		}
 	}
 	route, err := w.resolveTransferRoute(task, download)
 	if err != nil {

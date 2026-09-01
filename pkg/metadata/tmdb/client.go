@@ -117,6 +117,7 @@ type Snapshot struct {
 	Writers             []Person          `json:"writers,omitempty"`
 	Cast                []Person          `json:"cast,omitempty"`
 	PosterPath          string            `json:"poster_path,omitempty"`
+	PosterPaths         []string          `json:"poster_paths,omitempty"`
 	BackdropPath        string            `json:"backdrop_path,omitempty"`
 	BackdropPaths       []string          `json:"backdrop_paths,omitempty"`
 	Seasons             []SeasonSnapshot  `json:"seasons,omitempty"`
@@ -192,6 +193,9 @@ type detailCreator struct {
 }
 
 type detailImages struct {
+	Posters []struct {
+		FilePath string `json:"file_path"`
+	} `json:"posters"`
 	Backdrops []struct {
 		FilePath string `json:"file_path"`
 	} `json:"backdrops"`
@@ -743,7 +747,8 @@ func (c *Client) getDetailedMatch(ctx context.Context, mediaType string, id int6
 			imdbID = detail.ExternalIDs.IMDbID
 		}
 		snapshot := Snapshot{Version: 1, TMDBID: id, IMDbID: cleanIMDbID(imdbID), MediaType: mediaType, Title: cleanText(detail.Title, 512), OriginalTitle: cleanText(detail.OriginalTitle, 512), ReleaseDate: cleanDate(detail.ReleaseDate), Overview: cleanText(detail.Overview, 32768), Tagline: cleanText(detail.Tagline, 2048), Status: cleanText(detail.Status, 128), VoteAverage: boundedRating(detail.VoteAverage), VoteCount: boundedCount(detail.VoteCount), RuntimeMinutes: boundedRuntime(detail.Runtime), OriginalLanguage: cleanCode(detail.OriginalLanguage), PosterPath: cleanImagePath(detail.PosterPath), BackdropPath: cleanImagePath(detail.BackdropPath)}
-		snapshot.BackdropPaths = collectBackdropPaths(snapshot.BackdropPath, detail.Images)
+		snapshot.PosterPaths = collectImagePaths(snapshot.PosterPath, detail.Images.Posters)
+		snapshot.BackdropPaths = collectImagePaths(snapshot.BackdropPath, detail.Images.Backdrops)
 		populateCommonSnapshot(&snapshot, detail.Genres, detail.ProductionCountries, nil, detail.Credits, nil)
 		populateDetailSnapshot(&snapshot, detail.SpokenLanguages, detail.ProductionCompanies)
 		return matchFromSnapshot(snapshot), nil
@@ -795,7 +800,8 @@ func (c *Client) getDetailedMatch(ctx context.Context, mediaType string, id int6
 		runtimeMinutes = boundedRuntime(detail.EpisodeRuntime[0])
 	}
 	snapshot := Snapshot{Version: 1, TMDBID: id, IMDbID: cleanIMDbID(detail.ExternalIDs.IMDbID), MediaType: mediaType, Title: cleanText(detail.Name, 512), OriginalTitle: cleanText(detail.OriginalName, 512), ReleaseDate: cleanDate(detail.FirstAirDate), Overview: cleanText(detail.Overview, 32768), Tagline: cleanText(detail.Tagline, 2048), Status: cleanText(detail.Status, 128), VoteAverage: boundedRating(detail.VoteAverage), VoteCount: boundedCount(detail.VoteCount), RuntimeMinutes: runtimeMinutes, SeasonCount: boundedCount(detail.NumberOfSeasons), EpisodeCount: boundedCount(detail.NumberOfEpisodes), OriginalLanguage: cleanCode(detail.OriginalLanguage), PosterPath: cleanImagePath(detail.PosterPath), BackdropPath: cleanImagePath(detail.BackdropPath)}
-	snapshot.BackdropPaths = collectBackdropPaths(snapshot.BackdropPath, detail.Images)
+	snapshot.PosterPaths = collectImagePaths(snapshot.PosterPath, detail.Images.Posters)
+	snapshot.BackdropPaths = collectImagePaths(snapshot.BackdropPath, detail.Images.Backdrops)
 	populateCommonSnapshot(&snapshot, detail.Genres, detail.ProductionCountries, detail.OriginCountries, detail.Credits, detail.CreatedBy)
 	populateDetailSnapshot(&snapshot, detail.SpokenLanguages, detail.ProductionCompanies)
 	for _, season := range detail.Seasons {
@@ -824,7 +830,9 @@ func imageLanguages(language string) string {
 	return language + ",null,en"
 }
 
-func collectBackdropPaths(primary string, images detailImages) []string {
+func collectImagePaths(primary string, images []struct {
+	FilePath string `json:"file_path"`
+}) []string {
 	result := make([]string, 0, 8)
 	seen := make(map[string]struct{}, 8)
 	appendPath := func(value string) {
@@ -839,7 +847,7 @@ func collectBackdropPaths(primary string, images detailImages) []string {
 		result = append(result, value)
 	}
 	appendPath(primary)
-	for _, image := range images.Backdrops {
+	for _, image := range images {
 		appendPath(image.FilePath)
 		if len(result) == 8 {
 			break

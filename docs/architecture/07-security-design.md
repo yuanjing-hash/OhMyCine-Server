@@ -371,6 +371,12 @@ HMAC-SHA256(secret, method + path + exp + user_or_library_scope)
 
 ## 9. 文件与路径安全
 
+媒体库目录修复不能把扫描结果直接当成写授权。修复计划只保存稳定 provider identity 与媒体库相对目标；执行本地移动时重新验证 canonical root、普通文件、大小、symlink/junction/Reparse Point 和目标冲突，执行 115 移动时通过 parent ancestry 证明每个来源仍位于当前 library provider root 下，并复用现有驱动限流和风控。单作品修复必须用全库索引判断旧目录是否混有其它作品；通用 `poster.jpg` 等伴随文件只有在目录可证明只属于一个作品时才可移动。空目录清理不得删除媒体库根、非空目录或无法证明 ancestry 的目录。
+
+结构修复 REST 只接受媒体清单签发的 opaque work token，不接受原始 work key、路径或 provider ID。响应只公开运行 ID、Job ID、scope、代次、阶段、计数和稳定错误码；`WorkKey`、rule fingerprint、PlanJSON、StateJSON、owner 内部字段和绝对路径均不得序列化。审计只记录 scope 和数量。
+
+完整元数据编辑不能扩大媒体身份授权。浏览器不能提交 TMDB ID、媒体类型、IMDb ID 或任意图片 URL；海报和背景只能选择当前持久化快照或 Server 按媒体库语言从相同 TMDB 身份重新验证得到的 `/file.ext`。作品全部 recognition 使用 revision 乐观锁和单事务保存，防止多季部分更新；制品生成与媒体变更只在事务提交后各触发一次。
+
 媒体库作品源文件删除不能复用“删除媒体库配置”。它要求独立 `media_libraries.media_delete` 权限、五分钟 actor-bound 单次 opaque token，并在 confirm 时重新对账 library/work revision 与完整 entry digest。浏览器不能提交绝对路径或 provider ID 作为授权：本地目标只能由 Storage root + library relative root + entry relative path 重算，并拒绝 traversal、symlink、junction/Reparse Point；115 必须先证明媒体库 provider root 仍在 Storage root 内，再逐项证明 item identity、parent、name 和 size 未漂移，只能回收预览中的精确 item，不能清空回收站。逐项完成状态必须持久化以便部分失败后收敛，数据库 catalog 不得先于源文件删除。审计只保存库 ID、作品键摘要、数量、storage type、结果和安全错误码。
 
 ### 9.1 路径规范化

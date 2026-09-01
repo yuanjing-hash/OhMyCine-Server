@@ -262,3 +262,16 @@ POST  /api/v1/system/update/install  { target_version }
 
 - Unit/component tests cover permission omission, exact request bodies, managed deployment, install enablement, request-generation staleness, old-response rejection, disconnect tolerance, successful recovery, rollback and responsive summary/control layout.
 - Run permissions check, WebUI tests, typecheck, lint and production build.
+
+## Scenario: MediaLibrary Repair and Full Metadata Editing
+
+### Contracts
+
+- Download-list polling must not overwrite an in-progress create form. Reload route preview only when its downloader/source key changes, and clear a target library only after refreshed options prove it invalid. Multi-line submission clears successful lines and retains failed lines with per-line feedback.
+- MediaLibrary structure diagnosis is read-only and surfaced once after an initial scan reports issues. The dialog shows only safe relative paths, offers explicit full repair, links unrecognized work to identification, and exposes work-scoped repair from catalog details.
+- The full metadata editor separates basic fields, classification/credits and verified artwork. Identity changes remain in the existing recognizer/override flow; revision conflict keeps the dialog open and requires a reload rather than presenting partial success.
+
+### Tests Required
+
+- Cover polling/form isolation, line parsing and partial results, diagnosis states, full/work repair actions, metadata tabs, verified artwork and stale-save feedback.
+- Run permissions check, WebUI tests, typecheck, lint and production build.

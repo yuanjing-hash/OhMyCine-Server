@@ -192,6 +192,30 @@ func (a *API) CreateDownload(c *gin.Context) {
 	success(c, http.StatusCreated, item)
 }
 
+func (a *API) CreateDownloadBatch(c *gin.Context) {
+	actor, _ := middleware.ActorFrom(c)
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 256<<10)
+	var payload struct {
+		DownloaderID   string   `json:"downloader_id"`
+		MediaLibraryID *uint    `json:"media_library_id"`
+		ProfileID      uint     `json:"profile_id"`
+		DisplayName    string   `json:"display_name"`
+		Priority       int      `json:"priority"`
+		SourceKind     string   `json:"source_kind"`
+		Sources        []string `json:"sources"`
+	}
+	if err := strictJSON(c, &payload); err != nil {
+		writeError(c, a.log, invalid("批量下载任务信息无效", err))
+		return
+	}
+	result, err := a.downloads.SubmitBatch(c.Request.Context(), actor, services.SubmitDownloadBatchInput{DownloaderID: payload.DownloaderID, MediaLibraryID: payload.MediaLibraryID, ProfileID: payload.ProfileID, DisplayName: payload.DisplayName, Priority: payload.Priority, SourceKind: payload.SourceKind, Sources: payload.Sources}, middleware.RequestContextFrom(c))
+	if err != nil {
+		writeError(c, a.log, err)
+		return
+	}
+	success(c, http.StatusOK, result)
+}
+
 func (a *API) DeleteDownload(c *gin.Context) {
 	actor, _ := middleware.ActorFrom(c)
 	id, ok := stringID(c)

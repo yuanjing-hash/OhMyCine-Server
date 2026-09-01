@@ -119,6 +119,9 @@ func main() {
 	artifacts.SetConnectionService(connections)
 	artifacts.SetMediaChangeService(mediaChanges)
 	libraries.SetArtifactService(artifacts)
+	libraryStructure := services.NewMediaLibraryStructureService(db, audit, queue, connections, logManager.Logger("media_library", "structure"))
+	libraryStructure.SetReconcileNotifier(libraries.RequestReconcile)
+	libraries.SetStructureService(libraryStructure)
 	strmManagement := services.NewSTRMManagementService(db, audit, queue, libraries, artifacts, logManager.Logger("strm", "management"))
 	artifacts.SetCleanupService(strmManagement)
 	providerRegistry := downloadpkg.NewRegistry()
@@ -169,6 +172,7 @@ func main() {
 	transfers.SetConnectionService(connections)
 	transfers.SetDownloaderService(downloaders)
 	transfers.SetMediaChangeService(mediaChanges)
+	transfers.SetMediaLibraryStructureService(libraryStructure)
 	reorganizations := services.NewMediaReorganizationService(db, audit, queue, metadataSettings, connections, logManager.Logger("media_reorganization", "worker"))
 	reorganizations.SetMediaLibraryService(libraries)
 	seeding := services.NewSeedingService(db, audit, queue, downloaders, logManager.Logger("seeding", "service"))
@@ -213,6 +217,7 @@ func main() {
 	api.SetProviderDirectoryService(providerDirectories)
 	api.SetRuntimeLogService(runtimeLogs)
 	api.SetMediaLibraryService(libraries)
+	api.SetMediaLibraryStructureService(libraryStructure)
 	api.SetSTRMManagementService(strmManagement)
 	api.SetMediaChangeService(mediaChanges)
 	api.SetMediaServerRefreshService(mediaServerRefresh)
@@ -230,6 +235,9 @@ func main() {
 	}
 	if err := registry.Register(services.JobTypeMediaReorganization, services.NewMediaReorganizationWorker(reorganizations)); err != nil {
 		logging.OperationServerLifecycle.Event(log.Fatal()).Err(err).Str("error_code", "media_reorganization_worker_registration_failed").Msg(logging.OperationServerLifecycle.Message("重新整理 Worker 注册失败"))
+	}
+	if err := registry.Register(services.JobTypeMediaLibraryRepair, services.NewMediaLibraryRepairWorker(libraryStructure)); err != nil {
+		logging.OperationServerLifecycle.Event(log.Fatal()).Err(err).Str("error_code", "media_library_repair_worker_registration_failed").Msg(logging.OperationServerLifecycle.Message("媒体库结构修复 Worker 注册失败"))
 	}
 	if err := registry.Register("seeding", services.NewSeedingWorker(seeding)); err != nil {
 		logging.OperationServerLifecycle.Event(log.Fatal()).Err(err).Str("error_code", "seeding_worker_registration_failed").Msg(logging.OperationServerLifecycle.Message("做种管理 Worker 注册失败"))

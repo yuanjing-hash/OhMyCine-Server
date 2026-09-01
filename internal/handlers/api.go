@@ -25,6 +25,7 @@ type API struct {
 	directory             *services.DirectoryBrowserService
 	profiles              *services.MediaClassificationProfileService
 	libraries             *services.MediaLibraryService
+	libraryStructure      *services.MediaLibraryStructureService
 	runtimeLogs           *services.RuntimeLogService
 	queue                 *services.QueueService
 	queueEvents           *services.QueueEventHub
@@ -62,11 +63,14 @@ func (a *API) SetProviderDirectoryService(service *services.ProviderDirectorySer
 	a.providerDirectory = service
 }
 func (a *API) SetMediaLibraryService(service *services.MediaLibraryService) { a.libraries = service }
-func (a *API) SetQueueService(service *services.QueueService)               { a.queue = service }
-func (a *API) SetQueueEventHub(hub *services.QueueEventHub)                 { a.queueEvents = hub }
-func (a *API) SetDownloaderService(service *services.DownloaderService)     { a.downloaders = service }
-func (a *API) SetDownloadService(service *services.DownloadService)         { a.downloads = service }
-func (a *API) SetTransferService(service *services.TransferService)         { a.transfers = service }
+func (a *API) SetMediaLibraryStructureService(service *services.MediaLibraryStructureService) {
+	a.libraryStructure = service
+}
+func (a *API) SetQueueService(service *services.QueueService)           { a.queue = service }
+func (a *API) SetQueueEventHub(hub *services.QueueEventHub)             { a.queueEvents = hub }
+func (a *API) SetDownloaderService(service *services.DownloaderService) { a.downloaders = service }
+func (a *API) SetDownloadService(service *services.DownloadService)     { a.downloads = service }
+func (a *API) SetTransferService(service *services.TransferService)     { a.transfers = service }
 func (a *API) SetMediaReorganizationService(service *services.MediaReorganizationService) {
 	a.reorganizations = service
 }

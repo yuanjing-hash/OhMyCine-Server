@@ -193,6 +193,76 @@ type SubmitDownloadInput struct {
 	BeforePersist func(*gorm.DB) error
 }
 
+const maxBatchDownloadSources = 50
+
+type SubmitDownloadBatchInput struct {
+	DownloaderID   string
+	MediaLibraryID *uint
+	ProfileID      uint
+	DisplayName    string
+	Priority       int
+	SourceKind     string
+	Sources        []string
+}
+
+type SubmitDownloadBatchItem struct {
+	Index     int                  `json:"index"`
+	Task      *DownloadTaskSummary `json:"task,omitempty"`
+	ErrorCode string               `json:"error_code,omitempty"`
+	Message   string               `json:"message,omitempty"`
+}
+
+type SubmitDownloadBatchResult struct {
+	Submitted int                       `json:"submitted"`
+	Failed    int                       `json:"failed"`
+	Results   []SubmitDownloadBatchItem `json:"results"`
+}
+
+// SubmitBatch deliberately reuses Submit for every source so downloader,
+// route, permission, audit and queue invariants stay identical to a single
+// download. Partial success is explicit and indexed; source URLs are never
+// echoed back because they may contain private tracker or share material.
+func (s *DownloadService) SubmitBatch(ctx context.Context, actor Actor, input SubmitDownloadBatchInput, request RequestContext) (SubmitDownloadBatchResult, error) {
+	if input.SourceKind != downloadpkg.SourceURL && input.SourceKind != downloadpkg.SourcePan115Share {
+		return SubmitDownloadBatchResult{}, appError(CodeDownloadSourceInvalid, "批量下载仅支持链接或 115 分享来源", nil)
+	}
+	if len(input.Sources) == 0 || len(input.Sources) > maxBatchDownloadSources {
+		return SubmitDownloadBatchResult{}, appError(CodeDownloadSourceInvalid, "一次可提交 1 到 50 个链接", nil)
+	}
+	result := SubmitDownloadBatchResult{Results: make([]SubmitDownloadBatchItem, 0, len(input.Sources))}
+	seen := make(map[string]struct{}, len(input.Sources))
+	for index, raw := range input.Sources {
+		if err := ctx.Err(); err != nil {
+			return result, err
+		}
+		source := strings.TrimSpace(raw)
+		item := SubmitDownloadBatchItem{Index: index}
+		if source == "" {
+			item.ErrorCode, item.Message = CodeDownloadSourceInvalid, "链接不能为空"
+		} else if _, exists := seen[source]; exists {
+			item.ErrorCode, item.Message = CodeDownloadSourceInvalid, "重复链接已忽略"
+		} else {
+			seen[source] = struct{}{}
+			displayName := strings.TrimSpace(input.DisplayName)
+			if displayName != "" && len(input.Sources) > 1 {
+				displayName = fmt.Sprintf("%s #%d", displayName, index+1)
+			}
+			created, err := s.Submit(ctx, actor, SubmitDownloadInput{DownloaderID: input.DownloaderID, MediaLibraryID: input.MediaLibraryID, ProfileID: input.ProfileID, DisplayName: displayName, Priority: input.Priority, Source: DownloadSourceInput{Kind: input.SourceKind, URL: source}}, request)
+			if err == nil {
+				item.Task = &created
+				result.Submitted++
+			} else {
+				item.ErrorCode, item.Message = ErrorCode(err), ErrorMessage(err)
+			}
+		}
+		if item.Task == nil {
+			result.Failed++
+		}
+		result.Results = append(result.Results, item)
+	}
+	return result, nil
+}
+
 type DownloadRecognitionIdentity struct {
 	TMDBID    int64
 	MediaType string

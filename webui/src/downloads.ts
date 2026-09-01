@@ -5,8 +5,27 @@ export type DownloadManagementSection = 'active' | 'history' | 'create' | 'seedi
 export interface DownloaderTaskStats { active: number; total: number; downloadSpeed: number | null; uploadSpeed: number | null; averageProgress: number | null }
 export interface DownloadRetryPresentationState { errorFingerprint: string; taskUpdatedAt: string; observedActive: boolean }
 export type DownloadRetryPresentations = Record<string, DownloadRetryPresentationState>
+export interface ParsedDownloadSources { sources: string[]; duplicateCount: number }
 
 const activeProviderStatuses = new Set(['allocating', 'checkingdl', 'checkingresumedata', 'downloading', 'forceddl', 'metadl', 'queueddl', 'stalleddl'])
+
+export function parseDownloadSourceLines(value: string, limit = 50): ParsedDownloadSources {
+  const sources: string[] = []
+  const seen = new Set<string>()
+  let duplicateCount = 0
+  for (const raw of value.split(/\r?\n/)) {
+    const source = raw.trim()
+    if (!source) continue
+    if (seen.has(source)) {
+      duplicateCount++
+      continue
+    }
+    if (sources.length >= limit) throw new Error(`一次最多提交 ${limit} 个链接`)
+    seen.add(source)
+    sources.push(source)
+  }
+  return { sources, duplicateCount }
+}
 
 export function formatBytes(value: number | null, suffix = ''): string {
   if (value === null || !Number.isFinite(value) || value < 0) return '未知'

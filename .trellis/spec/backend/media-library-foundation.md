@@ -594,3 +594,13 @@ backend, err := service.backends.Get(storage.Type)
 if err != nil { return safeScanFailure(err) }
 result, err := backend.Scan(ctx, request)
 ```
+
+## Existing-library structure repair and metadata editing
+
+- A successful first/full scan may diagnose directory layout, but must not mutate it. Diagnosis and explicit repair use the same immutable provider-neutral plan built from the current Profile and the fixed `电影` / `电视剧` roots.
+- Storage mutation is implemented by a strict backend registry. Local and provider backends revalidate root confinement, stable identity, file facts and conflicts immediately before each move. A target conflict fails closed; cleanup removes only proven-empty descendants and never a library root.
+- Work-scoped planning loads the full library index before filtering. Generic sidecars move only when the containing directory belongs to exactly one recognized work; unrecognized items remain visible and unmoved.
+- Transfer calls synchronous work-scoped repair before planning new files for an already indexed TMDB work. Failure blocks import rather than creating a second tree. Successful repair wakes the existing supervisor for reconciliation.
+- Repair APIs accept only opaque catalog work tokens. Public DTOs allowlist run/job IDs, scope, phase, generation, counters, timestamps and safe error codes; raw work keys, provider IDs, rule fingerprints, plans, checkpoints and absolute paths remain private.
+- Full metadata edits preserve TMDB/media identity, accept only Server-verified TMDB file paths for artwork, and update every recognition/entry for a work in one optimistic transaction. Any stale recognition rolls back all seasons. One successful edit produces at most one artifact generation and one media change.
+- Tests cover movie/TV targets, seasons, associated subtitles/artwork, shared-directory ambiguity, unrecognized entries, local/provider root boundaries, conflicts, stable provider identity, empty-directory cleanup, multi-recognition rollback and safe image selection.
