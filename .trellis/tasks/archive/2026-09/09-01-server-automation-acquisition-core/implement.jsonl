@@ -1,0 +1,9 @@
+{"file":".trellis/spec/backend/index.md","reason":"Server package boundaries and mandatory backend checks."}
+{"file":".trellis/spec/backend/api-guidelines.md","reason":"Authenticated REST/SSE contracts and safe response envelopes."}
+{"file":".trellis/spec/backend/web-admin-guidelines.md","reason":"RBAC, CSRF, permission catalog and embedded Web UI invariants."}
+{"file":".trellis/spec/backend/pt-discovery.md","reason":"Site search, progressive results, opaque claims and failure isolation."}
+{"file":".trellis/spec/backend/media-identity-discovery.md","reason":"TMDB identity and multilingual aggregate search behavior."}
+{"file":".trellis/spec/backend/media-library-foundation.md","reason":"Media-library roots, scans, path safety and provider behavior."}
+{"file":".trellis/spec/backend/persistent-task-queue.md","reason":"Durable job scheduling, recovery and action semantics."}
+{"file":".trellis/spec/backend/security-guidelines.md","reason":"Credentials, filesystem, provider and streaming security boundaries."}
+{"file":".trellis/tasks/09-01-server-automation-acquisition-core/research/current-system-findings.md","reason":"Verified current concurrency, Player streaming and artifact-cleanup root causes."}

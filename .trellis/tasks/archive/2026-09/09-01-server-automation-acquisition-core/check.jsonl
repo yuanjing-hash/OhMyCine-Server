@@ -1,0 +1,5 @@
+{"file":".trellis/spec/backend/quality-guidelines.md","reason":"Server test, build and review requirements."}
+{"file":".trellis/spec/backend/error-handling.md","reason":"Partial failure, timeout and safe error review."}
+{"file":".trellis/spec/backend/security-guidelines.md","reason":"Authorization, path, credential and SSE leakage review."}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"Verify API, service, database and Web UI consistency."}
+{"file":".trellis/tasks/09-01-server-automation-acquisition-core/research/current-system-findings.md","reason":"Regression checks must cover the identified root causes."}
