@@ -35,7 +35,7 @@ func TestValidatePublicDownloadURLRejectsSSRFAndHTTPSDowngrade(t *testing.T) {
 	}
 }
 
-func TestDownloadRedirectRevalidatesTargetAndDropsSensitiveHeaders(t *testing.T) {
+func TestDownloadRedirectAllowsPrivateCDNAndDropsSensitiveHeaders(t *testing.T) {
 	client := newDownloadHTTPClient()
 	request, _ := http.NewRequest(http.MethodGet, "https://8.8.8.8/media", nil)
 	request.Header.Set("User-Agent", "115Browser")
@@ -45,6 +45,10 @@ func TestDownloadRedirectRevalidatesTargetAndDropsSensitiveHeaders(t *testing.T)
 	previous, _ := http.NewRequest(http.MethodGet, "https://cdn.example.test/media", nil)
 	if err := client.CheckRedirect(request, []*http.Request{previous}); err != nil {
 		t.Fatal(err)
+	}
+	privateTarget, _ := http.NewRequest(http.MethodGet, "https://127.0.0.1/media", nil)
+	if err := client.CheckRedirect(privateTarget, []*http.Request{previous}); err != nil {
+		t.Fatalf("private CDN redirect was rejected: %v", err)
 	}
 	if request.Header.Get("Cookie") != "" || request.Header.Get("Authorization") != "" || request.Header.Get("User-Agent") != "115Browser" || request.Header.Get("Range") != "bytes=10-" {
 		t.Fatalf("redirect headers=%v", request.Header)

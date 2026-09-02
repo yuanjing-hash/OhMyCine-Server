@@ -11,12 +11,22 @@ import (
 
 type downloadIPResolver func(context.Context, string) ([]net.IPAddr, error)
 
-func validatePublicDownloadURL(ctx context.Context, target *url.URL, resolve downloadIPResolver) error {
+// validateDownloadURL keeps the direct-link protocol boundary narrow without
+// rejecting provider-signed endpoints that a user's DNS intentionally maps to
+// an internal acceleration address.
+func validateDownloadURL(target *url.URL) error {
 	if target == nil || target.Scheme != "https" || target.Host == "" || target.User != nil || target.Fragment != "" {
 		return errors.New("115 download target is invalid")
 	}
 	if port := target.Port(); port != "" && port != "443" {
 		return errors.New("115 download target port is invalid")
+	}
+	return nil
+}
+
+func validatePublicDownloadURL(ctx context.Context, target *url.URL, resolve downloadIPResolver) error {
+	if err := validateDownloadURL(target); err != nil {
+		return err
 	}
 	host := strings.TrimSpace(strings.TrimSuffix(target.Hostname(), "."))
 	if host == "" {

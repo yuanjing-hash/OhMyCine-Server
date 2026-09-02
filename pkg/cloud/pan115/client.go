@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -34,6 +33,11 @@ const (
 	maxInFlightCalls    = 2
 	maxOfflineTaskPages = int64(50)
 	bulkFoldersEndpoint = "https://proapi.115.com/app/2.0/chrome/downfolders"
+	// The 115 direct-link endpoint rejects the SDK's legacy 115Browser UA for
+	// some accounts, although ordinary metadata APIs still accept it. Use a
+	// current browser UA only when issuing and consuming an expiring file URL;
+	// it is intentionally separate from the SDK client's API UA.
+	downloadBrowserUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
 
 var errCircuitOpen = errors.New("115 request circuit is cooling down")
@@ -1134,16 +1138,14 @@ func (c *Client) DirectURL(ctx context.Context, request cloud.DirectURLRequest) 
 
 func newDownloadHTTPClient() *http.Client {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
-	transport.Proxy = nil
 	transport.ResponseHeaderTimeout = 30 * time.Second
-	transport.DialContext = publicDownloadDialContext(net.DefaultResolver.LookupIPAddr)
 	return &http.Client{
 		Transport: transport,
 		CheckRedirect: func(request *http.Request, previous []*http.Request) error {
 			if len(previous) >= 3 {
 				return errors.New("115 download redirected too many times")
 			}
-			if err := validatePublicDownloadURL(request.Context(), request.URL, net.DefaultResolver.LookupIPAddr); err != nil {
+			if err := validateDownloadURL(request.URL); err != nil {
 				return err
 			}
 			for key := range request.Header {
@@ -1170,7 +1172,7 @@ func (c *Client) OpenRead(ctx context.Context, request cloud.ReadRequest) (cloud
 	if item.IsDir || item.Size < 0 || request.Offset > item.Size {
 		return cloud.ReadResult{}, cloud.Error(cloud.CodeResponseInvalid, false, errors.New("115 read source is invalid"))
 	}
-	temporary, err := c.DirectURL(ctx, cloud.DirectURLRequest{FileID: item.ID, PickCode: item.PickCode, UserAgent: pan115sdk.UA115Browser})
+	temporary, err := c.DirectURL(ctx, cloud.DirectURLRequest{FileID: item.ID, PickCode: item.PickCode, UserAgent: downloadBrowserUserAgent})
 	if err != nil {
 		return cloud.ReadResult{}, err
 	}
@@ -1178,7 +1180,7 @@ func (c *Client) OpenRead(ctx context.Context, request cloud.ReadRequest) (cloud
 	if err != nil {
 		return cloud.ReadResult{}, cloud.Error(cloud.CodeResponseInvalid, false, err)
 	}
-	if err := validatePublicDownloadURL(ctx, httpRequest.URL, net.DefaultResolver.LookupIPAddr); err != nil {
+	if err := validateDownloadURL(httpRequest.URL); err != nil {
 		return cloud.ReadResult{}, cloud.Error(cloud.CodeResponseInvalid, false, err)
 	}
 	// 115 download URLs are bound only to the acquisition User-Agent. Never
