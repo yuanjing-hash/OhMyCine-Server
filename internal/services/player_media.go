@@ -18,6 +18,7 @@ import (
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/medialibrary"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
 	storagefs "github.com/yuanjing-hash/OhMyCine-Server/internal/storage"
+	cloudpkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/metadata/tmdb"
 	"gorm.io/gorm"
 )
@@ -341,16 +342,9 @@ func (s *MediaLibraryService) PlayerCatalogDetail(ctx context.Context, actor Act
 				_ = file.Close()
 			}
 		case models.StorageTypePan115:
-			var artifact models.MediaArtifact
-			artifactErr := s.db.Where("library_id = ? AND source_identity = ? AND kind = ? AND target_kind = ? AND managed = ? AND active = ? AND status = ?", entry.LibraryID, fmt.Sprintf("entry:%d", entry.ID), models.MediaArtifactKindSTRM, models.MediaArtifactTargetLocalProjection, true, true, models.MediaArtifactStatusCompleted).
-				Order("updated_at DESC").First(&artifact).Error
-			if artifactErr != nil && artifactErr != gorm.ErrRecordNotFound {
-				return PlayerMediaDetail{}, artifactErr
-			}
-			if artifactErr == nil {
+			if strings.TrimSpace(entry.ProviderID) != "" {
 				playable = true
 				deliveryKind = playerDeliveryServerRedirect
-				exactIdentity = "ohmycine:artifact:" + artifact.OpaqueID
 			}
 		}
 		streamPath := ""
@@ -382,15 +376,14 @@ func (s *MediaLibraryService) PlayerCatalogDetail(ctx context.Context, actor Act
 
 func (s *MediaLibraryService) playerDirectStreamMode(libraryID uint) (string, error) {
 	type row struct {
-		StorageType        string
-		LibraryEnabled     bool
-		StorageEnabled     bool
-		STRMEnabled        bool
-		SignedProxyEnabled bool
+		StorageType    string
+		LibraryEnabled bool
+		StorageEnabled bool
+		ConnectionID   uint
 	}
 	var item row
 	err := s.db.Table("media_libraries").
-		Select("storages.type AS storage_type, media_libraries.enabled AS library_enabled, storages.enabled AS storage_enabled, media_libraries.strm_enabled, media_libraries.signed_proxy_enabled").
+		Select("storages.type AS storage_type, media_libraries.enabled AS library_enabled, storages.enabled AS storage_enabled, COALESCE(storages.connection_id, 0) AS connection_id").
 		Joins("JOIN storages ON storages.id = media_libraries.storage_id").
 		Where("media_libraries.id = ?", libraryID).Take(&item).Error
 	if err != nil {
@@ -402,7 +395,7 @@ func (s *MediaLibraryService) playerDirectStreamMode(libraryID uint) (string, er
 	if item.StorageType == models.StorageTypeLocal {
 		return models.StorageTypeLocal, nil
 	}
-	if item.StorageType == models.StorageTypePan115 && item.STRMEnabled && item.SignedProxyEnabled {
+	if item.StorageType == models.StorageTypePan115 && item.ConnectionID > 0 {
 		return models.StorageTypePan115, nil
 	}
 	return "", nil
@@ -657,19 +650,37 @@ func (s *SignedProxyService) ResolvePlayerEntry(ctx context.Context, actor Actor
 		}
 		return PlayerStreamResolution{Kind: playerStreamKindLocal, File: file, Name: filepath.Base(filepath.FromSlash(entry.RelativePath)), ModifiedAt: info.ModTime()}, nil
 	}
-	if storage.Type != models.StorageTypePan115 || !library.STRMEnabled || !library.SignedProxyEnabled {
+	if storage.Type != models.StorageTypePan115 || storage.ConnectionID == nil || *storage.ConnectionID == 0 || strings.TrimSpace(entry.ProviderID) == "" || s.connections == nil {
 		return PlayerStreamResolution{}, appError(CodeProxyTargetUnavailable, "播放目标不可用", nil)
 	}
-	var artifact models.MediaArtifact
-	if err := s.db.Where("library_id = ? AND source_identity = ? AND kind = ? AND target_kind = ? AND managed = ? AND active = ? AND status = ?", entry.LibraryID, fmt.Sprintf("entry:%d", entry.ID), models.MediaArtifactKindSTRM, models.MediaArtifactTargetLocalProjection, true, true, models.MediaArtifactStatusCompleted).
-		Order("updated_at DESC").First(&artifact).Error; err != nil {
+	_, driver, err := s.connections.driver(*storage.ConnectionID)
+	if err != nil || !driver.Capabilities().TemporaryDirectURL {
 		return PlayerStreamResolution{}, appError(CodeProxyTargetUnavailable, "播放目标不可用", err)
 	}
-	redirect, err := s.ResolveArtifactForClient(ctx, artifact.OpaqueID, userAgent, remoteAddr)
+	readCtx := cloudpkg.WithReadClass(ctx, cloudpkg.ReadClassInteractive)
+	item, err := driver.Stat(readCtx, entry.ProviderID)
+	if err != nil || item.IsDir || item.ID != entry.ProviderID || strings.TrimSpace(item.PickCode) == "" {
+		return PlayerStreamResolution{}, appError(CodeProxyTargetUnavailable, "播放目标不可用", err)
+	}
+	rootID := strings.TrimSpace(library.ProviderRootID)
+	if rootID == "" {
+		rootID = strings.TrimSpace(storage.RootPath)
+	}
+	within, err := providerParentWithinRoot(readCtx, driver, item.ParentID, rootID)
+	if err != nil || !within {
+		return PlayerStreamResolution{}, appError(CodeProxyTargetUnavailable, "播放目标不可用", err)
+	}
+	target := signedProxyTarget{LibraryID: library.ID, ConnectionID: *storage.ConnectionID, ProviderItemID: item.ID, StorageType: storage.Type, LibraryEnabled: true, StorageEnabled: true}
+	redirect, err := s.resolveTargetWithItem(ctx, playerEntryProxyIdentity(library.ID, entry.ID, item.ID), target, userAgent, playbackClientFingerprint(remoteAddr, userAgent), &item)
 	if err != nil {
 		return PlayerStreamResolution{}, err
 	}
 	return PlayerStreamResolution{Kind: playerStreamKindRedirect, RedirectURL: redirect.URL}, nil
+}
+
+func playerEntryProxyIdentity(libraryID, entryID uint, providerItemID string) string {
+	provider := sha256.Sum256([]byte("ohmycine:player-entry-provider:v1\x00" + providerItemID))
+	return "player-entry-" + strconv.FormatUint(uint64(libraryID), 10) + "-" + strconv.FormatUint(uint64(entryID), 10) + "-" + hex.EncodeToString(provider[:8])
 }
 
 func openLocalPlayerEntry(db *gorm.DB, entry models.MediaLibraryEntry) (*os.File, os.FileInfo, error) {

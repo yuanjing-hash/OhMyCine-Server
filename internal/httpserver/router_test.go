@@ -129,8 +129,14 @@ func (routerCloudDriver) Stat(_ context.Context, id string) (cloudpkg.Item, erro
 	if id == "root-1" {
 		return cloudpkg.Item{ID: id, ParentID: "0", Name: "媒体", IsDir: true}, nil
 	}
+	if id == "outside-root" {
+		return cloudpkg.Item{ID: id, ParentID: "0", Name: "其他目录", IsDir: true}, nil
+	}
 	if id == "video-1" {
 		return cloudpkg.Item{ID: id, ParentID: "root-1", Name: "Movie.mkv", PickCode: "private-pickcode", Size: 100}, nil
+	}
+	if id == "outside-video" {
+		return cloudpkg.Item{ID: id, ParentID: "outside-root", Name: "Outside.mkv", PickCode: "outside-private-pickcode", Size: 100}, nil
 	}
 	return cloudpkg.Item{}, cloudpkg.Error(cloudpkg.CodeNotFound, false, nil)
 }
@@ -749,6 +755,15 @@ func TestPlayerDeviceAuthenticationIsRevocableAndIsolatedFromBrowserAdmin(t *tes
 	if err := client.db.Where("name_normalized = ?", "proxy-route-library").First(&library).Error; err != nil {
 		t.Fatal(err)
 	}
+	// Player playback is based on the committed media entry, not on the optional
+	// STRM filesystem projection. Cover an artifact-free library with both STRM
+	// switches disabled so this contract cannot regress.
+	if err := client.db.Where("library_id = ?", library.ID).Delete(&models.MediaArtifact{}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := client.db.Model(&models.MediaLibrary{}).Where("id = ?", library.ID).Updates(map[string]any{"strm_enabled": false, "signed_proxy_enabled": false}).Error; err != nil {
+		t.Fatal(err)
+	}
 	var readyChange models.MediaLibraryChange
 	if err := client.db.Transaction(func(tx *gorm.DB) error {
 		var err error
@@ -802,7 +817,7 @@ func TestPlayerDeviceAuthenticationIsRevocableAndIsolatedFromBrowserAdmin(t *tes
 			ExactIdentity string `json:"exact_identity"`
 		} `json:"versions"`
 	}
-	if err := json.Unmarshal(detailEnvelope.Data, &playableDetail); err != nil || len(playableDetail.Versions) != 1 || !playableDetail.Versions[0].Playable || playableDetail.Versions[0].DeliveryKind != "server_redirect" || !strings.HasPrefix(playableDetail.Versions[0].ExactIdentity, "ohmycine:artifact:") {
+	if err := json.Unmarshal(detailEnvelope.Data, &playableDetail); err != nil || len(playableDetail.Versions) != 1 || !playableDetail.Versions[0].Playable || playableDetail.Versions[0].DeliveryKind != "server_redirect" || !strings.HasPrefix(playableDetail.Versions[0].ExactIdentity, "server:entry:") {
 		t.Fatalf("Player playable detail invalid err=%v data=%s", err, detailEnvelope.Data)
 	}
 	var entry models.MediaLibraryEntry
@@ -868,7 +883,7 @@ func TestPlayerDeviceAuthenticationIsRevocableAndIsolatedFromBrowserAdmin(t *tes
 			t.Fatalf("%s Player stream status=%d location=%q", method, streamResponse.Code, streamResponse.Header().Get("Location"))
 		}
 	}
-	if err := client.db.Model(&models.MediaArtifact{}).Where("source_identity = ?", "entry:"+uintString(entry.ID)).Update("active", false).Error; err != nil {
+	if err := client.db.Model(&models.MediaLibraryEntry{}).Where("id = ?", entry.ID).Update("provider_id", "outside-video").Error; err != nil {
 		t.Fatal(err)
 	}
 	unavailableRequest := httptest.NewRequest(http.MethodGet, "/api/v1/player/media-entries/"+uintString(entry.ID)+"/stream", nil)
@@ -876,7 +891,7 @@ func TestPlayerDeviceAuthenticationIsRevocableAndIsolatedFromBrowserAdmin(t *tes
 	unavailableResponse := httptest.NewRecorder()
 	client.router.ServeHTTP(unavailableResponse, unavailableRequest)
 	if unavailableResponse.Code != http.StatusNotFound || unavailableResponse.Header().Get("Location") != "" {
-		t.Fatalf("unavailable Player stream status=%d location=%q body=%s", unavailableResponse.Code, unavailableResponse.Header().Get("Location"), unavailableResponse.Body.String())
+		t.Fatalf("out-of-root Player stream status=%d location=%q body=%s", unavailableResponse.Code, unavailableResponse.Header().Get("Location"), unavailableResponse.Body.String())
 	}
 
 	management := httptest.NewRequest(http.MethodGet, "/api/v1/dashboard", nil)

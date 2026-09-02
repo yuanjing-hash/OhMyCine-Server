@@ -885,7 +885,7 @@ func providerParentWithinRoot(ctx context.Context, driver cloudpkg.Driver, paren
 		if current == rootID {
 			return true, nil
 		}
-		item, err := driver.Stat(cloudpkg.WithReadClass(ctx, cloudpkg.ReadClassBackground), current)
+		item, err := driver.Stat(ctx, current)
 		if err != nil {
 			return false, err
 		}

@@ -103,12 +103,18 @@ func playbackClientFingerprint(remoteAddr, userAgent string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func (p *pan115PlaybackCoordinator) Resolve(ctx context.Context, opaque string, target signedProxyTarget, userAgent, clientFingerprint string, driver cloudpkg.Driver) (cloudpkg.TemporaryURL, error) {
+func (p *pan115PlaybackCoordinator) Resolve(ctx context.Context, opaque string, target signedProxyTarget, userAgent, clientFingerprint string, driver cloudpkg.Driver, verifiedItem *cloudpkg.Item) (cloudpkg.TemporaryURL, error) {
 	if len(clientFingerprint) != sha256.Size*2 {
 		return cloudpkg.TemporaryURL{}, appError(CodeProxyTargetUnavailable, "播放设备标识无效", nil)
 	}
-	source, err := driver.Stat(ctx, target.ProviderItemID)
-	if err != nil || source.IsDir || strings.TrimSpace(source.PickCode) == "" {
+	source := cloudpkg.Item{}
+	var err error
+	if verifiedItem != nil {
+		source = *verifiedItem
+	} else {
+		source, err = driver.Stat(ctx, target.ProviderItemID)
+	}
+	if err != nil || source.ID != target.ProviderItemID || source.IsDir || strings.TrimSpace(source.PickCode) == "" {
 		return cloudpkg.TemporaryURL{}, appError(CodeProxyTargetUnavailable, "播放目标不可用", err)
 	}
 	lease, err := p.acquireLease(opaque, clientFingerprint, target.ConnectionID, source.ID)

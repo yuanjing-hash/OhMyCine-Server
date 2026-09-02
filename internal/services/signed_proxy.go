@@ -385,8 +385,12 @@ func (s *SignedProxyService) verify(opaque, keyID string, expiry int64, signatur
 }
 
 func (s *SignedProxyService) resolveTarget(ctx context.Context, opaque string, target signedProxyTarget, userAgent, clientFingerprint string) (ProxyRedirect, error) {
+	return s.resolveTargetWithItem(ctx, opaque, target, userAgent, clientFingerprint, nil)
+}
+
+func (s *SignedProxyService) resolveTargetWithItem(ctx context.Context, opaque string, target signedProxyTarget, userAgent, clientFingerprint string, verifiedItem *cloudpkg.Item) (ProxyRedirect, error) {
 	now := s.now()
-	cacheKey := proxyCacheKey(target.ConnectionID, opaque, userAgent+":"+clientFingerprint)
+	cacheKey := proxyCacheKey(target.ConnectionID, opaque, target.ProviderItemID, userAgent+":"+clientFingerprint)
 	if cached, ok := s.cached(cacheKey, now); ok {
 		return cached, nil
 	}
@@ -394,7 +398,7 @@ func (s *SignedProxyService) resolveTarget(ctx context.Context, opaque string, t
 		if cached, ok := s.cached(cacheKey, s.now()); ok {
 			return cached, nil
 		}
-		redirect, err := s.resolveProvider(ctx, opaque, target, userAgent, clientFingerprint)
+		redirect, err := s.resolveProvider(ctx, opaque, target, userAgent, clientFingerprint, verifiedItem)
 		if err != nil {
 			return ProxyRedirect{}, err
 		}
@@ -438,17 +442,23 @@ func (s *SignedProxyService) proxyTarget(opaque string) (signedProxyTarget, erro
 	return target, nil
 }
 
-func (s *SignedProxyService) resolveProvider(ctx context.Context, opaque string, target signedProxyTarget, userAgent, clientFingerprint string) (ProxyRedirect, error) {
+func (s *SignedProxyService) resolveProvider(ctx context.Context, opaque string, target signedProxyTarget, userAgent, clientFingerprint string, verifiedItem *cloudpkg.Item) (ProxyRedirect, error) {
 	_, driver, err := s.connections.driver(target.ConnectionID)
 	if err != nil || !driver.Capabilities().TemporaryDirectURL {
 		return ProxyRedirect{}, appError(CodeProxyTargetUnavailable, "播放目标不可用", err)
 	}
 	var temporary cloudpkg.TemporaryURL
 	if target.StorageType == models.StorageTypePan115 && s.playback != nil {
-		temporary, err = s.playback.Resolve(ctx, opaque, target, userAgent, clientFingerprint, driver)
+		temporary, err = s.playback.Resolve(ctx, opaque, target, userAgent, clientFingerprint, driver, verifiedItem)
 	} else {
-		item, statErr := driver.Stat(ctx, target.ProviderItemID)
-		if statErr != nil || item.IsDir || strings.TrimSpace(item.PickCode) == "" {
+		item := cloudpkg.Item{}
+		var statErr error
+		if verifiedItem != nil {
+			item = *verifiedItem
+		} else {
+			item, statErr = driver.Stat(ctx, target.ProviderItemID)
+		}
+		if statErr != nil || item.ID != target.ProviderItemID || item.IsDir || strings.TrimSpace(item.PickCode) == "" {
 			return ProxyRedirect{}, appError(CodeProxyTargetUnavailable, "播放目标不可用", statErr)
 		}
 		temporary, err = driver.DirectURL(ctx, cloudpkg.DirectURLRequest{FileID: item.ID, PickCode: item.PickCode, UserAgent: userAgent})
@@ -508,9 +518,9 @@ func hmacSHA256(secret, message []byte) []byte {
 	return mac.Sum(nil)
 }
 
-func proxyCacheKey(connectionID uint, opaque, userAgent string) string {
-	ua := sha256.Sum256([]byte(userAgent))
-	return strconv.FormatUint(uint64(connectionID), 10) + ":" + opaque + ":" + base64.RawURLEncoding.EncodeToString(ua[:])
+func proxyCacheKey(connectionID uint, opaque, providerItemID, userAgent string) string {
+	scope := sha256.Sum256([]byte(providerItemID + "\x00" + userAgent))
+	return strconv.FormatUint(uint64(connectionID), 10) + ":" + opaque + ":" + base64.RawURLEncoding.EncodeToString(scope[:])
 }
 
 func (s *SignedProxyService) cached(key string, now time.Time) (ProxyRedirect, bool) {

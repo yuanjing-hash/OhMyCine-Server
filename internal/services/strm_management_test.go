@@ -37,7 +37,11 @@ func strmManagementFixture(t *testing.T) (*STRMManagementService, *QueueService,
 		t.Fatal(err)
 	}
 	root := t.TempDir()
-	storage := models.Storage{Name: "Cloud", NameNormalized: "strm-cloud", Type: models.StorageTypePan115, RootPath: "root", RootDisplayPath: "/", RootPathNormalized: "strm:root", Enabled: true, Capabilities: "{}"}
+	connection := models.Connection{Name: "STRM Cloud", NameNormalized: "strm-cloud", Provider: "pan115", CredentialCiphertext: "fixture", Enabled: true, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()}
+	if err := db.Create(&connection).Error; err != nil {
+		t.Fatal(err)
+	}
+	storage := models.Storage{Name: "Cloud", NameNormalized: "strm-cloud", Type: models.StorageTypePan115, RootPath: "root", RootDisplayPath: "/", RootPathNormalized: "strm:root", ConnectionID: &connection.ID, Enabled: true, Capabilities: "{}"}
 	if err := db.Create(&storage).Error; err != nil {
 		t.Fatal(err)
 	}
@@ -203,7 +207,7 @@ func TestSTRMManagementReconcileUsesDurableQueue(t *testing.T) {
 		t.Fatalf("duplicate job=%s, want coalesced %s", duplicate.ID, job.ID)
 	}
 	var jobCount int64
-	if err := service.db.Model(&models.Job{}).Where("job_type = ? AND resource_key = ?", JobTypeSTRMReconcile, "library:"+strconv.FormatUint(uint64(library.ID), 10)).Count(&jobCount).Error; err != nil || jobCount != 1 {
+	if err := service.db.Model(&models.Job{}).Where("job_type = ? AND resource_key = ?", JobTypeSTRMReconcile, strmReconcileResourceKey(library.ID)).Count(&jobCount).Error; err != nil || jobCount != 1 {
 		t.Fatalf("jobs=%d err=%v", jobCount, err)
 	}
 	claimed, err := queue.Claim([]string{JobTypeSTRMReconcile})
@@ -216,6 +220,63 @@ func TestSTRMManagementReconcileUsesDurableQueue(t *testing.T) {
 	}
 	if payload.LibraryID != library.ID || payload.Mode != "full" {
 		t.Fatalf("payload=%+v", payload)
+	}
+}
+
+func TestSTRMManagementReconcileImmediatelySchedulesCurrentCatalogWithoutRepairLockContention(t *testing.T) {
+	service, queue, actor, library, _ := strmManagementFixture(t)
+	service.artifacts = NewMediaArtifactService(service.db, queue, &SignedProxyService{}, zerolog.Nop())
+	if err := service.db.Model(&models.MediaLibrary{}).Where("id = ?", library.ID).Updates(map[string]any{
+		"baseline_generation":         3,
+		"artifact_generation":         2,
+		"artifact_applied_generation": 2,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	repair, err := queue.Enqueue(EnqueueJobInput{
+		System:      true,
+		JobType:     JobTypeMediaLibraryRepair,
+		DisplayName: "fixture repair",
+		Provider:    "media_library",
+		ResourceKey: "library:" + strconv.FormatUint(uint64(library.ID), 10),
+		Payload:     map[string]any{"library_id": library.ID},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimedRepair, err := queue.Claim([]string{JobTypeMediaLibraryRepair})
+	if err != nil || claimedRepair == nil || claimedRepair.Job.ID != repair.ID {
+		t.Fatalf("repair claim=%+v err=%v", claimedRepair, err)
+	}
+
+	strmJob, err := service.RequestReconcile(actor, library.ID, "incremental")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strmJob.ResourceKey != strmReconcileResourceKey(library.ID) || strmJob.Priority != 100 {
+		t.Fatalf("STRM job=%+v", strmJob)
+	}
+	var run models.MediaArtifactRun
+	if err := service.db.Where("library_id = ? AND generation = ?", library.ID, 3).First(&run).Error; err != nil {
+		t.Fatalf("current catalog artifact run was not created immediately: %v", err)
+	}
+	if run.Status != models.MediaArtifactStatusQueued {
+		t.Fatalf("artifact run status=%q", run.Status)
+	}
+	var artifactJob models.Job
+	if err := service.db.First(&artifactJob, "job_type = ?", JobTypeMediaArtifact).Error; err != nil {
+		t.Fatal(err)
+	}
+	if artifactJob.ResourceKey != mediaArtifactResourceKey(library.ID) || artifactJob.Priority != 100 {
+		t.Fatalf("artifact job=%+v", artifactJob)
+	}
+	claimedArtifact, err := queue.Claim([]string{JobTypeMediaArtifact})
+	if err != nil || claimedArtifact == nil || claimedArtifact.Job.ID != artifactJob.ID {
+		t.Fatalf("artifact was blocked by active repair: claim=%+v err=%v", claimedArtifact, err)
+	}
+	claimedSTRM, err := queue.Claim([]string{JobTypeSTRMReconcile})
+	if err != nil || claimedSTRM == nil || claimedSTRM.Job.ID != strmJob.ID {
+		t.Fatalf("STRM reconcile was blocked by active repair: claim=%+v err=%v", claimedSTRM, err)
 	}
 }
 

@@ -22,6 +22,7 @@ Use this contract for Server jobs that perform discrete, restart-safe automation
 - Type capacity and optional resource-key capacity derive from unexpired running leases, so provider A cannot exhaust provider B's slots.
 - `QueueService.Claim(nil)` may scan every policy for maintenance and deterministic service tests. `Scheduler` must therefore return without claiming when `WorkerRegistry.Types()` is empty; an empty runtime registry means no executable work, not "all job types". This keeps production jobs queued until their real adapters are registered.
 - `media_artifact` payload contains only `artifact_run_id`. Its private run policy binds library/generation/output root and target kind; one coalescing key per library points the active Job at the newest queued generation, and an older running generation stops at the next file boundary without blocking watchers.
+- Resource keys express only real mutual exclusion. Media-library structure repair keeps `library:<id>`, explicit STRM reconciliation uses `strm-library:<id>`, and artifact generation uses `media-artifact-library:<id>`. The latter two are high-priority user-visible convergence work and must remain claimable while a long structure repair for the same library is running; coalescing and per-type resource concurrency still serialize each domain per library.
 
 ## Private state and public DTOs
 
@@ -33,6 +34,7 @@ Use this contract for Server jobs that perform discrete, restart-safe automation
 ## Required verification
 
 - Exercise concurrency caps, resource fairness, complete-lane reorder conflicts, stale leases, checkpoint persistence, action-version rejection, retry promotion, expired-lease recovery, coalescing generation and running interrupt acknowledgement.
+- Hold a running `media_library_repair` Job for one library, enqueue its explicit STRM reconcile and current-generation artifact jobs, and assert both remain claimable under their domain-specific resource keys.
 - Exercise an empty Scheduler registry and assert that queued jobs remain queued with zero attempts. Also place more than 64 jobs for a capacity-blocked resource ahead of another runnable resource to prevent bounded candidate scans from reintroducing provider starvation.
 - Verify operator grants read/control/respond/reorder; viewer receives no task-center permission; policy mutation remains administrator-only by default.
 - Run repeated queue service tests, HTTP RBAC tests, Web UI test/typecheck/lint/build, embedded build and the Windows `./test.ps1` gate.
@@ -99,6 +101,70 @@ Wrong:
 ```go
 // Generic coalescing mutates the active Job generation.
 queue.Enqueue(EnqueueJobInput{ResourceKey: resource, CoalescingKey: "scheduled"})
+```
+
+## Scenario: Established provider monitoring is not a queue retry
+
+### 1. Scope / Trigger
+
+- Applies when a durable provider-backed Job already stores a real provider task identity and polling temporarily cannot reach that provider.
+- This distinction prevents connectivity polling from consuming submission attempts or creating duplicate provider work.
+
+### 2. Signatures
+
+- `DownloadWorker.Run(ctx, runtime, claimedJob) WorkerResult` keeps retryable `Client.Get` failures inside the active Worker when `provider_task_id` is a real qBittorrent hash.
+- `QueueService.RecoverExpiredLeases() error` budgets only consecutive attempts whose `safe_error_code` is `worker_lease_expired`.
+- A monitoring wait returns neither `WorkerResult.RetryAt` nor a new queue claim; a genuine expired Worker lease returns the Job through normal recovery.
+
+### 3. Contracts
+
+- An established provider identity is non-empty and does not have the temporary `tag:` prefix.
+- Retryable provider unavailability updates only safe DownloadTask connectivity diagnostics while the Job stays `running` under the same lease and attempt.
+- Provider recovery queries the same identity, clears only recoverable connectivity diagnostics, and never calls `Submit`.
+- Submission failure before a real identity exists may use delayed queue retry and must first attempt stable-tag adoption.
+- Process loss may produce one new Claim after lease recovery; unrelated historical retries do not consume the consecutive lease-expiry budget.
+
+### 4. Validation & Error Matrix
+
+| Condition | Required result |
+| --- | --- |
+| Real hash + retryable qBittorrent `Get` error | Context-aware wait, same running Job and attempt |
+| Real hash + provider recovers | Continue the same hash, clear temporary diagnostics, zero Submit calls |
+| No real identity + retryable submit error | Delayed queue retry with stable-tag adoption |
+| Context cancelled during monitoring wait | Exit promptly without completion, failure, or retry scheduling |
+| Authentication failure, task missing, or provider terminal failure | Preserve the adapter's explicit terminal semantics |
+| Genuine Worker lease expires | Recover by consecutive lease-expiry policy and resume from the stored identity |
+
+### 5. Good / Base / Bad Cases
+
+- Good: qBittorrent is stopped and restarted; one Job remains `running`, `attempt_count` stays unchanged, and its original hash resumes telemetry.
+- Base: Server itself restarts; the expired lease is reclaimed once and the stored hash is reused.
+- Bad: every connection error returns `RetryAt`, increments attempts, eventually writes `failed/worker_lease_expired`, or resubmits the torrent.
+
+### 6. Tests Required
+
+- Return multiple retryable `Get` errors followed by a successful sample; assert one JobAttempt, unchanged `attempt_count`, original hash and zero Submit calls.
+- Cancel the context after `provider_status=unavailable`; assert the Job is still `running` with one attempt before cancellation and the Worker exits promptly.
+- Seed a legacy false terminal and assert consecutive lease-expiry recovery reclaims it without Submit; separately assert a true consecutive-expiry limit remains terminal.
+
+### 7. Wrong vs Correct
+
+Wrong:
+
+```go
+if retryable {
+    return WorkerResult{RetryAt: ptr(time.Now().Add(backoff))}
+}
+```
+
+Correct:
+
+```go
+if retryable && isEstablishedProviderTask(task.ProviderTaskID) {
+    markProviderReconnectWait(&task, code, message)
+    if err := waitForProviderReconnect(ctx); err != nil { return WorkerResult{} }
+    continue // same Worker, lease, attempt, and provider hash
+}
 ```
 
 Correct:

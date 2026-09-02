@@ -29,6 +29,10 @@ import (
 
 const JobTypeSTRMReconcile = "strm_reconcile"
 
+func strmReconcileResourceKey(libraryID uint) string {
+	return "strm-library:" + strconv.FormatUint(uint64(libraryID), 10)
+}
+
 const cleanupClaimOperation = "artifact_cleanup"
 
 type STRMLibraryOverview struct {
@@ -237,6 +241,14 @@ func (s *STRMManagementService) RequestReconcile(actor Actor, libraryID uint, mo
 	if !library.Enabled || !library.STRMEnabled {
 		return JobDTO{}, appError(CodeConflict, "媒体库未启用 STRM", nil)
 	}
+	// Generate from the already committed catalog immediately. The queued scan
+	// remains as a consistency pass for provider changes that have not reached
+	// the catalog yet, and will coalesce a newer generation when necessary.
+	if s.artifacts != nil && library.BaselineGeneration > 0 && library.ArtifactAppliedGeneration < library.BaselineGeneration {
+		if err := s.artifacts.ScheduleGeneration(library.ID, library.BaselineGeneration); err != nil {
+			return JobDTO{}, err
+		}
+	}
 	label := "增量"
 	if mode == "full" {
 		label = "全量"
@@ -244,7 +256,7 @@ func (s *STRMManagementService) RequestReconcile(actor Actor, libraryID uint, mo
 	// Repeated clicks for the same library and mode represent the same desired
 	// reconciliation. Keep full and incremental requests distinct so a queued
 	// incremental refresh can never silently swallow a later full rebuild.
-	return s.queue.Enqueue(EnqueueJobInput{System: true, JobType: JobTypeSTRMReconcile, DisplayName: fmt.Sprintf("STRM %s刷新 · %s", label, library.Name), Provider: "media_library", ResourceKey: "library:" + strconv.FormatUint(uint64(libraryID), 10), CoalescingKey: "manual_" + mode, Payload: strmReconcilePayload{LibraryID: libraryID, Mode: mode}})
+	return s.queue.Enqueue(EnqueueJobInput{System: true, JobType: JobTypeSTRMReconcile, Priority: 100, DisplayName: fmt.Sprintf("STRM %s刷新 · %s", label, library.Name), Provider: "media_library", ResourceKey: strmReconcileResourceKey(libraryID), CoalescingKey: "manual_" + mode, Payload: strmReconcilePayload{LibraryID: libraryID, Mode: mode}})
 }
 
 func (s *STRMManagementService) RetryRun(actor Actor, runID string) error {

@@ -879,8 +879,9 @@ func snapshotTree(t *testing.T, root string) map[string]treeItemSnapshot {
 func TestPan115MediaLibraryScanKeepsFileIdentityAcrossRename(t *testing.T) {
 	modified := time.Now().UTC().Truncate(time.Second)
 	driver := &fakeCloudDriver{
-		items:    map[string]cloud.Item{"cloud-root": {ID: "cloud-root", ParentID: "0", Name: "媒体", IsDir: true}},
-		children: map[string][]cloud.Item{"cloud-root": {{ID: "video-id", ParentID: "cloud-root", Name: "Before.2026.mkv", Size: 128, ModifiedAt: modified}}},
+		signedProxy: true,
+		items:       map[string]cloud.Item{"cloud-root": {ID: "cloud-root", ParentID: "0", Name: "媒体", IsDir: true}},
+		children:    map[string][]cloud.Item{"cloud-root": {{ID: "video-id", ParentID: "cloud-root", Name: "Before.2026.mkv", Size: 128, ModifiedAt: modified}}},
 	}
 	db, _, connections, actor := newConnectionTestService(t, driver)
 	for _, permission := range []string{authz.PermissionMediaLibrariesRead, authz.PermissionMediaLibrariesCreate, authz.PermissionMediaLibrariesScan} {
@@ -902,14 +903,26 @@ func TestPan115MediaLibraryScanKeepsFileIdentityAcrossRename(t *testing.T) {
 	}
 	service := NewMediaLibraryService(db, NewAuditService(db), zerolog.Nop())
 	service.SetConnectionService(connections)
+	queue := NewQueueService(db, NewAuditService(db))
+	artifacts := NewMediaArtifactService(db, queue, &SignedProxyService{}, zerolog.Nop())
+	service.SetArtifactService(artifacts)
 	t.Cleanup(service.Close)
-	library, err := service.Create(context.Background(), actor, MediaLibraryInput{Name: "115 media", StorageID: storage.ID, ProfileID: profile.ID, RelativeRoot: "/", ProviderRootID: storage.RootPath, Enabled: false, Recursive: true, VideoExtensions: []string{".mkv"}, TransferMode: models.MediaLibraryTransferCopy}, RequestContext{})
+	metadataArtifacts := true
+	library, err := service.Create(context.Background(), actor, MediaLibraryInput{Name: "115 media", StorageID: storage.ID, ProfileID: profile.ID, RelativeRoot: "/", ProviderRootID: storage.RootPath, Enabled: false, Recursive: true, VideoExtensions: []string{".mkv"}, STRMEnabled: true, STRMLocalRoot: t.TempDir(), MetadataArtifactsEnabled: &metadataArtifacts, TransferMode: models.MediaLibraryTransferCopy}, RequestContext{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	first, err := service.ScanNow(context.Background(), actor, library.ID)
 	if err != nil || first.Added != 1 {
 		t.Fatalf("first=%+v err=%v", first, err)
+	}
+	var firstArtifactRun models.MediaArtifactRun
+	if err := db.Where("library_id = ? AND generation = ?", library.ID, first.Generation).First(&firstArtifactRun).Error; err != nil || firstArtifactRun.Status != models.MediaArtifactStatusQueued {
+		t.Fatalf("115 scan did not immediately schedule artifact generation: run=%+v err=%v", firstArtifactRun, err)
+	}
+	var firstArtifactJob models.Job
+	if err := db.First(&firstArtifactJob, "job_type = ?", JobTypeMediaArtifact).Error; err != nil || firstArtifactJob.ResourceKey != mediaArtifactResourceKey(library.ID) {
+		t.Fatalf("115 scan artifact job=%+v err=%v", firstArtifactJob, err)
 	}
 	driver.children["cloud-root"] = []cloud.Item{{ID: "video-id", ParentID: "cloud-root", Name: "After.2026.mkv", Size: 128, ModifiedAt: modified}}
 	second, err := service.ScanNow(context.Background(), actor, library.ID)

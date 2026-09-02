@@ -30,6 +30,10 @@ import (
 
 const JobTypeMediaArtifact = "media_artifact"
 
+func mediaArtifactResourceKey(libraryID uint) string {
+	return fmt.Sprintf("media-artifact-library:%d", libraryID)
+}
+
 type mediaArtifactPolicy struct {
 	LibraryID              uint     `json:"library_id"`
 	Generation             uint64   `json:"generation"`
@@ -172,7 +176,7 @@ func (s *MediaArtifactService) ScheduleGeneration(libraryID uint, generation uin
 	if run.Status == models.MediaArtifactStatusCompleted || run.Status == models.MediaArtifactStatusRunning {
 		return nil
 	}
-	job, err := s.queue.Enqueue(EnqueueJobInput{System: true, JobType: JobTypeMediaArtifact, Priority: 0, DisplayName: fmt.Sprintf("媒体产物 · 媒体库 %d", library.ID), Provider: "media_library", ResourceKey: fmt.Sprintf("library:%d", library.ID), CoalescingKey: "latest_generation", Payload: mediaArtifactJobPayload{ArtifactRunID: run.ID}})
+	job, err := s.queue.Enqueue(EnqueueJobInput{System: true, JobType: JobTypeMediaArtifact, Priority: 100, DisplayName: fmt.Sprintf("媒体产物 · 媒体库 %d", library.ID), Provider: "media_library", ResourceKey: mediaArtifactResourceKey(library.ID), CoalescingKey: "latest_generation", Payload: mediaArtifactJobPayload{ArtifactRunID: run.ID}})
 	if err != nil {
 		_ = s.failRun(run.ID, "artifact_enqueue_failed")
 		return err
