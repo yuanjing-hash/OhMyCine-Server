@@ -62,6 +62,7 @@ func New(cfg config.Config, api *handlers.API, auth *services.AuthService, log z
 	playerProtected.GET("/discovery/images/:provider/:token", middleware.RequirePermission(authz.PermissionDiscoveryRead), api.DiscoveryImage)
 	playerProtected.GET("/discovery/media/:mediaType/:tmdbID/coverage", middleware.RequirePermission(authz.PermissionDiscoveryRead), middleware.RequirePermission(authz.PermissionMediaLibrariesRead), api.DiscoveryMediaCoverage)
 	playerProtected.GET("/discovery/media/:mediaType/:tmdbID/acquisition", middleware.RequirePermission(authz.PermissionDiscoveryRead), api.MediaAcquisition)
+	playerProtected.GET("/discovery/acquisitions", middleware.RequirePermission(authz.PermissionDiscoveryRead), api.MediaAcquisitions)
 	playerProtected.GET("/discovery/search-options", middleware.RequirePermission(authz.PermissionDiscoveryRead), api.DiscoverySearchOptions)
 	playerProtected.GET("/discovery/torrent-search", middleware.RequirePermission(authz.PermissionDiscoveryRead), api.TorrentSearch)
 	playerProtected.GET("/discovery/torrent-search/stream", middleware.RequirePermission(authz.PermissionDiscoveryRead), api.TorrentSearchStream)

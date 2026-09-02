@@ -270,6 +270,7 @@ func newTestClient(t *testing.T) *testClient {
 	sites := services.NewSiteServiceWithAdapters(db, audit, credentialStore, downloads, []sitepkg.Adapter{routerSiteAdapter{}}, log)
 	sites.SetMetadataSettings(metadataSettings)
 	api.SetSiteService(sites)
+	api.SetAcquisitionService(services.NewAcquisitionService(db))
 	transfers := services.NewTransferService(db, audit, queue, log)
 	seeding := services.NewSeedingService(db, audit, queue, downloaders, log)
 	transfers.SetSeedingService(seeding)
@@ -284,6 +285,64 @@ func newTestClient(t *testing.T) *testClient {
 	api.SetSeedingService(seeding)
 	api.SetPluginRepositoryService(services.NewPluginRepositoryService(db, audit, nil, log))
 	return &testClient{router: New(cfg, api, auth, log), queue: queue, db: db, connections: connections, signedProxy: signedProxy, embyGateway: embyGateway, changes: changes, sites: sites}
+}
+
+func TestPlayerAcquisitionListRequiresDeviceAuthScopesOwnerAndValidatesInput(t *testing.T) {
+	client := newTestClient(t)
+	status, _, _ := client.playerRequest(t, http.MethodGet, "/api/v1/player/discovery/acquisitions", "", nil)
+	if status != http.StatusUnauthorized {
+		t.Fatalf("anonymous acquisition list status=%d", status)
+	}
+	client.setup(t)
+	status, loginEnvelope, _ := client.playerRequest(t, http.MethodPost, "/api/v1/player/auth/login", "", map[string]any{
+		"username": "owner", "password": "strong-owner-password",
+		"device_id": "acquisition-list-device", "device_name": "Acquisition List Player",
+	})
+	var login struct {
+		AccessToken string `json:"access_token"`
+	}
+	if err := json.Unmarshal(loginEnvelope.Data, &login); status != http.StatusOK || err != nil || login.AccessToken == "" {
+		t.Fatalf("login status=%d err=%v data=%s", status, err, loginEnvelope.Data)
+	}
+	var owner models.User
+	if err := client.db.Where("username_normalized = ?", "owner").First(&owner).Error; err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	foreignUser := models.User{Username: "acquisition-foreign", UsernameNormalized: "acquisition-foreign", DisplayName: "Acquisition Foreign", PasswordHash: "unused", Status: models.UserStatusActive, AuthzVersion: 1, CreatedAt: now, UpdatedAt: now}
+	if err := client.db.Create(&foreignUser).Error; err != nil {
+		t.Fatal(err)
+	}
+	rows := []models.MediaAcquisition{
+		{ID: "owner-acquisition", OwnerID: owner.ID, MediaType: "movie", TMDBID: 346, Stage: "download", Status: "queued", FrozenSnapshotJSON: `{}`, Revision: 1, CreatedAt: now, UpdatedAt: now},
+		{ID: "foreign-acquisition", OwnerID: foreignUser.ID, MediaType: "tv", TMDBID: 999, Stage: "download", Status: "queued", FrozenSnapshotJSON: `{}`, Revision: 1, CreatedAt: now, UpdatedAt: now},
+	}
+	if err := client.db.Create(&rows).Error; err != nil {
+		t.Fatal(err)
+	}
+	status, envelope, headers := client.playerRequest(t, http.MethodGet, "/api/v1/player/discovery/acquisitions?page=1&page_size=10", login.AccessToken, nil)
+	if status != http.StatusOK || headers.Get("Cache-Control") != "no-store" || bytes.Contains(envelope.Data, []byte("foreign-acquisition")) {
+		t.Fatalf("acquisition list status=%d cache=%q data=%s", status, headers.Get("Cache-Control"), envelope.Data)
+	}
+	var page services.AcquisitionPage
+	if err := json.Unmarshal(envelope.Data, &page); err != nil || page.Total != 1 || len(page.List) != 1 || page.List[0].ID != "owner-acquisition" {
+		t.Fatalf("acquisition page=%+v err=%v data=%s", page, err, envelope.Data)
+	}
+	for _, path := range []string{
+		"/api/v1/player/discovery/acquisitions?page=zero&page_size=10",
+		"/api/v1/player/discovery/acquisitions?page=1&page_size=101",
+	} {
+		status, envelope, _ = client.playerRequest(t, http.MethodGet, path, login.AccessToken, nil)
+		if status != http.StatusBadRequest || !bytes.Contains(envelope.Data, []byte(services.CodeInvalidRequest)) {
+			t.Fatalf("invalid path=%q status=%d data=%s", path, status, envelope.Data)
+		}
+	}
+	status, envelope, _ = client.playerRequest(t, http.MethodPost, "/api/v1/player/discovery/downloads", login.AccessToken, map[string]any{
+		"result_token": "unused", "downloader_id": "unused", "expected_tmdb_id": 346,
+	})
+	if status != http.StatusBadRequest || !bytes.Contains(envelope.Data, []byte(services.CodeInvalidRequest)) {
+		t.Fatalf("partial expected identity status=%d data=%s", status, envelope.Data)
+	}
 }
 
 func TestFollowRoutesRequireAuthenticationPermissionsAndNoStore(t *testing.T) {

@@ -559,6 +559,59 @@ func TestMediaIdentitySearchAggregatesAliasesDeduplicatesAndBindsVerifiedIdentit
 	}
 }
 
+func TestBindExpectedIdentityFreezesMatchingClaimAndRejectsMismatchBeforeDownload(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/movie/346" {
+			http.NotFound(writer, request)
+			return
+		}
+		_, _ = writer.Write([]byte(`{"id":346,"title":"七武士","original_title":"Seven Samurai","original_language":"ja","release_date":"1954-04-26","alternative_titles":{"titles":[{"iso_3166_1":"US","title":"Seven Samurai"}]},"translations":{"translations":[]}}`))
+	}))
+	defer upstream.Close()
+
+	service, adapter, actor, store, _, _ := siteFixture(t)
+	metadata := NewMetadataSettingsService(service.db, service.audit, store, tmdb.Credential{Kind: tmdb.CredentialKindReadAccessToken, Value: "test-token"})
+	metadata.clientFactory = func(tmdb.Credential, string, string) (*tmdb.Client, error) {
+		return tmdb.NewForTest("test-token", upstream.URL, upstream.Client())
+	}
+	service.SetMetadataSettings(metadata)
+	created, err := service.Create(context.Background(), actor, validSiteInput("Expected identity", "https://expected-identity.example.test"), RequestContext{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	adapter.searchTitle = "Seven.Samurai.1954.1080p.BluRay.x265-GROUP"
+	groups, err := service.Search(context.Background(), actor, SiteSearchInput{Keyword: "Seven Samurai", SiteID: &created.ID, Page: 1})
+	if err != nil || len(groups) != 1 || len(groups[0].Items) != 1 {
+		t.Fatalf("matching groups=%+v err=%v", groups, err)
+	}
+	matchingToken := groups[0].Items[0].Token
+	if err := service.BindExpectedIdentity(context.Background(), actor, matchingToken, "movie", 346); err != nil {
+		t.Fatal(err)
+	}
+	claim, err := service.resolveClaim(matchingToken, actor.User.ID)
+	if err != nil || claim.ManualTMDBID == nil || *claim.ManualTMDBID != 346 || claim.ManualMediaType != "movie" || claim.RecognitionSource != mediaIdentitySourceDirectID || claim.RecognitionStatus != mediaIdentityStatusVerified {
+		t.Fatalf("bound claim=%+v err=%v", claim, err)
+	}
+
+	adapter.searchTitle = "Completely.Unrelated.Movie.2024.1080p.WEB-DL"
+	groups, err = service.Search(context.Background(), actor, SiteSearchInput{Keyword: "Unrelated", SiteID: &created.ID, Page: 1})
+	if err != nil || len(groups) != 1 || len(groups[0].Items) != 1 {
+		t.Fatalf("mismatch groups=%+v err=%v", groups, err)
+	}
+	mismatchToken := groups[0].Items[0].Token
+	if err := service.BindExpectedIdentity(context.Background(), actor, mismatchToken, "movie", 346); ErrorCode(err) != CodeSiteResultIdentityMismatch {
+		t.Fatalf("mismatch error=%v", err)
+	}
+	if adapter.downloads != 0 {
+		t.Fatalf("identity validation fetched torrent %d time(s)", adapter.downloads)
+	}
+	claim, err = service.resolveClaim(mismatchToken, actor.User.ID)
+	if err != nil || claim.ManualTMDBID != nil || claim.InFlight {
+		t.Fatalf("mismatch claim was mutated: claim=%+v err=%v", claim, err)
+	}
+}
+
 func TestMediaIdentityResultMatchesMultilingualReleaseTitle(t *testing.T) {
 	names := []tmdb.SearchName{
 		{Value: "迪迦奥特曼", Locale: "zh-CN", Kind: "localized"},

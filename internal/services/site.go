@@ -29,9 +29,10 @@ import (
 )
 
 const (
-	ptResultTTL                  = 15 * time.Minute
-	maxPTResultClaims            = 5000
-	defaultSiteSearchConcurrency = 4
+	ptResultTTL                    = 15 * time.Minute
+	maxPTResultClaims              = 5000
+	defaultSiteSearchConcurrency   = 4
+	CodeSiteResultIdentityMismatch = "site_result_identity_mismatch"
 )
 
 type SiteService struct {
@@ -803,6 +804,40 @@ func (s *SiteService) SearchOptions(actor Actor) ([]SiteSearchOption, error) {
 
 func (s *SiteService) SearchEach(ctx context.Context, actor Actor, input SiteSearchInput, emit func(SiteSearchGroup)) error {
 	return s.SearchEachProgress(ctx, actor, input, emit, nil)
+}
+
+// BindExpectedIdentity upgrades an actor-bound result claim with the TMDB
+// identity selected in Player. The title must still match one of TMDB's
+// bounded multilingual aliases, otherwise the download is rejected before
+// resolving the torrent or touching a downloader.
+func (s *SiteService) BindExpectedIdentity(ctx context.Context, actor Actor, resultToken, mediaType string, tmdbID int64) error {
+	if !actor.Can(authz.PermissionDownloadsCreate) || !actor.Can(authz.PermissionDiscoveryRead) {
+		return appError(CodePermissionDenied, "无权绑定入库媒体身份", nil)
+	}
+	mediaType = strings.ToLower(strings.TrimSpace(mediaType))
+	if tmdbID <= 0 || (mediaType != "movie" && mediaType != "tv") || s.metadata == nil {
+		return appError(CodeInvalidRequest, "入库媒体身份无效", nil)
+	}
+	token := strings.TrimSpace(resultToken)
+	claim, err := s.resolveAvailableClaim(token, actor.User.ID)
+	if err != nil {
+		return err
+	}
+	if !actor.CanResource(authz.PermissionDiscoveryRead, models.AuthorizationResourceSite, uintID(claim.SiteID)) {
+		return appError(CodePermissionDenied, "无权使用这个站点的搜索结果", nil)
+	}
+	client, err := s.metadata.Client()
+	if err != nil {
+		return appError(CodeTMDBUnavailable, "TMDB 详情服务暂时不可用", nil)
+	}
+	verified, names, err := client.IdentitySearchNames(ctx, mediaType, tmdbID, "zh-CN", tmdb.DefaultIdentitySearchNameLimit)
+	if err != nil {
+		return appError(tmdb.ErrorCode(err), "TMDB 作品身份无法解析", nil)
+	}
+	if len(names) == 0 || !mediaIdentityResultMatches(claim.Title, names, mediaType, verified.ReleaseYear, nil) {
+		return appError(CodeSiteResultIdentityMismatch, "所选资源与当前海报作品不匹配，请更换资源或使用 Server 手动识别", nil)
+	}
+	return s.bindClaimRecognition(token, actor.User.ID, tmdbID, mediaType, mediaIdentitySourceDirectID, mediaIdentityStatusVerified, false)
 }
 
 // SearchEachProgress streams independently completed Site groups and monotonic

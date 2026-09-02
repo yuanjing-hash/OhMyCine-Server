@@ -26,6 +26,9 @@ Use this contract when changing user authorization rules, Player bootstrap capab
 - Download, follow, transfer, and library projections advance the aggregate idempotently and survive restart.
 - Confirmation freezes downloader, target library, classification and follow options. Retries do not silently adopt new defaults.
 - Player and Server Web consume the same safe DTO. Resource-scoped denial hides inaccessible resource IDs while preserving a non-sensitive stage summary.
+- The Player acquisition list is owner-scoped and bounded-paginated. It must rebuild status from durable download, transfer, and follow records after restart rather than depending on process memory.
+- Safe progress fields may include download percentage, completed/total bytes, speed, ETA, and transfer file counts; titles and target library IDs remain subject to owner/resource visibility checks.
+- A poster-originated download may provide expected TMDB ID and media type only as a pair. Server resolves authoritative multilingual aliases and rejects an obvious title mismatch before reserving a claim, fetching a torrent, or invoking a downloader.
 - Never persist or return site credentials, upstream bodies, provider file identities, torrent URLs, local absolute paths, or temporary playback URLs in acquisition state.
 
 ## Required tests

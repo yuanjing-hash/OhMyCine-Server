@@ -14,6 +14,7 @@ import (
 
 type AcquisitionStatus struct {
 	ID                   string     `json:"id,omitempty"`
+	Title                string     `json:"title,omitempty"`
 	MediaType            string     `json:"media_type"`
 	TMDBID               int64      `json:"tmdb_id"`
 	Stage                string     `json:"stage"`
@@ -22,11 +23,23 @@ type AcquisitionStatus struct {
 	FollowSubscriptionID string     `json:"follow_subscription_id,omitempty"`
 	TargetLibraryID      *uint      `json:"target_library_id,omitempty"`
 	TransferTaskID       string     `json:"transfer_task_id,omitempty"`
+	Progress             *float64   `json:"progress,omitempty"`
+	BytesCompleted       *int64     `json:"bytes_completed,omitempty"`
+	BytesTotal           *int64     `json:"bytes_total,omitempty"`
+	DownloadSpeed        *int64     `json:"download_speed,omitempty"`
+	ETASeconds           *int64     `json:"eta_seconds,omitempty"`
 	ProcessedFiles       int        `json:"processed_files,omitempty"`
 	TotalFiles           int        `json:"total_files,omitempty"`
 	LastErrorCode        string     `json:"last_error_code"`
 	Revision             uint64     `json:"revision"`
 	UpdatedAt            *time.Time `json:"updated_at,omitempty"`
+}
+
+type AcquisitionPage struct {
+	List     []AcquisitionStatus `json:"list"`
+	Total    int64               `json:"total"`
+	Page     int                 `json:"page"`
+	PageSize int                 `json:"page_size"`
 }
 
 type AcquisitionService struct{ db *gorm.DB }
@@ -45,11 +58,44 @@ func (s *AcquisitionService) Get(actor Actor, mediaType string, tmdbID int64) (A
 		}
 		return AcquisitionStatus{}, err
 	}
-	// Re-project current durable domain facts so process restarts never strand
-	// the Player on a stale in-memory state.
+	return s.project(actor, row)
+}
+
+func (s *AcquisitionService) List(actor Actor, page, pageSize int) (AcquisitionPage, error) {
+	if !actor.HasPermission(authz.PermissionDiscoveryRead) {
+		return AcquisitionPage{}, appError(CodePermissionDenied, "无权查看入库任务", nil)
+	}
+	if page < 1 || page > 100000 || pageSize < 1 || pageSize > 100 {
+		return AcquisitionPage{}, appError(CodeInvalidRequest, "入库任务分页参数无效", nil)
+	}
+	query := s.db.Model(&models.MediaAcquisition{}).Where("owner_id = ?", actor.User.ID)
+	var total int64
+	if err := query.Count(&total).Error; err != nil {
+		return AcquisitionPage{}, err
+	}
+	var rows []models.MediaAcquisition
+	if err := query.Order("updated_at DESC, id DESC").Offset((page - 1) * pageSize).Limit(pageSize).Find(&rows).Error; err != nil {
+		return AcquisitionPage{}, err
+	}
+	items := make([]AcquisitionStatus, 0, len(rows))
+	for _, row := range rows {
+		item, err := s.project(actor, row)
+		if err != nil {
+			return AcquisitionPage{}, err
+		}
+		items = append(items, item)
+	}
+	return AcquisitionPage{List: items, Total: total, Page: page, PageSize: pageSize}, nil
+}
+
+// project rebuilds current state from durable task facts so process restarts
+// never strand Player clients on a stale acquisition row.
+func (s *AcquisitionService) project(actor Actor, row models.MediaAcquisition) (AcquisitionStatus, error) {
+	title := ""
 	if row.DownloadTaskID != "" {
 		var task models.DownloadTask
 		if err := s.db.First(&task, "id = ?", row.DownloadTaskID).Error; err == nil {
+			title = task.DisplayName
 			row.Stage, row.Status, row.LastErrorCode = acquisitionDownloadState(task), task.Phase, task.LastErrorCode
 			if row.TargetLibraryID == nil {
 				row.TargetLibraryID = task.TargetLibraryID
@@ -60,6 +106,8 @@ func (s *AcquisitionService) Get(actor Actor, mediaType string, tmdbID int64) (A
 				row.Status = transfer.Phase
 				row.LastErrorCode = transfer.LastErrorCode
 				status := acquisitionStatus(row)
+				status.Title = title
+				projectDownloadProgress(&status, task)
 				status.TransferTaskID = transfer.ID
 				status.ProcessedFiles = transfer.ProcessedFiles
 				status.TotalFiles = transfer.TotalFiles
@@ -76,14 +124,30 @@ func (s *AcquisitionService) Get(actor Actor, mediaType string, tmdbID int64) (A
 	if row.FollowSubscriptionID != "" && row.DownloadTaskID == "" {
 		var follow models.FollowSubscription
 		if err := s.db.First(&follow, "id = ?", row.FollowSubscriptionID).Error; err == nil {
+			title = follow.Title
 			row.Stage, row.Status, row.LastErrorCode = "subscription", follow.Status, follow.LastErrorCode
 		}
 	}
 	status := acquisitionStatus(row)
+	status.Title = title
+	if row.DownloadTaskID != "" {
+		var task models.DownloadTask
+		if err := s.db.First(&task, "id = ?", row.DownloadTaskID).Error; err == nil {
+			projectDownloadProgress(&status, task)
+		}
+	}
 	if status.TargetLibraryID != nil && !actor.CanResource(authz.PermissionMediaLibrariesRead, models.AuthorizationResourceMediaLibrary, uintID(*status.TargetLibraryID)) {
 		status.TargetLibraryID = nil
 	}
 	return status, nil
+}
+
+func projectDownloadProgress(status *AcquisitionStatus, task models.DownloadTask) {
+	status.Progress = cloneFloat64(task.Progress)
+	status.BytesCompleted = cloneInt64(task.BytesCompleted)
+	status.BytesTotal = cloneInt64(task.BytesTotal)
+	status.DownloadSpeed = cloneInt64(task.DownloadSpeed)
+	status.ETASeconds = cloneInt64(task.ETASeconds)
 }
 
 func (s *AcquisitionService) RecordDownload(ownerID uint, summary DownloadTaskSummary) error {

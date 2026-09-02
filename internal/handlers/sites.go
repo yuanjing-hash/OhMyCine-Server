@@ -395,15 +395,27 @@ func (a *API) CreateDiscoveryDownload(c *gin.Context) {
 	actor, _ := middleware.ActorFrom(c)
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 16<<10)
 	var payload struct {
-		ResultToken    string `json:"result_token"`
-		DownloaderID   string `json:"downloader_id"`
-		MediaLibraryID *uint  `json:"media_library_id"`
-		ProfileID      uint   `json:"profile_id"`
-		Priority       int    `json:"priority"`
+		ResultToken       string `json:"result_token"`
+		DownloaderID      string `json:"downloader_id"`
+		MediaLibraryID    *uint  `json:"media_library_id"`
+		ProfileID         uint   `json:"profile_id"`
+		Priority          int    `json:"priority"`
+		ExpectedTMDBID    *int64 `json:"expected_tmdb_id"`
+		ExpectedMediaType string `json:"expected_media_type"`
 	}
 	if err := strictJSON(c, &payload); err != nil {
 		writeError(c, a.log, invalid("种子资源下载参数无效", err))
 		return
+	}
+	if (payload.ExpectedTMDBID == nil) != (strings.TrimSpace(payload.ExpectedMediaType) == "") {
+		writeError(c, a.log, &services.AppError{Code: services.CodeInvalidRequest, Message: "期望媒体身份参数不完整"})
+		return
+	}
+	if payload.ExpectedTMDBID != nil {
+		if err := a.sites.BindExpectedIdentity(c.Request.Context(), actor, payload.ResultToken, payload.ExpectedMediaType, *payload.ExpectedTMDBID); err != nil {
+			writeError(c, a.log, err)
+			return
+		}
 	}
 	item, err := a.sites.Download(c.Request.Context(), actor, services.SiteDownloadInput{ResultToken: payload.ResultToken, DownloaderID: payload.DownloaderID, MediaLibraryID: payload.MediaLibraryID, ProfileID: payload.ProfileID, Priority: payload.Priority}, middleware.RequestContextFrom(c))
 	if err != nil {
