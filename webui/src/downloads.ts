@@ -48,6 +48,7 @@ export function formatETA(value: number | null): string {
 
 export function downloadStatusLabel(task: DownloadTaskSummary, retrying = false): string {
 	if (retrying) return '正在重试…'
+	if (task.job_status === 'running' && normalizedProviderStatus(task.provider_status) === 'unavailable') return '等待下载器恢复'
 	if (task.job_status === 'running' && normalizedProviderStatus(task.provider_status) === 'stalleddl') return '等待连接/暂无速度'
 	const phases: Record<string, string> = { submitting: '提交下载器', metadata: '获取 metadata', classifying: '轻量刮削', waiting_user_action: '准备自动归入未识别', categorized: '已指派分类', downloading: '正式下载', verifying: '完成后复核' }
 	if (task.job_status === 'running' && phases[task.phase]) return phases[task.phase]
@@ -59,6 +60,7 @@ export function downloadStatusClass(task: DownloadTaskSummary, retrying = false)
   if (retrying) return 'status-chip status-chip--planned'
   if (task.job_status === 'completed') return 'status-chip status-chip--ready'
   if (task.job_status === 'failed' || task.job_status === 'cancelled') return 'status-chip status-chip--error'
+  if (task.job_status === 'running' && normalizedProviderStatus(task.provider_status) === 'unavailable') return 'status-chip status-chip--warning'
   if (task.job_status === 'retry_wait' || task.job_status === 'waiting_user_action' || task.job_status === 'paused') return 'status-chip status-chip--warning'
   return 'status-chip status-chip--planned'
 }
@@ -91,6 +93,7 @@ export function downloadProviderStatusLabel(value: string): string {
     metadl: '正在获取元数据',
     queueddl: '等待下载队列',
     stalleddl: '等待连接/暂无速度',
+    unavailable: '等待 qBittorrent 恢复',
   }
   const normalized = normalizedProviderStatus(value)
   return labels[normalized] ?? (value || '尚未采样')

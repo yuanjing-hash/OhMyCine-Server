@@ -291,6 +291,18 @@ func main() {
 		logging.OperationServerLifecycle.Event(log.Fatal()).Err(err).Str("error_code", "scheduler_start_failed").Msg(logging.OperationServerLifecycle.Message("任务调度器启动失败"))
 	}
 	defer scheduler.Close()
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		cleaned, err := downloads.ReconcileManagedProviderTags(ctx, 200)
+		if err != nil {
+			logging.OperationDownloadTask.Event(log.Warn()).Str("error_code", services.ErrorCode(err)).Msg(logging.OperationDownloadTask.Message("存量 qBittorrent 受管标签清理未完成"))
+			return
+		}
+		if cleaned > 0 {
+			logging.OperationDownloadTask.Event(log.Info()).Int("cleaned_tags", cleaned).Msg(logging.OperationDownloadTask.Message("存量 qBittorrent 受管标签清理完成"))
+		}
+	}()
 	if err := unifiedSchedules.Start(context.Background()); err != nil {
 		logging.OperationServerLifecycle.Event(log.Fatal()).Err(err).Str("error_code", "unified_schedule_start_failed").Msg(logging.OperationServerLifecycle.Message("统一计划任务调度器启动失败"))
 	}

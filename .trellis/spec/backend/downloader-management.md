@@ -377,3 +377,77 @@ task.IdentityLocked = recognition.Source == "manual"
 - The batch service invokes the existing single-item `Submit` path for every line so permissions, downloader/source compatibility, route snapshots, encryption, audit and queue semantics cannot diverge.
 - Results retain input indexes and safe error codes but never echo source text or ciphertext. One failed line does not roll back successful independent submissions.
 - Service and Web UI tests cover whitespace, duplicates, limits, partial success and source redaction.
+
+## Scenario: qBittorrent reconnect state and managed-tag lifecycle
+
+### 1. Scope / Trigger
+
+- Applies to qBittorrent submission identity handoff, temporary monitoring failures, managed `omc-*` tag cleanup, startup reconciliation, and download-state presentation.
+
+### 2. Signatures
+
+```go
+type ManagedTagCleaner interface {
+    DeleteManagedTag(context.Context, string) error
+}
+
+func (*qbittorrent.Client) DeleteManagedTag(ctx context.Context, tag string) error
+func (*DownloadService) ReconcileManagedProviderTags(ctx context.Context, limit int) (int, error)
+```
+
+- Private durable fields: `download_tasks.provider_task_id`, `provider_tag`, `provider_status`, `last_error_code`, and `last_error_message`.
+- qBittorrent call: `POST /api/v2/torrents/deleteTags` with one validated `tags=omc-<UUID>` value.
+
+### 3. Contracts
+
+- `omc-<DownloadTask UUID>` is a private idempotency/adoption label, not a permanent torrent classification.
+- The tag must remain until a real qBittorrent hash is durably stored. After that handoff, exact tag-definition deletion is best-effort and never deletes the torrent or its files.
+- Only an exact `omc-<UUID>` passes adapter validation. User tags, comma/newline lists, malformed UUIDs, or prefixed/suffixed composites are rejected locally.
+- Clear `provider_tag` only after upstream deletion succeeds. If another cleanup path already changed the row, refresh the durable marker into the current Worker snapshot to avoid stale repeated calls.
+- Cleanup failure retains the marker for bounded later retry and cannot fail download, seeding, transfer, or import.
+- Startup reconciliation is bounded to at most 500 requested rows, skips unavailable downloader instances after their first failure, and does not block Server startup.
+- While an established qBittorrent hash is temporarily unreachable, public status is `provider_status=unavailable` with a safe reconnect message; the Web UI renders “等待下载器恢复”, not “重试下载”.
+
+### 4. Validation & Error Matrix
+
+| Condition | Required result |
+| --- | --- |
+| Empty, `tag:*`, or absent provider identity | Do not delete the managed tag |
+| Exact `omc-<UUID>` + real hash | Call `deleteTags` for that exact tag only |
+| User/malformed/multi-tag input | `downloader_request_invalid`; make no HTTP request |
+| qBittorrent cleanup unavailable | Keep `provider_tag`; log safe warning; continue pipeline |
+| Remote cleanup succeeds, DB marker already cleared | Refresh local snapshot to empty; do not repeat deletion |
+| Retryable `Get` outage with real hash | Persist safe unavailable status and continue same-hash monitoring |
+| Authentication/task-not-found/provider-failed | Do not convert to reconnect wait unless the adapter explicitly classifies it retryable and compatible |
+
+### 5. Good / Base / Bad Cases
+
+- Good: submit creates `omc-UUID`, adoption stores the hash, cleanup removes only the label, and a qBittorrent restart resumes the same torrent.
+- Base: cleanup fails while qBittorrent is down; download monitoring later retries cleanup or bounded startup reconciliation handles it.
+- Bad: delete the tag before hash persistence, clear the marker before upstream success, delete all `omc-*` labels by enumeration, touch torrent data, or display a reconnect as a new download retry.
+
+### 6. Tests Required
+
+- Adapter tests assert exact URL/form data for one valid UUID tag and zero requests for user, malformed, comma, or newline tags.
+- Service tests assert failure retains the marker, success clears it, concurrent marker convergence refreshes the Worker snapshot, and startup cleanup is bounded.
+- Worker tests assert repeated outages do not increase Job attempts or call Submit and successful telemetry clears the temporary reconnect diagnostic.
+- Web UI tests assert `provider_status=unavailable` maps to the warning presentation and suppresses the retry-download action.
+
+### 7. Wrong vs Correct
+
+Wrong:
+
+```go
+client.DeleteManagedTag(ctx, task.ProviderTag) // before provider_task_id is a real hash
+task.ProviderTag = ""                         // before upstream success
+```
+
+Correct:
+
+```go
+if isEstablishedProviderTask(task.ProviderTaskID) {
+    if err := cleaner.DeleteManagedTag(ctx, task.ProviderTag); err == nil {
+        clearMarkerWithIdentityCAS(task.ID, task.ProviderTaskID, task.ProviderTag)
+    }
+}
+```

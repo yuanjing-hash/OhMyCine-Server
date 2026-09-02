@@ -39,6 +39,14 @@ describe('download presentation', () => {
     expect(downloadErrorMessage({ ...stalled, job_status: 'failed', last_error_message: '本次重试仍失败' })).toBe('本次重试仍失败')
     expect(downloadErrorMessage({ ...stalled, scrape_status: 'fallback_unrecognized', last_error_code: 'tmdb_no_match', last_error_message: '已自动归入未识别：TMDB 无匹配结果' })).toBe('已自动归入未识别：TMDB 无匹配结果')
   })
+  it('shows qBittorrent disconnect as monitoring wait instead of download retry', () => {
+    const waiting = { job_status: 'running', phase: 'downloading', provider_status: 'unavailable', last_error_code: 'downloader_unavailable', last_error_message: 'qBittorrent 暂时不可用，正在等待连接恢复' } as DownloadTaskSummary
+
+    expect(downloadStatusLabel(waiting)).toBe('等待下载器恢复')
+    expect(downloadStatusClass(waiting)).toBe('status-chip status-chip--warning')
+    expect(downloadProviderStatusLabel(waiting.provider_status)).toBe('等待 qBittorrent 恢复')
+    expect(downloadErrorMessage(waiting)).toBe(waiting.last_error_message)
+  })
   it('replaces a stale failure with a neutral retry presentation', () => {
     const failed = { id: 'download-1', job_status: 'failed', lifecycle_scope: 'active', updated_at: '2026-08-25T05:00:00Z', last_error_code: 'downloader_rejected', last_error_message: '下载器拒绝了下载链接' } as DownloadTaskSummary
 

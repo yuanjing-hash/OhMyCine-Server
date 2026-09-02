@@ -149,6 +149,13 @@ type Resumer interface {
 	Resume(context.Context, string) error
 }
 
+// ManagedTagCleaner removes one exact provider-side tag created by Server for
+// idempotent submission adoption. Implementations must reject arbitrary user
+// tags and must not mutate the torrent task or its data.
+type ManagedTagCleaner interface {
+	DeleteManagedTag(context.Context, string) error
+}
+
 type Builder func(Config) (Client, error)
 
 type Registry struct {

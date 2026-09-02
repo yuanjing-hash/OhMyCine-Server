@@ -17,6 +17,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/google/uuid"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/downloader"
 )
 
@@ -482,6 +483,23 @@ func (c *Client) Cancel(ctx context.Context, id string, deleteData bool) error {
 		return err
 	}
 	return c.action(ctx, "/api/v2/torrents/delete", url.Values{"hashes": {hash}, "deleteFiles": {strconv.FormatBool(deleteData)}})
+}
+
+func (c *Client) DeleteManagedTag(ctx context.Context, tag string) error {
+	tag = strings.TrimSpace(tag)
+	if !validManagedTag(tag) {
+		return downloader.Error("downloader_request_invalid", false, nil)
+	}
+	return c.action(ctx, "/api/v2/torrents/deleteTags", url.Values{"tags": {tag}})
+}
+
+func validManagedTag(tag string) bool {
+	const prefix = "omc-"
+	if len(tag) <= len(prefix) || len(tag) > 96 || !strings.HasPrefix(tag, prefix) || strings.ContainsAny(tag, ",\r\n") {
+		return false
+	}
+	_, err := uuid.Parse(strings.TrimPrefix(tag, prefix))
+	return err == nil
 }
 
 func (c *Client) resolveHash(ctx context.Context, id string) (string, error) {

@@ -36,9 +36,11 @@ const (
 	pan115DownloadFallbackPollInterval = 20 * time.Second
 	pan115DownloadHeartbeatInterval    = 10 * time.Second
 	lateSubmissionCancelTimeout        = 15 * time.Second
+	managedTagCleanupRetryInterval     = time.Minute
 )
 
 var errDownloadProviderIdentityChanged = errors.New("download provider identity changed during cleanup")
+var errManagedTagCleanupUnsupported = errors.New("downloader managed tag cleanup is unsupported")
 
 type providerEventWakeState struct {
 	generation uint64
@@ -758,6 +760,94 @@ func (s *DownloadService) List(actor Actor, limit int) ([]DownloadTaskSummary, e
 	return items, err
 }
 
+// ReconcileManagedProviderTags removes bounded legacy qBittorrent labels only
+// after the durable task already owns a real provider hash. Per-downloader
+// failures are isolated so one unavailable qBittorrent instance cannot turn
+// Server startup or unrelated downloads into a failure.
+func (s *DownloadService) ReconcileManagedProviderTags(ctx context.Context, limit int) (int, error) {
+	if limit < 1 {
+		limit = 100
+	}
+	if limit > 500 {
+		limit = 500
+	}
+	var tasks []models.DownloadTask
+	if err := s.db.WithContext(ctx).
+		Where("provider_type = ? AND provider_tag <> '' AND provider_task_id <> '' AND provider_task_id NOT LIKE ? AND downloader_id IS NOT NULL", models.DownloaderTypeQBittorrent, "tag:%").
+		Order("updated_at, id").
+		Limit(limit).
+		Find(&tasks).Error; err != nil {
+		return 0, err
+	}
+	cleaned := 0
+	unavailable := map[string]struct{}{}
+	for index := range tasks {
+		if err := ctx.Err(); err != nil {
+			return cleaned, err
+		}
+		task := &tasks[index]
+		if task.DownloaderID == nil {
+			continue
+		}
+		if _, skip := unavailable[*task.DownloaderID]; skip {
+			continue
+		}
+		_, client, err := s.downloader.client(*task.DownloaderID)
+		if err != nil {
+			unavailable[*task.DownloaderID] = struct{}{}
+			downloadOperation(task.ProviderType, task.SourceOrigin).Event(s.log.Warn()).Str("task_id", task.ID).Str("error_code", ErrorCode(err)).Msg(serverlog.OperationDownloadTask.Message("存量受管标签清理跳过不可用下载器"))
+			continue
+		}
+		if err := s.cleanupManagedProviderTag(ctx, task, client); err != nil {
+			unavailable[*task.DownloaderID] = struct{}{}
+			downloadOperation(task.ProviderType, task.SourceOrigin).Event(s.log.Warn()).Str("task_id", task.ID).Str("error_code", ErrorCode(err)).Msg(serverlog.OperationDownloadTask.Message("存量受管标签清理暂时失败"))
+			continue
+		}
+		cleaned++
+	}
+	return cleaned, nil
+}
+
+func (s *DownloadService) cleanupManagedProviderTag(ctx context.Context, task *models.DownloadTask, client downloadpkg.Client) error {
+	if task == nil || task.ProviderType != models.DownloaderTypeQBittorrent || strings.TrimSpace(task.ProviderTag) == "" || !isEstablishedProviderTask(task.ProviderTaskID) {
+		return nil
+	}
+	cleaner, ok := client.(downloadpkg.ManagedTagCleaner)
+	if !ok {
+		return errManagedTagCleanupUnsupported
+	}
+	tag := task.ProviderTag
+	if err := cleaner.DeleteManagedTag(ctx, tag); err != nil {
+		return err
+	}
+	now := time.Now().UTC()
+	result := s.db.WithContext(ctx).Model(&models.DownloadTask{}).
+		Where("id = ? AND provider_tag = ? AND provider_task_id = ?", task.ID, tag, task.ProviderTaskID).
+		Updates(map[string]any{"provider_tag": "", "updated_at": now})
+	if result.Error != nil {
+		return appError("download_managed_tag_state_failed", "下载器标签清理状态保存失败", result.Error)
+	}
+	if result.RowsAffected == 1 {
+		task.ProviderTag = ""
+	} else {
+		// Another worker/startup reconciliation may have cleared or replaced the
+		// durable marker after the provider accepted deleteTags. Refresh the
+		// caller's snapshot so this worker does not keep deleting a stale tag.
+		var current models.DownloadTask
+		if err := s.db.WithContext(ctx).Select("provider_tag", "provider_task_id").First(&current, "id = ?", task.ID).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				task.ProviderTag = ""
+				return nil
+			}
+			return appError("download_managed_tag_state_failed", "下载器标签清理状态读取失败", err)
+		}
+		task.ProviderTag = current.ProviderTag
+		task.ProviderTaskID = current.ProviderTaskID
+	}
+	downloadOperation(task.ProviderType, task.SourceOrigin).Event(s.log.Info()).Str("task_id", task.ID).Msg(serverlog.OperationDownloadTask.Message("已清理 qBittorrent 受管标签"))
+	return nil
+}
+
 func (s *DownloadService) ListScoped(actor Actor, scope string, limit int) ([]DownloadTaskSummary, int64, error) {
 	if !actor.Can(authz.PermissionDownloadsReadAll) && !actor.Can(authz.PermissionDownloadsReadOwn) {
 		return nil, 0, appError(CodePermissionDenied, "无权查看下载任务", nil)
@@ -1382,12 +1472,14 @@ func downloadTaskSummary(record models.DownloadTask, jobStatus string) DownloadT
 type DownloadWorker struct {
 	service            *DownloadService
 	pollInterval       time.Duration
+	reconnectInterval  time.Duration
 	pan115PollInterval time.Duration
 	heartbeatInterval  time.Duration
+	tagCleanupInterval time.Duration
 }
 
 func NewDownloadWorker(service *DownloadService) *DownloadWorker {
-	return &DownloadWorker{service: service, pollInterval: 2 * time.Second, pan115PollInterval: pan115DownloadFallbackPollInterval, heartbeatInterval: pan115DownloadHeartbeatInterval}
+	return &DownloadWorker{service: service, pollInterval: 2 * time.Second, reconnectInterval: 10 * time.Second, pan115PollInterval: pan115DownloadFallbackPollInterval, heartbeatInterval: pan115DownloadHeartbeatInterval, tagCleanupInterval: managedTagCleanupRetryInterval}
 }
 
 func (w *DownloadWorker) Run(ctx context.Context, runtime JobRuntime, job ClaimedJob) WorkerResult {
@@ -1507,11 +1599,28 @@ func (w *DownloadWorker) Run(ctx context.Context, runtime JobRuntime, job Claime
 	if eventDriven {
 		eventGeneration, _ = w.service.providerEvents.snapshot(connectionID)
 	}
+	var nextTagCleanupAt time.Time
 	for {
 		providerTask, err := client.Get(ctx, task.ProviderTaskID)
 		if err != nil {
+			if ctx.Err() != nil {
+				return WorkerResult{}
+			}
 			if code, _ := downloadpkg.ErrorInfo(err); code == "downloader_task_not_found" && strings.HasPrefix(task.ProviderTaskID, "tag:") {
 				return w.failureRetryable(task, err)
+			}
+			if code, retryable := downloadpkg.ErrorInfo(err); retryable && downloaderRecord.Type == models.DownloaderTypeQBittorrent && isEstablishedProviderTask(task.ProviderTaskID) {
+				message := qBittorrentReconnectMessage(code)
+				if task.LastErrorCode != code || task.LastErrorMessage != message || task.ProviderStatus != "unavailable" {
+					if persistErr := w.markProviderReconnectWait(&task, code, message); persistErr != nil {
+						return WorkerResult{ErrorCode: "download_state_persist_failed", ErrorMessage: "下载器连接状态保存失败"}
+					}
+					operation.Event(w.service.log.Warn()).Str("task_id", task.ID).Str("error_code", code).Msg(operation.Message("连接暂时不可用，保留原任务并等待恢复"))
+				}
+				if waitErr := w.waitForProviderReconnect(ctx); waitErr != nil {
+					return WorkerResult{}
+				}
+				continue
 			}
 			return w.failure(task, err)
 		}
@@ -1523,6 +1632,16 @@ func (w *DownloadWorker) Run(ctx context.Context, runtime JobRuntime, job Claime
 				return WorkerResult{}
 			}
 			return WorkerResult{ErrorCode: "download_state_persist_failed", ErrorMessage: "下载任务状态保存失败"}
+		}
+		if task.ProviderTag != "" && (nextTagCleanupAt.IsZero() || !time.Now().Before(nextTagCleanupAt)) {
+			if cleanupErr := w.service.cleanupManagedProviderTag(ctx, &task, client); cleanupErr != nil {
+				interval := w.tagCleanupInterval
+				if interval <= 0 {
+					interval = managedTagCleanupRetryInterval
+				}
+				nextTagCleanupAt = time.Now().Add(interval)
+				operation.Event(w.service.log.Warn()).Str("task_id", task.ID).Str("error_code", ErrorCode(cleanupErr)).Msg(operation.Message("受管标签清理暂时失败，将稍后重试"))
+			}
 		}
 		progress := providerTask.Progress
 		var speed *float64
@@ -1605,6 +1724,53 @@ func (w *DownloadWorker) Run(ctx context.Context, runtime JobRuntime, job Claime
 		case <-time.After(w.pollInterval):
 		}
 	}
+}
+
+func isEstablishedProviderTask(providerTaskID string) bool {
+	providerTaskID = strings.TrimSpace(providerTaskID)
+	return providerTaskID != "" && !strings.HasPrefix(providerTaskID, "tag:")
+}
+
+func qBittorrentReconnectMessage(code string) string {
+	if code == "downloader_rate_limited" {
+		return "qBittorrent 请求受到限速，正在等待连接恢复"
+	}
+	return "qBittorrent 暂时不可用，正在等待连接恢复"
+}
+
+func (w *DownloadWorker) waitForProviderReconnect(ctx context.Context) error {
+	interval := w.reconnectInterval
+	if interval <= 0 {
+		interval = 10 * time.Second
+	}
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func (w *DownloadWorker) markProviderReconnectWait(task *models.DownloadTask, code, message string) error {
+	now := time.Now().UTC()
+	result := w.service.db.Model(&models.DownloadTask{}).
+		Where("id = ? AND phase <> ?", task.ID, models.DownloadTaskStatusCancelled).
+		Updates(map[string]any{
+			"provider_status":    "unavailable",
+			"last_error_code":    safeLabel(code, 96),
+			"last_error_message": safeLabel(message, 512),
+			"updated_at":         now,
+		})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		return context.Canceled
+	}
+	task.ProviderStatus, task.LastErrorCode, task.LastErrorMessage, task.UpdatedAt = "unavailable", code, message, now
+	return nil
 }
 
 func (w *DownloadWorker) completedRecognitionRecoveryTask(job ClaimedJob) (models.DownloadTask, bool, error) {
@@ -2440,7 +2606,7 @@ func (w *DownloadWorker) cancelLateSubmittedProvider(ctx context.Context, task *
 
 func (w *DownloadWorker) persistTelemetry(task *models.DownloadTask, provider downloadpkg.Task) error {
 	now := time.Now().UTC()
-	clearTerminalError := task.Phase == models.DownloadTaskStatusFailed && !provider.Failed
+	clearTerminalError := !provider.Failed && (task.Phase == models.DownloadTaskStatusFailed || recoverableDownloadTelemetryError(task.LastErrorCode))
 	phase := models.DownloadTaskStatusDownloading
 	if provider.Completed {
 		phase = models.DownloadTaskStatusVerifying
@@ -2451,18 +2617,45 @@ func (w *DownloadWorker) persistTelemetry(task *models.DownloadTask, provider do
 	if clearTerminalError {
 		updates["last_error_code"], updates["last_error_message"], updates["finished_at"] = "", "", nil
 	}
-	result := w.service.db.Model(task).Where("phase <> ?", models.DownloadTaskStatusCancelled).Updates(updates)
-	if result.Error != nil {
-		return result.Error
-	}
-	if result.RowsAffected == 0 {
-		return context.Canceled
+	err := w.service.db.Transaction(func(tx *gorm.DB) error {
+		result := tx.Model(&models.DownloadTask{}).
+			Where("id = ? AND phase <> ?", task.ID, models.DownloadTaskStatusCancelled).
+			Updates(updates)
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected == 0 {
+			return context.Canceled
+		}
+		if provider.Failed {
+			return nil
+		}
+		return tx.Model(&models.Job{}).
+			Where("id = ? AND status = ? AND (last_error_code <> '' OR last_error_message <> '' OR finished_at IS NOT NULL)", task.JobID, models.JobStatusRunning).
+			Updates(map[string]any{
+				"last_error_code":    "",
+				"last_error_message": "",
+				"finished_at":        nil,
+				"updated_at":         now,
+			}).Error
+	})
+	if err != nil {
+		return err
 	}
 	task.Phase, task.ProviderStatus, task.ProviderOutputID, task.LastSampledAt = phase, provider.Status, provider.OutputItemID, &now
 	if clearTerminalError {
 		task.LastErrorCode, task.LastErrorMessage, task.FinishedAt = "", "", nil
 	}
 	return nil
+}
+
+func recoverableDownloadTelemetryError(code string) bool {
+	switch code {
+	case "downloader_unavailable", "downloader_rate_limited", "downloader_submission_unconfirmed", "downloader_task_not_found", "downloader_category_update_failed":
+		return true
+	default:
+		return false
+	}
 }
 
 func (w *DownloadWorker) failure(task models.DownloadTask, err error) WorkerResult {

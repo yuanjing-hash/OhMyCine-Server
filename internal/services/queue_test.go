@@ -13,6 +13,7 @@ import (
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/authz"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/database"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
+	"gorm.io/gorm"
 )
 
 type fakeQueueClock struct{ now time.Time }
@@ -192,6 +193,100 @@ func TestQueueActionRetryRecoveryCoalescingAndPrivateState(t *testing.T) {
 	}
 	if len(timeline) < 5 {
 		t.Fatalf("timeline=%+v", timeline)
+	}
+}
+
+func TestLeaseRecoveryCountsOnlyConsecutiveLeaseExpiries(t *testing.T) {
+	service, actor, clock := queueFixture(t)
+	job := enqueueFake(t, service, actor, "Long provider retry", "provider-a")
+
+	for attempt := 0; attempt < 7; attempt++ {
+		claimed, err := service.Claim([]string{"fake"})
+		if err != nil || claimed == nil {
+			t.Fatalf("retry claim %d = %+v err=%v", attempt+1, claimed, err)
+		}
+		if err := service.RetryLater(job.ID, claimed.LeaseToken, "downloader_unavailable", "provider offline", clock.now); err != nil {
+			t.Fatal(err)
+		}
+		if err := service.PromoteDueRetries(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	for expiry := 1; expiry <= 3; expiry++ {
+		claimed, err := service.Claim([]string{"fake"})
+		if err != nil || claimed == nil {
+			t.Fatalf("expiry claim %d = %+v err=%v", expiry, claimed, err)
+		}
+		clock.now = clock.now.Add(11 * time.Second)
+		if err := service.RecoverExpiredLeases(); err != nil {
+			t.Fatal(err)
+		}
+		detail, err := service.Get(actor, job.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := models.JobStatusRetryWait
+		if expiry == 3 {
+			want = models.JobStatusFailed
+		}
+		if detail.Status != want || detail.LastErrorCode != codeQueueWorkerLeaseExpired {
+			t.Fatalf("expiry %d detail=%+v want_status=%s", expiry, detail, want)
+		}
+		if expiry < 3 {
+			if err := service.PromoteDueRetries(); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+}
+
+func TestLeaseRecoveryReopensLegacyFalseTerminal(t *testing.T) {
+	service, actor, clock := queueFixture(t)
+	job := enqueueFake(t, service, actor, "Legacy false terminal", "provider-a")
+	claimed, err := service.Claim([]string{"fake"})
+	if err != nil || claimed == nil {
+		t.Fatalf("claim=%+v err=%v", claimed, err)
+	}
+	failedAt := clock.now.Add(11 * time.Second)
+	if err := service.db.Transaction(func(tx *gorm.DB) error {
+		updates := map[string]any{
+			"status":             models.JobStatusFailed,
+			"last_error_code":    codeQueueWorkerLeaseExpired,
+			"last_error_message": "Worker connection was lost; the job will resume from its checkpoint.",
+			"finished_at":        failedAt,
+			"updated_at":         failedAt,
+		}
+		releaseLease(updates)
+		if err := tx.Model(&models.Job{}).Where("id = ?", job.ID).Updates(updates).Error; err != nil {
+			return err
+		}
+		return tx.Model(&models.JobAttempt{}).
+			Where("job_id = ? AND attempt_number = ?", job.ID, claimed.Job.AttemptCount).
+			Updates(map[string]any{"status": models.JobStatusFailed, "safe_error_code": codeQueueWorkerLeaseExpired, "safe_error_message": "lease expired", "finished_at": failedAt}).Error
+	}); err != nil {
+		t.Fatal(err)
+	}
+	clock.now = failedAt
+
+	if err := service.RecoverExpiredLeases(); err != nil {
+		t.Fatal(err)
+	}
+	detail, err := service.Get(actor, job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if detail.Status != models.JobStatusQueued || detail.NextAttemptAt != nil || detail.FinishedAt != nil {
+		t.Fatalf("legacy detail=%+v", detail)
+	}
+	var recovered int64
+	if err := service.db.Model(&models.JobStatusEvent{}).
+		Where("job_id = ? AND event_type = ?", job.ID, "lease.false_terminal_recovered").
+		Count(&recovered).Error; err != nil {
+		t.Fatal(err)
+	}
+	if recovered != 1 {
+		t.Fatalf("recovery events=%d", recovered)
 	}
 }
 

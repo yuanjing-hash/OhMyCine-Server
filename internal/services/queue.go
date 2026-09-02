@@ -22,13 +22,14 @@ import (
 )
 
 const (
-	CodeQueueOrderConflict     = "queue_order_conflict"
-	CodeQueueStateConflict     = "queue_state_conflict"
-	CodeQueueLeaseInvalid      = "queue_lease_invalid"
-	CodeQueueActionStale       = "queue_action_stale"
-	CodeQueueActionInvalid     = "queue_action_invalid"
-	CodeQueuePolicyConflict    = "queue_policy_conflict"
-	CodeQueueWorkerUnavailable = "queue_worker_unavailable"
+	CodeQueueOrderConflict      = "queue_order_conflict"
+	CodeQueueStateConflict      = "queue_state_conflict"
+	CodeQueueLeaseInvalid       = "queue_lease_invalid"
+	CodeQueueActionStale        = "queue_action_stale"
+	CodeQueueActionInvalid      = "queue_action_invalid"
+	CodeQueuePolicyConflict     = "queue_policy_conflict"
+	CodeQueueWorkerUnavailable  = "queue_worker_unavailable"
+	codeQueueWorkerLeaseExpired = "worker_lease_expired"
 )
 
 type Clock interface{ Now() time.Time }
@@ -1257,18 +1258,30 @@ func (s *QueueService) RecoverExpiredLeases() error {
 	now := s.clock.Now()
 	var recovered []models.Job
 	err := s.db.Transaction(func(tx *gorm.DB) error {
+		policies := map[string]models.QueuePolicy{}
+		loadPolicy := func(jobType string) (models.QueuePolicy, error) {
+			if policy, ok := policies[jobType]; ok {
+				return policy, nil
+			}
+			var policy models.QueuePolicy
+			if err := tx.First(&policy, "job_type = ?", jobType).Error; err != nil {
+				return models.QueuePolicy{}, err
+			}
+			policies[jobType] = policy
+			return policy, nil
+		}
 		var jobs []models.Job
 		if err := tx.Where("status = ? AND lease_expires_at <= ?", models.JobStatusRunning, now).Find(&jobs).Error; err != nil {
 			return err
 		}
 		for _, job := range jobs {
-			var policy models.QueuePolicy
-			if err := tx.First(&policy, "job_type = ?", job.JobType).Error; err != nil {
+			policy, err := loadPolicy(job.JobType)
+			if err != nil {
 				return err
 			}
 			status := models.JobStatusRetryWait
 			next := any(now)
-			code := "worker_lease_expired"
+			code := codeQueueWorkerLeaseExpired
 			message := "Worker connection was lost; the job will resume from its checkpoint."
 			pendingInterrupt := job.InterruptStatus == models.JobStatusPaused || job.InterruptStatus == models.JobStatusCancelled
 			if pendingInterrupt {
@@ -1276,9 +1289,15 @@ func (s *QueueService) RecoverExpiredLeases() error {
 				next = nil
 				code = "worker_interrupt_recovered"
 				message = "Worker control was interrupted and will be reconciled with the provider."
-			} else if job.AttemptCount >= policy.MaxAttempts {
-				status = models.JobStatusFailed
-				next = nil
+			} else {
+				streak, err := consecutiveLeaseExpiryAttempts(tx, job.ID, job.AttemptCount-1, policy.MaxAttempts)
+				if err != nil {
+					return err
+				}
+				if streak+1 >= policy.MaxAttempts {
+					status = models.JobStatusFailed
+					next = nil
+				}
 			}
 			updates := map[string]any{"status": status, "revision": job.Revision + 1, "next_attempt_at": next, "last_error_code": code, "last_error_message": message, "updated_at": now}
 			if !pendingInterrupt {
@@ -1301,14 +1320,78 @@ func (s *QueueService) RecoverExpiredLeases() error {
 			job.Status = status
 			recovered = append(recovered, job)
 		}
+
+		// Older builds compared a lease failure against the total number of
+		// claims. A long-lived provider task could therefore become terminal
+		// after many ordinary RetryLater cycles even though only one worker
+		// lease had been lost. Re-open only those false terminals whose actual
+		// consecutive lease-expiry streak is still below the configured limit.
+		var falseTerminals []models.Job
+		if err := tx.Where("status = ? AND last_error_code = ?", models.JobStatusFailed, codeQueueWorkerLeaseExpired).Find(&falseTerminals).Error; err != nil {
+			return err
+		}
+		for _, job := range falseTerminals {
+			policy, err := loadPolicy(job.JobType)
+			if err != nil {
+				return err
+			}
+			streak, err := consecutiveLeaseExpiryAttempts(tx, job.ID, job.AttemptCount, policy.MaxAttempts)
+			if err != nil {
+				return err
+			}
+			if streak == 0 || streak >= policy.MaxAttempts {
+				continue
+			}
+			updates := map[string]any{
+				"status":          models.JobStatusQueued,
+				"revision":        job.Revision + 1,
+				"next_attempt_at": nil,
+				"finished_at":     nil,
+				"updated_at":      now,
+			}
+			releaseLease(updates)
+			if err := tx.Model(&job).Updates(updates).Error; err != nil {
+				return err
+			}
+			if err := recordJobEvent(tx, job.ID, "lease.false_terminal_recovered", models.JobStatusFailed, models.JobStatusQueued, nil, codeQueueWorkerLeaseExpired, now); err != nil {
+				return err
+			}
+			job.Status = models.JobStatusQueued
+			recovered = append(recovered, job)
+		}
 		return nil
 	})
 	if err == nil {
+		if len(recovered) > 0 {
+			s.wake()
+		}
 		for _, job := range recovered {
 			s.publish(job, "job.status_changed")
 		}
 	}
 	return err
+}
+
+func consecutiveLeaseExpiryAttempts(tx *gorm.DB, jobID string, throughAttempt, limit int) (int, error) {
+	if throughAttempt <= 0 || limit <= 0 {
+		return 0, nil
+	}
+	var attempts []models.JobAttempt
+	if err := tx.Select("attempt_number", "safe_error_code").
+		Where("job_id = ? AND attempt_number <= ?", jobID, throughAttempt).
+		Order("attempt_number DESC").
+		Limit(limit).
+		Find(&attempts).Error; err != nil {
+		return 0, err
+	}
+	streak := 0
+	for _, attempt := range attempts {
+		if attempt.SafeErrorCode != codeQueueWorkerLeaseExpired {
+			break
+		}
+		streak++
+	}
+	return streak, nil
 }
 
 func queueNotFound(err error) error {

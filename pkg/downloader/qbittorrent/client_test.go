@@ -113,6 +113,45 @@ func TestClientSubmitTelemetryAndSafeControls(t *testing.T) {
 	}
 }
 
+func TestClientDeletesOnlyExactManagedTag(t *testing.T) {
+	const managedTag = "omc-779d3f3a-edea-464c-8c17-f49d6bf22a0d"
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v2/auth/login":
+			http.SetCookie(w, &http.Cookie{Name: "SID", Value: "session"})
+			_, _ = io.WriteString(w, "Ok.")
+		case "/api/v2/torrents/deleteTags":
+			requests++
+			_ = r.ParseForm()
+			if got := r.Form.Get("tags"); got != managedTag {
+				t.Fatalf("tags=%q want=%q", got, managedTag)
+			}
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	client, err := New(downloader.Config{BaseURL: server.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.DeleteManagedTag(context.Background(), managedTag); err != nil {
+		t.Fatal(err)
+	}
+	if requests != 1 {
+		t.Fatalf("delete tag requests=%d", requests)
+	}
+	for _, tag := range []string{"user-tag", "omc-test", managedTag + ",user-tag", "omc-779d3f3a-edea-464c-8c17-f49d6bf22a0d\nuser-tag"} {
+		if err := client.DeleteManagedTag(context.Background(), tag); err == nil {
+			t.Fatalf("unsafe managed tag accepted: %q", tag)
+		}
+	}
+	if requests != 1 {
+		t.Fatalf("invalid tags reached provider: %d requests", requests)
+	}
+}
+
 func TestClientRejectsCredentialedOrPathBaseURL(t *testing.T) {
 	for _, value := range []string{"file:///tmp/qbit", "http://user:pass@example.test", "http://example.test/ui", "http://example.test?token=secret", "http://example.test/?", "http://example.test/#"} {
 		if _, err := New(downloader.Config{BaseURL: value}); err == nil {
