@@ -20,7 +20,10 @@ type StructurePlanItem struct {
 	TargetRelative   string `json:"target_relative"`
 	ProviderID       string `json:"provider_id,omitempty"`
 	ParentProviderID string `json:"parent_provider_id,omitempty"`
-	Size             int64  `json:"size"`
+	// AllowProviderRootSource is reserved for the verified historical 115
+	// cid=0 transfer defect. Normal structure plans never set it.
+	AllowProviderRootSource bool  `json:"allow_provider_root_source,omitempty"`
+	Size                    int64 `json:"size"`
 }
 
 type StructureIssue struct {

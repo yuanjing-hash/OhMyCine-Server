@@ -256,6 +256,9 @@ func (s *ConnectionService) Create(actor Actor, input ConnectionInput, request R
 				return err
 			}
 		}
+		if err := syncPan115RecycleSchedule(tx, actor.User.ID, record, true); err != nil {
+			return err
+		}
 		return s.audit.Record(tx, &actor.User.ID, "connection.create", "connection", uintID(record.ID), "success", map[string]any{"provider": provider, "enabled": record.Enabled}, request)
 	})
 	if err != nil {
@@ -428,6 +431,10 @@ func (s *ConnectionService) Update(actor Actor, id uint, input UpdateConnectionI
 				return err
 			}
 		}
+		overwriteSchedule := input.Enabled != nil || input.RecycleCleanupEnabled != nil || input.RecycleCleanupCron != nil
+		if err := syncPan115RecycleSchedule(tx, actor.User.ID, record, overwriteSchedule); err != nil {
+			return err
+		}
 		return s.audit.Record(tx, &actor.User.ID, "connection.update", "connection", uintID(id), "success", map[string]any{"provider": record.Provider, "enabled": record.Enabled}, request)
 	}); err != nil {
 		if conflict := connectionConstraintError(err); conflict != nil {
@@ -437,6 +444,14 @@ func (s *ConnectionService) Update(actor Actor, id uint, input UpdateConnectionI
 	}
 	s.invalidate(id)
 	return connectionSummary(record), nil
+}
+
+func syncPan115RecycleSchedule(tx *gorm.DB, ownerID uint, connection models.Connection, overwriteExisting bool) error {
+	if connection.Provider != models.ConnectionProviderPan115 {
+		return nil
+	}
+	enabled := connection.Enabled && connection.RecycleCleanupEnabled
+	return syncManagedSchedule(tx, ownerID, "115 回收站清理 · "+connection.Name, "pan115_recycle_cleanup", "connection", uintID(connection.ID), connection.RecycleCleanupCron, "Asia/Shanghai", enabled, overwriteExisting, time.Now().UTC())
 }
 
 func (s *ConnectionService) Test(ctx context.Context, actor Actor, id uint, request RequestContext) (ConnectionSummary, error) {

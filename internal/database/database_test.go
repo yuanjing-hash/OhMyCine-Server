@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -504,6 +505,96 @@ func applyMigrationsThrough(t *testing.T, db *gorm.DB, maximum int) {
 	}
 }
 
+func TestUnifiedScheduleManagedKeyMigrationBackfillsOnlyManagedDefinitions(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "schedule-managed-key-v63-upgrade.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sqlDB, _ := db.DB()
+	t.Cleanup(func() { _ = sqlDB.Close() })
+	applyMigrationsThrough(t, db, 62)
+
+	now := time.Now().UTC().Truncate(time.Second)
+	owner := models.User{
+		Username:           "schedule-owner",
+		UsernameNormalized: "schedule-owner",
+		DisplayName:        "Schedule owner",
+		PasswordHash:       "test-only",
+		Status:             models.UserStatusActive,
+		IsOwner:            true,
+		AuthzVersion:       1,
+		CreatedAt:          now,
+		UpdatedAt:          now,
+	}
+	if err := db.Create(&owner).Error; err != nil {
+		t.Fatal(err)
+	}
+	connection := models.Connection{
+		Name:                     "Test 115",
+		NameNormalized:           "test-115",
+		Provider:                 models.ConnectionProviderPan115,
+		CredentialCiphertext:     "test-only",
+		RecycleCleanupEnabled:    true,
+		RecycleCleanupCron:       "0 4 * * *",
+		RecycleCleanupNextRunAt:  &now,
+		RecycleCleanupLastStatus: "idle",
+		Enabled:                  true,
+		LastHealthStatus:         "unknown",
+		Revision:                 1,
+		CreatedAt:                now,
+		UpdatedAt:                now,
+	}
+	if err := db.Create(&connection).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := migrateUnifiedSchedules(db); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Exec(`INSERT INTO schedule_definitions (
+		id, owner_id, name, action_type, target_type, target_id, cron_expression,
+		timezone, enabled, misfire_policy, overlap_policy, max_retries,
+		retry_delay_seconds, max_runtime_seconds, last_status, revision, created_at, updated_at
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 'run_once', 'skip', 0, 60, 3600, 'idle', 1, ?, ?)`,
+		"manual-schedule", owner.ID, "我的手工清理", "pan115_recycle_cleanup", "connection",
+		connection.ID, "15 5 * * *", "Asia/Shanghai", now, now).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	if err := migrateUnifiedScheduleManagedKeys(db); err != nil {
+		t.Fatal(err)
+	}
+	if !db.Migrator().HasColumn(&models.ScheduleDefinition{}, "managed_key") {
+		t.Fatal("managed_key column missing after v64 migration")
+	}
+	if !db.Migrator().HasIndex("schedule_definitions", "idx_schedule_definitions_managed_key") {
+		t.Fatal("partial managed_key index missing after v64 migration")
+	}
+	var generated, manual models.ScheduleDefinition
+	if err := db.Where("name = ?", "115 回收站清理 · "+connection.Name).First(&generated).Error; err != nil {
+		t.Fatal(err)
+	}
+	wantKey := "pan115_recycle_cleanup:connection:" + strconv.FormatUint(uint64(connection.ID), 10)
+	if generated.ManagedKey != wantKey {
+		t.Fatalf("generated managed_key=%q want=%q", generated.ManagedKey, wantKey)
+	}
+	if err := db.First(&manual, "id = ?", "manual-schedule").Error; err != nil {
+		t.Fatal(err)
+	}
+	if manual.ManagedKey != "" {
+		t.Fatalf("manual schedule was incorrectly adopted: managed_key=%q", manual.ManagedKey)
+	}
+	if err := db.Exec(`INSERT INTO schedule_definitions (
+		id, managed_key, owner_id, name, action_type, target_type, target_id,
+		cron_expression, timezone, enabled, misfire_policy, overlap_policy,
+		max_retries, retry_delay_seconds, max_runtime_seconds, last_status,
+		revision, created_at, updated_at
+	) VALUES (?, '', ?, ?, 'media_library_scan', 'media_library', '2', '0 6 * * *',
+		'Asia/Shanghai', 1, 'run_once', 'skip', 0, 60, 3600, 'idle', 1, ?, ?)`,
+		"manual-schedule-two", owner.ID, "另一个手工计划", now, now).Error; err != nil {
+		t.Fatalf("partial index must allow multiple unmanaged schedules: %v", err)
+	}
+}
+
 func TestMigrateUpgradesAuthFoundationDatabaseToStorageFoundation(t *testing.T) {
 	db, err := Open(filepath.Join(t.TempDir(), "upgrade.db"))
 	if err != nil {
@@ -535,8 +626,8 @@ func TestMigrateUpgradesAuthFoundationDatabaseToStorageFoundation(t *testing.T) 
 	if err := db.Table("schema_migrations").Order("version").Pluck("version", &versions).Error; err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(versions, []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60}) {
-		t.Fatalf("migration versions=%v, want [1..60]", versions)
+	if !reflect.DeepEqual(versions, []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64}) {
+		t.Fatalf("migration versions=%v, want [1..64]", versions)
 	}
 	if !db.Migrator().HasTable(&models.PlayerPlaybackHistory{}) || !db.Migrator().HasTable(&models.PlayerPlaybackHistoryRevision{}) {
 		t.Fatal("player playback history sync tables missing after upgrade")
@@ -1191,7 +1282,7 @@ func TestPersistentQueueMigrationPoliciesRBACAndForeignKeys(t *testing.T) {
 		}
 	}
 	var policies int64
-	if err := db.Model(&models.QueuePolicy{}).Count(&policies).Error; err != nil || policies != 14 {
+	if err := db.Model(&models.QueuePolicy{}).Count(&policies).Error; err != nil || policies != 15 {
 		t.Fatalf("policies=%d err=%v", policies, err)
 	}
 	var downloadPolicy models.QueuePolicy

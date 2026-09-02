@@ -1,11 +1,14 @@
 package handlers
 
 import (
+	"errors"
+	"io"
 	"net/http"
 	"strconv"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/authz"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/middleware"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/services"
@@ -45,6 +48,10 @@ type mediaLibraryPayload struct {
 	IngestDownloaderID       string   `json:"ingest_downloader_id"`
 	IngestRelativeRoot       string   `json:"ingest_relative_root"`
 	IngestRelativeRootToken  string   `json:"ingest_relative_root_token"`
+}
+
+type mediaLibraryScanPayload struct {
+	Mode string `json:"mode"`
 }
 
 // mediaLibraryStructureRepairResponse is the browser-safe projection of a
@@ -216,7 +223,19 @@ func (a *API) ScanMediaLibrary(c *gin.Context) {
 	if !ok {
 		return
 	}
-	run, err := a.libraries.ScanNow(c.Request.Context(), actor, id)
+	var input mediaLibraryScanPayload
+	if err := c.ShouldBindJSON(&input); err != nil && !errors.Is(err, io.EOF) {
+		writeError(c, a.log, &services.AppError{Code: services.CodeInvalidRequest, Message: "扫描请求无效", Cause: err})
+		return
+	}
+	mode := input.Mode
+	if mode == "" {
+		// Existing clients used an empty object and historically expected the
+		// expensive comprehensive scan. Preserve that behavior while exposing a
+		// separate immediate incremental action in the UI.
+		mode = "full"
+	}
+	run, err := a.libraries.Scan(c.Request.Context(), actor, id, mode)
 	if err != nil {
 		writeError(c, a.log, err)
 		return
@@ -549,6 +568,45 @@ func (a *API) MediaLibraryStructure(c *gin.Context) {
 	success(c, http.StatusOK, result)
 }
 
+func (a *API) DiagnoseMediaLibraryStructure(c *gin.Context) {
+	actor, _ := middleware.ActorFrom(c)
+	id, ok := pathID(c)
+	if !ok {
+		return
+	}
+	if !actor.CanResource(authz.PermissionMediaLibrariesScan, models.AuthorizationResourceMediaLibrary, strconv.FormatUint(uint64(id), 10)) {
+		writeError(c, a.log, &services.AppError{Code: services.CodePermissionDenied, Message: "无权诊断媒体库结构"})
+		return
+	}
+	result, err := a.libraryStructure.Diagnose(c.Request.Context(), id, "")
+	if err != nil {
+		writeError(c, a.log, err)
+		return
+	}
+	success(c, http.StatusOK, result)
+}
+
+func (a *API) PreviewMediaLibraryStructureRepair(c *gin.Context) {
+	actor, _ := middleware.ActorFrom(c)
+	id, ok := pathID(c)
+	if !ok {
+		return
+	}
+	var payload struct {
+		Revision string `json:"revision"`
+	}
+	if err := strictJSON(c, &payload); err != nil {
+		writeError(c, a.log, invalid("媒体库修复预览参数无效", err))
+		return
+	}
+	result, err := a.libraryStructure.PreviewRepair(c.Request.Context(), actor, id, "", payload.Revision)
+	if err != nil {
+		writeError(c, a.log, err)
+		return
+	}
+	success(c, http.StatusOK, result)
+}
+
 func (a *API) RepairMediaLibraryStructure(c *gin.Context) {
 	actor, _ := middleware.ActorFrom(c)
 	id, ok := pathID(c)
@@ -556,7 +614,8 @@ func (a *API) RepairMediaLibraryStructure(c *gin.Context) {
 		return
 	}
 	var payload struct {
-		WorkID string `json:"work_id"`
+		WorkID            string `json:"work_id"`
+		ConfirmationToken string `json:"confirmation_token"`
 	}
 	if err := strictJSON(c, &payload); err != nil {
 		writeError(c, a.log, invalid("媒体库修复参数无效", err))
@@ -565,7 +624,7 @@ func (a *API) RepairMediaLibraryStructure(c *gin.Context) {
 	var repair models.MediaLibraryStructureRepair
 	var err error
 	if payload.WorkID == "" {
-		repair, err = a.libraryStructure.EnqueueRepair(c.Request.Context(), actor, id, "", middleware.RequestContextFrom(c))
+		repair, err = a.libraryStructure.EnqueueConfirmedRepair(c.Request.Context(), actor, id, "", payload.ConfirmationToken, middleware.RequestContextFrom(c))
 	} else {
 		repair, err = a.libraryStructure.EnqueueWorkRepair(c.Request.Context(), actor, id, payload.WorkID, middleware.RequestContextFrom(c))
 	}

@@ -144,7 +144,7 @@ func (s *MediaArtifactService) ScheduleGeneration(libraryID uint, generation uin
 		policy.ScanRunID = scanRun.ID
 		policy.ScanKind = scanRun.Kind
 		policy.ScanPartial = scanRun.Partial
-		policy.CleanupEligible = policy.TargetKind == models.MediaArtifactTargetLocalProjection && scanRun.Status == "success" && !scanRun.Partial && automaticCleanupScanKind(scanRun.Kind)
+		policy.CleanupEligible = (policy.TargetKind == models.MediaArtifactTargetLocalProjection || policy.TargetKind == models.MediaArtifactTargetLocalAdjacent) && scanRun.Status == "success" && !scanRun.Partial && automaticCleanupScanKind(scanRun.Kind)
 	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
 		return err
 	}

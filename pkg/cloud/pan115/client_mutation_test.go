@@ -29,6 +29,7 @@ type mutationTestSDK struct {
 	recycleItems    []pan115sdk.RecycleBinItem
 	cleanErr        error
 	err             error
+	directoryID     pan115sdk.IntString
 }
 
 func (s *mutationTestSDK) Mkdir(parentID, name string) (string, error) {
@@ -58,10 +59,13 @@ func (s *mutationTestSDK) CleanRecycleBin(password string, itemIDs ...string) er
 func (s *mutationTestSDK) ListRecycleBin(_, _ int) ([]pan115sdk.RecycleBinItem, error) {
 	return append([]pan115sdk.RecycleBinItem(nil), s.recycleItems...), nil
 }
+func (s *mutationTestSDK) DirName2CID(string) (*pan115sdk.APIGetDirIDResp, error) {
+	return &pan115sdk.APIGetDirIDResp{CategoryID: s.directoryID}, s.err
+}
 
 func newMutationTestClient(sdk sdkClient) *Client {
 	unlimited := func() *rate.Limiter { return rate.NewLimiter(rate.Inf, 1) }
-	return &Client{sdk: sdk, mkdirRate: unlimited(), uploadRate: unlimited(), moveRate: unlimited(), copyRate: unlimited(), renameRate: unlimited(), recycleRate: unlimited(), purgeRate: unlimited(), callSlots: make(chan struct{}, maxInFlightCalls), now: time.Now, jitter: func() time.Duration { return 0 }}
+	return &Client{sdk: sdk, listRate: unlimited(), mkdirRate: unlimited(), uploadRate: unlimited(), moveRate: unlimited(), copyRate: unlimited(), renameRate: unlimited(), recycleRate: unlimited(), purgeRate: unlimited(), callSlots: make(chan struct{}, maxInFlightCalls), now: time.Now, jitter: func() time.Duration { return 0 }}
 }
 
 func TestMutationAdapterUsesProviderArgumentOrderAndIdentities(t *testing.T) {
@@ -89,6 +93,22 @@ func TestMutationAdapterUsesProviderArgumentOrderAndIdentities(t *testing.T) {
 	}
 	if sdk.mkdirParent != "parent" || sdk.mkdirName != "电影" || sdk.moveParent != "move-parent" || !reflect.DeepEqual(sdk.moveItems, []string{"move-item"}) || sdk.copyParent != "copy-parent" || !reflect.DeepEqual(sdk.copyItems, []string{"copy-item"}) || sdk.renameID != "rename-item" || sdk.renameName != "新名字.mkv" || !reflect.DeepEqual(sdk.deleted, []string{"delete-item"}) {
 		t.Fatalf("sdk calls=%+v", sdk)
+	}
+}
+
+func TestResolveDirectoryRejectsProviderRootSentinelForMissingNestedPath(t *testing.T) {
+	sdk := &mutationTestSDK{bulkSDK: &bulkSDK{}, directoryID: pan115sdk.IntString("0")}
+	client := newMutationTestClient(sdk)
+	if _, err := client.ResolveDirectory(context.Background(), "/共享/Video/Auto/OhMyCine/电影"); err == nil {
+		t.Fatal("missing nested directory resolved to provider root")
+	} else if code, _ := cloud.ErrorInfo(err); code != cloud.CodeNotFound {
+		t.Fatalf("unexpected error code: %s (%v)", code, err)
+	}
+
+	sdk.directoryID = pan115sdk.IntString("3507480816240297689")
+	item, err := client.ResolveDirectory(context.Background(), "/共享/Video/Auto/OhMyCine")
+	if err != nil || item.ID != "3507480816240297689" || !item.IsDir {
+		t.Fatalf("valid directory was rejected: item=%+v err=%v", item, err)
 	}
 }
 

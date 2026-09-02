@@ -30,7 +30,9 @@ describe('grouped administration navigation', () => {
   it('exposes the real settings workspace for settings.read', () => {
     const item = findNavigationItem('settings')
     expect(item.planned).toBeUndefined()
-    expect(buildVisibleNavigation([Permissions.SettingsRead])[0]?.items.map(candidate => candidate.id)).toEqual(['settings'])
+    const schedule = findNavigationItem('schedules')
+    expect(schedule.planned).toBeUndefined()
+    expect(buildVisibleNavigation([Permissions.SettingsRead]).flatMap(group => group.items).map(candidate => candidate.id)).toEqual(['schedules', 'settings'])
   })
   it('exposes plugin repository management as a real workspace', () => {
     const item = findNavigationItem('plugins')

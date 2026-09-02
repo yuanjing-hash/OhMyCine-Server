@@ -65,6 +65,7 @@ export const navigationGroups: readonly NavigationGroup[] = [
     label: '媒体自动化',
     items: [
       { id: 'tasks', label: '任务中心', to: '/automation/tasks', permissionsAny: taskPermissions, description: '查看、筛选和控制获权范围内的持久化自动化任务。' },
+      { id: 'schedules', label: '计划任务', to: '/automation/schedules', permissionsAny: [Permissions.SettingsRead], description: '用可视化五段 Cron 统一管理扫描、追更、目录修复与一致性任务。' },
       { id: 'downloads', label: '下载管理', to: '/automation/downloads', permissionsAny: downloadPermissions, description: '管理 qBittorrent 下载器，提交磁力、URL 或种子，并查看真实任务 telemetry。' },
       { id: 'organization', label: '媒体整理', to: '/automation/organization', permissionsAny: [Permissions.TransfersReadOwn, Permissions.TransfersReadAll], description: '查看下载完成后自动生成的分类、命名、转移记录，并处理冲突或失败。' },
 	  { id: 'strm', label: 'STRM 管理', to: '/automation/strm', permissionsAny: [Permissions.StrmRunsRead], description: '按媒体库刷新 signed STRM 投影，查看运行历史、托管产物并安全清理失效文件。' },
@@ -79,7 +80,7 @@ export const navigationGroups: readonly NavigationGroup[] = [
       { id: 'players', label: '播放器管理', to: '/system/players', permissionsAny: [Permissions.ConnectionsRead], description: '管理 Emby 连接、聚合运行摘要与签名 STRM 的 302 播放网关。' },
       { id: 'media-libraries', label: '媒体库管理', to: '/system/media-libraries', permissionsAny: [Permissions.MediaLibrariesRead], description: '管理来源相对根、扫描计划、监听状态、扫描记录和媒体条目。' },
       { id: 'media-rules', label: '规则管理', to: '/system/media-rules', permissionsAny: [Permissions.MediaClassificationProfilesRead], description: '管理媒体分类、识别预处理与电影/剧集命名 Profile。' },
-      { id: 'sites', label: '站点管理', to: '/system/sites', permissionsAny: [Permissions.SystemAdmin], description: '安全配置内建 PTTime 站点、连接健康、限速和启停策略。' },
+      { id: 'sites', label: '站点管理', to: '/system/sites', permissionsAny: [Permissions.SitesRead], description: '安全配置 PT/BT 站点、连接健康、限速和启停策略。' },
       { id: 'plugins', label: '插件', to: '/system/plugins', permissionsAny: [Permissions.PluginsRead], description: '管理 GitHub 插件仓库、查看固定提交上的市场条目和真实安装状态。' },
       { id: 'user-management', label: '用户管理', to: '/system/users', permissionsAny: userManagementPermissions, description: '账户与角色权限的统一管理工作区。' },
       { id: 'settings', label: '设置', to: '/system/settings', permissionsAny: [Permissions.SettingsRead], description: '配置统一下载暂存目录；更多调度、安全与同步参数将按实际 API 逐步接入。' },

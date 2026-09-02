@@ -53,6 +53,24 @@ type MediaLibraryService struct {
 	structure         *MediaLibraryStructureService
 }
 
+func (s *MediaLibraryService) authorizedMediaLibraryIDs(actor Actor, permission string, enabledOnly bool) ([]uint, error) {
+	query := s.db.Model(&models.MediaLibrary{})
+	if enabledOnly {
+		query = query.Where("enabled = ?", true)
+	}
+	var ids []uint
+	if err := query.Order("id").Pluck("id", &ids).Error; err != nil {
+		return nil, err
+	}
+	allowed := ids[:0]
+	for _, id := range ids {
+		if actor.CanResource(permission, models.AuthorizationResourceMediaLibrary, uintID(id)) {
+			allowed = append(allowed, id)
+		}
+	}
+	return allowed, nil
+}
+
 // MediaLibraryIngestEnqueuer is the narrow boundary from provider directory
 // reconciliation into the existing durable download pipeline.
 type MediaLibraryIngestEnqueuer interface {
@@ -202,7 +220,7 @@ func (s *MediaLibraryService) Close() {
 }
 
 func (s *MediaLibraryService) List(actor Actor) ([]MediaLibraryDetail, error) {
-	if !actor.Can(authz.PermissionMediaLibrariesRead) {
+	if !actor.HasPermission(authz.PermissionMediaLibrariesRead) {
 		return nil, appError(CodePermissionDenied, "无权查看媒体库", nil)
 	}
 	var records []models.MediaLibrary
@@ -211,6 +229,9 @@ func (s *MediaLibraryService) List(actor Actor) ([]MediaLibraryDetail, error) {
 	}
 	out := make([]MediaLibraryDetail, 0, len(records))
 	for _, record := range records {
+		if !actor.CanResource(authz.PermissionMediaLibrariesRead, models.AuthorizationResourceMediaLibrary, uintID(record.ID)) {
+			continue
+		}
 		detail, err := s.detail(record)
 		if err != nil {
 			return nil, err
@@ -220,12 +241,15 @@ func (s *MediaLibraryService) List(actor Actor) ([]MediaLibraryDetail, error) {
 	return out, nil
 }
 func (s *MediaLibraryService) Get(actor Actor, id uint) (MediaLibraryDetail, error) {
-	if !actor.Can(authz.PermissionMediaLibrariesRead) {
+	if !actor.HasPermission(authz.PermissionMediaLibrariesRead) {
 		return MediaLibraryDetail{}, appError(CodePermissionDenied, "无权查看媒体库", nil)
 	}
 	var record models.MediaLibrary
 	if err := s.db.First(&record, id).Error; err != nil {
 		return MediaLibraryDetail{}, mediaLibraryNotFound(err)
+	}
+	if !actor.CanResource(authz.PermissionMediaLibrariesRead, models.AuthorizationResourceMediaLibrary, uintID(record.ID)) {
+		return MediaLibraryDetail{}, appError(CodePermissionDenied, "无权查看这个媒体库", nil)
 	}
 	return s.detail(record)
 }
@@ -254,6 +278,9 @@ func (s *MediaLibraryService) Create(ctx context.Context, actor Actor, input Med
 		if err := tx.Select("*").Create(&record).Error; err != nil {
 			return err
 		}
+		if err := syncMediaLibraryUnifiedSchedule(tx, actor.User.ID, record, true, time.Now().UTC()); err != nil {
+			return err
+		}
 		return s.audit.Record(tx, &actor.User.ID, "media_library.create", "media_library", uintID(record.ID), "success", map[string]any{"storage_id": record.StorageID, "profile_id": record.ProfileID, "relative_root": record.RelativeRoot, "enabled": record.Enabled}, request)
 	})
 	if transactionErr != nil {
@@ -266,12 +293,15 @@ func (s *MediaLibraryService) Create(ctx context.Context, actor Actor, input Med
 }
 
 func (s *MediaLibraryService) Update(ctx context.Context, actor Actor, id uint, input MediaLibraryInput, request RequestContext) (MediaLibraryDetail, error) {
-	if !actor.Can(authz.PermissionMediaLibrariesUpdate) {
+	if !actor.HasPermission(authz.PermissionMediaLibrariesUpdate) {
 		return MediaLibraryDetail{}, appError(CodePermissionDenied, "无权编辑媒体库", nil)
 	}
 	var existing models.MediaLibrary
 	if err := s.db.First(&existing, id).Error; err != nil {
 		return MediaLibraryDetail{}, mediaLibraryNotFound(err)
+	}
+	if !actor.CanResource(authz.PermissionMediaLibrariesUpdate, models.AuthorizationResourceMediaLibrary, uintID(existing.ID)) {
+		return MediaLibraryDetail{}, appError(CodePermissionDenied, "无权编辑这个媒体库", nil)
 	}
 	if input.MetadataArtifactsEnabled == nil {
 		value := existing.MetadataArtifactsEnabled
@@ -380,6 +410,10 @@ func (s *MediaLibraryService) Update(ctx context.Context, actor Actor, id uint, 
 		if err := tx.Model(&models.MediaLibrary{}).Where("id = ?", id).Select("content_revision").Scan(&record.ContentRevision).Error; err != nil {
 			return err
 		}
+		overwriteSchedule := existing.FullScanIntervalHours != record.FullScanIntervalHours || existing.Enabled != record.Enabled
+		if err := syncMediaLibraryUnifiedSchedule(tx, actor.User.ID, record, overwriteSchedule, time.Now().UTC()); err != nil {
+			return err
+		}
 		return s.audit.Record(tx, &actor.User.ID, "media_library.update", "media_library", uintID(id), "success", map[string]any{"storage_id": record.StorageID, "profile_id": record.ProfileID, "relative_root": record.RelativeRoot, "enabled": record.Enabled}, request)
 	}); err != nil {
 		lock.Unlock()
@@ -470,12 +504,15 @@ func (s *MediaLibraryService) Reorder(actor Actor, ids []uint, request RequestCo
 }
 
 func (s *MediaLibraryService) Delete(actor Actor, id uint, request RequestContext) error {
-	if !actor.Can(authz.PermissionMediaLibrariesDelete) {
+	if !actor.HasPermission(authz.PermissionMediaLibrariesDelete) {
 		return appError(CodePermissionDenied, "无权删除媒体库", nil)
 	}
 	var existing models.MediaLibrary
 	if err := s.db.First(&existing, id).Error; err != nil {
 		return mediaLibraryNotFound(err)
+	}
+	if !actor.CanResource(authz.PermissionMediaLibrariesDelete, models.AuthorizationResourceMediaLibrary, uintID(existing.ID)) {
+		return appError(CodePermissionDenied, "无权删除这个媒体库", nil)
 	}
 	if existing.DefaultIngestConnectionID != nil {
 		if err := requireNoEnabledLifeEventListener(context.Background(), s.db, *existing.DefaultIngestConnectionID); err != nil {
@@ -496,6 +533,9 @@ func (s *MediaLibraryService) Delete(actor Actor, id uint, request RequestContex
 				return err
 			}
 		}
+		if err := tx.Where("managed_key = ?", managedScheduleKey("media_library_scan", "media_library", uintID(id))).Delete(&models.ScheduleDefinition{}).Error; err != nil {
+			return err
+		}
 		if err := tx.Delete(&record).Error; err != nil {
 			return err
 		}
@@ -511,12 +551,15 @@ func (s *MediaLibraryService) Delete(actor Actor, id uint, request RequestContex
 	return err
 }
 func (s *MediaLibraryService) Retry(actor Actor, id uint) error {
-	if !actor.Can(authz.PermissionMediaLibrariesScan) {
+	if !actor.HasPermission(authz.PermissionMediaLibrariesScan) {
 		return appError(CodePermissionDenied, "无权扫描媒体库", nil)
 	}
 	var record models.MediaLibrary
 	if err := s.db.First(&record, id).Error; err != nil {
 		return mediaLibraryNotFound(err)
+	}
+	if !actor.CanResource(authz.PermissionMediaLibrariesScan, models.AuthorizationResourceMediaLibrary, uintID(record.ID)) {
+		return appError(CodePermissionDenied, "无权扫描这个媒体库", nil)
 	}
 	if !record.Enabled {
 		return appError(CodeConflict, "媒体库已停用", nil)
@@ -526,10 +569,26 @@ func (s *MediaLibraryService) Retry(actor Actor, id uint) error {
 	return nil
 }
 func (s *MediaLibraryService) ScanNow(ctx context.Context, actor Actor, id uint) (models.MediaLibraryScanRun, error) {
-	if !actor.Can(authz.PermissionMediaLibrariesScan) {
+	// Kept for existing callers. New callers should state whether the user
+	// requested a bounded follow-up or an explicit full reconciliation.
+	return s.Scan(ctx, actor, id, "incremental")
+}
+
+// Scan runs a user-requested reconciliation. The mode is intentionally
+// explicit in the run history even where a provider's current incremental
+// capability still needs a tree reconciliation as its safety fallback.
+func (s *MediaLibraryService) Scan(ctx context.Context, actor Actor, id uint, mode string) (models.MediaLibraryScanRun, error) {
+	if !actor.CanResource(authz.PermissionMediaLibrariesScan, models.AuthorizationResourceMediaLibrary, uintID(id)) {
 		return models.MediaLibraryScanRun{}, appError(CodePermissionDenied, "无权扫描媒体库", nil)
 	}
-	return s.reconcile(ctx, id, "manual")
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "incremental":
+		return s.reconcile(ctx, id, "incremental")
+	case "full":
+		return s.reconcile(ctx, id, "full")
+	default:
+		return models.MediaLibraryScanRun{}, appError(CodeInvalidRequest, "媒体库扫描模式无效", nil)
+	}
 }
 
 func (s *MediaLibraryService) ReconcileSTRM(ctx context.Context, id uint, mode string) (models.MediaLibraryScanRun, error) {
@@ -549,7 +608,7 @@ func (s *MediaLibraryService) ReconcileSTRM(ctx context.Context, id uint, mode s
 	return s.reconcile(ctx, id, kind)
 }
 func (s *MediaLibraryService) Entries(actor Actor, id uint, limit int) ([]models.MediaLibraryEntry, error) {
-	if !actor.Can(authz.PermissionMediaLibrariesRead) {
+	if !actor.CanResource(authz.PermissionMediaLibrariesRead, models.AuthorizationResourceMediaLibrary, uintID(id)) {
 		return nil, appError(CodePermissionDenied, "无权查看媒体库", nil)
 	}
 	if limit <= 0 || limit > 500 {
@@ -562,7 +621,7 @@ func (s *MediaLibraryService) Entries(actor Actor, id uint, limit int) ([]models
 	return items, nil
 }
 func (s *MediaLibraryService) Runs(actor Actor, id uint, limit int) ([]models.MediaLibraryScanRun, error) {
-	if !actor.Can(authz.PermissionMediaLibrariesRead) {
+	if !actor.CanResource(authz.PermissionMediaLibrariesRead, models.AuthorizationResourceMediaLibrary, uintID(id)) {
 		return nil, appError(CodePermissionDenied, "无权查看扫描记录", nil)
 	}
 	if limit <= 0 || limit > 100 {

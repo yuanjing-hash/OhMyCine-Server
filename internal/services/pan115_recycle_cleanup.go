@@ -116,6 +116,17 @@ func (s *Pan115RecycleCleanupService) Poll(ctx context.Context) error {
 	return nil
 }
 
+func (s *Pan115RecycleCleanupService) EnqueueConnection(connectionID uint) (JobDTO, error) {
+	var record models.Connection
+	if err := s.db.First(&record, connectionID).Error; err != nil {
+		return JobDTO{}, notFound(err, "115 连接不存在")
+	}
+	if record.Provider != models.ConnectionProviderPan115 || !record.Enabled || !record.RecycleCleanupEnabled || record.RecycleCredentialCiphertext == "" {
+		return JobDTO{}, appError(CodeConflict, "115 回收站清理未启用或缺少操作密码", nil)
+	}
+	return s.queue.Enqueue(EnqueueJobInput{System: true, JobType: JobTypePan115RecycleCleanup, Priority: 10, DisplayName: "清空 115 回收站", ResourceKey: "connection:" + strconv.FormatUint(uint64(record.ID), 10), CoalescingKey: "unified_schedule", Payload: pan115RecycleCleanupJobPayload{ConnectionID: record.ID, Revision: record.Revision}})
+}
+
 func NewPan115RecycleCleanupWorker(service *Pan115RecycleCleanupService) Worker {
 	return WorkerFunc(service.run)
 }

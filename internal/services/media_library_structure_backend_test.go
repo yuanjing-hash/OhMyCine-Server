@@ -125,6 +125,31 @@ func TestPan115StructureBackendMovesByStableIdentityAndCleansEmptyDirectory(t *t
 	}
 }
 
+func TestPan115StructureBackendRepairsOnlyExplicitHistoricalProviderRootItem(t *testing.T) {
+	driver := &structureCloudDriver{items: map[string]cloudpkg.Item{
+		"root":  {ID: "root", ParentID: "0", IsDir: true},
+		"video": {ID: "video", ParentID: "0", Name: "movie.mkv", Size: 5},
+	}}
+	backend := pan115MediaLibraryStructureBackend{driver: func(uint) (cloudpkg.Driver, error) { return driver, nil }}
+	connectionID := uint(3)
+	item := StructurePlanItem{Kind: "video", ProviderID: "video", SourceRelative: "网盘根目录/movie.mkv", TargetRelative: "电影/动画/movie.mkv", AllowProviderRootSource: true, Size: 5}
+	if err := backend.Apply(context.Background(), StructureBoundary{Library: models.MediaLibrary{ProviderRootID: "root"}, Storage: models.Storage{ConnectionID: &connectionID, RootPath: "root"}}, []StructurePlanItem{item}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if driver.items["video"].ParentID == "0" {
+		t.Fatalf("historical root item was not moved: %+v", driver.items["video"])
+	}
+	if err := backend.Apply(context.Background(), StructureBoundary{Library: models.MediaLibrary{ProviderRootID: "root"}, Storage: models.Storage{ConnectionID: &connectionID, RootPath: "root"}}, []StructurePlanItem{item}, nil); err != nil {
+		t.Fatalf("exact completed historical repair was not idempotent: %v", err)
+	}
+
+	driver.items["video"] = cloudpkg.Item{ID: "video", ParentID: "0", Name: "movie.mkv", Size: 5}
+	item.AllowProviderRootSource = false
+	if err := backend.Apply(context.Background(), StructureBoundary{Library: models.MediaLibrary{ProviderRootID: "root"}, Storage: models.Storage{ConnectionID: &connectionID, RootPath: "root"}}, []StructurePlanItem{item}, nil); err == nil {
+		t.Fatal("ordinary structure plan was allowed to move a provider-root item")
+	}
+}
+
 func TestPan115StructureBackendCleansSiblingOldDirectoriesBeforeTheirSharedParent(t *testing.T) {
 	driver := &structureCloudDriver{items: map[string]cloudpkg.Item{
 		"root":    {ID: "root", IsDir: true},

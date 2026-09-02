@@ -74,7 +74,7 @@ type mediaCatalogDeletionState struct {
 func (s *MediaLibraryService) PreviewCatalogDeletion(ctx context.Context, actor Actor, libraryID uint, workToken string, request RequestContext) (MediaCatalogDeletionPreviewResult, error) {
 	ctx, cancel := boundedTransferDeletionContext(ctx)
 	defer cancel()
-	if !actor.Can(authz.PermissionMediaLibrariesMediaDelete) {
+	if !actor.CanResource(authz.PermissionMediaLibrariesMediaDelete, models.AuthorizationResourceMediaLibrary, uintID(libraryID)) {
 		return MediaCatalogDeletionPreviewResult{}, appError(CodePermissionDenied, "无权删除媒体库作品源文件", nil)
 	}
 	library, storage, workKey, entries, err := s.catalogDeletionBoundary(libraryID, workToken)
@@ -170,7 +170,7 @@ func (s *MediaLibraryService) PreviewCatalogDeletion(ctx context.Context, actor 
 func (s *MediaLibraryService) ConfirmCatalogDeletion(ctx context.Context, actor Actor, libraryID uint, workToken, token string, request RequestContext) (MediaCatalogDeletionResult, error) {
 	ctx, cancel := boundedTransferDeletionContext(ctx)
 	defer cancel()
-	if !actor.Can(authz.PermissionMediaLibrariesMediaDelete) {
+	if !actor.CanResource(authz.PermissionMediaLibrariesMediaDelete, models.AuthorizationResourceMediaLibrary, uintID(libraryID)) {
 		return MediaCatalogDeletionResult{}, appError(CodePermissionDenied, "无权删除媒体库作品源文件", nil)
 	}
 	workKey, err := decodeCatalogToken(workToken)

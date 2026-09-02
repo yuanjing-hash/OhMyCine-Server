@@ -9,7 +9,7 @@ import MediaLibrarySettingsFields from '@/components/MediaLibrarySettingsFields.
 import { clearDefaultIngestLibrary, draftFromLibrary, emptyMediaLibraryDraft, isActiveLibraryStatus, isMediaLibraryDraftValid, mediaLibraryDraftFingerprint, mediaLibrarySourceDisplayPath, payloadFromDraft, presentLibraryStatus, setDefaultIngestLibrary, supportsSidecarUpload, supportsSTRM, type MediaLibraryDraft } from '@/media-libraries'
 import { mediaCatalogDetailEndpoint, mediaCatalogEndpoint, mediaCatalogPageCount, mediaCatalogPageSizes, mediaCatalogVisibleRange, type MediaCatalogMatchFilter, type MediaCatalogPageSize, type MediaCatalogTypeFilter } from '@/media-catalog'
 import { useAuthStore } from '@/stores/auth'
-import type { ListResponse, MediaCatalogDetail, MediaCatalogItem, MediaCatalogManagedTransfer, MediaClassificationProfileSummary, MediaLibraryDetail, MediaLibraryScanRun, MediaLibraryStructureDiagnostics, MediaLibraryStructureRepair, MediaRecognitionSummary, PageResponse, StorageSummary, TMDBCandidate } from '@/types/api'
+import type { ListResponse, MediaCatalogDetail, MediaCatalogItem, MediaCatalogManagedTransfer, MediaClassificationProfileSummary, MediaLibraryDetail, MediaLibraryScanRun, MediaLibraryStructureDiagnostics, MediaLibraryStructurePreview, MediaLibraryStructureRepair, MediaRecognitionSummary, PageResponse, StorageSummary, TMDBCandidate } from '@/types/api'
 
 type DetailTab = 'status' | 'runs' | 'entries' | 'settings'
 type PickerTarget = 'source' | 'strm'
@@ -56,6 +56,7 @@ const draggedLibraryID = ref<number | null>(null)
 const structureOpen = ref(false)
 const structureLoading = ref(false)
 const structureDiagnostics = ref<MediaLibraryStructureDiagnostics | null>(null)
+const structurePreview = ref<MediaLibraryStructurePreview | null>(null)
 const promptedStructureIDs = new Set<number>()
 let pollTimer: number | undefined
 let runsRequest: AbortController | null = null
@@ -80,7 +81,7 @@ function dateTime(value: string | null) { return value ? new Date(value).toLocal
 function bytes(value: number) { const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB']; let amount = value; let index = 0; while (amount >= 1024 && index < units.length - 1) { amount /= 1024; index++ } return `${amount.toFixed(index === 0 ? 0 : 1)} ${units[index]}` }
 function episodeLabel(entry: { season: number | null; episode: number | null }) { return entry.episode === null ? '' : `${entry.season === null ? '' : `S${String(entry.season).padStart(2, '0')}`}E${String(entry.episode).padStart(2, '0')}` }
 function seasonLabel(number: number) { return number === 0 ? '未分季' : `第 ${number} 季` }
-function scanKind(kind: string) { return ({ initial: '首次全量', catch_up: '监听交接对账', event: '文件事件', incremental: '定时增量', full: '周期全量', manual: '手动跟进' } as Record<string, string>)[kind] ?? kind }
+function scanKind(kind: string) { return ({ initial: '首次全量', catch_up: '监听交接对账', event: '文件事件', incremental: '立即/定时增量', full: '立即/周期全量', manual: '手动跟进' } as Record<string, string>)[kind] ?? kind }
 function scanStatus(run: MediaLibraryScanRun) { if (run.status === 'failed') return { label: '失败', className: 'status-chip status-chip--error' }; if (run.status === 'running') return { label: '运行中', className: 'status-chip status-chip--warning' }; return { label: run.partial ? '部分完成' : '成功', className: run.partial ? 'status-chip status-chip--warning' : 'status-chip status-chip--ready' } }
 
 async function persistOrder(next: MediaLibraryDetail[]) {
@@ -353,10 +354,12 @@ async function saveLibrary() {
   } finally { saving.value = false }
 }
 
-async function scanNow() {
+async function scanNow(mode: 'incremental' | 'full') {
   if (!selected.value) return
   const id = selected.value.id
-  await run(async () => { await api<MediaLibraryScanRun>(`/api/v1/media-libraries/${id}/scan`, { method: 'POST', body: '{}' }); notice.value = '手动跟进扫描已完成。'; await load({ preferred: id }) })
+  const isFull = mode === 'full'
+  if (isFull && !window.confirm('立即全量会重新核对整个媒体库，115 大库可能需要较长时间。继续吗？')) return
+  await run(async () => { await api<MediaLibraryScanRun>(`/api/v1/media-libraries/${id}/scan`, { method: 'POST', body: JSON.stringify({ mode }) }); notice.value = isFull ? '立即全量扫描已完成。' : '立即增量扫描已完成。'; await load({ preferred: id }) })
 }
 
 async function retryNow() {
@@ -392,8 +395,14 @@ async function clearAutoListenDefault() {
 
 async function openStructureDiagnostics() {
   if (!selected.value) return
-  structureOpen.value = true; structureLoading.value = true; structureDiagnostics.value = null
-  try { structureDiagnostics.value = await api<MediaLibraryStructureDiagnostics>(`/api/v1/media-libraries/${selected.value.id}/structure`) }
+  structureOpen.value = true; structureLoading.value = true; structureDiagnostics.value = null; structurePreview.value = null
+  try {
+    const diagnostics = await api<MediaLibraryStructureDiagnostics>(`/api/v1/media-libraries/${selected.value.id}/structure/diagnose`, { method: 'POST', body: '{}' })
+    structureDiagnostics.value = diagnostics
+    if (diagnostics.issues.some(item => item.repairable)) {
+      structurePreview.value = await api<MediaLibraryStructurePreview>(`/api/v1/media-libraries/${selected.value.id}/structure/preview`, { method: 'POST', body: JSON.stringify({ revision: diagnostics.revision }) })
+    }
+  }
   catch (reason) { error.value = message(reason); structureOpen.value = false }
   finally { structureLoading.value = false }
 }
@@ -402,9 +411,10 @@ async function repairStructure(workID = '') {
   if (!selected.value) return
   const id = selected.value.id
   await run(async () => {
-    const repair = await api<MediaLibraryStructureRepair>(`/api/v1/media-libraries/${id}/structure/repair`, { method: 'POST', body: JSON.stringify({ work_id: workID }) })
+    if (!workID && !structurePreview.value?.confirmation_token) throw new Error('修复预览已失效，请重新检查目录结构')
+    const repair = await api<MediaLibraryStructureRepair>(`/api/v1/media-libraries/${id}/structure/repair`, { method: 'POST', body: JSON.stringify({ work_id: workID, confirmation_token: workID ? undefined : structurePreview.value?.confirmation_token }) })
     notice.value = workID ? '该作品的目录修复已进入队列；完成后会自动重新扫描。' : `已提交 ${repair.total_items} 个目录整理动作；完成后会自动重新扫描。`
-    structureOpen.value = false; structureDiagnostics.value = null
+    structureOpen.value = false; structureDiagnostics.value = null; structurePreview.value = null
     await load({ quiet: true, preferred: id })
   })
 }
@@ -494,7 +504,7 @@ function clearEditDraft() {
       </aside>
       <main v-if="selected" class="min-w-0">
         <section class="panel">
-          <div class="flex flex-wrap items-start justify-between gap-4"><div><div class="flex flex-wrap items-center gap-2"><h2 class="m-0">{{ selected.name }}</h2><span :class="presentLibraryStatus(selected.status).className">{{ presentLibraryStatus(selected.status).label }}</span></div><p class="text-subtle mb-0 mt-2 text-sm">{{ selected.storage_name }} · {{ selectedSourceDisplay }}（相对根 {{ selected.relative_root }}） · Profile {{ selected.profile_name }} r{{ selected.profile_revision }}</p></div><div class="flex flex-wrap gap-2"><button v-if="selected.status === 'initialization_failed' && auth.can(Permissions.MediaLibrariesScan)" type="button" class="btn-primary" :disabled="saving" @click="retryNow">立即重试</button><button v-if="selected.enabled && selected.status !== 'initializing' && auth.can(Permissions.MediaLibrariesScan)" type="button" class="btn-secondary" :disabled="saving" @click="scanNow">立即扫描</button><button v-if="auth.can(Permissions.MediaLibrariesDelete)" type="button" class="btn-danger" :disabled="saving" @click="removeLibrary">删除配置</button></div></div>
+          <div class="flex flex-wrap items-start justify-between gap-4"><div><div class="flex flex-wrap items-center gap-2"><h2 class="m-0">{{ selected.name }}</h2><span :class="presentLibraryStatus(selected.status).className">{{ presentLibraryStatus(selected.status).label }}</span></div><p class="text-subtle mb-0 mt-2 text-sm">{{ selected.storage_name }} · {{ selectedSourceDisplay }}（相对根 {{ selected.relative_root }}） · Profile {{ selected.profile_name }} r{{ selected.profile_revision }}</p></div><div class="flex flex-wrap gap-2"><button v-if="auth.can(Permissions.MediaLibrariesScan)" type="button" class="btn-secondary" :disabled="saving || structureLoading" @click="openStructureDiagnostics">检查目录结构</button><button v-if="selected.status === 'initialization_failed' && auth.can(Permissions.MediaLibrariesScan)" type="button" class="btn-primary" :disabled="saving" @click="retryNow">立即重试</button><button v-if="selected.enabled && selected.status !== 'initializing' && auth.can(Permissions.MediaLibrariesScan)" type="button" class="btn-secondary" :disabled="saving" @click="scanNow('incremental')">立即增量</button><button v-if="selected.enabled && selected.status !== 'initializing' && auth.can(Permissions.MediaLibrariesScan)" type="button" class="btn-secondary" :disabled="saving" @click="scanNow('full')">立即全量</button><button v-if="auth.can(Permissions.MediaLibrariesDelete)" type="button" class="btn-danger" :disabled="saving" @click="removeLibrary">删除配置</button></div></div>
           <p v-if="selected.status === 'initialization_failed'" class="semantic-error mt-4 p-3 text-sm">初始化失败：{{ selected.status_error_code || 'media_library_scan_failed' }}。失败库不会启动监听；下次自动重试：{{ dateTime(selected.next_retry_at) }}。</p>
           <p v-if="selected.reclassification_due" class="semantic-warning mt-4 p-3 text-sm">所选 Profile 已更新。下一次扫描会重新应用分类，但不会移动、重命名或写回来源文件。<RouterLink class="semantic-link ml-1" to="/system/media-rules">打开规则管理</RouterLink></p>
           <div v-if="selected.structure_status === 'issues'" class="semantic-warning mt-4 flex flex-wrap items-center justify-between gap-3 p-3 text-sm"><span>首次结构诊断发现 {{ selected.structure_issue_count }} 项异常。Server 尚未移动任何文件；可先查看安全相对路径再决定是否修复。</span><button class="btn-secondary" type="button" @click="openStructureDiagnostics">查看并修复</button></div>
@@ -579,6 +589,6 @@ function clearEditDraft() {
 
     <DirectoryPickerDialog :open="pickerOpen" :storage-id="pickerTarget === 'source' ? activeDraft?.storage_id : null" :restrict-to-storage="pickerTarget === 'source'" @close="pickerOpen = false" @select="directorySelected" />
     <MediaReorganizationDialog v-if="reorganizationTarget" :open="true" :transfer-task-id="reorganizationTarget.transfer.transfer_task_id" :download-task-id="reorganizationTarget.transfer.download_task_id" :display-name="reorganizationTarget.work.title" :current-title="reorganizationTarget.work.title" :current-media-type="reorganizationTarget.work.kind === 'movie' ? 'movie' : 'tv'" @close="reorganizationTarget = null" @queued="catalogReorganizationQueued" />
-    <div v-if="structureOpen" class="fixed inset-0 z-80 grid place-items-center bg-black/65 p-4" @click.self="!saving && (structureOpen = false)"><section class="panel max-h-[85vh] w-full max-w-4xl overflow-y-auto" role="dialog" aria-modal="true" aria-labelledby="structure-dialog-title"><header class="flex items-start justify-between gap-4"><div><h2 id="structure-dialog-title" class="m-0 text-xl">媒体库目录诊断</h2><p class="page-description mt-1 text-sm">诊断本身只读。修复会按固定“电影 / 电视剧”根和当前 Profile 整理视频、字幕、NFO 与图片，并仅清理已经为空的旧目录。</p></div><button class="btn-secondary" type="button" :disabled="saving" @click="structureOpen = false">关闭</button></header><div v-if="structureLoading" class="py-12 text-center text-muted">正在诊断目录结构…</div><template v-else-if="structureDiagnostics"><div class="mt-4 grid gap-3 sm:grid-cols-3"><div class="semantic-inset p-3"><span class="text-subtle text-xs">全部问题</span><strong class="mt-1 block">{{ structureDiagnostics.issue_count }}</strong></div><div class="semantic-inset p-3"><span class="text-subtle text-xs">未识别</span><strong class="mt-1 block">{{ structureDiagnostics.unrecognized }}</strong></div><div class="semantic-inset p-3"><span class="text-subtle text-xs">诊断时间</span><strong class="mt-1 block text-sm">{{ dateTime(structureDiagnostics.checked_at) }}</strong></div></div><p v-if="structureDiagnostics.unrecognized" class="semantic-warning mt-4 p-3 text-sm">未识别作品不会被盲目改名，请先在“媒体清单 → 未识别”中手动识别；可修复的已识别项目仍可正常执行。</p><div class="mt-4 max-h-96 overflow-y-auto"><table class="semantic-table w-full text-left text-xs"><thead><tr><th>类型</th><th>作品</th><th>当前路径</th><th>期望路径</th><th>处理</th></tr></thead><tbody><tr v-for="(issue, index) in structureDiagnostics.issues" :key="`${issue.current_path}:${index}`"><td>{{ issue.kind === 'video' ? '视频' : '伴随文件' }}</td><td>{{ issue.title || '未识别' }}</td><td class="break-all font-mono">{{ issue.current_path || '—' }}</td><td class="break-all font-mono">{{ issue.expected_path || '—' }}</td><td>{{ issue.repairable ? '可修复' : '需先识别' }}</td></tr><tr v-if="structureDiagnostics.issues.length === 0"><td colspan="5" class="py-8 text-center text-muted">目录结构健康，无需修复</td></tr></tbody></table></div><footer class="semantic-divider mt-4 flex flex-wrap justify-end gap-3 border-t pt-4"><button class="btn-secondary" type="button" :disabled="saving" @click="structureOpen = false">暂不修复</button><button v-if="structureDiagnostics.issues.some(item => item.repairable) && auth.can(Permissions.MediaLibrariesScan)" class="btn-primary" type="button" :disabled="saving" @click="repairStructure()">{{ saving ? '正在提交…' : '修复全部可修复项目' }}</button></footer></template></section></div>
+    <div v-if="structureOpen" class="fixed inset-0 z-80 grid place-items-center bg-black/65 p-4" @click.self="!saving && (structureOpen = false)"><section class="panel max-h-[85vh] w-full max-w-4xl overflow-y-auto" role="dialog" aria-modal="true" aria-labelledby="structure-dialog-title"><header class="flex items-start justify-between gap-4"><div><h2 id="structure-dialog-title" class="m-0 text-xl">媒体库目录诊断</h2><p class="page-description mt-1 text-sm">诊断本身只读。修复会按固定“电影 / 电视剧”根和当前 Profile 整理视频、字幕、NFO 与图片，并仅清理已经为空的旧目录。</p></div><button class="btn-secondary" type="button" :disabled="saving" @click="structureOpen = false">关闭</button></header><div v-if="structureLoading" class="py-12 text-center text-muted">正在诊断并生成不可变修复预览…</div><template v-else-if="structureDiagnostics"><div class="mt-4 grid gap-3 sm:grid-cols-3"><div class="semantic-inset p-3"><span class="text-subtle text-xs">全部问题</span><strong class="mt-1 block">{{ structureDiagnostics.issue_count }}</strong></div><div class="semantic-inset p-3"><span class="text-subtle text-xs">未识别</span><strong class="mt-1 block">{{ structureDiagnostics.unrecognized }}</strong></div><div class="semantic-inset p-3"><span class="text-subtle text-xs">计划移动</span><strong class="mt-1 block">{{ structurePreview?.move_count ?? 0 }}</strong></div></div><p v-if="structureDiagnostics.unrecognized" class="semantic-warning mt-4 p-3 text-sm">未识别作品不会被盲目改名，请先在“媒体清单 → 未识别”中手动识别；可修复的已识别项目仍可正常执行。</p><div class="mt-4 max-h-96 overflow-y-auto"><table class="semantic-table w-full text-left text-xs"><thead><tr><th>类型</th><th>作品</th><th>当前路径</th><th>期望路径</th><th>处理</th></tr></thead><tbody><tr v-for="(issue, index) in structureDiagnostics.issues" :key="`${issue.current_path}:${index}`"><td>{{ issue.kind === 'video' ? '视频' : '伴随文件' }}</td><td>{{ issue.title || '未识别' }}</td><td class="break-all font-mono">{{ issue.current_path || '—' }}</td><td class="break-all font-mono">{{ issue.expected_path || '—' }}</td><td>{{ issue.repairable ? '可修复' : '需先识别' }}</td></tr><tr v-if="structureDiagnostics.issues.length === 0"><td colspan="5" class="py-8 text-center text-muted">目录结构健康，无需修复</td></tr></tbody></table></div><footer class="semantic-divider mt-4 flex flex-wrap justify-end gap-3 border-t pt-4"><button class="btn-secondary" type="button" :disabled="saving" @click="structureOpen = false">暂不修复</button><button v-if="structureDiagnostics.issues.some(item => item.repairable) && auth.can(Permissions.MediaLibrariesScan)" class="btn-primary" type="button" :disabled="saving || !structurePreview" @click="repairStructure()">{{ saving ? '正在提交…' : '按预览修复全部可修复项目' }}</button></footer></template></section></div>
   </section>
 </template>

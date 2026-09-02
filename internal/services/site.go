@@ -29,8 +29,9 @@ import (
 )
 
 const (
-	ptResultTTL       = 15 * time.Minute
-	maxPTResultClaims = 5000
+	ptResultTTL                  = 15 * time.Minute
+	maxPTResultClaims            = 5000
+	defaultSiteSearchConcurrency = 4
 )
 
 type SiteService struct {
@@ -44,6 +45,7 @@ type SiteService struct {
 	metadata        *MetadataSettingsService
 	aiRecognition   *AIRecognitionSettingsService
 	renderedFetcher sitepkg.RenderedFetcher
+	searchSlots     chan struct{}
 
 	limitMu sync.Mutex
 	limits  map[uint]*siteLimiter
@@ -187,6 +189,19 @@ type SiteSearchGroup struct {
 	Skipped    int                `json:"skipped"`
 	Items      []SiteSearchResult `json:"items"`
 }
+type SiteSearchProgress struct {
+	Total       int    `json:"total"`
+	Pending     int    `json:"pending"`
+	Running     int    `json:"running"`
+	Completed   int    `json:"completed"`
+	Succeeded   int    `json:"succeeded"`
+	Failed      int    `json:"failed"`
+	ResultCount int    `json:"result_count"`
+	SiteID      uint   `json:"site_id,omitempty"`
+	SiteName    string `json:"site_name,omitempty"`
+	SiteStatus  string `json:"site_status,omitempty"`
+	ErrorCode   string `json:"error_code,omitempty"`
+}
 type SiteDownloadInput struct {
 	ResultToken, DownloaderID string
 	MediaLibraryID            *uint
@@ -257,7 +272,7 @@ func NewSiteServiceWithAdapters(db *gorm.DB, audit *AuditService, credentials *c
 			registry[adapter.Kind()] = adapter
 		}
 	}
-	return &SiteService{db: db, audit: audit, credentials: credentials, downloads: downloads, adapters: registry, log: log, now: func() time.Time { return time.Now().UTC() }, limits: map[uint]*siteLimiter{}, vault: map[string]siteResultClaim{}}
+	return &SiteService{db: db, audit: audit, credentials: credentials, downloads: downloads, adapters: registry, log: log, now: func() time.Time { return time.Now().UTC() }, searchSlots: make(chan struct{}, defaultSiteSearchConcurrency), limits: map[uint]*siteLimiter{}, vault: map[string]siteResultClaim{}}
 }
 
 func (s *SiteService) SetMetadataSettings(service *MetadataSettingsService) { s.metadata = service }
@@ -269,8 +284,8 @@ func (s *SiteService) SetRenderedFetcher(fetcher sitepkg.RenderedFetcher) {
 }
 
 func (s *SiteService) List(actor Actor) ([]SiteSummary, error) {
-	if !actor.IsSystemAdmin() {
-		return nil, appError(CodePermissionDenied, "仅管理员可以管理站点", nil)
+	if !actor.IsSystemAdmin() && !actor.HasPermission(authz.PermissionSitesRead) {
+		return nil, appError(CodePermissionDenied, "无权管理站点", nil)
 	}
 	var records []models.Site
 	if err := s.db.Order("priority ASC, id ASC").Find(&records).Error; err != nil {
@@ -278,14 +293,17 @@ func (s *SiteService) List(actor Actor) ([]SiteSummary, error) {
 	}
 	items := make([]SiteSummary, 0, len(records))
 	for _, record := range records {
+		if !actor.IsSystemAdmin() && !actor.CanResource(authz.PermissionSitesRead, models.AuthorizationResourceSite, uintID(record.ID)) {
+			continue
+		}
 		items = append(items, s.siteSummary(record))
 	}
 	return items, nil
 }
 
 func (s *SiteService) Catalog(actor Actor) ([]SiteCatalogSummary, error) {
-	if !actor.IsSystemAdmin() {
-		return nil, appError(CodePermissionDenied, "仅管理员可以查看站点目录", nil)
+	if !actor.IsSystemAdmin() && !actor.HasPermission(authz.PermissionSitesRead) {
+		return nil, appError(CodePermissionDenied, "无权查看站点目录", nil)
 	}
 	definitions := builtin.CatalogDefinitions()
 	items := make([]SiteCatalogSummary, 0, len(definitions))
@@ -299,8 +317,8 @@ func (s *SiteService) Catalog(actor Actor) ([]SiteCatalogSummary, error) {
 }
 
 func (s *SiteService) ResolveBT(actor Actor, raw string) (SiteResolutionSummary, error) {
-	if !actor.IsSystemAdmin() {
-		return SiteResolutionSummary{}, appError(CodePermissionDenied, "仅管理员可以识别 BT 站点", nil)
+	if !actor.IsSystemAdmin() && !actor.Can(authz.PermissionSitesCreate) {
+		return SiteResolutionSummary{}, appError(CodePermissionDenied, "无权识别 BT 站点", nil)
 	}
 	definition, canonical, err := builtin.ResolveBTBaseURL(raw)
 	if err != nil {
@@ -316,8 +334,8 @@ func (s *SiteService) ResolveBT(actor Actor, raw string) (SiteResolutionSummary,
 }
 
 func (s *SiteService) Create(ctx context.Context, actor Actor, input SiteInput, request RequestContext) (SiteSummary, error) {
-	if !actor.IsSystemAdmin() {
-		return SiteSummary{}, appError(CodePermissionDenied, "仅管理员可以添加站点", nil)
+	if !actor.IsSystemAdmin() && !actor.Can(authz.PermissionSitesCreate) {
+		return SiteSummary{}, appError(CodePermissionDenied, "无权添加站点", nil)
 	}
 	name, normalized, err := normalizeSiteName(input.Name)
 	if err != nil {
@@ -454,12 +472,15 @@ func (s *SiteService) createFromCookieCloud(ctx context.Context, name, kind, bas
 }
 
 func (s *SiteService) Update(ctx context.Context, actor Actor, id uint, input SiteUpdateInput, request RequestContext) (SiteSummary, error) {
-	if !actor.IsSystemAdmin() {
-		return SiteSummary{}, appError(CodePermissionDenied, "仅管理员可以编辑站点", nil)
+	if !actor.IsSystemAdmin() && !actor.HasPermission(authz.PermissionSitesUpdate) {
+		return SiteSummary{}, appError(CodePermissionDenied, "无权编辑站点", nil)
 	}
 	var record models.Site
 	if err := s.db.First(&record, id).Error; err != nil {
 		return SiteSummary{}, siteNotFound(err)
+	}
+	if !actor.IsSystemAdmin() && !actor.CanResource(authz.PermissionSitesUpdate, models.AuthorizationResourceSite, uintID(record.ID)) {
+		return SiteSummary{}, appError(CodePermissionDenied, "无权编辑这个站点", nil)
 	}
 	if input.Revision == 0 || input.Revision != record.Revision {
 		return SiteSummary{}, appError(CodeConflict, "站点配置已变化，请刷新", nil)
@@ -609,12 +630,15 @@ func siteUpdateDisablesOnly(input SiteUpdateInput) bool {
 }
 
 func (s *SiteService) Test(ctx context.Context, actor Actor, id uint, request RequestContext) (SiteSummary, error) {
-	if !actor.IsSystemAdmin() {
-		return SiteSummary{}, appError(CodePermissionDenied, "仅管理员可以测试站点", nil)
+	if !actor.IsSystemAdmin() && !actor.HasPermission(authz.PermissionSitesTest) {
+		return SiteSummary{}, appError(CodePermissionDenied, "无权测试站点", nil)
 	}
 	record, config, adapter, err := s.runtimeConfig(id)
 	if err != nil {
 		return SiteSummary{}, err
+	}
+	if !actor.IsSystemAdmin() && !actor.CanResource(authz.PermissionSitesTest, models.AuthorizationResourceSite, uintID(record.ID)) {
+		return SiteSummary{}, appError(CodePermissionDenied, "无权测试这个站点", nil)
 	}
 	if err := s.waitLimit(ctx, record); err != nil {
 		return SiteSummary{}, err
@@ -639,12 +663,15 @@ func (s *SiteService) Test(ctx context.Context, actor Actor, id uint, request Re
 }
 
 func (s *SiteService) Delete(actor Actor, id uint, request RequestContext) error {
-	if !actor.IsSystemAdmin() {
-		return appError(CodePermissionDenied, "仅管理员可以删除站点", nil)
+	if !actor.IsSystemAdmin() && !actor.HasPermission(authz.PermissionSitesDelete) {
+		return appError(CodePermissionDenied, "无权删除站点", nil)
 	}
 	var record models.Site
 	if err := s.db.First(&record, id).Error; err != nil {
 		return siteNotFound(err)
+	}
+	if !actor.IsSystemAdmin() && !actor.CanResource(authz.PermissionSitesDelete, models.AuthorizationResourceSite, uintID(record.ID)) {
+		return appError(CodePermissionDenied, "无权删除这个站点", nil)
 	}
 	if err := s.db.Transaction(func(tx *gorm.DB) error {
 		if err := s.audit.Record(tx, &actor.User.ID, "site.delete", "site", uintID(id), "success", map[string]any{"kind": record.Kind}, request); err != nil {
@@ -663,6 +690,14 @@ func (s *SiteService) Search(ctx context.Context, actor Actor, input SiteSearchI
 	groups := []SiteSearchGroup{}
 	var mu sync.Mutex
 	err := s.SearchEach(ctx, actor, input, func(group SiteSearchGroup) { mu.Lock(); groups = append(groups, group); mu.Unlock() })
+	priorities := s.sitePriorityMap(input.SiteID, input.SiteIDs)
+	sort.SliceStable(groups, func(left, right int) bool {
+		leftPriority, rightPriority := priorities[groups[left].SiteID], priorities[groups[right].SiteID]
+		if leftPriority != rightPriority {
+			return leftPriority < rightPriority
+		}
+		return groups[left].SiteID < groups[right].SiteID
+	})
 	return groups, err
 }
 
@@ -699,7 +734,7 @@ func normalizeSiteSearchScope(siteID *uint, siteIDs []uint) ([]uint, error) {
 	return result, nil
 }
 
-func (s *SiteService) searchSiteRecords(siteID *uint, siteIDs []uint) ([]models.Site, error) {
+func (s *SiteService) searchSiteRecords(actor Actor, siteID *uint, siteIDs []uint) ([]models.Site, error) {
 	scope, err := normalizeSiteSearchScope(siteID, siteIDs)
 	if err != nil {
 		return nil, err
@@ -718,6 +753,12 @@ func (s *SiteService) searchSiteRecords(siteID *uint, siteIDs []uint) ([]models.
 	}
 	filtered := make([]models.Site, 0, len(records))
 	for _, record := range records {
+		if !actor.CanResource(authz.PermissionDiscoveryRead, models.AuthorizationResourceSite, uintID(record.ID)) {
+			if selected {
+				return nil, appError(CodePermissionDenied, "无权搜索所选站点", nil)
+			}
+			continue
+		}
 		definition, found := builtin.DefinitionForKey(record.Kind)
 		if !found || !definition.Search {
 			if selected {
@@ -731,7 +772,7 @@ func (s *SiteService) searchSiteRecords(siteID *uint, siteIDs []uint) ([]models.
 }
 
 func (s *SiteService) SearchOptions(actor Actor) ([]SiteSearchOption, error) {
-	if !actor.Can(authz.PermissionDiscoveryRead) {
+	if !actor.HasPermission(authz.PermissionDiscoveryRead) {
 		return nil, appError(CodePermissionDenied, "无权读取资源搜索站点", nil)
 	}
 	var records []models.Site
@@ -740,6 +781,9 @@ func (s *SiteService) SearchOptions(actor Actor) ([]SiteSearchOption, error) {
 	}
 	result := make([]SiteSearchOption, 0, len(records))
 	for _, record := range records {
+		if !actor.CanResource(authz.PermissionDiscoveryRead, models.AuthorizationResourceSite, uintID(record.ID)) {
+			continue
+		}
 		definition, found := builtin.DefinitionForKey(record.Kind)
 		if !found || !definition.Search {
 			continue
@@ -758,7 +802,15 @@ func (s *SiteService) SearchOptions(actor Actor) ([]SiteSearchOption, error) {
 }
 
 func (s *SiteService) SearchEach(ctx context.Context, actor Actor, input SiteSearchInput, emit func(SiteSearchGroup)) error {
-	if !actor.Can(authz.PermissionDiscoveryRead) {
+	return s.SearchEachProgress(ctx, actor, input, emit, nil)
+}
+
+// SearchEachProgress streams independently completed Site groups and monotonic
+// aggregate progress. All callbacks are serialized even though Site work runs
+// concurrently, so HTTP writers and native clients never receive overlapping
+// events.
+func (s *SiteService) SearchEachProgress(ctx context.Context, actor Actor, input SiteSearchInput, emit func(SiteSearchGroup), emitProgress func(SiteSearchProgress)) error {
+	if !actor.HasPermission(authz.PermissionDiscoveryRead) {
 		return appError(CodePermissionDenied, "无权搜索种子资源", nil)
 	}
 	keyword := strings.TrimSpace(input.Keyword)
@@ -781,7 +833,7 @@ func (s *SiteService) SearchEach(ctx context.Context, actor Actor, input SiteSea
 		if err != nil {
 			return appError(CodeTMDBUnavailable, "TMDB 作品身份无法解析", nil)
 		}
-		keyword, input.Year = match.Title, match.ReleaseYear
+		keyword, input.Year = match.Title, identitySearchYear(input.MediaType, match.ReleaseYear)
 	}
 	if keyword == "" || len([]rune(keyword)) > 160 {
 		return appError(CodeInvalidRequest, "请输入有效的资源关键词", nil)
@@ -793,38 +845,19 @@ func (s *SiteService) SearchEach(ctx context.Context, actor Actor, input SiteSea
 	if input.Page < 1 || input.Page > 20 {
 		return appError(CodeInvalidRequest, "种子资源搜索页码无效", nil)
 	}
-	records, err := s.searchSiteRecords(input.SiteID, input.SiteIDs)
+	records, err := s.searchSiteRecords(actor, input.SiteID, input.SiteIDs)
 	if err != nil {
 		return err
 	}
 	if len(records) == 0 {
+		if emitProgress != nil {
+			emitProgress(SiteSearchProgress{})
+		}
 		return nil
 	}
-	semaphore := make(chan struct{}, 4)
-	var wait sync.WaitGroup
-	var emitMu sync.Mutex
-	for _, record := range records {
-		record := record
-		wait.Add(1)
-		go func() {
-			defer wait.Done()
-			select {
-			case semaphore <- struct{}{}:
-				defer func() { <-semaphore }()
-			case <-ctx.Done():
-				return
-			}
-			group := s.searchSite(ctx, actor, record, input)
-			emitMu.Lock()
-			emit(group)
-			emitMu.Unlock()
-		}()
-	}
-	wait.Wait()
-	if ctx.Err() != nil {
-		return appError(CodeSiteUnavailable, "种子资源搜索已取消", nil)
-	}
-	return nil
+	return s.runSiteSearches(ctx, records, func(siteCtx context.Context, record models.Site) SiteSearchGroup {
+		return s.searchSite(siteCtx, actor, record, input)
+	}, emit, emitProgress)
 }
 
 func (s *SiteService) searchSite(ctx context.Context, actor Actor, record models.Site, input SiteSearchInput) SiteSearchGroup {
@@ -879,6 +912,9 @@ func (s *SiteService) RecognizeResult(ctx context.Context, actor Actor, resultTo
 	claim, err := s.resolveAvailableClaim(strings.TrimSpace(resultToken), actor.User.ID)
 	if err != nil {
 		return SiteRecognitionSummary{}, err
+	}
+	if !actor.CanResource(authz.PermissionDiscoveryRead, models.AuthorizationResourceSite, uintID(claim.SiteID)) {
+		return SiteRecognitionSummary{}, appError(CodePermissionDenied, "无权识别这个站点的搜索结果", nil)
 	}
 	input := mediarecognition.InputFacts{PackageName: claim.Title, SourceKind: mediarecognition.SourceDownload, MediaTypeHint: mediarecognition.MediaType(claim.MediaTypeHint)}
 	parsed, parseErr := mediarecognition.Parse(input)
@@ -973,6 +1009,9 @@ func (s *SiteService) RecognitionCandidates(ctx context.Context, actor Actor, re
 	if err != nil {
 		return nil, err
 	}
+	if !actor.CanResource(authz.PermissionDiscoveryRead, models.AuthorizationResourceSite, uintID(claim.SiteID)) {
+		return nil, appError(CodePermissionDenied, "无权识别这个站点的搜索结果", nil)
+	}
 	title = strings.Join(strings.Fields(title), " ")
 	if title == "" {
 		title = claim.Title
@@ -1049,8 +1088,12 @@ func (s *SiteService) RecognitionCandidates(ctx context.Context, actor Actor, re
 	// only while the same actor-bound claim can still be corrected. Recheck
 	// after the upstream request so a concurrent download reservation cannot
 	// leave the browser choosing an identity that can no longer be bound.
-	if _, err := s.resolveAvailableClaim(strings.TrimSpace(resultToken), actor.User.ID); err != nil {
+	currentClaim, err := s.resolveAvailableClaim(strings.TrimSpace(resultToken), actor.User.ID)
+	if err != nil {
 		return nil, err
+	}
+	if !actor.CanResource(authz.PermissionDiscoveryRead, models.AuthorizationResourceSite, uintID(currentClaim.SiteID)) {
+		return nil, appError(CodePermissionDenied, "无权识别这个站点的搜索结果", nil)
 	}
 	return items, nil
 }
@@ -1066,6 +1109,9 @@ func (s *SiteService) OverrideResultRecognition(ctx context.Context, actor Actor
 	claim, err := s.resolveAvailableClaim(token, actor.User.ID)
 	if err != nil {
 		return SiteRecognitionSummary{}, err
+	}
+	if !actor.CanResource(authz.PermissionDiscoveryRead, models.AuthorizationResourceSite, uintID(claim.SiteID)) {
+		return SiteRecognitionSummary{}, appError(CodePermissionDenied, "无权修正这个站点的搜索结果", nil)
 	}
 	input.MediaType = strings.ToLower(strings.TrimSpace(input.MediaType))
 	if input.TMDBID <= 0 || (input.MediaType != "movie" && input.MediaType != "tv") {
@@ -1214,9 +1260,18 @@ func (s *SiteService) Download(ctx context.Context, actor Actor, input SiteDownl
 	if !selectedDownloader.Enabled {
 		return DownloadTaskSummary{}, appError(CodeDownloaderUnavailable, "下载器已停用", nil)
 	}
+	if !actor.CanResource(authz.PermissionDownloadsCreate, models.AuthorizationResourceDownloader, selectedDownloader.ID) {
+		return DownloadTaskSummary{}, appError(CodePermissionDenied, "无权使用这个下载器创建任务", nil)
+	}
+	if input.MediaLibraryID != nil && !actor.CanResource(authz.PermissionDownloadsCreate, models.AuthorizationResourceMediaLibrary, uintID(*input.MediaLibraryID)) {
+		return DownloadTaskSummary{}, appError(CodePermissionDenied, "无权向这个媒体库入库", nil)
+	}
 	var claimedSite models.Site
 	if err := s.db.Select("id", "kind", "enabled").First(&claimedSite, claim.SiteID).Error; err != nil {
 		return DownloadTaskSummary{}, siteNotFound(err)
+	}
+	if !actor.CanResource(authz.PermissionDiscoveryRead, models.AuthorizationResourceSite, uintID(claimedSite.ID)) {
+		return DownloadTaskSummary{}, appError(CodePermissionDenied, "无权使用这个站点的搜索结果", nil)
 	}
 	definition, definitionFound := builtin.DefinitionForKey(claimedSite.Kind)
 	if selectedDownloader.Type == models.DownloaderTypePan115Offline && (!definitionFound || definition.SiteType != builtin.SiteTypeBT) {

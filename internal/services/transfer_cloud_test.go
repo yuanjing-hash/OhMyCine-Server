@@ -65,6 +65,19 @@ func TestUniqueCloudTargetDirectoriesBuildsDeterministicDAG(t *testing.T) {
 	}
 }
 
+func TestValidCloudNestedDirectoryIdentityRejectsProviderRootForNestedPath(t *testing.T) {
+	root := cloudpkg.Item{ID: "library-root", IsDir: true}
+	if validCloudNestedDirectoryIdentity(root.ID, "电影/动画电影", root) {
+		t.Fatal("nested directory accepted the media-library root identity")
+	}
+	if validCloudNestedDirectoryIdentity(root.ID, "电影/动画电影", cloudpkg.Item{ID: "0", IsDir: true}) {
+		t.Fatal("nested directory accepted the provider root sentinel")
+	}
+	if !validCloudNestedDirectoryIdentity(root.ID, "电影/动画电影", cloudpkg.Item{ID: "category", IsDir: true}) {
+		t.Fatal("valid nested directory was rejected")
+	}
+}
+
 func TestEnsureCloudDirectoryReusesCurrentAttemptValidation(t *testing.T) {
 	driver := newFakeMutationCloudDriver()
 	driver.items["root"] = cloudpkg.Item{ID: "root", ParentID: "0", Name: "library", IsDir: true}
@@ -663,7 +676,7 @@ func TestCloudTransferConflictAskDoesNotReplaceExistingItem(t *testing.T) {
 	}
 }
 
-func TestCloudTransferExistingTargetLeafUsesBoundedPathResolutionAndCachedListing(t *testing.T) {
+func TestCloudTransferExistingTargetLeafUsesBoundedPathResolutionAndCachedBoundaryProof(t *testing.T) {
 	fixture := newCloudTransferFixture(t, models.MediaLibraryTransferMove, models.MediaLibraryConflictAsk, true)
 	fixture.download.TargetRelativeRoot = "/library"
 	fixture.driver.paths["/media/library"] = "library-root"
@@ -681,8 +694,13 @@ func TestCloudTransferExistingTargetLeafUsesBoundedPathResolutionAndCachedListin
 	if fixture.driver.listCalls != 1 {
 		t.Fatalf("target listings=%d want one conflict listing", fixture.driver.listCalls)
 	}
-	if fixture.driver.statCalls != 0 {
-		t.Fatalf("target path resolution regressed to ancestry stats: %d", fixture.driver.statCalls)
+	// ResolveDirectory is an optimization, not an authorization boundary. The
+	// resolved non-zero ID still needs one cached ancestry proof so a buggy or
+	// compromised provider cannot redirect an import outside the library root.
+	// This fixture has movie-dir -> category-dir -> library-root, hence exactly
+	// three stats regardless of the number of files in that directory.
+	if fixture.driver.statCalls != 3 {
+		t.Fatalf("target ancestry proof stats=%d want one cached three-node proof", fixture.driver.statCalls)
 	}
 }
 

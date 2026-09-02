@@ -85,6 +85,24 @@ const initialTheme = readStoredTheme() // invalid or absent -> light
 applyTheme(initialTheme)
 ```
 
+## Scenario: Unified Scheduling, Scoped Authorization, and Repair Workflow
+
+### Contracts
+
+- “计划任务” is the authoritative UI for configurable periodic work. Its visual presets generate a standard five-field Cron and always expose timezone, future-run preview, misfire, overlap, retry, and maximum-runtime policy.
+- User authorization editing separates role templates from direct allow/deny rules. Scoped rules use only current selectable media-library, downloader, or site IDs, and the UI states that deny wins; Server authorization remains authoritative.
+- Progressive site search renders total/pending/running/succeeded/failed/result count from complete Server snapshots, incrementally merges site results, supports cancel, and retries only failed site IDs without clearing successes.
+- Acquisition stage and coverage are independent panels. A failure in one cannot blank the media detail page.
+- Media-library structure operations are explicit `diagnose -> preview -> confirm repair`. Display every move, managed cleanup, unmanaged residual, and blocking error before confirmation. Never present a copy as a completed move.
+- A successful local or provider repair refreshes the authoritative Server result. Partial cleanup, locked files, ACL denial, unmanaged residuals, or provider reconciliation failure remain visible and cannot be labeled healthy.
+
+### Required tests
+
+- Cron preset/advanced round-trip, timezone preview, invalid expressions, managed definition edits, and all execution-policy fields.
+- Global/scoped allow and deny editing, deny precedence display, stale-resource handling, and mutation error recovery.
+- Interleaved site progress, cancellation, partial failure, stable results, and failed-site retry.
+- Diagnose/preview/token confirmation, stale revision, move completion, managed empty-directory cleanup, and unmanaged residual reporting.
+
 ## Scenario: Search Scope Memory and Bounded Transfer Deletion UI
 
 ### 1. Scope / Trigger

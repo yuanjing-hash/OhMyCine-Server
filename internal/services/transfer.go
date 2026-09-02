@@ -38,7 +38,16 @@ type TransferService struct {
 	connections             *ConnectionService
 	mediaChanges            *MediaChangeService
 	structure               *MediaLibraryStructureService
+	libraryReconciler       transferMediaLibraryReconciler
 	verifyCompletedManifest func(context.Context, *models.DownloadTask, downloadpkg.Manifest) (downloadpkg.Manifest, error)
+}
+
+// transferMediaLibraryReconciler deliberately contains only the completion
+// signal. Transfer workers must not know about a storage backend, catalog, or
+// STRM implementation; the media-library service remains the sole owner of
+// that reconciliation pipeline.
+type transferMediaLibraryReconciler interface {
+	RequestReconcile(uint)
 }
 
 type transferJobPayload struct {
@@ -58,6 +67,9 @@ func (s *TransferService) SetMediaChangeService(changes *MediaChangeService) {
 }
 func (s *TransferService) SetMediaLibraryStructureService(structure *MediaLibraryStructureService) {
 	s.structure = structure
+}
+func (s *TransferService) SetMediaLibraryReconciler(reconciler transferMediaLibraryReconciler) {
+	s.libraryReconciler = reconciler
 }
 func (s *TransferService) SetConnectionService(connections *ConnectionService) {
 	s.connections = connections

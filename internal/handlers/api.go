@@ -49,6 +49,8 @@ type API struct {
 	discovery             *services.DiscoveryService
 	mediaCoverage         *services.MediaCoverageService
 	playerHistory         *services.PlayerHistoryService
+	acquisition           *services.AcquisitionService
+	schedules             *services.UnifiedScheduleService
 	follows               *services.FollowService
 	sites                 *services.SiteService
 	cookieCloud           *services.CookieCloudService
@@ -107,6 +109,10 @@ func (a *API) SetMediaCoverageService(service *services.MediaCoverageService) {
 }
 func (a *API) SetPlayerHistoryService(service *services.PlayerHistoryService) {
 	a.playerHistory = service
+}
+func (a *API) SetAcquisitionService(service *services.AcquisitionService) { a.acquisition = service }
+func (a *API) SetUnifiedScheduleService(service *services.UnifiedScheduleService) {
+	a.schedules = service
 }
 func (a *API) SetFollowService(service *services.FollowService)           { a.follows = service }
 func (a *API) SetSiteService(service *services.SiteService)               { a.sites = service }
@@ -304,6 +310,26 @@ func (a *API) AssignRoles(c *gin.Context) {
 		return
 	}
 	if err := a.admin.ReplaceUserRoles(actor, id, input.RoleIDs, middleware.RequestContextFrom(c)); err != nil {
+		writeError(c, a.log, err)
+		return
+	}
+	success(c, http.StatusOK, gin.H{"updated": true})
+}
+
+func (a *API) SetUserAuthorizationRules(c *gin.Context) {
+	actor, _ := middleware.ActorFrom(c)
+	id, ok := pathID(c)
+	if !ok {
+		return
+	}
+	var input struct {
+		Rules []services.AuthorizationRule `json:"rules" binding:"required"`
+	}
+	if err := strictJSON(c, &input); err != nil {
+		writeError(c, a.log, invalid("用户直接授权无效", err))
+		return
+	}
+	if err := a.admin.ReplaceUserAuthorizationRules(actor, id, services.ReplaceUserAuthorizationRulesInput{Rules: input.Rules}, middleware.RequestContextFrom(c)); err != nil {
 		writeError(c, a.log, err)
 		return
 	}

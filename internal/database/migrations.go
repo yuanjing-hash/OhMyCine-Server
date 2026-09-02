@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/authz"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/classification"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
@@ -86,7 +87,97 @@ func Migrate(db *gorm.DB) error {
 }
 
 func schemaMigrations() []migration {
-	return []migration{{Version: 1, Apply: migrateAuthFoundation}, {Version: 2, Apply: migrateStorageFoundation}, {Version: 3, Apply: migrateMediaClassificationProfiles}, {Version: 4, Apply: migrateRuntimeLogging}, {Version: 5, Apply: migrateMediaLibraries}, {Version: 6, Apply: migratePersistentQueue}, {Version: 7, Apply: migrateDownloaderManagement}, {Version: 8, Apply: migrateUnifiedDownloadStaging}, {Version: 9, Apply: migrateDownloadClassification}, {Version: 10, Apply: migrateTMDBRoutes}, {Version: 11, Apply: migrateTMDBCredentialKind}, {Version: 12, Apply: migrateGlobalDownloadStaging}, {Version: 13, Apply: migrateAutomaticDownloadClassification}, {Version: 14, Apply: migrateLibraryImportRouting}, {Version: 15, Apply: migrateSeedingManagement}, {Version: 16, Apply: migrateTransferOrganizationCenter}, {Version: 17, Apply: migratePan115Connections}, {Version: 18, Apply: migratePan115StorageRoots, DisableForeignKeys: true}, {Version: 19, Apply: migrateProviderEventInbox}, {Version: 20, Apply: migratePan115OfflineDownloader, DisableForeignKeys: true}, {Version: 21, Apply: migrateMediaLibraryCatalogV21}, {Version: 22, Apply: migratePan115OfflineDownloaderDirectories}, {Version: 23, Apply: migratePan115CloudImport}, {Version: 24, Apply: migrateProfileRecognitionAndNaming}, {Version: 25, Apply: migrateSharedMediaRecognition}, {Version: 26, Apply: migratePan115ShareIngest}, {Version: 27, Apply: migrateMediaArtifactsAndProxy}, {Version: 28, Apply: migrateSTRMAssetExtensionsAndGatewayAlias}, {Version: 29, Apply: migrateArtifactAutoCleanup}, {Version: 30, Apply: migratePan115MultiDevicePlayback}, {Version: 31, Apply: migrateEmbyWebEnhancements}, {Version: 32, Apply: migratePlayerDeviceTokens}, {Version: 33, Apply: migratePluginRepositories}, {Version: 34, Apply: migratePluginInstallations}, {Version: 35, Apply: migratePluginPackageIntegrity, DisableForeignKeys: true}, {Version: 36, Apply: migratePluginHostCapabilities}, {Version: 37, Apply: migratePluginOnlineMediaContracts}, {Version: 38, Apply: migratePluginManagedImports}, {Version: 39, Apply: migrateMediaRefreshNotify}, {Version: 40, Apply: migrateDiscoveryCache}, {Version: 41, Apply: migrateDownloadRecognitionOverride}, {Version: 42, Apply: migratePTSites}, {Version: 43, Apply: migrateCookieCloudAndSiteRendering}, {Version: 44, Apply: migratePTSiteCatalog, DisableForeignKeys: true}, {Version: 45, Apply: migrateCompletedDownloadManifest}, {Version: 46, Apply: migrateDownloaderQueueDelegation}, {Version: 47, Apply: migrateDownloadRecognitionEpisodeOverride}, {Version: 48, Apply: migrateDownloadMediaIdentity}, {Version: 49, Apply: migrateAIRecognitionSettings}, {Version: 50, Apply: migrateMediaReorganization}, {Version: 51, Apply: migrateTransferDeletionScopes}, {Version: 52, Apply: migrateAutomaticTVFollows}, {Version: 53, Apply: migrateDownloaderLifeEventListening}, {Version: 54, Apply: migrateMediaArtifactContentLease}, {Version: 55, Apply: migrateMediaCatalogDeletion}, {Version: 56, Apply: migrateDataSourceRouting}, {Version: 57, Apply: migrateMediaTypeFirstOrganization}, {Version: 58, Apply: migratePan115RecycleCleanup}, {Version: 59, Apply: migratePlayerPlaybackHistory}, {Version: 60, Apply: migrateMediaLibraryStructureRepair}}
+	return []migration{{Version: 1, Apply: migrateAuthFoundation}, {Version: 2, Apply: migrateStorageFoundation}, {Version: 3, Apply: migrateMediaClassificationProfiles}, {Version: 4, Apply: migrateRuntimeLogging}, {Version: 5, Apply: migrateMediaLibraries}, {Version: 6, Apply: migratePersistentQueue}, {Version: 7, Apply: migrateDownloaderManagement}, {Version: 8, Apply: migrateUnifiedDownloadStaging}, {Version: 9, Apply: migrateDownloadClassification}, {Version: 10, Apply: migrateTMDBRoutes}, {Version: 11, Apply: migrateTMDBCredentialKind}, {Version: 12, Apply: migrateGlobalDownloadStaging}, {Version: 13, Apply: migrateAutomaticDownloadClassification}, {Version: 14, Apply: migrateLibraryImportRouting}, {Version: 15, Apply: migrateSeedingManagement}, {Version: 16, Apply: migrateTransferOrganizationCenter}, {Version: 17, Apply: migratePan115Connections}, {Version: 18, Apply: migratePan115StorageRoots, DisableForeignKeys: true}, {Version: 19, Apply: migrateProviderEventInbox}, {Version: 20, Apply: migratePan115OfflineDownloader, DisableForeignKeys: true}, {Version: 21, Apply: migrateMediaLibraryCatalogV21}, {Version: 22, Apply: migratePan115OfflineDownloaderDirectories}, {Version: 23, Apply: migratePan115CloudImport}, {Version: 24, Apply: migrateProfileRecognitionAndNaming}, {Version: 25, Apply: migrateSharedMediaRecognition}, {Version: 26, Apply: migratePan115ShareIngest}, {Version: 27, Apply: migrateMediaArtifactsAndProxy}, {Version: 28, Apply: migrateSTRMAssetExtensionsAndGatewayAlias}, {Version: 29, Apply: migrateArtifactAutoCleanup}, {Version: 30, Apply: migratePan115MultiDevicePlayback}, {Version: 31, Apply: migrateEmbyWebEnhancements}, {Version: 32, Apply: migratePlayerDeviceTokens}, {Version: 33, Apply: migratePluginRepositories}, {Version: 34, Apply: migratePluginInstallations}, {Version: 35, Apply: migratePluginPackageIntegrity, DisableForeignKeys: true}, {Version: 36, Apply: migratePluginHostCapabilities}, {Version: 37, Apply: migratePluginOnlineMediaContracts}, {Version: 38, Apply: migratePluginManagedImports}, {Version: 39, Apply: migrateMediaRefreshNotify}, {Version: 40, Apply: migrateDiscoveryCache}, {Version: 41, Apply: migrateDownloadRecognitionOverride}, {Version: 42, Apply: migratePTSites}, {Version: 43, Apply: migrateCookieCloudAndSiteRendering}, {Version: 44, Apply: migratePTSiteCatalog, DisableForeignKeys: true}, {Version: 45, Apply: migrateCompletedDownloadManifest}, {Version: 46, Apply: migrateDownloaderQueueDelegation}, {Version: 47, Apply: migrateDownloadRecognitionEpisodeOverride}, {Version: 48, Apply: migrateDownloadMediaIdentity}, {Version: 49, Apply: migrateAIRecognitionSettings}, {Version: 50, Apply: migrateMediaReorganization}, {Version: 51, Apply: migrateTransferDeletionScopes}, {Version: 52, Apply: migrateAutomaticTVFollows}, {Version: 53, Apply: migrateDownloaderLifeEventListening}, {Version: 54, Apply: migrateMediaArtifactContentLease}, {Version: 55, Apply: migrateMediaCatalogDeletion}, {Version: 56, Apply: migrateDataSourceRouting}, {Version: 57, Apply: migrateMediaTypeFirstOrganization}, {Version: 58, Apply: migratePan115RecycleCleanup}, {Version: 59, Apply: migratePlayerPlaybackHistory}, {Version: 60, Apply: migrateMediaLibraryStructureRepair}, {Version: 61, Apply: migrateUserAuthorizationRules}, {Version: 62, Apply: migrateMediaAcquisitions}, {Version: 63, Apply: migrateUnifiedSchedules}, {Version: 64, Apply: migrateUnifiedScheduleManagedKeys}}
+}
+
+func migrateUnifiedScheduleManagedKeys(db *gorm.DB) error {
+	if err := db.Exec(`ALTER TABLE schedule_definitions ADD COLUMN managed_key TEXT NOT NULL DEFAULT ''`).Error; err != nil {
+		return err
+	}
+	updates := []struct {
+		action string
+		name   string
+	}{
+		{action: "pan115_recycle_cleanup", name: "115 回收站清理 · %"},
+		{action: "follow_search", name: "自动追更 · %"},
+		{action: "cookiecloud_sync", name: "CookieCloud 自动同步"},
+		{action: "media_library_scan", name: "媒体库全量扫描 · %"},
+	}
+	for _, item := range updates {
+		if err := db.Exec(`UPDATE schedule_definitions SET managed_key = action_type || ':' || target_type || ':' || target_id WHERE managed_key = '' AND action_type = ? AND name LIKE ?`, item.action, item.name).Error; err != nil {
+			return err
+		}
+	}
+	return db.Exec(`CREATE UNIQUE INDEX idx_schedule_definitions_managed_key ON schedule_definitions(managed_key) WHERE managed_key <> ''`).Error
+}
+
+func migrateUnifiedSchedules(db *gorm.DB) error {
+	statements := []string{
+		`CREATE TABLE schedule_definitions (id TEXT PRIMARY KEY, owner_id INTEGER NOT NULL, name TEXT NOT NULL, action_type TEXT NOT NULL, target_type TEXT NOT NULL, target_id TEXT NOT NULL, cron_expression TEXT NOT NULL, timezone TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, misfire_policy TEXT NOT NULL CHECK(misfire_policy IN ('skip','run_once')), overlap_policy TEXT NOT NULL CHECK(overlap_policy IN ('skip','queue')), max_retries INTEGER NOT NULL DEFAULT 0, retry_delay_seconds INTEGER NOT NULL DEFAULT 60, max_runtime_seconds INTEGER NOT NULL DEFAULT 3600, next_run_at DATETIME, last_run_at DATETIME, last_status TEXT NOT NULL DEFAULT 'idle', last_error_code TEXT NOT NULL DEFAULT '', revision INTEGER NOT NULL DEFAULT 1, created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL, FOREIGN KEY(owner_id) REFERENCES users(id) ON DELETE CASCADE, UNIQUE(owner_id,name))`,
+		`CREATE INDEX idx_schedule_definitions_due ON schedule_definitions(enabled,next_run_at)`,
+		`CREATE TABLE schedule_runs (id TEXT PRIMARY KEY, schedule_id TEXT NOT NULL, job_id TEXT NOT NULL DEFAULT '', scheduled_at DATETIME NOT NULL, status TEXT NOT NULL, attempt INTEGER NOT NULL DEFAULT 1, error_code TEXT NOT NULL DEFAULT '', started_at DATETIME, finished_at DATETIME, created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL, FOREIGN KEY(schedule_id) REFERENCES schedule_definitions(id) ON DELETE CASCADE)`,
+		`CREATE UNIQUE INDEX idx_schedule_runs_job ON schedule_runs(job_id) WHERE job_id <> ''`,
+		`CREATE INDEX idx_schedule_runs_schedule ON schedule_runs(schedule_id,scheduled_at DESC)`,
+		`CREATE INDEX idx_schedule_runs_status ON schedule_runs(status)`,
+	}
+	for _, statement := range statements {
+		if err := db.Exec(statement).Error; err != nil {
+			return err
+		}
+	}
+	var owner models.User
+	if err := db.Where("is_owner = ?", true).First(&owner).Error; err != nil {
+		if err == gorm.ErrRecordNotFound {
+			return nil
+		}
+		return err
+	}
+	var connections []models.Connection
+	if err := db.Where("provider = ? AND recycle_cleanup_enabled = ?", models.ConnectionProviderPan115, true).Find(&connections).Error; err != nil {
+		return err
+	}
+	now := time.Now().UTC()
+	for _, connection := range connections {
+		next := connection.RecycleCleanupNextRunAt
+		if next == nil {
+			value := now
+			next = &value
+		}
+		record := models.ScheduleDefinition{ID: uuid.NewString(), OwnerID: owner.ID, Name: "115 回收站清理 · " + connection.Name, ActionType: "pan115_recycle_cleanup", TargetType: "connection", TargetID: fmt.Sprint(connection.ID), CronExpression: connection.RecycleCleanupCron, Timezone: "Asia/Shanghai", Enabled: connection.Enabled, MisfirePolicy: "run_once", OverlapPolicy: "skip", MaxRetries: 1, RetryDelaySeconds: 300, MaxRuntimeSeconds: 3600, NextRunAt: next, Revision: 1, CreatedAt: now, UpdatedAt: now}
+		if err := db.Omit("managed_key").Create(&record).Error; err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func migrateMediaAcquisitions(db *gorm.DB) error {
+	statements := []string{
+		`CREATE TABLE media_acquisitions (id TEXT PRIMARY KEY, owner_id INTEGER NOT NULL, media_type TEXT NOT NULL CHECK(media_type IN ('movie','tv')), tmdb_id INTEGER NOT NULL, stage TEXT NOT NULL, status TEXT NOT NULL, download_task_id TEXT NOT NULL DEFAULT '', follow_subscription_id TEXT NOT NULL DEFAULT '', target_library_id INTEGER, last_error_code TEXT NOT NULL DEFAULT '', frozen_snapshot_json TEXT NOT NULL DEFAULT '{}', revision INTEGER NOT NULL DEFAULT 1, created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL, completed_at DATETIME, FOREIGN KEY(owner_id) REFERENCES users(id) ON DELETE CASCADE, FOREIGN KEY(target_library_id) REFERENCES media_libraries(id) ON DELETE SET NULL, UNIQUE(owner_id,media_type,tmdb_id))`,
+		`CREATE INDEX idx_media_acquisitions_owner_updated ON media_acquisitions(owner_id,updated_at DESC)`,
+		`CREATE INDEX idx_media_acquisitions_download ON media_acquisitions(download_task_id)`,
+		`CREATE INDEX idx_media_acquisitions_follow ON media_acquisitions(follow_subscription_id)`,
+	}
+	for _, statement := range statements {
+		if err := db.Exec(statement).Error; err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func migrateUserAuthorizationRules(db *gorm.DB) error {
+	statements := []string{
+		`CREATE TABLE user_authorization_rules (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, permission_code TEXT NOT NULL, effect TEXT NOT NULL CHECK(effect IN ('allow','deny')), resource_type TEXT NOT NULL DEFAULT '' CHECK(resource_type IN ('','media_library','downloader','site')), resource_id TEXT NOT NULL DEFAULT '', created_by INTEGER NOT NULL, created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL, FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE, FOREIGN KEY(permission_code) REFERENCES permissions(code) ON DELETE RESTRICT, FOREIGN KEY(created_by) REFERENCES users(id) ON DELETE RESTRICT, CHECK((resource_type = '' AND resource_id = '') OR (resource_type <> '' AND resource_id <> '')), UNIQUE(user_id,permission_code,effect,resource_type,resource_id))`,
+		`CREATE INDEX idx_user_authorization_rules_user ON user_authorization_rules(user_id)`,
+		`CREATE INDEX idx_user_authorization_rules_resource ON user_authorization_rules(resource_type,resource_id)`,
+	}
+	for _, statement := range statements {
+		if err := db.Exec(statement).Error; err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func migrateMediaLibraryStructureRepair(db *gorm.DB) error {
@@ -1671,6 +1762,7 @@ func seedQueuePolicies(db *gorm.DB) error {
 		{JobType: "media_reorganization", Concurrency: 2, ResourceConcurrency: 1, MaxAttempts: 5, LeaseSeconds: 30},
 		{JobType: "media_library_repair", Concurrency: 2, ResourceConcurrency: 1, MaxAttempts: 5, LeaseSeconds: 30},
 		{JobType: "pan115_recycle_cleanup", Concurrency: 2, ResourceConcurrency: 1, MaxAttempts: 1, LeaseSeconds: 30},
+		{JobType: "unified_schedule", Concurrency: 4, ResourceConcurrency: 1, MaxAttempts: 11, LeaseSeconds: 60},
 		{JobType: "follow-search", Concurrency: 4, ResourceConcurrency: 1, MaxAttempts: 4, LeaseSeconds: 60},
 		{JobType: "refresh", Concurrency: 2, ResourceConcurrency: 1, MaxAttempts: 3, LeaseSeconds: 30},
 		{JobType: "fake", Concurrency: 2, ResourceConcurrency: 1, MaxAttempts: 3, LeaseSeconds: 10},

@@ -91,13 +91,12 @@ func (localMediaLibraryBackend) OpenListener(_ context.Context, library models.M
 	if err != nil {
 		return nil, err
 	}
-	return &localMediaLibraryListener{watcher: watcher, incremental: time.Duration(library.IncrementalMinutes) * time.Minute, full: time.Duration(library.FullScanIntervalHours) * time.Hour}, nil
+	return &localMediaLibraryListener{watcher: watcher, incremental: time.Duration(library.IncrementalMinutes) * time.Minute}, nil
 }
 
 type localMediaLibraryListener struct {
 	watcher     *fsnotify.Watcher
 	incremental time.Duration
-	full        time.Duration
 }
 
 func (l *localMediaLibraryListener) Close() error {
@@ -109,9 +108,7 @@ func (l *localMediaLibraryListener) Close() error {
 
 func (l *localMediaLibraryListener) Run(ctx context.Context, reconcile func(context.Context, string) error) error {
 	incremental := time.NewTicker(l.incremental)
-	full := time.NewTicker(l.full)
 	defer incremental.Stop()
-	defer full.Stop()
 	var debounce *time.Timer
 	var debounceC <-chan time.Time
 	defer func() {
@@ -149,8 +146,6 @@ func (l *localMediaLibraryListener) Run(ctx context.Context, reconcile func(cont
 			debounceC = nil
 		case <-incremental.C:
 			_ = reconcile(ctx, "incremental")
-		case <-full.C:
-			_ = reconcile(ctx, "full")
 		case err, ok := <-l.watcher.Errors:
 			if !ok {
 				return nil
@@ -183,22 +178,19 @@ func (b pan115MediaLibraryBackend) Scan(ctx context.Context, request MediaLibrar
 }
 
 func (pan115MediaLibraryBackend) OpenListener(_ context.Context, library models.MediaLibrary, _ models.Storage, wake <-chan struct{}) (MediaLibraryListener, error) {
-	return &providerMediaLibraryListener{wake: wake, incremental: time.Duration(library.IncrementalMinutes) * time.Minute, full: time.Duration(library.FullScanIntervalHours) * time.Hour}, nil
+	return &providerMediaLibraryListener{wake: wake, incremental: time.Duration(library.IncrementalMinutes) * time.Minute}, nil
 }
 
 type providerMediaLibraryListener struct {
 	wake        <-chan struct{}
 	incremental time.Duration
-	full        time.Duration
 }
 
 func (*providerMediaLibraryListener) Close() error { return nil }
 
 func (l *providerMediaLibraryListener) Run(ctx context.Context, reconcile func(context.Context, string) error) error {
 	incremental := time.NewTicker(l.incremental)
-	full := time.NewTicker(l.full)
 	defer incremental.Stop()
-	defer full.Stop()
 	var debounce *time.Timer
 	var debounceC <-chan time.Time
 	defer func() {
@@ -231,8 +223,6 @@ func (l *providerMediaLibraryListener) Run(ctx context.Context, reconcile func(c
 			debounceC = nil
 		case <-incremental.C:
 			_ = reconcile(ctx, "incremental")
-		case <-full.C:
-			_ = reconcile(ctx, "full")
 		}
 	}
 }

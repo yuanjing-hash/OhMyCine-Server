@@ -233,14 +233,23 @@ func (s *FollowService) Defaults(ctx context.Context, actor Actor, tmdbID int64)
 	if err := s.db.Model(&models.FollowSubscriptionSeason{}).Where("owner_id = ? AND tmdb_id = ?", actor.User.ID, tmdbID).Order("season_number").Pluck("season_number", &result.SubscribedSeasons).Error; err != nil {
 		return FollowDefaults{}, err
 	}
+	authorizedSites := make([]models.Site, 0, len(sites))
 	for _, item := range sites {
+		if !actor.CanResource(authz.PermissionDiscoveryRead, models.AuthorizationResourceSite, uintID(item.ID)) {
+			continue
+		}
 		definition, found := builtin.DefinitionForKey(item.Kind)
 		if !found {
 			continue
 		}
+		authorizedSites = append(authorizedSites, item)
 		result.Sites = append(result.Sites, FollowSiteOption{ID: item.ID, Name: item.Name, SiteType: definition.SiteType})
 	}
+	authorizedDownloaders := make([]models.Downloader, 0, len(downloaders))
 	for _, item := range downloaders {
+		if !actor.CanResource(authz.PermissionDownloadsCreate, models.AuthorizationResourceDownloader, item.ID) {
+			continue
+		}
 		var connectionID *uint
 		if item.StorageID != nil {
 			var storage models.Storage
@@ -248,11 +257,17 @@ func (s *FollowService) Defaults(ctx context.Context, actor Actor, tmdbID int64)
 				connectionID = storage.ConnectionID
 			}
 		}
+		authorizedDownloaders = append(authorizedDownloaders, item)
 		result.Downloaders = append(result.Downloaders, FollowOption{ID: item.ID, Name: item.Name, Type: item.Type, ConnectionID: connectionID})
 	}
+	authorizedLibraries := make([]models.MediaLibrary, 0, len(libraries))
 	for _, item := range libraries {
+		if !actor.CanResource(authz.PermissionDownloadsCreate, models.AuthorizationResourceMediaLibrary, uintID(item.ID)) || !actor.CanResource(authz.PermissionMediaLibrariesRead, models.AuthorizationResourceMediaLibrary, uintID(item.ID)) {
+			continue
+		}
 		var storage models.Storage
 		if s.db.Select("type", "connection_id", "enabled").First(&storage, item.StorageID).Error == nil && storage.Enabled {
+			authorizedLibraries = append(authorizedLibraries, item)
 			result.MediaLibraries = append(result.MediaLibraries, FollowLibraryOption{ID: item.ID, Name: item.Name, StorageType: storage.Type, ConnectionID: storage.ConnectionID})
 		}
 	}
@@ -261,10 +276,10 @@ func (s *FollowService) Defaults(ctx context.Context, actor Actor, tmdbID int64)
 	result.Snapshot.MaxResourcesPerRun = 3
 	result.Snapshot.Filters = FollowFilters{Resolutions: []string{}, VideoCodecs: []string{}, Qualities: []string{}, IncludeKeywords: []string{}, ExcludeKeywords: []string{}, ReleaseGroups: []string{}, ExcludeReleaseGroups: []string{}, MinSeeders: 1}
 	foundTuple := false
-	for _, library := range libraries {
-		for _, downloader := range downloaders {
-			compatibleSiteIDs := make([]uint, 0, len(sites))
-			for _, site := range sites {
+	for _, library := range authorizedLibraries {
+		for _, downloader := range authorizedDownloaders {
+			compatibleSiteIDs := make([]uint, 0, len(authorizedSites))
+			for _, site := range authorizedSites {
 				if s.validateFollowRoute(context.Background(), downloader, library, []models.Site{site}) == nil {
 					compatibleSiteIDs = append(compatibleSiteIDs, site.ID)
 				}
@@ -331,6 +346,9 @@ func (s *FollowService) Create(ctx context.Context, actor Actor, input CreateFol
 			if err := tx.Create(&models.FollowSubscriptionSeason{SubscriptionID: record.ID, OwnerID: record.OwnerID, TMDBID: record.TMDBID, SeasonNumber: season, Special: season == 0}).Error; err != nil {
 				return followConstraintError(err)
 			}
+		}
+		if err := syncFollowUnifiedSchedule(tx, record, true, now); err != nil {
+			return err
 		}
 		return s.audit.Record(tx, &actor.User.ID, "follow.create", "follow", record.ID, "success", map[string]any{"revision": 1, "season_count": len(snapshot.Seasons)}, request)
 	})
@@ -434,6 +452,16 @@ func (s *FollowService) Update(ctx context.Context, actor Actor, id string, inpu
 				return followConstraintError(err)
 			}
 		}
+		updatedRecord := record
+		updatedRecord.ExecutionSnapshotJSON = string(raw)
+		updatedRecord.Revision = input.Revision + 1
+		updatedRecord.UpdatedAt = now
+		if record.Status == models.FollowStatusBlocked {
+			updatedRecord.Status = models.FollowStatusActive
+		}
+		if err := syncFollowUnifiedSchedule(tx, updatedRecord, true, now); err != nil {
+			return err
+		}
 		return s.audit.Record(tx, &actor.User.ID, "follow.update", "follow", id, "success", map[string]any{"revision": input.Revision + 1, "season_count": len(snapshot.Seasons)}, request)
 	})
 	if err != nil {
@@ -463,6 +491,12 @@ func (s *FollowService) SetPaused(actor Actor, id string, paused bool, request R
 		if result.Error != nil {
 			return result.Error
 		}
+		updatedRecord := record
+		updatedRecord.Status = status
+		updatedRecord.UpdatedAt = now
+		if err := syncFollowUnifiedSchedule(tx, updatedRecord, true, now); err != nil {
+			return err
+		}
 		return s.audit.Record(tx, &actor.User.ID, action, "follow", id, "success", map[string]any{"revision": record.Revision, "changed": result.RowsAffected == 1}, request)
 	}); err != nil {
 		return FollowSummary{}, err
@@ -476,6 +510,9 @@ func (s *FollowService) Delete(actor Actor, id string, request RequestContext) e
 		return err
 	}
 	return s.db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Where("managed_key = ?", managedScheduleKey("follow_search", "follow", id)).Delete(&models.ScheduleDefinition{}).Error; err != nil {
+			return err
+		}
 		if err := tx.Delete(&models.FollowSubscription{}, "id = ?", id).Error; err != nil {
 			return err
 		}
@@ -615,6 +652,9 @@ func (s *FollowService) validateSnapshot(actor Actor, tmdbID int64, input Follow
 	if input.Schedule.Kind != "interval" || input.Schedule.Minutes < 30 || input.Schedule.Minutes > 10080 || input.DownloaderID == "" || input.MediaLibraryID == 0 || input.MaxResourcesPerRun < 1 || input.MaxResourcesPerRun > 10 || input.DownloadPriority < -100 || input.DownloadPriority > 100 {
 		return input, nil, appError(CodeFollowConfigurationInvalid, "订阅执行策略无效", nil)
 	}
+	if _, err := cronFromIntervalMinutes(input.Schedule.Minutes); err != nil {
+		return input, nil, appError(CodeFollowConfigurationInvalid, "订阅间隔无法转换为标准五段 Cron，请选择整分钟、整小时或整天周期", err)
+	}
 	if len(input.Seasons) == 0 || len(input.Seasons) > 20 || !intsInRange(input.Seasons, 0, 200) {
 		return input, nil, appError(CodeFollowConfigurationInvalid, "订阅季选择无效", nil)
 	}
@@ -627,13 +667,24 @@ func (s *FollowService) validateSnapshot(actor Actor, tmdbID int64, input Follow
 	if err := s.db.Where("id = ? AND enabled = ?", input.DownloaderID, true).First(&downloader).Error; err != nil {
 		return input, nil, appError(CodeFollowConfigurationInvalid, "订阅下载器不存在或已停用", err)
 	}
+	if !actor.CanResource(authz.PermissionDownloadsCreate, models.AuthorizationResourceDownloader, downloader.ID) {
+		return input, nil, appError(CodePermissionDenied, "无权让订阅使用这个下载器", nil)
+	}
 	var library models.MediaLibrary
 	if err := s.db.Where("id = ? AND enabled = ?", input.MediaLibraryID, true).First(&library).Error; err != nil {
 		return input, nil, appError(CodeFollowConfigurationInvalid, "订阅目标媒体库不存在或已停用", err)
 	}
+	if !actor.CanResource(authz.PermissionDownloadsCreate, models.AuthorizationResourceMediaLibrary, uintID(library.ID)) || !actor.CanResource(authz.PermissionMediaLibrariesRead, models.AuthorizationResourceMediaLibrary, uintID(library.ID)) {
+		return input, nil, appError(CodePermissionDenied, "无权让订阅入库到这个媒体库", nil)
+	}
 	var sites []models.Site
 	if err := s.db.Where("id IN ? AND enabled = ?", input.SiteIDs, true).Find(&sites).Error; err != nil || len(sites) != len(input.SiteIDs) {
 		return input, nil, appError(CodeFollowConfigurationInvalid, "订阅站点不存在或已停用", err)
+	}
+	for _, site := range sites {
+		if !actor.CanResource(authz.PermissionDiscoveryRead, models.AuthorizationResourceSite, uintID(site.ID)) {
+			return input, nil, appError(CodePermissionDenied, "无权让订阅搜索所选站点", nil)
+		}
 	}
 	if err := s.validateFollowRoute(context.Background(), downloader, library, sites); err != nil {
 		return input, nil, err

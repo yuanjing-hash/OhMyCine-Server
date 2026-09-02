@@ -9,6 +9,16 @@ import FollowEditorDialog from '@/components/FollowEditorDialog.vue'
 import type { FollowSummary } from '@/follows'
 import { useAuthStore } from '@/stores/auth'
 
+interface AcquisitionStatus {
+  stage: string
+  status: string
+  transfer_task_id?: string
+  processed_files?: number
+  total_files?: number
+  follow_subscription_id?: string
+  last_error_code?: string
+}
+
 const route = useRoute()
 const router = useRouter()
 const auth = useAuthStore()
@@ -18,6 +28,8 @@ const detail = ref<DiscoveryDetail | null>(null)
 const coverage = ref<MediaCoverage | null>(null)
 const coverageLoading = ref(false)
 const coverageError = ref('')
+const acquisition = ref<AcquisitionStatus | null>(null)
+const acquisitionLoading = ref(false)
 const expandedSeasons = ref<number[]>([])
 const followEditorOpen = ref(false)
 
@@ -26,6 +38,12 @@ const identity = computed(() => ({
   media_type: String(route.params.mediaType) as DiscoveryMediaType,
   provider_id: String(route.params.providerID),
 }))
+const acquisitionLabel = computed(() => {
+  const current = acquisition.value
+  if (!current || current.stage === 'idle') return '尚未创建入库任务'
+  const stages: Record<string, string> = { subscription: '自动追更', download: '下载', organize: '整理', import: '入库', library: '已入库' }
+  return `${stages[current.stage] ?? current.stage} · ${current.status}`
+})
 
 async function load() {
   loading.value = true
@@ -36,9 +54,19 @@ async function load() {
   try {
     detail.value = await api<DiscoveryDetail>(discoveryDetailPath(identity.value))
     void loadCoverage()
+    void loadAcquisition()
   }
   catch (reason) { error.value = message(reason) }
   finally { loading.value = false }
+}
+
+async function loadAcquisition() {
+  const work = detail.value?.work
+  if (!work?.tmdb_id) return
+  acquisitionLoading.value = true
+  try { acquisition.value = await api<AcquisitionStatus>(`/api/v1/discovery/media/${work.media_type}/${work.tmdb_id}/acquisition`) }
+  catch { acquisition.value = null }
+  finally { acquisitionLoading.value = false }
 }
 
 async function loadCoverage() {
@@ -60,7 +88,7 @@ function subscribe() {
   if (!detail.value?.work.tmdb_id || detail.value.work.media_type !== 'tv') { notify('只有已确认 TMDB 身份的电视剧可以订阅。', 'warning'); return }
   followEditorOpen.value = true
 }
-function followSaved(follow: FollowSummary) { followEditorOpen.value = false; notify(`已创建《${follow.title}》自动追更，正在排队检查缺集。`, 'success') }
+function followSaved(follow: FollowSummary) { followEditorOpen.value = false; void loadAcquisition(); notify(`已创建《${follow.title}》自动追更，正在排队检查缺集。`, 'success') }
 function openWork(work: DiscoveryWork) { void router.push(discoveryDetailRoute(work)) }
 function message(reason: unknown) { return reason instanceof Error ? reason.message : '作品详情加载失败' }
 onMounted(load)
@@ -77,7 +105,7 @@ watch(() => route.fullPath, load)
         <div class="grid gap-6 p-6 md:grid-cols-[11rem_minmax(0,1fr)]">
           <div class="detail-poster"><img v-if="detail.work.poster_url" :src="detail.work.poster_url" :alt="`${detail.work.title} 海报`" /><span v-else>暂无海报</span></div>
           <div class="min-w-0 self-end">
-            <div class="flex flex-wrap gap-2"><span class="status-chip">{{ providerLabel(detail.work.provider) }}</span><span class="status-chip">{{ detail.work.media_type === 'tv' ? '剧集' : '电影' }}</span><span v-if="detail.work.rating != null" class="status-chip status-chip--ready">{{ detail.work.rating.toFixed(1) }}</span></div>
+            <div class="flex flex-wrap gap-2"><span class="status-chip">{{ providerLabel(detail.work.provider) }}</span><span class="status-chip">{{ detail.work.media_type === 'tv' ? '剧集' : '电影' }}</span><span v-if="detail.work.rating != null" class="status-chip status-chip--ready">{{ detail.work.rating.toFixed(1) }}</span><span v-if="detail.work.tmdb_id" :class="acquisition?.stage === 'library' ? 'status-chip status-chip--ready' : acquisition?.last_error_code ? 'status-chip status-chip--warning' : 'status-chip'">{{ acquisitionLoading ? '正在读取入库状态…' : acquisitionLabel }}</span></div>
             <h1 class="mb-0 mt-3 text-3xl font-850">{{ detail.work.title }}</h1>
             <p v-if="detail.work.original_title" class="mb-0 mt-1 text-sm text-muted">{{ detail.work.original_title }}</p>
             <p class="mb-0 mt-3 text-sm text-muted">{{ [detail.work.year, detail.runtime_minutes ? `${detail.runtime_minutes} 分钟` : '', ...detail.genres].filter(Boolean).join(' · ') }}</p>
@@ -86,6 +114,12 @@ watch(() => route.fullPath, load)
             <div class="mt-5 flex flex-wrap gap-3"><button class="btn-primary" :disabled="!detail.work.tmdb_id" @click="searchResources">搜索</button><button v-if="detail.work.media_type === 'tv' && auth.can(Permissions.FollowsCreate)" class="btn-secondary" :disabled="!detail.work.tmdb_id || coverageLoading" @click="subscribe">订阅</button></div>
           </div>
         </div>
+      </article>
+
+      <article v-if="acquisition && acquisition.stage !== 'idle'" class="panel" aria-labelledby="acquisition-status-title">
+        <header class="flex flex-wrap items-center justify-between gap-3"><div><h2 id="acquisition-status-title" class="m-0 text-lg">搜索、下载与入库状态</h2><p class="page-description mt-1 text-sm">Player 与 Server Web 使用同一份持久状态；刷新或重启后会从下载和整理任务重新投影。</p></div><button class="btn-secondary" type="button" :disabled="acquisitionLoading" @click="loadAcquisition">刷新状态</button></header>
+        <div class="mt-4 flex flex-wrap items-center gap-2"><span :class="acquisition.stage === 'library' ? 'status-chip status-chip--ready' : acquisition.last_error_code ? 'status-chip status-chip--warning' : 'status-chip'">{{ acquisitionLabel }}</span><span v-if="acquisition.total_files" class="text-subtle text-xs">文件 {{ acquisition.processed_files || 0 }} / {{ acquisition.total_files }}</span><span v-if="acquisition.follow_subscription_id" class="status-chip">已订阅</span></div>
+        <p v-if="acquisition.last_error_code" class="semantic-warning mb-0 mt-3 p-3 text-sm">最近失败：{{ acquisition.last_error_code }}</p>
       </article>
 
       <article class="panel" aria-labelledby="media-coverage-title">

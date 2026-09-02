@@ -35,14 +35,118 @@ type RoleSummary struct {
 }
 
 type UserSummary struct {
-	ID          uint          `json:"id"`
-	Username    string        `json:"username"`
-	DisplayName string        `json:"display_name"`
-	Status      string        `json:"status"`
-	IsOwner     bool          `json:"is_owner"`
-	Roles       []RoleSummary `json:"roles"`
-	LastLoginAt any           `json:"last_login_at"`
-	CreatedAt   any           `json:"created_at"`
+	ID                 uint                `json:"id"`
+	Username           string              `json:"username"`
+	DisplayName        string              `json:"display_name"`
+	Status             string              `json:"status"`
+	IsOwner            bool                `json:"is_owner"`
+	Roles              []RoleSummary       `json:"roles"`
+	AuthorizationRules []AuthorizationRule `json:"authorization_rules"`
+	LastLoginAt        any                 `json:"last_login_at"`
+	CreatedAt          any                 `json:"created_at"`
+}
+
+type ReplaceUserAuthorizationRulesInput struct {
+	Rules []AuthorizationRule
+}
+
+func (s *AdminService) ReplaceUserAuthorizationRules(actor Actor, userID uint, input ReplaceUserAuthorizationRulesInput, request RequestContext) error {
+	if actor.User.ID == userID {
+		return appError(CodeSelfModification, "不能修改当前登录账户的直接授权", nil)
+	}
+	return s.db.Transaction(func(tx *gorm.DB) error {
+		currentActor, err := s.authz.resolveWithDB(tx, actor.User.ID)
+		if err != nil {
+			return err
+		}
+		var user models.User
+		if err := tx.First(&user, userID).Error; err != nil {
+			return notFound(err, "用户不存在")
+		}
+		if user.IsOwner {
+			return appError(CodeOwnerProtected, "实例 owner 的授权不能被覆盖", nil)
+		}
+		seen := map[string]struct{}{}
+		rows := make([]models.UserAuthorizationRule, 0, len(input.Rules))
+		for _, rule := range input.Rules {
+			rule.PermissionCode = strings.TrimSpace(rule.PermissionCode)
+			rule.Effect = strings.TrimSpace(rule.Effect)
+			rule.ResourceType = strings.TrimSpace(rule.ResourceType)
+			rule.ResourceID = strings.TrimSpace(rule.ResourceID)
+			if !authz.Contains(rule.PermissionCode) {
+				return appError(CodeInvalidRequest, "包含未知权限代码", nil)
+			}
+			if rule.Effect != models.AuthorizationEffectAllow && rule.Effect != models.AuthorizationEffectDeny {
+				return appError(CodeInvalidRequest, "授权效果必须为 allow 或 deny", nil)
+			}
+			if !validAuthorizationScope(rule.ResourceType, rule.ResourceID) {
+				return appError(CodeInvalidRequest, "授权资源范围无效", nil)
+			}
+			if rule.Effect == models.AuthorizationEffectAllow {
+				allowed := currentActor.Can(rule.PermissionCode)
+				if rule.ResourceType != "" {
+					allowed = currentActor.CanResource(rule.PermissionCode, rule.ResourceType, rule.ResourceID)
+				}
+				if !allowed {
+					return appError(CodePermissionDenied, "不能授予当前操作者不具备的权限", nil)
+				}
+			}
+			if err := validateAuthorizationResource(tx, rule.ResourceType, rule.ResourceID); err != nil {
+				return err
+			}
+			key := rule.PermissionCode + "\x00" + rule.Effect + "\x00" + rule.ResourceType + "\x00" + rule.ResourceID
+			if _, exists := seen[key]; exists {
+				continue
+			}
+			seen[key] = struct{}{}
+			rows = append(rows, models.UserAuthorizationRule{UserID: userID, PermissionCode: rule.PermissionCode, Effect: rule.Effect, ResourceType: rule.ResourceType, ResourceID: rule.ResourceID, CreatedBy: actor.User.ID})
+		}
+		if err := tx.Where("user_id = ?", userID).Delete(&models.UserAuthorizationRule{}).Error; err != nil {
+			return err
+		}
+		for index := range rows {
+			if err := tx.Create(&rows[index]).Error; err != nil {
+				return err
+			}
+		}
+		if err := tx.Model(&user).Update("authz_version", gorm.Expr("authz_version + 1")).Error; err != nil {
+			return err
+		}
+		if err := s.ensureAdminRemains(tx); err != nil {
+			return err
+		}
+		return s.audit.Record(tx, &actor.User.ID, "users.authorization.replace", "user", uintID(userID), "success", map[string]any{"rule_count": len(rows)}, request)
+	})
+}
+
+func validAuthorizationScope(resourceType, resourceID string) bool {
+	if resourceType == "" {
+		return resourceID == ""
+	}
+	if resourceID == "" || len(resourceID) > 128 {
+		return false
+	}
+	switch resourceType {
+	case models.AuthorizationResourceMediaLibrary, models.AuthorizationResourceDownloader, models.AuthorizationResourceSite:
+		return true
+	default:
+		return false
+	}
+}
+
+func validateAuthorizationResource(db *gorm.DB, resourceType, resourceID string) error {
+	if resourceType == "" {
+		return nil
+	}
+	table := map[string]string{models.AuthorizationResourceMediaLibrary: "media_libraries", models.AuthorizationResourceDownloader: "downloaders", models.AuthorizationResourceSite: "sites"}[resourceType]
+	var count int64
+	if err := db.Table(table).Where("CAST(id AS TEXT) = ?", resourceID).Count(&count).Error; err != nil {
+		return err
+	}
+	if count == 0 {
+		return appError(CodeInvalidRequest, "授权范围引用的资源不存在", nil)
+	}
+	return nil
 }
 
 func (s *AdminService) ListUsers() ([]UserSummary, error) {
@@ -56,7 +160,11 @@ func (s *AdminService) ListUsers() ([]UserSummary, error) {
 		if err != nil {
 			return nil, err
 		}
-		result = append(result, UserSummary{ID: user.ID, Username: user.Username, DisplayName: user.DisplayName, Status: user.Status, IsOwner: user.IsOwner, Roles: roles, LastLoginAt: user.LastLoginAt, CreatedAt: user.CreatedAt})
+		rules, err := s.authorizationRulesForUser(s.db, user.ID)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, UserSummary{ID: user.ID, Username: user.Username, DisplayName: user.DisplayName, Status: user.Status, IsOwner: user.IsOwner, Roles: roles, AuthorizationRules: rules, LastLoginAt: user.LastLoginAt, CreatedAt: user.CreatedAt})
 	}
 	return result, nil
 }
@@ -616,7 +724,23 @@ func (s *AdminService) getUserSummary(userID uint) (UserSummary, error) {
 	if err != nil {
 		return UserSummary{}, err
 	}
-	return UserSummary{ID: user.ID, Username: user.Username, DisplayName: user.DisplayName, Status: user.Status, IsOwner: user.IsOwner, Roles: roles, LastLoginAt: user.LastLoginAt, CreatedAt: user.CreatedAt}, nil
+	rules, err := s.authorizationRulesForUser(s.db, user.ID)
+	if err != nil {
+		return UserSummary{}, err
+	}
+	return UserSummary{ID: user.ID, Username: user.Username, DisplayName: user.DisplayName, Status: user.Status, IsOwner: user.IsOwner, Roles: roles, AuthorizationRules: rules, LastLoginAt: user.LastLoginAt, CreatedAt: user.CreatedAt}, nil
+}
+
+func (s *AdminService) authorizationRulesForUser(db *gorm.DB, userID uint) ([]AuthorizationRule, error) {
+	var rows []models.UserAuthorizationRule
+	if err := db.Where("user_id = ?", userID).Order("permission_code,resource_type,resource_id,effect").Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	result := make([]AuthorizationRule, 0, len(rows))
+	for _, row := range rows {
+		result = append(result, AuthorizationRule{PermissionCode: row.PermissionCode, Effect: row.Effect, ResourceType: row.ResourceType, ResourceID: row.ResourceID})
+	}
+	return result, nil
 }
 
 func replaceRolePermissions(tx *gorm.DB, roleID uint, codes []string) error {

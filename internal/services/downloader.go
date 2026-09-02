@@ -88,7 +88,7 @@ type DownloaderSummary struct {
 }
 
 func (s *DownloaderService) List(actor Actor) ([]DownloaderSummary, error) {
-	if !actor.Can(authz.PermissionDownloadersRead) {
+	if !actor.HasPermission(authz.PermissionDownloadersRead) {
 		return nil, appError(CodePermissionDenied, "无权查看下载器", nil)
 	}
 	var records []models.Downloader
@@ -97,6 +97,9 @@ func (s *DownloaderService) List(actor Actor) ([]DownloaderSummary, error) {
 	}
 	items := make([]DownloaderSummary, 0, len(records))
 	for _, record := range records {
+		if !actor.CanResource(authz.PermissionDownloadersRead, models.AuthorizationResourceDownloader, record.ID) {
+			continue
+		}
 		items = append(items, s.summary(record))
 	}
 	return items, nil
@@ -172,7 +175,7 @@ func (s *DownloaderService) Update(actor Actor, id string, input UpdateDownloade
 }
 
 func (s *DownloaderService) UpdateContext(ctx context.Context, actor Actor, id string, input UpdateDownloaderInput, request RequestContext) (DownloaderSummary, error) {
-	if !actor.Can(authz.PermissionDownloadersUpdate) {
+	if !actor.HasPermission(authz.PermissionDownloadersUpdate) {
 		return DownloaderSummary{}, appError(CodePermissionDenied, "无权编辑下载器", nil)
 	}
 	if input.ClearUsername && input.Username != nil && *input.Username != "" || input.ClearPassword && input.Password != nil && *input.Password != "" {
@@ -181,6 +184,9 @@ func (s *DownloaderService) UpdateContext(ctx context.Context, actor Actor, id s
 	var record models.Downloader
 	if err := s.db.First(&record, "id = ?", id).Error; err != nil {
 		return DownloaderSummary{}, downloaderNotFound(err)
+	}
+	if !actor.CanResource(authz.PermissionDownloadersUpdate, models.AuthorizationResourceDownloader, record.ID) {
+		return DownloaderSummary{}, appError(CodePermissionDenied, "无权编辑这个下载器", nil)
 	}
 	if input.Name != nil {
 		name, normalized, err := normalizeDownloaderName(*input.Name)
@@ -272,10 +278,13 @@ func (s *DownloaderService) UpdateContext(ctx context.Context, actor Actor, id s
 }
 
 func (s *DownloaderService) Test(ctx context.Context, actor Actor, id string, request RequestContext) (DownloaderSummary, error) {
-	if !actor.Can(authz.PermissionDownloadersTest) {
+	if !actor.HasPermission(authz.PermissionDownloadersTest) {
 		return DownloaderSummary{}, appError(CodePermissionDenied, "无权测试下载器", nil)
 	}
 	record, client, err := s.client(id)
+	if err == nil && !actor.CanResource(authz.PermissionDownloadersTest, models.AuthorizationResourceDownloader, record.ID) {
+		return DownloaderSummary{}, appError(CodePermissionDenied, "无权测试这个下载器", nil)
+	}
 	now := time.Now().UTC()
 	status, version, errorCode, outcome := "offline", "", "downloader_unavailable", "failure"
 	if err == nil {
@@ -305,13 +314,16 @@ func (s *DownloaderService) Test(ctx context.Context, actor Actor, id string, re
 }
 
 func (s *DownloaderService) Delete(actor Actor, id string, request RequestContext) error {
-	if !actor.Can(authz.PermissionDownloadersDelete) {
+	if !actor.HasPermission(authz.PermissionDownloadersDelete) {
 		return appError(CodePermissionDenied, "无权删除下载器", nil)
 	}
 	return s.db.Transaction(func(tx *gorm.DB) error {
 		var record models.Downloader
 		if err := tx.First(&record, "id = ?", id).Error; err != nil {
 			return downloaderNotFound(err)
+		}
+		if !actor.CanResource(authz.PermissionDownloadersDelete, models.AuthorizationResourceDownloader, record.ID) {
+			return appError(CodePermissionDenied, "无权删除这个下载器", nil)
 		}
 		var active int64
 		if err := tx.Table("download_tasks").Joins("JOIN jobs ON jobs.id = download_tasks.job_id").Where("download_tasks.downloader_id = ? AND jobs.status IN ?", id, activeJobStatuses()).Count(&active).Error; err != nil {

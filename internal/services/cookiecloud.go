@@ -162,6 +162,11 @@ func (s *CookieCloudService) Update(ctx context.Context, actor Actor, input Cook
 	if input.AutoSyncMinutes != 0 && (input.AutoSyncMinutes < 15 || input.AutoSyncMinutes > 43200) {
 		return CookieCloudSettingsSummary{}, appError(CodeCookieCloudInvalid, "CookieCloud 自动同步间隔无效", nil)
 	}
+	if input.AutoSyncMinutes > 0 {
+		if _, err := cronFromIntervalMinutes(input.AutoSyncMinutes); err != nil {
+			return CookieCloudSettingsSummary{}, err
+		}
+	}
 	current, _ := s.decryptCredential(record)
 	if strings.TrimSpace(input.UUID) != "" {
 		current.UUID = strings.TrimSpace(input.UUID)
@@ -208,6 +213,9 @@ func (s *CookieCloudService) Update(ctx context.Context, actor Actor, input Cook
 	_ = s.audit.Record(s.db, &actor.User.ID, "cookiecloud.settings.update", "cookiecloud", "1", "success", map[string]any{"mode": mode, "auto_sync_minutes": input.AutoSyncMinutes}, request)
 	updated, err := s.record()
 	if err != nil {
+		return CookieCloudSettingsSummary{}, err
+	}
+	if err := syncCookieCloudUnifiedSchedule(s.db, actor.User.ID, updated, true, now); err != nil {
 		return CookieCloudSettingsSummary{}, err
 	}
 	return s.cookieCloudSummary(updated), nil

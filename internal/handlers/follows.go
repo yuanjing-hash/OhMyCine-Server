@@ -56,6 +56,12 @@ func (a *API) CreateFollow(c *gin.Context) {
 		writeError(c, a.log, err)
 		return
 	}
+	if a.acquisition != nil {
+		if err := a.acquisition.RecordFollow(data); err != nil {
+			writeError(c, a.log, err)
+			return
+		}
+	}
 	success(c, http.StatusCreated, data)
 }
 func (a *API) UpdateFollow(c *gin.Context) {

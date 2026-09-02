@@ -49,12 +49,20 @@ func NewMediaServerRefreshService(db *gorm.DB, queue *QueueService, audit *Audit
 }
 
 func (s *MediaServerRefreshService) List(actor Actor) ([]models.MediaServerRefreshTarget, error) {
-	if !actor.Can(authz.PermissionConnectionsRead) || !actor.Can(authz.PermissionMediaLibrariesRead) {
+	if !actor.Can(authz.PermissionConnectionsRead) || !actor.HasPermission(authz.PermissionMediaLibrariesRead) {
 		return nil, appError(CodePermissionDenied, "无权查看媒体服务器刷新目标", nil)
 	}
 	var targets []models.MediaServerRefreshTarget
-	err := s.db.Order("library_id,connection_id,id").Find(&targets).Error
-	return targets, err
+	if err := s.db.Order("library_id,connection_id,id").Find(&targets).Error; err != nil {
+		return nil, err
+	}
+	filtered := make([]models.MediaServerRefreshTarget, 0, len(targets))
+	for _, target := range targets {
+		if actor.CanResource(authz.PermissionMediaLibrariesRead, models.AuthorizationResourceMediaLibrary, uintID(target.LibraryID)) {
+			filtered = append(filtered, target)
+		}
+	}
+	return filtered, nil
 }
 
 func (s *MediaServerRefreshService) ListUpstreamLibraries(ctx context.Context, actor Actor, connectionID uint) ([]mediaserverpkg.Library, error) {
@@ -75,12 +83,15 @@ func (s *MediaServerRefreshService) ListUpstreamLibraries(ctx context.Context, a
 }
 
 func (s *MediaServerRefreshService) TestTarget(ctx context.Context, actor Actor, id uint, request RequestContext) (MediaServerRefreshTargetTestResult, error) {
-	if !actor.Can(authz.PermissionConnectionsTest) || !actor.Can(authz.PermissionMediaLibrariesRead) {
+	if !actor.Can(authz.PermissionConnectionsTest) || !actor.HasPermission(authz.PermissionMediaLibrariesRead) {
 		return MediaServerRefreshTargetTestResult{}, appError(CodePermissionDenied, "无权测试媒体服务器刷新目标", nil)
 	}
 	var target models.MediaServerRefreshTarget
 	if err := s.db.First(&target, id).Error; err != nil {
 		return MediaServerRefreshTargetTestResult{}, mediaServerRefreshTargetNotFound(err)
+	}
+	if !actor.CanResource(authz.PermissionMediaLibrariesRead, models.AuthorizationResourceMediaLibrary, uintID(target.LibraryID)) {
+		return MediaServerRefreshTargetTestResult{}, appError(CodePermissionDenied, "无权测试这个媒体库的刷新目标", nil)
 	}
 	checkedAt := time.Now().UTC()
 	client, _, probeErr := s.connections.mediaServerClient(target.ConnectionID)
@@ -116,7 +127,7 @@ func (s *MediaServerRefreshService) TestTarget(ctx context.Context, actor Actor,
 }
 
 func (s *MediaServerRefreshService) Create(ctx context.Context, actor Actor, input MediaServerRefreshTargetInput, request RequestContext) (models.MediaServerRefreshTarget, error) {
-	if !actor.Can(authz.PermissionConnectionsUpdate) || !actor.Can(authz.PermissionMediaLibrariesUpdate) {
+	if !actor.Can(authz.PermissionConnectionsUpdate) || !actor.HasPermission(authz.PermissionMediaLibrariesUpdate) {
 		return models.MediaServerRefreshTarget{}, appError(CodePermissionDenied, "无权创建媒体服务器刷新目标", nil)
 	}
 	upstreamID := strings.TrimSpace(input.UpstreamLibraryID)
@@ -126,6 +137,9 @@ func (s *MediaServerRefreshService) Create(ctx context.Context, actor Actor, inp
 	var library models.MediaLibrary
 	if err := s.db.First(&library, input.LibraryID).Error; err != nil {
 		return models.MediaServerRefreshTarget{}, mediaLibraryNotFound(err)
+	}
+	if !actor.CanResource(authz.PermissionMediaLibrariesUpdate, models.AuthorizationResourceMediaLibrary, uintID(library.ID)) {
+		return models.MediaServerRefreshTarget{}, appError(CodePermissionDenied, "无权为这个媒体库创建刷新目标", nil)
 	}
 	items, err := s.ListUpstreamLibraries(ctx, actor, input.ConnectionID)
 	if err != nil {
@@ -166,12 +180,15 @@ func (s *MediaServerRefreshService) Create(ctx context.Context, actor Actor, inp
 }
 
 func (s *MediaServerRefreshService) Update(actor Actor, id uint, input MediaServerRefreshTargetInput, request RequestContext) (models.MediaServerRefreshTarget, error) {
-	if !actor.Can(authz.PermissionConnectionsUpdate) || !actor.Can(authz.PermissionMediaLibrariesUpdate) {
+	if !actor.Can(authz.PermissionConnectionsUpdate) || !actor.HasPermission(authz.PermissionMediaLibrariesUpdate) {
 		return models.MediaServerRefreshTarget{}, appError(CodePermissionDenied, "无权修改媒体服务器刷新目标", nil)
 	}
 	var target models.MediaServerRefreshTarget
 	if err := s.db.First(&target, id).Error; err != nil {
 		return target, mediaServerRefreshTargetNotFound(err)
+	}
+	if !actor.CanResource(authz.PermissionMediaLibrariesUpdate, models.AuthorizationResourceMediaLibrary, uintID(target.LibraryID)) {
+		return target, appError(CodePermissionDenied, "无权修改这个媒体库的刷新目标", nil)
 	}
 	err := s.db.Transaction(func(tx *gorm.DB) error {
 		updates := map[string]any{"enabled": input.Enabled, "revision": input.Revision + 1, "updated_at": time.Now().UTC()}
@@ -206,8 +223,15 @@ func (s *MediaServerRefreshService) Update(actor Actor, id uint, input MediaServ
 }
 
 func (s *MediaServerRefreshService) Delete(actor Actor, id uint, request RequestContext) error {
-	if !actor.Can(authz.PermissionConnectionsUpdate) || !actor.Can(authz.PermissionMediaLibrariesUpdate) {
+	if !actor.Can(authz.PermissionConnectionsUpdate) || !actor.HasPermission(authz.PermissionMediaLibrariesUpdate) {
 		return appError(CodePermissionDenied, "无权删除媒体服务器刷新目标", nil)
+	}
+	var target models.MediaServerRefreshTarget
+	if err := s.db.First(&target, id).Error; err != nil {
+		return mediaServerRefreshTargetNotFound(err)
+	}
+	if !actor.CanResource(authz.PermissionMediaLibrariesUpdate, models.AuthorizationResourceMediaLibrary, uintID(target.LibraryID)) {
+		return appError(CodePermissionDenied, "无权删除这个媒体库的刷新目标", nil)
 	}
 	return s.db.Transaction(func(tx *gorm.DB) error {
 		result := tx.Delete(&models.MediaServerRefreshTarget{}, id)
@@ -222,12 +246,15 @@ func (s *MediaServerRefreshService) Delete(actor Actor, id uint, request Request
 }
 
 func (s *MediaServerRefreshService) ManualRefresh(actor Actor, id uint, request RequestContext) (JobDTO, error) {
-	if !actor.Can(authz.PermissionMediaServersRefresh) {
+	if !actor.HasPermission(authz.PermissionMediaServersRefresh) {
 		return JobDTO{}, appError(CodePermissionDenied, "无权刷新媒体服务器", nil)
 	}
 	var target models.MediaServerRefreshTarget
 	if err := s.db.First(&target, id).Error; err != nil {
 		return JobDTO{}, mediaServerRefreshTargetNotFound(err)
+	}
+	if !actor.CanResource(authz.PermissionMediaServersRefresh, models.AuthorizationResourceMediaLibrary, uintID(target.LibraryID)) {
+		return JobDTO{}, appError(CodePermissionDenied, "无权刷新这个媒体库", nil)
 	}
 	if !target.Enabled {
 		return JobDTO{}, appError(CodeConnectionUnavailable, "媒体服务器刷新目标已停用", nil)
@@ -251,12 +278,15 @@ func (s *MediaServerRefreshService) ManualRefresh(actor Actor, id uint, request 
 }
 
 func (s *MediaServerRefreshService) Retry(actor Actor, id uint, request RequestContext) (JobDTO, error) {
-	if !actor.Can(authz.PermissionMediaServersRefresh) {
+	if !actor.HasPermission(authz.PermissionMediaServersRefresh) {
 		return JobDTO{}, appError(CodePermissionDenied, "无权重试媒体服务器刷新", nil)
 	}
 	var target models.MediaServerRefreshTarget
 	if err := s.db.First(&target, id).Error; err != nil {
 		return JobDTO{}, mediaServerRefreshTargetNotFound(err)
+	}
+	if !actor.CanResource(authz.PermissionMediaServersRefresh, models.AuthorizationResourceMediaLibrary, uintID(target.LibraryID)) {
+		return JobDTO{}, appError(CodePermissionDenied, "无权重试这个媒体库的刷新", nil)
 	}
 	if !target.Enabled {
 		return JobDTO{}, appError(CodeConnectionUnavailable, "媒体服务器刷新目标已停用", nil)

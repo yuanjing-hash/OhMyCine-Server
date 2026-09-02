@@ -94,7 +94,12 @@ func (a *Adapter) Search(ctx context.Context, config site.Config, query site.Que
 	if keyword == "" || len([]rune(keyword)) > 160 || query.Page < 1 || query.Page > 20 {
 		return site.Page{}, site.ErrInvalidReply
 	}
-	if query.Year != nil {
+	// RSS-style public BT indexes search release text, not a stable media
+	// identity. A TV work's TMDB year is its first-air year and is commonly
+	// unrelated to the year carried by a current episode release. Appending it
+	// turns long-running shows into false empty results (for example a 2005
+	// series with a 2026 episode). Keep movie-year disambiguation only.
+	if query.Year != nil && strings.EqualFold(strings.TrimSpace(query.MediaType), "movie") {
 		keyword += " " + strconv.Itoa(*query.Year)
 	}
 	body, err := a.requestFeed(ctx, config, keyword, query.Page)

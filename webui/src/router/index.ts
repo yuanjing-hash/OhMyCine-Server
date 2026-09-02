@@ -31,6 +31,7 @@ import DiscoveryDetailView from '@/views/DiscoveryDetailView.vue'
 import LibraryCatalogView from '@/views/LibraryCatalogView.vue'
 import LibraryCatalogDetailView from '@/views/LibraryCatalogDetailView.vue'
 import FollowsView from '@/views/FollowsView.vue'
+import SchedulesView from '@/views/SchedulesView.vue'
 
 function navigationMeta(id: string) {
   const item = findNavigationItem(id)
@@ -67,6 +68,7 @@ export const router = createRouter({
         { path: 'system/media-rules', name: 'media-rules', component: MediaRulesView, meta: navigationMeta('media-rules') },
         { path: 'system/sites', name: 'sites', component: SitesView, meta: navigationMeta('sites') },
         { path: 'automation/tasks', name: 'tasks', component: TasksView, meta: navigationMeta('tasks') },
+        { path: 'automation/schedules', name: 'schedules', component: SchedulesView, meta: navigationMeta('schedules') },
         { path: downloadsRouteContract.path, name: downloadsRouteContract.name, component: DownloadsView, meta: navigationMeta(downloadsRouteContract.navigationID) },
 		{ path: organizationRouteContract.path, name: organizationRouteContract.name, component: OrganizationView, meta: navigationMeta(organizationRouteContract.navigationID) },
 		{ path: strmRouteContract.path, name: strmRouteContract.name, component: STRMView, meta: navigationMeta(strmRouteContract.navigationID) },

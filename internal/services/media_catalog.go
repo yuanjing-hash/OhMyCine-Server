@@ -195,17 +195,24 @@ func (s *MediaLibraryService) Catalog(actor Actor, libraryID uint, query MediaPa
 // concatenate per-library pages: matched works merge only by trustworthy TMDB
 // identity, while unmatched works remain library-scoped.
 func (s *MediaLibraryService) AggregateCatalog(actor Actor, query MediaPageQuery) (MediaCatalogPage, error) {
-	if !actor.Can(authz.PermissionMediaLibrariesRead) {
+	if !actor.HasPermission(authz.PermissionMediaLibrariesRead) {
 		return MediaCatalogPage{}, appError(CodePermissionDenied, "无权查看媒体库", nil)
 	}
 	query, err := normalizeMediaPageQuery(query)
 	if err != nil {
 		return MediaCatalogPage{}, err
 	}
+	libraryIDs, err := s.authorizedMediaLibraryIDs(actor, authz.PermissionMediaLibrariesRead, true)
+	if err != nil {
+		return MediaCatalogPage{}, err
+	}
+	if len(libraryIDs) == 0 {
+		return MediaCatalogPage{List: []MediaCatalogItem{}, Page: query.Page, PageSize: query.PageSize, Categories: []string{}}, nil
+	}
 	base := s.db.Model(&models.MediaLibraryEntry{}).
 		Joins("JOIN media_libraries ON media_libraries.id = media_library_entries.library_id").
 		Joins("JOIN storages ON storages.id = media_libraries.storage_id").
-		Where("media_library_entries.work_key <> '' AND media_libraries.enabled = ? AND storages.enabled = ?", true, true)
+		Where("media_library_entries.work_key <> '' AND media_libraries.enabled = ? AND storages.enabled = ? AND media_libraries.id IN ?", true, true, libraryIDs)
 	categories, err := catalogCategories(base)
 	if err != nil {
 		return MediaCatalogPage{}, err
@@ -220,7 +227,7 @@ func (s *MediaLibraryService) AggregateCatalog(actor Actor, query MediaPageQuery
 	}
 	libraryNames := map[uint]string{}
 	var libraries []models.MediaLibrary
-	if err := s.db.Select("id,name").Where("enabled = ?", true).Find(&libraries).Error; err != nil {
+	if err := s.db.Select("id,name").Where("enabled = ? AND id IN ?", true, libraryIDs).Find(&libraries).Error; err != nil {
 		return MediaCatalogPage{}, err
 	}
 	for _, library := range libraries {
@@ -672,7 +679,7 @@ func escapeLike(value string) string {
 }
 
 func (s *MediaLibraryService) ensureMediaLibraryReadable(actor Actor, libraryID uint) error {
-	if !actor.Can(authz.PermissionMediaLibrariesRead) {
+	if !actor.CanResource(authz.PermissionMediaLibrariesRead, models.AuthorizationResourceMediaLibrary, uintID(libraryID)) {
 		return appError(CodePermissionDenied, "无权查看媒体库", nil)
 	}
 	var count int64

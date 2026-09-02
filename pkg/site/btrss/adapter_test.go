@@ -46,6 +46,29 @@ func TestNyaaRSSSearchAndResolveTorrent(t *testing.T) {
 	}
 }
 
+func TestRSSSearchDoesNotAppendTVFirstAirYear(t *testing.T) {
+	year := 2005
+	queries := make(chan string, 2)
+	server := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		queries <- request.URL.Query().Get("q")
+		_, _ = writer.Write([]byte(`<rss><channel></channel></rss>`))
+	}))
+	defer server.Close()
+	adapter := NewForTest("nyaa", NyaaProfile(), server.Client(), server.URL)
+	if _, err := adapter.Search(context.Background(), site.Config{BaseURL: server.URL}, site.Query{Keyword: "Doraemon", MediaType: "tv", Year: &year, Page: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if got := <-queries; got != "Doraemon" {
+		t.Fatalf("TV first-air year leaked into RSS query: %q", got)
+	}
+	if _, err := adapter.Search(context.Background(), site.Config{BaseURL: server.URL}, site.Query{Keyword: "Seven Samurai", MediaType: "movie", Year: &year, Page: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if got := <-queries; got != "Seven Samurai 2005" {
+		t.Fatalf("movie year disambiguation missing: %q", got)
+	}
+}
+
 func TestBuiltInProfilesGenerateExpectedQueryAndConstrainSources(t *testing.T) {
 	tests := []struct {
 		name, kind, path, parameter, prefix string

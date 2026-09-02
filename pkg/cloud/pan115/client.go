@@ -911,10 +911,15 @@ func (c *Client) ResolveDirectory(ctx context.Context, providerPath string) (clo
 	}); err != nil {
 		return cloud.Item{}, mapError(err)
 	}
-	if response == nil || strings.TrimSpace(string(response.CategoryID)) == "" {
+	directoryID := strings.TrimSpace(string(response.CategoryID))
+	// DirName2CID reports a missing non-root path as id=0 on some 115
+	// endpoints. ID 0 is the provider root, so accepting it here silently
+	// redirects a planned nested transfer to the drive root. Only an explicit
+	// request for "/" may resolve to 0 (handled above).
+	if response == nil || directoryID == "" || directoryID == "0" || directoryID == "-1" {
 		return cloud.Item{}, cloud.Error(cloud.CodeNotFound, false, errors.New("115 directory path was not found"))
 	}
-	return cloud.Item{ID: strings.TrimSpace(string(response.CategoryID)), Name: path.Base(clean), IsDir: true}, nil
+	return cloud.Item{ID: directoryID, Name: path.Base(clean), IsDir: true}, nil
 }
 
 // ListTree uses 115's recursive file enumeration together with its descendant

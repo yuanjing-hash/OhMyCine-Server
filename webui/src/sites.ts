@@ -283,6 +283,19 @@ export type TorrentSearchResult = PTSearchResult
 export type TorrentSearchGroup = PTSearchGroup
 export type TorrentSearchResponse = PTSearchResponse
 export type TorrentRecognitionResult = PTRecognitionResult
+export interface TorrentSearchProgress {
+  total: number
+  pending: number
+  running: number
+  completed: number
+  succeeded: number
+  failed: number
+  result_count: number
+  site_id?: number
+  site_name?: string
+  site_status?: 'queued' | 'running' | 'success' | 'error' | 'timeout' | 'cancelled' | string
+  error_code?: string
+}
 export const buildTorrentSearchQuery = buildPTSearchQuery
 export const torrentSearchURL = ptSearchURL
 export const upsertTorrentGroup = upsertPTGroup

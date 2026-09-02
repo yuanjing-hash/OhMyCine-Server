@@ -70,8 +70,11 @@ func (e *PluginDownloadExecutor) Submit(ctx context.Context, actor Actor, input 
 	if e == nil || e.downloads == nil || e.plugins == nil || e.assets == nil {
 		return DownloadTaskSummary{}, appError(CodePluginRuntimeUnavailable, "插件下载服务不可用", nil)
 	}
-	if !actor.Can(authz.PermissionDownloadsCreate) {
+	if !actor.HasPermission(authz.PermissionDownloadsCreate) {
 		return DownloadTaskSummary{}, appError(CodePermissionDenied, "无权创建下载任务", nil)
+	}
+	if !actor.CanResource(authz.PermissionDownloadsCreate, models.AuthorizationResourceMediaLibrary, uintID(input.MediaLibraryID)) {
+		return DownloadTaskSummary{}, appError(CodePermissionDenied, "无权入库到这个媒体库", nil)
 	}
 	if !safeOnlineText(input.ConnectionID, 128) || !safeOnlineText(input.ItemID, maxOnlineIdentifierBytes) || !safeOnlineText(input.SegmentID, maxOnlineIdentifierBytes) || !safeOnlineText(input.VersionID, maxOnlineIdentifierBytes) || !safeOptionalOnlineText(input.VariantID, maxOnlineIdentifierBytes) || input.Priority < -100 || input.Priority > 100 {
 		return DownloadTaskSummary{}, appError(CodeInvalidRequest, "插件下载请求无效", nil)

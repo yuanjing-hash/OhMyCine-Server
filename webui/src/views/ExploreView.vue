@@ -9,7 +9,7 @@ import { formatBytes } from '@/downloads'
 import { useAuthStore } from '@/stores/auth'
 import { notify } from '@/toast'
 import { buildDiscoveryMediaSearchPath, discoveryDetailRoute, mediaIdentitySearchURL, type DiscoveryMediaSearch, type DiscoveryMediaSearchFilter, type DiscoveryMediaType, type DiscoverySearchName, type DiscoveryWork } from '@/discovery'
-import { discoveryDownloadsPath, discoverySearchOptionsPath, filterAndSortTorrentResults, ptRecognitionEpisodeLabel, ptRecognitionErrorLabel, ptRecognitionSpecLabels, readTorrentSearchSession, readTorrentSearchSiteSelection, saveTorrentSearchSession, saveTorrentSearchSiteSelection, sitesPath, torrentRecognitionCandidatesPath, torrentRecognitionOverridePath, torrentRecognitionPath, torrentSearchPath, torrentSearchStreamPath, torrentSearchURL, upsertTorrentGroup, type PTRecognitionCandidate, type SearchSiteOption, type SiteSummary, type TorrentRecognitionResult, type TorrentResultDirection, type TorrentSearchGroup, type TorrentSearchResponse, type TorrentSearchResult, type TorrentSearchSession } from '@/sites'
+import { discoveryDownloadsPath, discoverySearchOptionsPath, filterAndSortTorrentResults, ptRecognitionEpisodeLabel, ptRecognitionErrorLabel, ptRecognitionSpecLabels, readTorrentSearchSession, readTorrentSearchSiteSelection, saveTorrentSearchSession, saveTorrentSearchSiteSelection, sitesPath, torrentRecognitionCandidatesPath, torrentRecognitionOverridePath, torrentRecognitionPath, torrentSearchPath, torrentSearchStreamPath, torrentSearchURL, upsertTorrentGroup, type PTRecognitionCandidate, type SearchSiteOption, type SiteSummary, type TorrentRecognitionResult, type TorrentResultDirection, type TorrentSearchGroup, type TorrentSearchProgress, type TorrentSearchResponse, type TorrentSearchResult, type TorrentSearchSession } from '@/sites'
 import type { DownloaderSummary, ListResponse, MediaLibraryDetail } from '@/types/api'
 
 const route = useRoute()
@@ -40,6 +40,7 @@ const groups = ref<TorrentSearchGroup[]>([])
 const searching = ref(false)
 const searchError = ref('')
 const searched = ref(false)
+const searchProgress = ref<TorrentSearchProgress | null>(null)
 const siteSelectorOpen = ref(false)
 const siteOptionsLoading = ref(false)
 const siteOptionsError = ref('')
@@ -81,6 +82,12 @@ const resultSort = ref<'seeders' | 'published' | 'size'>('seeders')
 const resultDirection = ref<TorrentResultDirection>('desc')
 
 const orderedGroups = computed(() => [...groups.value].sort((left, right) => left.site_id - right.site_id))
+const failedGroups = computed(() => orderedGroups.value.filter(group => group.status === 'error'))
+const searchProgressPercent = computed(() => {
+  const progress = searchProgress.value
+  if (!progress?.total) return 0
+  return Math.min(100, Math.round(progress.completed / progress.total * 100))
+})
 const activeGroup = computed(() => typeof activeChannel.value === 'number' ? groups.value.find(group => group.site_id === activeChannel.value) ?? null : null)
 const resolutionOptions = computed(() => [...new Set(groups.value.flatMap(group => group.items.map(item => item.specifications?.resolution || item.quality || '').filter(Boolean)))].sort())
 const visibleResults = computed(() => filterAndSortTorrentResults(groups.value, {
@@ -206,6 +213,15 @@ function executeSearch(siteIDs: number[]) {
   identityNames.value = []
   searchError.value = ''
   searched.value = false
+  searchProgress.value = {
+    total: siteIDs.length,
+    pending: siteIDs.length,
+    running: 0,
+    completed: 0,
+    succeeded: 0,
+    failed: 0,
+    result_count: 0,
+  }
   searching.value = true
   if (lockedSiteID.value) {
     activeChannel.value = lockedSiteID.value
@@ -231,7 +247,13 @@ function executeSearch(siteIDs: number[]) {
     try { identityNames.value = (JSON.parse((event as MessageEvent<string>).data) as { query_names?: DiscoverySearchName[] }).query_names ?? [] }
     catch { /* safe metadata is optional */ }
   })
-  eventSource.addEventListener('done', () => {
+  eventSource.addEventListener('progress', event => {
+    try { searchProgress.value = JSON.parse((event as MessageEvent<string>).data) as TorrentSearchProgress }
+    catch { /* malformed progress must not discard valid site results */ }
+  })
+  eventSource.addEventListener('done', event => {
+    try { searchProgress.value = JSON.parse((event as MessageEvent<string>).data) as TorrentSearchProgress }
+    catch { /* the last valid progress snapshot remains visible */ }
     stopStream()
     searching.value = false
     searched.value = true
@@ -252,6 +274,18 @@ async function retrySite(group: TorrentSearchGroup) {
   searching.value = true
   searchError.value = ''
   await searchJSON(group.site_id, 1)
+  const failed = groups.value.filter(item => item.status === 'error').length
+  if (searchProgress.value) {
+    searchProgress.value = {
+      ...searchProgress.value,
+      failed,
+      succeeded: Math.max(0, searchProgress.value.completed - failed),
+      result_count: groups.value.reduce((total, item) => total + item.items.length, 0),
+      site_id: group.site_id,
+      site_name: group.site_name,
+      site_status: groups.value.find(item => item.site_id === group.site_id)?.status,
+    }
+  }
 }
 
 async function nextPage(group: TorrentSearchGroup) {
@@ -466,6 +500,17 @@ onBeforeUnmount(() => {
       </form>
       <div v-if="selectedTitle" class="panel"><span class="status-chip">已确认作品身份</span><h2 class="mt-3 text-xl font-750">{{ selectedTitle }}</h2><p class="mt-1 text-sm text-muted">Server 会重新验证 TMDB 身份，并按受限的中文名、地区别名、原名和英文名聚合搜索。</p><div v-if="identityNames.length" class="mt-3 flex flex-wrap gap-2"><span v-for="name in identityNames" :key="`${name.kind}:${name.locale}:${name.value}`" class="status-chip">{{ name.value }}<template v-if="name.locale"> · {{ name.locale }}</template></span></div></div>
       <div v-if="searchError" class="semantic-error p-4"><strong>搜索失败</strong><p class="mt-1 text-sm">{{ searchError }}</p><button class="btn-secondary mt-3" @click="search">{{ lockedSiteID ? '重试此站' : '重新选择站点' }}</button></div>
+      <section v-if="searchProgress" class="panel" aria-live="polite">
+        <div class="flex flex-wrap items-center justify-between gap-3">
+          <div><strong>站点搜索进度 {{ searchProgress.completed }} / {{ searchProgress.total }}</strong><p class="text-subtle mb-0 mt-1 text-xs">等待 {{ searchProgress.pending }} · 正在搜索 {{ searchProgress.running }} · 成功 {{ searchProgress.succeeded }} · 失败 {{ searchProgress.failed }} · 已发现 {{ searchProgress.result_count }}</p></div>
+          <button v-if="searching" class="btn-secondary" type="button" @click="stopStream(); searching = false">取消搜索</button>
+        </div>
+        <div class="mt-3 h-2 overflow-hidden rounded-full bg-[var(--surface-subtle)]" role="progressbar" :aria-valuemin="0" :aria-valuemax="searchProgress.total" :aria-valuenow="searchProgress.completed">
+          <div class="h-full rounded-full bg-[var(--accent)] transition-[width] duration-200" :style="{ width: `${searchProgressPercent}%` }"></div>
+        </div>
+        <p v-if="searchProgress.site_name" class="text-subtle mb-0 mt-2 text-xs">{{ searchProgress.site_name }}：{{ searchProgress.site_status === 'running' ? '搜索中' : searchProgress.site_status === 'success' ? '完成' : searchProgress.site_status === 'error' ? '失败' : searchProgress.site_status }}</p>
+        <div v-if="failedGroups.length" class="mt-3 flex flex-wrap items-center gap-2"><span class="text-sm font-650">失败站点：</span><button v-for="group in failedGroups" :key="group.site_id" class="btn-secondary" type="button" :disabled="searching" @click="retrySite(group)">{{ group.site_name }} · 重试</button></div>
+      </section>
       <div v-if="searching && !groups.length" class="panel py-10 text-center text-muted">正在按站点限速并行搜索，结果会渐进出现…</div>
       <div v-else-if="searched && !groups.length && !searchError" class="panel py-10 text-center text-muted">没有启用的 PT/BT 站点，或当前关键词暂无结果。可以先到“站点管理”添加站点。</div>
 

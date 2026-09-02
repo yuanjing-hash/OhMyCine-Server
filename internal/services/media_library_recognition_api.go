@@ -95,7 +95,7 @@ func (s *MediaLibraryService) Recognitions(actor Actor, libraryID uint, query Me
 }
 
 func (s *MediaLibraryService) RetryRecognition(ctx context.Context, actor Actor, libraryID uint, token string, request RequestContext) (MediaRecognitionSummary, error) {
-	if !actor.Can(authz.PermissionMediaLibrariesScan) {
+	if !actor.CanResource(authz.PermissionMediaLibrariesScan, models.AuthorizationResourceMediaLibrary, uintID(libraryID)) {
 		return MediaRecognitionSummary{}, appError(CodePermissionDenied, "无权重新识别媒体", nil)
 	}
 	record, library, profile, entries, err := s.recognitionContext(libraryID, token)
@@ -151,7 +151,7 @@ func (s *MediaLibraryService) RecognitionCandidates(ctx context.Context, actor A
 }
 
 func (s *MediaLibraryService) OverrideRecognition(ctx context.Context, actor Actor, libraryID uint, token string, input MediaRecognitionOverrideInput, request RequestContext) (MediaRecognitionSummary, error) {
-	if !actor.Can(authz.PermissionMediaLibrariesScan) {
+	if !actor.CanResource(authz.PermissionMediaLibrariesScan, models.AuthorizationResourceMediaLibrary, uintID(libraryID)) {
 		return MediaRecognitionSummary{}, appError(CodePermissionDenied, "无权人工匹配媒体", nil)
 	}
 	record, library, profile, _, err := s.recognitionContext(libraryID, token)
@@ -191,7 +191,7 @@ func (s *MediaLibraryService) OverrideRecognition(ctx context.Context, actor Act
 }
 
 func (s *MediaLibraryService) ClearRecognitionOverride(ctx context.Context, actor Actor, libraryID uint, token string, request RequestContext) (MediaRecognitionSummary, error) {
-	if !actor.Can(authz.PermissionMediaLibrariesScan) {
+	if !actor.CanResource(authz.PermissionMediaLibrariesScan, models.AuthorizationResourceMediaLibrary, uintID(libraryID)) {
 		return MediaRecognitionSummary{}, appError(CodePermissionDenied, "无权清除人工匹配", nil)
 	}
 	record, _, _, _, err := s.recognitionContext(libraryID, token)

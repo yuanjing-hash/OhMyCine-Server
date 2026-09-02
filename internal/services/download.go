@@ -354,6 +354,13 @@ func (s *DownloadService) Submit(ctx context.Context, actor Actor, input SubmitD
 	if !actor.Can(authz.PermissionDownloadsCreate) {
 		return DownloadTaskSummary{}, appError(CodePermissionDenied, "无权创建下载任务", nil)
 	}
+	downloaderID := strings.TrimSpace(input.DownloaderID)
+	if !actor.CanResource(authz.PermissionDownloadsCreate, models.AuthorizationResourceDownloader, downloaderID) {
+		return DownloadTaskSummary{}, appError(CodePermissionDenied, "无权使用这个下载器创建任务", nil)
+	}
+	if input.MediaLibraryID != nil && !actor.CanResource(authz.PermissionDownloadsCreate, models.AuthorizationResourceMediaLibrary, uintID(*input.MediaLibraryID)) {
+		return DownloadTaskSummary{}, appError(CodePermissionDenied, "无权向这个媒体库入库", nil)
+	}
 	return s.submit(ctx, actor.User.ID, input, request, models.DownloadSourceOriginUser, "", "")
 }
 

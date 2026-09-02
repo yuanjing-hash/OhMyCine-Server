@@ -100,6 +100,9 @@ func createAutoCleanupScenario(t *testing.T, service *STRMManagementService, lib
 	if err := service.db.Model(&models.MediaArtifact{}).Where("id = ?", artifact.ID).Update("active", false).Error; err != nil {
 		t.Fatal(err)
 	}
+	if err := service.db.Model(&models.MediaArtifact{}).Where("id = ?", artifact.ID).Update("active", false).Error; err != nil {
+		t.Fatal(err)
+	}
 	artifact.Active = false
 	return run, artifact, path
 }
@@ -117,6 +120,70 @@ func relocateCleanupArtifact(t *testing.T, service *STRMManagementService, artif
 		t.Fatal(err)
 	}
 	return target
+}
+
+func TestAutomaticCleanupRemovesStaleLocalAdjacentMetadataAndEmptyFolders(t *testing.T) {
+	service, _, _, baseLibrary, _ := strmManagementFixture(t)
+	root := t.TempDir()
+	rootCanonical, rootIdentity, err := canonicalProjectionRoot(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	storage := models.Storage{Name: "Local cleanup", NameNormalized: "local-cleanup", Type: models.StorageTypeLocal, RootPath: rootCanonical, RootDisplayPath: rootCanonical, RootPathNormalized: "local-cleanup:" + uuid.NewString(), Enabled: true, Capabilities: "{}", CreatedAt: now, UpdatedAt: now}
+	if err := service.db.Create(&storage).Error; err != nil {
+		t.Fatal(err)
+	}
+	library := models.MediaLibrary{Name: "Local metadata", NameNormalized: "local-metadata", StorageID: storage.ID, ProfileID: baseLibrary.ProfileID, ProfileRevision: baseLibrary.ProfileRevision, RelativeRoot: "/", Enabled: true, Recursive: true, VideoExtensionsJSON: `[".mkv"]`, IgnorePatternsJSON: `[]`, MetadataArtifactsEnabled: true, ArtifactGeneration: 3, ArtifactAppliedGeneration: 3, ArtifactStatus: models.MediaArtifactStatusCompleted, Status: models.MediaLibraryStatusListening, CreatedAt: now, UpdatedAt: now}
+	if err := service.db.Create(&library).Error; err != nil {
+		t.Fatal(err)
+	}
+	ownerPolicy, _ := json.Marshal(mediaArtifactPolicy{LibraryID: library.ID, Generation: 2, StorageID: storage.ID, StorageType: models.StorageTypeLocal, ProjectionRoot: rootCanonical, ProjectionRootIdentity: rootIdentity, TargetKind: models.MediaArtifactTargetLocalAdjacent, Metadata: true})
+	ownerRun := models.MediaArtifactRun{ID: uuid.NewString(), LibraryID: library.ID, Generation: 2, PolicyJSON: string(ownerPolicy), Status: models.MediaArtifactStatusCompleted, CleanupStatus: models.MediaArtifactCleanupCompleted, CreatedAt: now, UpdatedAt: now}
+	if err := service.db.Create(&ownerRun).Error; err != nil {
+		t.Fatal(err)
+	}
+	scan := models.MediaLibraryScanRun{LibraryID: library.ID, Kind: "reorganization", Status: "success", Generation: 3, StartedAt: now, FinishedAt: &now}
+	if err := service.db.Create(&scan).Error; err != nil {
+		t.Fatal(err)
+	}
+	// CleanupEligible is intentionally false to cover policies written before
+	// local-adjacent metadata cleanup was introduced.
+	currentPolicy, _ := json.Marshal(mediaArtifactPolicy{LibraryID: library.ID, Generation: 3, StorageID: storage.ID, StorageType: models.StorageTypeLocal, ProjectionRoot: rootCanonical, ProjectionRootIdentity: rootIdentity, TargetKind: models.MediaArtifactTargetLocalAdjacent, Metadata: true, ScanRunID: scan.ID, ScanKind: scan.Kind})
+	currentRun := models.MediaArtifactRun{ID: uuid.NewString(), LibraryID: library.ID, Generation: 3, PolicyJSON: string(currentPolicy), Status: models.MediaArtifactStatusCompleted, CleanupStatus: models.MediaArtifactCleanupPending, CreatedAt: now, UpdatedAt: now}
+	if err := service.db.Create(&currentRun).Error; err != nil {
+		t.Fatal(err)
+	}
+	staleRelative := "/动画电影/七武士 (1954)/七武士 (1954).nfo"
+	stalePath := filepath.Join(rootCanonical, filepath.FromSlash(strings.TrimPrefix(staleRelative, "/")))
+	if err := os.MkdirAll(filepath.Dir(stalePath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(stalePath, []byte("<movie />\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	artifact := models.MediaArtifact{OpaqueID: uuid.NewString(), RunID: ownerRun.ID, LibraryID: library.ID, Kind: models.MediaArtifactKindNFO, TargetKind: models.MediaArtifactTargetLocalAdjacent, RelativePath: staleRelative, ContentFingerprint: strings.Repeat("c", 64), Managed: true, Active: false, Status: models.MediaArtifactStatusCompleted, CreatedAt: now, UpdatedAt: now}
+	if err := service.db.Create(&artifact).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := service.db.Model(&models.MediaArtifact{}).Where("id = ?", artifact.ID).Update("active", false).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	result := service.AutoCleanup(context.Background(), currentRun.ID)
+	if result.ErrorCode != "" || result.Skipped || result.Removed != 1 {
+		t.Fatalf("cleanup=%+v", result)
+	}
+	if _, err := os.Stat(stalePath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stale NFO still exists: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(rootCanonical, "动画电影")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("empty category directory still exists: %v", err)
+	}
+	var count int64
+	if err := service.db.Model(&models.MediaArtifact{}).Where("id = ?", artifact.ID).Count(&count).Error; err != nil || count != 0 {
+		t.Fatalf("artifact count=%d err=%v", count, err)
+	}
 }
 
 func TestSTRMManagementReconcileUsesDurableQueue(t *testing.T) {

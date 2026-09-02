@@ -164,6 +164,8 @@ func main() {
 	follows := services.NewFollowService(db, audit, queue, mediaCoverage, authorization)
 	follows.SetDownloadService(downloads)
 	cookieCloud := services.NewCookieCloudService(db, audit, credentialStore, sites, logManager.Logger("site", "cookiecloud"))
+	unifiedSchedules := services.NewUnifiedScheduleService(db, queue, authorization, libraries, libraryStructure, strmManagement, follows, cookieCloud, logManager.Logger("scheduler", "unified"))
+	unifiedSchedules.SetRecycleCleanup(recycleCleanup)
 	downloads.SetMetadataSettings(metadataSettings)
 	downloads.SetAIRecognitionSettings(aiRecognitionSettings)
 	downloads.SetSeedingSettings(seedingSettings)
@@ -173,6 +175,7 @@ func main() {
 	transfers.SetDownloaderService(downloaders)
 	transfers.SetMediaChangeService(mediaChanges)
 	transfers.SetMediaLibraryStructureService(libraryStructure)
+	transfers.SetMediaLibraryReconciler(libraries)
 	reorganizations := services.NewMediaReorganizationService(db, audit, queue, metadataSettings, connections, logManager.Logger("media_reorganization", "worker"))
 	reorganizations.SetMediaLibraryService(libraries)
 	seeding := services.NewSeedingService(db, audit, queue, downloaders, logManager.Logger("seeding", "service"))
@@ -209,6 +212,8 @@ func main() {
 		logging.OperationServerUpdate.Event(log.Fatal()).Str("error_code", services.ErrorCode(err)).Msg(logging.OperationServerUpdate.Message("更新服务初始化失败"))
 	}
 	api := handlers.NewAPI(cfg, auth, admin, audit, storages, directories, profiles, log)
+	acquisition := services.NewAcquisitionService(db)
+	api.SetAcquisitionService(acquisition)
 	api.SetUpdateService(updateService)
 	api.SetConnectionService(connections)
 	api.SetCredentialRevealService(credentialReveal)
@@ -257,6 +262,9 @@ func main() {
 	if err := registry.Register(services.JobTypePan115RecycleCleanup, services.NewPan115RecycleCleanupWorker(recycleCleanup)); err != nil {
 		logging.OperationServerLifecycle.Event(log.Fatal()).Err(err).Str("error_code", "pan115_recycle_cleanup_worker_registration_failed").Msg(logging.OperationServerLifecycle.Message("115 回收站清理 Worker 注册失败"))
 	}
+	if err := registry.Register(services.JobTypeUnifiedSchedule, services.NewUnifiedScheduleWorker(unifiedSchedules)); err != nil {
+		logging.OperationServerLifecycle.Event(log.Fatal()).Err(err).Str("error_code", "unified_schedule_worker_registration_failed").Msg(logging.OperationServerLifecycle.Message("统一计划任务 Worker 注册失败"))
+	}
 	scheduler := services.NewScheduler(queue, registry, logManager.Logger("queue", "scheduler"))
 	api.SetQueueService(queue)
 	api.SetQueueEventHub(queueEvents)
@@ -278,22 +286,15 @@ func main() {
 	api.SetFollowService(follows)
 	api.SetSiteService(sites)
 	api.SetCookieCloudService(cookieCloud)
-	if err := cookieCloud.Start(context.Background()); err != nil {
-		logging.OperationServerLifecycle.Event(log.Fatal()).Err(err).Str("error_code", "cookiecloud_start_failed").Msg(logging.OperationServerLifecycle.Message("CookieCloud 同步服务启动失败"))
-	}
-	defer cookieCloud.Close()
-	if err := follows.Start(context.Background()); err != nil {
-		logging.OperationServerLifecycle.Event(log.Fatal()).Err(err).Str("error_code", "follow_scheduler_start_failed").Msg(logging.OperationServerLifecycle.Message("自动追更调度器启动失败"))
-	}
-	defer follows.Close()
+	api.SetUnifiedScheduleService(unifiedSchedules)
 	if err := scheduler.Start(context.Background()); err != nil {
 		logging.OperationServerLifecycle.Event(log.Fatal()).Err(err).Str("error_code", "scheduler_start_failed").Msg(logging.OperationServerLifecycle.Message("任务调度器启动失败"))
 	}
 	defer scheduler.Close()
-	if err := recycleCleanup.Start(context.Background()); err != nil {
-		logging.OperationServerLifecycle.Event(log.Fatal()).Err(err).Str("error_code", "pan115_recycle_cleanup_scheduler_start_failed").Msg(logging.OperationServerLifecycle.Message("115 回收站清理调度器启动失败"))
+	if err := unifiedSchedules.Start(context.Background()); err != nil {
+		logging.OperationServerLifecycle.Event(log.Fatal()).Err(err).Str("error_code", "unified_schedule_start_failed").Msg(logging.OperationServerLifecycle.Message("统一计划任务调度器启动失败"))
 	}
-	defer recycleCleanup.Close()
+	defer unifiedSchedules.Close()
 	if err := mediaServerRefresh.RecoverPending(); err != nil {
 		logging.OperationServerLifecycle.Event(log.Error()).Err(err).Str("error_code", "media_server_refresh_recovery_failed").Msg(logging.OperationServerLifecycle.Message("媒体服务器刷新恢复失败"))
 	}

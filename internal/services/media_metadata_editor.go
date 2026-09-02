@@ -289,7 +289,7 @@ func (s *MediaLibraryService) CatalogMetadata(ctx context.Context, actor Actor, 
 }
 
 func (s *MediaLibraryService) UpdateCatalogMetadata(ctx context.Context, actor Actor, libraryID uint, workToken string, input MediaMetadataUpdateInput, request RequestContext) (MediaMetadataDocument, error) {
-	if !actor.Can(authz.PermissionMediaLibrariesScan) {
+	if !actor.CanResource(authz.PermissionMediaLibrariesScan, models.AuthorizationResourceMediaLibrary, uintID(libraryID)) {
 		return MediaMetadataDocument{}, appError(CodePermissionDenied, "无权编辑媒体库元数据", nil)
 	}
 	records, err := s.catalogMetadataRecognitions(libraryID, workToken)

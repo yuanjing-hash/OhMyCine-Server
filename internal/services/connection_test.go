@@ -300,6 +300,14 @@ func TestConnectionUnrelatedUpdatePreservesRecycleCleanupDeadline(t *testing.T) 
 	if err := db.Model(&models.Connection{}).Where("id = ?", created.ID).Update("recycle_cleanup_next_run_at", deadline).Error; err != nil {
 		t.Fatal(err)
 	}
+	managedKey := managedScheduleKey("pan115_recycle_cleanup", "connection", uintID(created.ID))
+	if err := db.Model(&models.ScheduleDefinition{}).Where("managed_key = ?", managedKey).Updates(map[string]any{
+		"cron_expression": "15 4 * * 2",
+		"timezone":        "UTC",
+		"overlap_policy":  "queue",
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
 	name := "定时账号（改名）"
 	if _, err := service.Update(actor, created.ID, UpdateConnectionInput{Name: &name, Revision: created.Revision}, RequestContext{}); err != nil {
 		t.Fatal(err)
@@ -310,6 +318,13 @@ func TestConnectionUnrelatedUpdatePreservesRecycleCleanupDeadline(t *testing.T) 
 	}
 	if record.RecycleCleanupNextRunAt == nil || !record.RecycleCleanupNextRunAt.Equal(deadline) {
 		t.Fatalf("unrelated update moved cleanup deadline: got=%v want=%v", record.RecycleCleanupNextRunAt, deadline)
+	}
+	var schedule models.ScheduleDefinition
+	if err := db.First(&schedule, "managed_key = ?", managedKey).Error; err != nil {
+		t.Fatal(err)
+	}
+	if schedule.CronExpression != "15 4 * * 2" || schedule.Timezone != "UTC" || schedule.OverlapPolicy != "queue" {
+		t.Fatalf("unrelated connection update overwrote unified schedule: %+v", schedule)
 	}
 }
 

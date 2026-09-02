@@ -73,6 +73,12 @@ OhMyCine 是自托管家庭影院生态系统，安全设计的核心目标是�
 4. 302 代理是否允许匿名访问必须显式配置，默认不公开。
 5. 当前 Player 与 Server 不自动同步配置；未来同步功能启用时默认只同步必要结构字段，敏感字段需要用户逐次确认。
 
+### 3.1 用户授权与 Player 能力
+
+Server 的角色只提供权限模板；用户有效权限由角色允许、用户直接允许和用户直接拒绝共同计算，拒绝优先。媒体库、下载器和站点操作必须在 service 层使用稳定资源 ID 做精确 scope 校验，列表/defaults 也只能返回当前用户可用资源，不能依赖按钮隐藏或路由 middleware 作为唯一边界。
+
+Player device token 继承签发用户的当前授权。`/api/v1/player/bootstrap` 动态投影目录浏览、发现搜索、创建入库、订阅等 capability；Player 缓存的 capability 仅用于交互提示，Server 每次 mutation 仍重新授权。Acquisition、SSE 和错误 DTO 不返回站点凭据、claim 内部值、torrent URL、上游正文、本地绝对路径、provider 文件身份或临时播放地址。
+
 ## 4. 认证与会话
 
 ### 4.1 Server 登录

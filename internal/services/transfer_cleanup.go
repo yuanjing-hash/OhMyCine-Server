@@ -25,6 +25,13 @@ func (w *TransferWorker) finishCompletedTransfer(ctx context.Context, task model
 	if err := w.service.db.First(&download, "id = ?", task.DownloadTaskID).Error; err != nil {
 		return WorkerResult{ErrorCode: "transfer_download_missing", ErrorMessage: "原下载任务不存在"}
 	}
+	// A successful transfer is authoritative knowledge that the target library
+	// changed. Signal it before any follow/seeding/cleanup bookkeeping so a
+	// retryable post-transfer failure cannot delay catalog, STRM, or Player
+	// updates. Duplicate retries are coalesced by the library listener.
+	if w.service.libraryReconciler != nil {
+		w.service.libraryReconciler.RequestReconcile(task.LibraryID)
+	}
 	if err := w.service.db.Transaction(func(tx *gorm.DB) error {
 		if err := ensureDownloadPipelineActive(tx, task.DownloadTaskID); err != nil {
 			return err

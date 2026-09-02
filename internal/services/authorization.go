@@ -60,8 +60,26 @@ func (s *AuthorizationService) resolveWithDB(db *gorm.DB, userID uint) (Actor, e
 			permissions[code] = struct{}{}
 		}
 	}
+	var persistedRules []models.UserAuthorizationRule
+	if err := db.Where("user_id = ?", userID).Order("permission_code, resource_type, resource_id, effect").Find(&persistedRules).Error; err != nil {
+		return Actor{}, err
+	}
+	resourceRules := make([]AuthorizationRule, 0, len(persistedRules))
+	deniedPermissions := map[string]struct{}{}
+	for _, rule := range persistedRules {
+		if rule.ResourceType == "" {
+			if rule.Effect == models.AuthorizationEffectDeny {
+				delete(permissions, rule.PermissionCode)
+				deniedPermissions[rule.PermissionCode] = struct{}{}
+			} else {
+				permissions[rule.PermissionCode] = struct{}{}
+			}
+			continue
+		}
+		resourceRules = append(resourceRules, AuthorizationRule{PermissionCode: rule.PermissionCode, Effect: rule.Effect, ResourceType: rule.ResourceType, ResourceID: rule.ResourceID})
+	}
 	sort.Strings(roleCodes)
-	return Actor{User: user, RoleCodes: roleCodes, Permissions: permissions}, nil
+	return Actor{User: user, RoleCodes: roleCodes, Permissions: permissions, DeniedPermissions: deniedPermissions, ResourceRules: resourceRules}, nil
 }
 
 func subset(requested []string, allowed map[string]struct{}) bool {

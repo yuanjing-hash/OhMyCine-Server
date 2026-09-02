@@ -57,6 +57,29 @@ type RolePermission struct {
 	CreatedAt      time.Time `json:"created_at"`
 }
 
+const (
+	AuthorizationEffectAllow          = "allow"
+	AuthorizationEffectDeny           = "deny"
+	AuthorizationResourceMediaLibrary = "media_library"
+	AuthorizationResourceDownloader   = "downloader"
+	AuthorizationResourceSite         = "site"
+)
+
+// UserAuthorizationRule overlays role-derived permissions for one user. An
+// empty resource type/id is a global rule; scoped rules are evaluated by the
+// service that owns the resource. Deny always wins over allow.
+type UserAuthorizationRule struct {
+	ID             uint      `gorm:"primaryKey" json:"id"`
+	UserID         uint      `gorm:"not null;index;uniqueIndex:idx_user_authz_rule" json:"user_id"`
+	PermissionCode string    `gorm:"size:96;not null;uniqueIndex:idx_user_authz_rule" json:"permission_code"`
+	Effect         string    `gorm:"size:8;not null;uniqueIndex:idx_user_authz_rule" json:"effect"`
+	ResourceType   string    `gorm:"size:32;not null;default:'';uniqueIndex:idx_user_authz_rule" json:"resource_type"`
+	ResourceID     string    `gorm:"size:128;not null;default:'';uniqueIndex:idx_user_authz_rule" json:"resource_id"`
+	CreatedBy      uint      `gorm:"not null" json:"created_by"`
+	CreatedAt      time.Time `json:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at"`
+}
+
 type Session struct {
 	ID                string     `gorm:"primaryKey;size:64" json:"id"`
 	TokenHash         string     `gorm:"size:64;not null;uniqueIndex" json:"-"`
@@ -1356,6 +1379,65 @@ type FollowSubscriptionSeason struct {
 	TMDBID         int64  `gorm:"not null;uniqueIndex:idx_follow_owner_season,priority:2" json:"tmdb_id"`
 	SeasonNumber   int    `gorm:"primaryKey;uniqueIndex:idx_follow_owner_season,priority:3" json:"season_number"`
 	Special        bool   `gorm:"not null;default:false" json:"special"`
+}
+
+// MediaAcquisition is the durable, credential-free projection shown by both
+// Server Web UI and Player for one user and one TMDB work.
+type MediaAcquisition struct {
+	ID                   string     `gorm:"primaryKey;size:36" json:"id"`
+	OwnerID              uint       `gorm:"not null;uniqueIndex:idx_media_acquisition_identity;index" json:"owner_id"`
+	MediaType            string     `gorm:"size:8;not null;uniqueIndex:idx_media_acquisition_identity" json:"media_type"`
+	TMDBID               int64      `gorm:"not null;uniqueIndex:idx_media_acquisition_identity" json:"tmdb_id"`
+	Stage                string     `gorm:"size:24;not null;index" json:"stage"`
+	Status               string     `gorm:"size:24;not null;index" json:"status"`
+	DownloadTaskID       string     `gorm:"size:36;not null;default:'';index" json:"download_task_id,omitempty"`
+	FollowSubscriptionID string     `gorm:"size:36;not null;default:'';index" json:"follow_subscription_id,omitempty"`
+	TargetLibraryID      *uint      `gorm:"index" json:"target_library_id,omitempty"`
+	LastErrorCode        string     `gorm:"size:96;not null;default:''" json:"last_error_code"`
+	FrozenSnapshotJSON   string     `gorm:"type:text;not null;default:'{}'" json:"-"`
+	Revision             uint64     `gorm:"not null;default:1" json:"revision"`
+	CreatedAt            time.Time  `json:"created_at"`
+	UpdatedAt            time.Time  `json:"updated_at"`
+	CompletedAt          *time.Time `json:"completed_at,omitempty"`
+}
+
+type ScheduleDefinition struct {
+	ID                string     `gorm:"primaryKey;size:36" json:"id"`
+	ManagedKey        string     `gorm:"size:256;not null;default:''" json:"managed_key,omitempty"`
+	OwnerID           uint       `gorm:"not null;index" json:"owner_id"`
+	Name              string     `gorm:"size:128;not null" json:"name"`
+	ActionType        string     `gorm:"size:64;not null;index" json:"action_type"`
+	TargetType        string     `gorm:"size:32;not null" json:"target_type"`
+	TargetID          string     `gorm:"size:128;not null" json:"target_id"`
+	CronExpression    string     `gorm:"size:128;not null" json:"cron_expression"`
+	Timezone          string     `gorm:"size:64;not null" json:"timezone"`
+	Enabled           bool       `gorm:"not null;default:true;index" json:"enabled"`
+	MisfirePolicy     string     `gorm:"size:16;not null" json:"misfire_policy"`
+	OverlapPolicy     string     `gorm:"size:16;not null" json:"overlap_policy"`
+	MaxRetries        int        `gorm:"not null;default:0" json:"max_retries"`
+	RetryDelaySeconds int        `gorm:"not null;default:60" json:"retry_delay_seconds"`
+	MaxRuntimeSeconds int        `gorm:"not null;default:3600" json:"max_runtime_seconds"`
+	NextRunAt         *time.Time `gorm:"index" json:"next_run_at,omitempty"`
+	LastRunAt         *time.Time `json:"last_run_at,omitempty"`
+	LastStatus        string     `gorm:"size:24;not null;default:'idle'" json:"last_status"`
+	LastErrorCode     string     `gorm:"size:96;not null;default:''" json:"last_error_code"`
+	Revision          uint64     `gorm:"not null;default:1" json:"revision"`
+	CreatedAt         time.Time  `json:"created_at"`
+	UpdatedAt         time.Time  `json:"updated_at"`
+}
+
+type ScheduleRun struct {
+	ID          string     `gorm:"primaryKey;size:36" json:"id"`
+	ScheduleID  string     `gorm:"size:36;not null;index" json:"schedule_id"`
+	JobID       string     `gorm:"size:36;not null;default:'';index" json:"job_id,omitempty"`
+	ScheduledAt time.Time  `gorm:"not null;index" json:"scheduled_at"`
+	Status      string     `gorm:"size:24;not null;index" json:"status"`
+	Attempt     int        `gorm:"not null;default:1" json:"attempt"`
+	ErrorCode   string     `gorm:"size:96;not null;default:''" json:"error_code"`
+	StartedAt   *time.Time `json:"started_at,omitempty"`
+	FinishedAt  *time.Time `json:"finished_at,omitempty"`
+	CreatedAt   time.Time  `json:"created_at"`
+	UpdatedAt   time.Time  `json:"updated_at"`
 }
 
 type FollowRun struct {

@@ -84,7 +84,7 @@ func TestPan115MediaLibraryBackendUsesLibraryProviderRoot(t *testing.T) {
 func TestProviderMediaLibraryListenerStopsWhenWakeChannelCloses(t *testing.T) {
 	wake := make(chan struct{})
 	close(wake)
-	listener := &providerMediaLibraryListener{wake: wake, incremental: time.Hour, full: time.Hour}
+	listener := &providerMediaLibraryListener{wake: wake, incremental: time.Hour}
 	done := make(chan error, 1)
 	var reconciled atomic.Bool
 	go func() {

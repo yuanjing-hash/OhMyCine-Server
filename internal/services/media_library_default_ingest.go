@@ -2,6 +2,7 @@ package services
 
 import (
 	"context"
+	"errors"
 	"strconv"
 	"strings"
 	"time"
@@ -19,17 +20,24 @@ type DefaultIngestLibrarySummary struct {
 }
 
 func (s *MediaLibraryService) GetDefaultIngestLibrary(ctx context.Context, actor Actor, connectionID uint) (DefaultIngestLibrarySummary, error) {
-	if !actor.Can(authz.PermissionMediaLibrariesRead) {
+	if !actor.HasPermission(authz.PermissionMediaLibrariesRead) {
 		return DefaultIngestLibrarySummary{}, appError(CodePermissionDenied, "无权查看媒体库", nil)
 	}
-	return s.defaultIngestLibrary(ctx, connectionID)
+	result, err := s.defaultIngestLibrary(ctx, connectionID)
+	if err != nil {
+		return DefaultIngestLibrarySummary{}, err
+	}
+	if !actor.CanResource(authz.PermissionMediaLibrariesRead, models.AuthorizationResourceMediaLibrary, uintID(result.LibraryID)) {
+		return DefaultIngestLibrarySummary{}, appError(CodePermissionDenied, "无权查看这个媒体库", nil)
+	}
+	return result, nil
 }
 
 // SetDefaultIngestLibrary atomically replaces the one manual-life-event
 // destination for a 115 Connection. Existing DownloadTasks retain their
 // frozen target snapshots.
 func (s *MediaLibraryService) SetDefaultIngestLibrary(ctx context.Context, actor Actor, libraryID uint, request RequestContext) (DefaultIngestLibrarySummary, error) {
-	if !actor.Can(authz.PermissionMediaLibrariesUpdate) {
+	if !actor.CanResource(authz.PermissionMediaLibrariesUpdate, models.AuthorizationResourceMediaLibrary, uintID(libraryID)) {
 		return DefaultIngestLibrarySummary{}, appError(CodePermissionDenied, "无权编辑媒体库", nil)
 	}
 	library, storage, err := s.validateDefaultIngestCandidate(ctx, libraryID)
@@ -63,11 +71,19 @@ func (s *MediaLibraryService) SetDefaultIngestLibrary(ctx context.Context, actor
 // the Connection. Callers must disable those listeners or select a replacement
 // library first.
 func (s *MediaLibraryService) ClearDefaultIngestLibrary(ctx context.Context, actor Actor, connectionID uint, request RequestContext) error {
-	if !actor.Can(authz.PermissionMediaLibrariesUpdate) {
+	if !actor.HasPermission(authz.PermissionMediaLibrariesUpdate) {
 		return appError(CodePermissionDenied, "无权编辑媒体库", nil)
 	}
 	if connectionID == 0 {
 		return appError(CodeInvalidRequest, "115 连接无效", nil)
+	}
+	var current models.MediaLibrary
+	if err := s.db.Where("default_ingest_connection_id = ?", connectionID).First(&current).Error; err == nil {
+		if !actor.CanResource(authz.PermissionMediaLibrariesUpdate, models.AuthorizationResourceMediaLibrary, uintID(current.ID)) {
+			return appError(CodePermissionDenied, "无权修改这个媒体库的默认入库设置", nil)
+		}
+	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return err
 	}
 	if err := requireNoEnabledLifeEventListener(ctx, s.db, connectionID); err != nil {
 		return err

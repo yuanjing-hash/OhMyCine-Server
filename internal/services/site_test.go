@@ -461,6 +461,11 @@ func TestSiteResultRecognitionUsesServerClaimSharedRecognizerAndDoesNotConsumeDo
 	if _, err := service.resolveClaim(token, actor.User.ID); err != nil {
 		t.Fatalf("recognition consumed claim: %v", err)
 	}
+	denied := actor
+	denied.ResourceRules = []AuthorizationRule{{PermissionCode: authz.PermissionDiscoveryRead, Effect: models.AuthorizationEffectDeny, ResourceType: models.AuthorizationResourceSite, ResourceID: uintID(created.ID)}}
+	if _, err := service.RecognizeResult(context.Background(), denied, token); ErrorCode(err) != CodePermissionDenied {
+		t.Fatalf("resource-denied recognition error=%v", err)
+	}
 	claim, err := service.resolveClaim(token, actor.User.ID)
 	if err != nil || claim.ManualTMDBID == nil || *claim.ManualTMDBID != 346 || claim.ManualMediaType != "movie" || claim.RecognitionManual || claim.RecognitionSource != mediaIdentitySourceAutomatic || claim.RecognitionStatus != mediaIdentityStatusVerified || claim.RecognitionLocked {
 		t.Fatalf("automatic verified identity was not bound to claim: claim=%+v err=%v", claim, err)
@@ -561,18 +566,25 @@ func TestMediaIdentityResultMatchesMultilingualReleaseTitle(t *testing.T) {
 		{Value: "ウルトラマンティガ", Locale: "ja", Kind: "original"},
 	}
 	title := "[DBD-Raws][迪迦奥特曼/Ultraman Tiga/ウルトラマンティガ][01-52TV全集+剧场+OV+特典][1080P][BDRip][HEVC-10bit][FLAC][MKV]"
-	if !mediaIdentityResultMatches(title, names, nil, nil) {
+	if !mediaIdentityResultMatches(title, names, "tv", nil, nil) {
 		t.Fatalf("multilingual release title was filtered: %q", title)
 	}
-	if mediaIdentityResultMatches("[DBD-Raws][戴拿奥特曼][01-51][1080P]", names, nil, nil) {
+	if mediaIdentityResultMatches("[DBD-Raws][戴拿奥特曼][01-51][1080P]", names, "tv", nil, nil) {
 		t.Fatal("unrelated release title matched the verified identity")
 	}
 	seasonTwo := 2
-	if mediaIdentityResultMatches("Ultraman Tiga 1080p WEB-DL", names, nil, &seasonTwo) || mediaIdentityResultMatches("Ultraman Tiga S01 1080p WEB-DL", names, nil, &seasonTwo) {
+	if mediaIdentityResultMatches("Ultraman Tiga 1080p WEB-DL", names, "tv", nil, &seasonTwo) || mediaIdentityResultMatches("Ultraman Tiga S01 1080p WEB-DL", names, "tv", nil, &seasonTwo) {
 		t.Fatal("season-scoped identity search accepted a release without the exact season")
 	}
-	if !mediaIdentityResultMatches("Ultraman Tiga S02 1080p WEB-DL", names, nil, &seasonTwo) {
+	if !mediaIdentityResultMatches("Ultraman Tiga S02 1080p WEB-DL", names, "tv", nil, &seasonTwo) {
 		t.Fatal("season-scoped identity search rejected the exact season")
+	}
+	firstAirYear := 2005
+	if !mediaIdentityResultMatches("Ultraman Tiga 2026 S02 1080p WEB-DL", names, "tv", &firstAirYear, &seasonTwo) {
+		t.Fatal("TV identity search incorrectly treated first-air year as a release-year gate")
+	}
+	if mediaIdentityResultMatches("Ultraman Tiga 2026 1080p WEB-DL", names, "movie", &firstAirYear, nil) {
+		t.Fatal("movie identity search accepted a conflicting release year")
 	}
 }
 

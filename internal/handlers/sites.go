@@ -6,7 +6,6 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
-	"sync"
 
 	"github.com/gin-gonic/gin"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/middleware"
@@ -309,34 +308,40 @@ func (a *API) MediaIdentitySearchStream(c *gin.Context) {
 		return
 	}
 	started := false
-	err = a.sites.SearchMediaIdentityEach(c.Request.Context(), actor, input, func(result services.MediaIdentitySearchResult) {
+	lastProgress := services.SiteSearchProgress{}
+	writeEvent := func(event string, value any) {
+		if c.Request.Context().Err() != nil {
+			return
+		}
+		payload, marshalErr := json.Marshal(value)
+		if marshalErr != nil {
+			return
+		}
+		_, _ = fmt.Fprintf(c.Writer, "event: %s\ndata: %s\n\n", event, payload)
+		flusher.Flush()
+	}
+	err = a.sites.SearchMediaIdentityEachProgress(c.Request.Context(), actor, input, func(result services.MediaIdentitySearchResult) {
 		c.Header("Content-Type", "text/event-stream; charset=utf-8")
 		c.Header("Cache-Control", "no-store")
 		c.Header("X-Accel-Buffering", "no")
 		c.Status(http.StatusOK)
 		started = true
-		meta, _ := json.Marshal(gin.H{"media_type": result.MediaType, "tmdb_id": result.TMDBID, "title": result.Title, "year": result.Year, "query_names": result.QueryNames})
-		_, _ = fmt.Fprintf(c.Writer, "event: media\ndata: %s\n\n", meta)
-		flusher.Flush()
+		writeEvent("media", gin.H{"media_type": result.MediaType, "tmdb_id": result.TMDBID, "title": result.Title, "year": result.Year, "query_names": result.QueryNames})
 	}, func(group services.SiteSearchGroup) {
-		if c.Request.Context().Err() != nil {
-			return
-		}
-		payload, marshalErr := json.Marshal(group)
-		if marshalErr != nil {
-			return
-		}
-		_, _ = fmt.Fprintf(c.Writer, "event: site\ndata: %s\n\n", payload)
-		flusher.Flush()
+		writeEvent("site", group)
+	}, func(progress services.SiteSearchProgress) {
+		lastProgress = progress
+		writeEvent("progress", progress)
 	})
 	if err != nil {
 		if !started {
 			writeError(c, a.log, err)
+		} else if c.Request.Context().Err() == nil {
+			writeEvent("error", gin.H{"code": services.ErrorCode(err), "message": "种子资源搜索失败"})
 		}
 		return
 	}
-	_, _ = fmt.Fprint(c.Writer, "event: done\ndata: {}\n\n")
-	flusher.Flush()
+	writeEvent("done", lastProgress)
 }
 
 func (a *API) PTSearchStream(c *gin.Context) {
@@ -356,34 +361,32 @@ func (a *API) PTSearchStream(c *gin.Context) {
 	c.Header("X-Accel-Buffering", "no")
 	c.Status(http.StatusOK)
 	flusher.Flush()
-	var writeMu sync.Mutex
-	err = a.sites.SearchEach(c.Request.Context(), actor, input, func(group services.SiteSearchGroup) {
+	lastProgress := services.SiteSearchProgress{}
+	writeEvent := func(event string, value any) {
 		if c.Request.Context().Err() != nil {
 			return
 		}
-		payload, marshalErr := json.Marshal(group)
+		payload, marshalErr := json.Marshal(value)
 		if marshalErr != nil {
 			return
 		}
-		writeMu.Lock()
-		defer writeMu.Unlock()
-		if c.Request.Context().Err() != nil {
-			return
-		}
-		_, _ = fmt.Fprintf(c.Writer, "event: site\ndata: %s\n\n", payload)
+		_, _ = fmt.Fprintf(c.Writer, "event: %s\ndata: %s\n\n", event, payload)
 		flusher.Flush()
+	}
+	err = a.sites.SearchEachProgress(c.Request.Context(), actor, input, func(group services.SiteSearchGroup) {
+		writeEvent("site", group)
+	}, func(progress services.SiteSearchProgress) {
+		lastProgress = progress
+		writeEvent("progress", progress)
 	})
 	if c.Request.Context().Err() != nil {
 		return
 	}
 	if err != nil {
-		payload, _ := json.Marshal(gin.H{"code": services.ErrorCode(err), "message": "种子资源搜索失败"})
-		_, _ = fmt.Fprintf(c.Writer, "event: error\ndata: %s\n\n", payload)
-		flusher.Flush()
+		writeEvent("error", gin.H{"code": services.ErrorCode(err), "message": "种子资源搜索失败"})
 		return
 	}
-	_, _ = fmt.Fprint(c.Writer, "event: done\ndata: {}\n\n")
-	flusher.Flush()
+	writeEvent("done", lastProgress)
 }
 
 func (a *API) TorrentSearchStream(c *gin.Context) { a.PTSearchStream(c) }
@@ -406,6 +409,12 @@ func (a *API) CreateDiscoveryDownload(c *gin.Context) {
 	if err != nil {
 		writeError(c, a.log, err)
 		return
+	}
+	if a.acquisition != nil {
+		if err := a.acquisition.RecordDownload(actor.User.ID, item); err != nil {
+			writeError(c, a.log, err)
+			return
+		}
 	}
 	success(c, http.StatusCreated, item)
 }

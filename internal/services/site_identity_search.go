@@ -7,7 +7,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 	"unicode"
 
@@ -69,7 +68,11 @@ func (s *SiteService) SearchMediaIdentity(ctx context.Context, actor Actor, inpu
 // site group as soon as that site finishes all bounded aliases. Callbacks are
 // serialized, so HTTP writers never receive concurrent writes.
 func (s *SiteService) SearchMediaIdentityEach(ctx context.Context, actor Actor, input MediaIdentitySearchInput, emitMetadata func(MediaIdentitySearchResult), emit func(SiteSearchGroup)) error {
-	if !actor.Can(authz.PermissionDiscoveryRead) {
+	return s.SearchMediaIdentityEachProgress(ctx, actor, input, emitMetadata, emit, nil)
+}
+
+func (s *SiteService) SearchMediaIdentityEachProgress(ctx context.Context, actor Actor, input MediaIdentitySearchInput, emitMetadata func(MediaIdentitySearchResult), emit func(SiteSearchGroup), emitProgress func(SiteSearchProgress)) error {
+	if !actor.HasPermission(authz.PermissionDiscoveryRead) {
 		return appError(CodePermissionDenied, "无权搜索种子资源", nil)
 	}
 	input.MediaType = strings.ToLower(strings.TrimSpace(input.MediaType))
@@ -97,41 +100,16 @@ func (s *SiteService) SearchMediaIdentityEach(ctx context.Context, actor Actor, 
 		return appError(CodeTMDBUnavailable, "TMDB 作品没有可用搜索名称", nil)
 	}
 	metadata := MediaIdentitySearchResult{MediaType: input.MediaType, TMDBID: input.TMDBID, Title: verified.Title, Year: cloneInt(verified.ReleaseYear), QueryNames: names, Groups: []SiteSearchGroup{}}
-	records, err := s.searchSiteRecords(input.SiteID, input.SiteIDs)
+	records, err := s.searchSiteRecords(actor, input.SiteID, input.SiteIDs)
 	if err != nil {
 		return err
 	}
 	if emitMetadata != nil {
 		emitMetadata(metadata)
 	}
-	semaphore := make(chan struct{}, 4)
-	var wait sync.WaitGroup
-	var emitMu sync.Mutex
-	for _, record := range records {
-		record := record
-		wait.Add(1)
-		go func() {
-			defer wait.Done()
-			select {
-			case semaphore <- struct{}{}:
-				defer func() { <-semaphore }()
-			case <-ctx.Done():
-				return
-			}
-			group := s.searchMediaIdentitySite(ctx, actor, input, verified, names, record)
-			if ctx.Err() != nil || emit == nil {
-				return
-			}
-			emitMu.Lock()
-			emit(group)
-			emitMu.Unlock()
-		}()
-	}
-	wait.Wait()
-	if ctx.Err() != nil {
-		return appError(CodeSiteUnavailable, "种子资源搜索已取消", nil)
-	}
-	return nil
+	return s.runSiteSearches(ctx, records, func(siteCtx context.Context, record models.Site) SiteSearchGroup {
+		return s.searchMediaIdentitySite(siteCtx, actor, input, verified, names, record)
+	}, emit, emitProgress)
 }
 
 func (s *SiteService) searchMediaIdentitySite(ctx context.Context, actor Actor, input MediaIdentitySearchInput, verified tmdb.Match, names []tmdb.SearchName, record models.Site) SiteSearchGroup {
@@ -141,7 +119,7 @@ func (s *SiteService) searchMediaIdentitySite(ctx context.Context, actor Actor, 
 		if ctx.Err() != nil {
 			break
 		}
-		group := s.searchSite(ctx, actor, record, SiteSearchInput{Keyword: name.Value, MediaType: input.MediaType, SearchBy: "title", Year: verified.ReleaseYear, TMDBID: &input.TMDBID, Page: input.Page, SiteID: &record.ID})
+		group := s.searchSite(ctx, actor, record, SiteSearchInput{Keyword: name.Value, MediaType: input.MediaType, SearchBy: "title", Year: identitySearchYear(input.MediaType, verified.ReleaseYear), TMDBID: &input.TMDBID, Page: input.Page, SiteID: &record.ID})
 		if target == nil {
 			copy := group
 			copy.Items = []SiteSearchResult{}
@@ -164,7 +142,7 @@ func (s *SiteService) searchMediaIdentitySite(ctx context.Context, actor Actor, 
 			if claimErr != nil {
 				continue
 			}
-			if !mediaIdentityResultMatches(item.Title, names, verified.ReleaseYear, input.Season) {
+			if !mediaIdentityResultMatches(item.Title, names, input.MediaType, verified.ReleaseYear, input.Season) {
 				s.deleteClaim(item.Token)
 				target.Skipped++
 				continue
@@ -209,7 +187,14 @@ func privateResultFingerprint(siteID uint, torrentID string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func mediaIdentityResultMatches(title string, names []tmdb.SearchName, year, season *int) bool {
+func identitySearchYear(mediaType string, year *int) *int {
+	if !strings.EqualFold(strings.TrimSpace(mediaType), "movie") {
+		return nil
+	}
+	return cloneInt(year)
+}
+
+func mediaIdentityResultMatches(title string, names []tmdb.SearchName, mediaType string, year, season *int) bool {
 	parsed, err := mediarecognition.Parse(mediarecognition.InputFacts{PackageName: title, SourceKind: mediarecognition.SourceDownload})
 	if err != nil {
 		return false
@@ -226,7 +211,11 @@ func mediaIdentityResultMatches(title string, names []tmdb.SearchName, year, sea
 	if !matched {
 		return false
 	}
-	if year != nil && parsed.Year != nil && absInt(*year-*parsed.Year) > 1 {
+	// For TV, TMDB supplies the work's first-air year while release titles may
+	// contain a season year, episode year, encode year, or no year at all. It is
+	// useful metadata for display but cannot be a hard identity gate. Movie
+	// release years remain a bounded disambiguator.
+	if strings.EqualFold(strings.TrimSpace(mediaType), "movie") && year != nil && parsed.Year != nil && absInt(*year-*parsed.Year) > 1 {
 		return false
 	}
 	return season == nil || parsed.Season != nil && *season == *parsed.Season

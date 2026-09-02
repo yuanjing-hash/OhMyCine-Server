@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -77,7 +78,7 @@ func (a *API) PlayerBootstrap(c *gin.Context) {
 	actor, _ := middleware.ActorFrom(c)
 	device, _ := middleware.DeviceFrom(c)
 	mediaLibraryCount := 0
-	if actor.Can(authz.PermissionMediaLibrariesRead) {
+	if actor.HasPermission(authz.PermissionMediaLibrariesRead) {
 		libraries, err := a.libraries.PlayerLibraries(actor)
 		if err != nil {
 			writeError(c, a.log, err)
@@ -98,8 +99,29 @@ func (a *API) PlayerBootstrap(c *gin.Context) {
 		"server": gin.H{"name": "OhMyCine Server", "api_version": "v1"},
 		"user":   services.CurrentUserFromActor(actor), "device": playerDeviceDTO(device),
 		"media_library_count": mediaLibraryCount,
-		"capabilities":        []string{"media_catalog", "direct_stream", "playback_history_sync", "discovery_search", "download_control"}, "emby_instances": embyInstances,
+		"capabilities":        playerCapabilities(actor), "emby_instances": embyInstances,
 	})
+}
+
+func playerCapabilities(actor services.Actor) []string {
+	capabilities := []string{"server_connection", "playback_history_sync"}
+	if actor.HasPermission(authz.PermissionMediaLibrariesRead) {
+		capabilities = append(capabilities, "media_catalog", "direct_stream")
+	}
+	if actor.HasPermission(authz.PermissionDiscoveryRead) {
+		capabilities = append(capabilities, "discovery_search")
+	}
+	if actor.HasPermission(authz.PermissionDownloadsCreate) {
+		capabilities = append(capabilities, "acquisition_create", "download_control")
+	}
+	if actor.HasPermission(authz.PermissionFollowsCreate) {
+		capabilities = append(capabilities, "subscription_create")
+	}
+	if actor.HasPermission(authz.PermissionMediaLibrariesUpdate) || actor.HasPermission(authz.PermissionMediaLibrariesDelete) || actor.HasPermission(authz.PermissionMediaLibrariesScan) {
+		capabilities = append(capabilities, "media_library_manage")
+	}
+	sort.Strings(capabilities)
+	return capabilities
 }
 
 func (a *API) PlayerHistorySync(c *gin.Context) {

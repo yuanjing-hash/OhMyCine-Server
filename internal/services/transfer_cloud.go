@@ -40,12 +40,13 @@ type cloudDirectoryAttemptCache struct {
 	basePath string
 	resolver cloudpkg.DirectoryPathResolver
 	listings map[string][]cloudpkg.Item
+	proof    *providerBoundaryProof
 }
 
 type cloudDirectoryAttemptContextKey struct{}
 
 func withCloudDirectoryAttempt(ctx context.Context, driver cloudpkg.Driver, basePath string) context.Context {
-	cache := &cloudDirectoryAttemptCache{basePath: basePath, listings: map[string][]cloudpkg.Item{}}
+	cache := &cloudDirectoryAttemptCache{basePath: basePath, listings: map[string][]cloudpkg.Item{}, proof: newProviderBoundaryProof(driver)}
 	cache.resolver, _ = driver.(cloudpkg.DirectoryPathResolver)
 	return context.WithValue(ctx, cloudDirectoryAttemptContextKey{}, cache)
 }
@@ -396,6 +397,13 @@ func (w *TransferWorker) runCloudTransfer(ctx context.Context, runtime JobRuntim
 		return w.cloudFailure(task, cloudTransferError("transfer_state_persist_failed", true, err))
 	}
 
+	// Do not trust a checkpoint alone as proof of a cloud move. A provider may
+	// acknowledge a mutation while returning an unexpected directory identity;
+	// validate each completed item immediately before it becomes managed media.
+	if err := validateCloudTransferCompletion(ctx, driver, state, targets); err != nil {
+		return w.cloudFailure(task, err)
+	}
+
 	now := time.Now().UTC()
 	err = w.service.db.Transaction(func(tx *gorm.DB) error {
 		if err := ensureDownloadPipelineActive(tx, task.DownloadTaskID); err != nil {
@@ -600,7 +608,11 @@ func (w *TransferWorker) ensureCloudDirectory(ctx context.Context, mutations clo
 		providerPath, pathErr := joinProviderPath(cache.basePath, "/"+relative)
 		if pathErr == nil {
 			item, resolveErr := cache.resolver.ResolveDirectory(ctx, providerPath)
-			if resolveErr == nil && item.IsDir {
+			if resolveErr == nil && validCloudNestedDirectoryIdentity(state.Directories["."], relative, item) {
+				verified, boundaryErr := cache.proof.within(ctx, item.ID, state.Directories["."])
+				if boundaryErr != nil || !verified.IsDir {
+					return "", cloudTransferError("cloud_transfer_boundary_invalid", false, boundaryErr)
+				}
 				if saved := state.Directories[relative]; saved != "" && saved != item.ID {
 					return "", cloudTransferError("cloud_transfer_boundary_invalid", false, errors.New("cloud directory identity changed"))
 				}
@@ -621,7 +633,7 @@ func (w *TransferWorker) ensureCloudDirectory(ctx context.Context, mutations clo
 	}
 	if id := state.Directories[relative]; id != "" {
 		item, err := providerItemWithinRoot(ctx, mutations, id, state.Directories["."])
-		if err == nil && item.IsDir {
+		if err == nil && validCloudNestedDirectoryIdentity(state.Directories["."], relative, item) {
 			validated[relative] = struct{}{}
 			return id, nil
 		}
@@ -661,6 +673,13 @@ func (w *TransferWorker) ensureCloudDirectory(ctx context.Context, mutations clo
 			createdDirectory = true
 		}
 	}
+	if !validCloudNestedDirectoryIdentity(state.Directories["."], relative, directory) {
+		return "", cloudTransferError("cloud_transfer_boundary_invalid", false, errors.New("cloud directory did not resolve beneath the media-library root"))
+	}
+	verifiedDirectory, boundaryErr := providerItemWithinRoot(ctx, mutations, directory.ID, state.Directories["."])
+	if boundaryErr != nil || !verifiedDirectory.IsDir {
+		return "", cloudTransferError("cloud_transfer_boundary_invalid", false, boundaryErr)
+	}
 	if cache := cloudDirectoryAttemptFromContext(ctx); cache != nil {
 		parentItems := cache.listings[parentID]
 		if len(namedCloudItems(parentItems, directory.Name)) == 0 {
@@ -677,6 +696,78 @@ func (w *TransferWorker) ensureCloudDirectory(ctx context.Context, mutations clo
 		return "", cloudTransferError("transfer_state_persist_failed", true, err)
 	}
 	return directory.ID, nil
+}
+
+// validCloudNestedDirectory rejects provider-root sentinels and a media root
+// echoed as a nested path. The 115 path API has historically returned id=0
+// for a missing path; accepting it moves an entire planned title into the
+// user's drive root.
+func validCloudNestedDirectoryIdentity(rootID, relative string, item cloudpkg.Item) bool {
+	rootID = strings.TrimSpace(rootID)
+	itemID := strings.TrimSpace(item.ID)
+	if relative == "." || relative == "" {
+		return item.IsDir && itemID == rootID
+	}
+	if !item.IsDir || itemID == "" || itemID == rootID || (itemID == "0" && rootID != "0") {
+		return false
+	}
+	return true
+}
+
+// validateCloudTransferCompletion is the final fail-closed boundary check
+// before a cloud task is recorded as completed. It makes an old corrupt state
+// checkpoint harmless: files are left untouched and the task reports failure
+// rather than cataloging a file outside its configured media library.
+func validateCloudTransferCompletion(ctx context.Context, driver cloudpkg.Driver, state cloudTransferState, targets []transferTargetItem) error {
+	rootID := strings.TrimSpace(state.Directories["."])
+	if rootID == "" {
+		return cloudTransferError("cloud_transfer_boundary_invalid", false, errors.New("cloud media-library root is missing"))
+	}
+	proof := newProviderBoundaryProof(driver)
+	expectedByParent := make(map[string][]transferTargetItem)
+	for _, target := range targets {
+		item := state.Items[target.File.ProviderItemID]
+		if item.Status == "skipped" {
+			continue
+		}
+		relativeDirectory := pathpkg.Dir(target.Relative)
+		expectedParentID := strings.TrimSpace(state.Directories[relativeDirectory])
+		if expectedParentID == "" || (relativeDirectory != "." && (expectedParentID == rootID || (expectedParentID == "0" && rootID != "0"))) {
+			return cloudTransferError("cloud_transfer_boundary_invalid", false, errors.New("cloud target directory is invalid"))
+		}
+		if item.Status != "completed" || strings.TrimSpace(item.CurrentID) == "" {
+			return cloudTransferError("cloud_transfer_target_mismatch", false, errors.New("cloud target completion is incomplete"))
+		}
+		expectedByParent[expectedParentID] = append(expectedByParent[expectedParentID], target)
+	}
+	for parentID, expected := range expectedByParent {
+		parent, err := proof.within(ctx, parentID, rootID)
+		if err != nil || !parent.IsDir {
+			return cloudTransferError("cloud_transfer_boundary_invalid", false, err)
+		}
+		items, err := listCloudTargetDirectory(ctx, driver, parentID)
+		if err != nil {
+			return cloudTransferError("cloud_transfer_target_mismatch", true, err)
+		}
+		byID := make(map[string]cloudpkg.Item, len(items))
+		for _, current := range items {
+			if current.ID == "" || current.ParentID != parentID {
+				return cloudTransferError("cloud_transfer_target_mismatch", false, errors.New("cloud target directory listing is invalid"))
+			}
+			if _, duplicate := byID[current.ID]; duplicate {
+				return cloudTransferError("cloud_transfer_target_mismatch", false, errors.New("cloud target directory listing is ambiguous"))
+			}
+			byID[current.ID] = current
+		}
+		for _, target := range expected {
+			stateItem := state.Items[target.File.ProviderItemID]
+			current, exists := byID[stateItem.CurrentID]
+			if !exists || current.IsDir || current.Name != pathpkg.Base(target.Relative) || !cloudManifestMatches(current, target.File) {
+				return cloudTransferError("cloud_transfer_target_mismatch", false, errors.New("cloud target does not match the completed transfer plan"))
+			}
+		}
+	}
+	return nil
 }
 
 func listCloudDirectory(ctx context.Context, driver cloudpkg.Driver, parentID string) ([]cloudpkg.Item, error) {

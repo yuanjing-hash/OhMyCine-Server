@@ -21,6 +21,7 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/authz"
 	serverlog "github.com/yuanjing-hash/OhMyCine-Server/internal/logging"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/medialibrary"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
 	storagefs "github.com/yuanjing-hash/OhMyCine-Server/internal/storage"
 	"gorm.io/gorm"
@@ -106,7 +107,7 @@ func NewSTRMManagementService(db *gorm.DB, audit *AuditService, queue *QueueServ
 }
 
 func (s *STRMManagementService) Libraries(actor Actor) ([]STRMLibraryOverview, error) {
-	if !actor.Can(authz.PermissionSTRMRunsRead) {
+	if !actor.HasPermission(authz.PermissionSTRMRunsRead) {
 		return nil, appError(CodePermissionDenied, "无权查看 STRM 管理", nil)
 	}
 	var libraries []models.MediaLibrary
@@ -115,6 +116,9 @@ func (s *STRMManagementService) Libraries(actor Actor) ([]STRMLibraryOverview, e
 	}
 	result := make([]STRMLibraryOverview, 0, len(libraries))
 	for _, library := range libraries {
+		if !actor.CanResource(authz.PermissionSTRMRunsRead, models.AuthorizationResourceMediaLibrary, uintID(library.ID)) {
+			continue
+		}
 		item := STRMLibraryOverview{ID: library.ID, Name: library.Name, StorageID: library.StorageID, ArtifactGeneration: library.ArtifactGeneration, ArtifactAppliedGeneration: library.ArtifactAppliedGeneration, ArtifactStatus: library.ArtifactStatus, ArtifactError: library.ArtifactError, ArtifactUpdatedAt: library.ArtifactUpdatedAt, ArtifactCleanupRemoved: library.ArtifactCleanupRemoved, ArtifactCleanupError: library.ArtifactCleanupError, ArtifactCleanupAt: library.ArtifactCleanupAt}
 		var run models.MediaArtifactRun
 		if err := s.db.Where("library_id = ?", library.ID).Order("generation DESC, created_at DESC").First(&run).Error; err == nil {
@@ -140,14 +144,40 @@ func pageBounds(page, pageSize int) (int, int) {
 	return page, pageSize
 }
 
+func (s *STRMManagementService) authorizedLibraryIDs(actor Actor, permission string) ([]uint, error) {
+	var ids []uint
+	if err := s.db.Model(&models.MediaLibrary{}).Order("id").Pluck("id", &ids).Error; err != nil {
+		return nil, err
+	}
+	allowed := ids[:0]
+	for _, id := range ids {
+		if actor.CanResource(permission, models.AuthorizationResourceMediaLibrary, uintID(id)) {
+			allowed = append(allowed, id)
+		}
+	}
+	return allowed, nil
+}
+
 func (s *STRMManagementService) Runs(actor Actor, libraryID uint, page, pageSize int) (STRMRunPage, error) {
-	if !actor.Can(authz.PermissionSTRMRunsRead) {
+	if !actor.HasPermission(authz.PermissionSTRMRunsRead) {
 		return STRMRunPage{}, appError(CodePermissionDenied, "无权查看 STRM 历史", nil)
 	}
 	page, pageSize = pageBounds(page, pageSize)
 	query := s.db.Model(&models.MediaArtifactRun{})
 	if libraryID != 0 {
+		if !actor.CanResource(authz.PermissionSTRMRunsRead, models.AuthorizationResourceMediaLibrary, uintID(libraryID)) {
+			return STRMRunPage{}, appError(CodePermissionDenied, "无权查看这个媒体库的 STRM 历史", nil)
+		}
 		query = query.Where("library_id = ?", libraryID)
+	} else {
+		libraryIDs, err := s.authorizedLibraryIDs(actor, authz.PermissionSTRMRunsRead)
+		if err != nil {
+			return STRMRunPage{}, err
+		}
+		if len(libraryIDs) == 0 {
+			return STRMRunPage{List: []models.MediaArtifactRun{}, Page: page, PageSize: pageSize}, nil
+		}
+		query = query.Where("library_id IN ?", libraryIDs)
 	}
 	var total int64
 	if err := query.Count(&total).Error; err != nil {
@@ -161,13 +191,25 @@ func (s *STRMManagementService) Runs(actor Actor, libraryID uint, page, pageSize
 }
 
 func (s *STRMManagementService) Artifacts(actor Actor, libraryID uint, page, pageSize int) (STRMArtifactPage, error) {
-	if !actor.Can(authz.PermissionSTRMRunsRead) {
+	if !actor.HasPermission(authz.PermissionSTRMRunsRead) {
 		return STRMArtifactPage{}, appError(CodePermissionDenied, "无权查看 STRM 产物", nil)
 	}
 	page, pageSize = pageBounds(page, pageSize)
 	query := s.db.Model(&models.MediaArtifact{}).Where("managed = ?", true)
 	if libraryID != 0 {
+		if !actor.CanResource(authz.PermissionSTRMRunsRead, models.AuthorizationResourceMediaLibrary, uintID(libraryID)) {
+			return STRMArtifactPage{}, appError(CodePermissionDenied, "无权查看这个媒体库的 STRM 产物", nil)
+		}
 		query = query.Where("library_id = ?", libraryID)
+	} else {
+		libraryIDs, err := s.authorizedLibraryIDs(actor, authz.PermissionSTRMRunsRead)
+		if err != nil {
+			return STRMArtifactPage{}, err
+		}
+		if len(libraryIDs) == 0 {
+			return STRMArtifactPage{List: []models.MediaArtifact{}, Page: page, PageSize: pageSize}, nil
+		}
+		query = query.Where("library_id IN ?", libraryIDs)
 	}
 	var total int64
 	if err := query.Count(&total).Error; err != nil {
@@ -181,7 +223,7 @@ func (s *STRMManagementService) Artifacts(actor Actor, libraryID uint, page, pag
 }
 
 func (s *STRMManagementService) RequestReconcile(actor Actor, libraryID uint, mode string) (JobDTO, error) {
-	if !actor.Can(authz.PermissionSTRMRunsCreate) {
+	if !actor.CanResource(authz.PermissionSTRMRunsCreate, models.AuthorizationResourceMediaLibrary, uintID(libraryID)) {
 		return JobDTO{}, appError(CodePermissionDenied, "无权启动 STRM 刷新", nil)
 	}
 	mode = strings.ToLower(strings.TrimSpace(mode))
@@ -206,12 +248,15 @@ func (s *STRMManagementService) RequestReconcile(actor Actor, libraryID uint, mo
 }
 
 func (s *STRMManagementService) RetryRun(actor Actor, runID string) error {
-	if !actor.Can(authz.PermissionSTRMRunsCreate) {
+	if !actor.HasPermission(authz.PermissionSTRMRunsCreate) {
 		return appError(CodePermissionDenied, "无权重试 STRM 任务", nil)
 	}
 	var run models.MediaArtifactRun
 	if err := s.db.First(&run, "id = ?", runID).Error; err != nil {
 		return appError(CodeNotFound, "STRM 运行记录不存在", err)
+	}
+	if !actor.CanResource(authz.PermissionSTRMRunsCreate, models.AuthorizationResourceMediaLibrary, uintID(run.LibraryID)) {
+		return appError(CodePermissionDenied, "无权重试这个媒体库的 STRM 任务", nil)
 	}
 	if run.Status != models.MediaArtifactStatusFailed {
 		return appError(CodeConflict, "只有失败的 STRM 任务可以重试", nil)
@@ -344,17 +389,8 @@ func (s *STRMManagementService) buildCleanupPlan(libraryID uint, runID string, a
 	if err := s.db.First(&plan.Library, libraryID).Error; err != nil {
 		return plan, mediaLibraryNotFound(err)
 	}
-	if automatic && (!plan.Library.Enabled || !plan.Library.STRMEnabled) {
-		return plan, &artifactCleanupSkip{reason: "artifact_cleanup_policy_disabled"}
-	}
-	if !automatic && strings.TrimSpace(plan.Library.STRMLocalRoot) == "" {
-		return plan, appError(CodeConflict, "媒体库没有可清理的 STRM 投影目录", nil)
-	}
-	root, identity, err := canonicalProjectionRoot(plan.Library.STRMLocalRoot)
-	if err != nil {
-		return plan, cleanupFailure("artifact_cleanup_root_unavailable")
-	}
-	plan.Root, plan.RootIdentity, plan.Automatic = root, identity, automatic
+	targetKind := models.MediaArtifactTargetLocalProjection
+	rootPath := plan.Library.STRMLocalRoot
 	if automatic {
 		var run models.MediaArtifactRun
 		if err := s.db.First(&run, "id = ? AND library_id = ?", runID, libraryID).Error; err != nil {
@@ -366,14 +402,38 @@ func (s *STRMManagementService) buildCleanupPlan(libraryID uint, runID string, a
 		if run.Status != models.MediaArtifactStatusCompleted || run.Generation != plan.Policy.Generation || plan.Policy.LibraryID != libraryID {
 			return plan, &artifactCleanupSkip{reason: "artifact_cleanup_run_incomplete"}
 		}
-		if !plan.Policy.CleanupEligible || plan.Policy.ScanRunID == 0 || plan.Policy.ScanPartial || !automaticCleanupScanKind(plan.Policy.ScanKind) {
-			return plan, &artifactCleanupSkip{reason: "artifact_cleanup_scan_ineligible"}
-		}
-		if plan.Policy.TargetKind != models.MediaArtifactTargetLocalProjection || !plan.Policy.STRMEnabled {
+		targetKind = plan.Policy.TargetKind
+		rootPath = plan.Policy.ProjectionRoot
+		policyEnabled := plan.Library.Enabled && ((targetKind == models.MediaArtifactTargetLocalProjection && plan.Library.STRMEnabled && plan.Policy.STRMEnabled) || (targetKind == models.MediaArtifactTargetLocalAdjacent && plan.Library.MetadataArtifactsEnabled && plan.Policy.Metadata))
+		if !policyEnabled {
 			return plan, &artifactCleanupSkip{reason: "artifact_cleanup_policy_disabled"}
 		}
-		if plan.Policy.ProjectionRootIdentity == "" || plan.Policy.ProjectionRootIdentity != identity {
+		// Older local-adjacent policies predate automatic metadata cleanup and
+		// therefore persisted CleanupEligible=false. A successful complete scan
+		// remains sufficient because only inactive managed artifacts are eligible.
+		cleanupEligible := plan.Policy.CleanupEligible || targetKind == models.MediaArtifactTargetLocalAdjacent
+		if !cleanupEligible || plan.Policy.ScanRunID == 0 || plan.Policy.ScanPartial || !automaticCleanupScanKind(plan.Policy.ScanKind) {
+			return plan, &artifactCleanupSkip{reason: "artifact_cleanup_scan_ineligible"}
+		}
+		if targetKind != models.MediaArtifactTargetLocalProjection && targetKind != models.MediaArtifactTargetLocalAdjacent {
+			return plan, &artifactCleanupSkip{reason: "artifact_cleanup_policy_disabled"}
+		}
+		if plan.Library.StorageID != plan.Policy.StorageID {
 			return plan, cleanupFailure("artifact_cleanup_root_changed")
+		}
+		switch targetKind {
+		case models.MediaArtifactTargetLocalProjection:
+			rootPath = plan.Library.STRMLocalRoot
+		case models.MediaArtifactTargetLocalAdjacent:
+			var storage models.Storage
+			if err := s.db.First(&storage, plan.Library.StorageID).Error; err != nil || storage.Type != models.StorageTypeLocal {
+				return plan, cleanupFailure("artifact_cleanup_root_changed")
+			}
+			resolved, resolveErr := medialibrary.ResolveRoot(storage.RootPath, plan.Library.RelativeRoot)
+			if resolveErr != nil {
+				return plan, cleanupFailure("artifact_cleanup_root_changed")
+			}
+			rootPath = resolved
 		}
 		if plan.Library.ArtifactGeneration != run.Generation || plan.Library.ArtifactAppliedGeneration != run.Generation {
 			return plan, &artifactCleanupSkip{reason: "artifact_cleanup_generation_changed"}
@@ -383,11 +443,21 @@ func (s *STRMManagementService) buildCleanupPlan(libraryID uint, runID string, a
 			return plan, &artifactCleanupSkip{reason: "artifact_cleanup_scan_ineligible"}
 		}
 		plan.Run = &run
+	} else if strings.TrimSpace(rootPath) == "" {
+		return plan, appError(CodeConflict, "媒体库没有可清理的 STRM 投影目录", nil)
 	}
-	if err := s.db.Where("library_id = ? AND target_kind = ? AND managed = ? AND active = ?", libraryID, models.MediaArtifactTargetLocalProjection, true, false).Order("id").Find(&plan.Artifacts).Error; err != nil {
+	root, identity, err := canonicalProjectionRoot(rootPath)
+	if err != nil {
+		return plan, cleanupFailure("artifact_cleanup_root_unavailable")
+	}
+	if automatic && (plan.Policy.ProjectionRootIdentity == "" || plan.Policy.ProjectionRootIdentity != identity) {
+		return plan, cleanupFailure("artifact_cleanup_root_changed")
+	}
+	plan.Root, plan.RootIdentity, plan.Automatic = root, identity, automatic
+	if err := s.db.Where("library_id = ? AND target_kind = ? AND managed = ? AND active = ?", libraryID, targetKind, true, false).Order("id").Find(&plan.Artifacts).Error; err != nil {
 		return plan, err
 	}
-	targets, boundaryIdentity, err := s.resolveCleanupCandidateRoots(plan.Artifacts, root, identity, automatic)
+	targets, boundaryIdentity, err := s.resolveCleanupCandidateRoots(plan.Artifacts, root, identity, targetKind, automatic)
 	if err != nil {
 		return plan, err
 	}
@@ -397,7 +467,7 @@ func (s *STRMManagementService) buildCleanupPlan(libraryID uint, runID string, a
 	return plan, nil
 }
 
-func (s *STRMManagementService) resolveCleanupCandidateRoots(artifacts []models.MediaArtifact, currentRoot, currentRootIdentity string, automatic bool) (map[uint]artifactCleanupTarget, string, error) {
+func (s *STRMManagementService) resolveCleanupCandidateRoots(artifacts []models.MediaArtifact, currentRoot, currentRootIdentity, targetKind string, automatic bool) (map[uint]artifactCleanupTarget, string, error) {
 	policies := make(map[string]mediaArtifactPolicy)
 	targets := make(map[uint]artifactCleanupTarget, len(artifacts))
 	for _, artifact := range artifacts {
@@ -409,7 +479,7 @@ func (s *STRMManagementService) resolveCleanupCandidateRoots(artifacts []models.
 			}
 			policies[artifact.RunID] = policy
 		}
-		if policy.LibraryID != artifact.LibraryID || policy.TargetKind != models.MediaArtifactTargetLocalProjection {
+		if policy.LibraryID != artifact.LibraryID || policy.TargetKind != targetKind {
 			return nil, "", cleanupFailure("artifact_cleanup_ownership_invalid")
 		}
 		if !cleanupArtifactPathAllowed(artifact, policy) {
@@ -465,7 +535,7 @@ func cleanupArtifactPathAllowed(artifact models.MediaArtifact, policy mediaArtif
 }
 
 func (s *STRMManagementService) PreviewCleanup(actor Actor, libraryID uint) (STRMCleanupPreview, error) {
-	if !actor.Can(authz.PermissionSTRMCleanup) {
+	if !actor.CanResource(authz.PermissionSTRMCleanup, models.AuthorizationResourceMediaLibrary, uintID(libraryID)) {
 		return STRMCleanupPreview{}, appError(CodePermissionDenied, "无权清理 STRM 产物", nil)
 	}
 	plan, err := s.buildCleanupPlan(libraryID, "", false)
@@ -490,7 +560,7 @@ func (s *STRMManagementService) PreviewCleanup(actor Actor, libraryID uint) (STR
 }
 
 func (s *STRMManagementService) ExecuteCleanup(actor Actor, libraryID uint, token string, request RequestContext) (int, error) {
-	if !actor.Can(authz.PermissionSTRMCleanup) {
+	if !actor.CanResource(authz.PermissionSTRMCleanup, models.AuthorizationResourceMediaLibrary, uintID(libraryID)) {
 		return 0, appError(CodePermissionDenied, "无权清理 STRM 产物", nil)
 	}
 	claim, err := s.verifyCleanupClaim(token)
@@ -556,7 +626,7 @@ func (s *STRMManagementService) executeCleanupPlan(ctx context.Context, plan art
 			return removed, removedDirectories, cleanupFailure("artifact_cleanup_boundary_changed")
 		}
 		current, ok := cleanupArtifactByID(fresh.Artifacts, artifact.ID)
-		if !ok || current.RunID != artifact.RunID || current.RelativePath != artifact.RelativePath || current.ContentFingerprint != artifact.ContentFingerprint || !current.Managed || current.Active || current.TargetKind != models.MediaArtifactTargetLocalProjection {
+		if !ok || current.RunID != artifact.RunID || current.RelativePath != artifact.RelativePath || current.ContentFingerprint != artifact.ContentFingerprint || !current.Managed || current.Active || current.TargetKind != cleanupPlanTargetKind(plan) {
 			return removed, removedDirectories, cleanupFailure("artifact_cleanup_ownership_changed")
 		}
 		originalStatus := current.Status
@@ -636,7 +706,7 @@ func (s *STRMManagementService) claimCleanupArtifact(plan artifactCleanupPlan, a
 		if plan.Run != nil && (plan.Run.ID == "" || plan.Run.Generation != library.ArtifactAppliedGeneration) {
 			return cleanupFailure("artifact_cleanup_run_changed")
 		}
-		result := tx.Model(&models.MediaArtifact{}).Where("id = ? AND library_id = ? AND run_id = ? AND target_kind = ? AND kind = ? AND managed = ? AND active = ? AND relative_path = ? AND content_fingerprint = ? AND status = ?", artifact.ID, artifact.LibraryID, artifact.RunID, models.MediaArtifactTargetLocalProjection, artifact.Kind, true, false, artifact.RelativePath, artifact.ContentFingerprint, artifact.Status).Update("status", models.MediaArtifactStatusCleanup)
+		result := tx.Model(&models.MediaArtifact{}).Where("id = ? AND library_id = ? AND run_id = ? AND target_kind = ? AND kind = ? AND managed = ? AND active = ? AND relative_path = ? AND content_fingerprint = ? AND status = ?", artifact.ID, artifact.LibraryID, artifact.RunID, cleanupPlanTargetKind(plan), artifact.Kind, true, false, artifact.RelativePath, artifact.ContentFingerprint, artifact.Status).Update("status", models.MediaArtifactStatusCleanup)
 		if result.Error != nil {
 			return result.Error
 		}
@@ -660,7 +730,7 @@ func (s *STRMManagementService) deleteClaimedCleanupArtifact(plan artifactCleanu
 		if boundaryCount != 1 {
 			return cleanupFailure("artifact_cleanup_generation_changed")
 		}
-		result := tx.Where("id = ? AND library_id = ? AND run_id = ? AND target_kind = ? AND kind = ? AND managed = ? AND active = ? AND relative_path = ? AND content_fingerprint = ? AND status = ?", artifact.ID, artifact.LibraryID, artifact.RunID, models.MediaArtifactTargetLocalProjection, artifact.Kind, true, false, artifact.RelativePath, artifact.ContentFingerprint, models.MediaArtifactStatusCleanup).Delete(&models.MediaArtifact{})
+		result := tx.Where("id = ? AND library_id = ? AND run_id = ? AND target_kind = ? AND kind = ? AND managed = ? AND active = ? AND relative_path = ? AND content_fingerprint = ? AND status = ?", artifact.ID, artifact.LibraryID, artifact.RunID, cleanupPlanTargetKind(plan), artifact.Kind, true, false, artifact.RelativePath, artifact.ContentFingerprint, models.MediaArtifactStatusCleanup).Delete(&models.MediaArtifact{})
 		if result.Error != nil {
 			return cleanupFailure("artifact_cleanup_manifest_delete_failed")
 		}
@@ -678,6 +748,13 @@ func (s *STRMManagementService) deleteClaimedCleanupArtifact(plan artifactCleanu
 		}
 		return nil
 	})
+}
+
+func cleanupPlanTargetKind(plan artifactCleanupPlan) string {
+	if plan.Automatic && plan.Policy.TargetKind != "" {
+		return plan.Policy.TargetKind
+	}
+	return models.MediaArtifactTargetLocalProjection
 }
 
 func cleanupArtifactByID(artifacts []models.MediaArtifact, id uint) (models.MediaArtifact, bool) {

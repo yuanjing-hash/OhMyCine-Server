@@ -83,7 +83,7 @@ func NewMediaCoverageService(db *gorm.DB, metadata *MetadataSettingsService) *Me
 }
 
 func (s *MediaCoverageService) Coverage(ctx context.Context, actor Actor, mediaType string, tmdbID int64) (MediaCoverage, error) {
-	if !actor.Can(authz.PermissionDiscoveryRead) || !actor.Can(authz.PermissionMediaLibrariesRead) {
+	if !actor.HasPermission(authz.PermissionDiscoveryRead) || !actor.HasPermission(authz.PermissionMediaLibrariesRead) {
 		return MediaCoverage{}, appError(CodePermissionDenied, "无权查看媒体库覆盖率", nil)
 	}
 	mediaType = strings.ToLower(strings.TrimSpace(mediaType))
@@ -101,7 +101,7 @@ func (s *MediaCoverageService) Coverage(ctx context.Context, actor Actor, mediaT
 	if err != nil {
 		return MediaCoverage{}, appError(tmdb.ErrorCode(err), "TMDB 作品身份无法解析", nil)
 	}
-	libraries, reliable, scanState, err := s.coverageLibraries()
+	libraries, reliable, scanState, err := s.coverageLibraries(actor)
 	if err != nil {
 		return MediaCoverage{}, err
 	}
@@ -262,7 +262,7 @@ func normalizeMediaCoverageCollections(result *MediaCoverage) {
 	}
 }
 
-func (s *MediaCoverageService) coverageLibraries() ([]MediaCoverageLibrary, bool, string, error) {
+func (s *MediaCoverageService) coverageLibraries(actor Actor) ([]MediaCoverageLibrary, bool, string, error) {
 	var records []models.MediaLibrary
 	if err := s.db.Where("enabled = ?", true).Order("sort_order ASC,id ASC").Find(&records).Error; err != nil {
 		return nil, false, "unknown", err
@@ -272,6 +272,9 @@ func (s *MediaCoverageService) coverageLibraries() ([]MediaCoverageLibrary, bool
 	anyScanned := false
 	anyPartial := false
 	for _, record := range records {
+		if !actor.CanResource(authz.PermissionMediaLibrariesRead, models.AuthorizationResourceMediaLibrary, uintID(record.ID)) {
+			continue
+		}
 		state := "unscanned"
 		var run models.MediaLibraryScanRun
 		runErr := s.db.Where("library_id = ?", record.ID).Order("id DESC").First(&run).Error
@@ -286,6 +289,9 @@ func (s *MediaCoverageService) coverageLibraries() ([]MediaCoverageLibrary, bool
 			reliable = false
 		}
 		result = append(result, MediaCoverageLibrary{ID: record.ID, Name: record.Name, ScanState: state, LastSuccessfulAt: record.LastSuccessfulScanAt, ContentRevision: record.ContentRevision})
+	}
+	if len(result) == 0 {
+		reliable = false
 	}
 	aggregate := "unscanned"
 	if reliable {

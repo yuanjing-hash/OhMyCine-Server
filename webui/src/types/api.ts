@@ -29,8 +29,16 @@ export interface UserSummary {
   status: 'active' | 'disabled'
   is_owner: boolean
   roles: RoleSummary[]
+  authorization_rules: AuthorizationRule[]
   last_login_at: string | null
   created_at: string
+}
+
+export interface AuthorizationRule {
+  permission_code: PermissionCode
+  effect: 'allow' | 'deny'
+  resource_type: '' | 'media_library' | 'downloader' | 'site'
+  resource_id: string
 }
 
 export interface PermissionDefinition {
@@ -43,6 +51,14 @@ export interface PermissionDefinition {
 }
 
 export interface ListResponse<T> { list: T[]; total: number }
+
+export interface ScheduleAction { code: string; name: string; target_type: 'media_library' | 'follow' | 'connection' | 'system' }
+export interface ScheduleDefinition {
+  id: string; owner_id: number; name: string; action_type: string; target_type: string; target_id: string; cron_expression: string; timezone: string; enabled: boolean
+  misfire_policy: 'skip' | 'run_once'; overlap_policy: 'skip' | 'queue'; max_retries: number; retry_delay_seconds: number; max_runtime_seconds: number
+  next_run_at: string | null; last_run_at: string | null; last_status: string; last_error_code: string; revision: number; created_at: string; updated_at: string
+}
+export interface ScheduleRun { id: string; schedule_id: string; job_id?: string; scheduled_at: string; status: string; attempt: number; error_code: string; started_at?: string; finished_at?: string }
 
 export interface ConnectionSummary {
   id: number; name: string; provider: 'pan115' | 'emby' | string; endpoint: string; enabled: boolean; credential_configured: boolean; recycle_password_configured: boolean
@@ -225,7 +241,8 @@ export interface MediaCatalogDeletionPreview {
 }
 export interface MediaCatalogDeletionResult { deleted: boolean; removed_files: number; missing_files: number }
 export interface MediaLibraryStructureIssue { code: string; kind: 'video' | 'sidecar'; title?: string; current_path?: string; expected_path?: string; repairable: boolean }
-export interface MediaLibraryStructureDiagnostics { library_id: number; status: MediaLibraryDetail['structure_status']; issue_count: number; unrecognized: number; checked_at: string; issues: MediaLibraryStructureIssue[] }
+export interface MediaLibraryStructureDiagnostics { library_id: number; status: MediaLibraryDetail['structure_status']; issue_count: number; unrecognized: number; checked_at: string; issues: MediaLibraryStructureIssue[]; revision: string }
+export interface MediaLibraryStructurePreview { library_id: number; revision: string; issue_count: number; repairable_count: number; move_count: number; issues: MediaLibraryStructureIssue[]; confirmation_token: string; expires_at: string }
 export interface MediaLibraryStructureRepair { id: string; job_id?: string; library_id: number; scope: 'full' | 'work'; generation: number; phase: 'queued' | 'executing' | 'reconciling' | 'completed' | 'failed'; issue_count: number; total_items: number; processed_items: number; last_error_code: string; created_at: string; updated_at: string; finished_at?: string }
 export interface TMDBGenre { id: number; name: string }
 export interface TMDBCompany { tmdb_id: number; name: string }

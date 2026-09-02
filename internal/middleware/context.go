@@ -161,7 +161,7 @@ func CSRF(auth *services.AuthService) gin.HandlerFunc {
 func RequirePermission(code string) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		actor, ok := ActorFrom(c)
-		if !ok || !actor.Can(code) {
+		if !ok || !actor.HasPermission(code) {
 			abortJSON(c, http.StatusForbidden, services.CodePermissionDenied, "没有执行此操作的权限")
 			return
 		}
@@ -174,7 +174,7 @@ func RequireAnyPermission(codes ...string) gin.HandlerFunc {
 		actor, ok := ActorFrom(c)
 		if ok {
 			for _, code := range codes {
-				if actor.Can(code) {
+				if actor.HasPermission(code) {
 					c.Next()
 					return
 				}

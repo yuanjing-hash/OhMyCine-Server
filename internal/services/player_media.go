@@ -153,8 +153,15 @@ func PlayerStreamUnavailableError() error {
 }
 
 func (s *MediaLibraryService) PlayerLibraries(actor Actor) ([]PlayerMediaLibrary, error) {
-	if !actor.Can(authz.PermissionMediaLibrariesRead) {
+	if !actor.HasPermission(authz.PermissionMediaLibrariesRead) {
 		return nil, appError(CodePermissionDenied, "无权查看媒体库", nil)
+	}
+	libraryIDs, err := s.authorizedMediaLibraryIDs(actor, authz.PermissionMediaLibrariesRead, true)
+	if err != nil {
+		return nil, err
+	}
+	if len(libraryIDs) == 0 {
+		return []PlayerMediaLibrary{}, nil
 	}
 	type row struct {
 		ID                   uint
@@ -169,11 +176,11 @@ func (s *MediaLibraryService) PlayerLibraries(actor Actor) ([]PlayerMediaLibrary
 		WorkCount            int64
 	}
 	var rows []row
-	err := s.db.Table("media_libraries").
+	err = s.db.Table("media_libraries").
 		Select("media_libraries.id, media_libraries.name, storages.type AS storage_type, media_libraries.sort_order, media_libraries.status, media_libraries.strm_enabled, media_libraries.signed_proxy_enabled, media_libraries.last_successful_scan_at, COUNT(media_library_entries.id) AS entry_count, COUNT(DISTINCT CASE WHEN media_library_entries.work_key <> '' THEN media_library_entries.work_key END) AS work_count").
 		Joins("JOIN storages ON storages.id = media_libraries.storage_id").
 		Joins("LEFT JOIN media_library_entries ON media_library_entries.library_id = media_libraries.id").
-		Where("media_libraries.enabled = ? AND storages.enabled = ?", true, true).
+		Where("media_libraries.enabled = ? AND storages.enabled = ? AND media_libraries.id IN ?", true, true, libraryIDs).
 		Group("media_libraries.id").Order("media_libraries.sort_order, media_libraries.id").Scan(&rows).Error
 	if err != nil {
 		return nil, err
@@ -446,7 +453,7 @@ func (s *MediaLibraryService) PlayerSearch(actor Actor, query MediaPageQuery) (P
 }
 
 func (s *MediaLibraryService) ensurePlayerMediaLibraryReadable(actor Actor, libraryID uint) error {
-	if !actor.Can(authz.PermissionMediaLibrariesRead) {
+	if !actor.CanResource(authz.PermissionMediaLibrariesRead, models.AuthorizationResourceMediaLibrary, uintID(libraryID)) {
 		return appError(CodePermissionDenied, "无权查看媒体库", nil)
 	}
 	var count int64
@@ -625,12 +632,15 @@ func EmbyInstanceFingerprint(systemID string) string {
 }
 
 func (s *SignedProxyService) ResolvePlayerEntry(ctx context.Context, actor Actor, entryID uint, userAgent, remoteAddr string) (PlayerStreamResolution, error) {
-	if !actor.Can(authz.PermissionMediaLibrariesRead) {
+	if !actor.HasPermission(authz.PermissionMediaLibrariesRead) {
 		return PlayerStreamResolution{}, appError(CodePermissionDenied, "无权播放该媒体", nil)
 	}
 	var entry models.MediaLibraryEntry
 	if err := s.db.First(&entry, entryID).Error; err != nil {
 		return PlayerStreamResolution{}, appError(CodeNotFound, "媒体文件不存在", err)
+	}
+	if !actor.CanResource(authz.PermissionMediaLibrariesRead, models.AuthorizationResourceMediaLibrary, uintID(entry.LibraryID)) {
+		return PlayerStreamResolution{}, appError(CodePermissionDenied, "无权播放该媒体", nil)
 	}
 	var library models.MediaLibrary
 	if err := s.db.First(&library, entry.LibraryID).Error; err != nil || !library.Enabled {

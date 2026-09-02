@@ -414,6 +414,34 @@ func testLibraryInput(name string, storage models.Storage, profile models.MediaC
 	return MediaLibraryInput{Name: name, StorageID: storage.ID, ProfileID: profile.ID, RelativeRoot: "/", Enabled: enabled, Recursive: true}
 }
 
+func TestMediaLibraryUnrelatedUpdatePreservesUnifiedSchedule(t *testing.T) {
+	service, db, actor, storage, profile := mediaLibraryTestService(t)
+	input := testLibraryInput("Schedule library", storage, profile, false)
+	created, err := service.Create(context.Background(), actor, input, RequestContext{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	managedKey := managedScheduleKey("media_library_scan", "media_library", uintID(created.ID))
+	if err := db.Model(&models.ScheduleDefinition{}).Where("managed_key = ?", managedKey).Updates(map[string]any{
+		"cron_expression": "15 4 * * 2",
+		"timezone":        "UTC",
+		"overlap_policy":  "queue",
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	input.Name = "Schedule library renamed"
+	if _, err := service.Update(context.Background(), actor, created.ID, input, RequestContext{}); err != nil {
+		t.Fatal(err)
+	}
+	var schedule models.ScheduleDefinition
+	if err := db.First(&schedule, "managed_key = ?", managedKey).Error; err != nil {
+		t.Fatal(err)
+	}
+	if schedule.CronExpression != "15 4 * * 2" || schedule.Timezone != "UTC" || schedule.OverlapPolicy != "queue" {
+		t.Fatalf("unrelated media library update overwrote unified schedule: %+v", schedule)
+	}
+}
+
 func waitForLibrary(t *testing.T, db *gorm.DB, id uint, condition func(models.MediaLibrary) bool) models.MediaLibrary {
 	t.Helper()
 	deadline := time.Now().Add(8 * time.Second)
