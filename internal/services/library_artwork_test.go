@@ -5,12 +5,15 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"image"
 	"image/color"
 	"image/jpeg"
 	"image/png"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -56,23 +59,87 @@ func TestLibraryArtworkGeneratorComposesAndCachesStableCover(t *testing.T) {
 	if err != nil || !bytes.Equal(opened.Bytes, first.Bytes) {
 		t.Fatalf("cached artwork unavailable: err=%v", err)
 	}
-	now := time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC)
-	service.now = func() time.Time { return now }
-	signed, err := url.Parse(service.signedArtworkURL(first.Digest))
-	if err != nil || !strings.HasPrefix(signed.Path, "/api/v1/assets/generated-library-covers/") {
-		t.Fatalf("signed artwork URL invalid: url=%q err=%v", signed, err)
+	parsed, err := url.Parse(service.artworkURL(first.Digest))
+	if err != nil || parsed.RawQuery != "" || !strings.HasPrefix(parsed.Path, "/api/v1/assets/generated-library-covers/") {
+		t.Fatalf("content-addressed artwork URL invalid: url=%q err=%v", parsed, err)
 	}
-	signedAsset, err := service.OpenSigned(first.Digest, signed.Query().Get("exp"), signed.Query().Get("sig"))
-	if err != nil || !bytes.Equal(signedAsset.Bytes, first.Bytes) {
-		t.Fatalf("signed artwork unavailable: err=%v", err)
+}
+
+func TestMediaCategoryArtworkPersistsAcrossRestartAndRetainsActiveVersionOnFailure(t *testing.T) {
+	mediaLibraries, db, actor, storage, profile := mediaLibraryTestService(t)
+	library, err := mediaLibraries.Create(context.Background(), actor, testLibraryInput("Artwork library", storage, profile, false), RequestContext{})
+	if err != nil {
+		t.Fatal(err)
 	}
-	if _, err := service.OpenSigned(first.Digest, signed.Query().Get("exp"), "invalid-signature"); err == nil {
-		t.Fatal("invalid artwork signature accepted")
+	root := t.TempDir()
+	loads := 0
+	candidates := func(uint, string, string) ([]artworkCandidate, error) {
+		return []artworkCandidate{{key: "tmdb:/stable-poster.jpg", load: func(ctx context.Context) ([]byte, error) {
+			loads++
+			return solidArtworkLoader(color.RGBA{R: 30, G: 100, B: 210, A: 255})(ctx)
+		}}}, nil
 	}
-	expiresAt, _ := strconv.ParseInt(signed.Query().Get("exp"), 10, 64)
-	service.now = func() time.Time { return time.Unix(expiresAt+1, 0) }
-	if _, err := service.OpenSigned(first.Digest, signed.Query().Get("exp"), signed.Query().Get("sig")); err == nil {
-		t.Fatal("expired artwork signature accepted")
+	service := NewLibraryArtworkService(db, nil, nil, nil, zerolog.Nop(), WithLibraryArtworkRoot(root))
+	service.categoryCandidates = candidates
+	categoryKey := mediaCategoryArtworkKey("movie", "电影")
+	if err := service.reconcileCategory(context.Background(), library.ID, categoryKey, "电影", "movie"); err != nil {
+		t.Fatal(err)
+	}
+	var first models.MediaCategoryArtwork
+	if err := db.Where("library_id = ? AND category_key = ?", library.ID, categoryKey).First(&first).Error; err != nil {
+		t.Fatal(err)
+	}
+	if first.Revision != 1 || first.Status != "ready" || first.ContentHash == "" || first.RelativePath == "" || loads != 1 {
+		t.Fatalf("initial artwork=%+v loads=%d", first, loads)
+	}
+	firstInfo, err := os.Stat(filepath.Join(root, first.RelativePath))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	restarted := NewLibraryArtworkService(db, nil, nil, nil, zerolog.Nop(), WithLibraryArtworkRoot(root))
+	restarted.categoryCandidates = candidates
+	if err := restarted.reconcileCategory(context.Background(), library.ID, categoryKey, "电影", "movie"); err != nil {
+		t.Fatal(err)
+	}
+	var unchanged models.MediaCategoryArtwork
+	if err := db.First(&unchanged, first.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	secondInfo, err := os.Stat(filepath.Join(root, unchanged.RelativePath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loads != 1 || unchanged.Revision != first.Revision || unchanged.ContentHash != first.ContentHash || !secondInfo.ModTime().Equal(firstInfo.ModTime()) {
+		t.Fatalf("unchanged generation rewrote artwork: loads=%d first=%+v unchanged=%+v mtimes=%s/%s", loads, first, unchanged, firstInfo.ModTime(), secondInfo.ModTime())
+	}
+	opened, err := restarted.Open(first.ContentHash)
+	if err != nil || opened.Digest != first.ContentHash || len(opened.Bytes) == 0 {
+		t.Fatalf("restart open failed: asset=%+v err=%v", opened, err)
+	}
+	decorated := restarted.DecorateMediaCategories(context.Background(), library.ID, []PlayerMediaCategory{{ID: categoryKey, Name: "电影", MediaType: "movie", ArtworkURL: "/fallback.png"}})
+	if len(decorated) != 1 || decorated[0].ArtworkSource != "generated" || decorated[0].ArtworkURL != restarted.artworkURL(first.ContentHash) {
+		t.Fatalf("decorated category=%+v", decorated)
+	}
+
+	restarted.categoryCandidates = func(uint, string, string) ([]artworkCandidate, error) {
+		return []artworkCandidate{{key: "tmdb:/changed-poster.jpg", load: func(context.Context) ([]byte, error) {
+			return nil, errors.New("upstream unavailable")
+		}}}, nil
+	}
+	if err := restarted.reconcileCategory(context.Background(), library.ID, categoryKey, "电影", "movie"); err == nil {
+		t.Fatal("changed unavailable candidate unexpectedly succeeded")
+	}
+	var failed models.MediaCategoryArtwork
+	if err := db.First(&failed, first.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if failed.Status != "failed" || failed.ContentHash != first.ContentHash || failed.Revision != first.Revision || failed.LastErrorCode != libraryArtworkErrorGenerate {
+		t.Fatalf("failed generation did not preserve active artwork: %+v", failed)
+	}
+	decorated = restarted.DecorateMediaCategories(context.Background(), library.ID, []PlayerMediaCategory{{ID: categoryKey, Name: "电影", MediaType: "movie", ArtworkURL: "/fallback.png"}})
+	if decorated[0].ArtworkSource != "generated" || decorated[0].ArtworkURL != restarted.artworkURL(first.ContentHash) {
+		t.Fatalf("failed generation hid previous artwork: %+v", decorated[0])
 	}
 }
 

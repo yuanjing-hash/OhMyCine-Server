@@ -65,33 +65,35 @@ type PlayerMediaPerson struct {
 }
 
 type PlayerMediaItem struct {
-	ID             string              `json:"id"`
-	LibraryID      uint                `json:"library_id"`
-	Title          string              `json:"title"`
-	OriginalTitle  string              `json:"original_title,omitempty"`
-	Kind           string              `json:"kind"`
-	ReleaseYear    *int                `json:"release_year,omitempty"`
-	Overview       string              `json:"overview,omitempty"`
-	Tagline        string              `json:"tagline,omitempty"`
-	Rating         float64             `json:"rating,omitempty"`
-	RuntimeMinutes int                 `json:"runtime_minutes,omitempty"`
-	Genres         []string            `json:"genres,omitempty"`
-	Directors      []string            `json:"directors,omitempty"`
-	Writers        []string            `json:"writers,omitempty"`
-	Cast           []string            `json:"cast,omitempty"`
-	People         []PlayerMediaPerson `json:"people,omitempty"`
-	TMDBID         int64               `json:"tmdb_id,omitempty"`
-	IMDbID         string              `json:"imdb_id,omitempty"`
-	PosterPath     string              `json:"poster_path,omitempty"`
-	BackdropPath   string              `json:"backdrop_path,omitempty"`
-	StillPaths     []string            `json:"still_paths,omitempty"`
-	WorkIdentity   PlayerMediaIdentity `json:"work_identity"`
-	FileCount      int64               `json:"file_count"`
-	SeasonCount    int64               `json:"season_count"`
-	EpisodeCount   int64               `json:"episode_count"`
-	ModifiedAt     time.Time           `json:"modified_at"`
-	CategoryName   string              `json:"category_name"`
-	MatchStatus    string              `json:"match_status"`
+	ID              string              `json:"id"`
+	ItemToken       string              `json:"item_token"`
+	HistoryIdentity string              `json:"history_identity,omitempty"`
+	LibraryID       uint                `json:"library_id"`
+	Title           string              `json:"title"`
+	OriginalTitle   string              `json:"original_title,omitempty"`
+	Kind            string              `json:"kind"`
+	ReleaseYear     *int                `json:"release_year,omitempty"`
+	Overview        string              `json:"overview,omitempty"`
+	Tagline         string              `json:"tagline,omitempty"`
+	Rating          float64             `json:"rating,omitempty"`
+	RuntimeMinutes  int                 `json:"runtime_minutes,omitempty"`
+	Genres          []string            `json:"genres,omitempty"`
+	Directors       []string            `json:"directors,omitempty"`
+	Writers         []string            `json:"writers,omitempty"`
+	Cast            []string            `json:"cast,omitempty"`
+	People          []PlayerMediaPerson `json:"people,omitempty"`
+	TMDBID          int64               `json:"tmdb_id,omitempty"`
+	IMDbID          string              `json:"imdb_id,omitempty"`
+	PosterPath      string              `json:"poster_path,omitempty"`
+	BackdropPath    string              `json:"backdrop_path,omitempty"`
+	StillPaths      []string            `json:"still_paths,omitempty"`
+	WorkIdentity    PlayerMediaIdentity `json:"work_identity"`
+	FileCount       int64               `json:"file_count"`
+	SeasonCount     int64               `json:"season_count"`
+	EpisodeCount    int64               `json:"episode_count"`
+	ModifiedAt      time.Time           `json:"modified_at"`
+	CategoryName    string              `json:"category_name"`
+	MatchStatus     string              `json:"match_status"`
 }
 
 type PlayerMediaItemPage struct {
@@ -102,21 +104,30 @@ type PlayerMediaItemPage struct {
 }
 
 type PlayerMediaVersion struct {
-	ID             uint      `json:"id"`
-	Title          string    `json:"title"`
-	Season         *int      `json:"season,omitempty"`
-	Episode        *int      `json:"episode,omitempty"`
-	Overview       string    `json:"overview,omitempty"`
-	StillPath      string    `json:"still_path,omitempty"`
-	AirDate        string    `json:"air_date,omitempty"`
-	RuntimeMinutes int       `json:"runtime_minutes,omitempty"`
-	Rating         float64   `json:"rating,omitempty"`
-	Size           int64     `json:"size"`
-	ModifiedAt     time.Time `json:"modified_at"`
-	Playable       bool      `json:"playable"`
-	StreamPath     string    `json:"stream_path,omitempty"`
-	DeliveryKind   string    `json:"delivery_kind,omitempty"`
-	ExactIdentity  string    `json:"exact_identity"`
+	ID               uint      `json:"id"`
+	ItemToken        string    `json:"item_token"`
+	HistoryIdentity  string    `json:"history_identity"`
+	Title            string    `json:"title"`
+	DisplayTitle     string    `json:"display_title"`
+	DisplaySubtitle  string    `json:"display_subtitle,omitempty"`
+	SeriesTitle      string    `json:"series_title,omitempty"`
+	EpisodeTitle     string    `json:"episode_title,omitempty"`
+	Season           *int      `json:"season,omitempty"`
+	Episode          *int      `json:"episode,omitempty"`
+	Overview         string    `json:"overview,omitempty"`
+	StillPath        string    `json:"still_path,omitempty"`
+	PosterPath       string    `json:"poster_path,omitempty"`
+	BackdropPath     string    `json:"backdrop_path,omitempty"`
+	EpisodeStillPath string    `json:"episode_still_path,omitempty"`
+	AirDate          string    `json:"air_date,omitempty"`
+	RuntimeMinutes   int       `json:"runtime_minutes,omitempty"`
+	Rating           float64   `json:"rating,omitempty"`
+	Size             int64     `json:"size"`
+	ModifiedAt       time.Time `json:"modified_at"`
+	Playable         bool      `json:"playable"`
+	StreamPath       string    `json:"stream_path,omitempty"`
+	DeliveryKind     string    `json:"delivery_kind,omitempty"`
+	ExactIdentity    string    `json:"exact_identity"`
 }
 
 type PlayerMediaDetail struct {
@@ -358,7 +369,20 @@ func (s *MediaLibraryService) PlayerCatalogDetail(ctx context.Context, actor Act
 				title = playerEpisodeFallbackTitle(entry, episode)
 			}
 		}
-		versions = append(versions, PlayerMediaVersion{ID: entry.ID, Title: title, Season: season, Episode: episode, Overview: episodeSnapshot.Overview, StillPath: safeTMDBImagePath(episodeSnapshot.StillPath), AirDate: episodeSnapshot.AirDate, RuntimeMinutes: episodeSnapshot.RuntimeMinutes, Rating: episodeSnapshot.VoteAverage, Size: entry.Size, ModifiedAt: entry.ModifiedAt, Playable: playable, StreamPath: streamPath, DeliveryKind: deliveryKind, ExactIdentity: exactIdentity})
+		itemToken := playerHistoryEntryToken(libraryID, token, entry.ID)
+		historyIdentity := playerHistoryCanonicalIdentity(libraryID, token, item.Kind, season, episode, entry.ID)
+		displayTitle := item.Title
+		displaySubtitle := ""
+		seriesTitle := ""
+		episodeTitle := ""
+		episodeStillPath := ""
+		if item.Kind == "series" {
+			seriesTitle = item.Title
+			episodeTitle = strings.TrimSpace(episodeSnapshot.Name)
+			episodeStillPath = safeTMDBImagePath(episodeSnapshot.StillPath)
+			displaySubtitle = playerHistoryEpisodeSubtitle(season, episode, episodeTitle)
+		}
+		versions = append(versions, PlayerMediaVersion{ID: entry.ID, ItemToken: itemToken, HistoryIdentity: historyIdentity, Title: title, DisplayTitle: displayTitle, DisplaySubtitle: displaySubtitle, SeriesTitle: seriesTitle, EpisodeTitle: episodeTitle, Season: season, Episode: episode, Overview: episodeSnapshot.Overview, StillPath: episodeStillPath, PosterPath: item.PosterPath, BackdropPath: item.BackdropPath, EpisodeStillPath: episodeStillPath, AirDate: episodeSnapshot.AirDate, RuntimeMinutes: episodeSnapshot.RuntimeMinutes, Rating: episodeSnapshot.VoteAverage, Size: entry.Size, ModifiedAt: entry.ModifiedAt, Playable: playable, StreamPath: streamPath, DeliveryKind: deliveryKind, ExactIdentity: exactIdentity})
 	}
 	sort.SliceStable(versions, func(i, j int) bool {
 		leftSeason, rightSeason := pointerIntValue(versions[i].Season), pointerIntValue(versions[j].Season)
@@ -486,8 +510,12 @@ func (s *MediaLibraryService) playerMediaItem(libraryID uint, item MediaCatalogI
 	if item.TMDBID != nil {
 		identity = PlayerMediaIdentity{Scheme: "tmdb", MediaType: item.Kind, Value: strconv.FormatInt(*item.TMDBID, 10)}
 	}
+	historyIdentity := ""
+	if item.Kind == "movie" {
+		historyIdentity = playerHistoryCanonicalIdentity(libraryID, item.ID, item.Kind, nil, nil, 0)
+	}
 	return PlayerMediaItem{
-		ID: item.ID, LibraryID: libraryID, Title: item.Title, OriginalTitle: snapshot.OriginalTitle,
+		ID: item.ID, ItemToken: playerHistoryWorkToken(libraryID, item.ID), HistoryIdentity: historyIdentity, LibraryID: libraryID, Title: item.Title, OriginalTitle: snapshot.OriginalTitle,
 		Kind: item.Kind, ReleaseYear: item.ReleaseYear, Overview: snapshot.Overview, Tagline: snapshot.Tagline,
 		Rating: snapshot.VoteAverage, RuntimeMinutes: snapshot.RuntimeMinutes, Genres: genreNames(snapshot.Genres),
 		Directors: personNames(snapshot.Directors), Writers: personNames(snapshot.Writers), Cast: personNames(snapshot.Cast),

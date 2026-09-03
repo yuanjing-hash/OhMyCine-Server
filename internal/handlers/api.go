@@ -50,6 +50,7 @@ type API struct {
 	mediaCoverage         *services.MediaCoverageService
 	playerHistory         *services.PlayerHistoryService
 	playerMediaState      *services.PlayerMediaStateService
+	playerOverview        *services.PlayerOverviewService
 	acquisition           *services.AcquisitionService
 	schedules             *services.UnifiedScheduleService
 	follows               *services.FollowService
@@ -113,6 +114,9 @@ func (a *API) SetPlayerHistoryService(service *services.PlayerHistoryService) {
 }
 func (a *API) SetPlayerMediaStateService(service *services.PlayerMediaStateService) {
 	a.playerMediaState = service
+}
+func (a *API) SetPlayerOverviewService(service *services.PlayerOverviewService) {
+	a.playerOverview = service
 }
 func (a *API) SetAcquisitionService(service *services.AcquisitionService) { a.acquisition = service }
 func (a *API) SetUnifiedScheduleService(service *services.UnifiedScheduleService) {

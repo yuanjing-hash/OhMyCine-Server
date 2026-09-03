@@ -106,7 +106,7 @@ func (a *API) PlayerBootstrap(c *gin.Context) {
 func playerCapabilities(actor services.Actor) []string {
 	capabilities := []string{"server_connection", "playback_history_sync", "media_favorites", "media_collections"}
 	if actor.HasPermission(authz.PermissionMediaLibrariesRead) {
-		capabilities = append(capabilities, "media_catalog", "direct_stream")
+		capabilities = append(capabilities, "canonical_playback_history_v1", "persistent_category_artwork_v1", "media_overview_v1", "media_catalog", "direct_stream")
 	}
 	if actor.HasPermission(authz.PermissionDiscoveryRead) {
 		capabilities = append(capabilities, "discovery_search")
@@ -122,6 +122,14 @@ func playerCapabilities(actor services.Actor) []string {
 	}
 	sort.Strings(capabilities)
 	return capabilities
+}
+
+func (a *API) PlayerOverview(c *gin.Context) {
+	if a.playerOverview == nil {
+		writeError(c, a.log, &services.AppError{Code: services.CodeInvalidRequest, Message: "Server 暂不支持媒体总览"})
+		return
+	}
+	success(c, http.StatusOK, a.playerOverview.Overview(mustActor(c)))
 }
 
 func (a *API) PlayerFavorites(c *gin.Context) {

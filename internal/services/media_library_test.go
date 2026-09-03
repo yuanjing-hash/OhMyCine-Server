@@ -414,6 +414,35 @@ func testLibraryInput(name string, storage models.Storage, profile models.MediaC
 	return MediaLibraryInput{Name: name, StorageID: storage.ID, ProfileID: profile.ID, RelativeRoot: "/", Enabled: enabled, Recursive: true}
 }
 
+type recordingLibraryArtworkScheduler struct {
+	libraryID uint
+	complete  bool
+	calls     int
+}
+
+func (s *recordingLibraryArtworkScheduler) ScheduleGeneration(libraryID uint, complete bool) error {
+	s.libraryID, s.complete = libraryID, complete
+	s.calls++
+	return nil
+}
+
+func TestSuccessfulMediaLibraryScanSchedulesCategoryArtworkAfterCommit(t *testing.T) {
+	service, _, actor, storage, profile := mediaLibraryTestService(t)
+	recorder := &recordingLibraryArtworkScheduler{}
+	service.SetLibraryArtworkScheduler(recorder)
+	created, err := service.Create(context.Background(), actor, testLibraryInput("Artwork scheduling", storage, profile, false), RequestContext{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := service.ScanNow(context.Background(), actor, created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.Status != "success" || recorder.calls != 1 || recorder.libraryID != created.ID || !recorder.complete {
+		t.Fatalf("run=%+v artwork schedule=%+v", run, recorder)
+	}
+}
+
 func TestMediaLibraryUnrelatedUpdatePreservesUnifiedSchedule(t *testing.T) {
 	service, db, actor, storage, profile := mediaLibraryTestService(t)
 	input := testLibraryInput("Schedule library", storage, profile, false)

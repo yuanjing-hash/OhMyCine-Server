@@ -51,6 +51,7 @@ type MediaLibraryService struct {
 	lifeEvents        map[string]downloaderLifeEventCandidate
 	backends          *MediaLibraryBackendRegistry
 	structure         *MediaLibraryStructureService
+	libraryArtwork    MediaLibraryArtworkScheduler
 }
 
 func (s *MediaLibraryService) authorizedMediaLibraryIDs(actor Actor, permission string, enabledOnly bool) ([]uint, error) {
@@ -75,6 +76,12 @@ func (s *MediaLibraryService) authorizedMediaLibraryIDs(actor Actor, permission 
 // reconciliation into the existing durable download pipeline.
 type MediaLibraryIngestEnqueuer interface {
 	AdoptProviderItem(context.Context, uint, string, string) (bool, error)
+}
+
+// MediaLibraryArtworkScheduler keeps artwork work outside the scan
+// transaction and bounds it behind the owning background service.
+type MediaLibraryArtworkScheduler interface {
+	ScheduleGeneration(uint, bool) error
 }
 
 type downloaderLifeEventIngestEnqueuer interface {
@@ -182,6 +189,9 @@ func (s *MediaLibraryService) SetMediaChangeService(changes *MediaChangeService)
 }
 func (s *MediaLibraryService) SetStructureService(structure *MediaLibraryStructureService) {
 	s.structure = structure
+}
+func (s *MediaLibraryService) SetLibraryArtworkScheduler(artwork MediaLibraryArtworkScheduler) {
+	s.libraryArtwork = artwork
 }
 func (s *MediaLibraryService) Start(ctx context.Context) error {
 	var libraries []models.MediaLibrary
@@ -1969,6 +1979,11 @@ func (s *MediaLibraryService) reconcile(ctx context.Context, id uint, kind strin
 	if s.artifacts != nil && mediaLibraryArtifactGenerationRequired(kind, run, metadataProjectionChanged) {
 		if err := s.artifacts.ScheduleGeneration(id, generation); err != nil {
 			serverlog.OperationMediaArtifact.Event(s.log.Error()).Uint("library_id", id).Uint64("generation", generation).Str("error_code", "artifact_schedule_failed").Msg(serverlog.OperationMediaArtifact.Message("入队失败"))
+		}
+	}
+	if s.libraryArtwork != nil {
+		if err := s.libraryArtwork.ScheduleGeneration(id, !run.Partial); err != nil {
+			s.log.Warn().Uint("library_id", id).Str("error_code", "library_artwork_schedule_failed").Msg("媒体库分类封面生成入队失败")
 		}
 	}
 	if s.structure != nil && !run.Partial {

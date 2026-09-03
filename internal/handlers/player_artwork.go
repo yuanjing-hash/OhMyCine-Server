@@ -65,12 +65,12 @@ func (a *API) GeneratedLibraryArtwork(c *gin.Context) {
 		return
 	}
 	digest := c.Param("digest")
-	artwork, err := a.libraryArtwork.OpenSigned(digest, c.Query("exp"), c.Query("sig"))
+	artwork, err := a.libraryArtwork.Open(digest)
 	if err != nil {
 		c.Status(http.StatusNotFound)
 		return
 	}
-	c.Header("Cache-Control", "private, max-age=600, immutable")
+	c.Header("Cache-Control", "public, max-age=31536000, immutable")
 	c.Header("Content-Type", "image/jpeg")
 	c.Header("Content-Length", strconv.Itoa(len(artwork.Bytes)))
 	c.Header("ETag", `"`+artwork.Digest+`"`)

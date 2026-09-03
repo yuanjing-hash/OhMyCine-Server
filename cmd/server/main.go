@@ -146,8 +146,9 @@ func main() {
 	aiRecognitionSettings := services.NewAIRecognitionSettingsService(db, audit, credentialStore)
 	discoveryService := services.NewDiscoveryService(db, metadataSettings, logManager.Logger("discovery", "service"))
 	mediaCoverage := services.NewMediaCoverageService(db, metadataSettings)
-	playerHistory := services.NewPlayerHistoryService(db)
+	playerHistory := services.NewPlayerHistoryService(db, libraries)
 	playerMediaState := services.NewPlayerMediaStateService(db, libraries)
+	playerOverview := services.NewPlayerOverviewService(playerHistory, playerMediaState, libraries)
 	libraries.SetMetadataSettingsService(metadataSettings)
 	libraries.SetAIRecognitionSettings(aiRecognitionSettings)
 	artifacts.SetMetadataSettingsService(metadataSettings)
@@ -185,12 +186,20 @@ func main() {
 	pluginHostAPI := pluginhostapi.New(db, credentialStore, logManager.Logger("plugin", "host"))
 	pluginHost.SetCapabilityHost(pluginHostAPI)
 	pluginRepositories := services.NewPluginRepositoryService(db, audit, pluginrepository.NewGitHubClient(nil), logManager.Logger("plugin", "repository"), services.WithPluginRoot(cfg.PluginDirectory), services.WithPluginRuntimeHost(pluginHost), services.WithPluginCredentialStore(credentialStore))
-	libraryArtwork := services.NewLibraryArtworkService(db, metadataSettings, pluginRepositories, pluginHostAPI, logManager.Logger("library_artwork", "generator"))
+	libraryArtwork := services.NewLibraryArtworkService(
+		db, metadataSettings, pluginRepositories, pluginHostAPI, logManager.Logger("library_artwork", "generator"),
+		services.WithLibraryArtworkRoot(filepath.Join(filepath.Dir(cfg.DatabasePath), "cache", "artwork", "categories")),
+	)
+	libraries.SetLibraryArtworkScheduler(libraryArtwork)
 	pluginDownloads := services.NewPluginDownloadExecutor(downloads, pluginRepositories, pluginHostAPI, mediatool.Discover(cfg.FFmpegPath))
 	downloads.SetPluginDownloadExecutor(pluginDownloads)
 	if err := pluginRepositories.RestorePlugins(context.Background()); err != nil {
 		logging.OperationPluginRuntime.Event(log.Fatal()).Str("error_code", services.ErrorCode(err)).Msg(logging.OperationPluginRuntime.Message("插件运行时恢复失败"))
 	}
+	if err := libraryArtwork.Start(context.Background()); err != nil {
+		logging.OperationServerLifecycle.Event(log.Fatal()).Err(err).Str("error_code", "library_artwork_start_failed").Msg(logging.OperationServerLifecycle.Message("媒体库分类封面服务启动失败"))
+	}
+	defer libraryArtwork.Close()
 	defer func() {
 		if err := pluginRepositories.ClosePlugins(context.Background()); err != nil {
 			logging.OperationPluginRuntime.Event(log.Error()).Str("error_code", services.ErrorCode(err)).Msg(logging.OperationPluginRuntime.Message("插件运行时关闭失败"))
@@ -286,6 +295,7 @@ func main() {
 	api.SetMediaCoverageService(mediaCoverage)
 	api.SetPlayerHistoryService(playerHistory)
 	api.SetPlayerMediaStateService(playerMediaState)
+	api.SetPlayerOverviewService(playerOverview)
 	api.SetFollowService(follows)
 	api.SetSiteService(sites)
 	api.SetCookieCloudService(cookieCloud)

@@ -3,13 +3,12 @@ package services
 import (
 	"bytes"
 	"context"
-	"crypto/hmac"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"image"
 	"image/color"
 	"image/jpeg"
@@ -17,8 +16,9 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -40,7 +40,9 @@ const (
 	libraryArtworkMaxDimension    = 8192
 	libraryArtworkMaxPixels       = 36_000_000
 	libraryArtworkCacheLimit      = 256
-	libraryArtworkTicketTTL       = 15 * time.Minute
+	libraryArtworkScopeCategory   = "media_category"
+	libraryArtworkErrorGenerate   = "library_artwork_generation_failed"
+	libraryArtworkErrorPersist    = "library_artwork_persistence_failed"
 )
 
 type PluginArtworkAssetGateway interface {
@@ -71,41 +73,277 @@ type LibraryArtworkService struct {
 	cache map[string][]byte
 	// generation maps the deterministic candidate/template key to the digest
 	// of the actual encoded JPEG. Public immutable URLs always use the latter.
-	generation map[string]string
-	order      []string
-	signingKey [32]byte
-	now        func() time.Time
+	generation         map[string]string
+	order              []string
+	root               string
+	now                func() time.Time
+	jobs               chan libraryArtworkJob
+	pending            map[uint]libraryArtworkJob
+	workerStop         context.CancelFunc
+	workerWG           sync.WaitGroup
+	categoryCandidates func(uint, string, string) ([]artworkCandidate, error)
 }
 
-func NewLibraryArtworkService(db *gorm.DB, metadata *MetadataSettingsService, plugins *PluginRepositoryService, assets PluginArtworkAssetGateway, log zerolog.Logger) *LibraryArtworkService {
-	var signingKey [32]byte
-	if _, err := rand.Read(signingKey[:]); err != nil {
-		panic("library artwork signing key unavailable")
+type LibraryArtworkOption func(*LibraryArtworkService) error
+
+func WithLibraryArtworkRoot(root string) LibraryArtworkOption {
+	return func(service *LibraryArtworkService) error {
+		resolved, err := filepath.Abs(strings.TrimSpace(root))
+		if err != nil || strings.TrimSpace(root) == "" {
+			return errors.New("library artwork root is invalid")
+		}
+		service.root = filepath.Clean(resolved)
+		return nil
 	}
-	return &LibraryArtworkService{
+}
+
+func NewLibraryArtworkService(db *gorm.DB, metadata *MetadataSettingsService, plugins *PluginRepositoryService, assets PluginArtworkAssetGateway, log zerolog.Logger, options ...LibraryArtworkOption) *LibraryArtworkService {
+	service := &LibraryArtworkService{
 		db: db, metadata: metadata, plugins: plugins, assets: assets, log: log,
-		cache: make(map[string][]byte), generation: make(map[string]string), signingKey: signingKey, now: time.Now,
+		cache: make(map[string][]byte), generation: make(map[string]string), now: time.Now,
+		jobs: make(chan libraryArtworkJob, 64), pending: make(map[uint]libraryArtworkJob),
+	}
+	for _, option := range options {
+		if err := option(service); err != nil {
+			panic(err)
+		}
+	}
+	return service
+}
+
+type libraryArtworkJob struct {
+	libraryID uint
+	complete  bool
+}
+
+func (s *LibraryArtworkService) Start(ctx context.Context) error {
+	if s.root == "" {
+		return errors.New("library artwork root is required")
+	}
+	if err := os.MkdirAll(s.root, 0o700); err != nil {
+		return err
+	}
+	workerCtx, cancel := context.WithCancel(ctx)
+	s.mu.Lock()
+	if s.workerStop != nil {
+		s.mu.Unlock()
+		cancel()
+		return nil
+	}
+	s.workerStop = cancel
+	s.workerWG.Add(1)
+	s.mu.Unlock()
+	go s.run(workerCtx)
+	var libraryIDs []uint
+	if err := s.db.Model(&models.MediaLibrary{}).Where("enabled = ? AND last_successful_scan_at IS NOT NULL", true).Order("id").Pluck("id", &libraryIDs).Error; err != nil {
+		s.Close()
+		return err
+	}
+	for _, libraryID := range libraryIDs {
+		_ = s.ScheduleGeneration(libraryID, true)
+	}
+	return nil
+}
+
+func (s *LibraryArtworkService) Close() {
+	s.mu.Lock()
+	cancel := s.workerStop
+	s.workerStop = nil
+	s.mu.Unlock()
+	if cancel != nil {
+		cancel()
+		s.workerWG.Wait()
+	}
+}
+
+func (s *LibraryArtworkService) ScheduleGeneration(libraryID uint, complete bool) error {
+	if libraryID == 0 || s.root == "" {
+		return errors.New("library artwork generation is unavailable")
+	}
+	s.mu.Lock()
+	if existing, ok := s.pending[libraryID]; ok {
+		if complete && !existing.complete {
+			existing.complete = true
+			s.pending[libraryID] = existing
+		}
+		s.mu.Unlock()
+		return nil
+	}
+	job := libraryArtworkJob{libraryID: libraryID, complete: complete}
+	s.pending[libraryID] = job
+	s.mu.Unlock()
+	select {
+	case s.jobs <- job:
+		return nil
+	default:
+		s.mu.Lock()
+		delete(s.pending, libraryID)
+		s.mu.Unlock()
+		return errors.New("library artwork generation queue is full")
+	}
+}
+
+func (s *LibraryArtworkService) run(ctx context.Context) {
+	defer s.workerWG.Done()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case queued := <-s.jobs:
+			s.mu.Lock()
+			job := s.pending[queued.libraryID]
+			delete(s.pending, queued.libraryID)
+			s.mu.Unlock()
+			if err := s.ReconcileMediaLibrary(ctx, job.libraryID, job.complete); err != nil && !errors.Is(err, context.Canceled) {
+				s.log.Warn().Str("module", "library_artwork").Uint("library_id", job.libraryID).Str("error_code", libraryArtworkErrorGenerate).Msg("媒体库分类封面后台生成失败")
+			}
+		}
 	}
 }
 
 func (s *LibraryArtworkService) DecorateMediaCategories(ctx context.Context, libraryID uint, categories []PlayerMediaCategory) []PlayerMediaCategory {
+	_ = ctx
+	var records []models.MediaCategoryArtwork
+	if err := s.db.Where("scope_kind = ? AND library_id = ? AND content_hash <> ''", libraryArtworkScopeCategory, libraryID).Find(&records).Error; err != nil {
+		records = nil
+	}
+	byCategory := make(map[string]models.MediaCategoryArtwork, len(records))
+	for _, record := range records {
+		byCategory[record.CategoryKey] = record
+	}
 	for index := range categories {
 		categories[index].ArtworkSource = "fallback"
 		categories[index].ArtworkRevision = fallbackArtworkRevision(categories[index].ArtworkURL)
-		candidates, err := s.mediaCategoryCandidates(libraryID, categories[index].Name, categories[index].MediaType)
-		if err != nil || len(candidates) == 0 {
+		record, ok := byCategory[categories[index].ID]
+		if !ok || record.ContentHash == "" || record.RelativePath == "" {
 			continue
 		}
-		asset, err := s.generate(ctx, categories[index].Name, candidates)
-		if err != nil {
-			s.log.Debug().Str("module", "library_artwork").Uint("library_id", libraryID).Str("category", categories[index].Name).Str("error_code", "library_artwork_generation_failed").Msg("动态分类封面生成失败，继续使用兜底图")
-			continue
-		}
-		categories[index].ArtworkURL = s.signedArtworkURL(asset.Digest)
-		categories[index].ArtworkRevision = asset.Digest
+		categories[index].ArtworkURL = s.artworkURL(record.ContentHash)
+		categories[index].ArtworkRevision = fmt.Sprint(record.Revision, "-", record.ContentHash)
 		categories[index].ArtworkSource = "generated"
 	}
 	return categories
+}
+
+func (s *LibraryArtworkService) ReconcileMediaLibrary(ctx context.Context, libraryID uint, complete bool) error {
+	if libraryID == 0 {
+		return errors.New("library id is required")
+	}
+	type categoryRow struct {
+		CategoryName string
+		MediaType    string
+	}
+	var rows []categoryRow
+	if err := s.db.Model(&models.MediaLibraryEntry{}).
+		Select("category_name, CASE WHEN media_type = 'tv' THEN 'series' ELSE 'movie' END AS media_type").
+		Where("library_id = ? AND work_key <> '' AND category_name <> ''", libraryID).
+		Group("category_name, CASE WHEN media_type = 'tv' THEN 'series' ELSE 'movie' END").
+		Order("media_type, category_name").Scan(&rows).Error; err != nil {
+		return err
+	}
+	seen := make([]string, 0, len(rows))
+	for _, row := range rows {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		categoryKey := mediaCategoryArtworkKey(row.MediaType, row.CategoryName)
+		seen = append(seen, categoryKey)
+		if err := s.reconcileCategory(ctx, libraryID, categoryKey, row.CategoryName, row.MediaType); err != nil {
+			s.log.Warn().Str("module", "library_artwork").Uint("library_id", libraryID).Str("category", row.CategoryName).Str("error_code", libraryArtworkErrorGenerate).Msg("媒体库分类封面生成失败，保留上一版本")
+		}
+	}
+	if complete {
+		query := s.db.Where("scope_kind = ? AND library_id = ?", libraryArtworkScopeCategory, libraryID)
+		if len(seen) > 0 {
+			query = query.Where("category_key NOT IN ?", seen)
+		}
+		if err := query.Delete(&models.MediaCategoryArtwork{}).Error; err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *LibraryArtworkService) reconcileCategory(ctx context.Context, libraryID uint, categoryKey, categoryName, mediaType string) error {
+	loadCandidates := s.mediaCategoryCandidates
+	if s.categoryCandidates != nil {
+		loadCandidates = s.categoryCandidates
+	}
+	candidates, err := loadCandidates(libraryID, categoryName, mediaType)
+	if err != nil {
+		return err
+	}
+	candidates = normalizeArtworkCandidates(candidates)
+	if len(candidates) == 0 {
+		return nil
+	}
+	generationKey := artworkGenerationKey(categoryName, candidates)
+	candidateDigest := artworkCandidateDigest(candidates)
+	now := s.currentTime()
+	var record models.MediaCategoryArtwork
+	findErr := s.db.Where("scope_kind = ? AND library_id = ? AND category_key = ?", libraryArtworkScopeCategory, libraryID, categoryKey).First(&record).Error
+	if errors.Is(findErr, gorm.ErrRecordNotFound) {
+		record = models.MediaCategoryArtwork{ScopeKind: libraryArtworkScopeCategory, LibraryID: libraryID, CategoryKey: categoryKey, CreatedAt: now}
+	} else if findErr != nil {
+		return findErr
+	}
+	if record.GenerationKey == generationKey && record.ContentHash != "" && s.contentFileValid(record.ContentHash, record.RelativePath) {
+		return nil
+	}
+	record.CategoryName, record.MediaType = categoryName, mediaType
+	record.PendingGenerationKey, record.CandidateDigest = generationKey, candidateDigest
+	record.TemplateVersion, record.Status, record.LastErrorCode, record.UpdatedAt = libraryArtworkTemplateVersion, "pending", "", now
+	if err := s.db.Save(&record).Error; err != nil {
+		return err
+	}
+	asset, err := s.generate(ctx, categoryName, candidates)
+	if err != nil {
+		s.markCategoryArtworkFailed(record.ID, generationKey, libraryArtworkErrorGenerate)
+		return err
+	}
+	relativePath, err := s.persistContent(asset)
+	if err != nil {
+		s.markCategoryArtworkFailed(record.ID, generationKey, libraryArtworkErrorPersist)
+		return err
+	}
+	generatedAt := s.currentTime()
+	return s.db.Transaction(func(tx *gorm.DB) error {
+		var current models.MediaCategoryArtwork
+		if err := tx.First(&current, record.ID).Error; err != nil {
+			return err
+		}
+		if current.PendingGenerationKey != generationKey {
+			return nil
+		}
+		revision := current.Revision
+		if current.ContentHash != asset.Digest || current.GenerationKey != generationKey {
+			revision++
+		}
+		return tx.Model(&models.MediaCategoryArtwork{}).Where("id = ?", current.ID).Updates(map[string]any{
+			"generation_key": generationKey, "pending_generation_key": "", "candidate_digest": candidateDigest,
+			"template_version": libraryArtworkTemplateVersion, "content_hash": asset.Digest, "relative_path": relativePath,
+			"mime_type": "image/jpeg", "revision": revision, "status": "ready", "last_error_code": "",
+			"generated_at": generatedAt, "updated_at": generatedAt,
+		}).Error
+	})
+}
+
+func (s *LibraryArtworkService) markCategoryArtworkFailed(id uint, generationKey, code string) {
+	now := s.currentTime()
+	_ = s.db.Model(&models.MediaCategoryArtwork{}).Where("id = ? AND pending_generation_key = ?", id, generationKey).
+		Updates(map[string]any{"status": "failed", "last_error_code": code, "updated_at": now}).Error
+}
+
+func mediaCategoryArtworkKey(mediaType, categoryName string) string {
+	return base64.RawURLEncoding.EncodeToString([]byte(strings.TrimSpace(mediaType) + "\x00" + strings.TrimSpace(categoryName)))
+}
+
+func artworkCandidateDigest(candidates []artworkCandidate) string {
+	hash := sha256.New()
+	for _, candidate := range candidates {
+		_, _ = io.WriteString(hash, candidate.key+"\x00")
+	}
+	return hex.EncodeToString(hash.Sum(nil))
 }
 
 func (s *LibraryArtworkService) DecoratePluginNavigation(ctx context.Context, actor Actor, libraryID string, raw json.RawMessage) (json.RawMessage, error) {
@@ -146,7 +384,7 @@ func (s *LibraryArtworkService) DecoratePluginNavigation(ctx context.Context, ac
 			s.log.Debug().Str("module", "library_artwork").Str("plugin_id", manifest.ID).Str("scope", scopeKey).Str("error_code", "library_artwork_generation_failed").Msg("插件分类封面生成失败，继续使用兜底图")
 			continue
 		}
-		response.Nodes[index].ArtworkURL = s.signedArtworkURL(asset.Digest)
+		response.Nodes[index].ArtworkURL = s.artworkURL(asset.Digest)
 		response.Nodes[index].ArtworkRevision = asset.Digest
 		response.Nodes[index].ArtworkSource = "generated"
 	}
@@ -193,25 +431,110 @@ func (s *LibraryArtworkService) Open(digest string) (LibraryArtworkAsset, error)
 	s.mu.RLock()
 	data, ok := s.cache[digest]
 	s.mu.RUnlock()
-	if !ok {
+	if ok {
+		return LibraryArtworkAsset{Digest: digest, Bytes: append([]byte(nil), data...)}, nil
+	}
+	if s.root == "" {
 		return LibraryArtworkAsset{}, appError(CodeNotFound, "媒体库封面不存在", nil)
 	}
+	var record models.MediaCategoryArtwork
+	if err := s.db.Select("content_hash", "relative_path").Where("content_hash = ? AND relative_path <> ''", digest).First(&record).Error; err != nil {
+		return LibraryArtworkAsset{}, appError(CodeNotFound, "媒体库封面不存在", nil)
+	}
+	path, err := s.resolveContentPath(digest, record.RelativePath)
+	if err != nil {
+		return LibraryArtworkAsset{}, appError(CodeNotFound, "媒体库封面不存在", nil)
+	}
+	data, err = os.ReadFile(path)
+	if err != nil || len(data) == 0 || len(data) > libraryArtworkMaxSourceBytes {
+		return LibraryArtworkAsset{}, appError(CodeNotFound, "媒体库封面不存在", err)
+	}
+	actual := sha256.Sum256(data)
+	if !strings.EqualFold(hex.EncodeToString(actual[:]), digest) {
+		return LibraryArtworkAsset{}, appError(CodeNotFound, "媒体库封面不存在", nil)
+	}
+	s.rememberContent(digest, data)
 	return LibraryArtworkAsset{Digest: digest, Bytes: append([]byte(nil), data...)}, nil
 }
 
-func (s *LibraryArtworkService) OpenSigned(digest, expiration, signature string) (LibraryArtworkAsset, error) {
-	if len(expiration) == 0 || len(expiration) > 20 || len(signature) != 43 {
-		return LibraryArtworkAsset{}, appError(CodeNotFound, "媒体库封面不存在", nil)
+func (s *LibraryArtworkService) persistContent(asset LibraryArtworkAsset) (string, error) {
+	if s.root == "" {
+		return "", errors.New("library artwork root is unavailable")
 	}
-	expiresAt, err := strconv.ParseInt(expiration, 10, 64)
-	if err != nil || expiresAt < s.currentTime().Unix() {
-		return LibraryArtworkAsset{}, appError(CodeNotFound, "媒体库封面不存在", nil)
+	relativePath := asset.Digest + ".jpg"
+	target, err := s.resolveContentPath(asset.Digest, relativePath)
+	if err != nil {
+		return "", err
 	}
-	expected := s.artworkSignature(digest, expiration)
-	if !hmac.Equal([]byte(signature), []byte(expected)) {
-		return LibraryArtworkAsset{}, appError(CodeNotFound, "媒体库封面不存在", nil)
+	if existing, readErr := os.ReadFile(target); readErr == nil {
+		digest := sha256.Sum256(existing)
+		if hex.EncodeToString(digest[:]) == asset.Digest {
+			return relativePath, nil
+		}
 	}
-	return s.Open(digest)
+	if err := os.MkdirAll(s.root, 0o700); err != nil {
+		return "", err
+	}
+	temporary, err := os.CreateTemp(s.root, ".category-artwork-*.tmp")
+	if err != nil {
+		return "", err
+	}
+	temporaryPath := temporary.Name()
+	defer func() { _ = os.Remove(temporaryPath) }()
+	if err := temporary.Chmod(0o600); err != nil {
+		_ = temporary.Close()
+		return "", err
+	}
+	if _, err := temporary.Write(asset.Bytes); err != nil {
+		_ = temporary.Close()
+		return "", err
+	}
+	if err := temporary.Sync(); err != nil {
+		_ = temporary.Close()
+		return "", err
+	}
+	if err := temporary.Close(); err != nil {
+		return "", err
+	}
+	if err := os.Rename(temporaryPath, target); err != nil {
+		if existing, readErr := os.ReadFile(target); readErr == nil {
+			digest := sha256.Sum256(existing)
+			if hex.EncodeToString(digest[:]) == asset.Digest {
+				return relativePath, nil
+			}
+		}
+		return "", err
+	}
+	return relativePath, nil
+}
+
+func (s *LibraryArtworkService) contentFileValid(digest, relativePath string) bool {
+	path, err := s.resolveContentPath(digest, relativePath)
+	if err != nil {
+		return false
+	}
+	data, err := os.ReadFile(path)
+	if err != nil || len(data) == 0 || len(data) > libraryArtworkMaxSourceBytes {
+		return false
+	}
+	actual := sha256.Sum256(data)
+	return hex.EncodeToString(actual[:]) == digest
+}
+
+func (s *LibraryArtworkService) resolveContentPath(digest, relativePath string) (string, error) {
+	if s.root == "" || relativePath != digest+".jpg" || filepath.Base(relativePath) != relativePath {
+		return "", errors.New("library artwork path is invalid")
+	}
+	target := filepath.Join(s.root, relativePath)
+	relative, err := filepath.Rel(s.root, target)
+	if err != nil || relative == "." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) || filepath.IsAbs(relative) {
+		return "", errors.New("library artwork path escapes root")
+	}
+	return target, nil
+}
+
+func (s *LibraryArtworkService) artworkURL(digest string) string {
+	return "/api/v1/assets/generated-library-covers/" + digest
 }
 
 func (s *LibraryArtworkService) mediaCategoryCandidates(libraryID uint, categoryName, mediaType string) ([]artworkCandidate, error) {
@@ -315,30 +638,40 @@ func (s *LibraryArtworkService) generate(ctx context.Context, title string, cand
 	data := encoded.Bytes()
 	contentHash := sha256.Sum256(data)
 	digest := hex.EncodeToString(contentHash[:])
+	s.rememberContent(digest, data)
 	s.mu.Lock()
+	if s.generation == nil {
+		s.generation = make(map[string]string)
+	}
+	s.generation[generationKey] = digest
+	s.mu.Unlock()
+	return LibraryArtworkAsset{Digest: digest, Bytes: append([]byte(nil), data...)}, nil
+}
+
+func (s *LibraryArtworkService) rememberContent(digest string, data []byte) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.cache == nil {
 		s.cache = make(map[string][]byte)
 	}
 	if s.generation == nil {
 		s.generation = make(map[string]string)
 	}
-	if _, exists := s.cache[digest]; !exists {
-		if len(s.order) >= libraryArtworkCacheLimit {
-			evicted := s.order[0]
-			delete(s.cache, evicted)
-			for key, cachedDigest := range s.generation {
-				if cachedDigest == evicted {
-					delete(s.generation, key)
-				}
-			}
-			s.order = s.order[1:]
-		}
-		s.cache[digest] = append([]byte(nil), data...)
-		s.order = append(s.order, digest)
+	if _, exists := s.cache[digest]; exists {
+		return
 	}
-	s.generation[generationKey] = digest
-	s.mu.Unlock()
-	return LibraryArtworkAsset{Digest: digest, Bytes: append([]byte(nil), data...)}, nil
+	if len(s.order) >= libraryArtworkCacheLimit {
+		evicted := s.order[0]
+		delete(s.cache, evicted)
+		for key, cachedDigest := range s.generation {
+			if cachedDigest == evicted {
+				delete(s.generation, key)
+			}
+		}
+		s.order = s.order[1:]
+	}
+	s.cache[digest] = append([]byte(nil), data...)
+	s.order = append(s.order, digest)
 }
 
 func decodeLibraryArtwork(data []byte) (image.Image, error) {
@@ -661,21 +994,6 @@ func readBoundedArtwork(reader io.Reader) ([]byte, error) {
 		return nil, errors.New("library artwork asset exceeds the safe limit")
 	}
 	return data, nil
-}
-
-func (s *LibraryArtworkService) signedArtworkURL(digest string) string {
-	// Quantize tickets so repeated library-list requests reuse the same URL and
-	// do not force Player's image cache to redownload identical content.
-	ttlSeconds := int64(libraryArtworkTicketTTL / time.Second)
-	expiresAt := (s.currentTime().Unix()/ttlSeconds + 2) * ttlSeconds
-	expiration := strconv.FormatInt(expiresAt, 10)
-	return "/api/v1/assets/generated-library-covers/" + digest + "?exp=" + expiration + "&sig=" + s.artworkSignature(digest, expiration)
-}
-
-func (s *LibraryArtworkService) artworkSignature(digest, expiration string) string {
-	mac := hmac.New(sha256.New, s.signingKey[:])
-	_, _ = io.WriteString(mac, "GET\n/api/v1/assets/generated-library-covers/"+digest+"\n"+expiration)
-	return base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
 }
 
 func (s *LibraryArtworkService) currentTime() time.Time {

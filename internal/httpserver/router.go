@@ -46,6 +46,7 @@ func New(cfg config.Config, api *handlers.API, auth *services.AuthService, log z
 	playerProtected.Use(middleware.DeviceAuth(auth))
 	playerProtected.POST("/auth/logout", api.PlayerLogout)
 	playerProtected.GET("/bootstrap", api.PlayerBootstrap)
+	playerProtected.GET("/overview", api.PlayerOverview)
 	playerProtected.GET("/devices", api.PlayerDevices)
 	playerProtected.DELETE("/devices/:id", api.RevokePlayerDevice)
 	playerProtected.GET("/media-libraries", api.PlayerMediaLibraries)
