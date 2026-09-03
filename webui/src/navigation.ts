@@ -48,7 +48,7 @@ export const navigationGroups: readonly NavigationGroup[] = [
     items: [
       { id: 'recommendations', label: '推荐', to: '/discovery/recommendations', permissionsAny: discoveryPermissions, description: '浏览 TMDB 与豆瓣真实推荐栏目，按来源刷新并查看缓存状态。' },
       { id: 'explore', label: '搜索', to: '/discovery/explore', permissionsAny: discoveryPermissions, description: '确认作品后按需聚合搜索已启用的 PT 站点并创建下载。' },
-      { id: 'library-catalog', label: '媒体库', to: '/discovery/library', permissionsAny: [Permissions.MediaLibrariesRead], description: '按媒体库浏览已入库作品、真实季集覆盖与元数据维护操作。' },
+      { id: 'library-catalog', label: '媒体库', to: '/discovery/library', permissionsAny: [Permissions.MediaLibrariesRead], description: '统一查看继续观看、收藏、合集、最近入库与全部作品。' },
     ],
   },
   {

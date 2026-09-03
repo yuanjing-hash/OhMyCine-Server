@@ -107,7 +107,7 @@ func (s *PlayerHistoryService) Sync(actor Actor, cursor uint64, changes []Player
 				return err
 			}
 		}
-		return nil
+		return s.reconcileLegacyServerHistory(tx, actor)
 	})
 	if err != nil {
 		return PlayerHistorySyncResult{}, err
@@ -126,6 +126,36 @@ func (s *PlayerHistoryService) Sync(actor Actor, cursor uint64, changes []Player
 	return result, nil
 }
 
+func (s *PlayerHistoryService) reconcileLegacyServerHistory(tx *gorm.DB, actor Actor) error {
+	if s.libraries == nil {
+		return nil
+	}
+	var rows []models.PlayerPlaybackHistory
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where(
+		"user_id = ? AND source_kind = ? AND deleted = ? AND canonical_identity = ?",
+		actor.User.ID, "server", false, "",
+	).Order("client_updated_at DESC, sync_key ASC").Limit(playerHistorySyncLimit).Find(&rows).Error; err != nil {
+		return err
+	}
+	for _, row := range rows {
+		original := playerHistoryChangeDTO(row)
+		authority, err := s.resolveServerHistoryAuthority(tx, actor, original)
+		if err != nil {
+			switch ErrorCode(err) {
+			case CodeInvalidRequest, CodeNotFound, CodePermissionDenied:
+				continue
+			default:
+				return err
+			}
+		}
+		canonical := applyServerHistoryAuthority(original, authority)
+		if err := s.mergeCanonicalServerHistory(tx, actor, original, canonical, authority); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *PlayerHistoryService) List(actor Actor, page, pageSize int, sourceKind string) (PlayerHistoryPage, error) {
 	if page < 1 || page > 100_000 || pageSize < 1 || pageSize > 100 {
 		return PlayerHistoryPage{}, appError(CodeInvalidRequest, "播放历史分页参数无效", nil)
@@ -133,6 +163,9 @@ func (s *PlayerHistoryService) List(actor Actor, page, pageSize int, sourceKind 
 	sourceKind = strings.ToLower(strings.TrimSpace(sourceKind))
 	if sourceKind != "" && (len(sourceKind) > 32 || strings.ContainsAny(sourceKind, "\r\n\x00")) {
 		return PlayerHistoryPage{}, appError(CodeInvalidRequest, "播放历史来源类型无效", nil)
+	}
+	if sourceKind == "server" && s.libraries != nil {
+		return s.listAvailableServerHistory(actor, page, pageSize)
 	}
 	query := s.db.Model(&models.PlayerPlaybackHistory{}).Where("user_id = ? AND deleted = ?", actor.User.ID, false)
 	if sourceKind != "" {
@@ -152,6 +185,171 @@ func (s *PlayerHistoryService) List(actor Actor, page, pageSize int, sourceKind 
 		result.List = append(result.List, playerHistoryChangeDTO(row))
 	}
 	return result, nil
+}
+
+func (s *PlayerHistoryService) listAvailableServerHistory(actor Actor, page, pageSize int) (PlayerHistoryPage, error) {
+	wantedOffset := (page - 1) * pageSize
+	result := PlayerHistoryPage{List: make([]PlayerHistoryChange, 0, pageSize), Page: page, PageSize: pageSize}
+	query := s.db.Where("user_id = ? AND source_kind = ? AND deleted = ?", actor.User.ID, "server", false).
+		Order("client_updated_at DESC, sync_key ASC")
+	for rawOffset := 0; ; rawOffset += playerHistorySyncLimit {
+		var rows []models.PlayerPlaybackHistory
+		if err := query.Limit(playerHistorySyncLimit).Offset(rawOffset).Find(&rows).Error; err != nil {
+			return PlayerHistoryPage{}, err
+		}
+		available, err := s.availableServerHistoryRows(actor, rows)
+		if err != nil {
+			return PlayerHistoryPage{}, err
+		}
+		for index, row := range rows {
+			if !available[index] {
+				continue
+			}
+			if result.Total >= int64(wantedOffset) && len(result.List) < pageSize {
+				result.List = append(result.List, playerHistoryChangeDTO(row))
+			}
+			result.Total++
+		}
+		if len(rows) < playerHistorySyncLimit {
+			break
+		}
+	}
+	result.HasMore = int64(wantedOffset+len(result.List)) < result.Total
+	return result, nil
+}
+
+func (s *PlayerHistoryService) BrowserList(actor Actor, page, pageSize int) (BrowserHistoryPage, error) {
+	result, err := s.List(actor, page, pageSize, "server")
+	if err != nil {
+		return BrowserHistoryPage{}, err
+	}
+	return BrowserHistoryPage{
+		List: browserHistoryItems(result.List, s.libraries), Total: result.Total,
+		Page: result.Page, PageSize: result.PageSize, HasMore: result.HasMore,
+	}, nil
+}
+
+type parsedCanonicalServerHistoryIdentity struct {
+	kind          string
+	libraryID     uint
+	workKey       string
+	seasonNumber  *int
+	episodeNumber *int
+	entryID       uint
+}
+
+func parseCanonicalServerHistoryIdentity(value string) (parsedCanonicalServerHistoryIdentity, bool) {
+	parts := strings.Split(strings.TrimSpace(value), ":")
+	if len(parts) < 5 || parts[0] != "server" || parts[1] != "v1" {
+		return parsedCanonicalServerHistoryIdentity{}, false
+	}
+	libraryID, err := strconv.ParseUint(parts[3], 10, 32)
+	if err != nil || libraryID == 0 {
+		return parsedCanonicalServerHistoryIdentity{}, false
+	}
+	workKey, err := decodeCatalogToken(parts[4])
+	if err != nil {
+		return parsedCanonicalServerHistoryIdentity{}, false
+	}
+	result := parsedCanonicalServerHistoryIdentity{kind: parts[2], libraryID: uint(libraryID), workKey: workKey}
+	switch result.kind {
+	case "movie":
+		return result, len(parts) == 5
+	case "episode":
+		if len(parts) != 7 {
+			return parsedCanonicalServerHistoryIdentity{}, false
+		}
+		season, seasonErr := strconv.Atoi(parts[5])
+		episode, episodeErr := strconv.Atoi(parts[6])
+		if seasonErr != nil || episodeErr != nil || !validHistoryEpisodeFacts(&season, &episode) {
+			return parsedCanonicalServerHistoryIdentity{}, false
+		}
+		result.seasonNumber, result.episodeNumber = &season, &episode
+		return result, true
+	case "episode-entry":
+		if len(parts) != 6 {
+			return parsedCanonicalServerHistoryIdentity{}, false
+		}
+		entryID, entryErr := strconv.ParseUint(parts[5], 10, 32)
+		if entryErr != nil || entryID == 0 {
+			return parsedCanonicalServerHistoryIdentity{}, false
+		}
+		result.entryID = uint(entryID)
+		return result, true
+	default:
+		return parsedCanonicalServerHistoryIdentity{}, false
+	}
+}
+
+func (s *PlayerHistoryService) availableServerHistoryRows(actor Actor, rows []models.PlayerPlaybackHistory) ([]bool, error) {
+	type candidate struct {
+		index    int
+		identity parsedCanonicalServerHistoryIdentity
+	}
+	available := make([]bool, len(rows))
+	candidatesByLibrary := make(map[uint][]candidate)
+	workKeysByLibrary := make(map[uint]map[string]struct{})
+	for index, row := range rows {
+		identity, ok := parseCanonicalServerHistoryIdentity(row.HistoryIdentity)
+		if !ok || row.LibraryID != strconv.FormatUint(uint64(identity.libraryID), 10) || !actor.CanResource(authz.PermissionMediaLibrariesRead, models.AuthorizationResourceMediaLibrary, uintID(identity.libraryID)) {
+			continue
+		}
+		candidatesByLibrary[identity.libraryID] = append(candidatesByLibrary[identity.libraryID], candidate{index: index, identity: identity})
+		if workKeysByLibrary[identity.libraryID] == nil {
+			workKeysByLibrary[identity.libraryID] = make(map[string]struct{})
+		}
+		workKeysByLibrary[identity.libraryID][identity.workKey] = struct{}{}
+	}
+	if len(candidatesByLibrary) == 0 {
+		return available, nil
+	}
+	libraryIDs := make([]uint, 0, len(candidatesByLibrary))
+	for libraryID := range candidatesByLibrary {
+		libraryIDs = append(libraryIDs, libraryID)
+	}
+	var enabledLibraryIDs []uint
+	if err := s.db.Table("media_libraries").Select("media_libraries.id").
+		Joins("JOIN storages ON storages.id = media_libraries.storage_id").
+		Where("media_libraries.id IN ? AND media_libraries.enabled = ? AND storages.enabled = ?", libraryIDs, true, true).
+		Scan(&enabledLibraryIDs).Error; err != nil {
+		return nil, err
+	}
+	for _, libraryID := range enabledLibraryIDs {
+		workKeys := make([]string, 0, len(workKeysByLibrary[libraryID]))
+		for workKey := range workKeysByLibrary[libraryID] {
+			workKeys = append(workKeys, workKey)
+		}
+		var entries []models.MediaLibraryEntry
+		if err := s.db.Where("library_id = ? AND work_key IN ?", libraryID, workKeys).Find(&entries).Error; err != nil {
+			return nil, err
+		}
+		entriesByWork := make(map[string][]models.MediaLibraryEntry)
+		for _, entry := range entries {
+			entriesByWork[entry.WorkKey] = append(entriesByWork[entry.WorkKey], entry)
+		}
+		for _, item := range candidatesByLibrary[libraryID] {
+			available[item.index] = serverHistoryIdentityAvailable(item.identity, entriesByWork[item.identity.workKey])
+		}
+	}
+	return available, nil
+}
+
+func serverHistoryIdentityAvailable(identity parsedCanonicalServerHistoryIdentity, entries []models.MediaLibraryEntry) bool {
+	if identity.kind == "movie" {
+		return len(entries) > 0
+	}
+	for _, entry := range entries {
+		if identity.kind == "episode-entry" && entry.ID == identity.entryID {
+			return true
+		}
+		if identity.kind == "episode" {
+			season, episode := resolvedCatalogEpisodeFacts(entry)
+			if equalIntPointers(season, identity.seasonNumber) && equalIntPointers(episode, identity.episodeNumber) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 type serverHistoryAuthority struct {

@@ -86,6 +86,8 @@ type PlayerMediaItem struct {
 	IMDbID          string              `json:"imdb_id,omitempty"`
 	PosterPath      string              `json:"poster_path,omitempty"`
 	BackdropPath    string              `json:"backdrop_path,omitempty"`
+	PosterURL       string              `json:"poster_url,omitempty"`
+	BackdropURL     string              `json:"backdrop_url,omitempty"`
 	StillPaths      []string            `json:"still_paths,omitempty"`
 	WorkIdentity    PlayerMediaIdentity `json:"work_identity"`
 	FileCount       int64               `json:"file_count"`
@@ -521,6 +523,7 @@ func (s *MediaLibraryService) playerMediaItem(libraryID uint, item MediaCatalogI
 		Directors: personNames(snapshot.Directors), Writers: personNames(snapshot.Writers), Cast: personNames(snapshot.Cast),
 		People: playerMediaPeople(snapshot),
 		TMDBID: snapshot.TMDBID, IMDbID: snapshot.IMDbID, PosterPath: safeTMDBImagePath(snapshot.PosterPath), BackdropPath: safeTMDBImagePath(snapshot.BackdropPath),
+		PosterURL: s.catalogImageURL(snapshot.PosterPath, "w500"), BackdropURL: s.catalogImageURL(snapshot.BackdropPath, "w1280"),
 		StillPaths: snapshotStillPaths(snapshot), WorkIdentity: identity, FileCount: item.FileCount,
 		SeasonCount: item.SeasonCount, EpisodeCount: item.EpisodeCount, ModifiedAt: item.ModifiedAt,
 		CategoryName: item.CategoryName, MatchStatus: item.MatchStatus,

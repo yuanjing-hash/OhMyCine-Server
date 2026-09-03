@@ -149,6 +149,86 @@ func TestPlayerHistoryCanonicalizesMovieAcrossOriginEntryAndPhysicalVersions(t *
 	}
 }
 
+func TestPlayerHistoryReconcilesLegacyMovieRowsWithoutIncomingChanges(t *testing.T) {
+	fixture := newPlayerHistoryCatalogFixture(t)
+	legacy := NewPlayerHistoryService(fixture.libraries.db)
+	firstToken := playerHistoryEntryToken(fixture.libraryID, fixture.movieWork, fixture.movie[0].ID)
+	secondToken := playerHistoryEntryToken(fixture.libraryID, fixture.movieWork, fixture.movie[1].ID)
+	first := fixture.change(strings.Repeat("d", 64), "legacy-phone", "https://legacy-phone.example.test", firstToken, 120, 2_000)
+	second := fixture.change(strings.Repeat("e", 64), "legacy-desktop", "https://legacy-desktop.example.test", secondToken, 360, 3_000)
+	if _, err := legacy.Sync(fixture.actor, 0, []PlayerHistoryChange{first, second}); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := fixture.history.Sync(fixture.actor, 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantIdentity := playerHistoryCanonicalIdentity(fixture.libraryID, fixture.movieWork, "movie", nil, nil, 0)
+	wantKey := playerHistoryCanonicalSyncKey(wantIdentity)
+	page, err := fixture.history.List(fixture.actor, 1, 100, "server")
+	if err != nil || page.Total != 1 || len(page.List) != 1 {
+		t.Fatalf("page=%+v err=%v", page, err)
+	}
+	if page.List[0].SyncKey != wantKey || page.List[0].HistoryIdentity != wantIdentity || page.List[0].Position != 360 {
+		t.Fatalf("canonical page=%+v", page)
+	}
+	if len(result.Changes) != 3 {
+		t.Fatalf("sync changes=%+v", result.Changes)
+	}
+	var activeLegacy int64
+	if err := fixture.libraries.db.Model(&models.PlayerPlaybackHistory{}).Where("user_id = ? AND canonical_identity = ? AND deleted = ?", fixture.actor.User.ID, "", false).Count(&activeLegacy).Error; err != nil || activeLegacy != 0 {
+		t.Fatalf("active legacy=%d err=%v", activeLegacy, err)
+	}
+
+	retry, err := fixture.history.Sync(fixture.actor, result.Cursor, nil)
+	if err != nil || len(retry.Changes) != 0 || retry.Cursor != result.Cursor {
+		t.Fatalf("idempotent retry=%+v err=%v", retry, err)
+	}
+}
+
+func TestPlayerHistoryLegacyReconciliationKeepsEpisodesDistinctAndNewestCanonicalState(t *testing.T) {
+	fixture := newPlayerHistoryCatalogFixture(t)
+	legacy := NewPlayerHistoryService(fixture.libraries.db)
+	episodeOneFirst := fixture.change(strings.Repeat("1a", 32), "legacy-phone", "https://legacy-phone.example.test", playerHistoryEntryToken(fixture.libraryID, fixture.seriesWork, fixture.episodes[0].ID), 60, 1_000)
+	episodeOneSecond := fixture.change(strings.Repeat("2b", 32), "legacy-tv", "https://legacy-tv.example.test", playerHistoryEntryToken(fixture.libraryID, fixture.seriesWork, fixture.episodes[1].ID), 180, 2_000)
+	episodeTwo := fixture.change(strings.Repeat("3c", 32), "legacy-tablet", "https://legacy-tablet.example.test", playerHistoryEntryToken(fixture.libraryID, fixture.seriesWork, fixture.episodes[2].ID), 30, 2_100)
+	if _, err := legacy.Sync(fixture.actor, 0, []PlayerHistoryChange{episodeOneFirst, episodeOneSecond, episodeTwo}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.history.Sync(fixture.actor, 0, nil); err != nil {
+		t.Fatal(err)
+	}
+	page, err := fixture.history.List(fixture.actor, 1, 100, "server")
+	if err != nil || page.Total != 2 || len(page.List) != 2 {
+		t.Fatalf("page=%+v err=%v", page, err)
+	}
+	if page.List[0].DisplaySubtitle != "S01E02 · 第二集" || page.List[0].Position != 30 || page.List[1].DisplaySubtitle != "S01E01 · 第一集" || page.List[1].Position != 180 {
+		t.Fatalf("episode page=%+v", page)
+	}
+
+	canonicalEpisodeOne := fixture.change(strings.Repeat("5e", 32), "canonical-device", "https://canonical.example.test", playerHistoryEntryToken(fixture.libraryID, fixture.seriesWork, fixture.episodes[0].ID), 240, 3_000)
+	if _, err := fixture.history.Sync(fixture.actor, 0, []PlayerHistoryChange{canonicalEpisodeOne}); err != nil {
+		t.Fatal(err)
+	}
+	olderLegacy := fixture.change(strings.Repeat("4d", 32), "old-device", "https://old.example.test", playerHistoryEntryToken(fixture.libraryID, fixture.seriesWork, fixture.episodes[1].ID), 90, 2_500)
+	if _, err := legacy.Sync(fixture.actor, 0, []PlayerHistoryChange{olderLegacy}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.history.Sync(fixture.actor, 0, nil); err != nil {
+		t.Fatal(err)
+	}
+	page, err = fixture.history.List(fixture.actor, 1, 100, "server")
+	if err != nil || page.Total != 2 {
+		t.Fatalf("page after canonical merge=%+v err=%v", page, err)
+	}
+	for _, item := range page.List {
+		if item.DisplaySubtitle == "S01E01 · 第一集" && item.Position != 240 {
+			t.Fatalf("older legacy replaced canonical state: %+v", item)
+		}
+	}
+}
+
 func TestPlayerHistoryCanonicalizesEpisodesAndKeepsSeriesPresentation(t *testing.T) {
 	fixture := newPlayerHistoryCatalogFixture(t)
 	firstToken := playerHistoryEntryToken(fixture.libraryID, fixture.seriesWork, fixture.episodes[0].ID)
@@ -210,7 +290,7 @@ func TestPlayerHistoryCanonicalizesEpisodesAndKeepsSeriesPresentation(t *testing
 func TestPlayerHistoryRejectsForgedCatalogItemAndPreservesUnresolvableLegacy(t *testing.T) {
 	fixture := newPlayerHistoryCatalogFixture(t)
 	legacy := NewPlayerHistoryService(fixture.libraries.db)
-	unresolved := PlayerHistoryChange{SyncKey: strings.Repeat("8", 64), SourceKind: "server", SourceLocator: "https://legacy.example.test", SourceID: "legacy", MediaIdentity: "entry|999|invalid|1", Title: "Legacy", Position: 10, UpdatedAt: 1_000}
+	unresolved := PlayerHistoryChange{SyncKey: strings.Repeat("8", 64), SourceKind: "server", SourceLocator: "https://legacy.example.test", SourceID: "legacy", MediaIdentity: "entry|999|invalid|1", Title: "Legacy", Position: 10, UpdatedAt: 3_000}
 	if _, err := legacy.Sync(fixture.actor, 0, []PlayerHistoryChange{unresolved}); err != nil {
 		t.Fatal(err)
 	}
@@ -219,8 +299,8 @@ func TestPlayerHistoryRejectsForgedCatalogItemAndPreservesUnresolvableLegacy(t *
 	if _, err := fixture.history.Sync(fixture.actor, 0, []PlayerHistoryChange{valid}); err != nil {
 		t.Fatal(err)
 	}
-	page, err := fixture.history.List(fixture.actor, 1, 100, "server")
-	if err != nil || page.Total != 2 {
+	page, err := fixture.history.List(fixture.actor, 1, 1, "server")
+	if err != nil || page.Total != 1 || len(page.List) != 1 || page.HasMore || page.List[0].HistoryIdentity == "" {
 		t.Fatalf("page=%+v err=%v", page, err)
 	}
 	forged := valid
@@ -242,6 +322,25 @@ func TestPlayerHistoryRejectsForgedCatalogItemAndPreservesUnresolvableLegacy(t *
 	forged.SyncKey = strings.Repeat("c", 64)
 	if _, err := fixture.history.Sync(denied, 0, []PlayerHistoryChange{forged}); ErrorCode(err) != CodePermissionDenied {
 		t.Fatalf("denied actor err=%v", err)
+	}
+}
+
+func TestPlayerHistoryServerListHidesCanonicalItemsMissingFromCurrentCatalog(t *testing.T) {
+	fixture := newPlayerHistoryCatalogFixture(t)
+	change := fixture.change(strings.Repeat("f", 64), "desktop", "https://desktop.example.test", playerHistoryEntryToken(fixture.libraryID, fixture.movieWork, fixture.movie[0].ID), 120, 2_000)
+	if _, err := fixture.history.Sync(fixture.actor, 0, []PlayerHistoryChange{change}); err != nil {
+		t.Fatal(err)
+	}
+	page, err := fixture.history.List(fixture.actor, 1, 100, "server")
+	if err != nil || len(page.List) != 1 {
+		t.Fatalf("available page=%+v err=%v", page, err)
+	}
+	if err := fixture.libraries.db.Where("library_id = ? AND work_key = ?", fixture.libraryID, "movie:tmdb:200").Delete(&models.MediaLibraryEntry{}).Error; err != nil {
+		t.Fatal(err)
+	}
+	page, err = fixture.history.List(fixture.actor, 1, 100, "server")
+	if err != nil || page.Total != 0 || len(page.List) != 0 || page.HasMore {
+		t.Fatalf("missing catalog item leaked into history: page=%+v err=%v", page, err)
 	}
 }
 

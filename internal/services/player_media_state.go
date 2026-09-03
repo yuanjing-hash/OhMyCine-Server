@@ -31,6 +31,8 @@ type PlayerCollectionSummary struct {
 	ItemCount    int    `json:"item_count"`
 	PosterPath   string `json:"poster_path,omitempty"`
 	BackdropPath string `json:"backdrop_path,omitempty"`
+	PosterURL    string `json:"poster_url,omitempty"`
+	BackdropURL  string `json:"backdrop_url,omitempty"`
 }
 
 func NewPlayerMediaStateService(db *gorm.DB, libraries *MediaLibraryService) *PlayerMediaStateService {
@@ -136,6 +138,14 @@ func (s *PlayerMediaStateService) Favorites(actor Actor) ([]PlayerMediaItem, err
 	return result, nil
 }
 
+func (s *PlayerMediaStateService) BrowserFavorites(actor Actor) ([]BrowserMediaItem, error) {
+	items, err := s.Favorites(actor)
+	if err != nil {
+		return nil, err
+	}
+	return browserMediaItems(items), nil
+}
+
 func normalizePlayerCollectionInput(name, kind string) (string, string, error) {
 	name = strings.TrimSpace(name)
 	kind = strings.TrimSpace(kind)
@@ -201,9 +211,17 @@ func (s *PlayerMediaStateService) Collections(actor Actor, kind string) ([]Playe
 		if row.Source == models.PlayerMediaCollectionSourceTMDB && len(items) == 0 {
 			continue
 		}
-		result = append(result, PlayerCollectionSummary{ID: row.ID, Name: row.Name, Kind: row.Kind, Source: row.Source, ItemCount: len(items), PosterPath: row.PosterPath, BackdropPath: row.BackdropPath})
+		result = append(result, PlayerCollectionSummary{ID: row.ID, Name: row.Name, Kind: row.Kind, Source: row.Source, ItemCount: len(items), PosterPath: row.PosterPath, BackdropPath: row.BackdropPath, PosterURL: s.libraries.catalogImageURL(row.PosterPath, "w500"), BackdropURL: s.libraries.catalogImageURL(row.BackdropPath, "w1280")})
 	}
 	return result, nil
+}
+
+func (s *PlayerMediaStateService) BrowserCollections(actor Actor, kind string) ([]BrowserCollectionSummary, error) {
+	items, err := s.Collections(actor, kind)
+	if err != nil {
+		return nil, err
+	}
+	return browserCollections(items), nil
 }
 
 func (s *PlayerMediaStateService) collectionItems(actor Actor, collectionID string) ([]PlayerMediaItem, error) {
@@ -232,6 +250,14 @@ func (s *PlayerMediaStateService) CollectionItems(actor Actor, collectionID stri
 		return nil, err
 	}
 	return s.collectionItems(actor, collectionID)
+}
+
+func (s *PlayerMediaStateService) BrowserCollectionItems(actor Actor, collectionID string) ([]BrowserMediaItem, error) {
+	items, err := s.CollectionItems(actor, collectionID)
+	if err != nil {
+		return nil, err
+	}
+	return browserMediaItems(items), nil
 }
 
 func (s *PlayerMediaStateService) AddCollectionItem(actor Actor, collectionID, itemID string) error {

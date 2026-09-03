@@ -217,6 +217,25 @@ func (s *PlayerOverviewService) Overview(actor Actor) PlayerOverview {
 	return result
 }
 
+func (s *PlayerOverviewService) BrowserOverview(actor Actor) BrowserMediaOverview {
+	result := s.Overview(actor)
+	libraries, ok := s.libraries.(*MediaLibraryService)
+	if !ok {
+		libraries = nil
+	}
+	return BrowserMediaOverview{
+		Version: result.Version,
+		Sections: BrowserMediaOverviewSections{
+			ContinueWatching:     browserSection(result.Sections.ContinueWatching, func(items []PlayerHistoryChange) []BrowserHistoryItem { return browserHistoryItems(items, libraries) }),
+			RecentlyAdded:        browserSection(result.Sections.RecentlyAdded, browserMediaItems),
+			Favorites:            browserSection(result.Sections.Favorites, browserMediaItems),
+			AutomaticCollections: browserSection(result.Sections.AutomaticCollections, browserCollections),
+			ManualCollections:    browserSection(result.Sections.ManualCollections, browserCollections),
+			MediaLibraries:       browserSection(result.Sections.MediaLibraries, browserLibraries),
+		},
+	}
+}
+
 func (s *PlayerOverviewService) loadLibraries(actor Actor) ([]PlayerMediaLibrary, error) {
 	if s == nil || s.libraries == nil {
 		return nil, appError(CodeInvalidRequest, "Server 暂不支持媒体总览", nil)

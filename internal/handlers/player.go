@@ -295,14 +295,9 @@ func (a *API) PlayerHistory(c *gin.Context) {
 		writeError(c, a.log, &services.AppError{Code: services.CodeInvalidRequest, Message: "Server 暂不支持播放历史"})
 		return
 	}
-	page, err := strconv.Atoi(c.DefaultQuery("page", "1"))
+	page, pageSize, err := historyPageParameters(c)
 	if err != nil {
-		writeError(c, a.log, invalid("播放历史页码无效", err))
-		return
-	}
-	pageSize, err := strconv.Atoi(c.DefaultQuery("page_size", "24"))
-	if err != nil {
-		writeError(c, a.log, invalid("播放历史分页大小无效", err))
+		writeError(c, a.log, err)
 		return
 	}
 	result, err := a.playerHistory.List(mustActor(c), page, pageSize, c.Query("source_kind"))

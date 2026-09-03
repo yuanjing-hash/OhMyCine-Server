@@ -1,9 +1,15 @@
 package httpserver
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
+
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
 )
 
 func TestPlayerOverviewUsesDeviceBearerAndAdvertisedVersionedCapabilities(t *testing.T) {
@@ -66,6 +72,121 @@ func TestPlayerOverviewUsesDeviceBearerAndAdvertisedVersionedCapabilities(t *tes
 		if jsonContainsKey(overviewEnvelope.Data, forbidden) {
 			t.Fatalf("overview leaked %q: %s", forbidden, overviewEnvelope.Data)
 		}
+	}
+}
+
+func TestBrowserMediaLibraryOverviewUsesSessionFiltersSourcesAndReturnsSafeDTOs(t *testing.T) {
+	client := newTestClient(t)
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/media-libraries/overview", nil)
+	response := httptest.NewRecorder()
+	client.router.ServeHTTP(response, request)
+	if response.Code != http.StatusUnauthorized || response.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("anonymous status=%d cache=%q", response.Code, response.Header().Get("Cache-Control"))
+	}
+
+	client.setup(t)
+	var owner models.User
+	if err := client.db.Where("username_normalized = ?", "owner").First(&owner).Error; err != nil {
+		t.Fatal(err)
+	}
+	var profile models.MediaClassificationProfile
+	if err := client.db.Where("code = ?", "default-v1").First(&profile).Error; err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	storage := models.Storage{Name: "Overview local", NameNormalized: "overview-local", Type: models.StorageTypeLocal, RootPath: t.TempDir(), RootPathNormalized: "overview-local", Enabled: true, Capabilities: `{}`, CreatedAt: now, UpdatedAt: now}
+	if err := client.db.Create(&storage).Error; err != nil {
+		t.Fatal(err)
+	}
+	library := models.MediaLibrary{Name: "Overview library", NameNormalized: "overview-library", StorageID: storage.ID, ProfileID: profile.ID, ProfileRevision: profile.Revision, RelativeRoot: "/", Enabled: true, Recursive: true, VideoExtensionsJSON: `[".mkv"]`, IgnorePatternsJSON: `[]`, Status: models.MediaLibraryStatusListening, ArtifactStatus: models.MediaArtifactStatusCompleted, CreatedAt: now, UpdatedAt: now}
+	if err := client.db.Select("*").Create(&library).Error; err != nil {
+		t.Fatal(err)
+	}
+	workKey := "movie:tmdb:346"
+	entry := models.MediaLibraryEntry{LibraryID: library.ID, RelativePath: "/Seven.Samurai.1954.mkv", Size: 100, ModifiedAt: now, MediaType: "movie", Title: "七武士", WorkKey: workKey, MatchStatus: "matched", CategoryName: "电影", LastGeneration: 1, CreatedAt: now, UpdatedAt: now}
+	if err := client.db.Create(&entry).Error; err != nil {
+		t.Fatal(err)
+	}
+	manualCollectionID := "11111111-1111-4111-8111-111111111111"
+	favorite := models.PlayerMediaFavorite{UserID: owner.ID, LibraryID: library.ID, WorkKey: workKey, CreatedAt: now, UpdatedAt: now}
+	manualCollection := models.PlayerMediaCollection{ID: manualCollectionID, OwnerID: &owner.ID, Source: models.PlayerMediaCollectionSourceManual, Kind: models.PlayerMediaCollectionKindCollection, Name: "周末片单", Visible: true, Revision: 1, CreatedAt: now, UpdatedAt: now}
+	manualItem := models.PlayerMediaCollectionItem{CollectionID: manualCollectionID, LibraryID: library.ID, WorkKey: workKey, Origin: models.PlayerMediaCollectionItemOriginManual, CreatedAt: now, UpdatedAt: now}
+	if err := client.db.Create(&favorite).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := client.db.Create(&manualCollection).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := client.db.Create(&manualItem).Error; err != nil {
+		t.Fatal(err)
+	}
+	workToken := base64.RawURLEncoding.EncodeToString([]byte(workKey))
+	identity := "server:v1:movie:" + uintString(library.ID) + ":" + workToken
+	duration := 6000.0
+	rows := []models.PlayerPlaybackHistory{
+		{UserID: owner.ID, SyncKey: strings.Repeat("a", 64), HistoryIdentity: identity, SourceKind: "server", SourceID: "server-private-id", LibraryID: uintString(library.ID), ItemID: "work|" + uintString(library.ID) + "|" + workToken, ItemToken: "work|" + uintString(library.ID) + "|" + workToken, MediaIdentity: identity, Title: "七武士", DisplayTitle: "七武士", MediaType: "movie", PosterPath: "/poster-secret-path.jpg", Position: 1200, Duration: &duration, ClientUpdatedAt: now.UnixMilli(), Revision: 1, CreatedAt: now, UpdatedAt: now},
+		{UserID: owner.ID, SyncKey: strings.Repeat("b", 64), SourceKind: "emby", SourceLocator: "https://emby.example.test", SourceID: "emby-private-id", MediaIdentity: "emby-item", Title: "外部 Emby 作品", DisplayTitle: "外部 Emby 作品", Position: 300, Duration: &duration, ClientUpdatedAt: now.Add(-time.Minute).UnixMilli(), Revision: 2, CreatedAt: now, UpdatedAt: now},
+	}
+	if err := client.db.Create(&rows).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	status, envelope := client.request(t, http.MethodGet, "/api/v1/media-libraries/overview", nil, false)
+	if status != http.StatusOK || client.lastHeader.Get("Cache-Control") != "no-store" {
+		t.Fatalf("overview status=%d cache=%q data=%s", status, client.lastHeader.Get("Cache-Control"), envelope.Data)
+	}
+	var overview struct {
+		Sections map[string]struct {
+			List []json.RawMessage `json:"list"`
+		} `json:"sections"`
+	}
+	if err := json.Unmarshal(envelope.Data, &overview); err != nil {
+		t.Fatal(err)
+	}
+	if len(overview.Sections["continue_watching"].List) != 1 {
+		t.Fatalf("continue watching=%s", envelope.Data)
+	}
+	if _, duplicated := overview.Sections["recent_history"]; duplicated {
+		t.Fatalf("browser overview must not duplicate history: %s", envelope.Data)
+	}
+	for _, forbidden := range []string{"source_kind", "source_locator", "source_id", "item_token", "media_identity", "poster_path", "provider_id", "root_path"} {
+		if jsonContainsKey(envelope.Data, forbidden) {
+			t.Fatalf("browser overview leaked %q: %s", forbidden, envelope.Data)
+		}
+	}
+
+	status, envelope = client.request(t, http.MethodGet, "/api/v1/media-libraries/history?page=1&page_size=24", nil, false)
+	var page struct {
+		List []json.RawMessage `json:"list"`
+	}
+	if err := json.Unmarshal(envelope.Data, &page); status != http.StatusOK || err != nil || len(page.List) != 1 {
+		t.Fatalf("history status=%d err=%v data=%s", status, err, envelope.Data)
+	}
+	if bytes := string(envelope.Data); strings.Contains(bytes, "外部 Emby 作品") || strings.Contains(bytes, "server-private-id") || strings.Contains(bytes, "poster-secret-path") {
+		t.Fatalf("history leaked foreign/private data: %s", bytes)
+	}
+	for _, path := range []string{
+		"/api/v1/media-libraries/favorites",
+		"/api/v1/media-libraries/collections?kind=collection",
+		"/api/v1/media-libraries/collections/" + manualCollectionID + "/items",
+	} {
+		status, envelope = client.request(t, http.MethodGet, path, nil, false)
+		if status != http.StatusOK || client.lastHeader.Get("Cache-Control") != "no-store" {
+			t.Fatalf("%s status=%d cache=%q data=%s", path, status, client.lastHeader.Get("Cache-Control"), envelope.Data)
+		}
+		for _, forbidden := range []string{"item_token", "history_identity", "work_identity", "poster_path", "backdrop_path", "provider_id", "relative_path", "root_path"} {
+			if jsonContainsKey(envelope.Data, forbidden) {
+				t.Fatalf("%s leaked %q: %s", path, forbidden, envelope.Data)
+			}
+		}
+	}
+
+	if err := client.db.Delete(&entry).Error; err != nil {
+		t.Fatal(err)
+	}
+	status, envelope = client.request(t, http.MethodGet, "/api/v1/media-libraries/history?page=1&page_size=24", nil, false)
+	if err := json.Unmarshal(envelope.Data, &page); status != http.StatusOK || err != nil || len(page.List) != 0 {
+		t.Fatalf("deleted catalog history status=%d err=%v data=%s", status, err, envelope.Data)
 	}
 }
 

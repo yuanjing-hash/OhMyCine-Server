@@ -109,6 +109,13 @@ func New(cfg config.Config, api *handlers.API, auth *services.AuthService, log z
 	v1.GET("/setup/status", api.SetupStatus)
 	v1.POST("/setup/owner", api.SetupOwner)
 	v1.POST("/auth/login", api.Login)
+	mediaLibraryUserAPI := v1.Group("")
+	mediaLibraryUserAPI.Use(middleware.NoStore(), middleware.Auth(auth, api.CookieName()), middleware.CSRF(auth))
+	mediaLibraryUserAPI.GET("/media-libraries/overview", middleware.RequirePermission(authz.PermissionMediaLibrariesRead), api.MediaLibraryOverview)
+	mediaLibraryUserAPI.GET("/media-libraries/history", middleware.RequirePermission(authz.PermissionMediaLibrariesRead), api.MediaLibraryHistory)
+	mediaLibraryUserAPI.GET("/media-libraries/favorites", middleware.RequirePermission(authz.PermissionMediaLibrariesRead), api.MediaLibraryFavorites)
+	mediaLibraryUserAPI.GET("/media-libraries/collections", middleware.RequirePermission(authz.PermissionMediaLibrariesRead), api.MediaLibraryCollections)
+	mediaLibraryUserAPI.GET("/media-libraries/collections/:id/items", middleware.RequirePermission(authz.PermissionMediaLibrariesRead), api.MediaLibraryCollectionItems)
 
 	protected := v1.Group("")
 	protected.Use(middleware.Auth(auth, api.CookieName()), middleware.CSRF(auth))
