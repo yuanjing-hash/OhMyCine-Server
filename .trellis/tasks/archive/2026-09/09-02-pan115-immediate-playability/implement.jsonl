@@ -1,4 +1,0 @@
-{"_example": "Fill with {\"file\": \"<path>\", \"reason\": \"<why>\"}. Put spec/research files only — no code paths. Run `python .trellis/scripts/get_context.py --mode packages` to list available specs. Delete this line once real entries are added."}
-{"file": ".trellis/spec/backend/media-library-foundation.md", "reason": "Player catalog、115 扫描、artifact 与通知契约"}
-{"file": ".trellis/spec/backend/persistent-task-queue.md", "reason": "媒体产物队列合并、资源并发与租约契约"}
-{"file": "docs/architecture/07-security-design.md", "reason": "受保护播放、临时 URL、provider 边界与信息泄漏约束"}
