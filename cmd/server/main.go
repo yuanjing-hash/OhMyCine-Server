@@ -11,6 +11,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	_ "time/tzdata"
 
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/config"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/credential"

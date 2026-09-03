@@ -54,6 +54,14 @@ class WorkflowTests(unittest.TestCase):
             path.write_text(source, encoding="utf-8")
             self.assertIn("lint action supports v2 and version is pinned", guard.verify_workflow(path))
 
+    def test_detects_missing_standalone_timezone_guard(self) -> None:
+        source = guard.DEFAULT_WORKFLOW.read_text(encoding="utf-8")
+        source = source.replace("go list -deps -tags webui ./cmd/server | grep -Fxq 'time/tzdata'", "")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "workflow.yml"
+            path.write_text(source, encoding="utf-8")
+            self.assertIn("standalone timezone database is enforced", guard.verify_workflow(path))
+
     def test_detects_missing_linker_build_identity(self) -> None:
         source = guard.DEFAULT_WORKFLOW.read_text(encoding="utf-8")
         source = source.replace(

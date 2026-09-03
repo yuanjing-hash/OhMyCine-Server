@@ -171,3 +171,26 @@ func TestLegacyScheduleSyncAllowsInstallWithoutOwner(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestUnifiedScheduleStartSurvivesInvalidLegacyMediaLibrarySchedule(t *testing.T) {
+	service, queue, actor, now := scheduleFixture(t)
+	if err := queue.db.Model(&models.User{}).Where("id = ?", actor.User.ID).Update("is_owner", true).Error; err != nil {
+		t.Fatal(err)
+	}
+	storage := models.Storage{Name: "Legacy schedule storage", NameNormalized: "legacy-schedule-storage", Type: models.StorageTypeLocal, RootPath: t.TempDir(), RootPathNormalized: uuid.NewString(), Enabled: true, Capabilities: `{}`}
+	if err := queue.db.Create(&storage).Error; err != nil {
+		t.Fatal(err)
+	}
+	profile := models.MediaClassificationProfile{Name: "Legacy schedule profile", NameNormalized: "legacy-schedule-profile", Kind: models.MediaClassificationProfileKindCustom, SchemaVersion: 1, RulesJSON: `{"version":1,"groups":[]}`, BuiltinRecognitionPacksJSON: `[]`, RecognitionRulesJSON: `[]`, Revision: 1}
+	if err := queue.db.Create(&profile).Error; err != nil {
+		t.Fatal(err)
+	}
+	library := models.MediaLibrary{Name: "Invalid legacy schedule", NameNormalized: "invalid-legacy-schedule", StorageID: storage.ID, ProfileID: profile.ID, ProfileRevision: 1, RelativeRoot: "/", Enabled: true, FullScanIntervalHours: 25, VideoExtensionsJSON: `[]`, STRMAssetExtraExtensionsJSON: `[]`, IgnorePatternsJSON: `[]`, CreatedAt: now, UpdatedAt: now}
+	if err := queue.db.Create(&library).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := service.Start(context.Background()); err != nil {
+		t.Fatalf("invalid legacy schedule stopped Server startup: %v", err)
+	}
+	service.Close()
+}

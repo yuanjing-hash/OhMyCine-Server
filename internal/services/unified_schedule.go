@@ -321,9 +321,12 @@ func (s *UnifiedScheduleService) Start(parent context.Context) error {
 	ctx, cancel := context.WithCancel(parent)
 	s.cancel = cancel
 	if err := s.syncLegacyDefinitions(); err != nil {
-		cancel()
-		s.cancel = nil
-		return err
+		if ErrorCode(err) != CodeInvalidRequest {
+			cancel()
+			s.cancel = nil
+			return err
+		}
+		s.log.Warn().Err(err).Str("error_code", ErrorCode(err)).Msg("旧计划任务配置无效，已跳过迁移并继续启动")
 	}
 	if err := s.Poll(ctx); err != nil {
 		cancel()

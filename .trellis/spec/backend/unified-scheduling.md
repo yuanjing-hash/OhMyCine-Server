@@ -1,5 +1,9 @@
 # Unified Scheduling
 
+Official standalone Server binaries must import Go's `time/tzdata`; Windows release artifacts cannot depend on a Go installation or host IANA zone database to resolve schedule timezones. The Server beta workflow must reject a build graph that does not contain `time/tzdata`.
+
+An invalid legacy schedule configuration is recoverable startup data, not a Server lifecycle failure. Skip the legacy migration with a structured warning and continue serving HTTP; durable due schedules are validated individually and invalid definitions are disabled by the polling path. Database or queue failures remain fatal.
+
 ## Scope
 
 Use this contract for configurable periodic work, schedule APIs/UI, migration from legacy interval fields, or queue dispatch from Cron.
