@@ -12,6 +12,18 @@ import (
 	"gorm.io/gorm/clause"
 )
 
+const acquisitionReconcileDownloadLimit = 500
+
+type acquisitionMediaIdentity struct {
+	MediaType string
+	TMDBID    int64
+}
+
+type acquisitionDownloadCandidate struct {
+	Task     models.DownloadTask
+	Identity acquisitionMediaIdentity
+}
+
 type AcquisitionStatus struct {
 	ID                   string     `json:"id,omitempty"`
 	Title                string     `json:"title,omitempty"`
@@ -51,6 +63,9 @@ func (s *AcquisitionService) Get(actor Actor, mediaType string, tmdbID int64) (A
 	if (mediaType != "movie" && mediaType != "tv") || tmdbID <= 0 {
 		return AcquisitionStatus{}, appError(CodeInvalidRequest, "媒体身份无效", nil)
 	}
+	if err := s.reconcileDirectDownloads(actor.User.ID); err != nil {
+		return AcquisitionStatus{}, err
+	}
 	var row models.MediaAcquisition
 	if err := s.db.Where("owner_id = ? AND media_type = ? AND tmdb_id = ?", actor.User.ID, mediaType, tmdbID).First(&row).Error; err != nil {
 		if err == gorm.ErrRecordNotFound {
@@ -67,6 +82,9 @@ func (s *AcquisitionService) List(actor Actor, page, pageSize int) (AcquisitionP
 	}
 	if page < 1 || page > 100000 || pageSize < 1 || pageSize > 100 {
 		return AcquisitionPage{}, appError(CodeInvalidRequest, "入库任务分页参数无效", nil)
+	}
+	if err := s.reconcileDirectDownloads(actor.User.ID); err != nil {
+		return AcquisitionPage{}, err
 	}
 	query := s.db.Model(&models.MediaAcquisition{}).Where("owner_id = ?", actor.User.ID)
 	var total int64
@@ -151,12 +169,159 @@ func projectDownloadProgress(status *AcquisitionStatus, task models.DownloadTask
 }
 
 func (s *AcquisitionService) RecordDownload(ownerID uint, summary DownloadTaskSummary) error {
-	if summary.ScrapeTMDBID == nil || *summary.ScrapeTMDBID <= 0 || (summary.ScrapeMediaType != "movie" && summary.ScrapeMediaType != "tv") {
+	if ownerID == 0 || strings.TrimSpace(summary.ID) == "" {
 		return nil
 	}
-	snapshot, _ := json.Marshal(map[string]any{"downloader_id": summary.DownloaderID, "target_library_id": summary.TargetLibraryID, "profile_id": summary.ProfileID, "route_kind": summary.RouteKind})
-	row := models.MediaAcquisition{ID: uuid.NewString(), OwnerID: ownerID, MediaType: summary.ScrapeMediaType, TMDBID: *summary.ScrapeTMDBID, Stage: "download", Status: summary.Phase, DownloadTaskID: summary.ID, TargetLibraryID: summary.TargetLibraryID, LastErrorCode: summary.LastErrorCode, FrozenSnapshotJSON: string(snapshot), Revision: 1}
-	return s.upsert(row, map[string]any{"stage": row.Stage, "status": row.Status, "download_task_id": row.DownloadTaskID, "target_library_id": row.TargetLibraryID, "last_error_code": row.LastErrorCode, "frozen_snapshot_json": row.FrozenSnapshotJSON, "revision": gorm.Expr("media_acquisitions.revision + 1"), "updated_at": time.Now().UTC()})
+	var task models.DownloadTask
+	if err := s.db.Where("id = ? AND owner_id = ?", strings.TrimSpace(summary.ID), ownerID).First(&task).Error; err != nil {
+		if err == gorm.ErrRecordNotFound {
+			return nil
+		}
+		return err
+	}
+	identity, ok := acquisitionIdentityForDownload(task)
+	if !ok {
+		return nil
+	}
+	return s.recordDownloadTask(task, identity)
+}
+
+// reconcileDirectDownloads repairs projections missed by Server versions that
+// only inspected scrape fields at task creation time. The bounded query is
+// deliberately limited to poster-originated identities so ordinary download
+// history does not unexpectedly become Player acquisition history.
+func (s *AcquisitionService) reconcileDirectDownloads(ownerID uint) error {
+	if ownerID == 0 {
+		return nil
+	}
+	var tasks []models.DownloadTask
+	if err := s.db.Where("owner_id = ? AND identity_source = ? AND identity_status = ? AND identity_revision > 0", ownerID, mediaIdentitySourceDirectID, mediaIdentityStatusVerified).
+		Order("created_at DESC, id DESC").Limit(acquisitionReconcileDownloadLimit).Find(&tasks).Error; err != nil {
+		return err
+	}
+	seen := make(map[acquisitionMediaIdentity]struct{}, len(tasks))
+	candidates := make([]acquisitionDownloadCandidate, 0, len(tasks))
+	movieIDs := make([]int64, 0, len(tasks))
+	tvIDs := make([]int64, 0, len(tasks))
+	for _, task := range tasks {
+		identity, ok := acquisitionIdentityFromSnapshot(task)
+		if !ok {
+			continue
+		}
+		if _, exists := seen[identity]; exists {
+			continue
+		}
+		seen[identity] = struct{}{}
+		candidates = append(candidates, acquisitionDownloadCandidate{Task: task, Identity: identity})
+		if identity.MediaType == "movie" {
+			movieIDs = append(movieIDs, identity.TMDBID)
+		} else {
+			tvIDs = append(tvIDs, identity.TMDBID)
+		}
+	}
+	if len(candidates) == 0 {
+		return nil
+	}
+	query := s.db.Where("owner_id = ?", ownerID)
+	switch {
+	case len(movieIDs) > 0 && len(tvIDs) > 0:
+		query = query.Where("(media_type = ? AND tmdb_id IN ?) OR (media_type = ? AND tmdb_id IN ?)", "movie", movieIDs, "tv", tvIDs)
+	case len(movieIDs) > 0:
+		query = query.Where("media_type = ? AND tmdb_id IN ?", "movie", movieIDs)
+	default:
+		query = query.Where("media_type = ? AND tmdb_id IN ?", "tv", tvIDs)
+	}
+	var existingRows []models.MediaAcquisition
+	if err := query.Find(&existingRows).Error; err != nil {
+		return err
+	}
+	existingByIdentity := make(map[acquisitionMediaIdentity]models.MediaAcquisition, len(existingRows))
+	for _, row := range existingRows {
+		existingByIdentity[acquisitionMediaIdentity{MediaType: row.MediaType, TMDBID: row.TMDBID}] = row
+	}
+	for _, candidate := range candidates {
+		if existing, ok := existingByIdentity[candidate.Identity]; ok && existing.DownloadTaskID == candidate.Task.ID {
+			continue
+		}
+		if err := s.recordDownloadTask(candidate.Task, candidate.Identity); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func acquisitionIdentityForDownload(task models.DownloadTask) (acquisitionMediaIdentity, bool) {
+	mediaType := strings.TrimSpace(task.ScrapeMediaType)
+	if task.ScrapeTMDBID != nil && *task.ScrapeTMDBID > 0 && (mediaType == "movie" || mediaType == "tv") {
+		return acquisitionMediaIdentity{MediaType: mediaType, TMDBID: *task.ScrapeTMDBID}, true
+	}
+	return acquisitionIdentityFromSnapshot(task)
+}
+
+func acquisitionIdentityFromSnapshot(task models.DownloadTask) (acquisitionMediaIdentity, bool) {
+	if task.IdentityRevision == 0 || strings.TrimSpace(task.IdentitySnapshotJSON) == "" {
+		return acquisitionMediaIdentity{}, false
+	}
+	snapshot, err := decodeMediaIdentity(task.IdentitySnapshotJSON)
+	if err != nil || snapshot.Revision != task.IdentityRevision || snapshot.Source != task.IdentitySource || snapshot.Status != task.IdentityStatus || snapshot.Locked != task.IdentityLocked || snapshot.TMDBID == nil || *snapshot.TMDBID <= 0 {
+		return acquisitionMediaIdentity{}, false
+	}
+	mediaType := strings.TrimSpace(snapshot.MediaType)
+	if mediaType != "movie" && mediaType != "tv" {
+		return acquisitionMediaIdentity{}, false
+	}
+	if !validDownloadIdentityBinding(DownloadRecognitionIdentity{TMDBID: *snapshot.TMDBID, MediaType: mediaType, Source: snapshot.Source, Status: snapshot.Status, Locked: snapshot.Locked, Season: cloneInt(snapshot.Season), Episode: cloneInt(snapshot.Episode)}) {
+		return acquisitionMediaIdentity{}, false
+	}
+	return acquisitionMediaIdentity{MediaType: mediaType, TMDBID: *snapshot.TMDBID}, true
+}
+
+func (s *AcquisitionService) recordDownloadTask(task models.DownloadTask, identity acquisitionMediaIdentity) error {
+	snapshot, err := json.Marshal(map[string]any{"downloader_id": task.DownloaderID, "target_library_id": task.TargetLibraryID, "profile_id": task.ProfileID, "route_kind": task.TransferRouteKind})
+	if err != nil {
+		return err
+	}
+	frozenSnapshot := string(snapshot)
+	return s.db.Transaction(func(tx *gorm.DB) error {
+		var existing models.MediaAcquisition
+		err := tx.Where("owner_id = ? AND media_type = ? AND tmdb_id = ?", task.OwnerID, identity.MediaType, identity.TMDBID).First(&existing).Error
+		if err != nil && err != gorm.ErrRecordNotFound {
+			return err
+		}
+		if err == nil {
+			if existing.DownloadTaskID == task.ID && optionalUintEqual(existing.TargetLibraryID, task.TargetLibraryID) && existing.FrozenSnapshotJSON == frozenSnapshot {
+				return nil
+			}
+			if keepExistingAcquisitionDownload(tx, existing.DownloadTaskID, task) {
+				return nil
+			}
+		}
+		now := time.Now().UTC()
+		row := models.MediaAcquisition{ID: uuid.NewString(), OwnerID: task.OwnerID, MediaType: identity.MediaType, TMDBID: identity.TMDBID, Stage: acquisitionDownloadState(task), Status: task.Phase, DownloadTaskID: task.ID, TargetLibraryID: task.TargetLibraryID, LastErrorCode: task.LastErrorCode, FrozenSnapshotJSON: frozenSnapshot, Revision: 1, CreatedAt: now, UpdatedAt: now}
+		updates := map[string]any{"stage": row.Stage, "status": row.Status, "download_task_id": row.DownloadTaskID, "target_library_id": row.TargetLibraryID, "last_error_code": row.LastErrorCode, "frozen_snapshot_json": row.FrozenSnapshotJSON, "revision": gorm.Expr("media_acquisitions.revision + 1"), "updated_at": now}
+		return tx.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "owner_id"}, {Name: "media_type"}, {Name: "tmdb_id"}}, DoUpdates: clause.Assignments(updates)}).Create(&row).Error
+	})
+}
+
+func optionalUintEqual(left, right *uint) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return *left == *right
+}
+
+func keepExistingAcquisitionDownload(tx *gorm.DB, existingTaskID string, candidate models.DownloadTask) bool {
+	if strings.TrimSpace(existingTaskID) == "" {
+		return false
+	}
+	var existing models.DownloadTask
+	if err := tx.Select("id", "owner_id", "created_at").First(&existing, "id = ?", existingTaskID).Error; err != nil || existing.OwnerID != candidate.OwnerID {
+		return false
+	}
+	if existing.CreatedAt.After(candidate.CreatedAt) {
+		return true
+	}
+	return existing.CreatedAt.Equal(candidate.CreatedAt) && existing.ID >= candidate.ID
 }
 
 func (s *AcquisitionService) RecordFollow(summary FollowSummary) error {

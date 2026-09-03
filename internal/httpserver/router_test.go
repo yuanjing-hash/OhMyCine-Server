@@ -259,6 +259,7 @@ func newTestClient(t *testing.T) *testClient {
 	coverage := services.NewMediaCoverageService(db, metadataSettings)
 	api.SetMediaCoverageService(coverage)
 	api.SetPlayerHistoryService(services.NewPlayerHistoryService(db))
+	api.SetPlayerMediaStateService(services.NewPlayerMediaStateService(db, libraries))
 	follows := services.NewFollowService(db, audit, queue, coverage, authorization)
 	api.SetFollowService(follows)
 	libraries.SetMetadataSettingsService(metadataSettings)
@@ -320,13 +321,28 @@ func TestPlayerAcquisitionListRequiresDeviceAuthScopesOwnerAndValidatesInput(t *
 	if err := client.db.Create(&rows).Error; err != nil {
 		t.Fatal(err)
 	}
+	directJob, err := client.queue.Enqueue(services.EnqueueJobInput{OwnerID: owner.ID, JobType: "download", DisplayName: "Player direct acquisition", Payload: map[string]any{"download_task_id": "owner-direct-download"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	directDownload := models.DownloadTask{ID: "owner-direct-download", OwnerID: owner.ID, JobID: directJob.ID, DownloaderName: "Test", ProviderType: models.DownloaderTypeFake, SourceCiphertext: "encrypted", DisplayName: "Doraemon", Phase: models.DownloadTaskStatusDownloading, IdentitySource: "direct_id", IdentityStatus: "verified", IdentityRevision: 1, IdentitySnapshotJSON: `{"version":1,"revision":1,"source":"direct_id","status":"verified","locked":false,"tmdb_id":65733,"media_type":"tv","title":"Doraemon"}`, CreatedAt: now.Add(time.Minute), UpdatedAt: now.Add(time.Minute)}
+	if err := client.db.Create(&directDownload).Error; err != nil {
+		t.Fatal(err)
+	}
 	status, envelope, headers := client.playerRequest(t, http.MethodGet, "/api/v1/player/discovery/acquisitions?page=1&page_size=10", login.AccessToken, nil)
 	if status != http.StatusOK || headers.Get("Cache-Control") != "no-store" || bytes.Contains(envelope.Data, []byte("foreign-acquisition")) {
 		t.Fatalf("acquisition list status=%d cache=%q data=%s", status, headers.Get("Cache-Control"), envelope.Data)
 	}
 	var page services.AcquisitionPage
-	if err := json.Unmarshal(envelope.Data, &page); err != nil || page.Total != 1 || len(page.List) != 1 || page.List[0].ID != "owner-acquisition" {
+	if err := json.Unmarshal(envelope.Data, &page); err != nil || page.Total != 2 || len(page.List) != 2 {
 		t.Fatalf("acquisition page=%+v err=%v data=%s", page, err, envelope.Data)
+	}
+	items := make(map[int64]services.AcquisitionStatus, len(page.List))
+	for _, item := range page.List {
+		items[item.TMDBID] = item
+	}
+	if items[346].ID != "owner-acquisition" || items[65733].DownloadTaskID != directDownload.ID || items[65733].Status != models.DownloadTaskStatusDownloading {
+		t.Fatalf("acquisition items=%+v", items)
 	}
 	for _, path := range []string{
 		"/api/v1/player/discovery/acquisitions?page=zero&page_size=10",
