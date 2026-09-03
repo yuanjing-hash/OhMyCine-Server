@@ -145,6 +145,57 @@ type PlayerPlaybackHistoryRevision struct {
 	ChangedAt time.Time `gorm:"not null"`
 }
 
+const (
+	PlayerMediaCollectionSourceTMDB       = "tmdb"
+	PlayerMediaCollectionSourceManual     = "manual"
+	PlayerMediaCollectionKindCollection   = "collection"
+	PlayerMediaCollectionKindPlaylist     = "playlist"
+	PlayerMediaCollectionItemOriginTMDB   = "tmdb"
+	PlayerMediaCollectionItemOriginManual = "manual"
+)
+
+// PlayerMediaFavorite is durable user-owned state for one accessible Server
+// catalog work. WorkKey remains private and is resolved from opaque Player IDs.
+type PlayerMediaFavorite struct {
+	UserID    uint      `gorm:"primaryKey" json:"-"`
+	LibraryID uint      `gorm:"primaryKey" json:"library_id"`
+	WorkKey   string    `gorm:"primaryKey;size:80" json:"-"`
+	CreatedAt time.Time `gorm:"not null" json:"created_at"`
+	UpdatedAt time.Time `gorm:"not null" json:"updated_at"`
+}
+
+// PlayerMediaCollection stores both system-derived TMDB collections and
+// user-owned manual collections. A nil OwnerID is reserved for system rows.
+type PlayerMediaCollection struct {
+	ID               string    `gorm:"primaryKey;size:36" json:"id"`
+	OwnerID          *uint     `gorm:"index" json:"-"`
+	Source           string    `gorm:"size:16;not null;index" json:"source"`
+	Kind             string    `gorm:"size:16;not null;index" json:"kind"`
+	Name             string    `gorm:"size:512;not null" json:"name"`
+	TMDBCollectionID *int64    `gorm:"index" json:"tmdb_collection_id,omitempty"`
+	PosterPath       string    `gorm:"size:512;not null;default:''" json:"poster_path,omitempty"`
+	BackdropPath     string    `gorm:"size:512;not null;default:''" json:"backdrop_path,omitempty"`
+	Visible          bool      `gorm:"not null;default:false;index" json:"visible"`
+	Locked           bool      `gorm:"not null;default:false" json:"locked"`
+	Revision         uint64    `gorm:"not null;default:1" json:"revision"`
+	CreatedAt        time.Time `gorm:"not null" json:"created_at"`
+	UpdatedAt        time.Time `gorm:"not null" json:"updated_at"`
+}
+
+// PlayerMediaCollectionItem keeps membership provenance so scan reconciliation
+// can mutate TMDB-derived rows without touching user-created membership.
+type PlayerMediaCollectionItem struct {
+	ID           uint      `gorm:"primaryKey" json:"-"`
+	CollectionID string    `gorm:"size:36;not null;index;uniqueIndex:idx_player_collection_member" json:"collection_id"`
+	LibraryID    uint      `gorm:"not null;index;uniqueIndex:idx_player_collection_member" json:"library_id"`
+	WorkKey      string    `gorm:"size:80;not null;uniqueIndex:idx_player_collection_member" json:"-"`
+	TMDBMovieID  *int64    `gorm:"index" json:"tmdb_movie_id,omitempty"`
+	Origin       string    `gorm:"size:16;not null;index;uniqueIndex:idx_player_collection_member" json:"origin"`
+	Ordinal      int       `gorm:"not null;default:0" json:"ordinal"`
+	CreatedAt    time.Time `gorm:"not null" json:"created_at"`
+	UpdatedAt    time.Time `gorm:"not null" json:"updated_at"`
+}
+
 type AuditLog struct {
 	ID         uint      `gorm:"primaryKey" json:"id"`
 	ActorID    *uint     `gorm:"index" json:"actor_id"`

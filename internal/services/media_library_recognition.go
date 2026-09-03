@@ -249,7 +249,7 @@ func mediaLibraryRecognitionCacheKey(unit medialibrary.RecognitionUnit, profile 
 	// v2 refreshes older derived cache entries so the additive v1 snapshot
 	// receives the richer bounded detail fields without breaking persisted v1
 	// envelopes or requiring a database migration.
-	value := "recognition:" + mediarecognition.EngineVersion + ":snapshot-v2\x00" + unit.InputFingerprint + "\x00" + strconv.FormatUint(uint64(profile.ID), 10) + "\x00" + strconv.FormatUint(profile.Revision, 10) + "\x00" + library.MetadataLanguage + "\x00" + library.MetadataRegion
+	value := "recognition:" + mediarecognition.EngineVersion + ":snapshot-v3\x00" + unit.InputFingerprint + "\x00" + strconv.FormatUint(uint64(profile.ID), 10) + "\x00" + strconv.FormatUint(profile.Revision, 10) + "\x00" + library.MetadataLanguage + "\x00" + library.MetadataRegion
 	sum := sha256.Sum256([]byte(value))
 	return hex.EncodeToString(sum[:])
 }

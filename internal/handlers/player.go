@@ -104,7 +104,7 @@ func (a *API) PlayerBootstrap(c *gin.Context) {
 }
 
 func playerCapabilities(actor services.Actor) []string {
-	capabilities := []string{"server_connection", "playback_history_sync"}
+	capabilities := []string{"server_connection", "playback_history_sync", "media_favorites", "media_collections"}
 	if actor.HasPermission(authz.PermissionMediaLibrariesRead) {
 		capabilities = append(capabilities, "media_catalog", "direct_stream")
 	}
@@ -124,6 +124,142 @@ func playerCapabilities(actor services.Actor) []string {
 	return capabilities
 }
 
+func (a *API) PlayerFavorites(c *gin.Context) {
+	if a.playerMediaState == nil {
+		writeError(c, a.log, &services.AppError{Code: services.CodeInvalidRequest, Message: "Server 暂不支持收藏"})
+		return
+	}
+	items, err := a.playerMediaState.Favorites(mustActor(c))
+	if err != nil {
+		writeError(c, a.log, err)
+		return
+	}
+	success(c, http.StatusOK, gin.H{"list": items, "total": len(items)})
+}
+
+func (a *API) PlayerFavoriteState(c *gin.Context) {
+	if a.playerMediaState == nil {
+		writeError(c, a.log, &services.AppError{Code: services.CodeInvalidRequest, Message: "Server 暂不支持收藏"})
+		return
+	}
+	favorite, err := a.playerMediaState.FavoriteState(mustActor(c), c.Param("itemId"))
+	if err != nil {
+		writeError(c, a.log, err)
+		return
+	}
+	success(c, http.StatusOK, gin.H{"favorite": favorite})
+}
+
+func (a *API) SetPlayerFavorite(c *gin.Context) {
+	if a.playerMediaState == nil {
+		writeError(c, a.log, &services.AppError{Code: services.CodeInvalidRequest, Message: "Server 暂不支持收藏"})
+		return
+	}
+	var input struct {
+		Favorite bool `json:"favorite"`
+	}
+	if err := strictJSON(c, &input); err != nil {
+		writeError(c, a.log, invalid("收藏参数无效", err))
+		return
+	}
+	favorite, err := a.playerMediaState.SetFavorite(mustActor(c), c.Param("itemId"), input.Favorite)
+	if err != nil {
+		writeError(c, a.log, err)
+		return
+	}
+	success(c, http.StatusOK, gin.H{"favorite": favorite})
+}
+
+func (a *API) PlayerCollections(c *gin.Context) {
+	if a.playerMediaState == nil {
+		writeError(c, a.log, &services.AppError{Code: services.CodeInvalidRequest, Message: "Server 暂不支持合集"})
+		return
+	}
+	items, err := a.playerMediaState.Collections(mustActor(c), c.Query("kind"))
+	if err != nil {
+		writeError(c, a.log, err)
+		return
+	}
+	success(c, http.StatusOK, gin.H{"list": items, "total": len(items)})
+}
+
+func (a *API) CreatePlayerCollection(c *gin.Context) {
+	if a.playerMediaState == nil {
+		writeError(c, a.log, &services.AppError{Code: services.CodeInvalidRequest, Message: "Server 暂不支持合集"})
+		return
+	}
+	var input struct {
+		Name string `json:"name"`
+		Kind string `json:"kind"`
+	}
+	if err := strictJSON(c, &input); err != nil {
+		writeError(c, a.log, invalid("合集参数无效", err))
+		return
+	}
+	item, err := a.playerMediaState.CreateCollection(mustActor(c), input.Name, input.Kind)
+	if err != nil {
+		writeError(c, a.log, err)
+		return
+	}
+	success(c, http.StatusCreated, gin.H{"id": item.ID, "name": item.Name, "kind": item.Kind, "source": item.Source, "item_count": 0})
+}
+
+func (a *API) PlayerCollectionItems(c *gin.Context) {
+	if a.playerMediaState == nil {
+		writeError(c, a.log, &services.AppError{Code: services.CodeInvalidRequest, Message: "Server 暂不支持合集"})
+		return
+	}
+	items, err := a.playerMediaState.CollectionItems(mustActor(c), c.Param("id"))
+	if err != nil {
+		writeError(c, a.log, err)
+		return
+	}
+	success(c, http.StatusOK, gin.H{"list": items, "total": len(items)})
+}
+
+func (a *API) AddPlayerCollectionItem(c *gin.Context) {
+	if a.playerMediaState == nil {
+		writeError(c, a.log, &services.AppError{Code: services.CodeInvalidRequest, Message: "Server 暂不支持合集"})
+		return
+	}
+	var input struct {
+		ItemID string `json:"item_id"`
+	}
+	if err := strictJSON(c, &input); err != nil {
+		writeError(c, a.log, invalid("合集成员参数无效", err))
+		return
+	}
+	if err := a.playerMediaState.AddCollectionItem(mustActor(c), c.Param("id"), input.ItemID); err != nil {
+		writeError(c, a.log, err)
+		return
+	}
+	success(c, http.StatusOK, gin.H{"added": true})
+}
+
+func (a *API) RemovePlayerCollectionItem(c *gin.Context) {
+	if a.playerMediaState == nil {
+		writeError(c, a.log, &services.AppError{Code: services.CodeInvalidRequest, Message: "Server 暂不支持合集"})
+		return
+	}
+	if err := a.playerMediaState.RemoveCollectionItem(mustActor(c), c.Param("id"), c.Param("itemId")); err != nil {
+		writeError(c, a.log, err)
+		return
+	}
+	success(c, http.StatusOK, gin.H{"removed": true})
+}
+
+func (a *API) DeletePlayerCollection(c *gin.Context) {
+	if a.playerMediaState == nil {
+		writeError(c, a.log, &services.AppError{Code: services.CodeInvalidRequest, Message: "Server 暂不支持合集"})
+		return
+	}
+	if err := a.playerMediaState.DeleteCollection(mustActor(c), c.Param("id")); err != nil {
+		writeError(c, a.log, err)
+		return
+	}
+	success(c, http.StatusOK, gin.H{"deleted": true})
+}
+
 func (a *API) PlayerHistorySync(c *gin.Context) {
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 2<<20)
 	var payload struct {
@@ -139,6 +275,29 @@ func (a *API) PlayerHistorySync(c *gin.Context) {
 		return
 	}
 	result, err := a.playerHistory.Sync(mustActor(c), payload.Cursor, payload.Changes)
+	if err != nil {
+		writeError(c, a.log, err)
+		return
+	}
+	success(c, http.StatusOK, result)
+}
+
+func (a *API) PlayerHistory(c *gin.Context) {
+	if a.playerHistory == nil {
+		writeError(c, a.log, &services.AppError{Code: services.CodeInvalidRequest, Message: "Server 暂不支持播放历史"})
+		return
+	}
+	page, err := strconv.Atoi(c.DefaultQuery("page", "1"))
+	if err != nil {
+		writeError(c, a.log, invalid("播放历史页码无效", err))
+		return
+	}
+	pageSize, err := strconv.Atoi(c.DefaultQuery("page_size", "24"))
+	if err != nil {
+		writeError(c, a.log, invalid("播放历史分页大小无效", err))
+		return
+	}
+	result, err := a.playerHistory.List(mustActor(c), page, pageSize, c.Query("source_kind"))
 	if err != nil {
 		writeError(c, a.log, err)
 		return

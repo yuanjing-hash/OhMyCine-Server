@@ -42,6 +42,14 @@ type PlayerHistorySyncResult struct {
 	Changes []PlayerHistoryChange `json:"changes"`
 }
 
+type PlayerHistoryPage struct {
+	List     []PlayerHistoryChange `json:"list"`
+	Total    int64                 `json:"total"`
+	Page     int                   `json:"page"`
+	PageSize int                   `json:"page_size"`
+	HasMore  bool                  `json:"has_more"`
+}
+
 type PlayerHistoryService struct{ db *gorm.DB }
 
 func NewPlayerHistoryService(db *gorm.DB) *PlayerHistoryService { return &PlayerHistoryService{db: db} }
@@ -65,8 +73,20 @@ func (s *PlayerHistoryService) Sync(actor Actor, cursor uint64, changes []Player
 			if err != nil && err != gorm.ErrRecordNotFound {
 				return err
 			}
-			if err == nil && (current.ClientUpdatedAt > change.UpdatedAt || current.ClientUpdatedAt == change.UpdatedAt && (current.Completed || current.Deleted) && !change.Completed && !change.Deleted) {
-				continue
+			if err == nil {
+				if current.ClientUpdatedAt > change.UpdatedAt {
+					continue
+				}
+				if current.ClientUpdatedAt == change.UpdatedAt {
+					currentTerminal := current.Completed || current.Deleted
+					incomingTerminal := change.Completed || change.Deleted
+					// The client timestamp is the immutable change identity. Re-uploading the
+					// same local page must not create an endless revision stream. A terminal
+					// state is the only deterministic winner for a timestamp tie.
+					if currentTerminal || !incomingTerminal {
+						continue
+					}
+				}
 			}
 			revision := models.PlayerPlaybackHistoryRevision{UserID: actor.User.ID, SyncKey: change.SyncKey, ChangedAt: time.Now().UTC()}
 			if err := tx.Create(&revision).Error; err != nil {
@@ -93,6 +113,34 @@ func (s *PlayerHistoryService) Sync(actor Actor, cursor uint64, changes []Player
 		if row.Revision > result.Cursor {
 			result.Cursor = row.Revision
 		}
+	}
+	return result, nil
+}
+
+func (s *PlayerHistoryService) List(actor Actor, page, pageSize int, sourceKind string) (PlayerHistoryPage, error) {
+	if page < 1 || page > 100_000 || pageSize < 1 || pageSize > 100 {
+		return PlayerHistoryPage{}, appError(CodeInvalidRequest, "播放历史分页参数无效", nil)
+	}
+	sourceKind = strings.ToLower(strings.TrimSpace(sourceKind))
+	if sourceKind != "" && (len(sourceKind) > 32 || strings.ContainsAny(sourceKind, "\r\n\x00")) {
+		return PlayerHistoryPage{}, appError(CodeInvalidRequest, "播放历史来源类型无效", nil)
+	}
+	query := s.db.Model(&models.PlayerPlaybackHistory{}).Where("user_id = ? AND deleted = ?", actor.User.ID, false)
+	if sourceKind != "" {
+		query = query.Where("source_kind = ?", sourceKind)
+	}
+	var total int64
+	if err := query.Count(&total).Error; err != nil {
+		return PlayerHistoryPage{}, err
+	}
+	var rows []models.PlayerPlaybackHistory
+	offset := (page - 1) * pageSize
+	if err := query.Order("client_updated_at DESC, sync_key ASC").Limit(pageSize).Offset(offset).Find(&rows).Error; err != nil {
+		return PlayerHistoryPage{}, err
+	}
+	result := PlayerHistoryPage{List: make([]PlayerHistoryChange, 0, len(rows)), Total: total, Page: page, PageSize: pageSize, HasMore: int64(offset+len(rows)) < total}
+	for _, row := range rows {
+		result.List = append(result.List, playerHistoryChangeDTO(row))
 	}
 	return result, nil
 }

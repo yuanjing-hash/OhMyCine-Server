@@ -1911,6 +1911,9 @@ func (s *MediaLibraryService) reconcile(ctx context.Context, id uint, kind strin
 				}
 			}
 		}
+		if err := reconcileTMDBCollectionsTx(tx, id, result.Partial, now); err != nil {
+			return wrapMediaLibraryPersistence(mediaLibraryPersistenceStageCollections, err)
+		}
 		updates := map[string]any{"dirty_generation": generation, "baseline_generation": generation, "last_scan_at": finished, "last_successful_scan_at": finished, "profile_revision": profile.Revision, "reclassification_due": false, "status_error_code": "", "next_retry_at": nil}
 		if err := tx.Model(&models.MediaLibrary{}).Where("id = ?", id).Updates(updates).Error; err != nil {
 			return wrapMediaLibraryPersistence(mediaLibraryPersistenceStageGeneration, err)

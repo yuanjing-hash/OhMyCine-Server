@@ -120,10 +120,21 @@ type Snapshot struct {
 	PosterPaths         []string          `json:"poster_paths,omitempty"`
 	BackdropPath        string            `json:"backdrop_path,omitempty"`
 	BackdropPaths       []string          `json:"backdrop_paths,omitempty"`
+	Collection          *Collection       `json:"collection,omitempty"`
 	Seasons             []SeasonSnapshot  `json:"seasons,omitempty"`
 	EpisodeSnapshots    []EpisodeSnapshot `json:"episode_snapshots,omitempty"`
 	EpisodeSeasons      []int             `json:"episode_seasons,omitempty"`
 	EpisodeLanguage     string            `json:"episode_language,omitempty"`
+}
+
+// Collection is the bounded TMDB belongs_to_collection projection used to
+// derive Server-owned movie collections after a successful library scan.
+// Image fields remain TMDB file identities and never contain configured URLs.
+type Collection struct {
+	TMDBID       int64  `json:"tmdb_id"`
+	Name         string `json:"name"`
+	PosterPath   string `json:"poster_path,omitempty"`
+	BackdropPath string `json:"backdrop_path,omitempty"`
 }
 
 type Genre struct {
@@ -730,8 +741,14 @@ func (c *Client) getDetailedMatch(ctx context.Context, mediaType string, id int6
 			ProductionCountries []detailCountry  `json:"production_countries"`
 			SpokenLanguages     []detailLanguage `json:"spoken_languages"`
 			ProductionCompanies []detailCompany  `json:"production_companies"`
-			Credits             detailCredits    `json:"credits"`
-			ExternalIDs         struct {
+			BelongsToCollection *struct {
+				ID           int64  `json:"id"`
+				Name         string `json:"name"`
+				PosterPath   string `json:"poster_path"`
+				BackdropPath string `json:"backdrop_path"`
+			} `json:"belongs_to_collection"`
+			Credits     detailCredits `json:"credits"`
+			ExternalIDs struct {
 				IMDbID string `json:"imdb_id"`
 			} `json:"external_ids"`
 			Images detailImages `json:"images"`
@@ -747,6 +764,11 @@ func (c *Client) getDetailedMatch(ctx context.Context, mediaType string, id int6
 			imdbID = detail.ExternalIDs.IMDbID
 		}
 		snapshot := Snapshot{Version: 1, TMDBID: id, IMDbID: cleanIMDbID(imdbID), MediaType: mediaType, Title: cleanText(detail.Title, 512), OriginalTitle: cleanText(detail.OriginalTitle, 512), ReleaseDate: cleanDate(detail.ReleaseDate), Overview: cleanText(detail.Overview, 32768), Tagline: cleanText(detail.Tagline, 2048), Status: cleanText(detail.Status, 128), VoteAverage: boundedRating(detail.VoteAverage), VoteCount: boundedCount(detail.VoteCount), RuntimeMinutes: boundedRuntime(detail.Runtime), OriginalLanguage: cleanCode(detail.OriginalLanguage), PosterPath: cleanImagePath(detail.PosterPath), BackdropPath: cleanImagePath(detail.BackdropPath)}
+		if collection := detail.BelongsToCollection; collection != nil && collection.ID > 0 {
+			if name := cleanText(collection.Name, 512); name != "" {
+				snapshot.Collection = &Collection{TMDBID: collection.ID, Name: name, PosterPath: cleanImagePath(collection.PosterPath), BackdropPath: cleanImagePath(collection.BackdropPath)}
+			}
+		}
 		snapshot.PosterPaths = collectImagePaths(snapshot.PosterPath, detail.Images.Posters)
 		snapshot.BackdropPaths = collectImagePaths(snapshot.BackdropPath, detail.Images.Backdrops)
 		populateCommonSnapshot(&snapshot, detail.Genres, detail.ProductionCountries, nil, detail.Credits, nil)

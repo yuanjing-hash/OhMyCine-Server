@@ -31,7 +31,7 @@ func TestClientUsesBoundedOfficialShapeWithoutLeakingTokenIntoURL(t *testing.T) 
 			if r.URL.Query().Get("append_to_response") != "credits,external_ids,images" || r.URL.Query().Get("include_image_language") != "zh,null,en" {
 				t.Fatalf("detail query=%q", r.URL.RawQuery)
 			}
-			_, _ = io.WriteString(w, `{"id":42,"title":"示例电影","original_title":"Example Movie","original_language":"zh","release_date":"2026-01-01","overview":"安全简介","tagline":"一句话简介","status":"Released","vote_average":8.5,"vote_count":1234,"runtime":123,"poster_path":"/poster.jpg","backdrop_path":"/backdrop.jpg","genres":[{"id":16,"name":"动画"}],"production_countries":[{"iso_3166_1":"CN"}],"spoken_languages":[{"iso_639_1":"zh"},{"iso_639_1":"en"}],"production_companies":[{"id":9,"name":"示例制片厂"}],"credits":{"cast":[{"id":1,"name":"演员","character":"角色","profile_path":"/actor.jpg"}],"crew":[{"id":2,"name":"导演","department":"Directing","job":"Director","profile_path":"/director.jpg"},{"id":3,"name":"编剧","department":"Writing","job":"Screenplay"}]},"external_ids":{"imdb_id":"tt1234567"},"images":{"backdrops":[{"file_path":"/backdrop.jpg"},{"file_path":"/still-2.jpg"},{"file_path":"https://unsafe.example/still.jpg"}]}}`)
+			_, _ = io.WriteString(w, `{"id":42,"title":"示例电影","original_title":"Example Movie","original_language":"zh","release_date":"2026-01-01","overview":"安全简介","tagline":"一句话简介","status":"Released","vote_average":8.5,"vote_count":1234,"runtime":123,"poster_path":"/poster.jpg","backdrop_path":"/backdrop.jpg","belongs_to_collection":{"id":9001,"name":"示例电影合集","poster_path":"/collection.jpg","backdrop_path":"https://unsafe.example/collection.jpg"},"genres":[{"id":16,"name":"动画"}],"production_countries":[{"iso_3166_1":"CN"}],"spoken_languages":[{"iso_639_1":"zh"},{"iso_639_1":"en"}],"production_companies":[{"id":9,"name":"示例制片厂"}],"credits":{"cast":[{"id":1,"name":"演员","character":"角色","profile_path":"/actor.jpg"}],"crew":[{"id":2,"name":"导演","department":"Directing","job":"Director","profile_path":"/director.jpg"},{"id":3,"name":"编剧","department":"Writing","job":"Screenplay"}]},"external_ids":{"imdb_id":"tt1234567"},"images":{"backdrops":[{"file_path":"/backdrop.jpg"},{"file_path":"/still-2.jpg"},{"file_path":"https://unsafe.example/still.jpg"}]}}`)
 		default:
 			http.NotFound(w, r)
 		}
@@ -57,6 +57,9 @@ func TestClientUsesBoundedOfficialShapeWithoutLeakingTokenIntoURL(t *testing.T) 
 	}
 	if match.Snapshot.Directors[0].ProfilePath != "/director.jpg" || match.Snapshot.Cast[0].ProfilePath != "/actor.jpg" {
 		t.Fatalf("people=%+v %+v", match.Snapshot.Directors, match.Snapshot.Cast)
+	}
+	if match.Snapshot.Collection == nil || match.Snapshot.Collection.TMDBID != 9001 || match.Snapshot.Collection.Name != "示例电影合集" || match.Snapshot.Collection.PosterPath != "/collection.jpg" || match.Snapshot.Collection.BackdropPath != "" {
+		t.Fatalf("collection=%+v", match.Snapshot.Collection)
 	}
 	payload, err := json.Marshal(match.Snapshot)
 	if err != nil || strings.Contains(string(payload), server.URL) || strings.Contains(string(payload), "test-token") || strings.Contains(string(payload), "api_key") {

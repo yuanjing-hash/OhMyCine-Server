@@ -44,6 +44,7 @@ Before changing backend code or API documentation:
 | [Server Web Administration](./web-admin-guidelines.md) | Embedded Web UI, sessions, users, roles, permission codes, and RBAC invariants | Active |
 | [Media Classification Profiles](./media-classification-profiles.md) | Versioned logical media classification, matcher, Profile API, RBAC, and audit contracts | Active |
 | [Media Library Foundation](./media-library-foundation.md) | Storage-relative configuration, automatic baseline, watchers, reconciliation, path safety, and MediaLibrary API contracts | Active |
+| [Player User Media State](./player-user-media-state.md) | User-scoped history/favorites/manual collections and TMDB post-scan collection projection | Active |
 | [Persistent Task Queue](./persistent-task-queue.md) | SQLite jobs, lanes, leases, actions, recovery, safe DTOs, scheduler and task center | Active |
 | [Downloader Management](./downloader-management.md) | Encrypted downloader config/source, qBittorrent adapters, download jobs, telemetry, recovery and safe controls | Active |
 | [Download Route Selection](./download-route-selection.md) | Source/site compatibility, 115 Downloader directory ownership, life-event adoption, and target MediaLibrary contracts | Active |

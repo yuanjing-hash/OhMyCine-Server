@@ -14,6 +14,7 @@ const (
 	mediaLibraryPersistenceStageRecognition   = "persist_recognition"
 	mediaLibraryPersistenceStageEntries       = "persist_entries"
 	mediaLibraryPersistenceStagePrune         = "prune_stale_entries"
+	mediaLibraryPersistenceStageCollections   = "reconcile_tmdb_collections"
 	mediaLibraryPersistenceStageGeneration    = "advance_library_generation"
 	mediaLibraryPersistenceStageScanRun       = "persist_scan_run"
 	mediaLibraryPersistenceStageChange        = "record_media_change"

@@ -31,6 +31,7 @@
 - [x] 签名 302、115 播放 lease 和 Emby 网关。
 - [x] Emby/Jellyfin 刷新通知及持久 revision/outbox。
 - [x] Player device Bearer API、目录、详情、搜索、播放和媒体变更长轮询。
+- [x] Player 用户隔离的历史、收藏、手工合集，以及首次/后续扫库的 TMDB 自动合集对账。
 - [ ] 完成更多客户端和反向代理组合的兼容性验证。
 
 ## 发现、搜索与追更
