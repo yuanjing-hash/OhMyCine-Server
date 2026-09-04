@@ -24,6 +24,7 @@ import (
 	cloudpkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/metadata/tmdb"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 const maxSourceAssetExtraExtensions = 16
@@ -52,6 +53,7 @@ type MediaLibraryService struct {
 	backends          *MediaLibraryBackendRegistry
 	structure         *MediaLibraryStructureService
 	libraryArtwork    MediaLibraryArtworkScheduler
+	queue             *QueueService
 }
 
 func (s *MediaLibraryService) authorizedMediaLibraryIDs(actor Actor, permission string, enabledOnly bool) ([]uint, error) {
@@ -89,9 +91,10 @@ type downloaderLifeEventIngestEnqueuer interface {
 }
 
 type supervisorHandle struct {
-	cancel context.CancelFunc
-	done   <-chan struct{}
-	wake   chan struct{}
+	cancel  context.CancelFunc
+	done    <-chan struct{}
+	wake    chan struct{}
+	pending *providerChangeAccumulator
 }
 
 type downloaderLifeEventCandidate struct {
@@ -193,6 +196,7 @@ func (s *MediaLibraryService) SetStructureService(structure *MediaLibraryStructu
 func (s *MediaLibraryService) SetLibraryArtworkScheduler(artwork MediaLibraryArtworkScheduler) {
 	s.libraryArtwork = artwork
 }
+func (s *MediaLibraryService) SetQueueService(queue *QueueService) { s.queue = queue }
 func (s *MediaLibraryService) Start(ctx context.Context) error {
 	var libraries []models.MediaLibrary
 	if err := s.db.Where("enabled = ?", true).Find(&libraries).Error; err != nil {
@@ -200,6 +204,12 @@ func (s *MediaLibraryService) Start(ctx context.Context) error {
 	}
 	for _, library := range libraries {
 		s.startSupervisor(ctx, library.ID)
+	}
+	if err := s.cleanupTerminalMediaLibraryScanStaging(time.Now().UTC()); err != nil {
+		return err
+	}
+	if err := s.recoverMediaLibraryRecognitionJobs(); err != nil {
+		return err
 	}
 	s.startDownloaderLifeEventSupervisor(ctx)
 	serverlog.OperationLibraryEventScan.Event(s.log.Info()).Int("library_count", len(libraries)).Msg(serverlog.OperationLibraryEventScan.Message("媒体库监听已启动"))
@@ -1106,7 +1116,8 @@ func (s *MediaLibraryService) startSupervisor(parent context.Context, id uint) {
 	ctx, cancel := context.WithCancel(parent)
 	done := make(chan struct{})
 	wake := make(chan struct{}, 1)
-	handle := supervisorHandle{cancel: cancel, done: done, wake: wake}
+	pending := newProviderChangeAccumulator()
+	handle := supervisorHandle{cancel: cancel, done: done, wake: wake, pending: pending}
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
@@ -1126,7 +1137,7 @@ func (s *MediaLibraryService) startSupervisor(parent context.Context, id uint) {
 		if ctx.Err() != nil {
 			return
 		}
-		s.supervise(ctx, id, wake)
+		s.supervise(ctx, id, wake, pending)
 	}()
 }
 func (s *MediaLibraryService) stopSupervisor(id uint) {
@@ -1155,6 +1166,7 @@ func (s *MediaLibraryService) RequestReconcile(id uint) {
 	s.mu.Lock()
 	handle, ok := s.supervisors[id]
 	if ok {
+		handle.pending.markFullFallback("unscoped_wakeup")
 		select {
 		case handle.wake <- struct{}{}:
 		default:
@@ -1163,7 +1175,7 @@ func (s *MediaLibraryService) RequestReconcile(id uint) {
 	s.mu.Unlock()
 }
 
-func (s *MediaLibraryService) supervise(ctx context.Context, id uint, wake <-chan struct{}) {
+func (s *MediaLibraryService) supervise(ctx context.Context, id uint, wake chan struct{}, pending *providerChangeAccumulator) {
 	delay := time.Second
 	for {
 		if ctx.Err() != nil {
@@ -1201,7 +1213,7 @@ func (s *MediaLibraryService) supervise(ctx context.Context, id uint, wake <-cha
 			delay = nextRetryDelay(delay)
 			continue
 		}
-		listener, err := backend.OpenListener(ctx, library, storage, wake)
+		listener, err := backend.OpenListener(ctx, library, storage, wake, pending)
 		if err != nil {
 			next := time.Now().UTC().Add(delay)
 			_ = s.setStatus(id, models.MediaLibraryStatusInitializationFailed, CodeMediaLibraryScanFailed, &next)
@@ -1211,21 +1223,46 @@ func (s *MediaLibraryService) supervise(ctx context.Context, id uint, wake <-cha
 			delay = nextRetryDelay(delay)
 			continue
 		}
-		_ = s.setStatus(id, models.MediaLibraryStatusReconciling, "", nil)
-		if _, err := s.reconcile(ctx, id, "catch_up"); err != nil {
-			_ = listener.Close()
-			next := time.Now().UTC().Add(delay)
-			_ = s.setStatus(id, models.MediaLibraryStatusInitializationFailed, CodeMediaLibraryScanFailed, &next)
-			if !waitForRetry(ctx, delay) {
-				return
+		if storage.Type == models.StorageTypePan115 {
+			if err := s.hydratePendingProviderChanges(ctx, id, pending, wake); err != nil {
+				_ = listener.Close()
+				next := time.Now().UTC().Add(delay)
+				_ = s.setStatus(id, models.MediaLibraryStatusInitializationFailed, CodeMediaLibraryScanFailed, &next)
+				if !waitForRetry(ctx, delay) {
+					return
+				}
+				delay = nextRetryDelay(delay)
+				continue
 			}
-			delay = nextRetryDelay(delay)
-			continue
+		}
+		// Provider wakeups are buffered while the initial snapshot and listener
+		// attachment run. For 115, consuming that buffered wake in listener.Run
+		// closes the race without repeating an unconditional full enumeration.
+		// Local filesystem watchers retain the conservative catch-up pass.
+		if storage.Type != models.StorageTypePan115 {
+			_ = s.setStatus(id, models.MediaLibraryStatusReconciling, "", nil)
+			if _, err := s.reconcile(ctx, id, "catch_up"); err != nil {
+				_ = listener.Close()
+				next := time.Now().UTC().Add(delay)
+				_ = s.setStatus(id, models.MediaLibraryStatusInitializationFailed, CodeMediaLibraryScanFailed, &next)
+				if !waitForRetry(ctx, delay) {
+					return
+				}
+				delay = nextRetryDelay(delay)
+				continue
+			}
+		} else {
+			serverlog.OperationLibraryInitialScan.Event(s.log.Info()).Uint("library_id", id).Str("phase", "listener_attached").Msg(serverlog.OperationLibraryInitialScan.Message("115 监听已接管，跳过无变化的重复全量扫描"))
 		}
 		_ = s.sweepIngest(ctx, id)
 		_ = s.setStatus(id, models.MediaLibraryStatusListening, "", nil)
 		_ = listener.Run(ctx, func(reconcileCtx context.Context, reason string) error {
 			_, reconcileErr := s.reconcile(reconcileCtx, id, reason)
+			if reconcileErr == nil {
+				if scope, ok := providerChangeScopeFromContext(reconcileCtx); ok && scope.DeliveryMaxID > 0 {
+					reconcileErr = s.ackPendingProviderChanges(reconcileCtx, id, scope.DeliveryMaxID)
+				}
+			}
 			if reconcileErr == nil {
 				_ = s.sweepIngest(reconcileCtx, id)
 			}
@@ -1324,25 +1361,56 @@ func (s *MediaLibraryService) sweepIngest(ctx context.Context, libraryID uint) e
 	return nil
 }
 
-// ProviderEventsChanged coalesces a connection event batch into one immediate
-// reconciliation per affected library. Libraries remain independently watched
-// and no persistent queue slot is consumed.
-func (s *MediaLibraryService) ProviderEventsChanged(ctx context.Context, connectionID uint, _ []models.ProviderEvent) error {
+// ProviderEventsChanged durably fans a connection event batch out to every
+// affected library before the shared inbox may be acknowledged. Active
+// supervisors are then woken; stopped/restarting supervisors hydrate these
+// private deliveries when they attach, so a process crash cannot lose scope.
+func (s *MediaLibraryService) ProviderEventsChanged(ctx context.Context, connectionID uint, events []models.ProviderEvent) error {
 	var ids []uint
 	if err := s.db.WithContext(ctx).Table("media_libraries").Select("media_libraries.id").Joins("JOIN storages ON storages.id = media_libraries.storage_id").Where("media_libraries.enabled = ? AND storages.type = ? AND storages.connection_id = ?", true, models.StorageTypePan115, connectionID).Scan(&ids).Error; err != nil {
 		return err
 	}
+	now := time.Now().UTC()
+	if err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		for _, id := range ids {
+			for _, event := range events {
+				if event.ID == 0 || strings.TrimSpace(event.PayloadJSON) == "" {
+					return errors.New("provider event delivery is invalid")
+				}
+				delivery := models.MediaLibraryProviderEvent{LibraryID: id, InboxEventID: event.ID, PayloadJSON: event.PayloadJSON, CreatedAt: now, UpdatedAt: now}
+				if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&delivery).Error; err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	type pendingTarget struct {
+		id      uint
+		pending *providerChangeAccumulator
+		wake    chan struct{}
+	}
+	targets := make([]pendingTarget, 0, len(ids))
 	s.mu.Lock()
 	for _, id := range ids {
 		if handle, ok := s.supervisors[id]; ok {
-			select {
-			case handle.wake <- struct{}{}:
-			default:
-			}
+			targets = append(targets, pendingTarget{id: id, pending: handle.pending, wake: handle.wake})
 		}
 	}
 	s.mu.Unlock()
+	var deliveryErrors []error
+	for _, target := range targets {
+		if err := s.hydratePendingProviderChanges(ctx, target.id, target.pending, target.wake); err != nil {
+			deliveryErrors = append(deliveryErrors, err)
+		}
+	}
 	err := s.sweepDownloaderLifeEvents(ctx, connectionID)
+	if len(deliveryErrors) > 0 {
+		deliveryErrors = append(deliveryErrors, err)
+		return errors.Join(deliveryErrors...)
+	}
 	if err == nil {
 		// The first event normally arrives while 115 is still changing the
 		// provider item. Recheck once after the stability window even when no
@@ -1350,6 +1418,53 @@ func (s *MediaLibraryService) ProviderEventsChanged(ctx context.Context, connect
 		s.scheduleDownloaderLifeEventRecheck(connectionID)
 	}
 	return err
+}
+
+func (s *MediaLibraryService) hydratePendingProviderChanges(ctx context.Context, libraryID uint, pending *providerChangeAccumulator, wake chan struct{}) error {
+	if libraryID == 0 || pending == nil {
+		return nil
+	}
+	var watermark struct{ MaxID uint }
+	if err := s.db.WithContext(ctx).Model(&models.MediaLibraryProviderEvent{}).
+		Select("COALESCE(MAX(id), 0) AS max_id").
+		Where("library_id = ? AND processed_at IS NULL", libraryID).Scan(&watermark).Error; err != nil || watermark.MaxID == 0 {
+		return err
+	}
+	var rows []models.MediaLibraryProviderEvent
+	if err := s.db.WithContext(ctx).Where("library_id = ? AND processed_at IS NULL AND id <= ?", libraryID, watermark.MaxID).
+		Order("id").Limit(maxProviderChangeScopeItems + 1).Find(&rows).Error; err != nil {
+		return err
+	}
+	if len(rows) > maxProviderChangeScopeItems {
+		pending.merge(providerChangeScope{EventCount: len(rows), DeliveryMaxID: watermark.MaxID, FullFallback: true, FallbackCode: "scope_overflow"})
+	} else {
+		pending.addDeliveries(rows, watermark.MaxID)
+	}
+	select {
+	case wake <- struct{}{}:
+	default:
+	}
+	return nil
+}
+
+func (s *MediaLibraryService) ackPendingProviderChanges(ctx context.Context, libraryID, deliveryMaxID uint) error {
+	if libraryID == 0 || deliveryMaxID == 0 {
+		return nil
+	}
+	now := time.Now().UTC()
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// Normally the shared inbox is already acknowledged by the time the
+		// debounced catalog commit finishes, so completed deliveries can be
+		// removed immediately. If it is not, retain a processed tombstone; the
+		// shared acknowledgement transaction removes it atomically later.
+		if err := tx.Where("library_id = ? AND id <= ? AND inbox_event_id IN (?)", libraryID, deliveryMaxID,
+			tx.Model(&models.ProviderEvent{}).Select("id").Where("processed_at IS NOT NULL")).Delete(&models.MediaLibraryProviderEvent{}).Error; err != nil {
+			return err
+		}
+		return tx.Model(&models.MediaLibraryProviderEvent{}).
+			Where("library_id = ? AND processed_at IS NULL AND id <= ?", libraryID, deliveryMaxID).
+			Updates(map[string]any{"processed_at": now, "updated_at": now}).Error
+	})
 }
 
 // scheduleDownloaderLifeEventRecheck coalesces event storms per Connection.
@@ -1674,6 +1789,7 @@ func nextRetryDelay(delay time.Duration) time.Duration {
 func (s *MediaLibraryService) reconcile(ctx context.Context, id uint, kind string) (models.MediaLibraryScanRun, error) {
 	started := time.Now()
 	operation := mediaLibraryScanOperation(kind)
+	providerScope, hasProviderScope := providerChangeScopeFromContext(ctx)
 	lock := s.scanLock(id)
 	lock.Lock()
 	defer lock.Unlock()
@@ -1695,22 +1811,79 @@ func (s *MediaLibraryService) reconcile(ctx context.Context, id uint, kind strin
 	_ = json.Unmarshal([]byte(library.IgnorePatternsJSON), &ignores)
 	assetExtensions := effectiveSourceAssetExtensions(extraAssetExtensions)
 	generation := library.DirtyGeneration + 1
-	run := models.MediaLibraryScanRun{LibraryID: id, Kind: kind, Status: "running", Generation: generation, StartedAt: time.Now().UTC()}
+	run := models.MediaLibraryScanRun{LibraryID: id, Kind: kind, Status: "running", Phase: "enumerating", Generation: generation, SourceFingerprint: mediaLibraryScanSourceFingerprint(library, storage, profile), CheckpointJSON: "{}", StartedAt: time.Now().UTC()}
 	if err := s.db.Create(&run).Error; err != nil {
 		return run, err
 	}
-	operation.Event(s.log.Info()).Uint("library_id", id).Uint("scan_run_id", run.ID).Str("scan_kind", kind).Msg(operation.Message("开始"))
+	operation.Event(s.log.Info()).Uint("library_id", id).Uint("scan_run_id", run.ID).Uint64("generation", generation).
+		Str("scan_kind", kind).Str("phase", "enumerating").Msg(operation.Message("开始从数据源枚举媒体"))
+	if hasProviderScope {
+		if providerScope.FullFallback {
+			operation.Event(s.log.Info()).Uint("library_id", id).Uint("scan_run_id", run.ID).Uint64("generation", generation).
+				Str("scan_kind", kind).Str("phase", "scope_fallback").Str("fallback_code", providerScope.FallbackCode).
+				Int("event_count", providerScope.EventCount).Msg(operation.Message("增量事件范围不完整，回退全量对账"))
+			hasProviderScope = false
+		} else {
+			operation.Event(s.log.Info()).Uint("library_id", id).Uint("scan_run_id", run.ID).Uint64("generation", generation).
+				Str("scan_kind", kind).Str("phase", "scope_reconciliation").Int("event_count", providerScope.EventCount).
+				Int("scope_items", len(providerScope.Events)).Int("scope_parents", len(providerScope.ParentIDs)).
+				Msg(operation.Message("开始按受影响范围增量对账"))
+		}
+	}
 	backend, backendErr := s.backends.Get(storage.Type)
 	var result medialibrary.Result
 	var scanErr error
 	if backendErr != nil {
 		scanErr = backendErr
 	} else {
-		result, scanErr = backend.Scan(ctx, MediaLibraryScanRequest{Library: library, Storage: storage, VideoExtensions: extensions, AssetExtensions: assetExtensions, IgnorePatterns: ignores})
+		timing := cloudpkg.NewOperationTimingCollector()
+		scanCtx := cloudpkg.WithOperationTimingCollector(ctx, timing)
+		request := MediaLibraryScanRequest{Library: library, Storage: storage, VideoExtensions: extensions, AssetExtensions: assetExtensions, IgnorePatterns: ignores}
+		if hasProviderScope && storage.Type == models.StorageTypePan115 {
+			request.providerScope = &providerScope
+			request.knownProviderIDs, scanErr = s.knownPan115CatalogProviderIDs(scanCtx, id)
+		}
+		request.Progress = func(progress cloudpkg.TreeScanProgress) {
+			if progress.Phase == "scope_fallback" {
+				operation.Event(s.log.Info()).Uint("library_id", id).Uint("scan_run_id", run.ID).Uint64("generation", generation).
+					Str("scan_kind", kind).Str("phase", "scope_fallback").Str("fallback_code", "scope_unproven").
+					Msg(operation.Message("无法证明增量范围完整，回退全量对账"))
+				return
+			}
+			phase := "enumerating"
+			_ = s.db.Model(&models.MediaLibraryScanRun{}).Where("id = ?", run.ID).Updates(map[string]any{"phase": phase, "enumerated": progress.Enumerated}).Error
+			operation.Event(s.log.Info()).Uint("library_id", id).Uint("scan_run_id", run.ID).Uint64("generation", generation).Str("scan_kind", kind).
+				Str("phase", phase).Int("batch", progress.Batch).Int("batch_items", progress.BatchEntries).Int("enumerated", progress.Enumerated).
+				Int64("total", progress.Total).Int64("duration_ms", progress.Duration.Milliseconds()).Msg(operation.Message("115 扫描分页进度"))
+		}
+		if scanErr == nil {
+			result, scanErr = backend.Scan(scanCtx, request)
+		}
+		if scanErr == nil {
+			snapshot := timing.Snapshot()
+			effectiveConcurrency := library.ProviderConcurrency
+			if effectiveConcurrency <= 0 {
+				effectiveConcurrency = 2
+			} else if effectiveConcurrency > 32 {
+				effectiveConcurrency = 32
+			}
+			effectiveRate := library.ProviderRatePerSecond
+			if effectiveRate <= 0 {
+				effectiveRate = 2
+			} else if effectiveRate > 1000 {
+				effectiveRate = 1000
+			}
+			operation.Event(s.log.Info()).Uint("library_id", id).Uint("scan_run_id", run.ID).Uint64("generation", generation).Str("scan_kind", kind).
+				Str("phase", "enumeration_complete").Int("provider_call_count", snapshot.ProviderCallCalls).Int64("provider_call_ms", snapshot.ProviderCall.Milliseconds()).
+				Int64("provider_wait_ms", snapshot.ProviderWait.Milliseconds()).Int("provider_configured_concurrency", library.ProviderConcurrency).
+				Int("provider_concurrency", effectiveConcurrency).Int("provider_configured_rate_per_second", library.ProviderRatePerSecond).
+				Int("provider_rate_per_second", effectiveRate).Msg(operation.Message("数据源枚举完成"))
+		}
 	}
 	finished := time.Now().UTC()
 	if scanErr != nil {
 		run.Status = "failed"
+		run.Phase = "failed"
 		run.ErrorCode = CodeMediaLibraryScanFailed
 		run.FinishedAt = &finished
 		_ = s.db.Save(&run).Error
@@ -1719,10 +1892,26 @@ func (s *MediaLibraryService) reconcile(ctx context.Context, id uint, kind strin
 		operation.Event(s.log.Error()).Str("error_code", CodeMediaLibraryScanFailed).Uint("library_id", id).Uint("scan_run_id", run.ID).Str("scan_kind", kind).Int64("duration_ms", time.Since(started).Milliseconds()).Msg(operation.Message("失败"))
 		return run, appError(CodeMediaLibraryScanFailed, "媒体库扫描失败", scanErr)
 	}
+	if storage.Type == models.StorageTypePan115 && s.queue != nil {
+		if result.Scoped {
+			result, scanErr = s.mergeScopedPan115Catalog(ctx, id, result)
+			if scanErr != nil {
+				return s.failFastScanPersistence(run, operation, started, mediaLibraryPersistenceStageLoadEntries, scanErr)
+			}
+			operation.Event(s.log.Info()).Uint("library_id", id).Uint("scan_run_id", run.ID).Uint64("generation", generation).
+				Str("scan_kind", kind).Str("phase", "scope_reconciliation").Int("scope_items", len(providerScope.Events)).
+				Msg(operation.Message("受影响范围已确认，准备安全发布增量结果"))
+		}
+		return s.publishFastPan115Scan(ctx, library, storage, profile, run, result, started, operation)
+	}
 	units := medialibrary.GroupRecognitionUnits(result.Files)
 	recognitionStarted := time.Now()
 	serverlog.OperationMediaRecognition.Event(s.log.Info()).Uint("library_id", id).Uint("scan_run_id", run.ID).Int("unit_count", len(units)).Msg(serverlog.OperationMediaRecognition.Message("开始"))
-	recognizedUnits, recognitionErr := s.recognizeLibraryUnits(ctx, library, profile, units)
+	units, recognitionErr := s.stabilizeExistingRecognitionUnits(ctx, id, units)
+	var recognizedUnits []mediaLibraryRecognizedUnit
+	if recognitionErr == nil {
+		recognizedUnits, recognitionErr = s.recognizeLibraryUnits(ctx, library, profile, units)
+	}
 	if recognitionErr != nil {
 		run.Status = "failed"
 		run.ErrorCode = CodeMediaLibraryScanFailed
@@ -1987,8 +2176,10 @@ func (s *MediaLibraryService) reconcile(ctx context.Context, id uint, kind strin
 		}
 	}
 	if s.structure != nil && !run.Partial {
-		if _, err := s.structure.Diagnose(ctx, id, ""); err != nil {
-			serverlog.OperationLibraryEventScan.Event(s.log.Warn()).Uint("library_id", id).Str("error_code", CodeMediaLibraryStructureDiagnosisFailed).Msg(serverlog.OperationLibraryEventScan.Message("目录结构诊断失败"))
+		if err := s.structure.EnqueueDiagnosis(ctx, id, run.ID, run.Generation, run.Kind); err != nil {
+			serverlog.OperationMediaLibraryStructureDiagnosis.Event(s.log.Warn()).Uint("library_id", id).Uint("scan_run_id", run.ID).Uint64("generation", run.Generation).
+				Str("scan_kind", run.Kind).Str("phase", "enqueue_failed").Str("error_code", CodeMediaLibraryStructureDiagnosisFailed).
+				Msg(serverlog.OperationMediaLibraryStructureDiagnosis.Message("目录结构诊断入队失败，扫描目录仍然可用"))
 		}
 	}
 	return run, nil

@@ -24,13 +24,18 @@ import (
 	"github.com/google/uuid"
 	"github.com/rs/zerolog"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/authz"
+	serverlog "github.com/yuanjing-hash/OhMyCine-Server/internal/logging"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/medialibrary"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
 	cloudpkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
-const JobTypeMediaLibraryRepair = "media_library_repair"
+const (
+	JobTypeMediaLibraryRepair             = "media_library_repair"
+	JobTypeMediaLibraryStructureDiagnosis = "media_library_structure_diagnosis"
+)
 
 type StructureBoundary struct {
 	Library models.MediaLibrary
@@ -92,13 +97,30 @@ type MediaLibraryStructureService struct {
 }
 
 type MediaLibraryStructureDiagnostics struct {
-	LibraryID    uint             `json:"library_id"`
-	Status       string           `json:"status"`
-	IssueCount   int              `json:"issue_count"`
-	Unrecognized int              `json:"unrecognized"`
-	CheckedAt    time.Time        `json:"checked_at"`
-	Issues       []StructureIssue `json:"issues"`
-	Revision     string           `json:"revision"`
+	LibraryID       uint                          `json:"library_id"`
+	JobID           string                        `json:"job_id,omitempty"`
+	ScanRunID       *uint                         `json:"scan_run_id,omitempty"`
+	Generation      uint64                        `json:"generation"`
+	ScanKind        string                        `json:"scan_kind"`
+	Status          string                        `json:"status"`
+	TotalItems      int                           `json:"total_items"`
+	ProcessedItems  int                           `json:"processed_items"`
+	IssueCount      int                           `json:"issue_count"`
+	RepairableCount int                           `json:"repairable_count"`
+	Unrecognized    int                           `json:"unrecognized"`
+	Classifications StructureIssueClassifications `json:"classifications"`
+	ErrorCode       string                        `json:"error_code"`
+	StartedAt       *time.Time                    `json:"started_at,omitempty"`
+	CheckedAt       *time.Time                    `json:"checked_at,omitempty"`
+	Issues          []StructureIssue              `json:"issues"`
+	Revision        string                        `json:"revision"`
+}
+
+type mediaLibraryStructureDiagnosisJobPayload struct {
+	LibraryID  uint   `json:"library_id"`
+	ScanRunID  uint   `json:"scan_run_id"`
+	Generation uint64 `json:"generation"`
+	ScanKind   string `json:"scan_kind"`
 }
 
 type MediaLibraryStructurePreview struct {
@@ -198,29 +220,35 @@ func (s *MediaLibraryStructureService) verifyStructureClaim(token string) (media
 }
 
 func (s *MediaLibraryStructureService) Diagnose(ctx context.Context, libraryID uint, workKey string) (MediaLibraryStructureDiagnostics, error) {
-	plan, library, err := s.buildPlan(ctx, libraryID, workKey)
-	if err != nil {
-		if strings.TrimSpace(workKey) == "" {
-			now := time.Now().UTC()
-			_ = s.db.Model(&models.MediaLibrary{}).Where("id = ?", libraryID).Updates(map[string]any{"structure_status": models.MediaLibraryStructureFailed, "structure_error_code": CodeMediaLibraryStructureDiagnosisFailed, "structure_checked_at": now}).Error
-		}
-		return MediaLibraryStructureDiagnostics{}, err
-	}
-	now := time.Now().UTC()
-	status := models.MediaLibraryStructureHealthy
-	if plan.IssueCount > 0 {
-		status = models.MediaLibraryStructureIssues
-	}
-	if strings.TrimSpace(workKey) == "" {
-		if err := s.db.Model(&models.MediaLibrary{}).Where("id = ?", libraryID).Updates(map[string]any{"structure_status": status, "structure_issue_count": plan.IssueCount, "structure_error_code": "", "structure_checked_at": now}).Error; err != nil {
+	workKey = strings.TrimSpace(workKey)
+	if workKey != "" {
+		plan, library, err := s.buildPlan(ctx, libraryID, workKey)
+		if err != nil {
 			return MediaLibraryStructureDiagnostics{}, err
 		}
-		library.StructureStatus = status
-		library.StructureIssueCount = plan.IssueCount
-		library.StructureErrorCode = ""
-		library.StructureCheckedAt = &now
+		now := time.Now().UTC()
+		status := models.MediaLibraryStructureHealthy
+		if plan.IssueCount > 0 {
+			status = models.MediaLibraryStructureIssues
+		}
+		return diagnosticsFromPlan(library, plan, status, nil, "manual", &now), nil
 	}
-	return MediaLibraryStructureDiagnostics{LibraryID: libraryID, Status: status, IssueCount: plan.IssueCount, Unrecognized: plan.Unrecognized, CheckedAt: now, Issues: plan.Issues, Revision: structureDiagnosticRevision(library)}, nil
+	var library models.MediaLibrary
+	if err := s.db.WithContext(ctx).First(&library, libraryID).Error; err != nil {
+		return MediaLibraryStructureDiagnostics{}, mediaLibraryNotFound(err)
+	}
+	var latest models.MediaLibraryScanRun
+	scanRunID := uint(0)
+	scanKind := "manual"
+	if err := s.db.WithContext(ctx).Where("library_id = ? AND generation = ? AND catalog_published_at IS NOT NULL", libraryID, library.BaselineGeneration).Order("id DESC").First(&latest).Error; err == nil {
+		scanRunID, scanKind = latest.ID, latest.Kind
+	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return MediaLibraryStructureDiagnostics{}, err
+	}
+	if err := s.EnqueueDiagnosis(ctx, libraryID, scanRunID, library.BaselineGeneration, scanKind); err != nil {
+		return MediaLibraryStructureDiagnostics{}, err
+	}
+	return s.diagnosticsForLibrary(ctx, library)
 }
 
 func (s *MediaLibraryStructureService) Diagnostics(ctx context.Context, actor Actor, libraryID uint) (MediaLibraryStructureDiagnostics, error) {
@@ -231,11 +259,117 @@ func (s *MediaLibraryStructureService) Diagnostics(ctx context.Context, actor Ac
 	if err := s.db.First(&library, libraryID).Error; err != nil {
 		return MediaLibraryStructureDiagnostics{}, mediaLibraryNotFound(err)
 	}
-	checkedAt := time.Time{}
-	if library.StructureCheckedAt != nil {
-		checkedAt = *library.StructureCheckedAt
+	return s.diagnosticsForLibrary(ctx, library)
+}
+
+func diagnosticsFromPlan(library models.MediaLibrary, plan StructurePlan, status string, scanRunID *uint, scanKind string, checkedAt *time.Time) MediaLibraryStructureDiagnostics {
+	return MediaLibraryStructureDiagnostics{
+		LibraryID: library.ID, ScanRunID: scanRunID, Generation: plan.Generation, ScanKind: scanKind,
+		Status: status, TotalItems: plan.CheckedItems, ProcessedItems: plan.CheckedItems, IssueCount: plan.IssueCount,
+		RepairableCount: len(plan.Items), Unrecognized: plan.Unrecognized, Classifications: plan.Classifications,
+		CheckedAt: checkedAt, Issues: plan.Issues, Revision: structureDiagnosticRevision(library),
 	}
-	return MediaLibraryStructureDiagnostics{LibraryID: libraryID, Status: library.StructureStatus, IssueCount: library.StructureIssueCount, CheckedAt: checkedAt, Issues: []StructureIssue{}, Revision: structureDiagnosticRevision(library)}, nil
+}
+
+func (s *MediaLibraryStructureService) diagnosticsForLibrary(ctx context.Context, library models.MediaLibrary) (MediaLibraryStructureDiagnostics, error) {
+	var diagnosis models.MediaLibraryStructureDiagnosis
+	err := s.db.WithContext(ctx).First(&diagnosis, "library_id = ?", library.ID).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return MediaLibraryStructureDiagnostics{LibraryID: library.ID, Generation: library.BaselineGeneration, Status: library.StructureStatus, IssueCount: library.StructureIssueCount, ErrorCode: library.StructureErrorCode, CheckedAt: library.StructureCheckedAt, Issues: []StructureIssue{}, Revision: structureDiagnosticRevision(library)}, nil
+	}
+	if err != nil {
+		return MediaLibraryStructureDiagnostics{}, err
+	}
+	issues := make([]StructureIssue, 0)
+	if json.Unmarshal([]byte(diagnosis.IssuesJSON), &issues) != nil || len(issues) > maxStructureIssueSamples {
+		issues = []StructureIssue{}
+	}
+	for index := range issues {
+		issues[index].Title = safeMediaDisplayName(issues[index].Title)
+		issues[index].CurrentPath = safeStructurePath(issues[index].CurrentPath)
+		issues[index].ExpectedPath = safeStructurePath(issues[index].ExpectedPath)
+		issues[index].ConflictSources = sanitizeStructureConflictSources(issues[index].ConflictSources)
+		if issues[index].ConflictSourceCount < len(issues[index].ConflictSources) {
+			issues[index].ConflictSourceCount = len(issues[index].ConflictSources)
+		}
+	}
+	classifications := StructureIssueClassifications{
+		Unrecognized: diagnosis.UnrecognizedCount, MissingEpisode: diagnosis.MissingEpisodeCount,
+		InvalidPath: diagnosis.InvalidPathCount, TemplateError: diagnosis.TemplateErrorCount,
+		DuplicateTarget: diagnosis.DuplicateTargetCount, SidecarConflict: diagnosis.SidecarConflictCount,
+	}
+	return MediaLibraryStructureDiagnostics{
+		LibraryID: diagnosis.LibraryID, JobID: diagnosis.JobID, ScanRunID: cloneOptionalUint(diagnosis.ScanRunID), Generation: diagnosis.Generation,
+		ScanKind: diagnosis.ScanKind, Status: diagnosis.Status, TotalItems: diagnosis.TotalItems, ProcessedItems: diagnosis.ProcessedItems,
+		IssueCount: diagnosis.IssueCount, RepairableCount: diagnosis.RepairableCount, Unrecognized: diagnosis.UnrecognizedCount,
+		Classifications: classifications, ErrorCode: diagnosis.LastErrorCode, StartedAt: diagnosis.StartedAt,
+		CheckedAt: diagnosis.FinishedAt, Issues: issues, Revision: structureDiagnosticRevision(library),
+	}, nil
+}
+
+func (s *MediaLibraryStructureService) EnqueueDiagnosis(ctx context.Context, libraryID, scanRunID uint, generation uint64, scanKind string) error {
+	if s.queue == nil {
+		return errors.New("media library structure diagnosis queue is unavailable")
+	}
+	var library models.MediaLibrary
+	if err := s.db.WithContext(ctx).First(&library, libraryID).Error; err != nil {
+		return mediaLibraryNotFound(err)
+	}
+	if generation == 0 {
+		generation = library.BaselineGeneration
+	}
+	if library.BaselineGeneration != generation {
+		return appError(CodeConflict, "媒体库目录代际已经变化", nil)
+	}
+	scanKind = safeLabel(scanKind, 24)
+	var scanRunIDPtr *uint
+	if scanRunID != 0 {
+		var run models.MediaLibraryScanRun
+		if err := s.db.WithContext(ctx).First(&run, scanRunID).Error; err != nil || run.LibraryID != libraryID || run.Generation != generation || run.CatalogPublishedAt == nil {
+			return appError(CodeConflict, "媒体库扫描关联已经变化", err)
+		}
+		scanRunIDPtr = &scanRunID
+		if scanKind == "" {
+			scanKind = run.Kind
+		}
+	}
+	payload := mediaLibraryStructureDiagnosisJobPayload{LibraryID: libraryID, ScanRunID: scanRunID, Generation: generation, ScanKind: scanKind}
+	now := time.Now().UTC()
+	job, err := s.queue.EnqueueLatestWith(EnqueueJobInput{
+		System: true, JobType: JobTypeMediaLibraryStructureDiagnosis, Priority: 15,
+		DisplayName: "目录结构诊断 · " + safeMediaDisplayName(library.Name), Provider: "media_library",
+		ResourceKey: "structure-diagnosis-library:" + strconv.FormatUint(uint64(libraryID), 10), CoalescingKey: "latest_generation", Payload: payload,
+	}, func(tx *gorm.DB, job models.Job) error {
+		diagnosis := models.MediaLibraryStructureDiagnosis{
+			LibraryID: libraryID, JobID: job.ID, ScanRunID: scanRunIDPtr, Generation: generation, ScanKind: scanKind,
+			Status: models.MediaLibraryStructureQueued, IssuesJSON: "[]", CreatedAt: now, UpdatedAt: now,
+		}
+		columns := []string{"job_id", "scan_run_id", "generation", "scan_kind", "status", "total_items", "processed_items", "issue_count", "repairable_count", "unrecognized_count", "missing_episode_count", "invalid_path_count", "template_error_count", "duplicate_target_count", "sidecar_conflict_count", "issues_json", "last_error_code", "started_at", "finished_at", "updated_at"}
+		if err := tx.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "library_id"}}, DoUpdates: clause.AssignmentColumns(columns)}).Create(&diagnosis).Error; err != nil {
+			return err
+		}
+		updated := tx.Model(&models.MediaLibrary{}).Where("id = ? AND baseline_generation = ?", libraryID, generation).Updates(map[string]any{
+			"structure_status": models.MediaLibraryStructureQueued, "structure_issue_count": 0, "structure_error_code": "", "structure_checked_at": nil,
+		})
+		if updated.Error != nil {
+			return updated.Error
+		}
+		if updated.RowsAffected != 1 {
+			return appError(CodeConflict, "媒体库目录代际已经变化", nil)
+		}
+		return nil
+	})
+	if err != nil {
+		failedAt := time.Now().UTC()
+		_ = s.db.Model(&models.MediaLibrary{}).Where("id = ? AND baseline_generation = ?", libraryID, generation).Updates(map[string]any{"structure_status": models.MediaLibraryStructureFailed, "structure_error_code": CodeMediaLibraryStructureDiagnosisFailed, "structure_checked_at": failedAt}).Error
+		return err
+	}
+	event := serverlog.OperationMediaLibraryStructureDiagnosis.Event(s.log.Info()).Uint("library_id", libraryID).Uint64("generation", generation).Str("scan_kind", scanKind).Str("phase", "queued").Str("action", "diagnosis_queued").Str("job_id", job.ID)
+	if scanRunID != 0 {
+		event = event.Uint("scan_run_id", scanRunID)
+	}
+	event.Msg(serverlog.OperationMediaLibraryStructureDiagnosis.Message("目录结构诊断已进入持久任务队列"))
+	return nil
 }
 
 func (s *MediaLibraryStructureService) PreviewRepair(ctx context.Context, actor Actor, libraryID uint, workKey, revision string) (MediaLibraryStructurePreview, error) {
@@ -444,7 +578,7 @@ func updateStructureCatalogPaths(tx *gorm.DB, libraryID uint, items []StructureP
 	return nil
 }
 
-func (s *MediaLibraryStructureService) buildPlan(_ context.Context, libraryID uint, workKey string) (StructurePlan, models.MediaLibrary, error) {
+func (s *MediaLibraryStructureService) buildPlan(ctx context.Context, libraryID uint, workKey string) (StructurePlan, models.MediaLibrary, error) {
 	var library models.MediaLibrary
 	if err := s.db.First(&library, libraryID).Error; err != nil {
 		return StructurePlan{}, library, mediaLibraryNotFound(err)
@@ -469,27 +603,347 @@ func (s *MediaLibraryStructureService) buildPlan(_ context.Context, libraryID ui
 	if err := s.db.Where("library_id = ? AND active = ?", libraryID, true).Order("relative_path").Find(&assets).Error; err != nil {
 		return StructurePlan{}, library, err
 	}
-	plan, err := s.planner.Build(library, entries, assets, workKey)
-	if err != nil || strings.TrimSpace(workKey) != "" || strings.TrimSpace(library.ProviderRootID) == "" || strings.TrimSpace(library.ProviderRootID) == "0" {
+	plan, err := s.planner.BuildContext(ctx, library, entries, assets, workKey, nil)
+	if err != nil || strings.TrimSpace(workKey) != "" {
 		return plan, library, err
+	}
+	plan, err = s.includeHistoricalProviderRootItems(ctx, library, plan)
+	return plan, library, err
+}
+
+func (s *MediaLibraryStructureService) includeHistoricalProviderRootItems(ctx context.Context, library models.MediaLibrary, plan StructurePlan) (StructurePlan, error) {
+	if strings.TrimSpace(library.ProviderRootID) == "" || strings.TrimSpace(library.ProviderRootID) == "0" {
+		return plan, nil
 	}
 	// This is intentionally limited to rows already owned by OhMyCine. The
 	// old cid=0 error placed such rows in 115's provider root, outside normal
 	// scanning; include them in the existing read-only diagnose/confirmed-repair
 	// workflow without adopting any unrelated root files.
 	var misplaced []models.MediaManagedItem
-	if err := s.db.Where("library_id = ? AND managed = ? AND active = ? AND provider_parent_id = ? AND provider_item_id <> ''", libraryID, true, true, "0").Order("id").Find(&misplaced).Error; err != nil {
-		return StructurePlan{}, library, err
+	if err := s.db.WithContext(ctx).Where("library_id = ? AND managed = ? AND active = ? AND provider_parent_id = ? AND provider_item_id <> ''", library.ID, true, true, "0").Order("id").Find(&misplaced).Error; err != nil {
+		return StructurePlan{}, err
 	}
+	candidates := make([]structurePlanCandidate, 0, len(plan.Items)+len(misplaced))
+	for index, item := range plan.Items {
+		candidates = append(candidates, structurePlanCandidate{
+			index: index, kind: item.Kind, workKey: item.WorkKey,
+			title: item.Title, recognitionID: item.RecognitionID, source: item.SourceRelative, target: item.TargetRelative,
+			providerID: item.ProviderID, parentProviderID: item.ParentProviderID, size: item.Size,
+		})
+	}
+	// Movement issues are regenerated below so historical items participate in
+	// the same all-members target-conflict isolation as catalog items.
+	plan.Items = nil
+	plan.IssueCount -= len(candidates)
+	if plan.IssueCount < 0 {
+		plan.IssueCount = 0
+	}
+	nonMovementIssues := plan.Issues[:0]
+	for _, issue := range plan.Issues {
+		if !issue.Repairable {
+			nonMovementIssues = append(nonMovementIssues, issue)
+		}
+	}
+	plan.Issues = nonMovementIssues
+	plan.rebuildIssueSampleCounts()
 	for _, managed := range misplaced {
 		target := safeStructurePath(managed.RelativePath)
 		if target == "" || (managed.Kind != models.MediaManagedItemKindVideo && managed.Kind != models.MediaManagedItemKindSidecar) || managed.Size < 0 {
 			continue
 		}
-		plan.Items = append(plan.Items, StructurePlanItem{Kind: managed.Kind, SourceRelative: "网盘根目录/" + pathpkg.Base(target), TargetRelative: target, ProviderID: managed.ProviderItemID, ParentProviderID: "0", AllowProviderRootSource: true, Size: managed.Size})
-		plan.addIssue(StructureIssue{Code: "cloud_transfer_root_misplaced", Kind: managed.Kind, Title: "历史 115 入库文件", CurrentPath: "网盘根目录/" + pathpkg.Base(target), ExpectedPath: target, Repairable: true})
+		plan.CheckedItems++
+		candidates = append(candidates, structurePlanCandidate{
+			index: len(candidates), kind: managed.Kind, title: "历史 115 入库文件",
+			source: "网盘根目录/" + pathpkg.Base(target), target: target,
+			providerID: managed.ProviderItemID, parentProviderID: "0", size: managed.Size,
+			allowRootSource: true, moveIssueCode: "cloud_transfer_root_misplaced",
+		})
 	}
-	return plan, library, nil
+	appendStructureCandidates(&plan, candidates)
+	sort.Slice(plan.Items, func(i, j int) bool {
+		leftDepth := strings.Count(plan.Items[i].SourceRelative, "/")
+		rightDepth := strings.Count(plan.Items[j].SourceRelative, "/")
+		if leftDepth != rightDepth {
+			return leftDepth > rightDepth
+		}
+		return plan.Items[i].SourceRelative < plan.Items[j].SourceRelative
+	})
+	return plan, nil
+}
+
+type MediaLibraryStructureDiagnosisWorker struct{ service *MediaLibraryStructureService }
+
+func NewMediaLibraryStructureDiagnosisWorker(service *MediaLibraryStructureService) *MediaLibraryStructureDiagnosisWorker {
+	return &MediaLibraryStructureDiagnosisWorker{service: service}
+}
+
+func (w *MediaLibraryStructureDiagnosisWorker) Run(ctx context.Context, runtime JobRuntime, job ClaimedJob) WorkerResult {
+	if w == nil || w.service == nil {
+		return WorkerResult{ErrorCode: CodeMediaLibraryStructureDiagnosisFailed, ErrorMessage: "目录结构诊断服务不可用"}
+	}
+	var payload mediaLibraryStructureDiagnosisJobPayload
+	if json.Unmarshal([]byte(job.Job.PayloadJSON), &payload) != nil || payload.LibraryID == 0 || payload.Generation == 0 {
+		return WorkerResult{ErrorCode: CodeMediaLibraryStructureDiagnosisFailed, ErrorMessage: "目录结构诊断任务参数无效"}
+	}
+	if err := w.service.runDiagnosis(ctx, runtime, job.Job.ID, job.Job.StartedGeneration, payload); err != nil {
+		w.service.failDiagnosis(payload, job.Job.ID, job.Job.StartedGeneration)
+		return WorkerResult{ErrorCode: CodeMediaLibraryStructureDiagnosisFailed, ErrorMessage: "目录结构诊断系统失败"}
+	}
+	return WorkerResult{}
+}
+
+func (s *MediaLibraryStructureService) runDiagnosis(ctx context.Context, runtime JobRuntime, jobID string, jobGeneration uint64, payload mediaLibraryStructureDiagnosisJobPayload) error {
+	started := time.Now().UTC()
+	currentJob, err := s.currentStructureDiagnosisJob(ctx, jobID, jobGeneration)
+	if err != nil {
+		return err
+	}
+	if !currentJob {
+		return nil
+	}
+	var diagnosis models.MediaLibraryStructureDiagnosis
+	if err := s.db.WithContext(ctx).First(&diagnosis, "library_id = ?", payload.LibraryID).Error; err != nil {
+		return err
+	}
+	if diagnosis.JobID != jobID || diagnosis.Generation != payload.Generation || optionalUintValue(diagnosis.ScanRunID) != payload.ScanRunID || diagnosis.ScanKind != payload.ScanKind {
+		return nil
+	}
+	var library models.MediaLibrary
+	if err := s.db.WithContext(ctx).First(&library, payload.LibraryID).Error; err != nil {
+		return err
+	}
+	if library.BaselineGeneration != payload.Generation {
+		return nil
+	}
+	if payload.ScanRunID != 0 {
+		var run models.MediaLibraryScanRun
+		if err := s.db.WithContext(ctx).First(&run, payload.ScanRunID).Error; err != nil {
+			return err
+		}
+		if run.LibraryID != payload.LibraryID || run.Generation != payload.Generation || run.Kind != payload.ScanKind || run.CatalogPublishedAt == nil {
+			return nil
+		}
+	}
+	begin := s.db.WithContext(ctx).Model(&models.MediaLibraryStructureDiagnosis{}).
+		Where("library_id = ? AND job_id = ? AND generation = ? AND scan_kind = ?", payload.LibraryID, jobID, payload.Generation, payload.ScanKind).
+		Updates(map[string]any{"status": models.MediaLibraryStructureRunning, "started_at": started, "finished_at": nil, "last_error_code": "", "updated_at": started})
+	if begin.Error != nil {
+		return begin.Error
+	}
+	if begin.RowsAffected != 1 {
+		return nil
+	}
+	if err := s.db.WithContext(ctx).Model(&models.MediaLibrary{}).Where("id = ? AND baseline_generation = ?", payload.LibraryID, payload.Generation).
+		Updates(map[string]any{"structure_status": models.MediaLibraryStructureRunning, "structure_error_code": ""}).Error; err != nil {
+		return err
+	}
+	structureDiagnosisLogEvent(serverlog.OperationMediaLibraryStructureDiagnosis.Event(s.log.Info()), payload, "running").
+		Int("worker_count", StructurePlanningWorkers).Msg(serverlog.OperationMediaLibraryStructureDiagnosis.Message("开始目录结构诊断"))
+
+	entries, err := s.loadStructureEntries(ctx, payload.LibraryID)
+	if err != nil {
+		return err
+	}
+	assets, err := s.loadStructureAssets(ctx, payload.LibraryID)
+	if err != nil {
+		return err
+	}
+	total := len(entries) + len(assets)
+	if err := s.db.WithContext(ctx).Model(&models.MediaLibraryStructureDiagnosis{}).
+		Where("library_id = ? AND job_id = ? AND generation = ?", payload.LibraryID, jobID, payload.Generation).
+		Updates(map[string]any{"total_items": total, "processed_items": 0, "updated_at": time.Now().UTC()}).Error; err != nil {
+		return err
+	}
+	planCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	progressStep := max(256, total/20)
+	lastPersisted := 0
+	var progressErr error
+	progress := func(processed, total int) {
+		if progressErr != nil || (processed != total && processed-lastPersisted < progressStep) {
+			return
+		}
+		processed64, total64 := int64(processed), int64(total)
+		percent := float64(100)
+		if total > 0 {
+			percent = float64(processed) * 100 / float64(total)
+		}
+		if err := runtime.Heartbeat(&percent, &processed64, &total64, nil, nil); err != nil {
+			progressErr = err
+			cancel()
+			return
+		}
+		result := s.db.WithContext(planCtx).Model(&models.MediaLibraryStructureDiagnosis{}).
+			Where("library_id = ? AND job_id = ? AND generation = ? AND status = ?", payload.LibraryID, jobID, payload.Generation, models.MediaLibraryStructureRunning).
+			Updates(map[string]any{"processed_items": processed, "updated_at": time.Now().UTC()})
+		if result.Error != nil {
+			progressErr = result.Error
+			cancel()
+			return
+		}
+		lastPersisted = processed
+		structureDiagnosisLogEvent(serverlog.OperationMediaLibraryStructureDiagnosis.Event(s.log.Info()), payload, "running").
+			Int("processed", processed).Int("total", total).Msg(serverlog.OperationMediaLibraryStructureDiagnosis.Message("目录结构诊断进度"))
+	}
+	plan, err := s.planner.BuildContext(planCtx, library, entries, assets, "", progress)
+	if err != nil {
+		if progressErr != nil {
+			return progressErr
+		}
+		return err
+	}
+	if progressErr != nil {
+		return progressErr
+	}
+	plan, err = s.includeHistoricalProviderRootItems(planCtx, library, plan)
+	if err != nil {
+		return err
+	}
+	total = plan.CheckedItems
+	var current models.MediaLibrary
+	if err := s.db.WithContext(ctx).First(&current, payload.LibraryID).Error; err != nil {
+		return err
+	}
+	if current.BaselineGeneration != payload.Generation || libraryRuleFingerprint(current) != plan.RuleFingerprint {
+		return nil
+	}
+	issuesJSON, err := json.Marshal(plan.Issues)
+	if err != nil {
+		return err
+	}
+	status := models.MediaLibraryStructureHealthy
+	if plan.IssueCount > 0 {
+		status = models.MediaLibraryStructureIssues
+	}
+	finished := time.Now().UTC()
+	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		current, err := structureDiagnosisJobCurrentTx(tx, jobID, jobGeneration)
+		if err != nil {
+			return err
+		}
+		if !current {
+			return nil
+		}
+		updated := tx.Model(&models.MediaLibraryStructureDiagnosis{}).
+			Where("library_id = ? AND job_id = ? AND generation = ? AND scan_kind = ?", payload.LibraryID, jobID, payload.Generation, payload.ScanKind).
+			Updates(map[string]any{
+				"status": status, "processed_items": total, "issue_count": plan.IssueCount, "repairable_count": len(plan.Items),
+				"unrecognized_count": plan.Classifications.Unrecognized, "missing_episode_count": plan.Classifications.MissingEpisode,
+				"invalid_path_count": plan.Classifications.InvalidPath, "template_error_count": plan.Classifications.TemplateError,
+				"duplicate_target_count": plan.Classifications.DuplicateTarget, "sidecar_conflict_count": plan.Classifications.SidecarConflict,
+				"issues_json": string(issuesJSON), "last_error_code": "", "finished_at": finished, "updated_at": finished,
+			})
+		if updated.Error != nil {
+			return updated.Error
+		}
+		if updated.RowsAffected != 1 {
+			return nil
+		}
+		return tx.Model(&models.MediaLibrary{}).Where("id = ? AND baseline_generation = ?", payload.LibraryID, payload.Generation).
+			Updates(map[string]any{"structure_status": status, "structure_issue_count": plan.IssueCount, "structure_error_code": "", "structure_checked_at": finished}).Error
+	})
+	if err != nil {
+		return err
+	}
+	for _, issue := range plan.Issues {
+		structureDiagnosisLogEvent(serverlog.OperationMediaLibraryStructureDiagnosis.Event(s.log.Debug()), payload, "completed").
+			Str("issue_code", issue.Code).Str("media_kind", issue.Kind).Str("media_display_name", safeMediaDisplayName(issue.Title)).
+			Msg(serverlog.OperationMediaLibraryStructureDiagnosis.Message("目录结构诊断问题样本"))
+	}
+	structureDiagnosisLogEvent(serverlog.OperationMediaLibraryStructureDiagnosis.Event(s.log.Info()), payload, "completed").
+		Str("status", status).Int("total", total).Int("issue_count", plan.IssueCount).Int("repairable_count", len(plan.Items)).
+		Int("unrecognized", plan.Classifications.Unrecognized).Int("missing_season_episode", plan.Classifications.MissingEpisode).
+		Int("invalid_path", plan.Classifications.InvalidPath).Int("template_unavailable", plan.Classifications.TemplateError).
+		Int("duplicate_target", plan.Classifications.DuplicateTarget).Int("sidecar_target_conflict", plan.Classifications.SidecarConflict).
+		Int64("duration_ms", time.Since(started).Milliseconds()).Msg(serverlog.OperationMediaLibraryStructureDiagnosis.Message("目录结构诊断完成，未移动任何文件"))
+	return nil
+}
+
+func (s *MediaLibraryStructureService) loadStructureEntries(ctx context.Context, libraryID uint) ([]models.MediaLibraryEntry, error) {
+	entries := make([]models.MediaLibraryEntry, 0, 4096)
+	lastID := uint(0)
+	for {
+		batch := make([]models.MediaLibraryEntry, 0, 2000)
+		if err := s.db.WithContext(ctx).Where("library_id = ? AND id > ?", libraryID, lastID).Order("id").Limit(2000).Find(&batch).Error; err != nil {
+			return nil, err
+		}
+		if len(batch) == 0 {
+			return entries, nil
+		}
+		entries = append(entries, batch...)
+		lastID = batch[len(batch)-1].ID
+	}
+}
+
+func (s *MediaLibraryStructureService) loadStructureAssets(ctx context.Context, libraryID uint) ([]models.MediaLibrarySourceAsset, error) {
+	assets := make([]models.MediaLibrarySourceAsset, 0, 4096)
+	lastID := uint(0)
+	for {
+		batch := make([]models.MediaLibrarySourceAsset, 0, 2000)
+		if err := s.db.WithContext(ctx).Where("library_id = ? AND active = ? AND id > ?", libraryID, true, lastID).Order("id").Limit(2000).Find(&batch).Error; err != nil {
+			return nil, err
+		}
+		if len(batch) == 0 {
+			return assets, nil
+		}
+		assets = append(assets, batch...)
+		lastID = batch[len(batch)-1].ID
+	}
+}
+
+func (s *MediaLibraryStructureService) failDiagnosis(payload mediaLibraryStructureDiagnosisJobPayload, jobID string, jobGeneration uint64) {
+	failedAt := time.Now().UTC()
+	marked := false
+	_ = s.db.Transaction(func(tx *gorm.DB) error {
+		current, err := structureDiagnosisJobCurrentTx(tx, jobID, jobGeneration)
+		if err != nil || !current {
+			return err
+		}
+		result := tx.Model(&models.MediaLibraryStructureDiagnosis{}).
+			Where("library_id = ? AND job_id = ? AND generation = ? AND scan_kind = ?", payload.LibraryID, jobID, payload.Generation, payload.ScanKind).
+			Updates(map[string]any{"status": models.MediaLibraryStructureFailed, "last_error_code": CodeMediaLibraryStructureDiagnosisFailed, "finished_at": failedAt, "updated_at": failedAt})
+		if result.Error != nil || result.RowsAffected != 1 {
+			return result.Error
+		}
+		if err := tx.Model(&models.MediaLibrary{}).Where("id = ? AND baseline_generation = ?", payload.LibraryID, payload.Generation).
+			Updates(map[string]any{"structure_status": models.MediaLibraryStructureFailed, "structure_error_code": CodeMediaLibraryStructureDiagnosisFailed, "structure_checked_at": failedAt}).Error; err != nil {
+			return err
+		}
+		marked = true
+		return nil
+	})
+	if !marked {
+		return
+	}
+	structureDiagnosisLogEvent(serverlog.OperationMediaLibraryStructureDiagnosis.Event(s.log.Error()), payload, "failed").
+		Str("error_code", CodeMediaLibraryStructureDiagnosisFailed).Msg(serverlog.OperationMediaLibraryStructureDiagnosis.Message("目录结构诊断系统失败"))
+}
+
+func (s *MediaLibraryStructureService) currentStructureDiagnosisJob(ctx context.Context, jobID string, generation uint64) (bool, error) {
+	return structureDiagnosisJobCurrentTx(s.db.WithContext(ctx), jobID, generation)
+}
+
+func structureDiagnosisJobCurrentTx(tx *gorm.DB, jobID string, generation uint64) (bool, error) {
+	var job models.Job
+	if err := tx.Select("id", "generation").First(&job, "id = ?", jobID).Error; err != nil {
+		return false, err
+	}
+	return job.Generation == generation, nil
+}
+
+func structureDiagnosisLogEvent(event *zerolog.Event, payload mediaLibraryStructureDiagnosisJobPayload, phase string) *zerolog.Event {
+	event = event.Uint("library_id", payload.LibraryID).Uint64("generation", payload.Generation).Str("scan_kind", payload.ScanKind).Str("phase", phase)
+	if payload.ScanRunID != 0 {
+		event = event.Uint("scan_run_id", payload.ScanRunID)
+	}
+	return event
+}
+
+func optionalUintValue(value *uint) uint {
+	if value == nil {
+		return 0
+	}
+	return *value
 }
 
 type MediaLibraryRepairWorker struct{ service *MediaLibraryStructureService }

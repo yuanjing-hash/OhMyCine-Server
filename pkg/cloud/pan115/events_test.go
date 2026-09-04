@@ -3,6 +3,7 @@ package pan115
 import (
 	"context"
 	"errors"
+	"strconv"
 	"testing"
 	"time"
 
@@ -60,6 +61,23 @@ func TestChangesMapsAllowlistedKindsAndOrdersNumericIDs(t *testing.T) {
 	}
 	if page.NextCursor.ID != "11" || page.NextCursor.Time.Unix() != 201 {
 		t.Fatalf("cursor=%+v", page.NextCursor)
+	}
+	if !page.FullFallback {
+		t.Fatal("unknown fresh life event must require a complete fallback")
+	}
+}
+
+func TestChangesMarksExpiredLifeWindowAsCursorGap(t *testing.T) {
+	events := make([]lifeEventWire, lifeEventsReadLimit)
+	for index := range events {
+		events[index] = lifeEventWire{ID: pan115sdk.IntString(strconv.Itoa(index + 100)), Type: 2, UpdateTime: pan115sdk.StringInt64(500 + index), FileID: pan115sdk.IntString("file-" + strconv.Itoa(index)), ParentID: "root", FileName: "Movie.mkv"}
+	}
+	page, err := newLifeClient(&lifeSDK{batch: lifeEventBatch{Events: events}}).Changes(context.Background(), cloud.ChangeCursor{Time: time.Unix(100, 0).UTC(), ID: "1"}, lifeEventsReadLimit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !page.FullFallback {
+		t.Fatal("full provider window newer than cursor must report a gap")
 	}
 }
 

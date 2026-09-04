@@ -21,6 +21,7 @@ var builtinProcessorCache = struct {
 
 const (
 	mediaRecognitionStatusMatched       = "matched"
+	mediaRecognitionStatusPending       = "pending"
 	mediaRecognitionStatusUnrecognized  = "unrecognized"
 	mediaIdentityStatusVerified         = "verified"
 	mediaIdentityStatusProvisional      = "provisional"
@@ -135,6 +136,13 @@ func recognizeMedia(ctx context.Context, lookup mediaRecognitionLookup, request 
 		}
 	}
 	sources := recognitionSources(request.PackageName, request.Files)
+	if request.SourceKind == mediarecognition.SourceLibraryScan {
+		// GroupRecognitionUnits has already selected the established work
+		// directory. Do not send file/Season/BDMV/category ancestors through the
+		// Profile processor as additional title candidates; files remain present
+		// in InputFacts for structure, year and episode evidence below.
+		sources = []string{request.PackageName}
+	}
 	processedSources := make([]string, 0, len(sources)+len(request.AuxiliaryNames))
 	var directHint *mediarecognition.DirectTMDBHint
 	processSource := func(source string, acceptDirectHint bool) error {
@@ -228,6 +236,20 @@ func recognizeMedia(ctx context.Context, lookup mediaRecognitionLookup, request 
 			result.IdentitySource = mediaIdentitySourceLocalProvisional
 			result.DecisionReason = decisionReason
 		}
+		return result
+	}
+	// Existing-library scans are read-only indexing, not acquisition planning.
+	// A deterministic provisional winner is useful for a download to keep
+	// moving, but binding it into a library catalog can merge unrelated works
+	// and manufacture directory conflicts. Keep only exact/verified automatic
+	// decisions (or an AI/direct/manual verified identity) as catalog matches;
+	// expose weak and ambiguous automatic candidates through manual recovery.
+	if request.SourceKind == mediarecognition.SourceLibraryScan && identitySource == mediaIdentitySourceAutomatic &&
+		(decisionReason == mediarecognition.ReasonLowConfidence || decisionReason == mediarecognition.ReasonCandidateConflict) {
+		result.ErrorCode = domainRecognitionErrorCode(decisionReason)
+		result.IdentityStatus = mediaIdentityStatusProvisional
+		result.IdentitySource = mediaIdentitySourceAutomatic
+		result.DecisionReason = decisionReason
 		return result
 	}
 	result.Metadata = classificationMetadataForMatch(match)

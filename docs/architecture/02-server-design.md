@@ -38,6 +38,12 @@ Server 已完成管理基础与 Web UI v0.2 壳层：Go/Gin + SQLite/GORM、显�
 
 当前版本已实现 local 与 115 数据源基础：管理员从统一“数据源”页面先选择本地目录或 115 网盘；本地根继续执行绝对路径、Reparse Point 和只读探测校验，115 Cookie 由 Connection AES-GCM 加密保存并可被多个 provider root 复用。115 云目录选择使用绑定 actor、Connection、Storage、Storage 根、provider directory ID、用途和过期时间的 opaque token，Storage 保存稳定 file ID 与显示路径，不保存 Cookie、pickcode 或临时直链。MediaLibrary 可继续从 Storage 根选择任意下级媒体目录，私有保存稳定 provider root ID，并从该 ID 执行 bulk-tree 全量扫描；创建数据源本身不会扫描媒体，删除配置不会修改真实文件或网盘内容。媒体服务器连接、目标绑定、持久刷新任务和 Player 媒体变更通知已经接入；其余 Storage Destination、STRM/302 纵向能力仍按各自路线图继续完善。
 
+115 大媒体库扫描现采用“Provider 分页枚举 → 固定 128 个本地处理 worker → 每批最多 5,000 条 staging/checkpoint → 完整快照原子发布 → 持久后台识别”的分段流水线。128 只负责路径规范化、过滤、解析和去重；115 HTTP 并发由媒体库配置实际控制并硬限制为 32，且与交互/播放直链通道隔离。旧 catalog 在完整 generation 发布前始终可见，partial 或缺页快照不能删除未见条目、识别、合集或托管产物。基础目录发布后立即允许浏览并排队 STRM/封面，只有新增、物理变化或缓存失效的作品才访问 TMDB；识别完成后以同一 generation 的 refresh serial 再次刷新元数据产物，避免基础产物先完成造成永久缺少 NFO/海报。
+
+目录结构诊断同样从 catalog 发布事务中解耦：发布只写入按媒体库 latest-wins 合并的持久任务，后台分批读取当前 generation，并用固定 128 个本地 worker 计算视频与伴随文件目标。缺少季集、非法路径、模板不可用、重复视频目标和伴随文件冲突均形成单项安全分类；冲突组全部剔除修复动作，不再让一条坏数据把一万级媒体库判成诊断失败。管理端显示排队、处理中、检查进度、分类计数和 scan-run 关联，查看已有结果不会重复排队；诊断始终只读，只有终态问题结果才能生成预览，并在用户再次确认后进入独立修复 Job。数据库、队列或代际基础设施故障才显示“目录结构诊断系统失败”，且不改变已发布 catalog 的成功状态。
+
+扫描日志复用统一 runtime log center，并用 `library_id + scan_run_id + generation + scan_kind` 串联枚举、128-worker 处理、staging、发布、识别和产物调度。info 级记录节流后的分页/批次进度、耗时、有效并发、结果和最多 20 个变更样本，debug 级才记录逐媒体安全动作；媒体名清除控制字符并拒绝 URL/绝对路径。Provider ID、物理/相对路径、Cookie、请求 URL、响应体、原始错误、SQL、checkpoint 与 source fingerprint 均不得进入控制台、JSONL、API 或 WebUI。
+
 Server 管理端现将媒体库配置和内容浏览分开：原 `/system/media-libraries` 仅改名为“媒体库管理”，发现分组新增“媒体库”海报墙。单库继续使用现有 catalog；“全部库”在后端完成稳定身份去重和正确分页，只以媒体类型 + TMDB ID 合并可信匹配，未匹配作品保持库隔离。作品详情展示扫描事实中的真实文件与季集覆盖，并通过 opaque work token 组合现有 TMDB 候选、人工覆盖、清除覆盖和重新刮削；普通重新刮削不移动源文件。源文件删除使用独立 `media_libraries.media_delete` 权限和 preview/confirm：只作用于一个明确媒体库的当前作品，本地逐文件复核 canonical root/Reparse Point，115 逐项复核 Storage/库根 ancestry 与稳定身份后送入回收站；完成项持久 checkpoint，catalog 收敛后再调度产物、STRM 和媒体服务器刷新。
 
 Emby 不作为文件数据源展示，而进入独立“播放器管理”工作区。页面复用通用 Connection 记录和既有权限，以卡片展示真实探测状态、受控的服务器版本/媒体数量聚合摘要，以及默认关闭的签名 STRM 302 gateway。API Key 加密保存且永不回填；gateway 与 Web/API/STRM 共用 Server 主端口，复制地址只使用全局 `OMC_PUBLIC_ORIGIN`。默认监听 `0.0.0.0:3000` 与默认 advertised origin `http://127.0.0.1:3000` 明确分离，wildcard 地址不能进入持久 URL。为兼容不返回 CORS Header 的 115 CDN，网关修补 Emby Web 固定播放器资源中的远程 DirectPlay `crossOrigin` 赋值，并在固定 HTML 壳优先加载一个网关同源、不可配置的兜底脚本以覆盖旧模块缓存；同一固定脚本还可按网关开关提供设备适配的外部播放器入口和 Emby 背景图横向图库。外部播放器只接受本系统 PlaybackInfo 返回的短时 ticket，不传递 Emby/115 持久凭据或最终 CDN 地址；图库只使用当前 Emby 会话可见图片且无第三方前端依赖。其它 HTML/静态内容仍透明代理，不提供任意脚本注入。
@@ -64,7 +70,7 @@ Profile 的预识别现已内置用户指定的 MoviePilot-Help `TV.txt` 与 `an
 
 下载前、下载完成后与 Transfer 不再各自产生相互竞争的识别结果。DownloadTask 持久化带 `source/status/locked/revision` 的 `MediaIdentitySnapshot`；下载前建立身份，完成后只用真实清单补全逐文件季集/版本事实，Transfer 仅校验身份、目标和文件安全。来源区分 `manual`、`direct_id`、`automatic`、`ai` 与 `local_provisional`；人工 TMDB 复验写入 `manual + verified + locked`，后续自动识别、AI、重试和目标修改均不能覆盖。剧集解析共享同一逐文件事实，覆盖 `S01E01`、`1x01`、`EP01`、`第01集`、`- 01`、`[01]` 与 `[01v2]`，并结合包级骨架排除年份、分辨率和位深；TV 多视频全部无法确定集号时保留完整来源并返回专用“集号待整理”，不再退化为只选最大视频。`HQ`、尾部发布组、多集目录与 `CC MA 2.0` 等尾部版本/音轨片段属于结构化规格证据，`1566`、`1917`、`3 Body Problem`、合法连字符和方括号标题不得被盲删。冻结的离线 corpus/report 用于回归比较，必须明确资料与许可证边界，不能冒充真实运行 MoviePilot、Emby 或历史 Server 的横向实测。
 
-v25 新增媒体库识别单元和安全缓存持久化，Entry 关联识别投影，扫描记录显示匹配、未识别、缓存命中和识别失败数。缺少 TMDB、认证/网络失败或完全无候选不会让文件枚举失败；普通低置信结果保存为自动暂定身份，极低/无候选保存为本地暂定身份并进入待整理。管理端媒体清单提供全部、已识别、待整理和人工匹配分页；管理员可单项重试、搜索有限 TMDB 候选、只提交 TMDB ID/type 进行服务端复验，并可清除人工覆盖。更换 Storage/媒体库根/provider root 时，旧 Entry、识别单元、人工覆盖和扫描记录在同一事务内清空，再自动建立新基线；扫描和人工识别本身不会移动、重命名、上传或删除来源文件。
+v25 新增媒体库识别单元和安全缓存持久化，Entry 关联识别投影，扫描记录显示匹配、未识别、缓存命中和识别失败数。缺少 TMDB、认证/网络失败或完全无候选不会让文件枚举失败；普通低置信结果保存为自动暂定身份，极低/无候选保存为本地暂定身份并进入待整理。管理端媒体清单提供全部、已识别、待整理和人工匹配分页；列表只显示文件 basename 与有界作品目录名（Season 目录上提到剧名），不返回完整 provider-relative path、物理路径或 Provider ID。管理员可单项重试；无法形成有效标题时重试持久化 `recognition_input_invalid` 单条结果而不抛出 TMDB 通用请求错误。手动整理允许编辑标题、movie/tv 和可选年份，搜索最多十个安全 TMDB 候选，最终仍只提交 TMDB ID/type 由 Server 复验；保存身份后进入现有只读结构诊断与移动预览，不直接移动文件，并可随时清除人工覆盖。更换 Storage/媒体库根/provider root 时，旧 Entry、识别单元、人工覆盖和扫描记录在同一事务内清空，再自动建立新基线；扫描和人工识别本身不会移动、重命名、上传或删除来源文件。
 
 识别错误后的修正由受控的“预览 → 确认 → 幂等 Job”完成。下载历史、媒体整理历史和媒体详情均可发起修正；Server 先按当前媒体库 Profile revision 重新分类并展示旧位置到新位置、重命名、伴随文件和冲突预览。确认使用仅保存 SHA-256 的 256-bit 短期 opaque token，绑定 actor、Transfer、媒体库、identity revision、managed manifest 摘要、规则 revision、冲突策略和五分钟过期。执行只操作 Transfer 完成时登记的托管清单：本地重新校验根边界和 symlink/junction/Reparse Point，115 重新校验稳定 item ID 与 root ancestry；v50 前没有 ownership manifest 的旧任务安全拒绝自动重整。成功后重建 NFO/JPG/STRM，复用普通 reconciliation，并进入 Player 与 Emby/Jellyfin 刷新链；失败可重试且不会丢失旧 identity 或扩大文件操作集合。
 
@@ -1743,6 +1749,8 @@ Bilibili 的站点 API、登录态、分页、签名、播放与下载解析全�
 MediaLibrary 的扫描器仍以只读索引为默认边界；目录写入必须经过独立的结构修复服务。首次完整扫描结束后，Server 使用与 Transfer 相同的 Profile、固定 `电影` / `电视剧` 根和命名模板生成诊断计划，只记录 `healthy/issues/failed` 状态并提示管理员，不自动移动已有内容。管理员可显式提交全库修复或由作品 opaque token 提交单作品修复；如果旧作品未主动修复，新内容入库前必须先同步修复同 TMDB 作品，失败时阻止形成第二套目录。
 
 结构修复由 provider-neutral `StructurePlanner` 与严格 `MediaLibraryStructureBackend` registry 组成。本地和 115 backend 只负责在各自存储语义中执行同一不可变计划：视频、字幕、NFO 和图片作为关联资产一起移动；目标冲突一律停止；旧目录只有在仍位于媒体库根内且已经为空时才能删除。完成后只唤醒现有 LibrarySupervisor 重新扫描，不创建第二套 watcher。计划、provider identity、原始 work key 与 checkpoint 是服务内部状态，不进入浏览器 DTO。
+
+诊断问题样本继续保持有界，但目标冲突会携带最多 20 条经过约束的相对来源路径和完整来源计数，管理端可以看到冲突另一端以及大小写差异；完整计划重建直接保留内存中的作品标题，不能从最多 100 条公开问题样本反向恢复标题。显式 `SxxEyy` 可与中文标题或发布文本直接相邻，同时仍拒绝嵌入 ASCII 单词内部的伪标记。
 
 媒体清单的完整元数据编辑以一个作品的全部 recognition 为事务边界。可编辑字段包含标题、日期、简介、标语、状态、评分、时长、季集统计、类型/国家/语言/工作室、导演/编剧/演员和受验证的 TMDB 图片；TMDB ID、媒体类型及外部身份不接受浏览器修改。保存时先乐观校验全部 recognition revision，再在同一事务中更新 recognition 与 entry，只推进一次 artifact generation 和 media change；任一季或记录发生并发变化时整次回滚。手动识别、重新刮削和清除人工匹配继续复用既有识别器边界。
 

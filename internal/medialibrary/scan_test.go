@@ -2,9 +2,12 @@ package medialibrary
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -26,6 +29,25 @@ type bulkScanCloudDriver struct {
 	*scanCloudDriver
 	tree      cloudpkg.TreeResult
 	treeCalls int
+}
+
+type streamScanCloudDriver struct {
+	*scanCloudDriver
+	batches [][]cloudpkg.TreeEntry
+	partial bool
+}
+
+func (d *streamScanCloudDriver) StreamTree(_ context.Context, _ string, _ int, emit func(cloudpkg.TreeBatch) error) error {
+	total := 0
+	for _, batch := range d.batches {
+		total += len(batch)
+	}
+	for index, batch := range d.batches {
+		if err := emit(cloudpkg.TreeBatch{Offset: int64(index * 1000), Total: int64(total), Entries: batch, Partial: d.partial}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (d *bulkScanCloudDriver) ListTree(context.Context, string, int) (cloudpkg.TreeResult, error) {
@@ -53,6 +75,124 @@ func TestScanProviderUsesBulkTreeWithoutListOrStatCalls(t *testing.T) {
 	}
 	if len(result.Files) != 1 || result.Files[0].RelativePath != "/电影/Movie.2026.mkv" {
 		t.Fatalf("result=%+v", result)
+	}
+}
+
+func TestScanProviderBulkTreeMarksInvalidRelativePathPartial(t *testing.T) {
+	driver := &bulkScanCloudDriver{
+		scanCloudDriver: &scanCloudDriver{},
+		tree: cloudpkg.TreeResult{Entries: []cloudpkg.TreeEntry{
+			{Item: cloudpkg.Item{ID: "unsafe", Name: "unsafe.mkv"}, RelativePath: "/../unsafe.mkv"},
+			{Item: cloudpkg.Item{ID: "safe", Name: "safe.mkv"}, RelativePath: "/safe.mkv"},
+		}},
+	}
+	result, err := ScanProvider(context.Background(), driver, "root", true, []string{".mkv"}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Partial || result.Enumerated != 2 || len(result.Files) != 1 || result.Files[0].ProviderID != "safe" {
+		t.Fatalf("invalid bulk provider path did not preserve deletion safety: %+v", result)
+	}
+}
+
+func TestScanProviderStreamUses128WorkersAndDeterministicallyDeduplicates(t *testing.T) {
+	if ProviderProcessingWorkers != 128 {
+		t.Fatalf("workers=%d, want 128", ProviderProcessingWorkers)
+	}
+	modified := time.Date(2026, 9, 4, 1, 2, 3, 0, time.UTC)
+	entries := make([]cloudpkg.TreeEntry, 0, 12175)
+	for index := 0; index < 12171; index++ {
+		name := fmt.Sprintf("Movie.%05d.mkv", index)
+		entries = append(entries, cloudpkg.TreeEntry{Item: cloudpkg.Item{ID: fmt.Sprintf("id-%d", index), Name: name, Size: int64(index + 1), ModifiedAt: modified}, RelativePath: "/电影/" + name})
+	}
+	entries = append(entries,
+		entries[0],
+		cloudpkg.TreeEntry{Item: cloudpkg.Item{ID: "id-0", Name: "SameID.mkv", ModifiedAt: modified}, RelativePath: "/电影/SameID.mkv"},
+		cloudpkg.TreeEntry{Item: cloudpkg.Item{ID: "different-id", Name: "Movie.00000.mkv", ModifiedAt: modified}, RelativePath: "/电影/Movie.00000.mkv"},
+		cloudpkg.TreeEntry{Item: cloudpkg.Item{ID: "escape", Name: "Escape.mkv", ModifiedAt: modified}, RelativePath: "/../../Escape.mkv"},
+	)
+	batches := make([][]cloudpkg.TreeEntry, 0, 13)
+	for start := 0; start < len(entries); start += 1000 {
+		end := min(start+1000, len(entries))
+		batches = append(batches, entries[start:end])
+	}
+	driver := &streamScanCloudDriver{scanCloudDriver: &scanCloudDriver{}, batches: batches}
+	var startedWorkers atomic.Int32
+	var activeWorkers atomic.Int32
+	var maxActiveWorkers atomic.Int32
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	observer := providerProcessingObserver{
+		workerStarted: func() { startedWorkers.Add(1) },
+		beforeProcess: func() {
+			active := activeWorkers.Add(1)
+			for current := maxActiveWorkers.Load(); active > current && !maxActiveWorkers.CompareAndSwap(current, active); current = maxActiveWorkers.Load() {
+			}
+			if active >= 8 {
+				releaseOnce.Do(func() { close(release) })
+			}
+			<-release
+		},
+		afterProcess: func() { activeWorkers.Add(-1) },
+	}
+	started := time.Now()
+	ctx := withProviderProcessingObserver(context.Background(), observer)
+	result, err := ScanProvider(ctx, driver, "root", true, []string{".mkv"}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Files) != 12171 || result.Deduplicated != 3 || result.Enumerated != len(entries) {
+		t.Fatalf("files=%d deduplicated=%d enumerated=%d", len(result.Files), result.Deduplicated, result.Enumerated)
+	}
+	if elapsed := time.Since(started); elapsed > 5*time.Second {
+		t.Fatalf("12171 local facts took %s", elapsed)
+	}
+	if startedWorkers.Load() != ProviderProcessingWorkers || maxActiveWorkers.Load() < 2 {
+		t.Fatalf("started workers=%d max active=%d", startedWorkers.Load(), maxActiveWorkers.Load())
+	}
+}
+
+func TestScanProviderStreamPropagatesPartialSnapshot(t *testing.T) {
+	driver := &streamScanCloudDriver{scanCloudDriver: &scanCloudDriver{}, partial: true, batches: [][]cloudpkg.TreeEntry{{{
+		Item: cloudpkg.Item{ID: "video-1", Name: "Movie.mkv"}, RelativePath: "/Movie.mkv",
+	}}}}
+	result, err := ScanProvider(context.Background(), driver, "root", true, []string{".mkv"}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Partial || result.Enumerated != 1 || len(result.Files) != 1 {
+		t.Fatalf("result=%+v", result)
+	}
+}
+
+func TestScanProviderStreamMarksInvalidRelativePathPartial(t *testing.T) {
+	driver := &streamScanCloudDriver{scanCloudDriver: &scanCloudDriver{}, batches: [][]cloudpkg.TreeEntry{{
+		{Item: cloudpkg.Item{ID: "unsafe", Name: "unsafe.mkv", Size: 1}, RelativePath: "../unsafe.mkv"},
+		{Item: cloudpkg.Item{ID: "safe", Name: "safe.mkv", Size: 1}, RelativePath: "/safe.mkv"},
+	}}}
+	result, err := ScanProvider(context.Background(), driver, "root", true, []string{".mkv"}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Partial || result.Enumerated != 2 || len(result.Files) != 1 || result.Files[0].ProviderID != "safe" {
+		t.Fatalf("invalid provider path did not preserve deletion safety: %+v", result)
+	}
+}
+
+func TestScanProviderStreamContainsPerItemPanicAsPartial(t *testing.T) {
+	driver := &streamScanCloudDriver{scanCloudDriver: &scanCloudDriver{}, batches: [][]cloudpkg.TreeEntry{{{
+		Item: cloudpkg.Item{ID: "video-1", Name: "Movie.mkv"}, RelativePath: "/Movie.mkv",
+	}}}}
+	var once sync.Once
+	ctx := withProviderProcessingObserver(context.Background(), providerProcessingObserver{beforeProcess: func() {
+		once.Do(func() { panic("synthetic item panic") })
+	}})
+	result, err := ScanProvider(ctx, driver, "root", true, []string{".mkv"}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Partial || len(result.Files) != 0 {
+		t.Fatalf("panic was not isolated as a partial fact: %+v", result)
 	}
 }
 func (d *scanCloudDriver) Stat(context.Context, string) (cloudpkg.Item, error) {

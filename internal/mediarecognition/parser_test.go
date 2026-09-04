@@ -474,6 +474,59 @@ func TestBuildQueryVariantsPrioritizesCanonicalTitlesAcrossSources(t *testing.T)
 	}
 }
 
+func TestLibraryScanUsesNearestWorkDirectoryWithoutCategoryAncestors(t *testing.T) {
+	tests := []struct {
+		name      string
+		input     InputFacts
+		workTitle string
+		forbidden []string
+	}{
+		{
+			name: "season hierarchy",
+			input: InputFacts{
+				PackageName: "白日提灯 (2025)", SourceKind: SourceLibraryScan, MediaTypeHint: MediaTypeTV,
+				Files: []FileFact{{RelativePath: "电视剧/华语剧/白日提灯 (2025)/Season 01/白日提灯.S01E23.mkv", Size: 1 << 30}},
+			},
+			workTitle: "白日提灯",
+			forbidden: []string{"电视剧", "华语剧", "白日提灯 S01E23"},
+		},
+		{
+			name: "bdmv hierarchy",
+			input: InputFacts{
+				PackageName: "七武士 (1954)", SourceKind: SourceLibraryScan, MediaTypeHint: MediaTypeMovie,
+				Files: []FileFact{{RelativePath: "电影/经典电影/七武士 (1954)/BDMV/STREAM/00000.m2ts", Size: 30 << 30}},
+			},
+			workTitle: "七武士",
+			forbidden: []string{"电影", "经典电影", "BDMV", "STREAM"},
+		},
+		{
+			name: "video ts hierarchy",
+			input: InputFacts{
+				PackageName: "英雄 (2002)", SourceKind: SourceLibraryScan, MediaTypeHint: MediaTypeMovie,
+				Files: []FileFact{{RelativePath: "电影/华语电影/英雄 (2002)/VIDEO_TS/VTS_01_1.VOB", Size: 8 << 30}},
+			},
+			workTitle: "英雄",
+			forbidden: []string{"电影", "华语电影", "VIDEO_TS"},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			parsed, err := Parse(test.input)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !queryContains(parsed.Queries, test.workTitle) {
+				t.Fatalf("nearest work directory missing: %+v", parsed.Queries)
+			}
+			for _, ancestor := range test.forbidden {
+				if queryContains(parsed.Queries, ancestor) {
+					t.Fatalf("non-work ancestor %q entered queries: %+v", ancestor, parsed.Queries)
+				}
+			}
+		})
+	}
+}
+
 func TestParseProtectsNumericTitlesAndLegalHyphens(t *testing.T) {
 	cases := []struct {
 		name       string

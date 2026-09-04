@@ -42,7 +42,6 @@ func TestProviderEventsPersistBeforeCursorAndDeduplicate(t *testing.T) {
 	source := &fakeChangeSource{page: cloud.ChangePage{Events: []cloud.ChangeEvent{
 		{ID: "10", Time: timestamp, Kind: cloud.ChangeRenamed, ItemID: "file-1", ParentID: "root", Name: "New.mkv"},
 		{ID: "9", Time: timestamp, Kind: cloud.ChangeCreated, ItemID: "file-1", ParentID: "root", Name: "Old.mkv"},
-		{ID: "ignored", Time: timestamp, Kind: "credential", ItemID: "file-2", Name: "bad"},
 	}, NextCursor: cloud.ChangeCursor{Time: timestamp, ID: "10"}}}
 	service := NewProviderEventService(db, nil)
 	inserted, more, err := service.IngestOnce(context.Background(), connection.ID, source)
@@ -63,6 +62,31 @@ func TestProviderEventsPersistBeforeCursorAndDeduplicate(t *testing.T) {
 	var cursor models.ProviderCursor
 	if err := db.First(&cursor, "connection_id = ? AND stream = ?", connection.ID, providerLifeStream).Error; err != nil || cursor.CursorID != "10" {
 		t.Fatalf("cursor = %#v err %v", cursor, err)
+	}
+}
+
+func TestProviderEventsInvalidFreshEventPersistsFallbackBeforeCursor(t *testing.T) {
+	db, _, connections, actor := newConnectionTestService(t, &fakeCloudDriver{})
+	connection, err := connections.Create(actor, ConnectionInput{Name: "invalid event account", Provider: cloud.ProviderPan115, Cookie: testPan115Cookie, Enabled: true}, RequestContext{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	timestamp := time.Now().UTC().Truncate(time.Second)
+	source := &fakeChangeSource{page: cloud.ChangePage{
+		Events:     []cloud.ChangeEvent{{ID: "11", Time: timestamp, Kind: "unknown", ItemID: "file", ParentID: "root"}},
+		NextCursor: cloud.ChangeCursor{Time: timestamp, ID: "11"},
+	}}
+	service := NewProviderEventService(db)
+	if inserted, _, err := service.IngestOnce(context.Background(), connection.ID, source); err != nil || inserted != 1 {
+		t.Fatalf("inserted=%d err=%v", inserted, err)
+	}
+	var row models.ProviderEvent
+	if err := db.First(&row, "connection_id = ?", connection.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	payload, ok := decodePersistedProviderEvent(row)
+	if !ok || payload.Kind != cloud.ChangeFallback {
+		t.Fatalf("invalid event advanced without fallback: row=%+v payload=%+v ok=%v", row, payload, ok)
 	}
 }
 
@@ -115,5 +139,31 @@ func TestProviderEventsNotifyEveryConsumerBeforeAcknowledgement(t *testing.T) {
 	failing.err = nil
 	if processed, err := service.ProcessPending(context.Background(), connection.ID); err != nil || processed != 1 {
 		t.Fatalf("recovered fanout processed = %d err %v", processed, err)
+	}
+}
+
+func TestProviderCursorGapIsPersistedBeforeFallbackNotification(t *testing.T) {
+	db, _, connections, actor := newConnectionTestService(t, &fakeCloudDriver{})
+	connection, err := connections.Create(actor, ConnectionInput{Name: "gap account", Provider: cloud.ProviderPan115, Cookie: testPan115Cookie, Enabled: true}, RequestContext{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := time.Now().UTC().Add(-time.Minute).Truncate(time.Second)
+	if err := db.Create(&models.ProviderCursor{ConnectionID: connection.ID, Stream: providerLifeStream, CursorTime: base, CursorID: "1", UpdatedAt: base}).Error; err != nil {
+		t.Fatal(err)
+	}
+	next := base.Add(time.Second)
+	source := &fakeChangeSource{page: cloud.ChangePage{NextCursor: cloud.ChangeCursor{Time: next, ID: "9"}, FullFallback: true}}
+	notifier := &fakeEventNotifier{}
+	service := NewProviderEventService(db, notifier)
+	if inserted, _, err := service.IngestOnce(context.Background(), connection.ID, source); err != nil || inserted != 1 {
+		t.Fatalf("inserted=%d err=%v", inserted, err)
+	}
+	if processed, err := service.ProcessPending(context.Background(), connection.ID); err != nil || processed != 1 || len(notifier.events) != 1 {
+		t.Fatalf("processed=%d events=%d err=%v", processed, len(notifier.events), err)
+	}
+	payload, ok := decodePersistedProviderEvent(notifier.events[0])
+	if !ok || payload.Kind != cloud.ChangeFallback || notifier.events[0].ProcessedAt != nil {
+		t.Fatalf("fallback event=%+v payload=%+v ok=%v", notifier.events[0], payload, ok)
 	}
 }

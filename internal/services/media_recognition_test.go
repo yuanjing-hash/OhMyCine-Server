@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/classification"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/medialibrary"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/mediarecognition"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/metadata/tmdb"
 )
@@ -223,6 +224,9 @@ func TestRecognitionMetadataEnvelopePersistsSnapshotAndReadsLegacyClassification
 	metadata, snapshot, err := decodeRecognitionMetadata(raw)
 	if err != nil || metadata.OriginalLanguage != "ja" || snapshot.TMDBID != 346 || snapshot.PosterPath != "/poster.jpg" {
 		t.Fatalf("metadata=%+v snapshot=%+v err=%v", metadata, snapshot, err)
+	}
+	if !strings.Contains(raw, `"engine_version":"`+mediarecognition.EngineVersion+`"`) {
+		t.Fatalf("recognition engine version missing from durable envelope: %s", raw)
 	}
 	legacy, emptySnapshot, err := decodeRecognitionMetadata(`{"MediaType":"movie","OriginalLanguage":"ja"}`)
 	if err != nil || legacy.OriginalLanguage != "ja" || emptySnapshot.TMDBID != 0 {
@@ -682,6 +686,92 @@ func TestRecognizeMediaUsesExtremeFloorAndProvisionalConflictWinner(t *testing.T
 				}
 			} else if result.Status != mediaRecognitionStatusUnrecognized || result.ErrorCode != test.code || lookup.selectedID != 0 {
 				t.Fatalf("result=%+v selected=%d", result, lookup.selectedID)
+			}
+		})
+	}
+}
+
+func TestRecognizeMediaDoesNotBindProvisionalCandidateIntoLibraryCatalog(t *testing.T) {
+	year := 2018
+	lookup := &rankedRecognitionLookupFake{items: []tmdb.Candidate{
+		{ID: 1, Title: "蜡笔小新：功夫小子之拉面大作战2", MediaType: "movie", ReleaseYear: &year, Popularity: 1_000},
+	}}
+	result := recognizeMedia(context.Background(), lookup, MediaRecognitionRequest{
+		PackageName: "蜡笔小新：功夫小子之拉面大作战 (2018)",
+		Files: []recognitionSourceFile{{
+			RelativePath: "/电影/动画电影/蜡笔小新：功夫小子之拉面大作战 (2018)/蜡笔小新：功夫小子之拉面大作战.mp4",
+			Size:         1 << 30,
+		}},
+		SourceKind:       mediarecognition.SourceLibraryScan,
+		MediaTypeHint:    "movie",
+		BuiltinPackCodes: mediarecognition.DefaultPackCodes(),
+		Classification:   classification.DefaultRules(),
+		Language:         "zh-CN",
+		Region:           "CN",
+	})
+	if result.Status != mediaRecognitionStatusUnrecognized || result.ErrorCode != mediaRecognitionLowConfidence || result.TMDBID != nil || lookup.selectedID == 0 {
+		t.Fatalf("provisional library identity was bound: result=%+v selected=%d", result, lookup.selectedID)
+	}
+	if result.Title != "蜡笔小新:功夫小子之拉面大作战" || result.IdentityStatus != mediaIdentityStatusProvisional || result.DecisionReason != mediarecognition.ReasonLowConfidence {
+		t.Fatalf("manual recovery facts were not preserved: result=%+v", result)
+	}
+	for _, search := range lookup.searches {
+		if strings.Contains(search, ":电影") || strings.Contains(search, ":动画电影") {
+			t.Fatalf("library ancestor entered TMDB search: %v", lookup.searches)
+		}
+	}
+}
+
+func TestLibraryRecognitionSearchesOnlyGroupedWorkTitleAcrossNestedLayouts(t *testing.T) {
+	tests := []struct {
+		name        string
+		path        string
+		packageName string
+		workTitle   string
+		forbidden   []string
+	}{
+		{name: "season", path: "/电视剧/华语剧/白日提灯 (2025)/Season 01/白日提灯.S01E23.mkv", packageName: "白日提灯 (2025)", workTitle: "白日提灯", forbidden: []string{"电视剧", "华语剧", "Season 01", "白日提灯 S01E23"}},
+		{name: "bdmv", path: "/电影/经典电影/七武士 (1954)/BDMV/STREAM/00000.m2ts", packageName: "七武士 (1954)", workTitle: "七武士", forbidden: []string{"电影", "经典电影", "BDMV", "STREAM"}},
+		{name: "video ts", path: "/电影/华语电影/英雄 (2002)/VIDEO_TS/VTS_01_1.VOB", packageName: "英雄 (2002)", workTitle: "英雄", forbidden: []string{"电影", "华语电影", "VIDEO_TS", "VTS 01 1"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			units := medialibrary.GroupRecognitionUnits([]medialibrary.File{{RelativePath: test.path, Size: 1 << 30}})
+			if len(units) != 1 || units[0].PackageName != test.packageName {
+				t.Fatalf("library grouping did not select the work directory: units=%+v", units)
+			}
+			unit := units[0]
+			files := make([]recognitionSourceFile, 0, len(unit.EvidenceFiles))
+			for _, file := range unit.EvidenceFiles {
+				files = append(files, recognitionSourceFile{RelativePath: file.RelativePath, Size: file.Size})
+			}
+			lookup := &rankedRecognitionLookupFake{}
+			result := recognizeMedia(context.Background(), lookup, MediaRecognitionRequest{
+				PackageName: unit.PackageName, Files: files,
+				SourceKind: mediarecognition.SourceLibraryScan, MediaTypeHint: unit.MediaTypeHint,
+				BuiltinPackCodes: mediarecognition.DefaultPackCodes(), Classification: classification.DefaultRules(), Language: "zh-CN", Region: "CN",
+			})
+			if result.Status != mediaRecognitionStatusUnrecognized {
+				t.Fatalf("unexpected result=%+v", result)
+			}
+			foundWork := false
+			for _, search := range lookup.searches {
+				parts := strings.SplitN(search, ":", 2)
+				title := ""
+				if len(parts) == 2 {
+					title = parts[1]
+				}
+				if title == test.workTitle {
+					foundWork = true
+				}
+				for _, forbidden := range test.forbidden {
+					if title == forbidden {
+						t.Fatalf("non-work surface %q entered TMDB search: %v", forbidden, lookup.searches)
+					}
+				}
+			}
+			if !foundWork {
+				t.Fatalf("work title missing from TMDB searches: %v", lookup.searches)
 			}
 		})
 	}

@@ -23,6 +23,50 @@ func TestParseMediaGroupsPlayerCompatibleEpisodeLayouts(t *testing.T) {
 	}
 }
 
+func TestParseMediaAcceptsSxxExxAdjacentToChineseText(t *testing.T) {
+	name := "舌尖上的中国S02E02更多资源-XH1080.com.mp4"
+	parsed := ParseMedia(name, "/电视剧/纪录片/舌尖上的中国/Season 2/"+name)
+	if parsed.MediaType != "tv" || parsed.Title != "舌尖上的中国" || parsed.Season == nil || *parsed.Season != 2 || parsed.Episode == nil || *parsed.Episode != 2 {
+		t.Fatalf("parsed=%+v", parsed)
+	}
+}
+
+func TestParseMediaDoesNotTreatSxxExxEmbeddedInASCIIWordAsMarker(t *testing.T) {
+	name := "HOUSE01E02B.mkv"
+	parsed := ParseMedia(name, "/"+name)
+	if parsed.MediaType != "movie" || parsed.Season != nil || parsed.Episode != nil {
+		t.Fatalf("parsed=%+v", parsed)
+	}
+}
+
+func TestParseMediaUsesSeasonDirectoryForTrailingBareEpisode(t *testing.T) {
+	parsed := ParseMedia("哆啦A梦 01.mp4", "/哆啦A梦 (2005)/Season 1/哆啦A梦 01.mp4")
+	if parsed.MediaType != "tv" || parsed.Title != "哆啦A梦" || parsed.SeriesTitle != "哆啦A梦" || parsed.Year == nil || *parsed.Year != 2005 || parsed.Season == nil || *parsed.Season != 1 || parsed.Episode == nil || *parsed.Episode != 1 {
+		t.Fatalf("parsed=%+v", parsed)
+	}
+
+	special := ParseMedia("哆啦A梦 01.mp4", "/哆啦A梦 (2005)/Specials/哆啦A梦 01.mp4")
+	if special.MediaType != "tv" || special.Season == nil || *special.Season != 0 || special.Episode == nil || *special.Episode != 1 {
+		t.Fatalf("special=%+v", special)
+	}
+}
+
+func TestParseMediaDoesNotGuessBareEpisodeWithoutSeasonContext(t *testing.T) {
+	for _, name := range []string{"作品 2005.mp4", "作品 1080p.mp4", "作品 10bit.mp4"} {
+		t.Run(name, func(t *testing.T) {
+			parsed := ParseMedia(name, "/"+name)
+			if parsed.MediaType != "movie" || parsed.Episode != nil || parsed.Season != nil {
+				t.Fatalf("parsed=%+v", parsed)
+			}
+		})
+	}
+
+	yearInSeason := ParseMedia("作品 2005.mp4", "/作品/Season 1/作品 2005.mp4")
+	if yearInSeason.Episode != nil {
+		t.Fatalf("year was guessed as episode: %+v", yearInSeason)
+	}
+}
+
 func TestParseMediaUsesTitleYearFolderForMovie(t *testing.T) {
 	parsed := ParseMedia("Movie.2024.2160p.WEB-DL.mkv", "/电影/Movie (2024)/Movie.2024.2160p.WEB-DL.mkv")
 	if parsed.MediaType != "movie" || parsed.Title != "Movie" || parsed.SeriesTitle != "" || parsed.Season != nil || parsed.Episode != nil {

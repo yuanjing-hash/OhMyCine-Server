@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	storagefs "github.com/yuanjing-hash/OhMyCine-Server/internal/storage"
@@ -20,6 +21,9 @@ const (
 	MaxEntries           = 250000
 	MaxDepth             = 64
 	ProviderScanPageSize = 1000
+	// ProviderProcessingWorkers is deliberately independent from provider HTTP
+	// concurrency. These workers only normalize/filter in-memory file facts.
+	ProviderProcessingWorkers = 128
 )
 
 type File struct {
@@ -48,9 +52,17 @@ type SourceAsset struct {
 	HashHint         string
 }
 type Result struct {
-	Files   []File
-	Assets  []SourceAsset
-	Partial bool
+	Files        []File
+	Assets       []SourceAsset
+	Partial      bool
+	Deduplicated int
+	Enumerated   int
+	// Scoped reconciliation facts are private to the Server event path. A
+	// parent path is included only after its direct-child listing completed, so
+	// it authorizes pruning missing direct children but never a subtree.
+	Scoped                   bool
+	DeletedProviderIDs       []string
+	AuthoritativeParentPaths []string
 }
 
 type providerDirectory struct {
@@ -72,6 +84,9 @@ func ScanProvider(ctx context.Context, driver cloudpkg.Driver, rootID string, re
 	}
 	assetExtensionsSet := extensionSet(assetExtensions)
 	if recursive {
+		if stream, ok := driver.(cloudpkg.TreeStreamDriver); ok {
+			return scanProviderTreeStream(ctx, stream, rootID, extensionsSet, assetExtensionsSet, ignores)
+		}
 		if bulk, ok := driver.(cloudpkg.BulkTreeDriver); ok {
 			return scanProviderTree(ctx, bulk, rootID, extensionsSet, assetExtensionsSet, ignores)
 		}
@@ -122,34 +137,286 @@ func ScanProvider(ctx context.Context, driver cloudpkg.Driver, rootID string, re
 	return sortedResult(result), nil
 }
 
+type providerTreeJob struct {
+	sequence int
+	entry    cloudpkg.TreeEntry
+}
+
+type providerTreeProcessed struct {
+	sequence int
+	file     *File
+	asset    *SourceAsset
+	failed   bool
+}
+
+// providerProcessingObserver is an internal test seam used to prove the
+// fixed worker contract. Production callers never install one.
+type providerProcessingObserver struct {
+	workerStarted func()
+	beforeProcess func()
+	afterProcess  func()
+}
+
+type providerProcessingObserverContextKey struct{}
+
+func withProviderProcessingObserver(ctx context.Context, observer providerProcessingObserver) context.Context {
+	return context.WithValue(ctx, providerProcessingObserverContextKey{}, observer)
+}
+
+// scanProviderTreeStream uses exactly 128 bounded local workers and consumes
+// their results in provider order so duplicate winners are deterministic.
+func scanProviderTreeStream(ctx context.Context, driver cloudpkg.TreeStreamDriver, rootID string, extensionsSet, assetExtensionsSet map[string]struct{}, ignores []string) (Result, error) {
+	workerCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	observer, _ := ctx.Value(providerProcessingObserverContextKey{}).(providerProcessingObserver)
+	jobs := make(chan providerTreeJob, ProviderProcessingWorkers*2)
+	processed := make(chan providerTreeProcessed, ProviderProcessingWorkers*2)
+	var workers sync.WaitGroup
+	workers.Add(ProviderProcessingWorkers)
+	for worker := 0; worker < ProviderProcessingWorkers; worker++ {
+		go func() {
+			defer workers.Done()
+			if observer.workerStarted != nil {
+				observer.workerStarted()
+			}
+			for job := range jobs {
+				item := safelyProcessProviderTreeEntry(job, extensionsSet, assetExtensionsSet, ignores, observer)
+				select {
+				case processed <- item:
+				case <-workerCtx.Done():
+					return
+				}
+			}
+		}()
+	}
+
+	type streamOutcome struct {
+		err     error
+		partial bool
+		entries int
+	}
+	streamDone := make(chan streamOutcome, 1)
+	go func() {
+		sequence := 0
+		partial := false
+		err := driver.StreamTree(workerCtx, rootID, MaxEntries, func(batch cloudpkg.TreeBatch) error {
+			partial = partial || batch.Partial
+			for _, entry := range batch.Entries {
+				select {
+				case jobs <- providerTreeJob{sequence: sequence, entry: entry}:
+					sequence++
+				case <-workerCtx.Done():
+					return workerCtx.Err()
+				}
+			}
+			return nil
+		})
+		close(jobs)
+		workers.Wait()
+		close(processed)
+		streamDone <- streamOutcome{err: err, partial: partial, entries: sequence}
+	}()
+
+	result := Result{Files: make([]File, 0), Assets: make([]SourceAsset, 0)}
+	pending := make(map[int]providerTreeProcessed, ProviderProcessingWorkers*2)
+	seenPaths := make(map[string]struct{})
+	seenProviders := make(map[string]struct{})
+	next := 0
+	processingPartial := false
+	consume := func(item providerTreeProcessed) {
+		if item.failed {
+			processingPartial = true
+			return
+		}
+		if item.file == nil && item.asset == nil {
+			return
+		}
+		path, providerID := "", ""
+		if item.file != nil {
+			path, providerID = item.file.RelativePath, item.file.ProviderID
+		} else {
+			path, providerID = item.asset.RelativePath, item.asset.ProviderID
+		}
+		if _, exists := seenPaths[path]; exists {
+			result.Deduplicated++
+			return
+		}
+		if providerID != "" {
+			if _, exists := seenProviders[providerID]; exists {
+				result.Deduplicated++
+				return
+			}
+			seenProviders[providerID] = struct{}{}
+		}
+		seenPaths[path] = struct{}{}
+		if item.file != nil {
+			result.Files = append(result.Files, *item.file)
+		} else {
+			result.Assets = append(result.Assets, *item.asset)
+		}
+	}
+	for item := range processed {
+		pending[item.sequence] = item
+		for {
+			ready, ok := pending[next]
+			if !ok {
+				break
+			}
+			delete(pending, next)
+			consume(ready)
+			next++
+		}
+	}
+	outcome := <-streamDone
+	result.Partial = outcome.partial || processingPartial
+	result.Enumerated = outcome.entries
+	if outcome.err != nil {
+		return result, outcome.err
+	}
+	if len(result.Files)+len(result.Assets) >= MaxEntries {
+		result.Partial = true
+	}
+	return sortedResult(result), nil
+}
+
+// safelyProcessProviderTreeEntry converts an unexpected per-item panic into a
+// partial snapshot. One malformed/provider-specific fact must never crash the
+// Server or authorize destructive convergence for the rest of the library.
+func safelyProcessProviderTreeEntry(job providerTreeJob, extensionsSet, assetExtensionsSet map[string]struct{}, ignores []string, observer providerProcessingObserver) (result providerTreeProcessed) {
+	result.sequence = job.sequence
+	defer func() {
+		if recover() != nil {
+			result = providerTreeProcessed{sequence: job.sequence, failed: true}
+		}
+	}()
+	if observer.beforeProcess != nil {
+		observer.beforeProcess()
+	}
+	result = processProviderTreeEntry(job.sequence, job.entry, extensionsSet, assetExtensionsSet, ignores)
+	if observer.afterProcess != nil {
+		observer.afterProcess()
+	}
+	return result
+}
+
+func processProviderTreeEntry(sequence int, entry cloudpkg.TreeEntry, extensionsSet, assetExtensionsSet map[string]struct{}, ignores []string) providerTreeProcessed {
+	result := providerTreeProcessed{sequence: sequence}
+	providerPath := strings.TrimSpace(entry.RelativePath)
+	if entry.IsDir || shouldIgnore(providerPath, ignores) {
+		return result
+	}
+	if !strings.HasPrefix(providerPath, "/") {
+		result.failed = true
+		return result
+	}
+	for _, segment := range strings.Split(strings.ReplaceAll(providerPath, "\\", "/"), "/") {
+		if segment == ".." {
+			result.failed = true
+			return result
+		}
+	}
+	clean := filepath.ToSlash(filepath.Clean(providerPath))
+	if clean == "." || clean == "/" || !strings.HasPrefix(clean, "/") || strings.ContainsAny(clean, "\x00\r\n") {
+		result.failed = true
+		return result
+	}
+	extension := strings.ToLower(filepath.Ext(entry.Name))
+	if _, ok := extensionsSet[extension]; ok {
+		file := File{RelativePath: clean, ProviderID: entry.ID, ProviderIDStable: true, Size: entry.Size, ModifiedAt: entry.ModifiedAt.UTC()}
+		result.file = &file
+	} else if _, ok := assetExtensionsSet[extension]; ok {
+		asset := SourceAsset{RelativePath: clean, ProviderID: entry.ID, ParentProviderID: entry.ParentID, Name: entry.Name, Extension: extension, Size: entry.Size, ModifiedAt: entry.ModifiedAt.UTC(), HashHint: entry.SHA1}
+		result.asset = &asset
+	}
+	return result
+}
+
+// ProjectProviderEntries applies the same normalization/filtering rules as a
+// full provider scan to a bounded set of already ancestry-verified entries.
+// It performs no provider I/O and is used only by scoped reconciliation.
+func ProjectProviderEntries(entries []cloudpkg.TreeEntry, extensions, assetExtensions, ignores []string) Result {
+	extensionsSet := extensionSet(extensions)
+	assetExtensionsSet := extensionSet(assetExtensions)
+	result := Result{Files: make([]File, 0, len(entries)), Assets: make([]SourceAsset, 0, len(entries)), Enumerated: len(entries), Partial: true, Scoped: true}
+	seenPaths := make(map[string]struct{}, len(entries))
+	seenProviders := make(map[string]struct{}, len(entries))
+	for sequence, entry := range entries {
+		projected := processProviderTreeEntry(sequence, entry, extensionsSet, assetExtensionsSet, ignores)
+		pathValue, providerID := "", ""
+		if projected.file != nil {
+			pathValue, providerID = projected.file.RelativePath, projected.file.ProviderID
+		} else if projected.asset != nil {
+			pathValue, providerID = projected.asset.RelativePath, projected.asset.ProviderID
+		} else {
+			continue
+		}
+		if _, duplicate := seenPaths[pathValue]; duplicate {
+			result.Deduplicated++
+			continue
+		}
+		if providerID != "" {
+			if _, duplicate := seenProviders[providerID]; duplicate {
+				result.Deduplicated++
+				continue
+			}
+			seenProviders[providerID] = struct{}{}
+		}
+		seenPaths[pathValue] = struct{}{}
+		if projected.file != nil {
+			result.Files = append(result.Files, *projected.file)
+		} else {
+			result.Assets = append(result.Assets, *projected.asset)
+		}
+	}
+	return sortedResult(result)
+}
+
 func scanProviderTree(ctx context.Context, driver cloudpkg.BulkTreeDriver, rootID string, extensionsSet, assetExtensionsSet map[string]struct{}, ignores []string) (Result, error) {
 	tree, err := driver.ListTree(ctx, rootID, MaxEntries)
 	if err != nil {
 		return Result{}, err
 	}
-	result := Result{Files: make([]File, 0, min(len(tree.Entries), MaxEntries)), Partial: tree.Partial}
-	for _, entry := range tree.Entries {
+	result := Result{Files: make([]File, 0, min(len(tree.Entries), MaxEntries)), Assets: make([]SourceAsset, 0), Partial: tree.Partial, Enumerated: len(tree.Entries)}
+	seenPaths := make(map[string]struct{}, len(tree.Entries))
+	seenProviders := make(map[string]struct{}, len(tree.Entries))
+	for sequence, entry := range tree.Entries {
 		if err := ctx.Err(); err != nil {
 			return result, err
 		}
-		path := entry.RelativePath
-		if entry.IsDir || !strings.HasPrefix(path, "/") || shouldIgnore(path, ignores) {
+		projected := processProviderTreeEntry(sequence, entry, extensionsSet, assetExtensionsSet, ignores)
+		if projected.failed {
+			result.Partial = true
 			continue
 		}
-		extension := strings.ToLower(filepath.Ext(entry.Name))
-		if _, video := extensionsSet[extension]; !video {
-			if _, asset := assetExtensionsSet[extension]; !asset {
+		if projected.file == nil && projected.asset == nil {
+			continue
+		}
+		pathValue, providerID := "", ""
+		if projected.file != nil {
+			pathValue, providerID = projected.file.RelativePath, projected.file.ProviderID
+		} else {
+			pathValue, providerID = projected.asset.RelativePath, projected.asset.ProviderID
+		}
+		if _, duplicate := seenPaths[pathValue]; duplicate {
+			result.Deduplicated++
+			continue
+		}
+		if providerID != "" {
+			if _, duplicate := seenProviders[providerID]; duplicate {
+				result.Deduplicated++
 				continue
 			}
+			seenProviders[providerID] = struct{}{}
 		}
+		seenPaths[pathValue] = struct{}{}
 		if len(result.Files)+len(result.Assets) >= MaxEntries {
 			result.Partial = true
 			break
 		}
-		if _, ok := extensionsSet[extension]; ok {
-			result.Files = append(result.Files, File{RelativePath: path, ProviderID: entry.ID, ProviderIDStable: true, Size: entry.Size, ModifiedAt: entry.ModifiedAt.UTC()})
+		if projected.file != nil {
+			result.Files = append(result.Files, *projected.file)
 		} else {
-			result.Assets = append(result.Assets, SourceAsset{RelativePath: path, ProviderID: entry.ID, ParentProviderID: entry.ParentID, Name: entry.Name, Extension: extension, Size: entry.Size, ModifiedAt: entry.ModifiedAt.UTC(), HashHint: entry.SHA1})
+			result.Assets = append(result.Assets, *projected.asset)
 		}
 	}
 	return sortedResult(result), nil

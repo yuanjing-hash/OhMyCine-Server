@@ -77,8 +77,9 @@ type TreeEntry struct {
 }
 
 type TreeResult struct {
-	Entries []TreeEntry
-	Partial bool
+	Entries      []TreeEntry
+	Partial      bool
+	Deduplicated int
 }
 
 // BulkTreeDriver is implemented by providers that expose a recursive listing
@@ -86,6 +87,54 @@ type TreeResult struct {
 // avoids one network request per small directory.
 type BulkTreeDriver interface {
 	ListTree(context.Context, string, int) (TreeResult, error)
+}
+
+// TreeBatch is one ordered page from a recursive provider enumeration.
+type TreeBatch struct {
+	Offset  int64
+	Total   int64
+	Entries []TreeEntry
+	Partial bool
+}
+
+// TreeScanProgress contains aggregate-only facts safe for operation logs.
+type TreeScanProgress struct {
+	Phase        string
+	Batch        int
+	BatchEntries int
+	Enumerated   int
+	Total        int64
+	Duration     time.Duration
+}
+
+// TreeScanTuning separates provider HTTP pressure from local processing.
+type TreeScanTuning struct {
+	RatePerSecond int
+	Concurrency   int
+	Progress      func(TreeScanProgress)
+}
+
+type treeScanTuningContextKey struct{}
+
+func WithTreeScanTuning(ctx context.Context, tuning TreeScanTuning) context.Context {
+	if ctx == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, treeScanTuningContextKey{}, tuning)
+}
+
+func TreeScanTuningFromContext(ctx context.Context) TreeScanTuning {
+	if ctx == nil {
+		return TreeScanTuning{}
+	}
+	tuning, _ := ctx.Value(treeScanTuningContextKey{}).(TreeScanTuning)
+	return tuning
+}
+
+// TreeStreamDriver is the preferred recursive scan capability. Implementors
+// emit batches in ascending offset order.
+type TreeStreamDriver interface {
+	StreamTree(context.Context, string, int, func(TreeBatch) error) error
 }
 
 // DirectoryPathResolver is an optional acceleration for providers that can
@@ -158,6 +207,10 @@ const (
 	ChangeMoved   = "moved"
 	ChangeRenamed = "renamed"
 	ChangeDeleted = "deleted"
+	// ChangeFallback is an internal persisted marker. It records that the
+	// provider cursor crossed an event which could not be translated into a
+	// complete item scope, so consumers must reconcile a complete snapshot.
+	ChangeFallback = "fallback"
 )
 
 // ChangeCursor is an ordered, provider-owned position. Event ID is retained
@@ -183,6 +236,9 @@ type ChangePage struct {
 	Events     []ChangeEvent
 	NextCursor ChangeCursor
 	HasMore    bool
+	// FullFallback is true when the provider cannot prove that Events describe
+	// every catalog-affecting change since the supplied cursor.
+	FullFallback bool
 }
 
 type ChangeSource interface {

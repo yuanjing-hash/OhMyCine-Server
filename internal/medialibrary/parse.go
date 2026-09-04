@@ -8,10 +8,15 @@ import (
 	"strconv"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 )
 
 var (
-	sxxexxPattern      = regexp.MustCompile(`(?i)(?:^|[. _-])S\s*0*([0-9]{1,2})\s*E\s*0*([0-9]{1,5})(?:[. _-]|$)`)
+	// The marker itself is matched separately from its boundaries so adjacent
+	// CJK work/release text is preserved (for example 中文名S02E02更多资源).
+	// parseExplicitSxxExx rejects only ASCII word embedding such as
+	// HOUSE01E02B, which is not an explicit filename marker boundary.
+	sxxexxPattern      = regexp.MustCompile(`(?i)S\s*0*([0-9]{1,2})\s*E\s*0*([0-9]{1,5})`)
 	oneXEpisodePattern = regexp.MustCompile(`(?i)(?:^|[. _-])0*([0-9]{1,2})x0*([0-9]{1,5})(?:[. _-]|$)`)
 	episodeOnlyPattern = regexp.MustCompile(`(?i)(?:^|[. _-])(?:EP?|Episode)\s*0*([0-9]{1,5})(?:[. _-]|$)`)
 	// A bare trailing number is only trusted when a following bracket carries
@@ -21,7 +26,9 @@ var (
 	trailingBracketEpisodePattern = regexp.MustCompile(`(?i)-\s*0*([0-9]{1,5})\s*(\[[^\]]{1,128}\]|【[^】]{1,128}】)`)
 	chineseEpisodePattern         = regexp.MustCompile(`第\s*([0-9一二三四五六七八九十百两〇零]+)\s*[集话話]`)
 	seasonFolderPattern           = regexp.MustCompile(`(?i)^(?:Season|Seanson|S)\s*0*([0-9]{1,2})$`)
+	specialsFolderPattern         = regexp.MustCompile(`(?i)^(?:Specials?|Extras?)$`)
 	chineseSeasonPattern          = regexp.MustCompile(`^第\s*([0-9一二三四五六七八九十百两〇零]+)\s*季$`)
+	seasonScopedEpisodePattern    = regexp.MustCompile(`(?:^|[. _-])0*([0-9]{1,4})\s*$`)
 	yearPattern                   = regexp.MustCompile(`(?:^|[\s._(（\[【-])((?:18|19|20|21)[0-9]{2})(?:$|[\s._)）\]】-])`)
 	bracketNoisePattern           = regexp.MustCompile(`\[[^\]]+\]|\([^)]*\)|【[^】]+】|（[^）]*）`)
 	technicalTokenPattern         = regexp.MustCompile(`(?i)(?:^|[. _-])(?:2160p|1080p|720p|576p|480p|UHD|BluRay|BDRip|WEB[- .]?DL|WEBRip|HDTV|DVDRip|REMUX|x264|x265|H\.?264|H\.?265|HEVC|AV1|AAC|DTS(?:-HD)?|TrueHD|Atmos|DDP?5(?:\.1)?|HDR10?|DoVi|10bit|8bit|Proper|Repack)(?:$|[. _-])`)
@@ -41,6 +48,7 @@ type ParsedMedia struct {
 	MediaType   string
 	Title       string
 	SeriesTitle string
+	Year        *int
 	Season      *int
 	Episode     *int
 }
@@ -61,6 +69,11 @@ func ParseMedia(name, providerPath string) ParsedMedia {
 	if season == nil {
 		season = folderSeason
 	}
+	if episode == nil && seasonIndex >= 1 && folderSeason != nil {
+		if scopedTitle, scopedEpisode := parseSeasonScopedTrailingEpisode(stem); scopedEpisode != nil {
+			episodeTitle, episode = scopedTitle, scopedEpisode
+		}
+	}
 
 	if episode != nil {
 		if season == nil {
@@ -68,14 +81,15 @@ func ParseMedia(name, providerPath string) ParsedMedia {
 			season = &defaultSeason
 		}
 		seriesTitle := ""
+		var year *int
 		if seasonIndex >= 1 {
-			seriesTitle = cleanWorkTitle(parents[seasonIndex-1])
+			seriesTitle, year = parseWorkIdentity(parents[seasonIndex-1])
 		}
 		if seriesTitle == "" {
-			seriesTitle = cleanWorkTitle(episodeTitle)
+			seriesTitle, year = parseWorkIdentity(episodeTitle)
 		}
 		if seriesTitle == "" && len(parents) > 0 {
-			seriesTitle = cleanWorkTitle(parents[len(parents)-1])
+			seriesTitle, year = parseWorkIdentity(parents[len(parents)-1])
 		}
 		if seriesTitle == "" {
 			seriesTitle = episodeTitle
@@ -83,24 +97,25 @@ func ParseMedia(name, providerPath string) ParsedMedia {
 		if seriesTitle == "" {
 			seriesTitle = cleanMediaTitle(stem)
 		}
-		return ParsedMedia{MediaType: "tv", Title: seriesTitle, SeriesTitle: seriesTitle, Season: season, Episode: episode}
+		return ParsedMedia{MediaType: "tv", Title: seriesTitle, SeriesTitle: seriesTitle, Year: year, Season: season, Episode: episode}
 	}
 
 	if seasonIndex >= 1 {
-		seriesTitle := cleanWorkTitle(parents[seasonIndex-1])
+		seriesTitle, year := parseWorkIdentity(parents[seasonIndex-1])
 		if seriesTitle != "" {
-			return ParsedMedia{MediaType: "tv", Title: seriesTitle, SeriesTitle: seriesTitle, Season: season}
+			return ParsedMedia{MediaType: "tv", Title: seriesTitle, SeriesTitle: seriesTitle, Year: year, Season: season}
 		}
 	}
 
-	title := titleFromYearFolder(parents)
+	title, year := titleYearFromFolder(parents)
 	if title == "" {
 		title = cleanMediaTitle(stem)
+		year = extractMediaYear(stem)
 	}
 	if title == "" {
 		title = strings.TrimSpace(stem)
 	}
-	return ParsedMedia{MediaType: "movie", Title: title}
+	return ParsedMedia{MediaType: "movie", Title: title, Year: year}
 }
 
 func WorkKey(parsed ParsedMedia, identity string) string {
@@ -119,9 +134,8 @@ func WorkKey(parsed ParsedMedia, identity string) string {
 }
 
 func parseEpisodeStem(stem string) (string, *int, *int) {
-	if match := sxxexxPattern.FindStringSubmatch(stem); len(match) == 3 {
-		season, episode := atoiPointer(match[1]), atoiPointer(match[2])
-		return cleanMediaTitle(sxxexxPattern.ReplaceAllString(stem, " ")), season, episode
+	if start, end, season, episode, ok := parseExplicitSxxExx(stem); ok {
+		return cleanMediaTitle(stem[:start] + " " + stem[end:]), season, episode
 	}
 	if match := oneXEpisodePattern.FindStringSubmatch(stem); len(match) == 3 {
 		season, episode := atoiPointer(match[1]), atoiPointer(match[2])
@@ -143,6 +157,61 @@ func parseEpisodeStem(stem string) (string, *int, *int) {
 	return cleanMediaTitle(stem), nil, nil
 }
 
+func parseExplicitSxxExx(stem string) (int, int, *int, *int, bool) {
+	searchOffset := 0
+	for searchOffset < len(stem) {
+		match := sxxexxPattern.FindStringSubmatchIndex(stem[searchOffset:])
+		if len(match) != 6 {
+			break
+		}
+		start, end := searchOffset+match[0], searchOffset+match[1]
+		if explicitEpisodeBoundaryAllowed(stem, start, end) {
+			seasonText := stem[searchOffset+match[2] : searchOffset+match[3]]
+			episodeText := stem[searchOffset+match[4] : searchOffset+match[5]]
+			return start, end, atoiPointer(seasonText), atoiPointer(episodeText), true
+		}
+		searchOffset = end
+	}
+	return 0, 0, nil, nil, false
+}
+
+func explicitEpisodeBoundaryAllowed(value string, start, end int) bool {
+	if start > 0 {
+		before, _ := utf8.DecodeLastRuneInString(value[:start])
+		if isASCIIAlphaNumeric(before) {
+			return false
+		}
+	}
+	if end < len(value) {
+		after, _ := utf8.DecodeRuneInString(value[end:])
+		if isASCIIAlphaNumeric(after) {
+			return false
+		}
+	}
+	return true
+}
+
+func isASCIIAlphaNumeric(value rune) bool {
+	return value <= unicode.MaxASCII && (unicode.IsLetter(value) || unicode.IsDigit(value))
+}
+
+func parseSeasonScopedTrailingEpisode(stem string) (string, *int) {
+	candidate := bracketNoisePattern.ReplaceAllString(stem, " ")
+	for technicalTokenPattern.MatchString(candidate) {
+		candidate = technicalTokenPattern.ReplaceAllString(candidate, " ")
+	}
+	match := seasonScopedEpisodePattern.FindStringSubmatch(strings.TrimSpace(candidate))
+	if len(match) != 2 {
+		return cleanMediaTitle(stem), nil
+	}
+	episode, err := strconv.Atoi(match[1])
+	if err != nil || episode <= 0 || (episode >= 1888 && episode <= 2200) {
+		return cleanMediaTitle(stem), nil
+	}
+	title := seasonScopedEpisodePattern.ReplaceAllString(candidate, " ")
+	return cleanMediaTitle(title), &episode
+}
+
 func trailingEpisodeBracketHasReleaseEvidence(value string) bool {
 	return technicalTokenPattern.MatchString(value) ||
 		strings.ContainsAny(strings.ToLower(value), "字幕语語粤粵国國英日韩韓音轨軌")
@@ -150,27 +219,63 @@ func trailingEpisodeBracketHasReleaseEvidence(value string) bool {
 
 func findSeasonFolder(segments []string) (int, *int) {
 	for index := len(segments) - 1; index >= 0; index-- {
-		if match := seasonFolderPattern.FindStringSubmatch(strings.TrimSpace(segments[index])); len(match) == 2 {
-			return index, atoiPointer(match[1])
-		}
-		if match := chineseSeasonPattern.FindStringSubmatch(strings.TrimSpace(segments[index])); len(match) == 2 {
-			if number, ok := parseNumberText(match[1]); ok {
-				return index, &number
-			}
+		if season, ok := seasonFolderNumber(segments[index]); ok {
+			return index, season
 		}
 	}
 	return -1, nil
 }
 
-func titleFromYearFolder(segments []string) string {
+func seasonFolderNumber(value string) (*int, bool) {
+	value = strings.TrimSpace(value)
+	if match := seasonFolderPattern.FindStringSubmatch(value); len(match) == 2 {
+		return atoiPointer(match[1]), true
+	}
+	if match := chineseSeasonPattern.FindStringSubmatch(value); len(match) == 2 {
+		if number, ok := parseNumberText(match[1]); ok {
+			return &number, true
+		}
+	}
+	if specialsFolderPattern.MatchString(value) {
+		season := 0
+		return &season, true
+	}
+	return nil, false
+}
+
+// IsSeasonFolderName reports whether a single safe path segment carries
+// explicit season context. Services use it only after reducing a path to its
+// basename, so no provider path crosses this parser boundary.
+func IsSeasonFolderName(value string) bool {
+	_, ok := seasonFolderNumber(value)
+	return ok
+}
+
+func titleYearFromFolder(segments []string) (string, *int) {
 	for index := len(segments) - 1; index >= 0; index-- {
 		if yearPattern.MatchString(segments[index]) {
-			if title := cleanWorkTitle(segments[index]); title != "" {
-				return title
+			if title, year := parseWorkIdentity(segments[index]); title != "" {
+				return title, year
 			}
 		}
 	}
-	return ""
+	return "", nil
+}
+
+func parseWorkIdentity(value string) (string, *int) {
+	return cleanWorkTitle(value), extractMediaYear(value)
+}
+
+func extractMediaYear(value string) *int {
+	match := yearPattern.FindStringSubmatch(value)
+	if len(match) != 2 {
+		return nil
+	}
+	year, err := strconv.Atoi(match[1])
+	if err != nil || year < 1888 || year > 2200 {
+		return nil
+	}
+	return &year
 }
 
 func cleanMediaTitle(value string) string {

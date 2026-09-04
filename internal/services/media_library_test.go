@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -19,6 +20,8 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/authz"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/database"
+	serverlog "github.com/yuanjing-hash/OhMyCine-Server/internal/logging"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/medialibrary"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/metadata/tmdb"
@@ -528,6 +531,48 @@ func TestMediaLibraryAutomaticallyBuildsBaselineThenListens(t *testing.T) {
 	}
 }
 
+func TestPan115InitialScanDoesNotRepeatUnchangedCatchUp(t *testing.T) {
+	modified := time.Now().UTC().Truncate(time.Second)
+	driver := &fakeCloudDriver{
+		items:    map[string]cloud.Item{"cloud-root": {ID: "cloud-root", ParentID: "0", Name: "媒体", IsDir: true}},
+		children: map[string][]cloud.Item{"cloud-root": {{ID: "video-id", ParentID: "cloud-root", Name: "Once.2026.mkv", Size: 128, ModifiedAt: modified}}},
+	}
+	db, _, connections, actor := newConnectionTestService(t, driver)
+	for _, permission := range []string{authz.PermissionMediaLibrariesRead, authz.PermissionMediaLibrariesCreate, authz.PermissionMediaLibrariesScan} {
+		actor.Permissions[permission] = struct{}{}
+	}
+	connection, err := connections.Create(actor, ConnectionInput{Name: "115 initial account", Provider: cloud.ProviderPan115, Cookie: testPan115Cookie, Enabled: true}, RequestContext{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	storageService := NewStorageService(db, NewAuditService(db))
+	storageService.SetConnectionService(connections)
+	storage, err := storageService.CreateContext(context.Background(), actor, StorageInput{Name: "115 initial root", Type: models.StorageTypePan115, RootPath: "cloud-root", RootDisplayPath: "/媒体", ConnectionID: &connection.ID, Enabled: true}, RequestContext{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var profile models.MediaClassificationProfile
+	if err := db.Order("id").First(&profile).Error; err != nil {
+		t.Fatal(err)
+	}
+	service := NewMediaLibraryService(db, NewAuditService(db), zerolog.Nop())
+	service.SetConnectionService(connections)
+	t.Cleanup(service.Close)
+	library, err := service.Create(context.Background(), actor, MediaLibraryInput{Name: "115 initial once", StorageID: storage.ID, ProfileID: profile.ID, RelativeRoot: "/", ProviderRootID: storage.RootPath, Enabled: true, Recursive: true, VideoExtensions: []string{".mkv"}, TransferMode: models.MediaLibraryTransferCopy}, RequestContext{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForLibrary(t, db, library.ID, func(item models.MediaLibrary) bool { return item.Status == models.MediaLibraryStatusListening })
+	time.Sleep(150 * time.Millisecond)
+	var kinds []string
+	if err := db.Model(&models.MediaLibraryScanRun{}).Where("library_id = ?", library.ID).Order("id").Pluck("kind", &kinds).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(kinds) != 1 || kinds[0] != "initial" {
+		t.Fatalf("115 initialization enumerated more than once without an event: kinds=%v", kinds)
+	}
+}
+
 func TestDisabledLibraryWaitsUntilEnabledAndWatcherReconcilesChanges(t *testing.T) {
 	service, db, actor, storage, profile := mediaLibraryTestService(t)
 	changes := NewMediaChangeService(db)
@@ -933,8 +978,11 @@ func TestPan115MediaLibraryScanKeepsFileIdentityAcrossRename(t *testing.T) {
 	service := NewMediaLibraryService(db, NewAuditService(db), zerolog.Nop())
 	service.SetConnectionService(connections)
 	queue := NewQueueService(db, NewAuditService(db))
+	service.SetQueueService(queue)
 	artifacts := NewMediaArtifactService(db, queue, &SignedProxyService{}, zerolog.Nop())
 	service.SetArtifactService(artifacts)
+	structure := NewMediaLibraryStructureService(db, NewAuditService(db), queue, connections, zerolog.Nop())
+	service.SetStructureService(structure)
 	t.Cleanup(service.Close)
 	metadataArtifacts := true
 	library, err := service.Create(context.Background(), actor, MediaLibraryInput{Name: "115 media", StorageID: storage.ID, ProfileID: profile.ID, RelativeRoot: "/", ProviderRootID: storage.RootPath, Enabled: false, Recursive: true, VideoExtensions: []string{".mkv"}, STRMEnabled: true, STRMLocalRoot: t.TempDir(), MetadataArtifactsEnabled: &metadataArtifacts, TransferMode: models.MediaLibraryTransferCopy}, RequestContext{})
@@ -944,6 +992,77 @@ func TestPan115MediaLibraryScanKeepsFileIdentityAcrossRename(t *testing.T) {
 	first, err := service.ScanNow(context.Background(), actor, library.ID)
 	if err != nil || first.Added != 1 {
 		t.Fatalf("first=%+v err=%v", first, err)
+	}
+	if first.Status != "catalog_ready" || first.Phase != "recognition_queued" || first.Persisted != 1 || first.RecognitionTotal != 1 {
+		t.Fatalf("fast 115 scan did not publish before recognition: %+v", first)
+	}
+	var recognitionJob models.Job
+	if err := db.First(&recognitionJob, "job_type = ?", JobTypeMediaLibraryRecognition).Error; err != nil {
+		t.Fatalf("recognition job was not queued: %v", err)
+	}
+	if recognitionJob.ResourceKey != mediaArtifactResourceKey(library.ID) {
+		t.Fatalf("recognition and artifact work were not serialized: resource=%q", recognitionJob.ResourceKey)
+	}
+	initialDiagnosis, err := queue.Claim([]string{JobTypeMediaLibraryStructureDiagnosis})
+	if err != nil || initialDiagnosis == nil {
+		t.Fatalf("initial structure diagnosis was not claimable: claimed=%+v err=%v", initialDiagnosis, err)
+	}
+	if result := NewMediaLibraryStructureDiagnosisWorker(structure).Run(context.Background(), fastScanTestRuntime{}, *initialDiagnosis); result.ErrorCode != "" {
+		t.Fatalf("initial structure diagnosis failed: %+v", result)
+	}
+	if err := queue.Complete(initialDiagnosis.Job.ID, initialDiagnosis.LeaseToken); err != nil {
+		t.Fatal(err)
+	}
+	pendingDiagnostics, err := structure.Diagnostics(context.Background(), actor, library.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pendingDiagnostics.Unrecognized != 0 || pendingDiagnostics.IssueCount != 0 {
+		t.Fatalf("pending recognition was exposed as an actionable issue: %+v", pendingDiagnostics)
+	}
+	claimed, err := queue.Claim([]string{JobTypeMediaLibraryRecognition})
+	if err != nil || claimed == nil {
+		t.Fatalf("recognition job was not claimable: claimed=%+v err=%v", claimed, err)
+	}
+	workerResult := NewMediaLibraryRecognitionWorker(service).Run(context.Background(), fastScanTestRuntime{}, *claimed)
+	if workerResult.ErrorCode != "" {
+		t.Fatalf("recognition worker failed: %+v", workerResult)
+	}
+	var diagnosisJobs int64
+	if err := db.Model(&models.Job{}).Where("job_type = ?", JobTypeMediaLibraryStructureDiagnosis).Count(&diagnosisJobs).Error; err != nil || diagnosisJobs != 2 {
+		t.Fatalf("recognition completion did not enqueue a fresh diagnosis: count=%d err=%v", diagnosisJobs, err)
+	}
+	refreshedDiagnosis, err := queue.Claim([]string{JobTypeMediaLibraryStructureDiagnosis})
+	if err != nil || refreshedDiagnosis == nil {
+		t.Fatalf("post-recognition structure diagnosis was not claimable: claimed=%+v err=%v", refreshedDiagnosis, err)
+	}
+	if result := NewMediaLibraryStructureDiagnosisWorker(structure).Run(context.Background(), fastScanTestRuntime{}, *refreshedDiagnosis); result.ErrorCode != "" {
+		t.Fatalf("post-recognition structure diagnosis failed: %+v", result)
+	}
+	if err := queue.Complete(refreshedDiagnosis.Job.ID, refreshedDiagnosis.LeaseToken); err != nil {
+		t.Fatal(err)
+	}
+	completedDiagnostics, err := structure.Diagnostics(context.Background(), actor, library.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if completedDiagnostics.Unrecognized != 1 || completedDiagnostics.Classifications.Unrecognized != 1 {
+		t.Fatalf("completed no-match recognition was not exposed for manual recovery: %+v", completedDiagnostics)
+	}
+	if err := queue.Complete(claimed.Job.ID, claimed.LeaseToken); err != nil {
+		t.Fatal(err)
+	}
+	var completedRun models.MediaLibraryScanRun
+	if err := db.First(&completedRun, first.ID).Error; err != nil || completedRun.Status != "success" || completedRun.Phase != "completed" || completedRun.RecognitionCompleted != 1 {
+		t.Fatalf("recognition did not complete scan run: run=%+v err=%v", completedRun, err)
+	}
+	unchanged, err := service.ScanNow(context.Background(), actor, library.ID)
+	if err != nil || unchanged.Status != "success" || unchanged.Phase != "completed" || unchanged.RecognitionTotal != 0 || unchanged.CacheHits != 1 {
+		t.Fatalf("unchanged scan did not reuse recognition: run=%+v err=%v", unchanged, err)
+	}
+	var recognitionJobs int64
+	if err := db.Model(&models.Job{}).Where("job_type = ?", JobTypeMediaLibraryRecognition).Count(&recognitionJobs).Error; err != nil || recognitionJobs != 1 {
+		t.Fatalf("unchanged scan queued recognition work: count=%d err=%v", recognitionJobs, err)
 	}
 	var firstArtifactRun models.MediaArtifactRun
 	if err := db.Where("library_id = ? AND generation = ?", library.ID, first.Generation).First(&firstArtifactRun).Error; err != nil || firstArtifactRun.Status != models.MediaArtifactStatusQueued {
@@ -968,4 +1087,547 @@ func TestPan115MediaLibraryScanKeepsFileIdentityAcrossRename(t *testing.T) {
 	if len(entries) != 1 || entries[0].ProviderID != "video-id" || entries[0].RelativePath != "/After.2026.mkv" {
 		t.Fatalf("entries=%+v", entries)
 	}
+}
+
+func TestPan115FastScanPublishes12171EntriesBeforeRecognition(t *testing.T) {
+	modified := time.Now().UTC().Truncate(time.Second)
+	items := make([]cloud.Item, 12171)
+	for index := range items {
+		name := fmt.Sprintf("Movie.%05d.2026.mkv", index)
+		items[index] = cloud.Item{ID: "video-" + strconv.Itoa(index), ParentID: "cloud-root", Name: name, Size: int64(1024 + index), ModifiedAt: modified}
+	}
+	driver := &fakeCloudDriver{
+		items:    map[string]cloud.Item{"cloud-root": {ID: "cloud-root", ParentID: "0", Name: "媒体", IsDir: true}},
+		children: map[string][]cloud.Item{"cloud-root": items},
+	}
+	db, _, connections, actor := newConnectionTestService(t, driver)
+	for _, permission := range []string{authz.PermissionMediaLibrariesRead, authz.PermissionMediaLibrariesCreate, authz.PermissionMediaLibrariesScan} {
+		actor.Permissions[permission] = struct{}{}
+	}
+	connection, err := connections.Create(actor, ConnectionInput{Name: "115 performance account", Provider: cloud.ProviderPan115, Cookie: testPan115Cookie, Enabled: true}, RequestContext{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	storageService := NewStorageService(db, NewAuditService(db))
+	storageService.SetConnectionService(connections)
+	storage, err := storageService.CreateContext(context.Background(), actor, StorageInput{Name: "115 performance root", Type: models.StorageTypePan115, RootPath: "cloud-root", RootDisplayPath: "/媒体", ConnectionID: &connection.ID, Enabled: true}, RequestContext{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var profile models.MediaClassificationProfile
+	if err := db.Order("id").First(&profile).Error; err != nil {
+		t.Fatal(err)
+	}
+	service := NewMediaLibraryService(db, NewAuditService(db), zerolog.Nop())
+	service.SetConnectionService(connections)
+	service.SetQueueService(NewQueueService(db, NewAuditService(db)))
+	t.Cleanup(service.Close)
+	library, err := service.Create(context.Background(), actor, MediaLibraryInput{Name: "115 performance library", StorageID: storage.ID, ProfileID: profile.ID, RelativeRoot: "/", ProviderRootID: storage.RootPath, Enabled: false, Recursive: true, VideoExtensions: []string{".mkv"}, TransferMode: models.MediaLibraryTransferCopy}, RequestContext{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	run, err := service.ScanNow(context.Background(), actor, library.ID)
+	elapsed := time.Since(started)
+	if err != nil || run.Status != "catalog_ready" || run.Added != len(items) || run.Persisted != len(items) {
+		t.Fatalf("run=%+v elapsed=%s err=%v", run, elapsed, err)
+	}
+	if elapsed >= 60*time.Second {
+		t.Fatalf("12171-entry catalog publication took %s", elapsed)
+	}
+	var count int64
+	if err := db.Model(&models.MediaLibraryEntry{}).Where("library_id = ?", library.ID).Count(&count).Error; err != nil || count != int64(len(items)) {
+		t.Fatalf("published entries=%d err=%v", count, err)
+	}
+}
+
+func TestFastScanStagingResumesCommittedCheckpoint(t *testing.T) {
+	service, db, actor, storage, profile := mediaLibraryTestService(t)
+	library, err := service.Create(context.Background(), actor, testLibraryInput("Staging resume", storage, profile, false), RequestContext{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := models.MediaLibraryScanRun{LibraryID: library.ID, Kind: "full", Status: "running", Phase: "staging", Generation: 1, CheckpointJSON: `{"next_row":5,"total":7}`, StartedAt: time.Now().UTC()}
+	if err := db.Create(&run).Error; err != nil {
+		t.Fatal(err)
+	}
+	created := time.Now().UTC().Add(-time.Hour)
+	staged := make([]models.MediaLibraryScanStaging, 5)
+	files := make([]medialibrary.File, 7)
+	for index := range files {
+		path := fmt.Sprintf("/Movie.%02d.mkv", index)
+		files[index] = medialibrary.File{RelativePath: path, ProviderID: fmt.Sprintf("provider-%02d", index), ProviderIDStable: true, Size: int64(index + 1), ModifiedAt: created}
+		if index < len(staged) {
+			staged[index] = models.MediaLibraryScanStaging{RunID: run.ID, LibraryID: library.ID, ItemKind: "video", RelativePath: path, ProviderID: files[index].ProviderID, Size: files[index].Size, ModifiedAt: created, RowOffset: index, CreatedAt: created, UpdatedAt: created}
+		}
+	}
+	if err := db.Create(&staged).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := service.stageFastMediaLibraryScan(context.Background(), &run, medialibrary.Result{Files: files}, serverlog.OperationLibraryFullScan); err != nil {
+		t.Fatal(err)
+	}
+	var rows []models.MediaLibraryScanStaging
+	if err := db.Where("run_id = ?", run.ID).Order("row_offset").Find(&rows).Error; err != nil || len(rows) != len(files) {
+		t.Fatalf("rows=%d err=%v", len(rows), err)
+	}
+	if !rows[0].CreatedAt.Equal(created) {
+		t.Fatalf("checkpoint rows were rewritten: got=%s want=%s", rows[0].CreatedAt, created)
+	}
+	if run.Persisted != len(files) || !strings.Contains(run.CheckpointJSON, `"next_row":7`) {
+		t.Fatalf("run checkpoint=%s persisted=%d", run.CheckpointJSON, run.Persisted)
+	}
+}
+
+func TestFastScanStagingRejectsNonPrefixCheckpoint(t *testing.T) {
+	service, db, actor, storage, profile := mediaLibraryTestService(t)
+	library, err := service.Create(context.Background(), actor, testLibraryInput("Staging prefix guard", storage, profile, false), RequestContext{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := models.MediaLibraryScanRun{LibraryID: library.ID, Kind: "full", Status: "running", Phase: "staging", Generation: 1, CheckpointJSON: `{"next_row":2,"total":3}`, StartedAt: time.Now().UTC()}
+	if err := db.Create(&run).Error; err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	// These rows prove only that two facts exist, not that rows 0 and 1 were
+	// committed. A count-only resume check would incorrectly skip the prefix.
+	stale := []models.MediaLibraryScanStaging{
+		{RunID: run.ID, LibraryID: library.ID, ItemKind: "video", RelativePath: "/stale-2.mkv", ProviderID: "stale-2", ModifiedAt: now, RowOffset: 2, CreatedAt: now, UpdatedAt: now},
+		{RunID: run.ID, LibraryID: library.ID, ItemKind: "video", RelativePath: "/stale-3.mkv", ProviderID: "stale-3", ModifiedAt: now, RowOffset: 3, CreatedAt: now, UpdatedAt: now},
+	}
+	if err := db.Create(&stale).Error; err != nil {
+		t.Fatal(err)
+	}
+	files := []medialibrary.File{
+		{RelativePath: "/Movie.00.mkv", ProviderID: "provider-0", ProviderIDStable: true, ModifiedAt: now},
+		{RelativePath: "/Movie.01.mkv", ProviderID: "provider-1", ProviderIDStable: true, ModifiedAt: now},
+		{RelativePath: "/Movie.02.mkv", ProviderID: "provider-2", ProviderIDStable: true, ModifiedAt: now},
+	}
+	if err := service.stageFastMediaLibraryScan(context.Background(), &run, medialibrary.Result{Files: files}, serverlog.OperationLibraryFullScan); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{"/Movie.00.mkv", "/Movie.01.mkv", "/Movie.02.mkv"} {
+		var count int64
+		if err := db.Model(&models.MediaLibraryScanStaging{}).Where("run_id = ? AND relative_path = ?", run.ID, path).Count(&count).Error; err != nil || count != 1 {
+			t.Fatalf("path=%s count=%d err=%v", path, count, err)
+		}
+	}
+}
+
+func TestFastScanStagingRejectsDuplicateOffsetCheckpoint(t *testing.T) {
+	service, db, actor, storage, profile := mediaLibraryTestService(t)
+	library, err := service.Create(context.Background(), actor, testLibraryInput("Staging duplicate prefix guard", storage, profile, false), RequestContext{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := models.MediaLibraryScanRun{LibraryID: library.ID, Kind: "full", Status: "running", Phase: "staging", Generation: 1, CheckpointJSON: `{"next_row":2,"total":3}`, StartedAt: time.Now().UTC()}
+	if err := db.Create(&run).Error; err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	stale := []models.MediaLibraryScanStaging{
+		{RunID: run.ID, LibraryID: library.ID, ItemKind: "video", RelativePath: "/stale-a.mkv", ProviderID: "stale-a", ModifiedAt: now, RowOffset: 0, CreatedAt: now, UpdatedAt: now},
+		{RunID: run.ID, LibraryID: library.ID, ItemKind: "video", RelativePath: "/stale-b.mkv", ProviderID: "stale-b", ModifiedAt: now, RowOffset: 0, CreatedAt: now, UpdatedAt: now},
+	}
+	if err := db.Create(&stale).Error; err != nil {
+		t.Fatal(err)
+	}
+	files := []medialibrary.File{
+		{RelativePath: "/Movie.00.mkv", ProviderID: "provider-0", ProviderIDStable: true, ModifiedAt: now},
+		{RelativePath: "/Movie.01.mkv", ProviderID: "provider-1", ProviderIDStable: true, ModifiedAt: now},
+		{RelativePath: "/Movie.02.mkv", ProviderID: "provider-2", ProviderIDStable: true, ModifiedAt: now},
+	}
+	if err := service.stageFastMediaLibraryScan(context.Background(), &run, medialibrary.Result{Files: files}, serverlog.OperationLibraryFullScan); err != nil {
+		t.Fatal(err)
+	}
+	var newPrefix int64
+	if err := db.Model(&models.MediaLibraryScanStaging{}).Where("run_id = ? AND relative_path IN ?", run.ID, []string{"/Movie.00.mkv", "/Movie.01.mkv"}).Count(&newPrefix).Error; err != nil {
+		t.Fatal(err)
+	}
+	if newPrefix != 2 {
+		t.Fatalf("duplicate offsets incorrectly authorized checkpoint resume: new_prefix=%d", newPrefix)
+	}
+}
+
+func TestFastPartialScanPreservesUnseenRecognition(t *testing.T) {
+	service, db, actor, storage, profile := mediaLibraryTestService(t)
+	queue := NewQueueService(db, NewAuditService(db))
+	service.SetQueueService(queue)
+	created, err := service.Create(context.Background(), actor, testLibraryInput("Partial recognition guard", storage, profile, false), RequestContext{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Truncate(time.Second)
+	if err := db.Model(&models.MediaLibrary{}).Where("id = ?", created.ID).Updates(map[string]any{"dirty_generation": 1, "baseline_generation": 1}).Error; err != nil {
+		t.Fatal(err)
+	}
+	var library models.MediaLibrary
+	if err := db.First(&library, created.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	oldRecognition := models.MediaLibraryRecognition{
+		LibraryID: library.ID, SourceKey: "old-source", InputFingerprint: "old-fingerprint", ProfileID: profile.ID, ProfileRevision: profile.Revision,
+		Status: mediaRecognitionStatusMatched, MediaType: "movie", Title: "保留作品", MetadataJSON: "{}", LastGeneration: 1, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := db.Create(&oldRecognition).Error; err != nil {
+		t.Fatal(err)
+	}
+	oldEntry := models.MediaLibraryEntry{
+		LibraryID: library.ID, RelativePath: "/Old.2025.mkv", ProviderID: "old-provider", RecognitionID: &oldRecognition.ID,
+		MediaType: "movie", Title: "保留作品", WorkKey: "tmdb:movie:1", MatchStatus: mediaRecognitionStatusMatched,
+		LastGeneration: 1, ModifiedAt: now, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := db.Create(&oldEntry).Error; err != nil {
+		t.Fatal(err)
+	}
+	run := models.MediaLibraryScanRun{LibraryID: library.ID, Kind: "event", Status: "running", Phase: "enumerating", Generation: 2, SourceFingerprint: mediaLibraryScanSourceFingerprint(library, storage, profile), CheckpointJSON: "{}", StartedAt: now}
+	if err := db.Create(&run).Error; err != nil {
+		t.Fatal(err)
+	}
+	result := medialibrary.Result{Partial: true, Enumerated: 1, Files: []medialibrary.File{{RelativePath: "/New.2026.mkv", ProviderID: "new-provider", ProviderIDStable: true, Size: 10, ModifiedAt: now}}}
+	published, err := service.publishFastPan115Scan(context.Background(), library, storage, profile, run, result, time.Now(), serverlog.OperationLibraryEventScan)
+	if err != nil || published.Status != "catalog_ready" || !published.Partial {
+		t.Fatalf("published=%+v err=%v", published, err)
+	}
+	var oldRecognitionCount, oldEntryCount int64
+	if err := db.Model(&models.MediaLibraryRecognition{}).Where("id = ?", oldRecognition.ID).Count(&oldRecognitionCount).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&models.MediaLibraryEntry{}).Where("id = ? AND recognition_id = ?", oldEntry.ID, oldRecognition.ID).Count(&oldEntryCount).Error; err != nil {
+		t.Fatal(err)
+	}
+	if oldRecognitionCount != 1 || oldEntryCount != 1 || published.Removed != 0 {
+		t.Fatalf("unseen partial state was pruned: recognition=%d entry=%d removed=%d", oldRecognitionCount, oldEntryCount, published.Removed)
+	}
+	claimed, err := queue.Claim([]string{JobTypeMediaLibraryRecognition})
+	if err != nil || claimed == nil {
+		t.Fatalf("recognition job was not claimable: claimed=%+v err=%v", claimed, err)
+	}
+	if result := NewMediaLibraryRecognitionWorker(service).Run(context.Background(), fastScanTestRuntime{}, *claimed); result.ErrorCode != "" {
+		t.Fatalf("partial recognition worker failed: %+v", result)
+	}
+	if err := queue.Complete(claimed.Job.ID, claimed.LeaseToken); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&models.MediaLibraryRecognition{}).Where("id = ?", oldRecognition.ID).Count(&oldRecognitionCount).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&models.MediaLibraryEntry{}).Where("id = ? AND recognition_id = ?", oldEntry.ID, oldRecognition.ID).Count(&oldEntryCount).Error; err != nil {
+		t.Fatal(err)
+	}
+	if oldRecognitionCount != 1 || oldEntryCount != 1 {
+		t.Fatalf("background recognition pruned unseen partial state: recognition=%d entry=%d", oldRecognitionCount, oldEntryCount)
+	}
+}
+
+func TestFastMixedScanAdvancesReusedRecognitionGeneration(t *testing.T) {
+	service, db, actor, storage, profile := mediaLibraryTestService(t)
+	service.SetQueueService(NewQueueService(db, NewAuditService(db)))
+	created, err := service.Create(context.Background(), actor, testLibraryInput("Mixed recognition generation", storage, profile, false), RequestContext{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&models.MediaLibrary{}).Where("id = ?", created.ID).Updates(map[string]any{"dirty_generation": 1, "baseline_generation": 1}).Error; err != nil {
+		t.Fatal(err)
+	}
+	var library models.MediaLibrary
+	if err := db.First(&library, created.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Truncate(time.Second)
+	cachedFile := medialibrary.File{RelativePath: "/Cached.2025.mkv", ProviderID: "cached-provider", ProviderIDStable: true, Size: 20, ModifiedAt: now}
+	cachedUnit := medialibrary.GroupRecognitionUnits([]medialibrary.File{cachedFile})[0]
+	recognition := models.MediaLibraryRecognition{
+		LibraryID: library.ID, SourceKey: cachedUnit.SourceKey, InputFingerprint: cachedUnit.InputFingerprint, ProfileID: profile.ID, ProfileRevision: profile.Revision,
+		Status: mediaRecognitionStatusMatched, MediaType: "movie", Title: "缓存作品", MetadataJSON: currentRecognitionMetadataJSON(t), LastGeneration: 1, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := db.Create(&recognition).Error; err != nil {
+		t.Fatal(err)
+	}
+	entry := models.MediaLibraryEntry{
+		LibraryID: library.ID, RelativePath: cachedFile.RelativePath, ProviderID: cachedFile.ProviderID, RecognitionID: &recognition.ID,
+		Size: cachedFile.Size, ModifiedAt: cachedFile.ModifiedAt, MediaType: "movie", Title: recognition.Title, WorkKey: "tmdb:movie:1",
+		MatchStatus: mediaRecognitionStatusMatched, LastGeneration: 1, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := db.Create(&entry).Error; err != nil {
+		t.Fatal(err)
+	}
+	run := models.MediaLibraryScanRun{LibraryID: library.ID, Kind: "full", Status: "running", Phase: "enumerating", Generation: 2, SourceFingerprint: mediaLibraryScanSourceFingerprint(library, storage, profile), CheckpointJSON: "{}", StartedAt: now}
+	if err := db.Create(&run).Error; err != nil {
+		t.Fatal(err)
+	}
+	newFile := medialibrary.File{RelativePath: "/New.2026.mkv", ProviderID: "new-provider", ProviderIDStable: true, Size: 10, ModifiedAt: now}
+	published, err := service.publishFastPan115Scan(context.Background(), library, storage, profile, run, medialibrary.Result{Files: []medialibrary.File{cachedFile, newFile}, Enumerated: 2}, time.Now(), serverlog.OperationLibraryFullScan)
+	if err != nil || published.RecognitionTotal != 1 || published.CacheHits != 1 {
+		t.Fatalf("published=%+v err=%v", published, err)
+	}
+	if err := db.First(&recognition, recognition.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if recognition.LastGeneration != run.Generation {
+		t.Fatalf("reused recognition generation=%d want=%d", recognition.LastGeneration, run.Generation)
+	}
+}
+
+func TestFastScanInvalidatesAutomaticProjectionFromOlderRecognitionEngine(t *testing.T) {
+	service, db, actor, storage, profile := mediaLibraryTestService(t)
+	service.SetQueueService(NewQueueService(db, NewAuditService(db)))
+	created, err := service.Create(context.Background(), actor, testLibraryInput("Recognition engine refresh", storage, profile, false), RequestContext{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&models.MediaLibrary{}).Where("id = ?", created.ID).Updates(map[string]any{"dirty_generation": 1, "baseline_generation": 1}).Error; err != nil {
+		t.Fatal(err)
+	}
+	var library models.MediaLibrary
+	if err := db.First(&library, created.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Truncate(time.Second)
+	file := medialibrary.File{RelativePath: "/电影/吉卜力工作室特别短片合辑/吉卜力工作室特别短片合辑.mp4", ProviderID: "old-engine-provider", ProviderIDStable: true, Size: 20, ModifiedAt: now}
+	unit := medialibrary.GroupRecognitionUnits([]medialibrary.File{file})[0]
+	wrongID := int64(1)
+	stale := models.MediaLibraryRecognition{
+		LibraryID: library.ID, SourceKey: unit.SourceKey, InputFingerprint: unit.InputFingerprint, ProfileID: profile.ID, ProfileRevision: profile.Revision,
+		Status: mediaRecognitionStatusMatched, MediaType: "movie", Title: "电影人", TMDBID: &wrongID,
+		MetadataJSON: `{"version":1,"engine_version":"nextgen-domain-v10","classification":{"MediaType":"movie"}}`, LastGeneration: 1, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := db.Create(&stale).Error; err != nil {
+		t.Fatal(err)
+	}
+	entry := models.MediaLibraryEntry{
+		LibraryID: library.ID, RelativePath: file.RelativePath, ProviderID: file.ProviderID, RecognitionID: &stale.ID,
+		Size: file.Size, ModifiedAt: file.ModifiedAt, MediaType: "movie", Title: stale.Title, WorkKey: "movie:tmdb:1",
+		MatchStatus: mediaRecognitionStatusMatched, TMDBID: &wrongID, LastGeneration: 1, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := db.Create(&entry).Error; err != nil {
+		t.Fatal(err)
+	}
+	run := models.MediaLibraryScanRun{LibraryID: library.ID, Kind: "full", Status: "running", Phase: "enumerating", Generation: 2, SourceFingerprint: mediaLibraryScanSourceFingerprint(library, storage, profile), CheckpointJSON: "{}", StartedAt: now}
+	if err := db.Create(&run).Error; err != nil {
+		t.Fatal(err)
+	}
+	published, err := service.publishFastPan115Scan(context.Background(), library, storage, profile, run, medialibrary.Result{Files: []medialibrary.File{file}, Enumerated: 1}, time.Now(), serverlog.OperationLibraryFullScan)
+	if err != nil || published.RecognitionTotal != 1 || published.CacheHits != 0 || published.Status != "catalog_ready" {
+		t.Fatalf("stale projection was reused: published=%+v err=%v", published, err)
+	}
+	var refreshed models.MediaLibraryEntry
+	if err := db.First(&refreshed, entry.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if refreshed.MatchStatus != mediaRecognitionStatusPending || refreshed.RecognitionID != nil || refreshed.TMDBID != nil || refreshed.Title == stale.Title {
+		t.Fatalf("old engine identity remained in published catalog: entry=%+v", refreshed)
+	}
+}
+
+func TestFastTVScanAddsEpisodeWithoutReidentifyingWork(t *testing.T) {
+	service, db, actor, storage, profile := mediaLibraryTestService(t)
+	created, err := service.Create(context.Background(), actor, testLibraryInput("Stable TV work identity", storage, profile, false), RequestContext{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&models.MediaLibrary{}).Where("id = ?", created.ID).Updates(map[string]any{"dirty_generation": 1, "baseline_generation": 1}).Error; err != nil {
+		t.Fatal(err)
+	}
+	var library models.MediaLibrary
+	if err := db.First(&library, created.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Truncate(time.Second)
+	first := medialibrary.File{RelativePath: "/哆啦A梦 (2005)/Season 01/哆啦A梦 0001.mp4", ProviderID: "episode-provider-1", ProviderIDStable: true, Size: 10, ModifiedAt: now}
+	second := medialibrary.File{RelativePath: "/哆啦A梦 (2005)/Season 01/哆啦A梦 0002.mp4", ProviderID: "episode-provider-0", ProviderIDStable: true, Size: 20, ModifiedAt: now}
+	unparsed := medialibrary.File{RelativePath: "/哆啦A梦 (2005)/Season 01/特别篇.mp4", ProviderID: "episode-provider-special", ProviderIDStable: true, Size: 30, ModifiedAt: now}
+	tmdbID := int64(65733)
+	recognition := models.MediaLibraryRecognition{
+		LibraryID: library.ID, SourceKey: "legacy-provider-anchor", InputFingerprint: "legacy-whole-series-fingerprint", ProfileID: profile.ID, ProfileRevision: profile.Revision,
+		Status: mediaRecognitionStatusMatched, MediaType: "tv", Title: "哆啦A梦", TMDBID: &tmdbID, MetadataJSON: "{}", ManualOverride: true,
+		LastGeneration: 1, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := db.Create(&recognition).Error; err != nil {
+		t.Fatal(err)
+	}
+	season, episode := 1, 1
+	entry := models.MediaLibraryEntry{
+		LibraryID: library.ID, RelativePath: first.RelativePath, ProviderID: first.ProviderID, RecognitionID: &recognition.ID,
+		Size: first.Size, ModifiedAt: first.ModifiedAt, MediaType: "tv", Title: recognition.Title, SeriesTitle: recognition.Title,
+		Season: &season, Episode: &episode, WorkKey: recognitionWorkKey(MediaRecognitionResult{Status: recognition.Status, MediaType: recognition.MediaType, Title: recognition.Title, TMDBID: recognition.TMDBID}, recognition.SourceKey),
+		MatchStatus: mediaRecognitionStatusMatched, TMDBID: &tmdbID, LastGeneration: 1, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := db.Create(&entry).Error; err != nil {
+		t.Fatal(err)
+	}
+	run := models.MediaLibraryScanRun{LibraryID: library.ID, Kind: "full", Status: "running", Phase: "enumerating", Generation: 2, SourceFingerprint: mediaLibraryScanSourceFingerprint(library, storage, profile), CheckpointJSON: "{}", StartedAt: now}
+	if err := db.Create(&run).Error; err != nil {
+		t.Fatal(err)
+	}
+	published, err := service.publishFastPan115Scan(context.Background(), library, storage, profile, run, medialibrary.Result{Files: []medialibrary.File{first, second, unparsed}, Enumerated: 3}, time.Now(), serverlog.OperationLibraryFullScan)
+	if err != nil || published.Status != "success" || published.RecognitionTotal != 0 || published.CacheHits != 1 {
+		t.Fatalf("published=%+v err=%v", published, err)
+	}
+	var added models.MediaLibraryEntry
+	if err := db.Where("library_id = ? AND relative_path = ?", library.ID, second.RelativePath).First(&added).Error; err != nil {
+		t.Fatal(err)
+	}
+	if added.RecognitionID == nil || *added.RecognitionID != recognition.ID || added.Season == nil || *added.Season != 1 || added.Episode == nil || *added.Episode != 2 || added.Title != "哆啦A梦" {
+		t.Fatalf("added entry=%+v", added)
+	}
+	var pendingEpisode models.MediaLibraryEntry
+	if err := db.Where("library_id = ? AND relative_path = ?", library.ID, unparsed.RelativePath).First(&pendingEpisode).Error; err != nil {
+		t.Fatal(err)
+	}
+	if pendingEpisode.RecognitionID == nil || *pendingEpisode.RecognitionID != recognition.ID || pendingEpisode.MatchStatus != mediaRecognitionStatusMatched || pendingEpisode.Season == nil || *pendingEpisode.Season != 1 || pendingEpisode.Episode != nil {
+		t.Fatalf("unparsed episode downgraded work recognition: %+v", pendingEpisode)
+	}
+	var persisted models.MediaLibraryRecognition
+	if err := db.First(&persisted, recognition.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if !persisted.ManualOverride || persisted.LastGeneration != run.Generation {
+		t.Fatalf("recognition=%+v", persisted)
+	}
+	var recognitionCount int64
+	if err := db.Model(&models.MediaLibraryRecognition{}).Where("library_id = ?", library.ID).Count(&recognitionCount).Error; err != nil {
+		t.Fatal(err)
+	}
+	if recognitionCount != 1 {
+		t.Fatalf("recognition count=%d", recognitionCount)
+	}
+}
+
+func TestFastScanRejectsChangedConfigurationBeforeCatalogPublish(t *testing.T) {
+	service, db, actor, storage, profile := mediaLibraryTestService(t)
+	created, err := service.Create(context.Background(), actor, testLibraryInput("Configuration guard", storage, profile, false), RequestContext{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var library models.MediaLibrary
+	if err := db.First(&library, created.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	run := models.MediaLibraryScanRun{LibraryID: library.ID, Kind: "full", Status: "running", Phase: "enumerating", Generation: library.DirtyGeneration + 1, SourceFingerprint: mediaLibraryScanSourceFingerprint(library, storage, profile), CheckpointJSON: "{}", StartedAt: time.Now().UTC()}
+	if err := db.Create(&run).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&library).Update("ignore_patterns_json", `["changed-during-scan"]`).Error; err != nil {
+		t.Fatal(err)
+	}
+	result := medialibrary.Result{Files: []medialibrary.File{{RelativePath: "/Guard.2026.mkv", ProviderID: "guard-provider", ProviderIDStable: true, Size: 10, ModifiedAt: time.Now().UTC()}}}
+	failed, err := service.publishFastPan115Scan(context.Background(), library, storage, profile, run, result, time.Now(), serverlog.OperationLibraryFullScan)
+	if err == nil || failed.Status != "failed" || failed.DatabaseErrorClass != mediaLibraryDatabaseErrorConfigurationChanged {
+		t.Fatalf("failed run=%+v err=%v", failed, err)
+	}
+	var catalogCount, stagingCount int64
+	if countErr := db.Model(&models.MediaLibraryEntry{}).Where("library_id = ?", library.ID).Count(&catalogCount).Error; countErr != nil {
+		t.Fatal(countErr)
+	}
+	if countErr := db.Model(&models.MediaLibraryScanStaging{}).Where("run_id = ?", run.ID).Count(&stagingCount).Error; countErr != nil {
+		t.Fatal(countErr)
+	}
+	if catalogCount != 0 || stagingCount != 1 {
+		t.Fatalf("catalog=%d staging=%d", catalogCount, stagingCount)
+	}
+}
+
+func TestFastScanKeepsCatalogUsableWhenRecognitionEnqueueFails(t *testing.T) {
+	service, db, actor, storage, profile := mediaLibraryTestService(t)
+	created, err := service.Create(context.Background(), actor, testLibraryInput("Queue failure", storage, profile, false), RequestContext{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var library models.MediaLibrary
+	if err := db.First(&library, created.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	run := models.MediaLibraryScanRun{LibraryID: library.ID, Kind: "full", Status: "running", Phase: "enumerating", Generation: 1, SourceFingerprint: mediaLibraryScanSourceFingerprint(library, storage, profile), CheckpointJSON: "{}", StartedAt: time.Now().UTC()}
+	if err := db.Create(&run).Error; err != nil {
+		t.Fatal(err)
+	}
+	result := medialibrary.Result{Files: []medialibrary.File{{RelativePath: "/Queue.2026.mkv", ProviderID: "queue-provider", ProviderIDStable: true, Size: 10, ModifiedAt: time.Now().UTC()}}}
+	published, err := service.publishFastPan115Scan(context.Background(), library, storage, profile, run, result, time.Now(), serverlog.OperationLibraryFullScan)
+	if err != nil || published.Status != "catalog_ready" || published.Phase != "recognition_enqueue_failed" || published.ErrorCode != "media_library_recognition_enqueue_failed" {
+		t.Fatalf("published run=%+v err=%v", published, err)
+	}
+	var count int64
+	if err := db.Model(&models.MediaLibraryEntry{}).Where("library_id = ?", library.ID).Count(&count).Error; err != nil || count != 1 {
+		t.Fatalf("catalog count=%d err=%v", count, err)
+	}
+}
+
+func TestFastScanStartupRecoversFailedRecognitionPhase(t *testing.T) {
+	service, db, actor, storage, profile := mediaLibraryTestService(t)
+	queue := NewQueueService(db, NewAuditService(db))
+	service.SetQueueService(queue)
+	library, err := service.Create(context.Background(), actor, testLibraryInput("Recognition recovery", storage, profile, false), RequestContext{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := models.MediaLibraryScanRun{LibraryID: library.ID, Kind: "full", Status: "catalog_ready", Phase: "recognition_failed", Generation: 1, RecognitionTotal: 1, StartedAt: time.Now().UTC()}
+	if err := db.Create(&run).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := service.recoverMediaLibraryRecognitionJobs(); err != nil {
+		t.Fatal(err)
+	}
+	var job models.Job
+	if err := db.First(&job, "job_type = ?", JobTypeMediaLibraryRecognition).Error; err != nil {
+		t.Fatal(err)
+	}
+	if job.ResourceKey != mediaArtifactResourceKey(library.ID) {
+		t.Fatalf("recovery job=%+v", job)
+	}
+}
+
+func TestFastScanPublicStateAndMediaDisplayNameAreSafe(t *testing.T) {
+	longName := strings.Repeat("电影", 100)
+	clean := safeMediaDisplayName("\x00\r\n  " + longName + "  ")
+	if strings.ContainsAny(clean, "\x00\r\n") || len([]rune(clean)) != 161 || !strings.HasSuffix(clean, "…") {
+		t.Fatalf("unsafe display name %q", clean)
+	}
+	for _, private := range []string{`C:\Media\Secret.mkv`, `/mnt/private/Secret.mkv`, `https://cdn.example.test/video.mkv?token=secret`, `file:///C:/Media/Secret.mkv`, `magnet:?xt=urn:btih:secret`} {
+		if got := safeMediaDisplayName(private); got != "未命名媒体" {
+			t.Fatalf("private locator was rendered as media name: input=%q got=%q", private, got)
+		}
+	}
+	run := models.MediaLibraryScanRun{LibraryID: 7, SourceFingerprint: "private-source", CheckpointJSON: `{"provider_id":"private-provider"}`}
+	payload, err := json.Marshal(run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(payload), "private-source") || strings.Contains(string(payload), "private-provider") || strings.Contains(string(payload), "checkpoint") || strings.Contains(string(payload), "source_fingerprint") {
+		t.Fatalf("private scan state leaked: %s", payload)
+	}
+}
+
+func TestFastScanOperationLogsNeverIncludeRawFailureOrLocator(t *testing.T) {
+	service, _, _, _, _ := mediaLibraryTestService(t)
+	var output bytes.Buffer
+	service.log = zerolog.New(&output).Level(zerolog.DebugLevel)
+	run := models.MediaLibraryScanRun{ID: 9, LibraryID: 7, Kind: "full", Generation: 3, StartedAt: time.Now().UTC()}
+	logFastScanMediaAction(service.log, serverlog.OperationLibraryFullScan, run, "processing", "discovered", `file:///C:/Media/Secret.mkv`, "movie")
+	_, _ = service.failFastScanPersistence(run, serverlog.OperationLibraryFullScan, time.Now(), mediaLibraryPersistenceStageEntries,
+		errors.New(`Cookie=secret-cookie https://provider.example/private C:\Media\Secret.mkv INSERT INTO private VALUES ('upstream-body')`))
+	logged := output.String()
+	for _, forbidden := range []string{"secret-cookie", "provider.example", `C:\\Media`, "INSERT INTO", "upstream-body", "file:///"} {
+		if strings.Contains(logged, forbidden) {
+			t.Fatalf("private diagnostic leaked into operation log: forbidden=%q log=%s", forbidden, logged)
+		}
+	}
+	if !strings.Contains(logged, "未命名媒体") || !strings.Contains(logged, mediaLibraryDatabaseErrorUnknown) {
+		t.Fatalf("safe diagnostics missing: %s", logged)
+	}
+}
+
+type fastScanTestRuntime struct{}
+
+func (fastScanTestRuntime) Heartbeat(*float64, *int64, *int64, *float64, *int64) error { return nil }
+func (fastScanTestRuntime) Checkpoint(any) error                                       { return nil }
+
+func currentRecognitionMetadataJSON(t *testing.T) string {
+	t.Helper()
+	raw, err := marshalRecognitionMetadata(MediaRecognitionResult{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
 }

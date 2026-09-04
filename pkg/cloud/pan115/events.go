@@ -102,9 +102,17 @@ func (c *Client) Changes(ctx context.Context, cursor cloud.ChangeCursor, limit i
 	}
 	events := make([]cloud.ChangeEvent, 0, len(batch.Events))
 	latest := cursor
+	fullFallback := false
+	var oldest cloud.ChangeCursor
 	for _, raw := range batch.Events {
-		if position, valid := lifeEventPosition(raw); valid && compareLifePosition(position.Time, position.ID, latest.Time, latest.ID) > 0 {
-			latest = position
+		position, validPosition := lifeEventPosition(raw)
+		if validPosition {
+			if oldest.Time.IsZero() || compareLifePosition(position.Time, position.ID, oldest.Time, oldest.ID) < 0 {
+				oldest = position
+			}
+			if compareLifePosition(position.Time, position.ID, latest.Time, latest.ID) > 0 {
+				latest = position
+			}
 		}
 		event, recognized, err := mapLifeEvent(raw)
 		if err != nil {
@@ -112,6 +120,10 @@ func (c *Client) Changes(ctx context.Context, cursor cloud.ChangeCursor, limit i
 		}
 		if recognized {
 			events = append(events, event)
+		} else if !cursor.Time.IsZero() && validPosition && compareLifePosition(position.Time, position.ID, cursor.Time, cursor.ID) > 0 {
+			// Advancing past an unknown life-event type without recording it
+			// would make a scoped catalog reconciliation unsound.
+			fullFallback = true
 		}
 	}
 	sort.SliceStable(events, func(i, j int) bool {
@@ -133,7 +145,13 @@ func (c *Client) Changes(ctx context.Context, cursor cloud.ChangeCursor, limit i
 			fresh = append(fresh, event)
 		}
 	}
-	page := cloud.ChangePage{NextCursor: latest}
+	// 115 exposes only the newest bounded life-event window. If that window is
+	// full and its oldest position is newer than our cursor, events may have
+	// fallen out of the window and only a complete snapshot can close the gap.
+	if !cursor.Time.IsZero() && len(batch.Events) >= lifeEventsReadLimit && !oldest.Time.IsZero() && compareLifePosition(oldest.Time, oldest.ID, cursor.Time, cursor.ID) > 0 {
+		fullFallback = true
+	}
+	page := cloud.ChangePage{NextCursor: latest, FullFallback: fullFallback}
 	if len(fresh) == 0 {
 		return page, nil
 	}

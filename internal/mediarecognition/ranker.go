@@ -120,6 +120,16 @@ func RankWithConfig(parsed ParsedFacts, candidates []RemoteCandidate, config Sco
 	threshold := config.MatchThreshold
 	exactIdentity := best.Score.TitleSimilarity == 1
 	typoIdentity := !exactIdentity && best.Score.TitleSimilarity >= config.TypoTitleThreshold && conservativeLatinTypoMatch(parsed, best.Candidate, config.HanEquivalence)
+	// Year, media type, structure, popularity and provider completeness are
+	// useful corroboration only after the title has established an identity.
+	// In particular, a short category/parent surface such as "movie" must not
+	// let a different work cross the automatic-match threshold merely because
+	// the remaining metadata agrees. Exact normalized titles include verified
+	// localized/original/alternative/translation aliases. The sole fuzzy
+	// automatic path stays the deliberately bounded Latin typo rule below.
+	if !exactIdentity && !typoIdentity {
+		return setProvisional(ReasonLowConfidence, "title_identity_not_verified", "supporting metadata cannot establish identity without an exact title or bounded Latin typo match")
+	}
 	if exactIdentity && config.ExactTitleThreshold > 0 && config.ExactTitleThreshold < threshold {
 		threshold = config.ExactTitleThreshold
 	} else if typoIdentity && config.TypoMatchThreshold > 0 && config.TypoMatchThreshold < threshold {

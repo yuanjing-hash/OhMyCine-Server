@@ -41,6 +41,103 @@ type recordingArtifactCleanup struct {
 	result ArtifactCleanupResult
 }
 
+func TestMediaArtifactRefreshRequeuesCompletedFastScanGeneration(t *testing.T) {
+	management, queue, _, library, root := strmManagementFixture(t)
+	_, identity, err := canonicalProjectionRoot(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	scan := models.MediaLibraryScanRun{LibraryID: library.ID, Kind: "full", Status: "catalog_ready", Phase: "recognition_queued", Generation: library.ArtifactGeneration, StartedAt: now}
+	if err := management.db.Create(&scan).Error; err != nil {
+		t.Fatal(err)
+	}
+	policyJSON, err := json.Marshal(mediaArtifactPolicy{LibraryID: library.ID, Generation: library.ArtifactGeneration, StorageID: library.StorageID, StorageType: models.StorageTypePan115, ProjectionRoot: root, ProjectionRootIdentity: identity, TargetKind: models.MediaArtifactTargetLocalProjection, STRMEnabled: true, Metadata: true, ScanRunID: scan.ID, ScanKind: scan.Kind})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := models.MediaArtifactRun{ID: "fast-scan-artifact-refresh", LibraryID: library.ID, Generation: library.ArtifactGeneration, PolicyJSON: string(policyJSON), Status: models.MediaArtifactStatusCompleted, CleanupStatus: models.MediaArtifactCleanupSkipped, FinishedAt: &now, CreatedAt: now, UpdatedAt: now}
+	if err := management.db.Create(&run).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := management.db.Model(&scan).Updates(map[string]any{"status": "success", "phase": "completed", "finished_at": now}).Error; err != nil {
+		t.Fatal(err)
+	}
+	artifacts := NewMediaArtifactService(management.db, queue, &SignedProxyService{}, zerolog.Nop())
+	if err := artifacts.RefreshGeneration(library.ID, library.ArtifactGeneration); err != nil {
+		t.Fatal(err)
+	}
+	var refreshed models.MediaArtifactRun
+	if err := management.db.First(&refreshed, "id = ?", run.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	var refreshedPolicy mediaArtifactPolicy
+	if err := json.Unmarshal([]byte(refreshed.PolicyJSON), &refreshedPolicy); err != nil {
+		t.Fatal(err)
+	}
+	if refreshed.Status != models.MediaArtifactStatusQueued || !refreshedPolicy.CleanupEligible || refreshedPolicy.ScanRunID != scan.ID {
+		t.Fatalf("refreshed run=%+v policy=%+v", refreshed, refreshedPolicy)
+	}
+	var job models.Job
+	if err := management.db.First(&job, "job_type = ?", JobTypeMediaArtifact).Error; err != nil || job.ResourceKey != mediaArtifactResourceKey(library.ID) {
+		t.Fatalf("artifact refresh job=%+v err=%v", job, err)
+	}
+}
+
+func TestMediaArtifactRefreshSignalsOverlappingRunningWorker(t *testing.T) {
+	management, queue, _, library, root := strmManagementFixture(t)
+	_, identity, err := canonicalProjectionRoot(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	scan := models.MediaLibraryScanRun{LibraryID: library.ID, Kind: "full", Status: "success", Phase: "completed", Generation: library.ArtifactGeneration, StartedAt: now, FinishedAt: &now}
+	if err := management.db.Create(&scan).Error; err != nil {
+		t.Fatal(err)
+	}
+	policyJSON, err := json.Marshal(mediaArtifactPolicy{LibraryID: library.ID, Generation: library.ArtifactGeneration, StorageID: library.StorageID, StorageType: models.StorageTypePan115, ProjectionRoot: root, ProjectionRootIdentity: identity, TargetKind: models.MediaArtifactTargetLocalProjection, STRMEnabled: true, Metadata: true, ScanRunID: scan.ID, ScanKind: scan.Kind})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := models.MediaArtifactRun{ID: "fast-scan-running-refresh", LibraryID: library.ID, Generation: library.ArtifactGeneration, PolicyJSON: string(policyJSON), Status: models.MediaArtifactStatusRunning, CleanupStatus: models.MediaArtifactCleanupPending, StartedAt: &now, CreatedAt: now, UpdatedAt: now}
+	if err := management.db.Create(&run).Error; err != nil {
+		t.Fatal(err)
+	}
+	job, err := queue.Enqueue(EnqueueJobInput{System: true, JobType: JobTypeMediaArtifact, Priority: 100, DisplayName: "overlap", Provider: "media_library", ResourceKey: mediaArtifactResourceKey(library.ID), CoalescingKey: "latest_generation", Payload: mediaArtifactJobPayload{ArtifactRunID: run.ID}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := queue.Claim([]string{JobTypeMediaArtifact})
+	if err != nil || claimed == nil || claimed.Job.ID != job.ID {
+		t.Fatalf("claim=%+v err=%v", claimed, err)
+	}
+	artifacts := NewMediaArtifactService(management.db, queue, &SignedProxyService{}, zerolog.Nop())
+	if err := artifacts.RefreshGeneration(library.ID, library.ArtifactGeneration); err != nil {
+		t.Fatal(err)
+	}
+	var refreshedRun models.MediaArtifactRun
+	if err := management.db.First(&refreshedRun, "id = ?", run.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	var refreshedPolicy mediaArtifactPolicy
+	if err := json.Unmarshal([]byte(refreshedRun.PolicyJSON), &refreshedPolicy); err != nil {
+		t.Fatal(err)
+	}
+	var refreshedJob models.Job
+	if err := management.db.First(&refreshedJob, "id = ?", job.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if refreshedRun.Status != models.MediaArtifactStatusRunning || refreshedPolicy.RefreshSerial == 0 || refreshedJob.Generation <= refreshedJob.StartedGeneration {
+		t.Fatalf("run=%+v policy=%+v job=%+v", refreshedRun, refreshedPolicy, refreshedJob)
+	}
+	if err := queue.Complete(claimed.Job.ID, claimed.LeaseToken); err != nil {
+		t.Fatal(err)
+	}
+	if err := management.db.First(&refreshedJob, "id = ?", job.ID).Error; err != nil || refreshedJob.Status != models.JobStatusQueued {
+		t.Fatalf("refresh signal was not requeued: job=%+v err=%v", refreshedJob, err)
+	}
+}
+
 func (c *recordingArtifactCleanup) AutoCleanup(_ context.Context, runID string) ArtifactCleanupResult {
 	c.runIDs = append(c.runIDs, runID)
 	return c.result

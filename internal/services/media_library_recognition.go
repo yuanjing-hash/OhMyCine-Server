@@ -26,8 +26,81 @@ type mediaLibraryRecognizedUnit struct {
 	Manual   bool
 }
 
+// stabilizeExistingRecognitionUnits preserves a work's durable identity when
+// grouping rules evolve or a provider adds/renames an episode. A legacy source
+// key is inherited only when every matching existing file points to exactly
+// one recognition and that recognition is claimed by exactly one new unit.
+func (s *MediaLibraryService) stabilizeExistingRecognitionUnits(ctx context.Context, libraryID uint, units []medialibrary.RecognitionUnit) ([]medialibrary.RecognitionUnit, error) {
+	if len(units) == 0 {
+		return units, nil
+	}
+	var entries []models.MediaLibraryEntry
+	if err := s.db.WithContext(ctx).Select("relative_path", "provider_id", "recognition_id").Where("library_id = ? AND recognition_id IS NOT NULL", libraryID).Find(&entries).Error; err != nil {
+		return nil, err
+	}
+	if len(entries) == 0 {
+		return units, nil
+	}
+	byPath := make(map[string]uint, len(entries))
+	byProvider := make(map[string]uint, len(entries))
+	recognitionIDs := make([]uint, 0, len(entries))
+	seenRecognitionIDs := make(map[uint]struct{}, len(entries))
+	for _, entry := range entries {
+		if entry.RecognitionID == nil {
+			continue
+		}
+		byPath[entry.RelativePath] = *entry.RecognitionID
+		if entry.ProviderID != "" {
+			byProvider[entry.ProviderID] = *entry.RecognitionID
+		}
+		if _, seen := seenRecognitionIDs[*entry.RecognitionID]; !seen {
+			seenRecognitionIDs[*entry.RecognitionID] = struct{}{}
+			recognitionIDs = append(recognitionIDs, *entry.RecognitionID)
+		}
+	}
+	var records []models.MediaLibraryRecognition
+	if err := s.db.WithContext(ctx).Where("library_id = ? AND id IN ?", libraryID, recognitionIDs).Find(&records).Error; err != nil {
+		return nil, err
+	}
+	byID := make(map[uint]models.MediaLibraryRecognition, len(records))
+	for _, record := range records {
+		byID[record.ID] = record
+	}
+	candidates := make([]uint, len(units))
+	claims := make(map[uint]int)
+	for index := range units {
+		ids := make(map[uint]struct{})
+		for _, file := range units[index].Files {
+			if id := byPath[file.RelativePath]; id != 0 {
+				ids[id] = struct{}{}
+			} else if file.ProviderID != "" {
+				if id := byProvider[file.ProviderID]; id != 0 {
+					ids[id] = struct{}{}
+				}
+			}
+		}
+		if len(ids) == 1 {
+			for id := range ids {
+				if _, exists := byID[id]; exists {
+					candidates[index] = id
+					claims[id]++
+				}
+			}
+		}
+	}
+	result := append([]medialibrary.RecognitionUnit(nil), units...)
+	for index, id := range candidates {
+		if id == 0 || claims[id] != 1 {
+			continue
+		}
+		result[index].SourceKey = byID[id].SourceKey
+	}
+	return result, nil
+}
+
 type recognitionMetadataEnvelope struct {
 	Version        int                     `json:"version"`
+	EngineVersion  string                  `json:"engine_version,omitempty"`
 	Classification classification.Metadata `json:"classification"`
 	Snapshot       tmdb.Snapshot           `json:"snapshot,omitempty"`
 }
@@ -137,8 +210,12 @@ func (s *MediaLibraryService) recognizeLibraryUnits(ctx context.Context, library
 		case <-workerCtx.Done():
 			return workerCtx.Err()
 		}
-		files := make([]recognitionSourceFile, 0, len(unit.Files))
-		for _, file := range unit.Files {
+		evidenceFiles := unit.EvidenceFiles
+		if len(evidenceFiles) == 0 {
+			evidenceFiles = medialibrary.RecognitionEvidenceFiles(unit.Files)
+		}
+		files := make([]recognitionSourceFile, 0, len(evidenceFiles))
+		for _, file := range evidenceFiles {
 			files = append(files, recognitionSourceFile{RelativePath: file.RelativePath, Size: file.Size})
 		}
 		result := recognizeMedia(workerCtx, lookup, MediaRecognitionRequest{
@@ -221,11 +298,29 @@ func recognitionResultFromStored(record models.MediaLibraryRecognition, rules cl
 }
 
 func marshalRecognitionMetadata(result MediaRecognitionResult) (string, error) {
-	payload, err := json.Marshal(recognitionMetadataEnvelope{Version: 1, Classification: result.Metadata, Snapshot: result.Snapshot})
+	payload, err := json.Marshal(recognitionMetadataEnvelope{Version: 1, EngineVersion: mediarecognition.EngineVersion, Classification: result.Metadata, Snapshot: result.Snapshot})
 	if err != nil {
 		return "", err
 	}
 	return string(payload), nil
+}
+
+// mediaLibraryRecognitionProjectionFresh prevents the fast catalog path from
+// bypassing the versioned recognition cache. Legacy automatic rows and rows
+// written by an older ranking contract are recomputed, while explicit manual
+// overrides remain authoritative across engine upgrades.
+func mediaLibraryRecognitionProjectionFresh(record models.MediaLibraryRecognition) bool {
+	if record.ManualOverride {
+		return true
+	}
+	if record.MetadataJSON == "" || record.MetadataJSON == "{}" {
+		return false
+	}
+	var envelope recognitionMetadataEnvelope
+	if err := json.Unmarshal([]byte(record.MetadataJSON), &envelope); err != nil {
+		return false
+	}
+	return envelope.Version == 1 && envelope.EngineVersion == mediarecognition.EngineVersion
 }
 
 func decodeRecognitionMetadata(raw string) (classification.Metadata, tmdb.Snapshot, error) {

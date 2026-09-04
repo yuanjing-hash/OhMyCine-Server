@@ -21,7 +21,7 @@ func (trackingMediaLibraryBackend) StorageType() string { return models.StorageT
 func (trackingMediaLibraryBackend) Scan(context.Context, MediaLibraryScanRequest) (medialibrary.Result, error) {
 	return medialibrary.Result{}, nil
 }
-func (b trackingMediaLibraryBackend) OpenListener(context.Context, models.MediaLibrary, models.Storage, <-chan struct{}) (MediaLibraryListener, error) {
+func (b trackingMediaLibraryBackend) OpenListener(context.Context, models.MediaLibrary, models.Storage, <-chan struct{}, *providerChangeAccumulator) (MediaLibraryListener, error) {
 	return &trackingMediaLibraryListener{active: b.active, max: b.max}, nil
 }
 

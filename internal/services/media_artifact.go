@@ -50,6 +50,7 @@ type mediaArtifactPolicy struct {
 	ScanKind               string   `json:"scan_kind,omitempty"`
 	ScanPartial            bool     `json:"scan_partial,omitempty"`
 	CleanupEligible        bool     `json:"cleanup_eligible,omitempty"`
+	RefreshSerial          int64    `json:"refresh_serial,omitempty"`
 }
 
 type mediaArtifactJobPayload struct {
@@ -100,6 +101,18 @@ func (s *MediaArtifactService) SetMediaChangeService(changes *MediaChangeService
 // enqueues only the run ID. Active per-library Jobs coalesce; their worker
 // always advances to the newest queued generation before writing a file.
 func (s *MediaArtifactService) ScheduleGeneration(libraryID uint, generation uint64) error {
+	return s.scheduleGeneration(libraryID, generation, false)
+}
+
+// RefreshGeneration reruns an already scheduled generation after background
+// recognition changed metadata. The policy snapshot changes from
+// catalog-ready to completed-scan state, which also gives the running worker a
+// durable signal to execute one more pass if both phases overlap.
+func (s *MediaArtifactService) RefreshGeneration(libraryID uint, generation uint64) error {
+	return s.scheduleGeneration(libraryID, generation, true)
+}
+
+func (s *MediaArtifactService) scheduleGeneration(libraryID uint, generation uint64, refresh bool) error {
 	if s == nil || s.queue == nil || libraryID == 0 || generation == 0 {
 		return appError(CodeInvalidRequest, "媒体产物任务参数无效", nil)
 	}
@@ -152,6 +165,9 @@ func (s *MediaArtifactService) ScheduleGeneration(libraryID uint, generation uin
 	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
 		return err
 	}
+	if refresh {
+		policy.RefreshSerial = time.Now().UTC().UnixNano()
+	}
 	policyJSON, err := json.Marshal(policy)
 	if err != nil {
 		return err
@@ -162,6 +178,30 @@ func (s *MediaArtifactService) ScheduleGeneration(libraryID uint, generation uin
 		var existing models.MediaArtifactRun
 		if err := tx.Where("library_id = ? AND generation = ?", library.ID, generation).First(&existing).Error; err == nil {
 			run = existing
+			if refresh {
+				updates := map[string]any{"policy_json": string(policyJSON), "updated_at": now}
+				if existing.Status != models.MediaArtifactStatusRunning {
+					updates["status"] = models.MediaArtifactStatusQueued
+					updates["expected_count"] = 0
+					updates["written_count"] = 0
+					updates["updated_count"] = 0
+					updates["removed_count"] = 0
+					updates["skipped_count"] = 0
+					updates["failed_count"] = 0
+					updates["error_code"] = ""
+					updates["cleanup_status"] = models.MediaArtifactCleanupPending
+					updates["cleanup_error_code"] = ""
+					updates["cleanup_at"] = nil
+					updates["started_at"] = nil
+					updates["finished_at"] = nil
+					run.Status = models.MediaArtifactStatusQueued
+				}
+				run.PolicyJSON = string(policyJSON)
+				if err := tx.Model(&existing).Updates(updates).Error; err != nil {
+					return err
+				}
+				return tx.Model(&models.MediaLibrary{}).Where("id = ?", library.ID).Updates(map[string]any{"artifact_generation": generation, "artifact_status": models.MediaArtifactStatusQueued, "artifact_error": "", "artifact_updated_at": now}).Error
+			}
 			return nil
 		} else if !errors.Is(err, gorm.ErrRecordNotFound) {
 			return err
@@ -173,7 +213,7 @@ func (s *MediaArtifactService) ScheduleGeneration(libraryID uint, generation uin
 	}); err != nil {
 		return err
 	}
-	if run.Status == models.MediaArtifactStatusCompleted || run.Status == models.MediaArtifactStatusRunning {
+	if !refresh && (run.Status == models.MediaArtifactStatusCompleted || run.Status == models.MediaArtifactStatusRunning) {
 		return nil
 	}
 	job, err := s.queue.Enqueue(EnqueueJobInput{System: true, JobType: JobTypeMediaArtifact, Priority: 100, DisplayName: fmt.Sprintf("媒体产物 · 媒体库 %d", library.ID), Provider: "media_library", ResourceKey: mediaArtifactResourceKey(library.ID), CoalescingKey: "latest_generation", Payload: mediaArtifactJobPayload{ArtifactRunID: run.ID}})
@@ -213,6 +253,16 @@ type MediaArtifactWorker struct{ service *MediaArtifactService }
 
 func NewMediaArtifactWorker(service *MediaArtifactService) *MediaArtifactWorker {
 	return &MediaArtifactWorker{service: service}
+}
+
+func withArtifactScanContext(event *zerolog.Event, policy mediaArtifactPolicy, phase string) *zerolog.Event {
+	if policy.ScanRunID != 0 {
+		event.Uint("scan_run_id", policy.ScanRunID)
+	}
+	if policy.ScanKind != "" {
+		event.Str("scan_kind", policy.ScanKind)
+	}
+	return event.Str("phase", phase)
 }
 
 func (w *MediaArtifactWorker) Run(ctx context.Context, runtime JobRuntime, job ClaimedJob) WorkerResult {
@@ -263,26 +313,26 @@ func (w *MediaArtifactWorker) Run(ctx context.Context, runtime JobRuntime, job C
 	}); err != nil {
 		return WorkerResult{ErrorCode: "artifact_state_persist_failed", ErrorMessage: "媒体产物状态保存失败"}
 	}
-	serverlog.OperationMediaArtifact.Event(w.service.log.Info()).Uint("library_id", run.LibraryID).Str("task_id", run.ID).Uint64("generation", run.Generation).Msg(serverlog.OperationMediaArtifact.Message("开始"))
+	withArtifactScanContext(serverlog.OperationMediaArtifact.Event(w.service.log.Info()).Uint("library_id", run.LibraryID).Str("task_id", run.ID).Uint64("generation", run.Generation), policy, "artifact_running").Msg(serverlog.OperationMediaArtifact.Message("开始"))
 	if policy.STRMEnabled {
-		serverlog.OperationSTRMGeneration.Event(w.service.log.Info()).Uint("library_id", run.LibraryID).Str("task_id", run.ID).Uint64("generation", run.Generation).Msg(serverlog.OperationSTRMGeneration.Message("开始"))
+		withArtifactScanContext(serverlog.OperationSTRMGeneration.Event(w.service.log.Info()).Uint("library_id", run.LibraryID).Str("task_id", run.ID).Uint64("generation", run.Generation), policy, "artifact_running").Msg(serverlog.OperationSTRMGeneration.Message("开始"))
 	}
 	result := w.service.generateArtifacts(ctx, runtime, run, policy)
 	_ = w.service.db.First(&run, "id = ?", run.ID).Error
 	if run.Status == models.MediaArtifactStatusSuperseded {
-		serverlog.OperationMediaArtifact.Event(w.service.log.Info()).Uint("library_id", run.LibraryID).Str("task_id", run.ID).Uint64("generation", run.Generation).Int64("duration_ms", time.Since(started).Milliseconds()).Msg(serverlog.OperationMediaArtifact.Message("已由更新 generation 接管"))
+		withArtifactScanContext(serverlog.OperationMediaArtifact.Event(w.service.log.Info()).Uint("library_id", run.LibraryID).Str("task_id", run.ID).Uint64("generation", run.Generation).Int64("duration_ms", time.Since(started).Milliseconds()), policy, "superseded").Msg(serverlog.OperationMediaArtifact.Message("已由更新 generation 接管"))
 		return WorkerResult{}
 	}
 	if result.ErrorCode != "" {
-		serverlog.OperationMediaArtifact.Event(w.service.log.Error()).Uint("library_id", run.LibraryID).Str("task_id", run.ID).Uint64("generation", run.Generation).Str("error_code", result.ErrorCode).Int64("duration_ms", time.Since(started).Milliseconds()).Msg(serverlog.OperationMediaArtifact.Message("失败"))
+		withArtifactScanContext(serverlog.OperationMediaArtifact.Event(w.service.log.Error()).Uint("library_id", run.LibraryID).Str("task_id", run.ID).Uint64("generation", run.Generation).Str("error_code", result.ErrorCode).Int64("duration_ms", time.Since(started).Milliseconds()), policy, "artifact_failed").Msg(serverlog.OperationMediaArtifact.Message("失败"))
 		if policy.STRMEnabled {
-			serverlog.OperationSTRMGeneration.Event(w.service.log.Error()).Uint("library_id", run.LibraryID).Str("task_id", run.ID).Uint64("generation", run.Generation).Str("error_code", result.ErrorCode).Int64("duration_ms", time.Since(started).Milliseconds()).Msg(serverlog.OperationSTRMGeneration.Message("失败"))
+			withArtifactScanContext(serverlog.OperationSTRMGeneration.Event(w.service.log.Error()).Uint("library_id", run.LibraryID).Str("task_id", run.ID).Uint64("generation", run.Generation).Str("error_code", result.ErrorCode).Int64("duration_ms", time.Since(started).Milliseconds()), policy, "artifact_failed").Msg(serverlog.OperationSTRMGeneration.Message("失败"))
 		}
 		return result
 	}
-	serverlog.OperationMediaArtifact.Event(w.service.log.Info()).Uint("library_id", run.LibraryID).Str("task_id", run.ID).Uint64("generation", run.Generation).Int("written", run.WrittenCount).Int("updated", run.UpdatedCount).Int("skipped", run.SkippedCount).Int64("duration_ms", time.Since(started).Milliseconds()).Msg(serverlog.OperationMediaArtifact.Message("完成"))
+	withArtifactScanContext(serverlog.OperationMediaArtifact.Event(w.service.log.Info()).Uint("library_id", run.LibraryID).Str("task_id", run.ID).Uint64("generation", run.Generation).Int("written", run.WrittenCount).Int("updated", run.UpdatedCount).Int("skipped", run.SkippedCount).Int64("duration_ms", time.Since(started).Milliseconds()), policy, "artifact_completed").Msg(serverlog.OperationMediaArtifact.Message("完成"))
 	if policy.STRMEnabled {
-		serverlog.OperationSTRMGeneration.Event(w.service.log.Info()).Uint("library_id", run.LibraryID).Str("task_id", run.ID).Uint64("generation", run.Generation).Int("written", run.WrittenCount).Int("updated", run.UpdatedCount).Int("skipped", run.SkippedCount).Int64("duration_ms", time.Since(started).Milliseconds()).Msg(serverlog.OperationSTRMGeneration.Message("完成"))
+		withArtifactScanContext(serverlog.OperationSTRMGeneration.Event(w.service.log.Info()).Uint("library_id", run.LibraryID).Str("task_id", run.ID).Uint64("generation", run.Generation).Int("written", run.WrittenCount).Int("updated", run.UpdatedCount).Int("skipped", run.SkippedCount).Int64("duration_ms", time.Since(started).Milliseconds()), policy, "artifact_completed").Msg(serverlog.OperationSTRMGeneration.Message("完成"))
 	}
 	return WorkerResult{}
 }
@@ -352,14 +402,22 @@ func (s *MediaArtifactService) generateArtifacts(ctx context.Context, runtime Jo
 	}
 	var recognitions []models.MediaLibraryRecognition
 	if policy.Metadata {
-		if err := s.db.Where("library_id = ? AND last_generation = ? AND status = ?", run.LibraryID, run.Generation, mediaRecognitionStatusMatched).Order("id").Find(&recognitions).Error; err != nil {
+		recognitionQuery := s.db.Where("library_id = ? AND status = ?", run.LibraryID, mediaRecognitionStatusMatched)
+		if !policy.ScanPartial {
+			recognitionQuery = recognitionQuery.Where("last_generation = ?", run.Generation)
+		}
+		if err := recognitionQuery.Order("id").Find(&recognitions).Error; err != nil {
 			_ = s.failRun(run.ID, "artifact_metadata_unavailable")
 			return WorkerResult{ErrorCode: "artifact_metadata_unavailable", ErrorMessage: "媒体元数据快照不可用"}
 		}
 	}
 	var sourceAssets []models.MediaLibrarySourceAsset
 	if policy.STRMEnabled && policy.StorageType != models.StorageTypeLocal {
-		if err := s.db.Where("library_id = ? AND generation = ? AND active = ?", run.LibraryID, run.Generation, true).Order("relative_path").Find(&sourceAssets).Error; err != nil {
+		assetQuery := s.db.Where("library_id = ? AND active = ?", run.LibraryID, true)
+		if !policy.ScanPartial {
+			assetQuery = assetQuery.Where("generation = ?", run.Generation)
+		}
+		if err := assetQuery.Order("relative_path").Find(&sourceAssets).Error; err != nil {
 			_ = s.failRun(run.ID, "artifact_source_assets_unavailable")
 			return WorkerResult{ErrorCode: "artifact_source_assets_unavailable", ErrorMessage: "源伴随文件清单不可用"}
 		}
@@ -469,8 +527,26 @@ func (s *MediaArtifactService) generateArtifacts(ctx context.Context, runtime Jo
 		status, code = models.MediaArtifactStatusFailed, "artifact_write_failed"
 	}
 	superseded := false
+	requeued := false
 	if err := s.db.Transaction(func(tx *gorm.DB) error {
 		if status == models.MediaArtifactStatusCompleted {
+			var currentRun models.MediaArtifactRun
+			if err := tx.First(&currentRun, "id = ?", run.ID).Error; err != nil {
+				return err
+			}
+			if currentRun.PolicyJSON != run.PolicyJSON {
+				requeued = true
+				if err := tx.Model(&models.MediaArtifactRun{}).Where("id = ?", run.ID).Updates(map[string]any{
+					"status": models.MediaArtifactStatusQueued, "expected_count": 0, "written_count": 0, "updated_count": 0,
+					"removed_count": 0, "skipped_count": 0, "failed_count": 0, "error_code": "",
+					"cleanup_status": models.MediaArtifactCleanupPending, "cleanup_error_code": "", "cleanup_at": nil,
+					"started_at": nil, "finished_at": nil, "updated_at": finished,
+				}).Error; err != nil {
+					return err
+				}
+				return tx.Model(&models.MediaLibrary{}).Where("id = ? AND artifact_generation = ?", run.LibraryID, run.Generation).
+					Updates(map[string]any{"artifact_status": models.MediaArtifactStatusQueued, "artifact_error": "", "artifact_updated_at": finished}).Error
+			}
 			var current models.MediaLibrary
 			if err := tx.First(&current, run.LibraryID).Error; err != nil {
 				return err
@@ -502,6 +578,11 @@ func (s *MediaArtifactService) generateArtifacts(ctx context.Context, runtime Jo
 		return WorkerResult{ErrorCode: "artifact_state_persist_failed", ErrorMessage: "媒体产物结果保存失败"}
 	}
 	if superseded {
+		return WorkerResult{}
+	}
+	if requeued {
+		withArtifactScanContext(serverlog.OperationMediaArtifact.Event(s.log.Info()).Uint("library_id", run.LibraryID).Str("task_id", run.ID).Uint64("generation", run.Generation), policy, "artifact_refresh_queued").
+			Msg(serverlog.OperationMediaArtifact.Message("识别结果已更新，将继续生成元数据产物"))
 		return WorkerResult{}
 	}
 	if run.FailedCount > 0 {

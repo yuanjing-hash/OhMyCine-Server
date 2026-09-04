@@ -1,11 +1,15 @@
 package services
 
 import (
+	"context"
 	"errors"
+	"time"
 
 	"modernc.org/sqlite"
 	sqlite3 "modernc.org/sqlite/lib"
 )
+
+const mediaLibraryBusyRetryAttempts = 3
 
 const (
 	mediaLibraryPersistenceStageConfiguration = "configuration_revalidate"
@@ -78,4 +82,28 @@ func mediaLibraryPersistenceDiagnostics(err error) (string, string) {
 	default:
 		return stage, mediaLibraryDatabaseErrorUnknown
 	}
+}
+
+// retryMediaLibraryBusy retries only SQLite's transient busy/locked class.
+// Constraint, configuration and data errors fail immediately so retries never
+// hide a deterministic bad snapshot.
+func retryMediaLibraryBusy(ctx context.Context, operation func() error) error {
+	var err error
+	for attempt := 0; attempt < mediaLibraryBusyRetryAttempts; attempt++ {
+		if err = operation(); err == nil {
+			return nil
+		}
+		_, class := mediaLibraryPersistenceDiagnostics(err)
+		if class != mediaLibraryDatabaseErrorBusy || attempt+1 == mediaLibraryBusyRetryAttempts {
+			return err
+		}
+		timer := time.NewTimer(time.Duration(25*(attempt+1)) * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return err
 }

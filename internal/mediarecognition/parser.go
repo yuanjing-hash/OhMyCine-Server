@@ -298,6 +298,15 @@ func collectNamedSources(input InputFacts) []namedSource {
 		files = files[:8]
 	}
 	for _, file := range files {
+		// Existing-library grouping has already promoted the established work
+		// directory into PackageName. File basenames still contribute structure,
+		// year and episode facts through analyzeStructure, but they must not
+		// independently establish a TMDB identity or mix in Season/BDMV/category
+		// ancestors. Download packages do not have that hierarchy guarantee and
+		// retain their filename and bounded parent fallback.
+		if input.SourceKind == SourceLibraryScan {
+			continue
+		}
 		add(path.Base(file.path), "filename")
 		parent := path.Dir(file.path)
 		for depth := 0; depth < 4 && parent != "." && parent != "/"; depth++ {
@@ -873,6 +882,7 @@ func analyzeStructure(input InputFacts) (StructureFacts, EpisodeFacts, []Evidenc
 		normalized := strings.ReplaceAll(file.RelativePath, "\\", "/")
 		lower := strings.ToLower(normalized)
 		segments := strings.Split(lower, "/")
+		var fileSeason *int
 		for _, segment := range segments[:len(segments)-1] {
 			switch {
 			case segment == "bdmv":
@@ -887,10 +897,12 @@ func analyzeStructure(input InputFacts) (StructureFacts, EpisodeFacts, []Evidenc
 			if match := seasonPattern.FindStringSubmatch(segment); len(match) == 2 {
 				season, _ := strconv.Atoi(match[1])
 				seasons[season] = struct{}{}
+				fileSeason = cloneDomainInt(&season)
 				structure.HasSeasonFolder = true
 			} else if match := chineseSeasonPattern.FindStringSubmatch(segment); len(match) == 2 {
 				if season := parseBoundedOrdinal(match[1], 200); season != nil {
 					seasons[*season] = struct{}{}
+					fileSeason = cloneDomainInt(season)
 					structure.HasSeasonFolder = true
 				}
 			}
@@ -911,6 +923,9 @@ func analyzeStructure(input InputFacts) (StructureFacts, EpisodeFacts, []Evidenc
 					}
 				}
 			}
+		}
+		if episode != nil && season == nil && fileSeason != nil {
+			season = cloneDomainInt(fileSeason)
 		}
 		if episode != nil {
 			seasonValue := 0

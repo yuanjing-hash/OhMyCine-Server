@@ -111,6 +111,7 @@ func main() {
 	profiles.SetRevisionNotifier(libraries)
 	storages.SetReferenceChecker(libraries)
 	queue := services.NewQueueService(db, audit)
+	libraries.SetQueueService(queue)
 	recycleCleanup := services.NewPan115RecycleCleanupService(db, queue, audit, connections, logManager.Logger("connection", "pan115_recycle_cleanup"))
 	mediaChanges := services.NewMediaChangeService(db)
 	mediaServerRefresh := services.NewMediaServerRefreshService(db, queue, audit, connections)
@@ -254,6 +255,12 @@ func main() {
 	}
 	if err := registry.Register(services.JobTypeMediaLibraryRepair, services.NewMediaLibraryRepairWorker(libraryStructure)); err != nil {
 		logging.OperationServerLifecycle.Event(log.Fatal()).Err(err).Str("error_code", "media_library_repair_worker_registration_failed").Msg(logging.OperationServerLifecycle.Message("媒体库结构修复 Worker 注册失败"))
+	}
+	if err := registry.Register(services.JobTypeMediaLibraryStructureDiagnosis, services.NewMediaLibraryStructureDiagnosisWorker(libraryStructure)); err != nil {
+		logging.OperationServerLifecycle.Event(log.Fatal()).Str("error_code", "media_library_structure_diagnosis_worker_registration_failed").Msg(logging.OperationServerLifecycle.Message("目录结构诊断 Worker 注册失败"))
+	}
+	if err := registry.Register(services.JobTypeMediaLibraryRecognition, services.NewMediaLibraryRecognitionWorker(libraries)); err != nil {
+		logging.OperationServerLifecycle.Event(log.Fatal()).Str("error_code", "media_library_recognition_worker_registration_failed").Msg(logging.OperationServerLifecycle.Message("媒体库识别 Worker 注册失败"))
 	}
 	if err := registry.Register("seeding", services.NewSeedingWorker(seeding)); err != nil {
 		logging.OperationServerLifecycle.Event(log.Fatal()).Err(err).Str("error_code", "seeding_worker_registration_failed").Msg(logging.OperationServerLifecycle.Message("做种管理 Worker 注册失败"))

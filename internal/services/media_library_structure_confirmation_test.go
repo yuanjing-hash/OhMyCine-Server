@@ -2,6 +2,7 @@ package services
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -33,6 +34,20 @@ func structureConfirmationFixture(t *testing.T) (*MediaLibraryStructureService, 
 	return NewMediaLibraryStructureService(queue.db, queue.audit, queue, nil, zerolog.Nop()), actor, library
 }
 
+func diagnoseStructureSynchronouslyForTest(t *testing.T, service *MediaLibraryStructureService, libraryID uint) MediaLibraryStructureDiagnostics {
+	t.Helper()
+	plan, library, err := service.buildPlan(context.Background(), libraryID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	status := models.MediaLibraryStructureHealthy
+	if plan.IssueCount > 0 {
+		status = models.MediaLibraryStructureIssues
+	}
+	return diagnosticsFromPlan(library, plan, status, nil, "manual", &now)
+}
+
 func TestStructureDiagnosisIncludesOwnedHistorical115RootItems(t *testing.T) {
 	service, actor, library := structureConfirmationFixture(t)
 	if err := service.db.Model(&models.MediaLibrary{}).Where("id = ?", library.ID).Update("provider_root_id", "library-root").Error; err != nil {
@@ -53,21 +68,111 @@ func TestStructureDiagnosisIncludesOwnedHistorical115RootItems(t *testing.T) {
 	if err := service.db.Create(&managed).Error; err != nil {
 		t.Fatal(err)
 	}
-	diagnostics, err := service.Diagnose(context.Background(), library.ID, "")
+	diagnostics := diagnoseStructureSynchronouslyForTest(t, service, library.ID)
+	if diagnostics.IssueCount != 1 || len(diagnostics.Issues) != 1 || diagnostics.Issues[0].Code != "cloud_transfer_root_misplaced" || !diagnostics.Issues[0].Repairable {
+		t.Fatalf("diagnostics=%+v", diagnostics)
+	}
+	if err := service.db.Model(&models.MediaLibrary{}).Where("id = ?", library.ID).Updates(map[string]any{
+		"movie_directory_template": "电影/{category}/{title}",
+		"movie_filename_template":  "{title}",
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	year, tmdbID := 2026, int64(115)
+	entry := models.MediaLibraryEntry{LibraryID: library.ID, RelativePath: "/待整理/示例.mkv", ProviderID: "catalog-video", MediaType: "movie", Title: "示例", WorkKey: "movie:tmdb:115", MatchStatus: mediaRecognitionStatusMatched, TMDBID: &tmdbID, ReleaseYear: &year, CategoryName: "动画"}
+	if err := service.db.Create(&entry).Error; err != nil {
+		t.Fatal(err)
+	}
+	diagnostics = diagnoseStructureSynchronouslyForTest(t, service, library.ID)
+	if diagnostics.RepairableCount != 0 || diagnostics.Classifications.DuplicateTarget != 2 || diagnostics.IssueCount != 2 {
+		t.Fatalf("conflicting historical target escaped isolation: %+v", diagnostics)
+	}
+	for _, issue := range diagnostics.Issues {
+		if issue.Repairable {
+			t.Fatalf("conflicting issue remained repairable: %+v", issue)
+		}
+	}
+	assertStructureConflictSources(t, diagnostics.Issues, 2)
+	if err := service.EnqueueDiagnosis(context.Background(), library.ID, 0, library.BaselineGeneration, "manual"); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := service.queue.Claim([]string{JobTypeMediaLibraryStructureDiagnosis})
+	if err != nil || claimed == nil {
+		t.Fatalf("claim=%+v err=%v", claimed, err)
+	}
+	if result := NewMediaLibraryStructureDiagnosisWorker(service).Run(context.Background(), fastScanTestRuntime{}, *claimed); result.ErrorCode != "" {
+		t.Fatalf("worker=%+v", result)
+	}
+	if err := service.queue.Complete(claimed.Job.ID, claimed.LeaseToken); err != nil {
+		t.Fatal(err)
+	}
+	diagnostics, err = service.Diagnostics(context.Background(), actor, library.ID)
+	if err != nil || diagnostics.RepairableCount != 0 || diagnostics.Classifications.DuplicateTarget != 2 || diagnostics.CheckedAt == nil {
+		t.Fatalf("persisted async diagnostics=%+v err=%v", diagnostics, err)
+	}
+	assertStructureConflictSources(t, diagnostics.Issues, 2)
+}
+
+func assertStructureConflictSources(t *testing.T, issues []StructureIssue, want int) {
+	t.Helper()
+	found := false
+	for _, issue := range issues {
+		if issue.Code != "duplicate_target" {
+			continue
+		}
+		found = true
+		if issue.ConflictSourceCount != want || len(issue.ConflictSources) != want {
+			t.Fatalf("conflict sources did not survive projection: %+v", issue)
+		}
+	}
+	if !found {
+		t.Fatal("duplicate target issue missing")
+	}
+}
+
+func TestHistoricalRootPlanRebuildRetainsTitlesBeyondIssueSample(t *testing.T) {
+	service, _, library := structureConfirmationFixture(t)
+	if err := service.db.Model(&models.MediaLibrary{}).Where("id = ?", library.ID).Updates(map[string]any{
+		"provider_root_id":         "library-root",
+		"movie_directory_template": "电影/{category}/{title} ({year})",
+		"movie_filename_template":  "{title} ({year})",
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	year := 2026
+	entries := make([]models.MediaLibraryEntry, 0, maxStructureIssueSamples+1)
+	for index := 0; index < maxStructureIssueSamples; index++ {
+		title := fmt.Sprintf("浅层影片 %03d", index)
+		tmdbID := int64(index + 1)
+		entries = append(entries, models.MediaLibraryEntry{LibraryID: library.ID, RelativePath: fmt.Sprintf("/a/%03d.mkv", index), ProviderID: fmt.Sprintf("shallow-%03d", index), MediaType: "movie", Title: title, WorkKey: fmt.Sprintf("movie:tmdb:%d", tmdbID), MatchStatus: mediaRecognitionStatusMatched, TMDBID: &tmdbID, ReleaseYear: &year, CategoryName: "剧情"})
+	}
+	deepTMDBID := int64(9999)
+	entries = append(entries, models.MediaLibraryEntry{LibraryID: library.ID, RelativePath: "/z/更深/机械之声.mkv", ProviderID: "deep-title", MediaType: "movie", Title: "机械之声的传奇", WorkKey: "movie:tmdb:9999", MatchStatus: mediaRecognitionStatusMatched, TMDBID: &deepTMDBID, ReleaseYear: &year, CategoryName: "动画"})
+	if err := service.db.CreateInBatches(entries, 50).Error; err != nil {
+		t.Fatal(err)
+	}
+	plan, _, err := service.buildPlan(context.Background(), library.ID, "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if diagnostics.IssueCount != 1 || len(diagnostics.Issues) != 1 || diagnostics.Issues[0].Code != "cloud_transfer_root_misplaced" || !diagnostics.Issues[0].Repairable {
-		t.Fatalf("diagnostics=%+v", diagnostics)
+	found := false
+	for _, issue := range plan.Issues {
+		if issue.CurrentPath != "z/更深/机械之声.mkv" {
+			continue
+		}
+		found = true
+		if issue.Title != "机械之声的传奇" {
+			t.Fatalf("title was lost while rebuilding the full plan: %+v", issue)
+		}
+	}
+	if !found {
+		t.Fatalf("deep rebuilt issue missing from bounded sample: %+v", plan.Issues)
 	}
 }
 
 func TestMediaLibraryStructureConfirmationRejectsTamperAndBoundaryChanges(t *testing.T) {
 	service, actor, library := structureConfirmationFixture(t)
-	diagnostics, err := service.Diagnose(context.Background(), library.ID, "")
-	if err != nil {
-		t.Fatal(err)
-	}
+	diagnostics := diagnoseStructureSynchronouslyForTest(t, service, library.ID)
 	preview, err := service.PreviewRepair(context.Background(), actor, library.ID, "", diagnostics.Revision)
 	if err != nil {
 		t.Fatal(err)
@@ -85,10 +190,7 @@ func TestMediaLibraryStructureConfirmationRejectsTamperAndBoundaryChanges(t *tes
 
 func TestMediaLibraryStructureResourceDenyBlocksServiceBypass(t *testing.T) {
 	service, actor, library := structureConfirmationFixture(t)
-	diagnostics, err := service.Diagnose(context.Background(), library.ID, "")
-	if err != nil {
-		t.Fatal(err)
-	}
+	diagnostics := diagnoseStructureSynchronouslyForTest(t, service, library.ID)
 	actor.ResourceRules = append(actor.ResourceRules, AuthorizationRule{PermissionCode: authz.PermissionMediaLibrariesScan, Effect: models.AuthorizationEffectDeny, ResourceType: models.AuthorizationResourceMediaLibrary, ResourceID: uintID(library.ID)})
 	if _, err := service.PreviewRepair(context.Background(), actor, library.ID, "", diagnostics.Revision); ErrorCode(err) != CodePermissionDenied {
 		t.Fatalf("scoped deny bypassed: %v", err)

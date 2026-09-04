@@ -202,15 +202,17 @@ export interface MediaLibraryDetail {
   status: MediaLibraryStatus; status_error_code: string; next_retry_at: string | null
   last_scan_at: string | null; last_successful_scan_at: string | null; baseline_generation: number; dirty_generation: number
   reclassification_due: boolean; entry_count: number; created_at: string; updated_at: string
-  structure_status: 'pending' | 'healthy' | 'issues' | 'repairing' | 'failed'; structure_issue_count: number; structure_error_code: string; structure_checked_at: string | null
+  structure_status: 'pending' | 'queued' | 'running' | 'healthy' | 'issues' | 'repairing' | 'failed'; structure_issue_count: number; structure_error_code: string; structure_checked_at: string | null
   sort_order: number; transfer_mode: 'move' | 'copy' | 'symlink'; conflict_policy: 'ask' | 'overwrite' | 'skip' | 'rename'
   movie_directory_template: string; movie_filename_template: string
   tv_directory_template: string; tv_filename_template: string
 }
 export interface MediaLibraryScanRun {
   id: number; library_id: number; kind: 'initial' | 'catch_up' | 'event' | 'incremental' | 'full' | 'manual' | string
-  status: 'running' | 'success' | 'failed'; generation: number; discovered: number; added: number; updated: number; removed: number
+  status: 'running' | 'catalog_ready' | 'success' | 'superseded' | 'failed'; phase: string; generation: number; discovered: number; added: number; updated: number; removed: number
   matched: number; unrecognized: number; cache_hits: number; recognition_failed: number
+  enumerated: number; processed: number; persisted: number; deduplicated: number; recognition_total: number; recognition_completed: number
+  persistence_stage: string; database_error_class: string; catalog_published_at: string | null
   error_code: string; partial: boolean; started_at: string; finished_at: string | null
 }
 export interface MediaLibraryEntry {
@@ -240,8 +242,9 @@ export interface MediaCatalogDeletionPreview {
   relative_paths: string[]; strm_impact_count: number; missing_count: number; warnings: string[]; confirmation_token: string; expires_at: string
 }
 export interface MediaCatalogDeletionResult { deleted: boolean; removed_files: number; missing_files: number }
-export interface MediaLibraryStructureIssue { code: string; kind: 'video' | 'sidecar'; title?: string; current_path?: string; expected_path?: string; repairable: boolean }
-export interface MediaLibraryStructureDiagnostics { library_id: number; status: MediaLibraryDetail['structure_status']; issue_count: number; unrecognized: number; checked_at: string; issues: MediaLibraryStructureIssue[]; revision: string }
+export interface MediaLibraryStructureIssue { code: string; kind: 'video' | 'sidecar'; title?: string; current_path?: string; expected_path?: string; conflict_sources?: string[]; conflict_source_count?: number; repairable: boolean }
+export interface MediaLibraryStructureClassifications { unrecognized: number; missing_season_episode: number; invalid_path: number; template_unavailable: number; duplicate_target: number; sidecar_target_conflict: number }
+export interface MediaLibraryStructureDiagnostics { library_id: number; job_id?: string; scan_run_id?: number; generation: number; scan_kind: string; status: MediaLibraryDetail['structure_status']; total_items: number; processed_items: number; issue_count: number; repairable_count: number; unrecognized: number; classifications: MediaLibraryStructureClassifications; error_code: string; started_at?: string; checked_at?: string; issues: MediaLibraryStructureIssue[]; revision: string }
 export interface MediaLibraryStructurePreview { library_id: number; revision: string; issue_count: number; repairable_count: number; move_count: number; issues: MediaLibraryStructureIssue[]; confirmation_token: string; expires_at: string }
 export interface MediaLibraryStructureRepair { id: string; job_id?: string; library_id: number; scope: 'full' | 'work'; generation: number; phase: 'queued' | 'executing' | 'reconciling' | 'completed' | 'failed'; issue_count: number; total_items: number; processed_items: number; last_error_code: string; created_at: string; updated_at: string; finished_at?: string }
 export interface TMDBGenre { id: number; name: string }
@@ -258,7 +261,7 @@ export interface MediaMetadataDocument { library_id: number; work_id: string; re
 export interface MediaRecognitionSummary {
   token: string; status: 'matched' | 'unrecognized'; error_code: string; title: string; media_type: 'movie' | 'tv' | ''
   release_year?: number; tmdb_id?: number; confidence?: number; category_name: string; manual_override: boolean
-  file_count: number; source_summary: string; updated_at: string
+  file_count: number; source_summary: string; source_directory: string; updated_at: string
 }
 export interface TMDBCandidate {
   id: number; title: string; original_title?: string; media_type: 'movie' | 'tv'; original_language: string; release_year?: number; confidence: number

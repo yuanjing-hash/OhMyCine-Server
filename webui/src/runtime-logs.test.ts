@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'vitest'
+import { readFileSync } from 'node:fs'
 import { emptyRuntimeLogFilters, filtersFromQuery, filtersToParams, filtersToQuery } from './runtime-logs'
 
 describe('runtime log filters', () => {
@@ -8,4 +9,5 @@ describe('runtime log filters', () => {
     expect(filtersFromQuery(query)).toMatchObject({pluginId:'plugin.demo',operation:'incremental_strm_generation'})
   })
   test('serializes advanced correlation ids',()=>{const filters=emptyRuntimeLogFilters();filters.libraryId='7';filters.requestId='req-1';const params=filtersToParams(filters);expect(params.get('library_id')).toBe('7');expect(params.get('request_id')).toBe('req-1')})
+  test('renders scan phases and fields with readable labels',()=>{const source=readFileSync(new URL('./views/RuntimeLogsView.vue',import.meta.url),'utf8');for(const label of ['当前步骤','媒体','数据源请求次数','限流/排队耗时（毫秒）','后台识别','STRM/产物已入队','正在生成 STRM/产物','其他处理步骤'])expect(source).toContain(label);for(const stage of ['persist_source_assets','persist_recognition','persist_entries','prune_stale_entries','reconcile_tmdb_collections','advance_library_generation','persist_scan_run','record_media_change'])expect(source).toContain(stage)})
 })

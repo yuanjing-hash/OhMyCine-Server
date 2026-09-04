@@ -2305,14 +2305,19 @@ func TestMediaLibraryAPICRUDRBACAndAutomaticInitialization(t *testing.T) {
 	}
 	var recognitionPage struct {
 		List []struct {
-			Token string `json:"token"`
+			Token           string `json:"token"`
+			SourceDirectory string `json:"source_directory"`
 		} `json:"list"`
 	}
-	if err := json.Unmarshal(recognitionEnvelope.Data, &recognitionPage); err != nil || len(recognitionPage.List) != 1 || recognitionPage.List[0].Token == "" {
+	if err := json.Unmarshal(recognitionEnvelope.Data, &recognitionPage); err != nil || len(recognitionPage.List) != 1 || recognitionPage.List[0].Token == "" || recognitionPage.List[0].SourceDirectory != "媒体库根目录" {
 		t.Fatalf("recognitions=%+v err=%v", recognitionPage, err)
 	}
+	status, invalidCandidateEnvelope := owner.request(t, http.MethodGet, "/api/v1/media-libraries/"+uintString(library.ID)+"/recognitions/"+recognitionPage.List[0].Token+"/tmdb-candidates?title=C:%5Cprivate%5Cmovie&media_type=movie", nil, false)
+	if status != http.StatusBadRequest || owner.lastHeader.Get("Cache-Control") != "no-store" || !bytes.Contains(invalidCandidateEnvelope.Data, []byte(services.CodeInvalidRequest)) || bytes.Contains(invalidCandidateEnvelope.Data, []byte(root)) {
+		t.Fatalf("invalid manual search status=%d cache=%q data=%s", status, owner.lastHeader.Get("Cache-Control"), invalidCandidateEnvelope.Data)
+	}
 	status, retryEnvelope := owner.request(t, http.MethodPost, "/api/v1/media-libraries/"+uintString(library.ID)+"/recognitions/"+recognitionPage.List[0].Token+"/retry", map[string]any{}, true)
-	if status != http.StatusOK || !bytes.Contains(retryEnvelope.Data, []byte(`"status":"unrecognized"`)) {
+	if status != http.StatusOK || owner.lastHeader.Get("Cache-Control") != "no-store" || !bytes.Contains(retryEnvelope.Data, []byte(`"status":"unrecognized"`)) {
 		t.Fatalf("recognition retry status=%d data=%s", status, retryEnvelope.Data)
 	}
 	status, catalogEnvelope := owner.request(t, http.MethodGet, "/api/v1/media-libraries/"+uintString(library.ID)+"/catalog?page=1&page_size=20&media_type=movie", nil, false)

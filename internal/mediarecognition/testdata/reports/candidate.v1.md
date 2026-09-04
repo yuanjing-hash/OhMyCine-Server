@@ -1,4 +1,4 @@
-# Media recognition benchmark: nextgen-domain-v10
+# Media recognition benchmark: nextgen-domain-v11
 
 Corpus `provider-neutral-v1`; offline deterministic: `true`.
 

@@ -10,6 +10,11 @@ import (
 	"time"
 )
 
+// MaxRecognitionEvidenceFiles bounds the work-level parser input. Files keeps
+// the complete projection set, while EvidenceFiles is the only slice that may
+// cross into remote work recognition.
+const MaxRecognitionEvidenceFiles = 32
+
 // RecognitionUnit is a provider-neutral group of file facts that represents
 // one TMDB lookup. SourceKey is an opaque, library-scoped stable identifier;
 // callers must not expose it as a provider item ID or path.
@@ -19,6 +24,7 @@ type RecognitionUnit struct {
 	PackageName      string
 	MediaTypeHint    string
 	Files            []File
+	EvidenceFiles    []File
 }
 
 // GroupRecognitionUnits groups already-enumerated facts without performing
@@ -53,10 +59,11 @@ func GroupRecognitionUnits(files []File) []RecognitionUnit {
 		})
 		units = append(units, RecognitionUnit{
 			SourceKey:        recognitionSourceKey(current.key, current.files),
-			InputFingerprint: recognitionInputFingerprint(current.name, current.files),
+			InputFingerprint: recognitionInputFingerprint(current.key, current.name, current.mediaType, current.files),
 			PackageName:      current.name,
 			MediaTypeHint:    current.mediaType,
 			Files:            append([]File(nil), current.files...),
+			EvidenceFiles:    RecognitionEvidenceFiles(current.files),
 		})
 	}
 	sort.Slice(units, func(i, j int) bool {
@@ -75,8 +82,7 @@ func recognitionGroup(relative string, parsed ParsedMedia) (string, string) {
 	}
 	if parsed.MediaType == "tv" {
 		seriesDirectory := directory
-		base := strings.ToLower(path.Base(directory))
-		if strings.HasPrefix(base, "season ") || strings.HasPrefix(base, "season.") || strings.HasPrefix(base, "s0") {
+		if _, ok := seasonFolderNumber(path.Base(directory)); ok {
 			seriesDirectory = path.Dir(directory)
 		}
 		if seriesDirectory == "." || seriesDirectory == "/" {
@@ -119,7 +125,10 @@ func recognitionSourceKey(groupKey string, files []File) string {
 		stableIDs = append(stableIDs, file.ProviderID)
 	}
 	identity := "path\x00" + groupKey
-	if allStable {
+	// A TV directory is the work identity. Deriving it from the lexicographically
+	// smallest episode provider ID made an existing series change identity when
+	// a newly added episode happened to sort before the old anchor.
+	if allStable && !strings.HasPrefix(groupKey, "tv-dir:") && !strings.HasPrefix(groupKey, "tv-root:") {
 		sort.Strings(stableIDs)
 		// One stable anchor keeps a work identity unchanged when later episodes
 		// or sidecars join the same provider directory. The provider ID remains
@@ -130,18 +139,46 @@ func recognitionSourceKey(groupKey string, files []File) string {
 	return hex.EncodeToString(sum[:20])
 }
 
-func recognitionInputFingerprint(packageName string, files []File) string {
+func recognitionInputFingerprint(groupKey, packageName, mediaType string, files []File) string {
 	hash := sha256.New()
-	hash.Write([]byte(packageName))
-	for _, file := range files {
+	hash.Write([]byte(mediaType))
+	hash.Write([]byte{'\x00'})
+	hash.Write([]byte(strings.TrimSpace(packageName)))
+	// Directory-backed works are identified by their directory surface. Episode
+	// membership is a per-file fact and must not invalidate the work lookup.
+	// Root-level files have no directory identity, so retain their physical fact
+	// fingerprint to detect replacement in place.
+	if strings.HasPrefix(groupKey, "file:") {
 		hash.Write([]byte{'\x00'})
-		hash.Write([]byte(normalizeFactPath(file.RelativePath)))
-		hash.Write([]byte{'\x00'})
-		hash.Write([]byte(strconv.FormatInt(file.Size, 10)))
-		hash.Write([]byte{'\x00'})
-		hash.Write([]byte(file.ModifiedAt.UTC().Format(time.RFC3339Nano)))
+		hash.Write([]byte(groupKey))
+		for _, file := range files {
+			hash.Write([]byte{'\x00'})
+			hash.Write([]byte(normalizeFactPath(file.RelativePath)))
+			hash.Write([]byte{'\x00'})
+			hash.Write([]byte(strconv.FormatInt(file.Size, 10)))
+			hash.Write([]byte{'\x00'})
+			hash.Write([]byte(file.ModifiedAt.UTC().Format(time.RFC3339Nano)))
+		}
 	}
 	return hex.EncodeToString(hash.Sum(nil))
+}
+
+// RecognitionEvidenceFiles returns a deterministic bounded copy suitable for
+// work parsing. It is shared by initial/background recognition and manual
+// retry so neither path can accidentally reintroduce an unbounded manifest.
+func RecognitionEvidenceFiles(files []File) []File {
+	ordered := append([]File(nil), files...)
+	sort.SliceStable(ordered, func(i, j int) bool {
+		left, right := normalizeFactPath(ordered[i].RelativePath), normalizeFactPath(ordered[j].RelativePath)
+		if left == right {
+			return ordered[i].ProviderID < ordered[j].ProviderID
+		}
+		return left < right
+	})
+	if len(ordered) > MaxRecognitionEvidenceFiles {
+		ordered = ordered[:MaxRecognitionEvidenceFiles]
+	}
+	return ordered
 }
 
 func normalizeFactPath(value string) string {

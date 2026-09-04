@@ -357,6 +357,67 @@ func TestRankReturnsStableUnrecognizedReasons(t *testing.T) {
 	}
 }
 
+func TestRankRequiresVerifiedTitleIdentityForProductionShapedChineseLibraryNames(t *testing.T) {
+	config := DefaultScoreConfig()
+	// Supporting evidence can be tuned by a caller, but it must never turn a
+	// merely related or category-derived title into an automatic identity.
+	config.MatchThreshold = .55
+	tests := []struct {
+		name               string
+		packageName        string
+		relativePath       string
+		candidateTitle     string
+		forbiddenAncestors []string
+	}{
+		{
+			name:               "unrelated result recalled by movie category",
+			packageName:        "吉卜力工作室特别短片合辑",
+			relativePath:       "电影/动画电影/吉卜力工作室特别短片合辑/吉卜力工作室特别短片合辑.mp4",
+			candidateTitle:     "电影人",
+			forbiddenAncestors: []string{"电影", "动画电影"},
+		},
+		{
+			name:               "unrelated result recalled by movie category for a titled film",
+			packageName:        "蜡笔小新：爆睡！梦世界大作战",
+			relativePath:       "电影/动画电影/蜡笔小新：爆睡！梦世界大作战/蜡笔小新：爆睡！梦世界大作战.mp4",
+			candidateTitle:     "电影人",
+			forbiddenAncestors: []string{"电影", "动画电影"},
+		},
+		{
+			name:               "same franchise but different film",
+			packageName:        "蜡笔小新：功夫小子之拉面大作战",
+			relativePath:       "电影/华语电影/蜡笔小新：功夫小子之拉面大作战/蜡笔小新：功夫小子之拉面大作战.mp4",
+			candidateTitle:     "蜡笔小新：呼风唤雨！夕阳下的春日部男孩",
+			forbiddenAncestors: []string{"电影", "华语电影"},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			parsed, err := Parse(InputFacts{
+				PackageName:   test.packageName,
+				SourceKind:    SourceLibraryScan,
+				MediaTypeHint: MediaTypeMovie,
+				Files:         []FileFact{{RelativePath: test.relativePath, Size: 1 << 30}},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if parsed.CanonicalTitle != cleanTitleSurface(test.packageName) || !queryContains(parsed.Queries, cleanTitleSurface(test.packageName)) {
+				t.Fatalf("production-shaped input was not preserved: parsed=%+v", parsed)
+			}
+			for _, ancestor := range test.forbiddenAncestors {
+				if queryContains(parsed.Queries, ancestor) {
+					t.Fatalf("library category ancestor %q entered identity queries: %+v", ancestor, parsed.Queries)
+				}
+			}
+			decision := RankWithConfig(parsed, []RemoteCandidate{{ID: 1, MediaType: MediaTypeMovie, Title: test.candidateTitle, Popularity: 1_000}}, config)
+			if decision.Status == DecisionMatched {
+				t.Fatalf("weak Chinese title was automatically bound: decision=%+v queries=%+v", decision, parsed.Queries)
+			}
+		})
+	}
+}
+
 func TestRankUsesAlternativeTitlesTranslationsAndReplaceableHanLayer(t *testing.T) {
 	year := 2011
 	parsed, err := Parse(InputFacts{PackageName: "後宮甄嬛傳 2011", MediaTypeHint: MediaTypeTV})

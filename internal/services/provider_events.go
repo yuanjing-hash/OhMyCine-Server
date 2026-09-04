@@ -2,8 +2,10 @@ package services
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sort"
 	"strings"
 	"time"
@@ -15,9 +17,12 @@ import (
 )
 
 const (
-	providerLifeStream       = "life"
-	providerEventBatchLimit  = 200
-	providerEventProcessSize = 500
+	providerLifeStream      = "life"
+	providerEventBatchLimit = 200
+	// One 115 poll can expose at most the newest 1000 life events. Consume the
+	// whole bounded window together so one storm is coalesced before listeners
+	// reconcile instead of producing several partial scopes.
+	providerEventProcessSize = 1024
 )
 
 type ProviderEventNotifier interface {
@@ -59,9 +64,17 @@ func (s *ProviderEventService) IngestOnce(ctx context.Context, connectionID uint
 	})
 	rows := make([]models.ProviderEvent, 0, len(events))
 	now := time.Now().UTC()
+	needsFallback := page.FullFallback && compareCursor(page.NextCursor, cursor) > 0
 	for _, event := range events {
 		row, valid := normalizeProviderEvent(connectionID, providerLifeStream, event, now)
-		if !valid || compareCursor(cloudpkg.ChangeCursor{Time: row.EventTime, ID: row.ProviderEventID}, cursor) <= 0 {
+		eventCursor := cloudpkg.ChangeCursor{Time: event.Time, ID: strings.TrimSpace(event.ID)}
+		if !valid {
+			if compareCursor(page.NextCursor, cursor) > 0 && (eventCursor.Time.IsZero() || compareCursor(eventCursor, cursor) > 0) {
+				needsFallback = true
+			}
+			continue
+		}
+		if compareCursor(cloudpkg.ChangeCursor{Time: row.EventTime, ID: row.ProviderEventID}, cursor) <= 0 {
 			continue
 		}
 		rows = append(rows, row)
@@ -73,6 +86,9 @@ func (s *ProviderEventService) IngestOnce(ctx context.Context, connectionID uint
 	}
 	if compareCursor(next, cursor) < 0 {
 		return 0, false, errors.New("provider event cursor moved backwards")
+	}
+	if needsFallback && compareCursor(next, cursor) > 0 {
+		rows = append(rows, providerFallbackEvent(connectionID, providerLifeStream, cursor, next, now))
 	}
 	inserted := int64(0)
 	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
@@ -99,7 +115,8 @@ func (s *ProviderEventService) ProcessPending(ctx context.Context, connectionID 
 		return 0, nil
 	}
 	var rows []models.ProviderEvent
-	if err := s.db.WithContext(ctx).Where("connection_id = ? AND stream = ? AND processed_at IS NULL", connectionID, providerLifeStream).Order("event_time, provider_event_id, id").Limit(providerEventProcessSize).Find(&rows).Error; err != nil || len(rows) == 0 {
+	if err := s.db.WithContext(ctx).Where("connection_id = ? AND stream = ? AND processed_at IS NULL", connectionID, providerLifeStream).
+		Order("CASE WHEN kind = 'fallback' THEN 0 ELSE 1 END, event_time, provider_event_id, id").Limit(providerEventProcessSize).Find(&rows).Error; err != nil || len(rows) == 0 {
 		return 0, err
 	}
 	var notificationErrors []error
@@ -116,8 +133,19 @@ func (s *ProviderEventService) ProcessPending(ctx context.Context, connectionID 
 		ids = append(ids, row.ID)
 	}
 	now := time.Now().UTC()
-	result := s.db.WithContext(ctx).Model(&models.ProviderEvent{}).Where("id IN ? AND processed_at IS NULL", ids).Update("processed_at", now)
-	return int(result.RowsAffected), result.Error
+	processed := int64(0)
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		result := tx.Model(&models.ProviderEvent{}).Where("id IN ? AND processed_at IS NULL", ids).Update("processed_at", now)
+		if result.Error != nil {
+			return result.Error
+		}
+		processed = result.RowsAffected
+		// A library may finish its catalog reconciliation before this shared
+		// fanout transaction acknowledges the inbox. Remove those completed
+		// delivery tombstones atomically with the source acknowledgement.
+		return tx.Where("inbox_event_id IN ? AND processed_at IS NOT NULL", ids).Delete(&models.MediaLibraryProviderEvent{}).Error
+	})
+	return int(processed), err
 }
 
 func (s *ProviderEventService) cursor(connectionID uint, stream string) (cloudpkg.ChangeCursor, error) {
@@ -145,6 +173,13 @@ func normalizeProviderEvent(connectionID uint, stream string, event cloudpkg.Cha
 	}
 	payload, _ := json.Marshal(map[string]string{"kind": event.Kind, "item_id": event.ItemID, "parent_id": event.ParentID, "previous_parent_id": event.PreviousParentID, "name": event.Name})
 	return models.ProviderEvent{ConnectionID: connectionID, Stream: stream, ProviderEventID: event.ID, EventTime: event.Time.UTC(), Kind: event.Kind, ItemID: event.ItemID, ParentID: event.ParentID, PreviousParentID: event.PreviousParentID, Name: event.Name, PayloadJSON: string(payload), CreatedAt: now}, true
+}
+
+func providerFallbackEvent(connectionID uint, stream string, previous, next cloudpkg.ChangeCursor, now time.Time) models.ProviderEvent {
+	fingerprint := sha256.Sum256([]byte(previous.Time.UTC().Format(time.RFC3339Nano) + "\x00" + previous.ID + "\x00" + next.Time.UTC().Format(time.RFC3339Nano) + "\x00" + next.ID))
+	eventID := "fallback:" + fmt.Sprintf("%x", fingerprint[:16])
+	payload, _ := json.Marshal(map[string]string{"kind": cloudpkg.ChangeFallback})
+	return models.ProviderEvent{ConnectionID: connectionID, Stream: stream, ProviderEventID: eventID, EventTime: next.Time.UTC(), Kind: cloudpkg.ChangeFallback, ItemID: eventID, PayloadJSON: string(payload), CreatedAt: now}
 }
 
 func compareCursor(a, b cloudpkg.ChangeCursor) int {

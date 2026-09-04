@@ -8,9 +8,12 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/authz"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/classification"
+	serverlog "github.com/yuanjing-hash/OhMyCine-Server/internal/logging"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/medialibrary"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/mediarecognition"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/metadata/tmdb"
@@ -18,20 +21,23 @@ import (
 	"gorm.io/gorm/clause"
 )
 
+const mediaLibraryRecognitionInputInvalid = "recognition_input_invalid"
+
 type MediaRecognitionSummary struct {
-	Token          string    `json:"token"`
-	Status         string    `json:"status"`
-	ErrorCode      string    `json:"error_code"`
-	Title          string    `json:"title"`
-	MediaType      string    `json:"media_type"`
-	ReleaseYear    *int      `json:"release_year,omitempty"`
-	TMDBID         *int64    `json:"tmdb_id,omitempty"`
-	Confidence     *float64  `json:"confidence,omitempty"`
-	CategoryName   string    `json:"category_name"`
-	ManualOverride bool      `json:"manual_override"`
-	FileCount      int64     `json:"file_count"`
-	SourceSummary  string    `json:"source_summary"`
-	UpdatedAt      time.Time `json:"updated_at"`
+	Token           string    `json:"token"`
+	Status          string    `json:"status"`
+	ErrorCode       string    `json:"error_code"`
+	Title           string    `json:"title"`
+	MediaType       string    `json:"media_type"`
+	ReleaseYear     *int      `json:"release_year,omitempty"`
+	TMDBID          *int64    `json:"tmdb_id,omitempty"`
+	Confidence      *float64  `json:"confidence,omitempty"`
+	CategoryName    string    `json:"category_name"`
+	ManualOverride  bool      `json:"manual_override"`
+	FileCount       int64     `json:"file_count"`
+	SourceSummary   string    `json:"source_summary"`
+	SourceDirectory string    `json:"source_directory"`
+	UpdatedAt       time.Time `json:"updated_at"`
 }
 
 type MediaRecognitionPage struct {
@@ -109,6 +115,12 @@ func (s *MediaLibraryService) RetryRecognition(ctx context.Context, actor Actor,
 	if err != nil {
 		return MediaRecognitionSummary{}, err
 	}
+	if result.Status == mediaRecognitionStatusUnrecognized && result.ErrorCode == tmdb.ErrorInvalidRequest {
+		// A malformed legacy filename is an item-level recognition outcome, not
+		// an HTTP/TMDB request failure. Keep it retryable and visible so the
+		// administrator can supply an explicit title through manual recovery.
+		result.ErrorCode = mediaLibraryRecognitionInputInvalid
+	}
 	if err := s.persistRecognitionResult(record, profile, result, false); err != nil {
 		return MediaRecognitionSummary{}, err
 	}
@@ -136,6 +148,10 @@ func (s *MediaLibraryService) RecognitionCandidates(ctx context.Context, actor A
 	if year == nil {
 		year = record.ReleaseYear
 	}
+	title, mediaType, err = normalizeRecognitionCandidateSearch(title, mediaType)
+	if err != nil {
+		return nil, err
+	}
 	if s.metadata == nil {
 		return nil, appError(CodeTMDBUnavailable, "TMDB 未配置", nil)
 	}
@@ -145,9 +161,31 @@ func (s *MediaLibraryService) RecognitionCandidates(ctx context.Context, actor A
 	}
 	items, err := client.SearchCandidates(ctx, mediaType, title, year, library.MetadataLanguage, library.MetadataRegion, 10)
 	if err != nil {
+		if tmdb.ErrorCode(err) == tmdb.ErrorNoMatch {
+			return []tmdb.Candidate{}, nil
+		}
 		return nil, appError(tmdb.ErrorCode(err), classificationFallbackMessage(tmdb.ErrorCode(err)), nil)
 	}
 	return items, nil
+}
+
+func normalizeRecognitionCandidateSearch(title, mediaType string) (string, string, error) {
+	title = strings.Join(strings.Fields(title), " ")
+	mediaType = strings.ToLower(strings.TrimSpace(mediaType))
+	if title == "" {
+		return "", "", appError(CodeInvalidRequest, "请输入要搜索的作品标题", nil)
+	}
+	if utf8.RuneCountInString(title) > 256 || strings.ContainsAny(title, "/\\\x00") {
+		return "", "", appError(CodeInvalidRequest, "搜索标题无效", nil)
+	}
+	lower := strings.ToLower(title)
+	if strings.Contains(lower, "://") || strings.HasPrefix(lower, "file:") || strings.Contains(lower, "authorization=") || strings.Contains(lower, "cookie=") || strings.Contains(lower, "token=") {
+		return "", "", appError(CodeInvalidRequest, "搜索标题无效", nil)
+	}
+	if mediaType != "movie" && mediaType != "tv" {
+		return "", "", appError(CodeInvalidRequest, "请选择电影或剧集", nil)
+	}
+	return title, mediaType, nil
 }
 
 func (s *MediaLibraryService) OverrideRecognition(ctx context.Context, actor Actor, libraryID uint, token string, input MediaRecognitionOverrideInput, request RequestContext) (MediaRecognitionSummary, error) {
@@ -185,6 +223,16 @@ func (s *MediaLibraryService) OverrideRecognition(ctx context.Context, actor Act
 	}
 	if err := s.db.First(&record, record.ID).Error; err != nil {
 		return MediaRecognitionSummary{}, err
+	}
+	if s.structure != nil {
+		var currentLibrary models.MediaLibrary
+		if loadErr := s.db.Select("id", "baseline_generation").First(&currentLibrary, libraryID).Error; loadErr == nil {
+			if enqueueErr := s.structure.EnqueueDiagnosis(ctx, libraryID, 0, currentLibrary.BaselineGeneration, "manual"); enqueueErr != nil {
+				serverlog.OperationMediaLibraryStructureDiagnosis.Event(s.log.Warn()).Uint("library_id", libraryID).Uint64("generation", currentLibrary.BaselineGeneration).
+					Str("scan_kind", "manual").Str("phase", "enqueue_failed").Str("error_code", CodeMediaLibraryStructureDiagnosisFailed).
+					Msg(serverlog.OperationMediaLibraryStructureDiagnosis.Message("人工识别后的目录结构诊断入队失败，识别结果仍然有效"))
+			}
+		}
 	}
 	_ = s.audit.Record(s.db, &actor.User.ID, "media_recognition.override", "media_library_recognition", strconv.FormatUint(uint64(record.ID), 10), "success", map[string]any{"library_id": libraryID, "media_type": match.MediaType, "tmdb_id": match.ID}, request)
 	return s.recognitionSummary(record)
@@ -258,14 +306,26 @@ func (s *MediaLibraryService) recognizeStoredUnit(ctx context.Context, library m
 			lookup = client
 		}
 	}
-	files := make([]recognitionSourceFile, 0, len(entries))
+	workFiles := make([]medialibrary.File, 0, len(entries))
 	for _, entry := range entries {
-		files = append(files, recognitionSourceFile{RelativePath: entry.RelativePath, Size: entry.Size})
+		workFiles = append(workFiles, medialibrary.File{RelativePath: entry.RelativePath, ProviderID: entry.ProviderID, ProviderIDStable: entry.ProviderID != "", Size: entry.Size, ModifiedAt: entry.ModifiedAt})
 	}
 	packageName := recognitionPackageName(entries)
 	mediaTypeHint := ""
 	if len(entries) > 0 {
 		mediaTypeHint = entries[0].MediaType
+	}
+	evidenceFiles := medialibrary.RecognitionEvidenceFiles(workFiles)
+	if units := medialibrary.GroupRecognitionUnits(workFiles); len(units) == 1 {
+		packageName = units[0].PackageName
+		if mediaTypeHint == "" {
+			mediaTypeHint = units[0].MediaTypeHint
+		}
+		evidenceFiles = units[0].EvidenceFiles
+	}
+	files := make([]recognitionSourceFile, 0, len(evidenceFiles))
+	for _, file := range evidenceFiles {
+		files = append(files, recognitionSourceFile{RelativePath: file.RelativePath, Size: file.Size})
 	}
 	return recognizeMedia(ctx, lookup, MediaRecognitionRequest{PackageName: packageName, Files: files, SourceKind: mediarecognition.SourceLibraryScan, MediaTypeHint: mediaTypeHint, BuiltinPackCodes: organization.BuiltinRecognitionPacks, BuiltinProcessor: processor, RecognitionRules: organization.RecognitionRules, Classification: rules, Language: library.MetadataLanguage, Region: library.MetadataRegion, AIAssist: s.aiRecognition}), nil
 }
@@ -358,7 +418,27 @@ func (s *MediaLibraryService) recognitionSummary(record models.MediaLibraryRecog
 	}
 	var first models.MediaLibraryEntry
 	_ = s.db.Where("library_id = ? AND recognition_id = ?", record.LibraryID, record.ID).Order("relative_path").First(&first).Error
-	return MediaRecognitionSummary{Token: encodeRecognitionToken(record.ID), Status: record.Status, ErrorCode: record.ErrorCode, Title: record.Title, MediaType: record.MediaType, ReleaseYear: cloneInt(record.ReleaseYear), TMDBID: cloneInt64(record.TMDBID), Confidence: cloneFloat64(record.Confidence), CategoryName: record.CategoryName, ManualOverride: record.ManualOverride, FileCount: count, SourceSummary: path.Base(first.RelativePath), UpdatedAt: record.UpdatedAt}, nil
+	return MediaRecognitionSummary{Token: encodeRecognitionToken(record.ID), Status: record.Status, ErrorCode: record.ErrorCode, Title: record.Title, MediaType: record.MediaType, ReleaseYear: cloneInt(record.ReleaseYear), TMDBID: cloneInt64(record.TMDBID), Confidence: cloneFloat64(record.Confidence), CategoryName: record.CategoryName, ManualOverride: record.ManualOverride, FileCount: count, SourceSummary: safeMediaDisplayName(path.Base(first.RelativePath)), SourceDirectory: recognitionSourceDirectory(first.RelativePath), UpdatedAt: record.UpdatedAt}, nil
+}
+
+func recognitionSourceDirectory(relativePath string) string {
+	relativePath = strings.ReplaceAll(relativePath, "\\", "/")
+	directory := path.Dir(relativePath)
+	if directory == "." || directory == "/" {
+		return "媒体库根目录"
+	}
+	name := path.Base(directory)
+	if medialibrary.IsSeasonFolderName(name) {
+		parent := path.Dir(directory)
+		if parent != "." && parent != "/" {
+			name = path.Base(parent)
+		}
+	}
+	name = safeMediaDisplayName(name)
+	if strings.ContainsAny(name, "/\\") || name == "未命名媒体" {
+		return "目录名不可显示"
+	}
+	return name
 }
 
 func recognitionPackageName(entries []models.MediaLibraryEntry) string {
@@ -371,7 +451,7 @@ func recognitionPackageName(entries []models.MediaLibraryEntry) string {
 		return strings.TrimSuffix(path.Base(relative), path.Ext(relative))
 	}
 	base := path.Base(directory)
-	if strings.HasPrefix(strings.ToLower(base), "season ") {
+	if medialibrary.IsSeasonFolderName(base) {
 		base = path.Base(path.Dir(directory))
 	}
 	return base

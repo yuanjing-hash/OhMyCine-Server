@@ -30,7 +30,8 @@ const (
 	bulkTreePageSize    = int64(pan115sdk.MaxDirPageLimit)
 	bulkFolderPageSize  = int64(5000)
 	bulkRequestSpacing  = 500 * time.Millisecond
-	maxInFlightCalls    = 2
+	maxInFlightCalls    = 34
+	maxBackgroundCalls  = 32
 	maxOfflineTaskPages = int64(50)
 	bulkFoldersEndpoint = "https://proapi.115.com/app/2.0/chrome/downfolders"
 	// The 115 direct-link endpoint rejects the SDK's legacy 115Browser UA for
@@ -249,7 +250,9 @@ func New(config cloud.Config) (cloud.Driver, error) {
 		mkdirRate: rate.NewLimiter(rate.Inf, 1), uploadRate: rate.NewLimiter(rate.Every(2*time.Second), 1),
 		moveRate: rate.NewLimiter(rate.Every(2*time.Second), 1), copyRate: rate.NewLimiter(rate.Every(2*time.Second), 1), renameRate: rate.NewLimiter(rate.Every(2*time.Second), 1),
 		recycleRate: rate.NewLimiter(rate.Every(2*time.Second), 1), purgeRate: rate.NewLimiter(rate.Every(2*time.Second), 1),
-		callSlots: make(chan struct{}, maxInFlightCalls), backgroundRead: make(chan struct{}, 1), now: time.Now, jitter: defaultJitter, recyclePassword: strings.TrimSpace(config.RecyclePassword),
+		// Background scans may use up to 32 calls while two global slots remain
+		// available for interactive/playback work.
+		callSlots: make(chan struct{}, maxInFlightCalls), backgroundRead: make(chan struct{}, maxBackgroundCalls), now: time.Now, jitter: defaultJitter, recyclePassword: strings.TrimSpace(config.RecyclePassword),
 	}, nil
 }
 
@@ -930,55 +933,217 @@ func (c *Client) ResolveDirectory(ctx context.Context, providerPath string) (clo
 // folder stream. It stays on the background lane so interactive navigation and
 // active transfers retain one shared provider call slot.
 func (c *Client) ListTree(ctx context.Context, rootID string, maxEntries int) (cloud.TreeResult, error) {
+	result := cloud.TreeResult{Entries: make([]cloud.TreeEntry, 0)}
+	err := c.StreamTree(ctx, rootID, maxEntries, func(batch cloud.TreeBatch) error {
+		result.Entries = append(result.Entries, batch.Entries...)
+		result.Partial = result.Partial || batch.Partial
+		return nil
+	})
+	return result, err
+}
+
+// StreamTree enumerates recursive 115 file pages concurrently while emitting
+// them in deterministic offset order. Provider request concurrency remains
+// separate from the 128 local processing workers in medialibrary.
+func (c *Client) StreamTree(ctx context.Context, rootID string, maxEntries int, emit func(cloud.TreeBatch) error) error {
 	rootID = normalizeID(rootID)
 	if rootID == "0" {
-		return cloud.TreeResult{}, cloud.Error(cloud.CodeResponseInvalid, false, errors.New("115 root has no bulk tree identity"))
+		return cloud.Error(cloud.CodeResponseInvalid, false, errors.New("115 root has no bulk tree identity"))
+	}
+	if emit == nil {
+		return cloud.Error(cloud.CodeResponseInvalid, false, errors.New("115 bulk tree consumer is unavailable"))
 	}
 	root, err := c.Stat(cloud.WithReadClass(ctx, cloud.ReadClassBackground), rootID)
 	if err != nil {
-		return cloud.TreeResult{}, err
+		return err
 	}
 	if !root.IsDir || root.PickCode == "" {
-		return cloud.TreeResult{}, cloud.Error(cloud.CodeResponseInvalid, false, errors.New("115 bulk tree root is invalid"))
+		return cloud.Error(cloud.CodeResponseInvalid, false, errors.New("115 bulk tree root is invalid"))
 	}
-	type folderResult struct {
-		items []bulkFolder
-		err   error
+	if maxEntries <= 0 {
+		maxEntries = 250000
 	}
-	type fileResult struct {
-		items   []pan115sdk.File
-		partial bool
-		err     error
+	tuning := cloud.TreeScanTuningFromContext(ctx)
+	concurrency := tuning.Concurrency
+	if concurrency <= 0 {
+		concurrency = 2
+	} else if concurrency > maxBackgroundCalls {
+		concurrency = maxBackgroundCalls
 	}
-	foldersDone, filesDone := make(chan folderResult, 1), make(chan fileResult, 1)
-	go func() {
-		items, loadErr := c.loadTreeFolders(ctx, root.PickCode)
-		foldersDone <- folderResult{items: items, err: loadErr}
-	}()
-	go func() {
-		items, partial, loadErr := c.loadTreeFiles(ctx, rootID, maxEntries)
-		filesDone <- fileResult{items: items, partial: partial, err: loadErr}
-	}()
-	folders, files := <-foldersDone, <-filesDone
-	if folders.err != nil {
-		return cloud.TreeResult{}, folders.err
+	ratePerSecond := tuning.RatePerSecond
+	if ratePerSecond <= 0 {
+		ratePerSecond = 2
+	} else if ratePerSecond > 1000 {
+		ratePerSecond = 1000
 	}
-	if files.err != nil {
-		return cloud.TreeResult{}, files.err
-	}
-	entries, err := buildTreeEntries(rootID, folders.items, files.items)
+	bulkLimiter := rate.NewLimiter(rate.Limit(ratePerSecond), max(1, concurrency))
+	started := time.Now()
+	folders, err := c.loadTreeFoldersWithLimiter(ctx, root.PickCode, bulkLimiter)
 	if err != nil {
-		return cloud.TreeResult{}, err
+		return err
 	}
-	return cloud.TreeResult{Entries: entries, Partial: files.partial}, nil
+	folderPaths, err := buildTreeFolderPaths(rootID, folders)
+	if err != nil {
+		return cloud.Error(cloud.CodeResponseInvalid, true, err)
+	}
+	if tuning.Progress != nil {
+		tuning.Progress(cloud.TreeScanProgress{Phase: "folders", BatchEntries: len(folders), Duration: time.Since(started)})
+	}
+
+	type filePage struct {
+		offset int64
+		files  []pan115sdk.File
+		total  int64
+		err    error
+	}
+	loadPage := func(callCtx context.Context, offset int64) filePage {
+		var files []pan115sdk.File
+		var total int64
+		err := c.waitReadAndCall(cloud.WithReadClass(callCtx, cloud.ReadClassBackground), bulkLimiter, func() error {
+			var callErr error
+			files, total, callErr = c.sdk.ListTreeFiles(rootID, offset, bulkTreePageSize)
+			return callErr
+		})
+		return filePage{offset: offset, files: files, total: total, err: err}
+	}
+	first := loadPage(ctx, 0)
+	if first.err != nil {
+		return mapError(first.err)
+	}
+	if len(first.files) == 0 && first.total > 0 {
+		return cloud.Error(cloud.CodeResponseInvalid, true, errors.New("115 bulk file page made no progress"))
+	}
+	limit := first.total
+	partial := limit > int64(maxEntries)
+	if limit > int64(maxEntries) {
+		limit = int64(maxEntries)
+	}
+	pageCount := int((limit + bulkTreePageSize - 1) / bulkTreePageSize)
+	if pageCount == 0 {
+		return emit(cloud.TreeBatch{Offset: 0, Total: first.total, Partial: partial})
+	}
+
+	workCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	offsets := make(chan int64, concurrency)
+	pages := make(chan filePage, concurrency)
+	var workers sync.WaitGroup
+	workerCount := min(concurrency, max(0, pageCount-1))
+	workers.Add(workerCount)
+	for worker := 0; worker < workerCount; worker++ {
+		go func() {
+			defer workers.Done()
+			for offset := range offsets {
+				page := loadPage(workCtx, offset)
+				select {
+				case pages <- page:
+				case <-workCtx.Done():
+					return
+				}
+			}
+		}()
+	}
+	go func() {
+		workers.Wait()
+		close(pages)
+	}()
+	nextScheduledOffset := int64(1) * bulkTreePageSize
+	endOffset := int64(pageCount) * bulkTreePageSize
+	offsetsClosed := false
+	scheduleNext := func() {
+		if nextScheduledOffset >= endOffset {
+			if !offsetsClosed {
+				close(offsets)
+				offsetsClosed = true
+			}
+			return
+		}
+		offsets <- nextScheduledOffset
+		nextScheduledOffset += bulkTreePageSize
+	}
+	for scheduled := 0; scheduled < workerCount; scheduled++ {
+		scheduleNext()
+	}
+	defer func() {
+		if !offsetsClosed {
+			close(offsets)
+		}
+	}()
+
+	pending := map[int64]filePage{0: first}
+	nextOffset := int64(0)
+	emitted := 0
+	batchNumber := 0
+	emitReady := func(page filePage) error {
+		if page.err != nil {
+			return mapError(page.err)
+		}
+		if page.total != first.total {
+			return cloud.Error(cloud.CodeResponseInvalid, true, errors.New("115 bulk file total changed during enumeration"))
+		}
+		remaining := maxEntries - emitted
+		if remaining <= 0 {
+			return nil
+		}
+		expected := int(min(bulkTreePageSize, limit-page.offset))
+		if expected < 0 || len(page.files) < expected {
+			return cloud.Error(cloud.CodeResponseInvalid, true, errors.New("115 bulk file page was incomplete"))
+		}
+		if len(page.files) > expected {
+			page.files = page.files[:expected]
+		}
+		if len(page.files) > remaining {
+			page.files = page.files[:remaining]
+		}
+		entries, invalid := buildTreeEntriesFromPaths(folderPaths, page.files)
+		emitted += len(page.files)
+		batchNumber++
+		// Invalid provider rows are isolated instead of failing the whole scan,
+		// but they make deletion proof incomplete. Propagate partial so callers
+		// retain the previous catalog rows until a clean snapshot succeeds.
+		if err := emit(cloud.TreeBatch{Offset: page.offset, Total: first.total, Entries: entries, Partial: partial || invalid > 0}); err != nil {
+			return err
+		}
+		if tuning.Progress != nil {
+			tuning.Progress(cloud.TreeScanProgress{Phase: "files", Batch: batchNumber, BatchEntries: len(page.files), Enumerated: emitted, Total: first.total, Duration: time.Since(started)})
+		}
+		return nil
+	}
+	for nextOffset < int64(pageCount)*bulkTreePageSize {
+		if page, ok := pending[nextOffset]; ok {
+			delete(pending, nextOffset)
+			if err := emitReady(page); err != nil {
+				cancel()
+				return err
+			}
+			// Keep at most `concurrency` fetched-or-in-flight pages ahead of the
+			// ordered consumer. A slow earlier page therefore cannot turn the
+			// reorder map into an entire-library buffer.
+			if page.offset > 0 {
+				scheduleNext()
+			}
+			nextOffset += bulkTreePageSize
+			continue
+		}
+		page, ok := <-pages
+		if !ok {
+			return cloud.Error(cloud.CodeResponseInvalid, true, errors.New("115 bulk file pages ended early"))
+		}
+		pending[page.offset] = page
+	}
+	return nil
 }
 
 func (c *Client) loadTreeFolders(ctx context.Context, pickCode string) ([]bulkFolder, error) {
+	return c.loadTreeFoldersWithLimiter(ctx, pickCode, c.bulkRate)
+}
+
+func (c *Client) loadTreeFoldersWithLimiter(ctx context.Context, pickCode string, limiter *rate.Limiter) ([]bulkFolder, error) {
 	folders := make([]bulkFolder, 0)
 	for page := int64(1); ; page++ {
 		var items []bulkFolder
 		var more bool
-		err := c.waitReadAndCall(cloud.WithReadClass(ctx, cloud.ReadClassBackground), c.bulkRate, func() error {
+		err := c.waitReadAndCall(cloud.WithReadClass(ctx, cloud.ReadClassBackground), limiter, func() error {
 			var err error
 			items, more, err = c.sdk.ListTreeFolders(pickCode, page, bulkFolderPageSize)
 			return err
@@ -991,6 +1156,63 @@ func (c *Client) loadTreeFolders(ctx context.Context, pickCode string) ([]bulkFo
 			return folders, nil
 		}
 	}
+}
+
+func buildTreeFolderPaths(rootID string, folders []bulkFolder) (map[string]string, error) {
+	nodes := map[string]bulkFolder{rootID: {ID: rootID}}
+	for _, folder := range folders {
+		if folder.ID == "" || folder.ParentID == "" || folder.Name == "" || strings.ContainsAny(folder.Name, "\x00\r\n/") {
+			return nil, errors.New("115 returned an invalid bulk folder")
+		}
+		nodes[folder.ID] = folder
+	}
+	paths := map[string]string{rootID: ""}
+	var folderPath func(string, map[string]struct{}) (string, error)
+	folderPath = func(id string, visiting map[string]struct{}) (string, error) {
+		if resolved, ok := paths[id]; ok {
+			return resolved, nil
+		}
+		if _, cycle := visiting[id]; cycle {
+			return "", errors.New("115 bulk folder cycle")
+		}
+		node, ok := nodes[id]
+		if !ok {
+			return "", errors.New("115 bulk folder parent is missing")
+		}
+		visiting[id] = struct{}{}
+		parent, err := folderPath(node.ParentID, visiting)
+		delete(visiting, id)
+		if err != nil {
+			return "", err
+		}
+		paths[id] = parent + "/" + node.Name
+		return paths[id], nil
+	}
+	for _, folder := range folders {
+		if _, err := folderPath(folder.ID, map[string]struct{}{}); err != nil {
+			return nil, err
+		}
+	}
+	return paths, nil
+}
+
+func buildTreeEntriesFromPaths(paths map[string]string, files []pan115sdk.File) ([]cloud.TreeEntry, int) {
+	entries := make([]cloud.TreeEntry, 0, len(files))
+	invalid := 0
+	for _, file := range files {
+		item, err := mapFile(file)
+		if err != nil || item.IsDir || strings.ContainsAny(item.Name, "\x00\r\n/") {
+			invalid++
+			continue
+		}
+		parent, ok := paths[item.ParentID]
+		if !ok {
+			invalid++
+			continue
+		}
+		entries = append(entries, cloud.TreeEntry{Item: item, RelativePath: parent + "/" + item.Name})
+	}
+	return entries, invalid
 }
 
 func (c *Client) loadTreeFiles(ctx context.Context, rootID string, maxEntries int) ([]pan115sdk.File, bool, error) {

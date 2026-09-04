@@ -157,6 +157,72 @@ describe('media library form boundary', () => {
     expect(source).toContain('aria-live="polite"')
   })
 
+  it('shows durable fast-scan progress and links each run to correlated logs', () => {
+    const source = readFileSync(new URL('./views/MediaLibrariesView.vue', import.meta.url), 'utf8')
+    for (const label of ['目录可用 · 识别中', '枚举 / 处理 / 落库 / 去重', '识别进度', '查看本次详细日志']) expect(source).toContain(label)
+    for (const stage of ['persist_source_assets', 'persist_recognition', 'persist_entries', 'prune_stale_entries', 'reconcile_tmdb_collections', 'advance_library_generation', 'persist_scan_run', 'record_media_change']) expect(source).toContain(stage)
+    expect(source).toContain("scan_run_id: String(runItem.id)")
+    expect(source).toContain("run.status === 'catalog_ready'")
+    expect(source).toContain("run.status === 'success'")
+    expect(source).toContain('状态待确认')
+    expect(source).not.toContain('checkpoint_json')
+    expect(source).not.toContain('source_fingerprint')
+  })
+
+  it('offers safe directory-aware manual recognition before any structure move', () => {
+    const source = readFileSync(new URL('./views/MediaLibrariesView.vue', import.meta.url), 'utf8')
+    for (const text of ['所在目录', '手动整理', '搜索标题', '作品类型', '年份（可选）', '搜索 TMDB', '保存后只生成目录移动预览，不会直接移动文件']) expect(source).toContain(text)
+    expect(source).toContain('item.source_directory')
+    expect(source).toContain('manualRecognitionForm.title.trim()')
+    expect(source).toContain("Number(year) < 1888 || Number(year) > 2200")
+    expect(source).toContain('await openStructureDiagnostics()')
+    expect(source).toContain("recognition_input_invalid: '无法从文件名推断标题，请手动整理'")
+    expect(source).not.toContain('item.provider_id')
+    expect(source).not.toContain('item.relative_path')
+  })
+
+  it('keeps background structure diagnosis read-only and does not restart it while viewing progress', () => {
+    const source = readFileSync(new URL('./views/MediaLibrariesView.vue', import.meta.url), 'utf8')
+    for (const text of ['目录结构诊断正在后台', '目录结构诊断系统失败', '诊断全程只读，不会移动文件', 'processed_items', 'classifications.duplicate_target', 'classifications.sidecar_target_conflict']) expect(source).toContain(text)
+    expect(source).toContain('async function viewStructureDiagnostics()')
+    expect(source).toContain('await showStructureDiagnostics(false)')
+    expect(source).toContain('diagnostics.status !== \'issues\'')
+    expect(source).toContain('@click="viewStructureDiagnostics">查看诊断进度</button>')
+    expect(source).not.toContain('@click="openStructureDiagnostics">查看诊断进度</button>')
+  })
+
+  it('keeps every structure-diagnosis resolution entry visible from authoritative counters', () => {
+    const source = readFileSync(new URL('./views/MediaLibrariesView.vue', import.meta.url), 'utf8')
+    for (const text of ['可选整理建议', '需要处理', '无需处理', '生成安全整理预览', '重试生成整理预览', '去手动整理', '去规则管理', '视频目标冲突', '伴随文件冲突', '重新检查', '跨分类抽取的最多 100 条代表样本']) expect(source).toContain(text)
+    for (const text of ['自动识别失败或无匹配', '目录结构初步检查完成 · 等待识别结果', '等待中的媒体不会计入“需要处理”', '识别完成后系统会自动重新检查', 'recognition_enqueue_failed']) expect(source).toContain(text)
+    expect(source).toContain('diagnostics.repairable_count <= 0')
+    expect(source).toContain("item.code !== 'missing_season_episode'")
+    expect(source).toContain('structureDiagnostics.repairable_count > 0')
+    expect(source).toContain('structurePreviewError.value = message(reason)')
+    expect(source).not.toContain('structureDiagnostics.issues.some(item => item.repairable)')
+  })
+
+  it('shows every available source in a bounded target-conflict summary', () => {
+    const source = readFileSync(new URL('./views/MediaLibrariesView.vue', import.meta.url), 'utf8')
+    for (const text of ['当前路径 / 冲突来源', '同一目标的来源', 'issue.conflict_sources', 'issue.conflict_source_count', '个来源已省略']) expect(source).toContain(text)
+  })
+
+  it('separates recognition mistakes, catalog duplicates, and real file conflicts', () => {
+    const source = readFileSync(new URL('./views/MediaLibrariesView.vue', import.meta.url), 'utf8')
+    for (const text of [
+      '多个不同作品疑似被识别成同一作品',
+      '同一来源事实在目录中重复',
+      '多个真实文件会得到同一目标',
+      '不要删除来源文件',
+      '核对并修正识别',
+      "catalogMatch.value = 'review'",
+      "catalogMatch.value === 'manual' || catalogMatch.value === 'review' ? 'matched' : 'unrecognized'",
+      "item.status === 'matched' ? '修正识别' : '手动整理'",
+      '(sourceTitle || item.title).trim()',
+    ]) expect(source).toContain(text)
+    expect(source).not.toContain('同一目标只能保留一个来源；请在来源侧改名或清理重复文件')
+  })
+
   it('shows persisted storage root and child roots as readable Windows locations', () => {
     const local = { ...storage('local'), root_path: 'D:\\Downloads\\115\\媒体', root_display_path: 'D:\\Downloads\\115\\媒体' }
     const rootLibrary = { relative_root: '/' } as Parameters<typeof mediaLibrarySourceDisplayPath>[0]

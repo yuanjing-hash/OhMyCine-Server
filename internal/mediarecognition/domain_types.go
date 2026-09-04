@@ -4,7 +4,7 @@ import (
 	"errors"
 )
 
-const EngineVersion = "nextgen-domain-v10"
+const EngineVersion = "nextgen-domain-v11"
 
 const (
 	MaxPackageRunes     = 512

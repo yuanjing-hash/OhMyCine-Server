@@ -110,6 +110,22 @@ func (s *QueueService) Enqueue(input EnqueueJobInput) (JobDTO, error) {
 // EnqueueWith atomically creates a Job and a domain record. The callback must
 // perform database work only; wakeups/events are emitted after commit.
 func (s *QueueService) EnqueueWith(input EnqueueJobInput, after func(*gorm.DB, models.Job) error) (JobDTO, error) {
+	return s.enqueueWith(input, after, false)
+}
+
+// EnqueueLatestWith is for a latest-state convergence job. Unlike ordinary
+// EnqueueWith coalescing, a newer request replaces the private payload and the
+// callback updates its domain projection in the same transaction. A running
+// worker still finishes under its claimed generation; Complete requeues it
+// when the Job generation advanced meanwhile.
+func (s *QueueService) EnqueueLatestWith(input EnqueueJobInput, after func(*gorm.DB, models.Job) error) (JobDTO, error) {
+	if strings.TrimSpace(input.CoalescingKey) == "" {
+		return JobDTO{}, appError(CodeInvalidRequest, "合并任务缺少合并键", nil)
+	}
+	return s.enqueueWith(input, after, true)
+}
+
+func (s *QueueService) enqueueWith(input EnqueueJobInput, after func(*gorm.DB, models.Job) error, updateCoalesced bool) (JobDTO, error) {
 	input.JobType = strings.ToLower(strings.TrimSpace(input.JobType))
 	input.DisplayName = strings.TrimSpace(input.DisplayName)
 	if (!input.System && input.OwnerID == 0) || (input.System && input.OwnerID != 0) || input.JobType == "" || input.DisplayName == "" || len(input.DisplayName) > 256 {
@@ -134,7 +150,18 @@ func (s *QueueService) EnqueueWith(input EnqueueJobInput, after func(*gorm.DB, m
 				job.Generation++
 				job.Revision++
 				job.UpdatedAt = now
-				return tx.Model(&job).Updates(map[string]any{"generation": job.Generation, "revision": job.Revision, "updated_at": now}).Error
+				updates := map[string]any{"generation": job.Generation, "revision": job.Revision, "updated_at": now}
+				if updateCoalesced {
+					job.PayloadJSON = string(payload)
+					updates["payload_json"] = job.PayloadJSON
+				}
+				if err := tx.Model(&job).Updates(updates).Error; err != nil {
+					return err
+				}
+				if updateCoalesced && after != nil {
+					return after(tx, job)
+				}
+				return nil
 			}
 			if err != gorm.ErrRecordNotFound {
 				return err

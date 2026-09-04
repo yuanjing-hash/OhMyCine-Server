@@ -600,6 +600,20 @@ type ProviderEvent struct {
 	CreatedAt        time.Time  `json:"created_at"`
 }
 
+// MediaLibraryProviderEvent is the durable per-library delivery record for a
+// normalized provider inbox event. ProviderEvent may be acknowledged once this
+// private copy exists; the library delivery is acknowledged only after its
+// catalog reconciliation commits successfully.
+type MediaLibraryProviderEvent struct {
+	ID           uint       `gorm:"primaryKey" json:"-"`
+	LibraryID    uint       `gorm:"not null;uniqueIndex:idx_media_library_provider_event;index" json:"-"`
+	InboxEventID uint       `gorm:"not null;uniqueIndex:idx_media_library_provider_event;index" json:"-"`
+	PayloadJSON  string     `gorm:"type:text;not null" json:"-"`
+	ProcessedAt  *time.Time `gorm:"index" json:"-"`
+	CreatedAt    time.Time  `gorm:"not null" json:"-"`
+	UpdatedAt    time.Time  `gorm:"not null" json:"-"`
+}
+
 type ProviderCursor struct {
 	ConnectionID uint      `gorm:"primaryKey" json:"connection_id"`
 	Stream       string    `gorm:"primaryKey;size:32" json:"stream"`
@@ -722,6 +736,8 @@ type MediaLibrary struct {
 
 const (
 	MediaLibraryStructurePending    = "pending"
+	MediaLibraryStructureQueued     = "queued"
+	MediaLibraryStructureRunning    = "running"
 	MediaLibraryStructureHealthy    = "healthy"
 	MediaLibraryStructureIssues     = "issues"
 	MediaLibraryStructureRepairing  = "repairing"
@@ -730,6 +746,35 @@ const (
 	MediaLibraryStructureScopeWork  = "work"
 	MediaLibraryStructurePhaseQueue = "queued"
 )
+
+// MediaLibraryStructureDiagnosis is the latest durable, per-library planning
+// projection. The queue payload freezes the same scan correlation fields;
+// IssuesJSON contains only bounded, sanitized relative-path samples and is
+// never serialized directly by handlers.
+type MediaLibraryStructureDiagnosis struct {
+	LibraryID            uint       `gorm:"primaryKey" json:"library_id"`
+	JobID                string     `gorm:"size:36;not null;uniqueIndex" json:"job_id"`
+	ScanRunID            *uint      `gorm:"index" json:"scan_run_id,omitempty"`
+	Generation           uint64     `gorm:"not null;index" json:"generation"`
+	ScanKind             string     `gorm:"size:24;not null;default:''" json:"scan_kind"`
+	Status               string     `gorm:"size:24;not null;index" json:"status"`
+	TotalItems           int        `gorm:"not null;default:0" json:"total_items"`
+	ProcessedItems       int        `gorm:"not null;default:0" json:"processed_items"`
+	IssueCount           int        `gorm:"not null;default:0" json:"issue_count"`
+	RepairableCount      int        `gorm:"not null;default:0" json:"repairable_count"`
+	UnrecognizedCount    int        `gorm:"not null;default:0" json:"unrecognized_count"`
+	MissingEpisodeCount  int        `gorm:"not null;default:0" json:"missing_season_episode_count"`
+	InvalidPathCount     int        `gorm:"not null;default:0" json:"invalid_path_count"`
+	TemplateErrorCount   int        `gorm:"not null;default:0" json:"template_unavailable_count"`
+	DuplicateTargetCount int        `gorm:"not null;default:0" json:"duplicate_target_count"`
+	SidecarConflictCount int        `gorm:"not null;default:0" json:"sidecar_target_conflict_count"`
+	IssuesJSON           string     `gorm:"type:text;not null;default:'[]'" json:"-"`
+	LastErrorCode        string     `gorm:"size:96;not null;default:''" json:"last_error_code"`
+	StartedAt            *time.Time `json:"started_at,omitempty"`
+	FinishedAt           *time.Time `json:"finished_at,omitempty"`
+	CreatedAt            time.Time  `gorm:"not null" json:"created_at"`
+	UpdatedAt            time.Time  `gorm:"not null" json:"updated_at"`
+}
 
 // MediaLibraryStructureRepair is the durable authority for one diagnostic or
 // repair run. PlanJSON and StateJSON contain private provider identities and
@@ -811,23 +856,56 @@ type MediaServerRefreshRun struct {
 }
 
 type MediaLibraryScanRun struct {
-	ID                uint       `gorm:"primaryKey" json:"id"`
-	LibraryID         uint       `gorm:"not null;index" json:"library_id"`
-	Kind              string     `gorm:"size:24;not null;index" json:"kind"`
-	Status            string     `gorm:"size:24;not null;index" json:"status"`
-	Generation        uint64     `gorm:"not null" json:"generation"`
-	Discovered        int        `gorm:"not null;default:0" json:"discovered"`
-	Added             int        `gorm:"not null;default:0" json:"added"`
-	Updated           int        `gorm:"not null;default:0" json:"updated"`
-	Removed           int        `gorm:"not null;default:0" json:"removed"`
-	Matched           int        `gorm:"not null;default:0" json:"matched"`
-	Unrecognized      int        `gorm:"not null;default:0" json:"unrecognized"`
-	CacheHits         int        `gorm:"not null;default:0" json:"cache_hits"`
-	RecognitionFailed int        `gorm:"not null;default:0" json:"recognition_failed"`
-	ErrorCode         string     `gorm:"size:64;not null;default:''" json:"error_code"`
-	Partial           bool       `gorm:"not null;default:false" json:"partial"`
-	StartedAt         time.Time  `gorm:"index" json:"started_at"`
-	FinishedAt        *time.Time `json:"finished_at"`
+	ID                   uint       `gorm:"primaryKey" json:"id"`
+	LibraryID            uint       `gorm:"not null;index" json:"library_id"`
+	Kind                 string     `gorm:"size:24;not null;index" json:"kind"`
+	Status               string     `gorm:"size:24;not null;index" json:"status"`
+	Generation           uint64     `gorm:"not null" json:"generation"`
+	Discovered           int        `gorm:"not null;default:0" json:"discovered"`
+	Added                int        `gorm:"not null;default:0" json:"added"`
+	Updated              int        `gorm:"not null;default:0" json:"updated"`
+	Removed              int        `gorm:"not null;default:0" json:"removed"`
+	Matched              int        `gorm:"not null;default:0" json:"matched"`
+	Unrecognized         int        `gorm:"not null;default:0" json:"unrecognized"`
+	CacheHits            int        `gorm:"not null;default:0" json:"cache_hits"`
+	RecognitionFailed    int        `gorm:"not null;default:0" json:"recognition_failed"`
+	Phase                string     `gorm:"size:32;not null;default:''" json:"phase"`
+	Enumerated           int        `gorm:"not null;default:0" json:"enumerated"`
+	Processed            int        `gorm:"not null;default:0" json:"processed"`
+	Persisted            int        `gorm:"not null;default:0" json:"persisted"`
+	Deduplicated         int        `gorm:"not null;default:0" json:"deduplicated"`
+	RecognitionTotal     int        `gorm:"not null;default:0" json:"recognition_total"`
+	RecognitionCompleted int        `gorm:"not null;default:0" json:"recognition_completed"`
+	PersistenceStage     string     `gorm:"size:48;not null;default:''" json:"persistence_stage"`
+	DatabaseErrorClass   string     `gorm:"size:32;not null;default:''" json:"database_error_class"`
+	CatalogPublishedAt   *time.Time `json:"catalog_published_at"`
+	SourceFingerprint    string     `gorm:"size:64;not null;default:''" json:"-"`
+	CheckpointJSON       string     `gorm:"type:text;not null;default:'{}'" json:"-"`
+	ErrorCode            string     `gorm:"size:64;not null;default:''" json:"error_code"`
+	Partial              bool       `gorm:"not null;default:false" json:"partial"`
+	StartedAt            time.Time  `gorm:"index" json:"started_at"`
+	FinishedAt           *time.Time `json:"finished_at"`
+}
+
+// MediaLibraryScanStaging contains private provider facts for one recoverable
+// scan run. It is never returned by handlers or used as presentation data.
+type MediaLibraryScanStaging struct {
+	ID               uint      `gorm:"primaryKey" json:"-"`
+	RunID            uint      `gorm:"not null;uniqueIndex:idx_media_library_scan_stage_path,priority:1;index;index:idx_media_library_scan_stage_checkpoint,priority:1" json:"-"`
+	LibraryID        uint      `gorm:"not null;index" json:"-"`
+	ItemKind         string    `gorm:"size:16;not null;uniqueIndex:idx_media_library_scan_stage_path,priority:2" json:"-"`
+	RelativePath     string    `gorm:"size:2048;not null;uniqueIndex:idx_media_library_scan_stage_path,priority:3" json:"-"`
+	ProviderID       string    `gorm:"size:128;not null;index:idx_media_library_scan_stage_provider,priority:2" json:"-"`
+	ParentProviderID string    `gorm:"size:128;not null;default:''" json:"-"`
+	Name             string    `gorm:"size:512;not null;default:''" json:"-"`
+	Extension        string    `gorm:"size:32;not null;default:''" json:"-"`
+	Size             int64     `gorm:"not null;default:0" json:"-"`
+	ModifiedAt       time.Time `json:"-"`
+	HashHint         string    `gorm:"size:128;not null;default:''" json:"-"`
+	PageOffset       int64     `gorm:"not null;default:0" json:"-"`
+	RowOffset        int       `gorm:"not null;default:0;index:idx_media_library_scan_stage_checkpoint,priority:2" json:"-"`
+	CreatedAt        time.Time `gorm:"not null" json:"-"`
+	UpdatedAt        time.Time `gorm:"not null" json:"-"`
 }
 
 type MediaLibraryEntry struct {
