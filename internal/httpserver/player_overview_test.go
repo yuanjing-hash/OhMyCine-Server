@@ -125,7 +125,7 @@ func TestBrowserMediaLibraryOverviewUsesSessionFiltersSourcesAndReturnsSafeDTOs(
 	duration := 6000.0
 	rows := []models.PlayerPlaybackHistory{
 		{UserID: owner.ID, SyncKey: strings.Repeat("a", 64), HistoryIdentity: identity, SourceKind: "server", SourceID: "server-private-id", LibraryID: uintString(library.ID), ItemID: "work|" + uintString(library.ID) + "|" + workToken, ItemToken: "work|" + uintString(library.ID) + "|" + workToken, MediaIdentity: identity, Title: "七武士", DisplayTitle: "七武士", MediaType: "movie", PosterPath: "/poster-secret-path.jpg", Position: 1200, Duration: &duration, ClientUpdatedAt: now.UnixMilli(), Revision: 1, CreatedAt: now, UpdatedAt: now},
-		{UserID: owner.ID, SyncKey: strings.Repeat("b", 64), SourceKind: "emby", SourceLocator: "https://emby.example.test", SourceID: "emby-private-id", MediaIdentity: "emby-item", Title: "外部 Emby 作品", DisplayTitle: "外部 Emby 作品", Position: 300, Duration: &duration, ClientUpdatedAt: now.Add(-time.Minute).UnixMilli(), Revision: 2, CreatedAt: now, UpdatedAt: now},
+		{UserID: owner.ID, SyncKey: strings.Repeat("b", 64), SourceKind: "emby", SourceName: "客厅 Emby", SourceLocator: "https://emby.example.test", SourceID: "emby-private-id", MediaIdentity: "emby-item", Title: "外部 Emby 作品", DisplayTitle: "外部 Emby 作品", PosterURL: "https://image.example.test/emby.jpg", Position: 300, Duration: &duration, ClientUpdatedAt: now.Add(-time.Minute).UnixMilli(), Revision: 2, CreatedAt: now, UpdatedAt: now},
 	}
 	if err := client.db.Create(&rows).Error; err != nil {
 		t.Fatal(err)
@@ -143,13 +143,13 @@ func TestBrowserMediaLibraryOverviewUsesSessionFiltersSourcesAndReturnsSafeDTOs(
 	if err := json.Unmarshal(envelope.Data, &overview); err != nil {
 		t.Fatal(err)
 	}
-	if len(overview.Sections["continue_watching"].List) != 1 {
+	if len(overview.Sections["continue_watching"].List) != 2 {
 		t.Fatalf("continue watching=%s", envelope.Data)
 	}
 	if _, duplicated := overview.Sections["recent_history"]; duplicated {
 		t.Fatalf("browser overview must not duplicate history: %s", envelope.Data)
 	}
-	for _, forbidden := range []string{"source_kind", "source_locator", "source_id", "item_token", "media_identity", "poster_path", "provider_id", "root_path"} {
+	for _, forbidden := range []string{"source_locator", "source_id", "item_token", "media_identity", "poster_path", "provider_id", "root_path"} {
 		if jsonContainsKey(envelope.Data, forbidden) {
 			t.Fatalf("browser overview leaked %q: %s", forbidden, envelope.Data)
 		}
@@ -159,10 +159,10 @@ func TestBrowserMediaLibraryOverviewUsesSessionFiltersSourcesAndReturnsSafeDTOs(
 	var page struct {
 		List []json.RawMessage `json:"list"`
 	}
-	if err := json.Unmarshal(envelope.Data, &page); status != http.StatusOK || err != nil || len(page.List) != 1 {
+	if err := json.Unmarshal(envelope.Data, &page); status != http.StatusOK || err != nil || len(page.List) != 2 {
 		t.Fatalf("history status=%d err=%v data=%s", status, err, envelope.Data)
 	}
-	if bytes := string(envelope.Data); strings.Contains(bytes, "外部 Emby 作品") || strings.Contains(bytes, "server-private-id") || strings.Contains(bytes, "poster-secret-path") {
+	if bytes := string(envelope.Data); !strings.Contains(bytes, "外部 Emby 作品") || !strings.Contains(bytes, "客厅 Emby") || !strings.Contains(bytes, "https://image.example.test/emby.jpg") || strings.Contains(bytes, "emby-private-id") || strings.Contains(bytes, "emby-item") || strings.Contains(bytes, "server-private-id") || strings.Contains(bytes, "poster-secret-path") {
 		t.Fatalf("history leaked foreign/private data: %s", bytes)
 	}
 	for _, path := range []string{
@@ -185,7 +185,7 @@ func TestBrowserMediaLibraryOverviewUsesSessionFiltersSourcesAndReturnsSafeDTOs(
 		t.Fatal(err)
 	}
 	status, envelope = client.request(t, http.MethodGet, "/api/v1/media-libraries/history?page=1&page_size=24", nil, false)
-	if err := json.Unmarshal(envelope.Data, &page); status != http.StatusOK || err != nil || len(page.List) != 0 {
+	if err := json.Unmarshal(envelope.Data, &page); status != http.StatusOK || err != nil || len(page.List) != 1 || !strings.Contains(string(page.List[0]), "外部 Emby 作品") {
 		t.Fatalf("deleted catalog history status=%d err=%v data=%s", status, err, envelope.Data)
 	}
 }

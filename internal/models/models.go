@@ -117,6 +117,7 @@ type PlayerPlaybackHistory struct {
 	SyncKey          string    `gorm:"primaryKey;size:128" json:"sync_key"`
 	HistoryIdentity  string    `gorm:"column:canonical_identity;size:512;not null;default:'';index" json:"history_identity,omitempty"`
 	SourceKind       string    `gorm:"size:32;not null" json:"source_kind"`
+	SourceName       string    `gorm:"size:128;not null;default:''" json:"source_name,omitempty"`
 	SourceLocator    string    `gorm:"size:512;not null;default:''" json:"source_locator"`
 	SourceID         string    `gorm:"size:128;not null" json:"source_id"`
 	LibraryID        string    `gorm:"size:256;not null;default:''" json:"library_id,omitempty"`

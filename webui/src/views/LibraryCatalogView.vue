@@ -132,7 +132,10 @@ function activate(mode: LibraryView) {
   void loadSection(mode)
 }
 function openMedia(item: UserMediaItem) { void router.push({ name: 'library-catalog-detail', params: { libraryID: String(item.library_id), workID: item.work_id } }) }
-function openHistory(item: UserHistoryItem) { void router.push({ name: 'library-catalog-detail', params: { libraryID: String(item.library_id), workID: item.work_id } }) }
+function openHistory(item: UserHistoryItem) {
+  if (item.playable)
+    void router.push({ name: 'library-catalog-detail', params: { libraryID: String(item.library_id), workID: item.work_id } })
+}
 function openOverviewCollection(item: UserCollectionSummary) { activeView.value = item.source === 'manual' ? 'manual' : 'automatic'; collections.value = [item]; void loadCollectionItems(item) }
 function openOverviewLibrary(item: UserMediaLibrarySummary) {
   const changed = selectedLibrary.value !== item.id
@@ -179,10 +182,10 @@ onUnmounted(() => { overviewController?.abort(); sectionController?.abort(); cat
       <div v-else-if="overviewError" class="semantic-error p-4"><strong>媒体总览暂时不可用</strong><p class="mt-1 text-sm">{{ overviewError }}</p><button class="btn-secondary mt-3" @click="loadOverview">重试</button></div>
       <template v-else>
         <article class="panel overflow-hidden p-0">
-          <header class="overview-heading"><div><h2>继续观看</h2><p>跨设备同步的 Server 媒体进度</p></div><button class="btn-secondary" @click="activate('history')">查看全部</button></header>
+          <header class="overview-heading"><div><h2>继续观看</h2><p>同一账号下跨设备合并的观看进度</p></div><button class="btn-secondary" @click="activate('history')">查看全部</button></header>
           <div v-if="overview.sections.continue_watching.status === 'unavailable'" class="overview-empty">该栏目暂时不可用（{{ overview.sections.continue_watching.error_code || 'UNKNOWN' }}）</div>
-          <div v-else-if="overview.sections.continue_watching.list.length" class="discovery-row p-5"><button v-for="item in overview.sections.continue_watching.list" :key="`${item.library_id}:${item.work_id}:${item.subtitle || ''}`" class="discovery-poster" @click="openHistory(item)"><div class="discovery-poster__image"><img v-if="item.poster_url" :src="item.poster_url" :alt="`${item.title} 海报`" loading="lazy"><span v-else>暂无海报</span></div><strong :title="item.title">{{ item.title }}</strong><small>{{ item.subtitle || '继续观看' }}</small><span class="history-progress" aria-hidden="true"><i :style="{ width: `${historyProgress(item)}%` }"></i></span></button></div>
-          <div v-else class="overview-empty">暂无未看完的 Server 媒体。</div>
+          <div v-else-if="overview.sections.continue_watching.list.length" class="discovery-row p-5"><button v-for="item in overview.sections.continue_watching.list" :key="`${item.source_kind}:${item.library_id}:${item.work_id}:${item.subtitle || ''}`" class="discovery-poster" :class="{ 'cursor-default': !item.playable }" @click="openHistory(item)"><div class="discovery-poster__image"><img v-if="item.poster_url" :src="item.poster_url" :alt="`${item.title} 海报`" loading="lazy"><span v-else>暂无海报</span></div><strong :title="item.title">{{ item.title }}</strong><small>{{ item.subtitle || '继续观看' }}</small><small>{{ item.source_name }}</small><span class="history-progress" aria-hidden="true"><i :style="{ width: `${historyProgress(item)}%` }"></i></span></button></div>
+          <div v-else class="overview-empty">当前账号暂无未看完的媒体。</div>
         </article>
 
         <article class="panel overflow-hidden p-0">
@@ -206,7 +209,7 @@ onUnmounted(() => { overviewController?.abort(); sectionController?.abort(); cat
     <template v-else-if="activeView === 'history'">
       <div v-if="sectionLoading" class="panel py-14 text-center text-muted">正在读取播放历史…</div>
       <div v-else-if="sectionError" class="semantic-error p-4"><strong>播放历史暂时不可用</strong><p class="mt-1 text-sm">{{ sectionError }}</p><button class="btn-secondary mt-3" @click="loadSection('history', history.page)">重试</button></div>
-      <template v-else><div v-if="history.list.length" class="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-5 2xl:grid-cols-7"><button v-for="item in history.list" :key="`${item.library_id}:${item.work_id}:${item.subtitle || ''}`" class="discovery-poster" @click="openHistory(item)"><div class="discovery-poster__image"><img v-if="item.poster_url" :src="item.poster_url" :alt="`${item.title} 海报`" loading="lazy"><span v-else>暂无海报</span></div><strong :title="item.title">{{ item.title }}</strong><small>{{ item.subtitle || (item.completed ? '已看完' : '已观看') }}</small><small>{{ formatDate(item.updated_at) }}</small><span class="history-progress" aria-hidden="true"><i :style="{ width: `${historyProgress(item)}%` }"></i></span></button></div><div v-else class="panel py-14 text-center text-muted">当前 Server 媒体库没有播放历史。</div><footer v-if="history.total" class="panel flex flex-wrap items-center justify-between gap-3 py-3"><span class="text-sm text-muted">共 {{ history.total }} 条记录</span><div class="flex items-center gap-2"><button class="btn-secondary" :disabled="history.page <= 1" @click="loadSection('history', history.page - 1)">上一页</button><span class="text-sm">第 {{ history.page }} 页</span><button class="btn-secondary" :disabled="!history.has_more" @click="loadSection('history', history.page + 1)">下一页</button></div></footer></template>
+      <template v-else><div v-if="history.list.length" class="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-5 2xl:grid-cols-7"><button v-for="item in history.list" :key="`${item.source_kind}:${item.library_id}:${item.work_id}:${item.subtitle || ''}`" class="discovery-poster" :class="{ 'cursor-default': !item.playable }" @click="openHistory(item)"><div class="discovery-poster__image"><img v-if="item.poster_url" :src="item.poster_url" :alt="`${item.title} 海报`" loading="lazy"><span v-else>暂无海报</span></div><strong :title="item.title">{{ item.title }}</strong><small>{{ item.subtitle || (item.completed ? '已看完' : '已观看') }}</small><small>{{ item.source_name }} · {{ formatDate(item.updated_at) }}</small><span class="history-progress" aria-hidden="true"><i :style="{ width: `${historyProgress(item)}%` }"></i></span></button></div><div v-else class="panel py-14 text-center text-muted">当前账号还没有同步播放历史。</div><footer v-if="history.total" class="panel flex flex-wrap items-center justify-between gap-3 py-3"><span class="text-sm text-muted">共 {{ history.total }} 条记录</span><div class="flex items-center gap-2"><button class="btn-secondary" :disabled="history.page <= 1" @click="loadSection('history', history.page - 1)">上一页</button><span class="text-sm">第 {{ history.page }} 页</span><button class="btn-secondary" :disabled="!history.has_more" @click="loadSection('history', history.page + 1)">下一页</button></div></footer></template>
     </template>
 
     <template v-else-if="activeView === 'favorites'">

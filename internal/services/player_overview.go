@@ -223,7 +223,7 @@ func (s *PlayerOverviewService) BrowserOverview(actor Actor) BrowserMediaOvervie
 	if !ok {
 		libraries = nil
 	}
-	return BrowserMediaOverview{
+	browserResult := BrowserMediaOverview{
 		Version: result.Version,
 		Sections: BrowserMediaOverviewSections{
 			ContinueWatching:     browserSection(result.Sections.ContinueWatching, func(items []PlayerHistoryChange) []BrowserHistoryItem { return browserHistoryItems(items, libraries) }),
@@ -234,6 +234,15 @@ func (s *PlayerOverviewService) BrowserOverview(actor Actor) BrowserMediaOvervie
 			MediaLibraries:       browserSection(result.Sections.MediaLibraries, browserLibraries),
 		},
 	}
+	if history, ok := s.history.(*PlayerHistoryService); ok {
+		items, hasMore, err := history.BrowserContinueWatching(actor, playerOverviewContinueLimit)
+		if err != nil {
+			browserResult.Sections.ContinueWatching = PlayerOverviewSection[BrowserHistoryItem]{Status: playerOverviewStatusUnavailable, List: []BrowserHistoryItem{}, ErrorCode: ErrorCode(err)}
+		} else {
+			browserResult.Sections.ContinueWatching = PlayerOverviewSection[BrowserHistoryItem]{Status: playerOverviewStatusOK, List: items, HasMore: hasMore}
+		}
+	}
+	return browserResult
 }
 
 func (s *PlayerOverviewService) loadLibraries(actor Actor) ([]PlayerMediaLibrary, error) {

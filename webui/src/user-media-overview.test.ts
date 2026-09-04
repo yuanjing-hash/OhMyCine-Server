@@ -33,4 +33,16 @@ describe('Server media-library overview contract', () => {
     expect(historyProgress(page.list[0])).toBe(50)
     expect(historyProgress({ ...page.list[0], position: 200 })).toBe(100)
   })
+
+  it('keeps synced external-source history and its safe artwork as non-playable account history', () => {
+    const page = normalizeUserHistoryPage({ list: [{
+      library_id: 0, work_id: 'emby:item:42', source_kind: 'emby', source_name: '客厅 Emby',
+      playable: false, title: '外部电影', poster_url: 'https://image.example.test/poster.jpg',
+      position: 20, duration: 100, updated_at: 2,
+    }], total: 1, page: 1, page_size: 24, has_more: false })
+    expect(page.list).toEqual([expect.objectContaining({
+      source_kind: 'emby', source_name: '客厅 Emby', playable: false,
+      poster_url: 'https://image.example.test/poster.jpg',
+    })])
+  })
 })

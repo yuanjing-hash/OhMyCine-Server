@@ -25,6 +25,9 @@ export interface UserMediaItem {
 export interface UserHistoryItem {
   library_id: number
   work_id: string
+  source_kind: string
+  source_name: string
+  playable: boolean
   title: string
   subtitle?: string
   media_type?: string
@@ -162,8 +165,12 @@ function normalizeMediaItem(value: unknown): UserMediaItem {
 
 function normalizeHistoryItem(value: unknown): UserHistoryItem {
   const source = record(value)
+  const libraryId = positiveNumber(source.library_id, 0)
   return {
-    library_id: positiveNumber(source.library_id, 0), work_id: text(source.work_id),
+    library_id: libraryId, work_id: text(source.work_id),
+    source_kind: text(source.source_kind) || (libraryId > 0 ? 'server' : ''),
+    source_name: text(source.source_name) || (libraryId > 0 ? 'OhMyCine Server' : ''),
+    playable: source.playable === true || libraryId > 0,
     title: text(source.title) || '未命名作品', ...(text(source.subtitle) ? { subtitle: text(source.subtitle) } : {}),
     ...(text(source.media_type) ? { media_type: text(source.media_type) } : {}),
     ...(text(source.poster_url) ? { poster_url: text(source.poster_url) } : {}),
@@ -194,7 +201,7 @@ function normalizeLibrary(value: unknown): UserMediaLibrarySummary {
 }
 
 function completeMediaItem(item: UserMediaItem): boolean { return item.library_id > 0 && !!item.work_id }
-function completeHistoryItem(item: UserHistoryItem): boolean { return item.library_id > 0 && !!item.work_id }
+function completeHistoryItem(item: UserHistoryItem): boolean { return !!item.work_id && (item.library_id > 0 || !!item.source_kind) }
 function record(value: unknown): Record<string, unknown> { return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {} }
 function array(value: unknown): unknown[] { return Array.isArray(value) ? value : [] }
 function text(value: unknown): string { return typeof value === 'string' ? value : '' }

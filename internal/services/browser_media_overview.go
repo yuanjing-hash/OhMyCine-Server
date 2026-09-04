@@ -23,6 +23,9 @@ type BrowserMediaItem struct {
 type BrowserHistoryItem struct {
 	LibraryID   uint     `json:"library_id"`
 	WorkID      string   `json:"work_id"`
+	SourceKind  string   `json:"source_kind"`
+	SourceName  string   `json:"source_name"`
+	Playable    bool     `json:"playable"`
 	Title       string   `json:"title"`
 	Subtitle    string   `json:"subtitle,omitempty"`
 	MediaType   string   `json:"media_type,omitempty"`
@@ -125,21 +128,46 @@ func browserLibraries(items []PlayerMediaLibrary) []BrowserMediaLibrary {
 }
 
 func browserHistoryItem(item PlayerHistoryChange, libraries *MediaLibraryService) (BrowserHistoryItem, bool) {
+	result := BrowserHistoryItem{
+		WorkID: item.SyncKey, SourceKind: item.SourceKind,
+		SourceName: browserHistorySourceName(item), Title: item.DisplayTitle,
+		Subtitle: item.DisplaySubtitle, MediaType: item.MediaType,
+		PosterURL: safeHistoryArtwork(item.PosterURL), BackdropURL: safeHistoryArtwork(item.BackdropURL), Position: item.Position,
+		Duration: cloneHistoryFloat64(item.Duration), Completed: item.Completed, UpdatedAt: item.UpdatedAt,
+	}
+	if item.SourceKind != "server" {
+		return result, result.WorkID != ""
+	}
 	parsed, err := parseServerHistoryToken(item.ItemToken)
 	if err != nil {
 		return BrowserHistoryItem{}, false
 	}
-	posterURL, backdropURL := "", ""
+	result.LibraryID, result.WorkID, result.Playable = parsed.libraryID, parsed.workToken, true
 	if libraries != nil {
-		posterURL = libraries.catalogImageURL(item.PosterPath, "w500")
-		backdropURL = libraries.catalogImageURL(item.BackdropPath, "w1280")
+		result.PosterURL = libraries.catalogImageURL(item.PosterPath, "w500")
+		result.BackdropURL = libraries.catalogImageURL(item.BackdropPath, "w1280")
 	}
-	return BrowserHistoryItem{
-		LibraryID: parsed.libraryID, WorkID: parsed.workToken,
-		Title: item.DisplayTitle, Subtitle: item.DisplaySubtitle, MediaType: item.MediaType,
-		PosterURL: posterURL, BackdropURL: backdropURL, Position: item.Position,
-		Duration: cloneHistoryFloat64(item.Duration), Completed: item.Completed, UpdatedAt: item.UpdatedAt,
-	}, true
+	return result, true
+}
+
+func browserHistorySourceName(item PlayerHistoryChange) string {
+	if item.SourceName != "" {
+		return item.SourceName
+	}
+	switch item.SourceKind {
+	case "server":
+		return "OhMyCine Server"
+	case "emby":
+		return "Emby"
+	case "jellyfin":
+		return "Jellyfin"
+	case "local", "local-file":
+		return "本机媒体"
+	case "115":
+		return "115"
+	default:
+		return item.SourceKind
+	}
 }
 
 func browserHistoryItems(items []PlayerHistoryChange, libraries *MediaLibraryService) []BrowserHistoryItem {

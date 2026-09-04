@@ -344,6 +344,39 @@ func TestPlayerHistoryServerListHidesCanonicalItemsMissingFromCurrentCatalog(t *
 	}
 }
 
+func TestPlayerHistoryBatchKeepsValidExternalRowsWhenOneServerRowIsStale(t *testing.T) {
+	fixture := newPlayerHistoryCatalogFixture(t)
+	stale := fixture.change(strings.Repeat("7", 64), "desktop", "https://desktop.example.test", "entry|999|missing|1", 120, 2_000)
+	external := PlayerHistoryChange{
+		SyncKey: strings.Repeat("8", 64), SourceKind: "emby", SourceName: "客厅 Emby",
+		SourceLocator: "https://emby.example.test", SourceID: "emby-living-room",
+		MediaIdentity: "emby:item:42", Title: "外部电影", DisplayTitle: "外部电影",
+		PosterURL: "https://image.example.test/poster.jpg", Position: 240,
+		Duration: floatPointer(1_000), UpdatedAt: 3_000,
+	}
+	result, err := fixture.history.Sync(fixture.actor, 0, []PlayerHistoryChange{stale, external})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Rejected) != 1 || result.Rejected[0].SyncKey != stale.SyncKey || len(result.Changes) != 1 {
+		t.Fatalf("partial sync result=%+v", result)
+	}
+	page, err := fixture.history.BrowserList(fixture.actor, 1, 24)
+	if err != nil || page.Total != 1 || len(page.List) != 1 {
+		t.Fatalf("browser history=%+v err=%v", page, err)
+	}
+	item := page.List[0]
+	if item.SourceKind != "emby" || item.SourceName != "客厅 Emby" || item.Playable || item.PosterURL != external.PosterURL {
+		t.Fatalf("external history projection=%+v", item)
+	}
+	legacyUnsafe := external
+	legacyUnsafe.PosterURL = "https://image.example.test/poster.jpg?password=secret"
+	projected, ok := browserHistoryItem(legacyUnsafe, fixture.libraries)
+	if !ok || projected.PosterURL != "" {
+		t.Fatalf("unsafe legacy artwork reached browser history: %+v", projected)
+	}
+}
+
 func TestPlayerCatalogPublishesHistoryIdentityAndItemToken(t *testing.T) {
 	fixture := newPlayerHistoryCatalogFixture(t)
 	moviePage, err := fixture.libraries.PlayerCatalog(fixture.actor, fixture.libraryID, MediaPageQuery{Page: 1, PageSize: 100, MediaType: "movie"})
