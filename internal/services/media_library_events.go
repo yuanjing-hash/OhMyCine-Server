@@ -102,7 +102,7 @@ func (a *providerChangeAccumulator) add(rows []models.ProviderEvent) {
 		if a.fullFallback {
 			continue
 		}
-		event := providerChangeEvent{Kind: payload.Kind, ItemID: payload.ItemID, ParentID: payload.ParentID, PreviousParentID: payload.PreviousParentID, Name: payload.Name}
+		event := providerChangeEvent(payload)
 		a.events[event.ItemID] = event
 		if event.ParentID != "" {
 			a.parents[event.ParentID] = struct{}{}
@@ -152,7 +152,7 @@ func (a *providerChangeAccumulator) addDeliveries(rows []models.MediaLibraryProv
 			a.markFallbackLocked("move_scope_unknown")
 			continue
 		}
-		event := providerChangeEvent{Kind: payload.Kind, ItemID: payload.ItemID, ParentID: payload.ParentID, PreviousParentID: payload.PreviousParentID, Name: payload.Name}
+		event := providerChangeEvent(payload)
 		a.events[event.ItemID] = event
 		if event.ParentID != "" {
 			a.parents[event.ParentID] = struct{}{}

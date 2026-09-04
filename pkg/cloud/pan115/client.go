@@ -1134,10 +1134,6 @@ func (c *Client) StreamTree(ctx context.Context, rootID string, maxEntries int, 
 	return nil
 }
 
-func (c *Client) loadTreeFolders(ctx context.Context, pickCode string) ([]bulkFolder, error) {
-	return c.loadTreeFoldersWithLimiter(ctx, pickCode, c.bulkRate)
-}
-
 func (c *Client) loadTreeFoldersWithLimiter(ctx context.Context, pickCode string, limiter *rate.Limiter) ([]bulkFolder, error) {
 	folders := make([]bulkFolder, 0)
 	for page := int64(1); ; page++ {
@@ -1213,86 +1209,6 @@ func buildTreeEntriesFromPaths(paths map[string]string, files []pan115sdk.File) 
 		entries = append(entries, cloud.TreeEntry{Item: item, RelativePath: parent + "/" + item.Name})
 	}
 	return entries, invalid
-}
-
-func (c *Client) loadTreeFiles(ctx context.Context, rootID string, maxEntries int) ([]pan115sdk.File, bool, error) {
-	if maxEntries <= 0 {
-		maxEntries = 250000
-	}
-	files := make([]pan115sdk.File, 0, min(maxEntries, int(bulkTreePageSize)))
-	for offset := int64(0); ; {
-		var page []pan115sdk.File
-		var total int64
-		err := c.waitReadAndCall(cloud.WithReadClass(ctx, cloud.ReadClassBackground), c.bulkRate, func() error {
-			var err error
-			page, total, err = c.sdk.ListTreeFiles(rootID, offset, bulkTreePageSize)
-			return err
-		})
-		if err != nil {
-			return nil, false, mapError(err)
-		}
-		if len(page) == 0 && offset < total {
-			return nil, false, cloud.Error(cloud.CodeResponseInvalid, true, errors.New("115 bulk file page made no progress"))
-		}
-		remaining := maxEntries - len(files)
-		if len(page) > remaining {
-			page = page[:remaining]
-		}
-		files = append(files, page...)
-		if len(files) >= maxEntries {
-			return files, offset+int64(len(page)) < total, nil
-		}
-		offset += int64(len(page))
-		if offset >= total || len(page) == 0 {
-			return files, false, nil
-		}
-	}
-}
-
-func buildTreeEntries(rootID string, folders []bulkFolder, files []pan115sdk.File) ([]cloud.TreeEntry, error) {
-	nodes := map[string]bulkFolder{rootID: {ID: rootID}}
-	for _, folder := range folders {
-		if folder.ID == "" || folder.ParentID == "" || folder.Name == "" || strings.ContainsAny(folder.Name, "\x00\r\n/") {
-			return nil, cloud.Error(cloud.CodeResponseInvalid, true, errors.New("115 returned an invalid bulk folder"))
-		}
-		nodes[folder.ID] = folder
-	}
-	paths := map[string]string{rootID: ""}
-	var folderPath func(string, map[string]struct{}) (string, error)
-	folderPath = func(id string, visiting map[string]struct{}) (string, error) {
-		if path, ok := paths[id]; ok {
-			return path, nil
-		}
-		if _, cycle := visiting[id]; cycle {
-			return "", errors.New("115 bulk folder cycle")
-		}
-		node, ok := nodes[id]
-		if !ok {
-			return "", errors.New("115 bulk folder parent is missing")
-		}
-		visiting[id] = struct{}{}
-		parent, err := folderPath(node.ParentID, visiting)
-		delete(visiting, id)
-		if err != nil {
-			return "", err
-		}
-		path := parent + "/" + node.Name
-		paths[id] = path
-		return path, nil
-	}
-	entries := make([]cloud.TreeEntry, 0, len(files))
-	for _, file := range files {
-		item, err := mapFile(file)
-		if err != nil || item.IsDir {
-			return nil, cloud.Error(cloud.CodeResponseInvalid, true, errors.New("115 returned an invalid bulk file"))
-		}
-		parent, err := folderPath(item.ParentID, map[string]struct{}{})
-		if err != nil {
-			return nil, cloud.Error(cloud.CodeResponseInvalid, true, err)
-		}
-		entries = append(entries, cloud.TreeEntry{Item: item, RelativePath: parent + "/" + item.Name})
-	}
-	return entries, nil
 }
 
 func (c *Client) Stat(ctx context.Context, itemID string) (cloud.Item, error) {
