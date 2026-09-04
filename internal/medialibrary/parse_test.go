@@ -49,6 +49,29 @@ func TestParseMediaUsesSeasonDirectoryForTrailingBareEpisode(t *testing.T) {
 	if special.MediaType != "tv" || special.Season == nil || *special.Season != 0 || special.Episode == nil || *special.Episode != 1 {
 		t.Fatalf("special=%+v", special)
 	}
+
+	doubleDot := ParseMedia("知否知否应是绿肥红瘦 02..mp4", "/电视剧/国产剧/知否知否应是绿肥红瘦 (2018)/Season 1/知否知否应是绿肥红瘦 02..mp4")
+	if doubleDot.MediaType != "tv" || doubleDot.Title != "知否知否应是绿肥红瘦" || doubleDot.Year == nil || *doubleDot.Year != 2018 || doubleDot.Season == nil || *doubleDot.Season != 1 || doubleDot.Episode == nil || *doubleDot.Episode != 2 {
+		t.Fatalf("double dot=%+v", doubleDot)
+	}
+
+	for _, test := range []struct {
+		folder  string
+		season  int
+		episode int
+	}{
+		{folder: "Season 1", season: 1, episode: 1},
+		{folder: "Season 02", season: 2, episode: 1},
+		{folder: "第3季", season: 3, episode: 1},
+		{folder: "Specials", season: 0, episode: 1},
+	} {
+		t.Run(test.folder+" keeps directory season", func(t *testing.T) {
+			parsed := ParseMedia("示例剧 01..mp4", "/示例剧/"+test.folder+"/示例剧 01..mp4")
+			if parsed.Season == nil || *parsed.Season != test.season || parsed.Episode == nil || *parsed.Episode != test.episode {
+				t.Fatalf("parsed=%+v want=S%02dE%02d", parsed, test.season, test.episode)
+			}
+		})
+	}
 }
 
 func TestParseMediaDoesNotGuessBareEpisodeWithoutSeasonContext(t *testing.T) {
@@ -61,9 +84,13 @@ func TestParseMediaDoesNotGuessBareEpisodeWithoutSeasonContext(t *testing.T) {
 		})
 	}
 
-	yearInSeason := ParseMedia("作品 2005.mp4", "/作品/Season 1/作品 2005.mp4")
-	if yearInSeason.Episode != nil {
-		t.Fatalf("year was guessed as episode: %+v", yearInSeason)
+	for _, name := range []string{"作品 2005.mp4", "作品 2005..mp4", "作品 1080p..mp4", "作品 10bit..mp4"} {
+		t.Run("season context "+name, func(t *testing.T) {
+			parsed := ParseMedia(name, "/作品/Season 1/"+name)
+			if parsed.Episode != nil {
+				t.Fatalf("technical number was guessed as episode: %+v", parsed)
+			}
+		})
 	}
 }
 

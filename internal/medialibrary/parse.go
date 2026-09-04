@@ -200,6 +200,12 @@ func parseSeasonScopedTrailingEpisode(stem string) (string, *int) {
 	for technicalTokenPattern.MatchString(candidate) {
 		candidate = technicalTokenPattern.ReplaceAllString(candidate, " ")
 	}
+	// filepath.Ext removes only the real extension, so names such as
+	// "Work 02..mp4" leave "Work 02." behind. An explicit season directory
+	// already provides the strong TV context required by this fallback; ignore
+	// separator-only suffixes while retaining the existing year/technical-number
+	// safeguards below.
+	candidate = strings.TrimRight(candidate, " ._-")
 	match := seasonScopedEpisodePattern.FindStringSubmatch(strings.TrimSpace(candidate))
 	if len(match) != 2 {
 		return cleanMediaTitle(stem), nil

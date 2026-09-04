@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/medialibrary"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
 )
 
@@ -40,6 +41,36 @@ func TestStructurePlannerBuildsMovieAndTVTargetsWithSidecars(t *testing.T) {
 		if target := want[item.SourceRelative]; item.TargetRelative != target {
 			t.Fatalf("%s target=%q want=%q", item.SourceRelative, item.TargetRelative, target)
 		}
+	}
+}
+
+func TestStructurePlannerTreatsSeasonScopedDoubleDotEpisodeAsRepairablePathMismatch(t *testing.T) {
+	const source = "/电视剧/国产剧/知否知否应是绿肥红瘦 (2018)/Season 1/知否知否应是绿肥红瘦 02..mp4"
+	parsed := medialibrary.ParseMedia("知否知否应是绿肥红瘦 02..mp4", source)
+	tmdbID := int64(100)
+	library := models.MediaLibrary{
+		ID: 1, BaselineGeneration: 1, ProfileRevision: 1,
+		TVDirectoryTemplate: "电视剧/{category}/{title} ({year})/Season {season:02}",
+		TVFilenameTemplate:  "{title} - S{season:02}E{episode:02}",
+	}
+	entry := models.MediaLibraryEntry{
+		RelativePath: source, ProviderID: "episode-2", MediaType: parsed.MediaType,
+		Title: parsed.Title, SeriesTitle: parsed.SeriesTitle, WorkKey: "series:tmdb:100",
+		Season: parsed.Season, Episode: parsed.Episode, MatchStatus: mediaRecognitionStatusMatched,
+		TMDBID: &tmdbID, ReleaseYear: parsed.Year, CategoryName: "国产剧",
+	}
+
+	plan, err := (StructurePlanner{}).Build(library, []models.MediaLibraryEntry{entry}, nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Classifications.MissingEpisode != 0 || len(plan.Items) != 1 || len(plan.Issues) != 1 {
+		t.Fatalf("plan=%+v", plan)
+	}
+	issue := plan.Issues[0]
+	wantTarget := "电视剧/国产剧/知否知否应是绿肥红瘦 (2018)/Season 01/知否知否应是绿肥红瘦 - S01E02.mp4"
+	if issue.Code != "path_mismatch" || !issue.Repairable || issue.ExpectedPath != wantTarget || plan.Items[0].TargetRelative != wantTarget {
+		t.Fatalf("issue=%+v item=%+v", issue, plan.Items[0])
 	}
 }
 
