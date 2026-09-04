@@ -243,6 +243,21 @@ export interface MediaCatalogDeletionPreview {
 }
 export interface MediaCatalogDeletionResult { deleted: boolean; removed_files: number; missing_files: number }
 export interface MediaLibraryStructureIssue { code: string; kind: 'video' | 'sidecar'; title?: string; current_path?: string; expected_path?: string; conflict_sources?: string[]; conflict_source_count?: number; repairable: boolean }
+export interface MediaLibraryStructureIssueMember { token: string; source_path: string; recommended: boolean }
+export interface MediaLibraryStructureIssueSummary {
+  token: string; code: string; kind: 'video' | 'sidecar'; state: 'needs_attention' | 'pending_repair' | 'unrecognized' | 'manual_identity_resolved' | string
+  repairable: boolean; title?: string; current_path?: string; expected_path?: string; recognition_token?: string
+  media_type?: 'movie' | 'tv'; release_year?: number; tmdb_id?: number; poster_path?: string
+  conflict_source_count?: number; recommended_member_token?: string; members: MediaLibraryStructureIssueMember[]
+}
+export type MediaLibraryStructureIssuePage = PageResponse<MediaLibraryStructureIssueSummary>
+export type MediaLibraryStructureSelectionAction = 'repair' | 'keep_recommended' | 'keep_member' | 'keep_all_versions' | 'skip'
+export interface MediaLibraryStructureSelection { issue_token: string; action: MediaLibraryStructureSelectionAction; member_token?: string }
+export interface MediaLibraryStructureBulkSelection { codes: string[]; action: 'keep_recommended' | 'skip' }
+export interface MediaLibraryStructureSelectionPreview {
+  library_id: number; revision: string; issue_count: number; recycle_count: number; move_count: number; skipped_count: number
+  selections: MediaLibraryStructureSelection[]; confirmation_token: string; expires_at: string
+}
 export interface MediaLibraryStructureClassifications { unrecognized: number; missing_season_episode: number; invalid_path: number; template_unavailable: number; duplicate_target: number; sidecar_target_conflict: number }
 export interface MediaLibraryStructureDiagnostics { library_id: number; job_id?: string; scan_run_id?: number; generation: number; scan_kind: string; status: MediaLibraryDetail['structure_status']; total_items: number; processed_items: number; issue_count: number; repairable_count: number; unrecognized: number; classifications: MediaLibraryStructureClassifications; error_code: string; started_at?: string; checked_at?: string; issues: MediaLibraryStructureIssue[]; revision: string }
 export interface MediaLibraryStructurePreview { library_id: number; revision: string; issue_count: number; repairable_count: number; move_count: number; issues: MediaLibraryStructureIssue[]; confirmation_token: string; expires_at: string }

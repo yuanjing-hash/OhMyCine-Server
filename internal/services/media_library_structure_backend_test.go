@@ -125,6 +125,30 @@ func TestPan115StructureBackendMovesByStableIdentityAndCleansEmptyDirectory(t *t
 	}
 }
 
+func TestPan115StructureBackendRecyclesOnlyRevalidatedLibraryMember(t *testing.T) {
+	driver := &structureCloudDriver{items: map[string]cloudpkg.Item{
+		"root":   {ID: "root", IsDir: true},
+		"folder": {ID: "folder", ParentID: "root", Name: "incoming", IsDir: true},
+		"video":  {ID: "video", ParentID: "folder", Name: "copy.mkv", Size: 4},
+		"other":  {ID: "other", ParentID: "0", Name: "outside.mkv", Size: 4},
+	}}
+	backend := pan115MediaLibraryStructureBackend{driver: func(uint) (cloudpkg.Driver, error) { return driver, nil }}
+	connectionID := uint(3)
+	boundary := StructureBoundary{Library: models.MediaLibrary{ProviderRootID: "root"}, Storage: models.Storage{ConnectionID: &connectionID, RootPath: "root"}}
+	if err := backend.Recycle(context.Background(), boundary, []StructureRecycleItem{{Kind: "video", SourceRelative: "incoming/copy.mkv", ProviderID: "video", Size: 4}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := driver.items["video"]; exists {
+		t.Fatal("selected provider item did not enter recycle bin")
+	}
+	if err := backend.Recycle(context.Background(), boundary, []StructureRecycleItem{{Kind: "video", SourceRelative: "outside.mkv", ProviderID: "other", Size: 4}}, nil); err == nil {
+		t.Fatal("provider item outside the library root was recycled")
+	}
+	if _, exists := driver.items["other"]; !exists {
+		t.Fatal("out-of-bound provider item changed")
+	}
+}
+
 func TestPan115StructureBackendRepairsOnlyExplicitHistoricalProviderRootItem(t *testing.T) {
 	driver := &structureCloudDriver{items: map[string]cloudpkg.Item{
 		"root":  {ID: "root", ParentID: "0", IsDir: true},
@@ -195,5 +219,23 @@ func TestLocalStructureBackendFailsClosedOnTargetConflict(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(root, "old", "movie.mkv")); err != nil {
 		t.Fatal("conflict changed source")
+	}
+}
+
+func TestLocalStructureBackendRejectsSymlinkedSourceAncestor(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	if err := os.WriteFile(filepath.Join(outside, "movie.mkv"), []byte("outside"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(root, "incoming")); err != nil {
+		t.Skipf("symlink creation is unavailable: %v", err)
+	}
+	err := (localMediaLibraryStructureBackend{}).Apply(context.Background(), StructureBoundary{Library: models.MediaLibrary{RelativeRoot: "/"}, Storage: models.Storage{RootPath: root}}, []StructurePlanItem{{Kind: "video", SourceRelative: "incoming/movie.mkv", TargetRelative: "电影/movie.mkv", Size: 7}}, nil)
+	if err == nil {
+		t.Fatal("symlinked source ancestor was accepted")
+	}
+	if data, readErr := os.ReadFile(filepath.Join(outside, "movie.mkv")); readErr != nil || string(data) != "outside" {
+		t.Fatalf("outside file changed: %q err=%v", data, readErr)
 	}
 }

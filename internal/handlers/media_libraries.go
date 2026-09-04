@@ -568,6 +568,30 @@ func (a *API) MediaLibraryStructure(c *gin.Context) {
 	success(c, http.StatusOK, result)
 }
 
+func (a *API) MediaLibraryStructureIssues(c *gin.Context) {
+	actor, _ := middleware.ActorFrom(c)
+	id, ok := pathID(c)
+	if !ok {
+		return
+	}
+	page, err := strconv.Atoi(c.DefaultQuery("page", "1"))
+	if err != nil {
+		writeError(c, a.log, invalid("分页参数无效", err))
+		return
+	}
+	pageSize, err := strconv.Atoi(c.DefaultQuery("page_size", "50"))
+	if err != nil {
+		writeError(c, a.log, invalid("分页参数无效", err))
+		return
+	}
+	result, err := a.libraryStructure.StructureIssues(c.Request.Context(), actor, id, services.MediaLibraryStructureIssueQuery{Page: page, PageSize: pageSize, Code: c.Query("code"), Actionable: c.DefaultQuery("actionable", "true") != "false"})
+	if err != nil {
+		writeError(c, a.log, err)
+		return
+	}
+	success(c, http.StatusOK, result)
+}
+
 func (a *API) DiagnoseMediaLibraryStructure(c *gin.Context) {
 	actor, _ := middleware.ActorFrom(c)
 	id, ok := pathID(c)
@@ -605,6 +629,46 @@ func (a *API) PreviewMediaLibraryStructureRepair(c *gin.Context) {
 		return
 	}
 	success(c, http.StatusOK, result)
+}
+
+func (a *API) PreviewMediaLibraryStructureSelection(c *gin.Context) {
+	actor, _ := middleware.ActorFrom(c)
+	id, ok := pathID(c)
+	if !ok {
+		return
+	}
+	var payload services.MediaLibraryStructureSelectionInput
+	if err := strictJSON(c, &payload); err != nil {
+		writeError(c, a.log, invalid("媒体库修复选择无效", err))
+		return
+	}
+	result, err := a.libraryStructure.PreviewSelectionRepair(c.Request.Context(), actor, id, payload)
+	if err != nil {
+		writeError(c, a.log, err)
+		return
+	}
+	success(c, http.StatusOK, result)
+}
+
+func (a *API) RepairMediaLibraryStructureSelection(c *gin.Context) {
+	actor, _ := middleware.ActorFrom(c)
+	id, ok := pathID(c)
+	if !ok {
+		return
+	}
+	var payload struct {
+		ConfirmationToken string `json:"confirmation_token"`
+	}
+	if err := strictJSON(c, &payload); err != nil {
+		writeError(c, a.log, invalid("媒体库修复确认无效", err))
+		return
+	}
+	repair, err := a.libraryStructure.EnqueueSelectionRepair(c.Request.Context(), actor, id, payload.ConfirmationToken, middleware.RequestContextFrom(c))
+	if err != nil {
+		writeError(c, a.log, err)
+		return
+	}
+	success(c, http.StatusAccepted, mediaLibraryStructureRepairDTO(repair))
 }
 
 func (a *API) RepairMediaLibraryStructure(c *gin.Context) {

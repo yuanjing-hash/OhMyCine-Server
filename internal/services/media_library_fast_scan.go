@@ -433,7 +433,7 @@ func (s *MediaLibraryService) publishFastPan115Scan(ctx context.Context, library
 		Int("removed", run.Removed).Int("recognition_total", run.RecognitionTotal).Int64("duration_ms", time.Since(started).Milliseconds()).
 		Msg(operation.Message(map[bool]string{true: "基础目录已发布，本轮元数据全部复用", false: "基础目录已发布，元数据转入后台识别"}[run.RecognitionTotal == 0]))
 	if s.structure != nil && !run.Partial {
-		if err := s.structure.EnqueueDiagnosis(ctx, library.ID, run.ID, run.Generation, run.Kind); err != nil {
+		if err := s.structure.EnqueueAutomaticDiagnosis(ctx, library.ID, run.ID, run.Generation, run.Kind); err != nil {
 			serverlog.OperationMediaLibraryStructureDiagnosis.Event(s.log.Warn()).Uint("library_id", library.ID).Uint("scan_run_id", run.ID).Uint64("generation", run.Generation).
 				Str("scan_kind", run.Kind).Str("phase", "enqueue_failed").Str("error_code", CodeMediaLibraryStructureDiagnosisFailed).
 				Msg(serverlog.OperationMediaLibraryStructureDiagnosis.Message("目录结构诊断入队失败，基础目录仍然可用"))
@@ -809,14 +809,14 @@ func (s *MediaLibraryService) completeFastMediaLibraryRecognition(ctx context.Co
 		Int("matched", matched).Int("unrecognized", unrecognized).Int("cache_hits", cacheHits).Int("recognition_failed", recognitionFailed).
 		Int64("duration_ms", time.Since(started).Milliseconds()).Msg(serverlog.OperationMediaRecognition.Message("后台识别完成"))
 	if s.structure != nil && !run.Partial {
-		if err := s.structure.EnqueueDiagnosis(ctx, library.ID, run.ID, run.Generation, run.Kind); err != nil {
+		if err := s.structure.EnqueueAutomaticDiagnosis(ctx, library.ID, run.ID, run.Generation, run.Kind); err != nil {
 			serverlog.OperationMediaLibraryStructureDiagnosis.Event(s.log.Warn()).Uint("library_id", library.ID).Uint("scan_run_id", run.ID).Uint64("generation", run.Generation).
 				Str("scan_kind", run.Kind).Str("phase", "recognition_completed_enqueue_failed").Str("error_code", CodeMediaLibraryStructureDiagnosisFailed).
-				Msg(serverlog.OperationMediaLibraryStructureDiagnosis.Message("识别完成后的目录结构重新诊断入队失败，媒体目录仍然可用"))
+				Msg(serverlog.OperationMediaLibraryStructureDiagnosis.Message("识别完成后的自动诊断收敛检查失败，媒体目录仍然可用"))
 		} else {
 			serverlog.OperationMediaLibraryStructureDiagnosis.Event(s.log.Info()).Uint("library_id", library.ID).Uint("scan_run_id", run.ID).Uint64("generation", run.Generation).
-				Str("scan_kind", run.Kind).Str("phase", "recognition_completed").Str("action", "diagnosis_requeued").
-				Msg(serverlog.OperationMediaLibraryStructureDiagnosis.Message("识别结果已提交，目录结构诊断将自动刷新"))
+				Str("scan_kind", run.Kind).Str("phase", "recognition_completed").Str("action", "automatic_diagnosis_convergence_checked").
+				Msg(serverlog.OperationMediaLibraryStructureDiagnosis.Message("识别完成，已检查本次来源版本是否需要自动诊断"))
 		}
 	}
 	if s.artifacts != nil && mediaLibraryArtifactGenerationRequired(run.Kind, run, true) {

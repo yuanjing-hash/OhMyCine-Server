@@ -649,6 +649,11 @@ func ParseFilename(name, path string) (string, string, *int, *int) {
 }
 func shouldIgnore(path string, patterns []string) bool {
 	lower := strings.ToLower(path)
+	for _, segment := range strings.Split(strings.Trim(lower, "/"), "/") {
+		if segment == ".ohmycine-recycle" {
+			return true
+		}
+	}
 	for _, pattern := range patterns {
 		pattern = strings.ToLower(strings.TrimSpace(pattern))
 		if pattern != "" && strings.Contains(lower, pattern) {

@@ -311,3 +311,23 @@ func TestScanProviderPaginatesRecursivelyAndKeepsStableIDs(t *testing.T) {
 		t.Fatalf("full scan made %d avoidable Stat calls", driver.statCalls)
 	}
 }
+
+func TestScanLocalAlwaysIgnoresManagedRecycleDirectory(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, ".ohmycine-recycle", "draft", "incoming"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, ".ohmycine-recycle", "draft", "incoming", "copy.mkv"), []byte("recycled"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "movie.mkv"), []byte("active"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	result, err := ScanLocal(context.Background(), root, "/", true, []string{".mkv"}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Files) != 1 || result.Files[0].RelativePath != "/movie.mkv" {
+		t.Fatalf("recycle directory leaked into scan: %+v", result.Files)
+	}
+}

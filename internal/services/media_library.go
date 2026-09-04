@@ -298,6 +298,9 @@ func (s *MediaLibraryService) Create(ctx context.Context, actor Actor, input Med
 		if err := tx.Select("*").Create(&record).Error; err != nil {
 			return err
 		}
+		if err := tx.Create(&models.MediaLibraryStructureAutoState{LibraryID: record.ID, SourceRevision: 1, Status: "pending", UpdatedAt: time.Now().UTC()}).Error; err != nil {
+			return err
+		}
 		if err := syncMediaLibraryUnifiedSchedule(tx, actor.User.ID, record, true, time.Now().UTC()); err != nil {
 			return err
 		}
@@ -407,6 +410,18 @@ func (s *MediaLibraryService) Update(ctx context.Context, actor Actor, id uint, 
 			record.DefaultIngestConnectionID = nil
 		}
 		if sourceChanged {
+			// Structure issues and confirmation drafts are projections of the old
+			// source boundary. Clear them in the same transaction as catalog facts
+			// so a newly selected root can never expose or execute old decisions.
+			if err := tx.Where("library_id = ?", id).Delete(&models.MediaLibraryStructureIssue{}).Error; err != nil {
+				return err
+			}
+			if err := tx.Where("library_id = ?", id).Delete(&models.MediaLibraryStructureRepairDraft{}).Error; err != nil {
+				return err
+			}
+			if err := tx.Where("library_id = ?", id).Delete(&models.MediaLibraryStructureDiagnosis{}).Error; err != nil {
+				return err
+			}
 			if err := tx.Where("library_id = ?", id).Delete(&models.MediaLibraryEntry{}).Error; err != nil {
 				return err
 			}
@@ -426,6 +441,20 @@ func (s *MediaLibraryService) Update(ctx context.Context, actor Actor, id uint, 
 		// loaded at the beginning of Update.
 		if err := tx.Omit("content_revision").Save(&record).Error; err != nil {
 			return err
+		}
+		if sourceChanged {
+			var autoState models.MediaLibraryStructureAutoState
+			if err := tx.Where("library_id = ?", id).First(&autoState).Error; errors.Is(err, gorm.ErrRecordNotFound) {
+				autoState = models.MediaLibraryStructureAutoState{LibraryID: id, SourceRevision: 1, Status: "pending", UpdatedAt: time.Now().UTC()}
+				if err := tx.Create(&autoState).Error; err != nil {
+					return err
+				}
+			} else if err != nil {
+				return err
+			}
+			if err := tx.Model(&autoState).Updates(map[string]any{"source_revision": max(autoState.SourceRevision, uint64(1)) + 1, "status": "pending", "updated_at": time.Now().UTC()}).Error; err != nil {
+				return err
+			}
 		}
 		if err := tx.Model(&models.MediaLibrary{}).Where("id = ?", id).Select("content_revision").Scan(&record.ContentRevision).Error; err != nil {
 			return err
@@ -2176,7 +2205,7 @@ func (s *MediaLibraryService) reconcile(ctx context.Context, id uint, kind strin
 		}
 	}
 	if s.structure != nil && !run.Partial {
-		if err := s.structure.EnqueueDiagnosis(ctx, id, run.ID, run.Generation, run.Kind); err != nil {
+		if err := s.structure.EnqueueAutomaticDiagnosis(ctx, id, run.ID, run.Generation, run.Kind); err != nil {
 			serverlog.OperationMediaLibraryStructureDiagnosis.Event(s.log.Warn()).Uint("library_id", id).Uint("scan_run_id", run.ID).Uint64("generation", run.Generation).
 				Str("scan_kind", run.Kind).Str("phase", "enqueue_failed").Str("error_code", CodeMediaLibraryStructureDiagnosisFailed).
 				Msg(serverlog.OperationMediaLibraryStructureDiagnosis.Message("目录结构诊断入队失败，扫描目录仍然可用"))

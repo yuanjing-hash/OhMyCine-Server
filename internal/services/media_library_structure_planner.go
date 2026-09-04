@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/medialibrary"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/mediarecognition"
@@ -37,6 +38,27 @@ type StructurePlanItem struct {
 	// cid=0 transfer defect. Normal structure plans never set it.
 	AllowProviderRootSource bool  `json:"allow_provider_root_source,omitempty"`
 	Size                    int64 `json:"size"`
+	ModifiedAtUnixNano      int64 `json:"modified_at_unix_nano,omitempty"`
+}
+
+// StructureConflictGroup is private planner output. It retains the complete
+// source facts needed to turn an opaque conflict decision into a bounded
+// repair plan; it is never serialized to an API response or persisted in the
+// legacy diagnosis summary.
+type StructureConflictGroup struct {
+	Code           string
+	Kind           string
+	TargetRelative string
+	Members        []StructurePlanItem
+}
+
+type StructureRecycleItem struct {
+	Kind               string `json:"kind"`
+	SourceRelative     string `json:"source_relative"`
+	RecycleRelative    string `json:"recycle_relative,omitempty"`
+	ProviderID         string `json:"provider_id,omitempty"`
+	Size               int64  `json:"size"`
+	ModifiedAtUnixNano int64  `json:"modified_at_unix_nano,omitempty"`
 }
 
 type StructureIssue struct {
@@ -49,6 +71,8 @@ type StructureIssue struct {
 	ConflictSources     []string `json:"conflict_sources,omitempty"`
 	ConflictSourceCount int      `json:"conflict_source_count,omitempty"`
 	Repairable          bool     `json:"repairable"`
+	RecognitionID       uint     `json:"-"`
+	AllConflictSources  []string `json:"-"`
 }
 
 type StructurePlan struct {
@@ -57,11 +81,20 @@ type StructurePlan struct {
 	Generation      uint64                        `json:"generation"`
 	RuleFingerprint string                        `json:"rule_fingerprint"`
 	Items           []StructurePlanItem           `json:"items"`
+	RecycleItems    []StructureRecycleItem        `json:"recycle_items,omitempty"`
+	ResolvedIssues  []string                      `json:"resolved_issues,omitempty"`
+	SkippedIssues   []string                      `json:"skipped_issues,omitempty"`
+	DiagnosisJobID  string                        `json:"diagnosis_job_id,omitempty"`
+	SourceRevision  uint64                        `json:"source_revision,omitempty"`
+	SelectionBound  bool                          `json:"selection_bound,omitempty"`
 	Issues          []StructureIssue              `json:"issues"`
+	AllIssues       []StructureIssue              `json:"-"`
 	IssueCount      int                           `json:"issue_count"`
 	Unrecognized    int                           `json:"unrecognized"`
 	CheckedItems    int                           `json:"checked_items"`
 	Classifications StructureIssueClassifications `json:"classifications"`
+	ConflictGroups  []StructureConflictGroup      `json:"-"`
+	OccupiedPaths   map[string]struct{}           `json:"-"`
 	sampleCounts    map[string]int                `json:"-"`
 }
 
@@ -105,6 +138,7 @@ type structurePlanCandidate struct {
 	recognitionID    uint
 	parentProviderID string
 	size             int64
+	modifiedAt       int64
 	allowRootSource  bool
 	moveIssueCode    string
 	issue            *StructureIssue
@@ -125,7 +159,7 @@ type structureAssociationIndex struct {
 }
 
 func (p StructurePlanner) BuildContext(ctx context.Context, library models.MediaLibrary, entries []models.MediaLibraryEntry, assets []models.MediaLibrarySourceAsset, workKey string, progress func(processed, total int)) (StructurePlan, error) {
-	plan := StructurePlan{Version: 1, LibraryID: library.ID, Generation: library.BaselineGeneration, RuleFingerprint: libraryRuleFingerprint(library)}
+	plan := StructurePlan{Version: 1, LibraryID: library.ID, Generation: library.BaselineGeneration, RuleFingerprint: libraryRuleFingerprint(library), OccupiedPaths: make(map[string]struct{}, len(entries)+len(assets))}
 	workKey = strings.TrimSpace(workKey)
 	orderedEntries := append([]models.MediaLibraryEntry(nil), entries...)
 	sort.SliceStable(orderedEntries, func(i, j int) bool { return orderedEntries[i].RelativePath < orderedEntries[j].RelativePath })
@@ -136,6 +170,16 @@ func (p StructurePlanner) BuildContext(ctx context.Context, library models.Media
 		}
 	}
 	sort.SliceStable(orderedAssets, func(i, j int) bool { return orderedAssets[i].RelativePath < orderedAssets[j].RelativePath })
+	for _, entry := range orderedEntries {
+		if source := safeStructurePath(entry.RelativePath); source != "" {
+			plan.OccupiedPaths[strings.ToLower(source)] = struct{}{}
+		}
+	}
+	for _, asset := range orderedAssets {
+		if source := safeStructurePath(asset.RelativePath); source != "" {
+			plan.OccupiedPaths[strings.ToLower(source)] = struct{}{}
+		}
+	}
 	total := len(orderedEntries) + len(orderedAssets)
 	plan.CheckedItems = total
 
@@ -244,7 +288,7 @@ func (p StructurePlanner) BuildContext(ctx context.Context, library models.Media
 }
 
 func buildStructureVideoCandidate(library models.MediaLibrary, entry models.MediaLibraryEntry, index int, workKey string) structurePlanCandidate {
-	candidate := structurePlanCandidate{index: index, kind: "video", workKey: entry.WorkKey, title: entry.Title, providerID: entry.ProviderID, size: entry.Size}
+	candidate := structurePlanCandidate{index: index, kind: "video", workKey: entry.WorkKey, title: entry.Title, providerID: entry.ProviderID, size: entry.Size, modifiedAt: structureModifiedAtUnixNano(entry.ModifiedAt)}
 	if entry.RecognitionID != nil {
 		candidate.recognitionID = *entry.RecognitionID
 	}
@@ -265,7 +309,7 @@ func buildStructureVideoCandidate(library models.MediaLibrary, entry models.Medi
 		return candidate
 	}
 	if entry.MatchStatus != mediaRecognitionStatusMatched || entry.TMDBID == nil || (entry.MediaType != "movie" && entry.MediaType != "tv") {
-		candidate.issue = &StructureIssue{Code: "media_unrecognized", Kind: "video", WorkKey: entry.WorkKey, Title: entry.Title, CurrentPath: candidate.source}
+		candidate.issue = &StructureIssue{Code: "media_unrecognized", Kind: "video", WorkKey: entry.WorkKey, Title: entry.Title, CurrentPath: candidate.source, RecognitionID: candidate.recognitionID}
 		return candidate
 	}
 	target, err := structureVideoTarget(library, entry)
@@ -274,7 +318,7 @@ func buildStructureVideoCandidate(library models.MediaLibrary, entry models.Medi
 		if errors.Is(err, errPackageEpisodeUnrecognized) {
 			code = "missing_season_episode"
 		}
-		candidate.issue = &StructureIssue{Code: code, Kind: "video", WorkKey: entry.WorkKey, Title: entry.Title, CurrentPath: candidate.source}
+		candidate.issue = &StructureIssue{Code: code, Kind: "video", WorkKey: entry.WorkKey, Title: entry.Title, CurrentPath: candidate.source, RecognitionID: candidate.recognitionID}
 		return candidate
 	}
 	if target == "" {
@@ -337,7 +381,7 @@ func buildStructureAssociationIndex(candidates []structurePlanCandidate, entries
 }
 
 func buildStructureSidecarCandidate(asset models.MediaLibrarySourceAsset, index int, workKey string, associations *structureAssociationIndex) structurePlanCandidate {
-	candidate := structurePlanCandidate{index: index, kind: "sidecar", providerID: asset.ProviderID, parentProviderID: asset.ParentProviderID, size: asset.Size}
+	candidate := structurePlanCandidate{index: index, kind: "sidecar", providerID: asset.ProviderID, parentProviderID: asset.ParentProviderID, size: asset.Size, modifiedAt: structureModifiedAtUnixNano(asset.ModifiedAt)}
 	candidate.source = safeStructurePath(asset.RelativePath)
 	if candidate.source == "" {
 		candidate.issue = &StructureIssue{Code: "invalid_path", Kind: "sidecar", Title: asset.Name}
@@ -357,6 +401,13 @@ func buildStructureSidecarCandidate(asset models.MediaLibrarySourceAsset, index 
 	return candidate
 }
 
+func structureModifiedAtUnixNano(value time.Time) int64 {
+	if value.IsZero() {
+		return 0
+	}
+	return value.UTC().UnixNano()
+}
+
 func appendStructureCandidates(plan *StructurePlan, candidates []structurePlanCandidate) {
 	groups := make(map[string][]int, len(candidates))
 	for i := range candidates {
@@ -368,6 +419,7 @@ func appendStructureCandidates(plan *StructurePlan, candidates []structurePlanCa
 	type targetConflict struct {
 		code        string
 		sources     []string
+		allSources  []string
 		sourceCount int
 	}
 	blocked := make(map[int]targetConflict)
@@ -382,28 +434,41 @@ func appendStructureCandidates(plan *StructurePlan, candidates []structurePlanCa
 				break
 			}
 		}
-		conflict := targetConflict{code: code, sources: boundedStructureConflictSources(candidates, members), sourceCount: len(members)}
+		conflict := targetConflict{code: code, sources: boundedStructureConflictSources(candidates, members), allSources: allStructureConflictSources(candidates, members), sourceCount: len(members)}
+		group := StructureConflictGroup{Code: code, Kind: candidates[members[0]].kind, TargetRelative: candidates[members[0]].target, Members: make([]StructurePlanItem, 0, len(members))}
 		for _, member := range members {
 			blocked[member] = conflict
+			candidate := candidates[member]
+			group.Members = append(group.Members, StructurePlanItem{Kind: candidate.kind, WorkKey: candidate.workKey, Title: candidate.title, RecognitionID: candidate.recognitionID, SourceRelative: candidate.source, TargetRelative: candidate.target, ProviderID: candidate.providerID, ParentProviderID: candidate.parentProviderID, AllowProviderRootSource: candidate.allowRootSource, Size: candidate.size, ModifiedAtUnixNano: candidate.modifiedAt})
 		}
+		sort.Slice(group.Members, func(i, j int) bool {
+			return strings.ToLower(group.Members[i].SourceRelative) < strings.ToLower(group.Members[j].SourceRelative)
+		})
+		plan.ConflictGroups = append(plan.ConflictGroups, group)
 	}
+	sort.Slice(plan.ConflictGroups, func(i, j int) bool {
+		if plan.ConflictGroups[i].Code != plan.ConflictGroups[j].Code {
+			return plan.ConflictGroups[i].Code < plan.ConflictGroups[j].Code
+		}
+		return strings.ToLower(plan.ConflictGroups[i].TargetRelative) < strings.ToLower(plan.ConflictGroups[j].TargetRelative)
+	})
 	for i, candidate := range candidates {
 		if candidate.target == "" {
 			continue
 		}
 		if conflict, exists := blocked[i]; exists {
-			plan.addIssue(StructureIssue{Code: conflict.code, Kind: candidate.kind, WorkKey: candidate.workKey, Title: candidate.title, CurrentPath: candidate.source, ExpectedPath: candidate.target, ConflictSources: conflict.sources, ConflictSourceCount: conflict.sourceCount})
+			plan.addIssue(StructureIssue{Code: conflict.code, Kind: candidate.kind, WorkKey: candidate.workKey, Title: candidate.title, CurrentPath: candidate.source, ExpectedPath: candidate.target, ConflictSources: conflict.sources, AllConflictSources: conflict.allSources, ConflictSourceCount: conflict.sourceCount, RecognitionID: candidate.recognitionID})
 			continue
 		}
 		if strings.EqualFold(candidate.source, candidate.target) {
 			continue
 		}
-		plan.Items = append(plan.Items, StructurePlanItem{Kind: candidate.kind, WorkKey: candidate.workKey, Title: candidate.title, RecognitionID: candidate.recognitionID, SourceRelative: candidate.source, TargetRelative: candidate.target, ProviderID: candidate.providerID, ParentProviderID: candidate.parentProviderID, AllowProviderRootSource: candidate.allowRootSource, Size: candidate.size})
+		plan.Items = append(plan.Items, StructurePlanItem{Kind: candidate.kind, WorkKey: candidate.workKey, Title: candidate.title, RecognitionID: candidate.recognitionID, SourceRelative: candidate.source, TargetRelative: candidate.target, ProviderID: candidate.providerID, ParentProviderID: candidate.parentProviderID, AllowProviderRootSource: candidate.allowRootSource, Size: candidate.size, ModifiedAtUnixNano: candidate.modifiedAt})
 		issueCode := candidate.moveIssueCode
 		if issueCode == "" {
 			issueCode = "path_mismatch"
 		}
-		plan.addIssue(StructureIssue{Code: issueCode, Kind: candidate.kind, WorkKey: candidate.workKey, Title: candidate.title, CurrentPath: candidate.source, ExpectedPath: candidate.target, Repairable: true})
+		plan.addIssue(StructureIssue{Code: issueCode, Kind: candidate.kind, WorkKey: candidate.workKey, Title: candidate.title, CurrentPath: candidate.source, ExpectedPath: candidate.target, Repairable: true, RecognitionID: candidate.recognitionID})
 	}
 }
 
@@ -474,7 +539,15 @@ func structureSourceTitleSimilarity(source, recognizedTitle string) float64 {
 }
 
 func boundedStructureConflictSources(candidates []structurePlanCandidate, members []int) []string {
-	sources := make([]string, 0, min(len(members), maxStructureConflictSourceSamples))
+	sources := allStructureConflictSources(candidates, members)
+	if len(sources) > maxStructureConflictSourceSamples {
+		sources = sources[:maxStructureConflictSourceSamples]
+	}
+	return sources
+}
+
+func allStructureConflictSources(candidates []structurePlanCandidate, members []int) []string {
+	sources := make([]string, 0, len(members))
 	seen := make(map[string]struct{}, len(members))
 	for _, member := range members {
 		source := safeStructurePath(candidates[member].source)
@@ -488,9 +561,6 @@ func boundedStructureConflictSources(candidates []structurePlanCandidate, member
 		sources = append(sources, source)
 	}
 	sort.Slice(sources, func(i, j int) bool { return strings.ToLower(sources[i]) < strings.ToLower(sources[j]) })
-	if len(sources) > maxStructureConflictSourceSamples {
-		sources = sources[:maxStructureConflictSourceSamples]
-	}
 	return sources
 }
 
@@ -498,6 +568,7 @@ func (p *StructurePlan) addIssue(issue StructureIssue) {
 	p.IssueCount++
 	issue.Title = safeMediaDisplayName(issue.Title)
 	issue.ConflictSources = sanitizeStructureConflictSources(issue.ConflictSources)
+	p.AllIssues = append(p.AllIssues, issue)
 	switch issue.Code {
 	case "media_unrecognized":
 		p.Unrecognized++

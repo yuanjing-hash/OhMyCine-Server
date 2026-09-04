@@ -186,25 +186,32 @@ describe('media library form boundary', () => {
     for (const text of ['目录结构诊断正在后台', '目录结构诊断系统失败', '诊断全程只读，不会移动文件', 'processed_items', 'classifications.duplicate_target', 'classifications.sidecar_target_conflict']) expect(source).toContain(text)
     expect(source).toContain('async function viewStructureDiagnostics()')
     expect(source).toContain('await showStructureDiagnostics(false)')
-    expect(source).toContain('diagnostics.status !== \'issues\'')
+    expect(source).toContain('else await loadStructureIssues(libraryID)')
     expect(source).toContain('@click="viewStructureDiagnostics">查看诊断进度</button>')
     expect(source).not.toContain('@click="openStructureDiagnostics">查看诊断进度</button>')
   })
 
-  it('keeps every structure-diagnosis resolution entry visible from authoritative counters', () => {
+  it('loads the complete actionable structure projection with server pagination', () => {
     const source = readFileSync(new URL('./views/MediaLibrariesView.vue', import.meta.url), 'utf8')
-    for (const text of ['可选整理建议', '需要处理', '无需处理', '生成安全整理预览', '重试生成整理预览', '去手动整理', '去规则管理', '视频目标冲突', '伴随文件冲突', '重新检查', '跨分类抽取的最多 100 条代表样本']) expect(source).toContain(text)
-    for (const text of ['自动识别失败或无匹配', '目录结构初步检查完成 · 等待识别结果', '等待中的媒体不会计入“需要处理”', '识别完成后系统会自动重新检查', 'recognition_enqueue_failed']) expect(source).toContain(text)
-    expect(source).toContain('diagnostics.repairable_count <= 0')
-    expect(source).toContain("item.code !== 'missing_season_episode'")
-    expect(source).toContain('structureDiagnostics.repairable_count > 0')
-    expect(source).toContain('structurePreviewError.value = message(reason)')
+    for (const text of ['完整问题列表', '需要决定', '预览全部已选操作', '只预览并提交当前类型', '去手动整理', '去规则管理', '视频目标冲突', '伴随文件冲突', '重新检查', 'structureIssuePageSize', 'changeStructureIssuePage']) expect(source).toContain(text)
+    for (const text of ['自动识别失败或无匹配', '目录结构初步检查完成 · 等待识别结果', '等待中的媒体不会计入“需要处理”', '本次来源版本的收敛检查', 'recognition_enqueue_failed']) expect(source).toContain(text)
+    expect(source).toContain('/structure/issues?')
+    expect(source).toContain("actionable: 'true'")
+    expect(source).toContain('structureSelectionError.value = message(reason)')
     expect(source).not.toContain('structureDiagnostics.issues.some(item => item.repairable)')
+    expect(source).not.toContain('跨分类抽取的最多 100 条代表样本')
+    expect(source).not.toContain('无需处理</span>')
   })
 
-  it('shows every available source in a bounded target-conflict summary', () => {
+  it('shows every persisted member in one target-conflict group', () => {
     const source = readFileSync(new URL('./views/MediaLibrariesView.vue', import.meta.url), 'utf8')
-    for (const text of ['当前路径 / 冲突来源', '同一目标的来源', 'issue.conflict_sources', 'issue.conflict_source_count', '个来源已省略']) expect(source).toContain(text)
+    for (const text of ['当前路径 / 冲突来源', '同一目标的全部来源', 'issue.members', 'member.source_path', '保留这一份', '按推荐保留', '全部保留为版本', '本次跳过']) expect(source).toContain(text)
+    expect(source).not.toContain('个来源已省略')
+  })
+
+  it('explains manual identity persistence and recoverable conflict handling', () => {
+    const source = readFileSync(new URL('./views/MediaLibrariesView.vue', import.meta.url), 'utf8')
+    for (const text of ['已人工识别 · 尚未整理文件', '身份已保存，文件尚未整理', '已保存 TMDB 海报', '落选文件只会进入可恢复回收站', '绝不会永久删除']) expect(source).toContain(text)
   })
 
   it('separates recognition mistakes, catalog duplicates, and real file conflicts', () => {

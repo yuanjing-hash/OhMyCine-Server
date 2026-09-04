@@ -247,6 +247,10 @@ func TestMediaLibraryTenEpisodeScanRepairsRegressedChangeRevision(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
+	var automaticDiagnosisState models.MediaLibraryStructureAutoState
+	if err := db.First(&automaticDiagnosisState, "library_id = ?", created.ID).Error; err != nil || automaticDiagnosisState.SourceRevision != 1 || automaticDiagnosisState.DiagnosedRevision != 0 || automaticDiagnosisState.Status != "pending" {
+		t.Fatalf("new source automatic diagnosis state=%+v err=%v", automaticDiagnosisState, err)
+	}
 	if err := db.Transaction(func(tx *gorm.DB) error {
 		_, recordErr := changes.RecordTx(tx, created.ID, 0, models.MediaLibraryChangeCatalog, true)
 		return recordErr
@@ -652,6 +656,10 @@ func TestMediaLibrarySourceChangeClearsOldCatalogAndBuildsNewBaseline(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
+	var automaticDiagnosisState models.MediaLibraryStructureAutoState
+	if err := db.First(&automaticDiagnosisState, "library_id = ?", created.ID).Error; err != nil || automaticDiagnosisState.SourceRevision != 1 || automaticDiagnosisState.DiagnosedRevision != 0 || automaticDiagnosisState.Status != "pending" {
+		t.Fatalf("new source automatic diagnosis state=%+v err=%v", automaticDiagnosisState, err)
+	}
 	waitForLibrary(t, db, created.ID, func(item models.MediaLibrary) bool {
 		var count, assetCount int64
 		return item.Status == models.MediaLibraryStatusListening &&
@@ -660,6 +668,16 @@ func TestMediaLibrarySourceChangeClearsOldCatalogAndBuildsNewBaseline(t *testing
 	})
 	cleanupAt := time.Now().UTC().Truncate(time.Millisecond)
 	if err := db.Model(&models.MediaLibrary{}).Where("id = ?", created.ID).Updates(map[string]any{"artifact_cleanup_removed": 3, "artifact_cleanup_error": "cleanup_test", "artifact_cleanup_at": cleanupAt}).Error; err != nil {
+		t.Fatal(err)
+	}
+	staleIssue := models.MediaLibraryStructureIssue{Token: "old-source-issue", LibraryID: created.ID, DiagnosisJobID: "old-source-diagnosis", Generation: 1, Code: "path_mismatch", Kind: "video", State: "pending_repair", Repairable: true, CurrentPath: "Old.Movie.mp4", ExpectedPath: "电影/Old Movie/Old Movie.mp4", CreatedAt: cleanupAt, UpdatedAt: cleanupAt}
+	if err := db.Create(&staleIssue).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Create(&models.MediaLibraryStructureIssueMember{IssueID: staleIssue.ID, Token: "old-source-member", SourcePath: "Old.Movie.mp4", CreatedAt: cleanupAt}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Create(&models.MediaLibraryStructureRepairDraft{ID: "old-source-draft", OwnerID: actor.User.ID, LibraryID: created.ID, DiagnosisJobID: "old-source-diagnosis", SourceRevision: 1, Generation: 1, RuleFingerprint: "old", PlanHash: "old", SelectionsJSON: `{}`, ExpiresAt: cleanupAt.Add(time.Hour), CreatedAt: cleanupAt}).Error; err != nil {
 		t.Fatal(err)
 	}
 
@@ -675,7 +693,10 @@ func TestMediaLibrarySourceChangeClearsOldCatalogAndBuildsNewBaseline(t *testing
 	if updated.ArtifactCleanupRemoved != 3 || updated.ArtifactCleanupError != "cleanup_test" || updated.ArtifactCleanupAt == nil {
 		t.Fatalf("source change lost cleanup observability: %+v", updated.MediaLibrary)
 	}
-	var entryCount, runCount, recognitionCount, assetCount int64
+	if err := db.First(&automaticDiagnosisState, "library_id = ?", created.ID).Error; err != nil || automaticDiagnosisState.SourceRevision != 2 || automaticDiagnosisState.Status != "pending" {
+		t.Fatalf("source change automatic diagnosis state=%+v err=%v", automaticDiagnosisState, err)
+	}
+	var entryCount, runCount, recognitionCount, assetCount, issueCount, memberCount, draftCount int64
 	if err := db.Model(&models.MediaLibraryEntry{}).Where("library_id = ?", created.ID).Count(&entryCount).Error; err != nil {
 		t.Fatal(err)
 	}
@@ -688,13 +709,25 @@ func TestMediaLibrarySourceChangeClearsOldCatalogAndBuildsNewBaseline(t *testing
 	if err := db.Model(&models.MediaLibrarySourceAsset{}).Where("library_id = ?", created.ID).Count(&assetCount).Error; err != nil {
 		t.Fatal(err)
 	}
-	if entryCount != 0 || runCount != 0 || recognitionCount != 0 || assetCount != 0 {
-		t.Fatalf("source change retained source-bound records: entries=%d runs=%d recognitions=%d assets=%d", entryCount, runCount, recognitionCount, assetCount)
+	if err := db.Model(&models.MediaLibraryStructureIssue{}).Where("library_id = ?", created.ID).Count(&issueCount).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&models.MediaLibraryStructureIssueMember{}).Where("issue_id = ?", staleIssue.ID).Count(&memberCount).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&models.MediaLibraryStructureRepairDraft{}).Where("library_id = ?", created.ID).Count(&draftCount).Error; err != nil {
+		t.Fatal(err)
+	}
+	if entryCount != 0 || runCount != 0 || recognitionCount != 0 || assetCount != 0 || issueCount != 0 || memberCount != 0 || draftCount != 0 {
+		t.Fatalf("source change retained source-bound records: entries=%d runs=%d recognitions=%d assets=%d issues=%d members=%d drafts=%d", entryCount, runCount, recognitionCount, assetCount, issueCount, memberCount, draftCount)
 	}
 
 	input.Enabled = true
 	if _, err := service.Update(context.Background(), actor, created.ID, input, RequestContext{}); err != nil {
 		t.Fatal(err)
+	}
+	if err := db.First(&automaticDiagnosisState, "library_id = ?", created.ID).Error; err != nil || automaticDiagnosisState.SourceRevision != 2 {
+		t.Fatalf("non-source update advanced automatic diagnosis revision: state=%+v err=%v", automaticDiagnosisState, err)
 	}
 	waitForLibrary(t, db, created.ID, func(item models.MediaLibrary) bool {
 		var newCount, oldCount int64
@@ -1004,21 +1037,8 @@ func TestPan115MediaLibraryScanKeepsFileIdentityAcrossRename(t *testing.T) {
 		t.Fatalf("recognition and artifact work were not serialized: resource=%q", recognitionJob.ResourceKey)
 	}
 	initialDiagnosis, err := queue.Claim([]string{JobTypeMediaLibraryStructureDiagnosis})
-	if err != nil || initialDiagnosis == nil {
-		t.Fatalf("initial structure diagnosis was not claimable: claimed=%+v err=%v", initialDiagnosis, err)
-	}
-	if result := NewMediaLibraryStructureDiagnosisWorker(structure).Run(context.Background(), fastScanTestRuntime{}, *initialDiagnosis); result.ErrorCode != "" {
-		t.Fatalf("initial structure diagnosis failed: %+v", result)
-	}
-	if err := queue.Complete(initialDiagnosis.Job.ID, initialDiagnosis.LeaseToken); err != nil {
-		t.Fatal(err)
-	}
-	pendingDiagnostics, err := structure.Diagnostics(context.Background(), actor, library.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if pendingDiagnostics.Unrecognized != 0 || pendingDiagnostics.IssueCount != 0 {
-		t.Fatalf("pending recognition was exposed as an actionable issue: %+v", pendingDiagnostics)
+	if err != nil || initialDiagnosis != nil {
+		t.Fatalf("automatic structure diagnosis ran before recognition convergence: claimed=%+v err=%v", initialDiagnosis, err)
 	}
 	claimed, err := queue.Claim([]string{JobTypeMediaLibraryRecognition})
 	if err != nil || claimed == nil {
@@ -1029,8 +1049,8 @@ func TestPan115MediaLibraryScanKeepsFileIdentityAcrossRename(t *testing.T) {
 		t.Fatalf("recognition worker failed: %+v", workerResult)
 	}
 	var diagnosisJobs int64
-	if err := db.Model(&models.Job{}).Where("job_type = ?", JobTypeMediaLibraryStructureDiagnosis).Count(&diagnosisJobs).Error; err != nil || diagnosisJobs != 2 {
-		t.Fatalf("recognition completion did not enqueue a fresh diagnosis: count=%d err=%v", diagnosisJobs, err)
+	if err := db.Model(&models.Job{}).Where("job_type = ?", JobTypeMediaLibraryStructureDiagnosis).Count(&diagnosisJobs).Error; err != nil || diagnosisJobs != 1 {
+		t.Fatalf("recognition convergence did not enqueue exactly one diagnosis: count=%d err=%v", diagnosisJobs, err)
 	}
 	refreshedDiagnosis, err := queue.Claim([]string{JobTypeMediaLibraryStructureDiagnosis})
 	if err != nil || refreshedDiagnosis == nil {

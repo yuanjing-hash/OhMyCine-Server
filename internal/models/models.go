@@ -757,6 +757,8 @@ type MediaLibraryStructureDiagnosis struct {
 	ScanRunID            *uint      `gorm:"index" json:"scan_run_id,omitempty"`
 	Generation           uint64     `gorm:"not null;index" json:"generation"`
 	ScanKind             string     `gorm:"size:24;not null;default:''" json:"scan_kind"`
+	Automatic            bool       `gorm:"not null;default:false" json:"automatic"`
+	SourceRevision       uint64     `gorm:"not null;default:0" json:"source_revision"`
 	Status               string     `gorm:"size:24;not null;index" json:"status"`
 	TotalItems           int        `gorm:"not null;default:0" json:"total_items"`
 	ProcessedItems       int        `gorm:"not null;default:0" json:"processed_items"`
@@ -774,6 +776,64 @@ type MediaLibraryStructureDiagnosis struct {
 	FinishedAt           *time.Time `json:"finished_at,omitempty"`
 	CreatedAt            time.Time  `gorm:"not null" json:"created_at"`
 	UpdatedAt            time.Time  `gorm:"not null" json:"updated_at"`
+}
+
+type MediaLibraryStructureAutoState struct {
+	LibraryID         uint      `gorm:"primaryKey" json:"library_id"`
+	SourceRevision    uint64    `gorm:"not null;default:1" json:"source_revision"`
+	DiagnosedRevision uint64    `gorm:"not null;default:0" json:"diagnosed_revision"`
+	Status            string    `gorm:"size:24;not null;default:'pending'" json:"status"`
+	UpdatedAt         time.Time `gorm:"not null" json:"updated_at"`
+}
+
+// MediaLibraryStructureIssue is the complete, paged public projection for one
+// diagnosis. Provider identities remain in the source fact tables and are
+// resolved again only while building a confirmed repair plan.
+type MediaLibraryStructureIssue struct {
+	ID                     uint      `gorm:"primaryKey" json:"-"`
+	Token                  string    `gorm:"size:36;not null;uniqueIndex" json:"token"`
+	LibraryID              uint      `gorm:"not null;index:idx_structure_issue_page,priority:1" json:"library_id"`
+	DiagnosisJobID         string    `gorm:"size:36;not null;index" json:"-"`
+	Generation             uint64    `gorm:"not null;index" json:"generation"`
+	Code                   string    `gorm:"size:64;not null;index:idx_structure_issue_page,priority:2" json:"code"`
+	Kind                   string    `gorm:"size:16;not null" json:"kind"`
+	State                  string    `gorm:"size:32;not null;default:'pending'" json:"state"`
+	Repairable             bool      `gorm:"not null;default:false;index" json:"repairable"`
+	Title                  string    `gorm:"size:256;not null;default:''" json:"title,omitempty"`
+	CurrentPath            string    `gorm:"size:2048;not null;default:''" json:"current_path,omitempty"`
+	ExpectedPath           string    `gorm:"size:2048;not null;default:''" json:"expected_path,omitempty"`
+	RecognitionID          *uint     `gorm:"index" json:"-"`
+	ConflictSourceCount    int       `gorm:"not null;default:0" json:"conflict_source_count,omitempty"`
+	RecommendedMemberToken string    `gorm:"size:36;not null;default:''" json:"recommended_member_token,omitempty"`
+	CreatedAt              time.Time `gorm:"not null" json:"created_at"`
+	UpdatedAt              time.Time `gorm:"not null" json:"updated_at"`
+}
+
+type MediaLibraryStructureIssueMember struct {
+	ID          uint      `gorm:"primaryKey" json:"-"`
+	IssueID     uint      `gorm:"not null;index" json:"-"`
+	Token       string    `gorm:"size:36;not null;uniqueIndex" json:"token"`
+	SourcePath  string    `gorm:"size:2048;not null" json:"source_path"`
+	Recommended bool      `gorm:"not null;default:false" json:"recommended"`
+	CreatedAt   time.Time `gorm:"not null" json:"created_at"`
+}
+
+// MediaLibraryStructureRepairDraft stores the server-only authority behind a
+// short-lived selection preview. The browser receives only the signed opaque
+// claim; source/provider facts remain in the selected private repair plan.
+type MediaLibraryStructureRepairDraft struct {
+	ID              string     `gorm:"primaryKey;size:36" json:"-"`
+	OwnerID         uint       `gorm:"not null;index" json:"-"`
+	LibraryID       uint       `gorm:"not null;index" json:"-"`
+	DiagnosisJobID  string     `gorm:"size:36;not null;index" json:"-"`
+	SourceRevision  uint64     `gorm:"not null" json:"-"`
+	Generation      uint64     `gorm:"not null" json:"-"`
+	RuleFingerprint string     `gorm:"size:64;not null" json:"-"`
+	PlanHash        string     `gorm:"size:64;not null" json:"-"`
+	SelectionsJSON  string     `gorm:"type:text;not null" json:"-"`
+	ExpiresAt       time.Time  `gorm:"not null;index" json:"-"`
+	ConsumedAt      *time.Time `gorm:"index" json:"-"`
+	CreatedAt       time.Time  `gorm:"not null" json:"-"`
 }
 
 // MediaLibraryStructureRepair is the durable authority for one diagnostic or

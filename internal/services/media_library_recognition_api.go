@@ -225,13 +225,10 @@ func (s *MediaLibraryService) OverrideRecognition(ctx context.Context, actor Act
 		return MediaRecognitionSummary{}, err
 	}
 	if s.structure != nil {
-		var currentLibrary models.MediaLibrary
-		if loadErr := s.db.Select("id", "baseline_generation").First(&currentLibrary, libraryID).Error; loadErr == nil {
-			if enqueueErr := s.structure.EnqueueDiagnosis(ctx, libraryID, 0, currentLibrary.BaselineGeneration, "manual"); enqueueErr != nil {
-				serverlog.OperationMediaLibraryStructureDiagnosis.Event(s.log.Warn()).Uint("library_id", libraryID).Uint64("generation", currentLibrary.BaselineGeneration).
-					Str("scan_kind", "manual").Str("phase", "enqueue_failed").Str("error_code", CodeMediaLibraryStructureDiagnosisFailed).
-					Msg(serverlog.OperationMediaLibraryStructureDiagnosis.Message("人工识别后的目录结构诊断入队失败，识别结果仍然有效"))
-			}
+		if refreshErr := s.structure.RefreshRecognitionProjection(ctx, libraryID, record.ID); refreshErr != nil {
+			serverlog.OperationMediaLibraryStructureDiagnosis.Event(s.log.Warn()).Uint("library_id", libraryID).
+				Str("scan_kind", "manual").Str("phase", "projection_refresh_failed").Str("error_code", CodeMediaLibraryStructureDiagnosisFailed).
+				Msg(serverlog.OperationMediaLibraryStructureDiagnosis.Message("人工识别结果已保存，但目录修复预览更新失败"))
 		}
 	}
 	_ = s.audit.Record(s.db, &actor.User.ID, "media_recognition.override", "media_library_recognition", strconv.FormatUint(uint64(record.ID), 10), "success", map[string]any{"library_id": libraryID, "media_type": match.MediaType, "tmdb_id": match.ID}, request)
