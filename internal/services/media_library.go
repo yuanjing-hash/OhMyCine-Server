@@ -211,6 +211,11 @@ func (s *MediaLibraryService) Start(ctx context.Context) error {
 	if err := s.recoverMediaLibraryRecognitionJobs(); err != nil {
 		return err
 	}
+	if s.structure != nil {
+		if err := s.structure.RecoverLegacyProjections(ctx); err != nil {
+			return err
+		}
+	}
 	s.startDownloaderLifeEventSupervisor(ctx)
 	serverlog.OperationLibraryEventScan.Event(s.log.Info()).Int("library_count", len(libraries)).Msg(serverlog.OperationLibraryEventScan.Message("媒体库监听已启动"))
 	return nil
@@ -2147,6 +2152,8 @@ func (s *MediaLibraryService) reconcile(ctx context.Context, id uint, kind strin
 			return wrapMediaLibraryPersistence(mediaLibraryPersistenceStageGeneration, err)
 		}
 		run.Status = "success"
+		run.Phase = "completed"
+		run.CatalogPublishedAt = &finished
 		run.FinishedAt = &finished
 		if err := tx.Save(&run).Error; err != nil {
 			return wrapMediaLibraryPersistence(mediaLibraryPersistenceStageScanRun, err)

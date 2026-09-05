@@ -107,7 +107,7 @@ func TestStructureDiagnosisIncludesOwnedHistorical115RootItems(t *testing.T) {
 		t.Fatal(err)
 	}
 	diagnostics, err = service.Diagnostics(context.Background(), actor, library.ID)
-	if err != nil || diagnostics.RepairableCount != 0 || diagnostics.Classifications.DuplicateTarget != 2 || diagnostics.CheckedAt == nil {
+	if err != nil || diagnostics.RepairableCount != 0 || diagnostics.Classifications.DuplicateTarget != 1 || diagnostics.CheckedAt == nil {
 		t.Fatalf("persisted async diagnostics=%+v err=%v", diagnostics, err)
 	}
 	assertStructureConflictSources(t, diagnostics.Issues, 2)

@@ -76,26 +76,27 @@ type StructureIssue struct {
 }
 
 type StructurePlan struct {
-	Version         int                           `json:"version"`
-	LibraryID       uint                          `json:"library_id"`
-	Generation      uint64                        `json:"generation"`
-	RuleFingerprint string                        `json:"rule_fingerprint"`
-	Items           []StructurePlanItem           `json:"items"`
-	RecycleItems    []StructureRecycleItem        `json:"recycle_items,omitempty"`
-	ResolvedIssues  []string                      `json:"resolved_issues,omitempty"`
-	SkippedIssues   []string                      `json:"skipped_issues,omitempty"`
-	DiagnosisJobID  string                        `json:"diagnosis_job_id,omitempty"`
-	SourceRevision  uint64                        `json:"source_revision,omitempty"`
-	SelectionBound  bool                          `json:"selection_bound,omitempty"`
-	Issues          []StructureIssue              `json:"issues"`
-	AllIssues       []StructureIssue              `json:"-"`
-	IssueCount      int                           `json:"issue_count"`
-	Unrecognized    int                           `json:"unrecognized"`
-	CheckedItems    int                           `json:"checked_items"`
-	Classifications StructureIssueClassifications `json:"classifications"`
-	ConflictGroups  []StructureConflictGroup      `json:"-"`
-	OccupiedPaths   map[string]struct{}           `json:"-"`
-	sampleCounts    map[string]int                `json:"-"`
+	Version             int                           `json:"version"`
+	LibraryID           uint                          `json:"library_id"`
+	Generation          uint64                        `json:"generation"`
+	RuleFingerprint     string                        `json:"rule_fingerprint"`
+	Items               []StructurePlanItem           `json:"items"`
+	RecycleItems        []StructureRecycleItem        `json:"recycle_items,omitempty"`
+	ResolvedIssues      []string                      `json:"resolved_issues,omitempty"`
+	SkippedIssues       []string                      `json:"skipped_issues,omitempty"`
+	DiagnosisJobID      string                        `json:"diagnosis_job_id,omitempty"`
+	DiagnosisGeneration uint64                        `json:"diagnosis_generation,omitempty"`
+	SourceRevision      uint64                        `json:"source_revision,omitempty"`
+	SelectionBound      bool                          `json:"selection_bound,omitempty"`
+	Issues              []StructureIssue              `json:"issues"`
+	AllIssues           []StructureIssue              `json:"-"`
+	IssueCount          int                           `json:"issue_count"`
+	Unrecognized        int                           `json:"unrecognized"`
+	CheckedItems        int                           `json:"checked_items"`
+	Classifications     StructureIssueClassifications `json:"classifications"`
+	ConflictGroups      []StructureConflictGroup      `json:"-"`
+	OccupiedPaths       map[string]struct{}           `json:"-"`
+	sampleCounts        map[string]int                `json:"-"`
 }
 
 type StructureIssueClassifications struct {

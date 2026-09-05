@@ -221,7 +221,7 @@ func (s *MediaLibraryStructureService) buildSelectionPlan(ctx context.Context, l
 	if err := s.db.WithContext(ctx).Where("library_id = ?", libraryID).First(&diagnosis).Error; err != nil {
 		return StructurePlan{}, diagnosis, nil, appError(CodeConflict, "目录诊断结果不存在，请重新诊断", err)
 	}
-	if diagnosis.Generation != library.BaselineGeneration || (diagnosis.Status != models.MediaLibraryStructureHealthy && diagnosis.Status != models.MediaLibraryStructureIssues) {
+	if diagnosis.Status != models.MediaLibraryStructureHealthy && diagnosis.Status != models.MediaLibraryStructureIssues {
 		return StructurePlan{}, diagnosis, nil, appError(CodeConflict, "目录诊断尚未完成或已经过期", nil)
 	}
 	selectionByIssue := make(map[string]MediaLibraryStructureSelection, len(input.Selections))
@@ -255,7 +255,7 @@ func (s *MediaLibraryStructureService) buildSelectionPlan(ctx context.Context, l
 				continue
 			}
 			action := bulk.Action
-			if action == StructureSelectionKeepRecommended && row.RecommendedMemberToken == "" {
+			if action == StructureSelectionKeepRecommended && (row.RecommendedMemberToken == "" || structureConflictRequiresReview(row.Code)) {
 				action = StructureSelectionSkip
 			}
 			selectionByIssue[row.Token] = MediaLibraryStructureSelection{IssueToken: row.Token, Action: action, MemberToken: mapRecommendedMember(action, row.RecommendedMemberToken)}
@@ -287,7 +287,7 @@ func (s *MediaLibraryStructureService) buildSelectionPlan(ctx context.Context, l
 	if err != nil {
 		return StructurePlan{}, diagnosis, nil, err
 	}
-	plan := StructurePlan{Version: 1, LibraryID: libraryID, Generation: base.Generation, RuleFingerprint: base.RuleFingerprint, DiagnosisJobID: diagnosis.JobID, SelectionBound: true}
+	plan := StructurePlan{Version: 1, LibraryID: libraryID, Generation: base.Generation, RuleFingerprint: base.RuleFingerprint, DiagnosisJobID: diagnosis.JobID, DiagnosisGeneration: diagnosis.Generation, SelectionBound: true}
 	var autoState models.MediaLibraryStructureAutoState
 	if err := s.db.WithContext(ctx).Where("library_id = ?", libraryID).First(&autoState).Error; err != nil {
 		return StructurePlan{}, diagnosis, nil, err
@@ -306,7 +306,96 @@ func (s *MediaLibraryStructureService) buildSelectionPlan(ctx context.Context, l
 	plan.Items = orderStructureSelectionMoves(plan.Items)
 	sort.Strings(plan.ResolvedIssues)
 	sort.Strings(plan.SkippedIssues)
+	if err := s.validateStructureSelectionSafety(ctx, plan); err != nil {
+		return StructurePlan{}, diagnosis, nil, err
+	}
 	return plan, diagnosis, resolved, nil
+}
+
+func structureConflictRequiresReview(code string) bool {
+	return code == "catalog_duplicate_conflict" || code == "recognition_suspect_conflict"
+}
+
+func structureConflictReviewError(code string) error {
+	if code == "recognition_suspect_conflict" {
+		return appError(CodeConflict, "作品识别尚有冲突，请先核对并修正识别，再重新检查目录问题", nil)
+	}
+	return appError(CodeConflict, "同一文件存在重复目录记录，请先扫描核对索引，再重新检查目录问题；不能按重复文件回收或改名", nil)
+}
+
+// validateStructureSelectionSafety also runs before executing persisted plans.
+// Provider identity, not a catalog row or display path, identifies a real file.
+// A canonical winner may need no move and therefore be absent from plan.Items;
+// the catalog check below still protects it from a legacy recycle/version plan.
+func (s *MediaLibraryStructureService) validateStructureSelectionSafety(ctx context.Context, plan StructurePlan) error {
+	if len(plan.ResolvedIssues) > 0 {
+		var issue models.MediaLibraryStructureIssue
+		result := s.db.WithContext(ctx).Where("library_id = ? AND diagnosis_job_id = ? AND token IN ? AND code IN ?", plan.LibraryID, plan.DiagnosisJobID, plan.ResolvedIssues, []string{"catalog_duplicate_conflict", "recognition_suspect_conflict"}).Limit(1).Find(&issue)
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 0 {
+			return structureConflictReviewError(issue.Code)
+		}
+	}
+	items := append([]StructurePlanItem(nil), plan.Items...)
+	for _, item := range plan.RecycleItems {
+		items = append(items, StructurePlanItem{SourceRelative: item.SourceRelative, ProviderID: item.ProviderID})
+	}
+	if err := validateDistinctStructureSources(items); err != nil {
+		return err
+	}
+	providerIDs := make(map[string]struct{}, len(items))
+	for _, item := range items {
+		if id := strings.TrimSpace(item.ProviderID); id != "" {
+			providerIDs[id] = struct{}{}
+		}
+	}
+	if len(providerIDs) == 0 {
+		return nil
+	}
+	// Query the library once, including companion facts. Stream only duplicate
+	// identities and match them against this plan in memory, avoiding repeated
+	// catalog scans or one provider call per file in large selections.
+	rows, err := s.db.WithContext(ctx).Raw(`SELECT provider_id FROM (
+		SELECT provider_id FROM media_library_entries WHERE library_id = ? AND provider_id <> ''
+		UNION ALL
+		SELECT provider_id FROM media_library_source_assets WHERE library_id = ? AND active = ? AND provider_id <> ''
+	) AS source_facts GROUP BY provider_id HAVING COUNT(*) > 1`, plan.LibraryID, plan.LibraryID, true).Rows()
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var providerID string
+		if err := rows.Scan(&providerID); err != nil {
+			return err
+		}
+		if _, affected := providerIDs[providerID]; affected {
+			return structureConflictReviewError("catalog_duplicate_conflict")
+		}
+	}
+	return rows.Err()
+}
+
+func validateDistinctStructureSources(items []StructurePlanItem) error {
+	providerIDs := make(map[string]struct{}, len(items))
+	paths := make(map[string]struct{}, len(items))
+	for _, item := range items {
+		if id := strings.TrimSpace(item.ProviderID); id != "" {
+			if _, exists := providerIDs[id]; exists {
+				return structureConflictReviewError("catalog_duplicate_conflict")
+			}
+			providerIDs[id] = struct{}{}
+		}
+		if path := strings.ToLower(safeStructurePath(item.SourceRelative)); path != "" {
+			if _, exists := paths[path]; exists {
+				return structureConflictReviewError("catalog_duplicate_conflict")
+			}
+			paths[path] = struct{}{}
+		}
+	}
+	return nil
 }
 
 func validStructureSelectionAction(action string) bool {
@@ -340,6 +429,9 @@ func appendStructureSelection(plan *StructurePlan, base StructurePlan, issue mod
 		plan.SkippedIssues = append(plan.SkippedIssues, issue.Token)
 		return nil
 	}
+	if structureConflictRequiresReview(issue.Code) {
+		return structureConflictReviewError(issue.Code)
+	}
 	if issue.ConflictSourceCount > 1 {
 		if selection.Action == StructureSelectionRepair {
 			return appError(CodeInvalidRequest, "冲突问题必须选择保留来源、全部保留为版本或跳过", nil)
@@ -347,6 +439,9 @@ func appendStructureSelection(plan *StructurePlan, base StructurePlan, issue mod
 		group := findStructureConflictGroup(base.ConflictGroups, issue.Code, issue.ExpectedPath)
 		if group == nil || len(group.Members) != len(members) {
 			return appError(CodeConflict, "冲突成员已经变化，请重新诊断", nil)
+		}
+		if err := validateDistinctStructureSources(group.Members); err != nil {
+			return err
 		}
 		byToken := make(map[string]models.MediaLibraryStructureIssueMember, len(members))
 		bySource := make(map[string]StructurePlanItem, len(group.Members))

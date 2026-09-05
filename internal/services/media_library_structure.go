@@ -421,7 +421,7 @@ func (s *MediaLibraryStructureService) RefreshRecognitionProjection(ctx context.
 	} else if err != nil {
 		return err
 	}
-	if diagnosis.Generation != library.BaselineGeneration {
+	if diagnosis.Status != models.MediaLibraryStructureHealthy && diagnosis.Status != models.MediaLibraryStructureIssues {
 		return nil
 	}
 	var affectedEntries []models.MediaLibraryEntry
@@ -482,6 +482,17 @@ func (s *MediaLibraryStructureService) RefreshRecognitionProjection(ctx context.
 	}
 	now := time.Now().UTC()
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var current models.MediaLibrary
+		var currentDiagnosis models.MediaLibraryStructureDiagnosis
+		if err := tx.First(&current, libraryID).Error; err != nil {
+			return err
+		}
+		if err := tx.First(&currentDiagnosis, "library_id = ?", libraryID).Error; err != nil {
+			return err
+		}
+		if current.BaselineGeneration != library.BaselineGeneration || currentDiagnosis.JobID != diagnosis.JobID || currentDiagnosis.Generation != diagnosis.Generation || libraryRuleFingerprint(current) != plan.RuleFingerprint {
+			return appError(CodeConflict, "目录已变化，请刷新人工识别结果", nil)
+		}
 		// Conflict groups can contain several recognition identities. Remove any
 		// group that references one of this recognition's safe source paths so a
 		// stale pre-override conflict is never shown as current truth.
@@ -498,7 +509,10 @@ func (s *MediaLibraryStructureService) RefreshRecognitionProjection(ctx context.
 		if err := query.Delete(&models.MediaLibraryStructureIssue{}).Error; err != nil {
 			return err
 		}
-		return insertStructureIssuesTx(tx, libraryID, diagnosis.JobID, diagnosis.Generation, projectedIssues, now, "manual_identity_resolved")
+		if err := insertStructureIssuesTx(tx, libraryID, diagnosis.JobID, diagnosis.Generation, projectedIssues, now, "manual_identity_resolved"); err != nil {
+			return err
+		}
+		return refreshStructureSummaryTx(tx, libraryID, now)
 	})
 }
 
@@ -567,6 +581,9 @@ func (s *MediaLibraryStructureService) EnqueueAutomaticDiagnosis(ctx context.Con
 		}
 	} else if err != nil {
 		return err
+	}
+	if autoState.Status == "projection_pending" {
+		return s.recoverLegacyProjection(ctx, library, autoState)
 	}
 	if autoState.SourceRevision == 0 || autoState.DiagnosedRevision >= autoState.SourceRevision {
 		return nil
@@ -854,6 +871,15 @@ func (s *MediaLibraryStructureService) EnsureWorkLayout(ctx context.Context, own
 		if err := updateStructureCatalogPaths(tx, libraryID, plan.Items, nil); err != nil {
 			return err
 		}
+		refreshSummary, err := resolveCompletedStructureMovesTx(tx, libraryID, plan.Items)
+		if err != nil {
+			return err
+		}
+		if refreshSummary {
+			if err := refreshStructureSummaryTx(tx, libraryID, finished); err != nil {
+				return err
+			}
+		}
 		if err := tx.Model(&models.MediaLibrary{}).Where("id = ? AND baseline_generation = ?", libraryID, plan.Generation).UpdateColumn("dirty_generation", gorm.Expr("dirty_generation + 1")).Error; err != nil {
 			return err
 		}
@@ -1029,6 +1055,13 @@ func (s *MediaLibraryStructureService) runDiagnosis(ctx context.Context, runtime
 	if library.BaselineGeneration != payload.Generation {
 		return nil
 	}
+	var sourceSnapshot models.MediaLibraryStructureAutoState
+	if err := s.db.WithContext(ctx).First(&sourceSnapshot, "library_id = ?", payload.LibraryID).Error; err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+		return err
+	}
+	if payload.SourceRevision != 0 && sourceSnapshot.SourceRevision != payload.SourceRevision {
+		return nil
+	}
 	if payload.ScanRunID != 0 {
 		var run models.MediaLibraryScanRun
 		if err := s.db.WithContext(ctx).First(&run, payload.ScanRunID).Error; err != nil {
@@ -1136,12 +1169,32 @@ func (s *MediaLibraryStructureService) runDiagnosis(ctx context.Context, runtime
 		status = models.MediaLibraryStructureIssues
 	}
 	finished := time.Now().UTC()
+	committed := false
 	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		current, err := structureDiagnosisJobCurrentTx(tx, jobID, jobGeneration)
 		if err != nil {
 			return err
 		}
 		if !current {
+			return nil
+		}
+		// Planning reads do not hold the writer. Recheck every snapshot inside
+		// the commit transaction so a concurrent scan/source edit cannot publish
+		// an obsolete issue list or consume the compatibility recovery marker.
+		var latestLibrary models.MediaLibrary
+		if err := tx.First(&latestLibrary, payload.LibraryID).Error; errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil
+		} else if err != nil {
+			return err
+		}
+		if latestLibrary.BaselineGeneration != payload.Generation || latestLibrary.StorageID != library.StorageID || latestLibrary.ProfileID != library.ProfileID || libraryRuleFingerprint(latestLibrary) != plan.RuleFingerprint {
+			return nil
+		}
+		var latestSource models.MediaLibraryStructureAutoState
+		if err := tx.First(&latestSource, "library_id = ?", payload.LibraryID).Error; err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+			return err
+		}
+		if latestSource.SourceRevision != sourceSnapshot.SourceRevision {
 			return nil
 		}
 		updated := tx.Model(&models.MediaLibraryStructureDiagnosis{}).
@@ -1173,10 +1226,24 @@ func (s *MediaLibraryStructureService) runDiagnosis(ctx context.Context, runtime
 				return nil
 			}
 		}
-		return where.Updates(libraryUpdates).Error
+		if err := where.Updates(libraryUpdates).Error; err != nil {
+			return err
+		}
+		// A user-requested diagnosis may finish the compatibility rebuild too.
+		if err := tx.Model(&models.MediaLibraryStructureAutoState{}).Where("library_id = ? AND status = ? AND source_revision = ?", payload.LibraryID, "projection_pending", sourceSnapshot.SourceRevision).Updates(map[string]any{"status": "completed", "diagnosed_revision": sourceSnapshot.SourceRevision, "updated_at": finished}).Error; err != nil {
+			return err
+		}
+		if err := refreshStructureSummaryTx(tx, payload.LibraryID, finished); err != nil {
+			return err
+		}
+		committed = true
+		return nil
 	})
 	if err != nil {
 		return err
+	}
+	if !committed {
+		return nil
 	}
 	for _, issue := range plan.Issues {
 		structureDiagnosisLogEvent(serverlog.OperationMediaLibraryStructureDiagnosis.Event(s.log.Debug()), payload, "completed").
@@ -1425,9 +1492,13 @@ func (s *MediaLibraryStructureService) runRepair(ctx context.Context, runtime Jo
 		return s.failRepair(repair, CodeMediaLibraryStructureBoundaryChanged, "媒体库已变化，请重新诊断后再修复")
 	}
 	if plan.SelectionBound {
+		diagnosisGeneration := plan.DiagnosisGeneration
+		if diagnosisGeneration == 0 {
+			diagnosisGeneration = plan.Generation
+		}
 		var diagnosis models.MediaLibraryStructureDiagnosis
 		var autoState models.MediaLibraryStructureAutoState
-		if err := s.db.Where("library_id = ?", repair.LibraryID).First(&diagnosis).Error; err != nil || diagnosis.JobID != plan.DiagnosisJobID || diagnosis.Generation != plan.Generation {
+		if err := s.db.Where("library_id = ?", repair.LibraryID).First(&diagnosis).Error; err != nil || diagnosis.JobID != plan.DiagnosisJobID || diagnosis.Generation != diagnosisGeneration {
 			return s.failRepair(repair, CodeMediaLibraryStructureBoundaryChanged, "目录诊断结果已变化，请重新预览")
 		}
 		if err := s.db.Where("library_id = ?", repair.LibraryID).First(&autoState).Error; err != nil || autoState.SourceRevision != plan.SourceRevision {
@@ -1436,7 +1507,7 @@ func (s *MediaLibraryStructureService) runRepair(ctx context.Context, runtime Jo
 		selectedIssueTokens := append(append([]string(nil), plan.ResolvedIssues...), plan.SkippedIssues...)
 		if len(selectedIssueTokens) > 0 {
 			var current int64
-			if err := s.db.Model(&models.MediaLibraryStructureIssue{}).Where("library_id = ? AND diagnosis_job_id = ? AND generation = ? AND token IN ?", repair.LibraryID, plan.DiagnosisJobID, plan.Generation, selectedIssueTokens).Count(&current).Error; err != nil || current != int64(len(selectedIssueTokens)) {
+			if err := s.db.Model(&models.MediaLibraryStructureIssue{}).Where("library_id = ? AND diagnosis_job_id = ? AND generation = ? AND token IN ?", repair.LibraryID, plan.DiagnosisJobID, diagnosisGeneration, selectedIssueTokens).Count(&current).Error; err != nil || current != int64(len(selectedIssueTokens)) {
 				return s.failRepair(repair, CodeMediaLibraryStructureBoundaryChanged, "目录问题选择已变化，请重新预览")
 			}
 		}
@@ -1445,10 +1516,13 @@ func (s *MediaLibraryStructureService) runRepair(ctx context.Context, runtime Jo
 	if err != nil {
 		return s.failRepair(repair, CodeMediaLibraryStructureUnavailable, "当前数据源不支持结构修复")
 	}
+	if err := s.validateStructureSelectionSafety(ctx, plan); err != nil {
+		return s.failRepair(repair, CodeMediaLibraryStructureConflict, "冲突来源身份需重新核对，已停止文件操作")
+	}
 	now := time.Now().UTC()
 	_ = s.db.Model(&repair).Updates(map[string]any{"phase": "executing", "updated_at": now, "last_error_code": ""}).Error
 	if repair.Scope == models.MediaLibraryStructureScopeFull {
-		_ = s.db.Model(&library).Updates(map[string]any{"structure_status": models.MediaLibraryStructureRepairing, "structure_error_code": ""}).Error
+		_ = s.db.Model(&models.MediaLibrary{}).Where("id = ? AND structure_status NOT IN ?", library.ID, []string{models.MediaLibraryStructureQueued, models.MediaLibraryStructureRunning}).Updates(map[string]any{"structure_status": models.MediaLibraryStructureRepairing, "structure_error_code": ""}).Error
 	}
 	totalMutations := len(plan.RecycleItems) + len(plan.Items)
 	progressAt := func(offset int) StructureProgress {
@@ -1502,6 +1576,11 @@ func (s *MediaLibraryStructureService) runRepair(ctx context.Context, runtime Jo
 		if err := updateStructureCatalogPaths(tx, repair.LibraryID, plan.Items, providerParents); err != nil {
 			return err
 		}
+		if !plan.SelectionBound {
+			if _, err := resolveCompletedStructureMovesTx(tx, repair.LibraryID, plan.Items); err != nil {
+				return err
+			}
+		}
 		if len(plan.ResolvedIssues) > 0 {
 			if err := tx.Where("library_id = ? AND diagnosis_job_id = ? AND token IN ?", repair.LibraryID, plan.DiagnosisJobID, plan.ResolvedIssues).Delete(&models.MediaLibraryStructureIssue{}).Error; err != nil {
 				return err
@@ -1512,19 +1591,12 @@ func (s *MediaLibraryStructureService) runRepair(ctx context.Context, runtime Jo
 				return err
 			}
 		}
-		var remaining int64
-		if err := tx.Model(&models.MediaLibraryStructureIssue{}).Where("library_id = ?", repair.LibraryID).Count(&remaining).Error; err != nil {
-			return err
-		}
-		status := models.MediaLibraryStructureHealthy
-		if remaining > 0 {
-			status = models.MediaLibraryStructureIssues
-		}
-		libraryUpdates := map[string]any{"structure_status": status, "structure_error_code": "", "structure_issue_count": remaining, "structure_checked_at": finished}
 		if totalMutations > 0 {
-			libraryUpdates["dirty_generation"] = gorm.Expr("dirty_generation + 1")
+			if err := tx.Model(&models.MediaLibrary{}).Where("id = ?", repair.LibraryID).UpdateColumn("dirty_generation", gorm.Expr("dirty_generation + 1")).Error; err != nil {
+				return err
+			}
 		}
-		if err := tx.Model(&models.MediaLibrary{}).Where("id = ?", repair.LibraryID).Updates(libraryUpdates).Error; err != nil {
+		if err := refreshStructureSummaryTx(tx, repair.LibraryID, finished); err != nil {
 			return err
 		}
 		if err := tx.Model(&repair).Updates(map[string]any{"phase": "completed", "processed_items": totalMutations, "last_error_code": "", "finished_at": finished, "updated_at": finished}).Error; err != nil {
