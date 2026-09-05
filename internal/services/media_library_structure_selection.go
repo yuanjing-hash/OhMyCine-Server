@@ -365,7 +365,7 @@ func (s *MediaLibraryStructureService) validateStructureSelectionSafety(ctx cont
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	for rows.Next() {
 		var providerID string
 		if err := rows.Scan(&providerID); err != nil {

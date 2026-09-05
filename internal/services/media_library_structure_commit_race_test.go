@@ -51,12 +51,12 @@ func TestStructureDiagnosisCommitFencesConcurrentCatalogChanges(t *testing.T) {
 					updates["movie_filename_template"] = "{title}-changed"
 				}
 				if err := s.db.Model(&models.MediaLibrary{}).Where("id = ?", library.ID).Updates(updates).Error; err != nil {
-					tx.AddError(err)
+					_ = tx.AddError(err)
 					return
 				}
 				if change == "source_revision" {
 					if err := s.db.Model(&models.MediaLibraryStructureAutoState{}).Where("library_id = ?", library.ID).Update("source_revision", 2).Error; err != nil {
-						tx.AddError(err)
+						_ = tx.AddError(err)
 					}
 				}
 			}); err != nil {
@@ -136,7 +136,7 @@ func TestStructureUpgradeRecoveryDefersStartupRaces(t *testing.T) {
 					err = s.db.Delete(&models.MediaLibrary{}, library.ID).Error
 				}
 				if err != nil {
-					tx.AddError(err)
+					_ = tx.AddError(err)
 				}
 			}); err != nil {
 				t.Fatal(err)
