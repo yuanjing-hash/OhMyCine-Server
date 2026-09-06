@@ -107,7 +107,7 @@ var catalogRuntimeAccessAllowlist = map[string]string{
 	"internal/services/media_library_structure.go:MediaLibraryStructureService.EnsureWorkLayout":             "call:updateStructureCatalogPaths=1|2f4fee82835a5b2f",
 	"internal/services/media_library_structure.go:MediaLibraryStructureService.RefreshRecognitionProjection": "model:E=1,model:R=1,query:First:R=1|b8c9c06a6d6b0789",
 	"internal/services/media_library_structure.go:MediaLibraryStructureService.runRepair":                    "call:removeStructureCatalogItems=1,call:updateStructureCatalogPaths=1|781c2e0d0d57ce29",
-	"internal/services/media_library_structure.go:MediaLibraryStructureService.structureIssuesTx":            "model:R=2,query:Find:R=1|ab571af52d1f1b8a",
+	"internal/services/media_library_structure.go:MediaLibraryStructureService.structureIssuesTx":            "model:R=2,query:Find:R=1|420e97017f927932",
 	"internal/services/media_library_structure.go:removeStructureCatalogItems":                               "helper:removeStructureCatalogItems=1,model:A=1,model:E=1,query:Delete:A=1,query:Delete:E=1|a46b1f03b11411a5",
 	"internal/services/media_library_structure.go:updateStructureCatalogPaths":                               "helper:updateStructureCatalogPaths=1,model:A=1,model:E=1,query:Model:A=1,query:Model:E=1|f2f4bad6fa3d9870",
 	"internal/services/media_library_structure_planner.go:StructurePlanner.Build":                            "model:A=1,model:E=1|16bf7db06ea2fae4",
