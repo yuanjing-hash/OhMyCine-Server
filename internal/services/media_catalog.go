@@ -133,14 +133,24 @@ type mediaCatalogRow struct {
 }
 
 func (s *MediaLibraryService) EntryPage(actor Actor, libraryID uint, query MediaPageQuery) (MediaLibraryEntryPage, error) {
+	var result MediaLibraryEntryPage
+	err := s.withCatalogRead(context.Background(), []uint{libraryID}, func(tx *gorm.DB, reader *CatalogReader) error {
+		var err error
+		result, err = s.entryPageTx(tx, reader, actor, libraryID, query)
+		return err
+	})
+	return result, err
+}
+
+func (s *MediaLibraryService) entryPageTx(tx *gorm.DB, reader *CatalogReader, actor Actor, libraryID uint, query MediaPageQuery) (MediaLibraryEntryPage, error) {
 	query, err := normalizeMediaPageQuery(query)
 	if err != nil {
 		return MediaLibraryEntryPage{}, err
 	}
-	if err := s.ensureMediaLibraryReadable(actor, libraryID); err != nil {
+	if err := s.ensureMediaLibraryReadableTx(tx, actor, libraryID); err != nil {
 		return MediaLibraryEntryPage{}, err
 	}
-	db := applyEntryFilters(s.db.Model(&models.MediaLibraryEntry{}).Where("library_id = ?", libraryID), query)
+	db := applyEntryFilters(reader.Entries().Where("library_id = ?", libraryID), query)
 	var total int64
 	if err := db.Count(&total).Error; err != nil {
 		return MediaLibraryEntryPage{}, err
@@ -153,36 +163,46 @@ func (s *MediaLibraryService) EntryPage(actor Actor, libraryID uint, query Media
 }
 
 func (s *MediaLibraryService) Catalog(actor Actor, libraryID uint, query MediaPageQuery) (MediaCatalogPage, error) {
+	var result MediaCatalogPage
+	err := s.withCatalogRead(context.Background(), []uint{libraryID}, func(tx *gorm.DB, reader *CatalogReader) error {
+		var err error
+		result, err = s.catalogTx(tx, reader, actor, libraryID, query)
+		return err
+	})
+	return result, err
+}
+
+func (s *MediaLibraryService) catalogTx(tx *gorm.DB, reader *CatalogReader, actor Actor, libraryID uint, query MediaPageQuery) (MediaCatalogPage, error) {
 	query, err := normalizeMediaPageQuery(query)
 	if err != nil {
 		return MediaCatalogPage{}, err
 	}
-	if err := s.ensureMediaLibraryReadable(actor, libraryID); err != nil {
+	if err := s.ensureMediaLibraryReadableTx(tx, actor, libraryID); err != nil {
 		return MediaCatalogPage{}, err
 	}
-	categories, err := catalogCategories(s.db.Model(&models.MediaLibraryEntry{}).Where("library_id = ?", libraryID))
+	categories, err := catalogCategories(reader.Entries().Where("library_id = ?", libraryID))
 	if err != nil {
 		return MediaCatalogPage{}, err
 	}
-	grouped := applyCatalogFilters(s.db.Model(&models.MediaLibraryEntry{}).Where("library_id = ? AND work_key <> ''", libraryID), query).Select("work_key").Group("work_key")
+	grouped := applyCatalogFilters(reader.Entries().Where("library_id = ? AND work_key <> ''", libraryID), query).Select("work_key").Group("work_key")
 	var total int64
-	if err := s.db.Table("(?) AS media_catalog", grouped).Count(&total).Error; err != nil {
+	if err := tx.Table("(?) AS media_catalog", grouped).Count(&total).Error; err != nil {
 		return MediaCatalogPage{}, err
 	}
 	rows := make([]mediaCatalogRow, 0)
-	rowsQuery := applyCatalogFilters(s.db.Model(&models.MediaLibraryEntry{}).Where("library_id = ? AND work_key <> ''", libraryID), query)
+	rowsQuery := applyCatalogFilters(reader.Entries().Where("library_id = ? AND work_key <> ''", libraryID), query)
 	if err := selectCatalogRows(rowsQuery).
 		Offset((query.Page - 1) * query.PageSize).
 		Limit(query.PageSize).
 		Scan(&rows).Error; err != nil {
 		return MediaCatalogPage{}, err
 	}
-	items, err := s.catalogItems(rows)
+	items, err := s.catalogItemsTx(tx, reader, rows)
 	if err != nil {
 		return MediaCatalogPage{}, err
 	}
 	var library models.MediaLibrary
-	if err := s.db.Select("id,name").First(&library, libraryID).Error; err != nil {
+	if err := tx.Select("id,name").First(&library, libraryID).Error; err != nil {
 		return MediaCatalogPage{}, err
 	}
 	for index := range items {
@@ -195,6 +215,23 @@ func (s *MediaLibraryService) Catalog(actor Actor, libraryID uint, query MediaPa
 // concatenate per-library pages: matched works merge only by trustworthy TMDB
 // identity, while unmatched works remain library-scoped.
 func (s *MediaLibraryService) AggregateCatalog(actor Actor, query MediaPageQuery) (MediaCatalogPage, error) {
+	var result MediaCatalogPage
+	err := s.withCatalogReadTx(context.Background(), func(tx *gorm.DB) error {
+		ids, err := s.authorizedMediaLibraryIDsTx(tx, actor, authz.PermissionMediaLibrariesRead, true)
+		if err != nil {
+			return err
+		}
+		reader, err := PinCatalogTx(tx, ids)
+		if err != nil {
+			return err
+		}
+		result, err = s.aggregateCatalogTx(tx, reader, actor, ids, query)
+		return err
+	})
+	return result, err
+}
+
+func (s *MediaLibraryService) aggregateCatalogTx(tx *gorm.DB, reader *CatalogReader, actor Actor, libraryIDs []uint, query MediaPageQuery) (MediaCatalogPage, error) {
 	if !actor.HasPermission(authz.PermissionMediaLibrariesRead) {
 		return MediaCatalogPage{}, appError(CodePermissionDenied, "无权查看媒体库", nil)
 	}
@@ -202,14 +239,10 @@ func (s *MediaLibraryService) AggregateCatalog(actor Actor, query MediaPageQuery
 	if err != nil {
 		return MediaCatalogPage{}, err
 	}
-	libraryIDs, err := s.authorizedMediaLibraryIDs(actor, authz.PermissionMediaLibrariesRead, true)
-	if err != nil {
-		return MediaCatalogPage{}, err
-	}
 	if len(libraryIDs) == 0 {
 		return MediaCatalogPage{List: []MediaCatalogItem{}, Page: query.Page, PageSize: query.PageSize, Categories: []string{}}, nil
 	}
-	base := s.db.Model(&models.MediaLibraryEntry{}).
+	base := reader.Entries().
 		Joins("JOIN media_libraries ON media_libraries.id = media_library_entries.library_id").
 		Joins("JOIN storages ON storages.id = media_libraries.storage_id").
 		Where("media_library_entries.work_key <> '' AND media_libraries.enabled = ? AND storages.enabled = ? AND media_libraries.id IN ?", true, true, libraryIDs)
@@ -221,13 +254,13 @@ func (s *MediaLibraryService) AggregateCatalog(actor Actor, query MediaPageQuery
 	if err := selectCatalogRows(applyCatalogFilters(base, query)).Scan(&rows).Error; err != nil {
 		return MediaCatalogPage{}, err
 	}
-	items, err := s.catalogItems(rows)
+	items, err := s.catalogItemsTx(tx, reader, rows)
 	if err != nil {
 		return MediaCatalogPage{}, err
 	}
 	libraryNames := map[uint]string{}
 	var libraries []models.MediaLibrary
-	if err := s.db.Select("id,name").Where("enabled = ? AND id IN ?", true, libraryIDs).Find(&libraries).Error; err != nil {
+	if err := tx.Select("id,name").Where("enabled = ? AND id IN ?", true, libraryIDs).Find(&libraries).Error; err != nil {
 		return MediaCatalogPage{}, err
 	}
 	for _, library := range libraries {
@@ -286,21 +319,33 @@ func (s *MediaLibraryService) AggregateCatalog(actor Actor, query MediaPageQuery
 
 func catalogCategories(db *gorm.DB) ([]string, error) {
 	items := make([]string, 0)
-	if err := db.Where("media_library_entries.category_name <> ''").Distinct().Order("media_library_entries.category_name COLLATE NOCASE").Pluck("media_library_entries.category_name", &items).Error; err != nil {
+	// Keep category discovery from adding its nonempty filter, DISTINCT and
+	// ordering to the aggregate query subsequently used for the actual page.
+	if err := db.Session(&gorm.Session{}).Where("media_library_entries.category_name <> ''").Distinct().Order("media_library_entries.category_name COLLATE NOCASE").Pluck("media_library_entries.category_name", &items).Error; err != nil {
 		return nil, err
 	}
 	return items, nil
 }
 
 func (s *MediaLibraryService) CatalogDetail(actor Actor, libraryID uint, token string) (MediaCatalogDetail, error) {
-	if err := s.ensureMediaLibraryReadable(actor, libraryID); err != nil {
+	var result MediaCatalogDetail
+	err := s.withCatalogRead(context.Background(), []uint{libraryID}, func(tx *gorm.DB, reader *CatalogReader) error {
+		var err error
+		result, err = s.catalogDetailTx(tx, reader, actor, libraryID, token)
+		return err
+	})
+	return result, err
+}
+
+func (s *MediaLibraryService) catalogDetailTx(tx *gorm.DB, reader *CatalogReader, actor Actor, libraryID uint, token string) (MediaCatalogDetail, error) {
+	if err := s.ensureMediaLibraryReadableTx(tx, actor, libraryID); err != nil {
 		return MediaCatalogDetail{}, err
 	}
 	workKey, err := decodeCatalogToken(token)
 	if err != nil {
 		return MediaCatalogDetail{}, err
 	}
-	filtered := s.db.Model(&models.MediaLibraryEntry{}).Where("library_id = ? AND work_key = ?", libraryID, workKey)
+	filtered := reader.Entries().Where("library_id = ? AND work_key = ?", libraryID, workKey)
 	var row mediaCatalogRow
 	if err := selectCatalogRows(filtered).Scan(&row).Error; err != nil {
 		return MediaCatalogDetail{}, err
@@ -309,20 +354,20 @@ func (s *MediaLibraryService) CatalogDetail(actor Actor, libraryID uint, token s
 		return MediaCatalogDetail{}, appError(CodeNotFound, "媒体作品不存在", gorm.ErrRecordNotFound)
 	}
 	var entries []models.MediaLibraryEntry
-	if err := s.db.Where("library_id = ? AND work_key = ?", libraryID, workKey).Order("COALESCE(season, 0), COALESCE(episode, 0), relative_path").Find(&entries).Error; err != nil {
+	if err := reader.Entries().Where("library_id = ? AND work_key = ?", libraryID, workKey).Order("COALESCE(season, 0), COALESCE(episode, 0), relative_path").Find(&entries).Error; err != nil {
 		return MediaCatalogDetail{}, err
 	}
-	items, err := s.catalogItems([]mediaCatalogRow{row})
+	items, err := s.catalogItemsTx(tx, reader, []mediaCatalogRow{row})
 	if err != nil {
 		return MediaCatalogDetail{}, err
 	}
 	var library models.MediaLibrary
-	if err := s.db.Select("id,name").First(&library, libraryID).Error; err != nil {
+	if err := tx.Select("id,name").First(&library, libraryID).Error; err != nil {
 		return MediaCatalogDetail{}, err
 	}
 	items[0].LibraryWorks = []MediaCatalogLibraryWork{{LibraryID: library.ID, LibraryName: library.Name, WorkID: items[0].ID, FileCount: items[0].FileCount}}
 	detail := MediaCatalogDetail{Work: items[0], Seasons: make([]MediaCatalogSeason, 0), Files: make([]MediaCatalogEpisode, 0), ReorganizableTransfers: make([]MediaCatalogManagedTransfer, 0)}
-	detail.ReorganizableTransfers = s.catalogManagedTransfers(actor, libraryID, entries)
+	detail.ReorganizableTransfers = s.catalogManagedTransfersTx(tx, actor, libraryID, entries)
 	if row.Kind != "series" {
 		for _, entry := range entries {
 			detail.Files = append(detail.Files, catalogEpisode(entry))
@@ -361,7 +406,7 @@ func (s *MediaLibraryService) CatalogDetail(actor Actor, libraryID uint, token s
 	return detail, nil
 }
 
-func (s *MediaLibraryService) catalogManagedTransfers(actor Actor, libraryID uint, entries []models.MediaLibraryEntry) []MediaCatalogManagedTransfer {
+func (s *MediaLibraryService) catalogManagedTransfersTx(tx *gorm.DB, actor Actor, libraryID uint, entries []models.MediaLibraryEntry) []MediaCatalogManagedTransfer {
 	if !actor.Can(authz.PermissionJobsControlAll) && !actor.Can(authz.PermissionJobsControlOwn) {
 		return []MediaCatalogManagedTransfer{}
 	}
@@ -374,7 +419,7 @@ func (s *MediaLibraryService) catalogManagedTransfers(actor Actor, libraryID uin
 	if len(paths) == 0 {
 		return []MediaCatalogManagedTransfer{}
 	}
-	query := s.db.Table("media_managed_items AS managed").
+	query := tx.Table("media_managed_items AS managed").
 		Select("managed.transfer_task_id, managed.download_task_id, MAX(managed.identity_revision) AS identity_revision, COUNT(*) AS file_count").
 		Joins("JOIN transfer_tasks AS transfer ON transfer.id = managed.transfer_task_id").
 		Where("managed.library_id = ? AND managed.managed = ? AND managed.active = ? AND managed.relative_path IN ? AND transfer.phase = ?", libraryID, true, true, paths, models.TransferTaskStatusCompleted)
@@ -481,39 +526,82 @@ func catalogItem(row mediaCatalogRow) MediaCatalogItem {
 	return MediaCatalogItem{ID: encodeCatalogToken(row.WorkKey), Title: row.Title, Kind: row.Kind, FileCount: row.FileCount, SeasonCount: row.SeasonCount, EpisodeCount: row.EpisodeCount, Size: row.Size, ModifiedAt: parseCatalogTime(row.ModifiedText), CategoryName: row.CategoryName, MatchStatus: row.MatchStatus, TMDBID: row.TMDBID, ReleaseYear: row.ReleaseYear, Confidence: row.Confidence, RecognitionErrorCode: row.RecognitionErrorCode, LibraryWorks: []MediaCatalogLibraryWork{}}
 }
 
-func (s *MediaLibraryService) catalogItems(rows []mediaCatalogRow) ([]MediaCatalogItem, error) {
+func (s *MediaLibraryService) catalogItemsTx(tx *gorm.DB, reader *CatalogReader, rows []mediaCatalogRow) ([]MediaCatalogItem, error) {
 	ids := make([]uint, 0, len(rows))
+	seen := make(map[uint]bool)
 	for _, row := range rows {
-		if row.RecognitionID != nil {
+		if row.RecognitionID != nil && !seen[*row.RecognitionID] {
+			seen[*row.RecognitionID] = true
 			ids = append(ids, *row.RecognitionID)
 		}
 	}
 	recognitions := make(map[uint]models.MediaLibraryRecognition, len(ids))
-	if len(ids) > 0 {
+	for start := 0; start < len(ids); start += 250 {
+		end := min(start+250, len(ids))
 		var records []models.MediaLibraryRecognition
-		if err := s.db.Where("id IN ?", ids).Find(&records).Error; err != nil {
+		if err := reader.Recognitions().Where("id IN ?", ids[start:end]).Find(&records).Error; err != nil {
 			return nil, err
 		}
 		for _, record := range records {
 			recognitions[record.ID] = record
 		}
 	}
+	// Image route configuration belongs to the same pinned DB snapshot. Client
+	// construction and ImageURL are pure; this does not perform a TMDB request.
+	client := s.catalogImageClientTx(tx)
 	items := make([]MediaCatalogItem, 0, len(rows))
 	for _, row := range rows {
 		item := catalogItem(row)
 		if row.RecognitionID != nil {
-			if recognition, ok := recognitions[*row.RecognitionID]; ok {
+			if recognition, ok := recognitions[*row.RecognitionID]; ok && recognition.LibraryID == row.LibraryID {
 				item.RecognitionToken, item.RecognitionRevision, item.ManualOverride = encodeRecognitionToken(recognition.ID), recognition.UpdatedAt.UnixNano(), recognition.ManualOverride
 				if _, snapshot, err := decodeRecognitionMetadata(recognition.MetadataJSON); err == nil {
 					item.OriginalTitle, item.Overview = snapshot.OriginalTitle, snapshot.Overview
-					item.PosterURL = s.catalogImageURL(snapshot.PosterPath, "w500")
-					item.BackdropURL = s.catalogImageURL(snapshot.BackdropPath, "w1280")
+					item.PosterURL = catalogImageURLWithClient(client, snapshot.PosterPath, "w500")
+					item.BackdropURL = catalogImageURLWithClient(client, snapshot.BackdropPath, "w1280")
 				}
 			}
 		}
 		items = append(items, item)
 	}
 	return items, nil
+}
+
+func (s *MediaLibraryService) catalogImageClientTx(tx *gorm.DB) *tmdb.Client {
+	if s.metadata == nil {
+		return nil
+	}
+	var record models.MetadataSettings
+	if err := tx.First(&record, 1).Error; err != nil {
+		return nil
+	}
+	if record.APIBaseURL == "" {
+		record.APIBaseURL = tmdb.DefaultAPIBaseURL
+	}
+	if record.ImageBaseURL == "" {
+		record.ImageBaseURL = tmdb.DefaultImageBaseURL
+	}
+	credential, _, err := s.metadata.effectiveCredential(record)
+	if err != nil {
+		return nil
+	}
+	client, err := s.metadata.clientFactory(credential, record.APIBaseURL, record.ImageBaseURL)
+	if err != nil {
+		return nil
+	}
+	return client
+}
+
+func catalogImageURLWithClient(client *tmdb.Client, identity, size string) string {
+	identity = safeTMDBImagePath(identity)
+	if client == nil || identity == "" {
+		return ""
+	}
+	upstream, err := client.ImageURL(identity, size)
+	if err != nil {
+		return ""
+	}
+	return proxyDiscoveryImage("tmdb", upstream)
 }
 
 func (s *MediaLibraryService) catalogImageURL(identity, size string) string {
@@ -536,7 +624,17 @@ func (s *MediaLibraryService) catalogImageURL(identity, size string) string {
 // empty or drifting association. Callers never accept recognition IDs from the
 // browser.
 func (s *MediaLibraryService) catalogRecognitionTokens(actor Actor, libraryID uint, workToken string) ([]string, error) {
-	if err := s.ensureMediaLibraryReadable(actor, libraryID); err != nil {
+	var result []string
+	err := s.withCatalogRead(context.Background(), []uint{libraryID}, func(tx *gorm.DB, reader *CatalogReader) error {
+		var err error
+		result, err = s.catalogRecognitionTokensTx(tx, reader, actor, libraryID, workToken)
+		return err
+	})
+	return result, err
+}
+
+func (s *MediaLibraryService) catalogRecognitionTokensTx(tx *gorm.DB, reader *CatalogReader, actor Actor, libraryID uint, workToken string) ([]string, error) {
+	if err := s.ensureMediaLibraryReadableTx(tx, actor, libraryID); err != nil {
 		return nil, err
 	}
 	workKey, err := decodeCatalogToken(workToken)
@@ -544,7 +642,7 @@ func (s *MediaLibraryService) catalogRecognitionTokens(actor Actor, libraryID ui
 		return nil, err
 	}
 	var ids []uint
-	if err := s.db.Model(&models.MediaLibraryEntry{}).Where("library_id = ? AND work_key = ? AND recognition_id IS NOT NULL", libraryID, workKey).Distinct().Order("recognition_id").Pluck("recognition_id", &ids).Error; err != nil {
+	if err := reader.Entries().Where("library_id = ? AND work_key = ? AND recognition_id IS NOT NULL", libraryID, workKey).Distinct().Order("recognition_id").Pluck("recognition_id", &ids).Error; err != nil {
 		return nil, err
 	}
 	if len(ids) == 0 {
@@ -604,9 +702,11 @@ func (s *MediaLibraryService) ClearCatalogRecognitionOverride(ctx context.Contex
 	}
 	result := make([]MediaRecognitionSummary, 0, len(tokens))
 	for _, token := range tokens {
-		var record models.MediaLibraryRecognition
-		id, _ := decodeRecognitionToken(token)
-		if s.db.First(&record, id).Error == nil && !record.ManualOverride {
+		record, _, _, readErr := s.recognitionContext(ctx, libraryID, token, false)
+		if readErr != nil {
+			return nil, readErr
+		}
+		if !record.ManualOverride {
 			continue
 		}
 		item, itemErr := s.ClearRecognitionOverride(ctx, actor, libraryID, token, request)

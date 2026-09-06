@@ -37,6 +37,7 @@ func (logger *traceCountingGORMLogger) Trace(_ context.Context, _ time.Time, cal
 }
 
 type recordingArtifactCleanup struct {
+	db     *gorm.DB
 	runIDs []string
 	result ArtifactCleanupResult
 }
@@ -84,7 +85,7 @@ func TestMediaArtifactRefreshRequeuesCompletedFastScanGeneration(t *testing.T) {
 	}
 }
 
-func TestMediaArtifactRefreshSignalsOverlappingRunningWorker(t *testing.T) {
+func TestMediaArtifactRefreshPreservesOverlappingRunningOwner(t *testing.T) {
 	management, queue, _, library, root := strmManagementFixture(t)
 	_, identity, err := canonicalProjectionRoot(root)
 	if err != nil {
@@ -112,8 +113,8 @@ func TestMediaArtifactRefreshSignalsOverlappingRunningWorker(t *testing.T) {
 		t.Fatalf("claim=%+v err=%v", claimed, err)
 	}
 	artifacts := NewMediaArtifactService(management.db, queue, &SignedProxyService{}, zerolog.Nop())
-	if err := artifacts.RefreshGeneration(library.ID, library.ArtifactGeneration); err != nil {
-		t.Fatal(err)
+	if err := artifacts.RefreshGeneration(library.ID, library.ArtifactGeneration); err == nil {
+		t.Fatal("refresh replaced a live owner's frozen policy")
 	}
 	var refreshedRun models.MediaArtifactRun
 	if err := management.db.First(&refreshedRun, "id = ?", run.ID).Error; err != nil {
@@ -127,19 +128,24 @@ func TestMediaArtifactRefreshSignalsOverlappingRunningWorker(t *testing.T) {
 	if err := management.db.First(&refreshedJob, "id = ?", job.ID).Error; err != nil {
 		t.Fatal(err)
 	}
-	if refreshedRun.Status != models.MediaArtifactStatusRunning || refreshedPolicy.RefreshSerial == 0 || refreshedJob.Generation <= refreshedJob.StartedGeneration {
+	if refreshedRun.Status != models.MediaArtifactStatusRunning || refreshedRun.PolicyJSON != string(policyJSON) || refreshedPolicy.RefreshSerial != 0 || refreshedJob.Generation != refreshedJob.StartedGeneration {
 		t.Fatalf("run=%+v policy=%+v job=%+v", refreshedRun, refreshedPolicy, refreshedJob)
 	}
 	if err := queue.Complete(claimed.Job.ID, claimed.LeaseToken); err != nil {
 		t.Fatal(err)
 	}
-	if err := management.db.First(&refreshedJob, "id = ?", job.ID).Error; err != nil || refreshedJob.Status != models.JobStatusQueued {
-		t.Fatalf("refresh signal was not requeued: job=%+v err=%v", refreshedJob, err)
+	if err := management.db.First(&refreshedJob, "id = ?", job.ID).Error; err != nil || refreshedJob.Status != models.JobStatusCompleted {
+		t.Fatalf("rejected refresh mutated live job: job=%+v err=%v", refreshedJob, err)
 	}
 }
 
 func (c *recordingArtifactCleanup) AutoCleanup(_ context.Context, runID string) ArtifactCleanupResult {
 	c.runIDs = append(c.runIDs, runID)
+	if c.result.ErrorCode == "" && c.db != nil {
+		if err := c.db.Model(&models.MediaArtifactRun{}).Where("id = ?", runID).Update("cleanup_status", models.MediaArtifactCleanupCompleted).Error; err != nil {
+			return ArtifactCleanupResult{ErrorCode: "artifact_cleanup_state_failed"}
+		}
+	}
 	return c.result
 }
 
@@ -153,18 +159,29 @@ func TestMediaArtifactWorkerResumesCleanupForCompletedRun(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	run := models.MediaArtifactRun{ID: "completed-cleanup-recovery", LibraryID: library.ID, Generation: library.ArtifactGeneration, PolicyJSON: string(policyJSON), Status: models.MediaArtifactStatusCompleted, CleanupStatus: models.MediaArtifactCleanupRunning, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()}
+	now := time.Now().UTC()
+	run := models.MediaArtifactRun{ID: "completed-cleanup-recovery", LibraryID: library.ID, Generation: library.ArtifactGeneration, PolicyJSON: string(policyJSON), Status: models.MediaArtifactStatusCompleted, CleanupStatus: models.MediaArtifactCleanupRunning, FinishedAt: &now, CreatedAt: now, UpdatedAt: now}
 	if err := service.db.Create(&run).Error; err != nil {
 		t.Fatal(err)
 	}
-	cleanup := &recordingArtifactCleanup{}
+	cleanup := &recordingArtifactCleanup{db: service.db}
 	artifacts := NewMediaArtifactService(service.db, queue, nil, zerolog.Nop())
 	artifacts.SetCleanupService(cleanup)
-	payload, _ := json.Marshal(mediaArtifactJobPayload{ArtifactRunID: run.ID})
-	result := NewMediaArtifactWorker(artifacts).Run(context.Background(), &providerWakeRuntime{}, ClaimedJob{Job: models.Job{PayloadJSON: string(payload)}})
+	_, err = queue.EnqueueWith(EnqueueJobInput{System: true, JobType: JobTypeMediaArtifact, DisplayName: "cleanup recovery", Payload: mediaArtifactJobPayload{ArtifactRunID: run.ID}}, func(tx *gorm.DB, job models.Job) error {
+		return tx.Model(&run).Update("job_id", job.ID).Error
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := queue.Claim([]string{JobTypeMediaArtifact})
+	if err != nil || claim == nil {
+		t.Fatalf("cleanup claim=%+v err=%v", claim, err)
+	}
+	result := NewMediaArtifactWorker(artifacts).Run(context.Background(), workerRuntime{queue: queue, job: *claim}, *claim)
 	if result.ErrorCode != "" || len(cleanup.runIDs) != 1 || cleanup.runIDs[0] != run.ID {
 		t.Fatalf("result=%+v cleanup=%v", result, cleanup.runIDs)
 	}
+	assertPhysicalOwnerState(t, service.db, CatalogPhysicalArtifact, run.ID, "settled")
 }
 
 func TestMediaArtifactWorkerGeneratesManagedSTRMAndPreservesUnmanagedFile(t *testing.T) {
@@ -245,7 +262,7 @@ func TestMediaArtifactWorkerGeneratesManagedSTRMAndPreservesUnmanagedFile(t *tes
 	artifacts.SetMediaChangeService(changes)
 	var notifiedRevision atomic.Uint64
 	changes.SetReadyHandler(func(_ uint, revision uint64) { notifiedRevision.Store(revision) })
-	cleanup := &recordingArtifactCleanup{}
+	cleanup := &recordingArtifactCleanup{db: db}
 	artifacts.SetCleanupService(cleanup)
 	scanFinished := time.Now().UTC()
 	partialScan := models.MediaLibraryScanRun{LibraryID: library.ID, Kind: "incremental", Status: "success", Generation: 1, Partial: true, StartedAt: now, FinishedAt: &scanFinished}
@@ -278,14 +295,25 @@ func TestMediaArtifactWorkerGeneratesManagedSTRMAndPreservesUnmanagedFile(t *tes
 		t.Fatal(err)
 	}
 	var queuedJobs int64
-	if err := db.Model(&models.Job{}).Where("job_type = ?", JobTypeMediaArtifact).Count(&queuedJobs).Error; err != nil || queuedJobs != 1 {
-		t.Fatalf("coalesced jobs=%d err=%v", queuedJobs, err)
+	if err := db.Model(&models.Job{}).Where("job_type = ?", JobTypeMediaArtifact).Count(&queuedJobs).Error; err != nil || queuedJobs != 2 {
+		t.Fatalf("per-run jobs=%d err=%v", queuedJobs, err)
 	}
 	claimed, err := queue.Claim([]string{JobTypeMediaArtifact})
 	if err != nil || claimed == nil {
 		t.Fatalf("claim=%+v err=%v", claimed, err)
 	}
 	result := NewMediaArtifactWorker(artifacts).Run(context.Background(), &providerWakeRuntime{}, *claimed)
+	if result.ErrorCode != "" || result.RetryAt != nil {
+		t.Fatalf("superseded worker result=%+v", result)
+	}
+	if err := queue.Complete(claimed.Job.ID, claimed.LeaseToken); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err = queue.Claim([]string{JobTypeMediaArtifact})
+	if err != nil || claimed == nil {
+		t.Fatalf("latest claim=%+v err=%v", claimed, err)
+	}
+	result = NewMediaArtifactWorker(artifacts).Run(context.Background(), &providerWakeRuntime{}, *claimed)
 	if result.ErrorCode != "" || result.RetryAt != nil {
 		t.Fatalf("worker result=%+v", result)
 	}
@@ -331,7 +359,7 @@ func TestMediaArtifactWorkerGeneratesManagedSTRMAndPreservesUnmanagedFile(t *tes
 	if err := db.Where("library_id = ? AND generation = ?", library.ID, 1).First(&superseded).Error; err != nil {
 		t.Fatal(err)
 	}
-	if superseded.Status != models.MediaArtifactStatusSuperseded || superseded.JobID != nil {
+	if superseded.Status != models.MediaArtifactStatusSuperseded || superseded.JobID == nil || *superseded.JobID == claimed.Job.ID {
 		t.Fatalf("superseded run=%+v", superseded)
 	}
 	var supersededPolicy mediaArtifactPolicy
@@ -339,6 +367,9 @@ func TestMediaArtifactWorkerGeneratesManagedSTRMAndPreservesUnmanagedFile(t *tes
 		t.Fatalf("superseded policy=%+v err=%v", supersededPolicy, err)
 	}
 	var manifestCount int64
+	if err := queue.Complete(claimed.Job.ID, claimed.LeaseToken); err != nil {
+		t.Fatal(err)
+	}
 	if err := db.Model(&models.MediaArtifact{}).Where("library_id = ?", library.ID).Count(&manifestCount).Error; err != nil || manifestCount != 4 {
 		t.Fatalf("manifest count=%d err=%v", manifestCount, err)
 	}
@@ -346,8 +377,15 @@ func TestMediaArtifactWorkerGeneratesManagedSTRMAndPreservesUnmanagedFile(t *tes
 	if err := db.First(&refreshed, library.ID).Error; err != nil || refreshed.ArtifactAppliedGeneration != 2 || refreshed.ArtifactStatus != models.MediaArtifactStatusCompleted {
 		t.Fatalf("library artifact state=%+v err=%v", refreshed, err)
 	}
-	if err := db.First(&pendingChange, "sequence = ?", pendingChange.Sequence).Error; err != nil || pendingChange.State != models.MediaLibraryChangeReady || pendingChange.ReadyAt == nil {
+	pendingLibrary, pendingRevision := pendingChange.LibraryID, pendingChange.Revision
+	pendingChange = models.MediaLibraryChange{}
+	if err := db.First(&pendingChange, "library_id = ? AND revision = ?", pendingLibrary, pendingRevision).Error; err != nil || pendingChange.State != models.MediaLibraryChangeReady || pendingChange.ReadyAt == nil {
 		t.Fatalf("ready change=%+v err=%v", pendingChange, err)
+	}
+	for i := 0; i < 2; i++ {
+		if found, err := changes.DispatchBatch(context.Background()); err != nil || !found {
+			t.Fatalf("artifact ready dispatch=%v %v", found, err)
+		}
 	}
 	if err := db.First(&target, target.ID).Error; err != nil || target.DesiredRevision != pendingChange.Revision || notifiedRevision.Load() != pendingChange.Revision {
 		t.Fatalf("target=%+v change_revision=%d notified_revision=%d err=%v", target, pendingChange.Revision, notifiedRevision.Load(), err)
@@ -415,14 +453,25 @@ func TestMediaArtifactWorkerGeneratesManagedSTRMAndPreservesUnmanagedFile(t *tes
 			t.Fatal(err)
 		}
 		generated := models.MediaArtifactRun{ID: fmt.Sprintf("lease-generation-%d", generation), LibraryID: library.ID, Generation: generation, PolicyJSON: string(policyJSON), Status: models.MediaArtifactStatusRunning, CleanupStatus: models.MediaArtifactCleanupPending, CreatedAt: proxyNow, UpdatedAt: proxyNow}
-		if err := db.Create(&generated).Error; err != nil {
-			t.Fatal(err)
-		}
 		if err := db.Model(&models.MediaLibrary{}).Where("id = ?", library.ID).Updates(map[string]any{"artifact_generation": generation, "dirty_generation": generation, "artifact_status": models.MediaArtifactStatusRunning}).Error; err != nil {
 			t.Fatal(err)
 		}
-		if result := artifacts.generateArtifacts(context.Background(), &providerWakeRuntime{}, generated, mediaArtifactPolicy{LibraryID: library.ID, Generation: generation, StorageID: library.StorageID, StorageType: models.StorageTypePan115, ConnectionID: connection.ID, ProjectionRoot: projection, ProjectionRootIdentity: identity, TargetKind: models.MediaArtifactTargetLocalProjection, STRMEnabled: true, Metadata: true, AssetExtensions: effectiveSourceAssetExtensions(nil), ScanRunID: scan.ID, ScanKind: scan.Kind, CleanupEligible: true}); result.ErrorCode != "" {
+		_, err = queue.EnqueueWith(EnqueueJobInput{System: true, JobType: JobTypeMediaArtifact, DisplayName: "lease generation", ResourceKey: mediaArtifactResourceKey(library.ID), Payload: mediaArtifactJobPayload{ArtifactRunID: generated.ID}}, func(tx *gorm.DB, job models.Job) error {
+			generated.JobID = &job.ID
+			return RegisterCatalogPhysicalOwnerTx(tx, CatalogPhysicalWriteInput{LibraryID: library.ID, OwnerKind: CatalogPhysicalArtifact, OwnerID: generated.ID, ArtifactReceiptVersion: 1}, func(tx *gorm.DB) error { return tx.Create(&generated).Error })
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		claim, err := queue.Claim([]string{JobTypeMediaArtifact})
+		if err != nil || claim == nil {
+			t.Fatalf("generation claim=%+v err=%v", claim, err)
+		}
+		if result := NewMediaArtifactWorker(artifacts).Run(context.Background(), workerRuntime{queue: queue, job: *claim}, *claim); result.ErrorCode != "" {
 			t.Fatalf("generation %d result=%+v", generation, result)
+		}
+		if err := queue.Complete(claim.Job.ID, claim.LeaseToken); err != nil {
+			t.Fatal(err)
 		}
 		if err := db.First(&generated, "id = ?", generated.ID).Error; err != nil {
 			t.Fatal(err)
@@ -504,7 +553,7 @@ func TestMediaArtifactCompletionCASDoesNotInvalidateNewerManifest(t *testing.T) 
 	if err := service.db.Create(&active).Error; err != nil {
 		t.Fatal(err)
 	}
-	result := artifacts.generateArtifacts(context.Background(), &providerWakeRuntime{}, oldRun, oldPolicy)
+	result := artifacts.generateArtifacts(context.Background(), &providerWakeRuntime{}, ClaimedJob{}, CatalogPhysicalWritePermit{}, oldRun, oldPolicy)
 	if result.ErrorCode != "" {
 		t.Fatalf("result=%+v", result)
 	}

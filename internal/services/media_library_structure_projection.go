@@ -10,15 +10,50 @@ import (
 	"gorm.io/gorm"
 )
 
+// Retained issue rows are private historical bookkeeping after a source reset;
+// only the current diagnosis/source can contribute to the visible issue page.
+// Pre-diagnosis legacy rows are supported only before any source revision exists.
+func currentStructureIssueScopeTx(tx, query *gorm.DB, libraryID uint) (*gorm.DB, error) {
+	var diagnosis models.MediaLibraryStructureDiagnosis
+	err := tx.First(&diagnosis, "library_id = ?", libraryID).Error
+	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+		return query, err
+	}
+	var source models.MediaLibraryStructureAutoState
+	if err := tx.First(&source, "library_id = ?", libraryID).Error; err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+		return query, err
+	}
+	if diagnosis.LibraryID == 0 {
+		if source.SourceRevision > 1 {
+			return query.Where("1 = 0"), nil
+		}
+		return query, nil
+	}
+	if diagnosis.LastErrorCode == "source_changed" || (source.LibraryID != 0 && diagnosis.SourceRevision != 0 && source.SourceRevision != diagnosis.SourceRevision) {
+		return query.Where("1 = 0"), nil
+	}
+	return query.Where("diagnosis_job_id = ? AND generation = ?", diagnosis.JobID, diagnosis.Generation), nil
+}
+
 // refreshStructureSummaryTx projects the same grouped rows used by the paged
 // API. It runs in the writer transaction so cards and detail cannot disagree.
 func refreshStructureSummaryTx(tx *gorm.DB, libraryID uint, now time.Time) error {
 	var diagnosis models.MediaLibraryStructureDiagnosis
-	if err := tx.Select("status").Where("library_id = ?", libraryID).Take(&diagnosis).Error; err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+	if err := tx.Where("library_id = ?", libraryID).Take(&diagnosis).Error; errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil
+	} else if err != nil {
 		return err
 	}
-	if diagnosis.Status == models.MediaLibraryStructureQueued || diagnosis.Status == models.MediaLibraryStructureRunning {
+	if diagnosis.Status == models.MediaLibraryStructureQueued || diagnosis.Status == models.MediaLibraryStructureRunning || diagnosis.LastErrorCode == "source_changed" {
 		return nil
+	}
+	var source models.MediaLibraryStructureAutoState
+	if err := tx.First(&source, "library_id = ?", libraryID).Error; err == nil {
+		if diagnosis.SourceRevision != 0 && source.SourceRevision != diagnosis.SourceRevision {
+			return nil
+		}
+	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return err
 	}
 	var counts []struct {
 		Code                string
@@ -29,7 +64,7 @@ func refreshStructureSummaryTx(tx *gorm.DB, libraryID uint, now time.Time) error
 	}
 	if err := tx.Model(&models.MediaLibraryStructureIssue{}).
 		Select("code, repairable, state, conflict_source_count, COUNT(*) AS total").
-		Where("library_id = ? AND code <> ?", libraryID, "missing_season_episode").
+		Where("library_id = ? AND diagnosis_job_id = ? AND generation = ? AND code <> ?", libraryID, diagnosis.JobID, diagnosis.Generation, "missing_season_episode").
 		Group("code, repairable, state, conflict_source_count").Scan(&counts).Error; err != nil {
 		return err
 	}
@@ -54,7 +89,7 @@ func refreshStructureSummaryTx(tx *gorm.DB, libraryID uint, now time.Time) error
 		}
 	}
 	var rows []models.MediaLibraryStructureIssue
-	if err := tx.Where("library_id = ? AND code <> ?", libraryID, "missing_season_episode").Order("code,id").Limit(maxStructureIssueSamples).Find(&rows).Error; err != nil {
+	if err := tx.Where("library_id = ? AND diagnosis_job_id = ? AND generation = ? AND code <> ?", libraryID, diagnosis.JobID, diagnosis.Generation, "missing_season_episode").Order("code,id").Limit(maxStructureIssueSamples).Find(&rows).Error; err != nil {
 		return err
 	}
 	samples := make([]StructureIssue, 0, len(rows))

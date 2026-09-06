@@ -17,7 +17,7 @@ import (
 	"gorm.io/gorm"
 )
 
-func (w *TransferWorker) runCloudUpload(ctx context.Context, runtime JobRuntime, task models.TransferTask, download models.DownloadTask, manifest downloadpkg.Manifest, started time.Time) WorkerResult {
+func (w *TransferWorker) runCloudUpload(ctx context.Context, runtime JobRuntime, job ClaimedJob, task models.TransferTask, download models.DownloadTask, manifest downloadpkg.Manifest, started time.Time) WorkerResult {
 	ctx = cloudpkg.WithReadClass(ctx, cloudpkg.ReadClassPipeline)
 	if w.service.connections == nil || download.TargetConnectionID == nil || download.TargetStorageID == nil || strings.TrimSpace(download.TargetProviderRootID) == "" {
 		return w.cloudFailure(task, cloudTransferError("cloud_upload_snapshot_invalid", false, nil))
@@ -62,6 +62,11 @@ func (w *TransferWorker) runCloudUpload(ctx context.Context, runtime JobRuntime,
 		summaryPlan = append(summaryPlan, transferPlanItem{Relative: target.Relative, Size: target.File.Size, Group: target.Group})
 	}
 	validatedDirectories := map[string]struct{}{".": {}}
+	permit, err := enterCatalogPhysicalWrite(ctx, w.service.db, CatalogPhysicalWriteInput{LibraryID: task.LibraryID, OwnerKind: CatalogPhysicalTransfer, OwnerID: task.ID, Job: &job})
+	if err != nil {
+		return w.cloudFailure(task, cloudTransferError("transfer_write_admission_failed", true, err))
+	}
+	defer quiesceCatalogPhysicalWrite(w.service.db, permit, w.service.log)
 	for _, directory := range uniqueCloudTargetDirectories(targets) {
 		if _, err := w.ensureCloudDirectory(ctx, mutations, &task, &state, directory, validatedDirectories); err != nil {
 			return w.cloudFailure(task, err)
@@ -206,6 +211,9 @@ func (w *TransferWorker) runCloudUpload(ctx context.Context, runtime JobRuntime,
 			return err
 		}
 		if err := tx.Model(&task).Updates(map[string]any{"phase": models.TransferTaskStatusCompleted, "processed_files": len(targets), "last_error_code": "", "finished_at": now, "updated_at": now}).Error; err != nil {
+			return err
+		}
+		if err := SettleCatalogPhysicalWriteTx(tx, permit, &job); err != nil {
 			return err
 		}
 		return w.service.audit.Record(tx, &task.OwnerID, "transfer.complete", "transfer_task", task.ID, "success", map[string]any{"download_task_id": task.DownloadTaskID, "media_library_id": task.LibraryID, "mode": "managed_upload", "files": len(targets), "provider": cloudpkg.ProviderPan115}, RequestContext{})

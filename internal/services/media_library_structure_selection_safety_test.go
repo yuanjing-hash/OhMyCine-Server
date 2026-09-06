@@ -113,9 +113,7 @@ func TestStructureSelectionDuplicateProviderFactsNeverRecycleRealFile(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result := service.runRepair(context.Background(), fastScanTestRuntime{}, repair.ID); result.ErrorCode != "" {
-		t.Fatalf("skip repair failed: %+v", result)
-	}
+	completeLegacyStructureRepairForTest(t, service, repair)
 	assertStructureProviderFilePreserved(t, driver)
 }
 

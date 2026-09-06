@@ -50,6 +50,7 @@ func (f *fakeReadCloudDriver) OpenRead(_ context.Context, request cloudpkg.ReadR
 
 func TestPan115ToLocalMaterializationResumesPartialAndCleansOwnedRoot(t *testing.T) {
 	queue, actor, _ := queueFixture(t)
+	queue.SetClock(realClock{})
 	var profile models.MediaClassificationProfile
 	if err := queue.db.Where("code = ?", "default-v1").First(&profile).Error; err != nil {
 		t.Fatal(err)

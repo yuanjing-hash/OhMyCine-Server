@@ -12,10 +12,11 @@ import (
 )
 
 type AdminService struct {
-	db    *gorm.DB
-	authz *AuthorizationService
-	auth  *AuthService
-	audit *AuditService
+	catalogStore *CatalogSnapshotStore
+	db           *gorm.DB
+	authz        *AuthorizationService
+	auth         *AuthService
+	audit        *AuditService
 }
 
 func NewAdminService(db *gorm.DB, authorization *AuthorizationService, auth *AuthService, audit *AuditService) *AdminService {

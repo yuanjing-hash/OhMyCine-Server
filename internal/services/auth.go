@@ -1,6 +1,7 @@
 package services
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -419,6 +420,24 @@ func (s *AuthService) Logout(token string, actor Actor, request RequestContext) 
 	}
 	_ = s.audit.Record(nil, &actor.User.ID, "auth.logout", "session", "current", "success", map[string]any{}, request)
 	return nil
+}
+
+// RevalidateSession is a read-only authority check for an established stream.
+// Background events and ping/pong must not extend a user's idle session.
+func (s *AuthService) RevalidateSession(ctx context.Context, token string) (Actor, error) {
+	if token == "" {
+		return Actor{}, appError(CodeNotAuthenticated, "请先登录", nil)
+	}
+	db := s.db.WithContext(ctx)
+	var session models.Session
+	if err := db.Where("token_hash = ?", tokenHash(token)).First(&session).Error; err != nil {
+		return Actor{}, appError(CodeNotAuthenticated, "登录会话无效", err)
+	}
+	now := s.now().UTC()
+	if session.RevokedAt != nil || !now.Before(session.IdleExpiresAt) || !now.Before(session.AbsoluteExpiresAt) {
+		return Actor{}, appError(CodeNotAuthenticated, "登录会话已过期", nil)
+	}
+	return s.authz.resolveWithDB(db, session.UserID)
 }
 
 func (s *AuthService) RevokeUserSessions(tx *gorm.DB, userID uint) error {

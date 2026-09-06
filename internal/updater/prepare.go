@@ -73,6 +73,13 @@ func (c *GitHubClient) Prepare(ctx context.Context, release SelectedRelease, sto
 	if err := ExtractCandidate(paths.Archive, paths.Candidate, names); err != nil {
 		return PreparedUpdate{}, err
 	}
+	probe := c.probeCompatibility
+	if probe == nil {
+		probe = verifyBinaryCompatibility
+	}
+	if err := probe(ctx, paths.Candidate); err != nil {
+		return PreparedUpdate{}, err
+	}
 	if err := copyExecutable(paths.Candidate, paths.Helper); err != nil {
 		return PreparedUpdate{}, err
 	}
@@ -84,7 +91,7 @@ func (c *GitHubClient) Prepare(ctx context.Context, release SelectedRelease, sto
 	if healthWait == 0 {
 		healthWait = 90 * time.Second
 	}
-	plan := Plan{OperationID: paths.OperationID, TargetVersion: release.Version.String(), RuntimeDirectory: store.RuntimeDirectory(), CurrentExecutable: currentExecutable, CurrentSHA256: currentDigest, Candidate: paths.Candidate, Backup: paths.Backup, ParentPID: request.ParentPID, OriginalArgs: append([]string(nil), request.OriginalArgs...), HealthURL: request.HealthURL, ParentWaitMillis: parentWait.Milliseconds(), HealthWaitMillis: healthWait.Milliseconds(), CreatedAt: time.Now().UTC()}
+	plan := Plan{OperationID: paths.OperationID, TargetVersion: release.Version.String(), RuntimeDirectory: store.RuntimeDirectory(), CurrentExecutable: currentExecutable, CurrentSHA256: currentDigest, Candidate: paths.Candidate, Backup: paths.Backup, ParentPID: request.ParentPID, OriginalArgs: StripCompatibilityArguments(request.OriginalArgs), HealthURL: request.HealthURL, ParentWaitMillis: parentWait.Milliseconds(), HealthWaitMillis: healthWait.Milliseconds(), CreatedAt: time.Now().UTC()}
 	planPath, err := store.SavePlan(plan)
 	if err != nil {
 		return PreparedUpdate{}, err

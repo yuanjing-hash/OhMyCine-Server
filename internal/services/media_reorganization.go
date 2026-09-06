@@ -81,12 +81,15 @@ type MediaReorganizationTaskSummary struct {
 }
 
 type reorganizationPlan struct {
-	Version         int                      `json:"version"`
-	LibraryID       uint                     `json:"library_id"`
-	TransferTaskID  string                   `json:"transfer_task_id"`
-	StorageType     string                   `json:"storage_type"`
-	RuleFingerprint string                   `json:"rule_fingerprint"`
-	Items           []reorganizationPlanItem `json:"items"`
+	Version         int                         `json:"version"`
+	LibraryID       uint                        `json:"library_id"`
+	TransferTaskID  string                      `json:"transfer_task_id"`
+	StorageType     string                      `json:"storage_type"`
+	RuleFingerprint string                      `json:"rule_fingerprint"`
+	Items           []reorganizationPlanItem    `json:"items"`
+	CatalogFence    *reorganizationCatalogFence `json:"catalog_fence,omitempty"`
+	VerifiedResult  *MediaRecognitionResult     `json:"verified_result,omitempty"`
+	ManagedRevision uint64                      `json:"managed_revision"`
 }
 
 type reorganizationPlanItem struct {
@@ -102,8 +105,9 @@ type reorganizationPlanItem struct {
 }
 
 type reorganizationState struct {
-	Version   int           `json:"version"`
-	Completed map[uint]bool `json:"completed"`
+	Version   int                         `json:"version"`
+	Completed map[uint]bool               `json:"completed"`
+	Catalog   *reorganizationCatalogState `json:"catalog,omitempty"`
 }
 
 type mediaReorganizationJobPayload struct {
@@ -187,6 +191,13 @@ func (s *MediaReorganizationService) Preview(ctx context.Context, actor Actor, i
 	if conflicts > 0 && input.ConflictPolicy == models.MediaLibraryConflictAsk {
 		return MediaReorganizationPreviewResult{}, appError(CodeReorganizationConflict, "新位置存在冲突，请选择跳过或重命名后重新预览", nil)
 	}
+	if err := s.freezeReorganizationPreview(ctx, &plan, library, storage, profile); err != nil {
+		return MediaReorganizationPreviewResult{}, reorganizationAppError(err)
+	}
+	if plan.CatalogFence != nil {
+		plan.Version = 2
+		plan.VerifiedResult = &MediaRecognitionResult{Status: mediaRecognitionStatusMatched, Title: match.Title, MediaType: match.MediaType, TMDBID: &match.ID, ReleaseYear: match.ReleaseYear, Confidence: &confidence, CategoryName: classified.CategoryName, MatchedRuleID: classified.MatchedRuleID, Metadata: classificationMetadataForMatch(match), Snapshot: match.Snapshot}
+	}
 	planRaw, _ := json.Marshal(plan)
 	digest := managedManifestDigest(items)
 	token, tokenHash, err := newOpaqueConfirmationToken()
@@ -221,6 +232,9 @@ func (s *MediaReorganizationService) Confirm(actor Actor, token string, request 
 	jobID := uuid.NewString()
 	enqueueInput.Payload = mediaReorganizationJobPayload{ReorganizationTaskID: jobID}
 	queued, err := s.queue.EnqueueWith(enqueueInput, func(tx *gorm.DB, job models.Job) error {
+		if err := AssertCatalogPhysicalAdmissionTx(tx, schedulingPreview.LibraryID); err != nil {
+			return err
+		}
 		var preview models.MediaReorganizationPreview
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("token_hash = ?", hex.EncodeToString(hash[:])).First(&preview).Error; err != nil {
 			return appError(CodeReorganizationPreviewExpired, "重新整理预览已失效，请重新预览", nil)
@@ -244,10 +258,14 @@ func (s *MediaReorganizationService) Confirm(actor Actor, token string, request 
 			return appError(CodeReorganizationBoundaryChanged, "目标媒体身份无效，请重新预览", nil)
 		}
 		now, id := time.Now().UTC(), jobID
-		stateRaw, _ := json.Marshal(reorganizationState{Version: 1, Completed: map[uint]bool{}})
+		state := reorganizationState{Version: 1, Completed: map[uint]bool{}}
+		if err := s.freezeReorganizationConfirmationTx(tx, id, library.ID, plan, &state); err != nil {
+			return reorganizationAppError(err)
+		}
+		stateRaw, _ := json.Marshal(state)
 		created = models.MediaReorganizationTask{ID: id, OwnerID: actor.User.ID, LibraryID: library.ID, TransferTaskID: transfer.ID, SourceIdentityRevision: preview.SourceIdentityRevision, TargetIdentityRevision: target.Revision, TargetIdentityJSON: preview.TargetIdentityJSON, ManagedManifestDigest: preview.ManagedManifestDigest, RuleRevision: preview.RuleRevision, ConflictPolicy: preview.ConflictPolicy, PlanJSON: preview.PlanJSON, StateJSON: string(stateRaw), Phase: models.MediaReorganizationPhaseQueued, TotalItems: len(plan.Items), CreatedAt: now, UpdatedAt: now}
 		created.JobID = job.ID
-		if err := tx.Create(&created).Error; err != nil {
+		if err := RegisterCatalogPhysicalOwnerTx(tx, CatalogPhysicalWriteInput{LibraryID: created.LibraryID, OwnerKind: CatalogPhysicalReorganization, OwnerID: created.ID, ActorID: actor.User.ID}, func(tx *gorm.DB) error { return tx.Create(&created).Error }); err != nil {
 			return err
 		}
 		if err := tx.Model(&preview).Updates(map[string]any{"consumed_at": now}).Error; err != nil {
@@ -303,7 +321,7 @@ func (s *MediaReorganizationService) loadBoundaryWithDB(db *gorm.DB, actor Actor
 }
 
 func buildReorganizationPlan(library models.MediaLibrary, storage models.Storage, transfer models.TransferTask, download models.DownloadTask, source, target MediaIdentitySnapshot, items []models.MediaManagedItem, policy string) (reorganizationPlan, int, error) {
-	plan := reorganizationPlan{Version: 1, LibraryID: library.ID, TransferTaskID: transfer.ID, StorageType: storage.Type, RuleFingerprint: libraryRuleFingerprint(library), Items: make([]reorganizationPlanItem, 0, len(items))}
+	plan := reorganizationPlan{Version: 1, LibraryID: library.ID, TransferTaskID: transfer.ID, StorageType: storage.Type, RuleFingerprint: libraryRuleFingerprint(library), ManagedRevision: transfer.ManagedRevision, Items: make([]reorganizationPlanItem, 0, len(items))}
 	originalByProviderID := map[string]downloadpkg.File{}
 	episodeByProviderID := map[string]transferEpisodeFact{}
 	if strings.TrimSpace(transfer.ManifestJSON) != "" {
@@ -381,7 +399,7 @@ func buildReorganizationPlan(library models.MediaLibrary, storage models.Storage
 			return plan, 0, appError(CodeInvalidRequest, "媒体库命名规则无效", nil)
 		}
 		ext := strings.ToLower(pathpkg.Ext(item.RelativePath))
-		if target.MediaType == "movie" && values.Version != "" && !strings.Contains(filenameTemplate, "{version}") {
+		if values.Version != "" && !strings.Contains(filenameTemplate, "{version}") {
 			base = appendMovieReleaseVersion(base, values.Version)
 		}
 		newRelative, err := sanitizeTransferRelativePath(pathpkg.Join(dir, base+ext))
@@ -454,7 +472,9 @@ func managedManifestDigest(items []models.MediaManagedItem) string {
 }
 
 func libraryRuleFingerprint(library models.MediaLibrary) string {
-	h := sha256.Sum256([]byte(strings.Join([]string{strconv.FormatUint(library.ProfileRevision, 10), library.MovieDirectoryTemplate, library.MovieFilenameTemplate, library.TVDirectoryTemplate, library.TVFilenameTemplate, library.RelativeRoot, library.ProviderRootID}, "\x00")))
+	// Old lossy version plans require a fresh preview even if the Profile
+	// itself hasn't changed. Check this before any move or recycle operation.
+	h := sha256.Sum256([]byte(strings.Join([]string{"multiversion-naming-v2", strconv.FormatUint(library.ProfileRevision, 10), library.MovieDirectoryTemplate, library.MovieFilenameTemplate, library.TVDirectoryTemplate, library.TVFilenameTemplate, library.RelativeRoot, library.ProviderRootID}, "\x00")))
 	return hex.EncodeToString(h[:])
 }
 
@@ -647,12 +667,24 @@ func (w *MediaReorganizationWorker) Run(ctx context.Context, runtime JobRuntime,
 	if w.service.db.First(&library, task.LibraryID).Error != nil || w.service.db.First(&storage, library.StorageID).Error != nil || w.service.db.First(&transfer, "id = ?", task.TransferTaskID).Error != nil || w.service.db.First(&download, "id = ?", transfer.DownloadTaskID).Error != nil {
 		return w.fail(task, CodeReorganizationUnavailable, "重新整理边界不可用")
 	}
-	if library.ProfileRevision != task.RuleRevision || libraryRuleFingerprint(library) != plan.RuleFingerprint || download.IdentityRevision != task.SourceIdentityRevision {
+	if (state.Catalog == nil || state.Catalog.Stage != "reconciling") && (library.ProfileRevision != task.RuleRevision || libraryRuleFingerprint(library) != plan.RuleFingerprint || download.IdentityRevision != task.SourceIdentityRevision) {
 		return w.fail(task, CodeReorganizationBoundaryChanged, "媒体身份或规则已变化，请重新预览")
+	}
+	versioned, catalogErr := w.service.reorganizationCatalogMode(ctx, library.ID)
+	if catalogErr != nil {
+		return w.fail(task, CodeReorganizationBoundaryChanged, "媒体目录不可用，请重新预览")
+	}
+	if versioned || state.Catalog != nil || plan.CatalogFence != nil {
+		return w.runVersioned(ctx, runtime, job, task, download, library, storage, plan, state)
 	}
 	if err := w.validatePlanBoundary(task, plan, state); err != nil {
 		return w.fail(task, ErrorCode(err), ErrorMessage(err))
 	}
+	permit, enterErr := enterCatalogPhysicalWrite(ctx, w.service.db, CatalogPhysicalWriteInput{LibraryID: library.ID, OwnerKind: CatalogPhysicalReorganization, OwnerID: task.ID, Job: &job})
+	if enterErr != nil {
+		return w.fail(task, ErrorCode(enterErr), ErrorMessage(enterErr))
+	}
+	defer quiesceCatalogPhysicalWrite(w.service.db, permit, w.service.log)
 	_ = w.service.db.Model(&task).Updates(map[string]any{"phase": models.MediaReorganizationPhaseExecuting, "last_error_code": "", "updated_at": time.Now().UTC()}).Error
 	var err error
 	switch storage.Type {
@@ -666,7 +698,7 @@ func (w *MediaReorganizationWorker) Run(ctx context.Context, runtime JobRuntime,
 	if err != nil {
 		return w.fail(task, ErrorCode(err), ErrorMessage(err))
 	}
-	if err := w.finalize(task, download, library, plan); err != nil {
+	if err := w.finalize(task, download, library, plan, permit, job); err != nil {
 		return w.fail(task, "media_reorganization_reconcile_failed", "重新整理对账失败")
 	}
 	// Re-scan through the normal library pipeline so metadata snapshots,
@@ -885,7 +917,7 @@ func (w *MediaReorganizationWorker) persistProgress(task *models.MediaReorganiza
 	})
 }
 
-func (w *MediaReorganizationWorker) finalize(task models.MediaReorganizationTask, download models.DownloadTask, library models.MediaLibrary, plan reorganizationPlan) error {
+func (w *MediaReorganizationWorker) finalize(task models.MediaReorganizationTask, download models.DownloadTask, library models.MediaLibrary, plan reorganizationPlan, permit CatalogPhysicalWritePermit, claim ClaimedJob) error {
 	var target MediaIdentitySnapshot
 	if decodeStrictJSON(task.TargetIdentityJSON, &target) != nil {
 		return errors.New("invalid target identity")
@@ -908,6 +940,9 @@ func (w *MediaReorganizationWorker) finalize(task models.MediaReorganizationTask
 			return err
 		}
 		if err := tx.Model(&task).Updates(map[string]any{"phase": models.MediaReorganizationPhaseCompleted, "processed_items": task.TotalItems, "last_error_code": "", "finished_at": now, "updated_at": now}).Error; err != nil {
+			return err
+		}
+		if err := SettleCatalogPhysicalWriteTx(tx, permit, &claim); err != nil {
 			return err
 		}
 		return w.service.audit.Record(tx, &task.OwnerID, "media.reorganization.complete", "media_reorganization_task", task.ID, "success", map[string]any{"library_id": library.ID, "items": task.TotalItems}, RequestContext{})

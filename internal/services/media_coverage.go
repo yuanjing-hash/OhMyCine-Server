@@ -2,6 +2,7 @@ package services
 
 import (
 	"context"
+	"errors"
 	"sort"
 	"strings"
 	"sync"
@@ -16,9 +17,10 @@ import (
 const maxCoverageSeasons = 200
 
 type MediaCoverageService struct {
-	db       *gorm.DB
-	metadata *MetadataSettingsService
-	now      func() time.Time
+	catalogStore *CatalogSnapshotStore
+	db           *gorm.DB
+	metadata     *MetadataSettingsService
+	now          func() time.Time
 }
 
 type MediaCoverageLibrary struct {
@@ -82,6 +84,10 @@ func NewMediaCoverageService(db *gorm.DB, metadata *MetadataSettingsService) *Me
 	return &MediaCoverageService{db: db, metadata: metadata, now: func() time.Time { return time.Now().UTC() }}
 }
 
+func (s *MediaCoverageService) SetCatalogSnapshotStore(store *CatalogSnapshotStore) {
+	s.catalogStore = store
+}
+
 func (s *MediaCoverageService) Coverage(ctx context.Context, actor Actor, mediaType string, tmdbID int64) (MediaCoverage, error) {
 	if !actor.HasPermission(authz.PermissionDiscoveryRead) || !actor.HasPermission(authz.PermissionMediaLibrariesRead) {
 		return MediaCoverage{}, appError(CodePermissionDenied, "无权查看媒体库覆盖率", nil)
@@ -101,15 +107,11 @@ func (s *MediaCoverageService) Coverage(ctx context.Context, actor Actor, mediaT
 	if err != nil {
 		return MediaCoverage{}, appError(tmdb.ErrorCode(err), "TMDB 作品身份无法解析", nil)
 	}
-	libraries, reliable, scanState, err := s.coverageLibraries(actor)
+	libraries, entries, reliable, scanState, err := s.coverageCatalog(ctx, actor, mediaType, tmdbID)
 	if err != nil {
 		return MediaCoverage{}, err
 	}
 	result := MediaCoverage{MediaType: mediaType, TMDBID: tmdbID, Title: verified.Title, Status: "unknown", Libraries: libraries, Freshness: MediaCoverageFreshness{CheckedAt: s.now(), LibraryScanState: scanState, TMDBState: "complete"}}
-	entries, err := s.coverageEntries(mediaType, tmdbID, libraries)
-	if err != nil {
-		return MediaCoverage{}, err
-	}
 	if mediaType == "movie" {
 		ids := uniqueEntryLibraries(entries, nil, nil)
 		result.Movie = &struct {
@@ -262,9 +264,40 @@ func normalizeMediaCoverageCollections(result *MediaCoverage) {
 	}
 }
 
-func (s *MediaCoverageService) coverageLibraries(actor Actor) ([]MediaCoverageLibrary, bool, string, error) {
+func (s *MediaCoverageService) coverageCatalog(ctx context.Context, actor Actor, mediaType string, tmdbID int64) ([]MediaCoverageLibrary, []models.MediaLibraryEntry, bool, string, error) {
+	facade := &MediaLibraryService{db: s.db, catalogStore: s.catalogStore}
+	var libraries []MediaCoverageLibrary
+	var entries []models.MediaLibraryEntry
+	var reliable bool
+	state := "unknown"
+	err := facade.withCatalogReadTx(ctx, func(tx *gorm.DB) error {
+		var err error
+		libraries, reliable, state, err = s.coverageLibrariesTx(tx, actor)
+		if err != nil {
+			return err
+		}
+		ids := make([]uint, 0, len(libraries))
+		for _, library := range libraries {
+			ids = append(ids, library.ID)
+		}
+		reader, err := PinCatalogTx(tx, ids)
+		if err != nil {
+			return err
+		}
+		entries, err = coverageEntries(reader, mediaType, tmdbID)
+		return err
+	})
+	return libraries, entries, reliable, state, err
+}
+
+func (s *MediaCoverageService) coverageLibrariesTx(tx *gorm.DB, actor Actor) ([]MediaCoverageLibrary, bool, string, error) {
+	facade := &MediaLibraryService{db: s.db, catalogStore: s.catalogStore}
+	ids, err := facade.authorizedMediaLibraryIDsTx(tx, actor, authz.PermissionMediaLibrariesRead, true)
+	if err != nil {
+		return nil, false, "unknown", err
+	}
 	var records []models.MediaLibrary
-	if err := s.db.Where("enabled = ?", true).Order("sort_order ASC,id ASC").Find(&records).Error; err != nil {
+	if err := tx.Select("media_libraries.*").Joins("JOIN storages ON storages.id=media_libraries.storage_id").Where("media_libraries.id IN ? AND media_libraries.enabled = ? AND storages.enabled = ?", ids, true, true).Order("media_libraries.sort_order ASC,media_libraries.id ASC").Find(&records).Error; err != nil {
 		return nil, false, "unknown", err
 	}
 	result := make([]MediaCoverageLibrary, 0, len(records))
@@ -277,7 +310,10 @@ func (s *MediaCoverageService) coverageLibraries(actor Actor) ([]MediaCoverageLi
 		}
 		state := "unscanned"
 		var run models.MediaLibraryScanRun
-		runErr := s.db.Where("library_id = ?", record.ID).Order("id DESC").First(&run).Error
+		runErr := tx.Where("library_id = ?", record.ID).Order("id DESC").First(&run).Error
+		if runErr != nil && !errors.Is(runErr, gorm.ErrRecordNotFound) {
+			return nil, false, "unknown", runErr
+		}
 		if record.BaselineGeneration > 0 && record.LastSuccessfulScanAt != nil {
 			anyScanned = true
 			if runErr == nil && (run.Status != "success" || run.Partial) {
@@ -302,16 +338,9 @@ func (s *MediaCoverageService) coverageLibraries(actor Actor) ([]MediaCoverageLi
 	return result, reliable, aggregate, nil
 }
 
-func (s *MediaCoverageService) coverageEntries(mediaType string, tmdbID int64, libraries []MediaCoverageLibrary) ([]models.MediaLibraryEntry, error) {
-	ids := make([]uint, 0, len(libraries))
-	for _, library := range libraries {
-		ids = append(ids, library.ID)
-	}
-	if len(ids) == 0 {
-		return []models.MediaLibraryEntry{}, nil
-	}
+func coverageEntries(reader *CatalogReader, mediaType string, tmdbID int64) ([]models.MediaLibraryEntry, error) {
 	var entries []models.MediaLibraryEntry
-	err := s.db.Where("library_id IN ? AND media_type = ? AND tmdb_id = ? AND match_status = ?", ids, mediaType, tmdbID, mediaRecognitionStatusMatched).Find(&entries).Error
+	err := reader.Entries().Where("media_type = ? AND tmdb_id = ? AND match_status = ?", mediaType, tmdbID, mediaRecognitionStatusMatched).Find(&entries).Error
 	return entries, err
 }
 

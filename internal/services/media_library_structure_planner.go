@@ -5,6 +5,7 @@ import (
 	"errors"
 	pathpkg "path"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -76,6 +77,7 @@ type StructureIssue struct {
 }
 
 type StructurePlan struct {
+	catalogFence        *structureLogicalFence
 	Version             int                           `json:"version"`
 	LibraryID           uint                          `json:"library_id"`
 	Generation          uint64                        `json:"generation"`
@@ -665,9 +667,12 @@ func structureVideoTarget(library models.MediaLibrary, entry models.MediaLibrary
 			return "", errPackageEpisodeUnrecognized
 		}
 		dirTemplate, fileTemplate = library.TVDirectoryTemplate, library.TVFilenameTemplate
-	} else {
-		values.Version = releaseversion.Parse(entry.RelativePath)
 	}
+	// Existing libraries may already have Emby-compatible version names. Use
+	// the version-free template as identity prefix; never strip a valid suffix
+	// merely because it isn't represented by our download release parser.
+	canonicalBase, canonicalErr := renderImportTemplate(fileTemplate, values, false)
+	values.Version = releaseversion.Parse(entry.RelativePath)
 	directory, err := renderImportTemplate(dirTemplate, values, true)
 	if err != nil {
 		return "", err
@@ -676,12 +681,41 @@ func structureVideoTarget(library models.MediaLibrary, entry models.MediaLibrary
 	if err != nil {
 		return "", err
 	}
-	if entry.MediaType == "movie" && values.Version != "" && !strings.Contains(fileTemplate, "{version}") && !strings.Contains(strings.ToLower(base), strings.ToLower(values.Version)) {
+	if values.Version != "" && !strings.Contains(fileTemplate, "{version}") && !strings.Contains(strings.ToLower(base), strings.ToLower(values.Version)) {
 		base = appendMovieReleaseVersion(base, values.Version)
+	}
+	sourceBase := strings.TrimSuffix(pathpkg.Base(strings.ReplaceAll(entry.RelativePath, "\\", "/")), pathpkg.Ext(entry.RelativePath))
+	if canonicalErr == nil && structureExistingVersionName(sourceBase, canonicalBase) {
+		base = sourceBase
 	}
 	extension := strings.ToLower(pathpkg.Ext(strings.ReplaceAll(entry.RelativePath, "\\", "/")))
 	target := filepath.ToSlash(filepath.Join(directory, base+extension))
 	return sanitizeTransferRelativePath(target)
+}
+
+var structureNumberedVersion = regexp.MustCompile(`^\([1-9][0-9]{0,3}\)$`)
+var structureVersionEpisode = regexp.MustCompile(`(?i)(?:^|[ ._-])s[0-9]{1,3}e[0-9]{1,4}(?:$|[ ._-])`)
+
+func structureExistingVersionName(source, canonical string) bool {
+	if canonical == "" || len(source) <= len(canonical) || !strings.EqualFold(source[:len(canonical)], canonical) {
+		return false
+	}
+	suffix := source[len(canonical):]
+	if !strings.HasPrefix(suffix, " ") || strings.HasSuffix(source, ".") || strings.TrimSpace(source) != source {
+		return false
+	}
+	// Episode markers are identity, not edition labels. Do not preserve an
+	// extra SxxExx token after a template's work/episode identity prefix.
+	if structureVersionEpisode.MatchString(suffix) {
+		return false
+	}
+	if strings.HasPrefix(suffix, " - ") && strings.TrimSpace(suffix[3:]) != "" {
+		return true
+	}
+	if structureNumberedVersion.MatchString(strings.TrimSpace(suffix)) {
+		return true
+	}
+	return releaseversion.Parse(strings.TrimSpace(suffix)+".mkv") != ""
 }
 
 func structureSidecarTargetIndexed(source string, index *structureAssociationIndex) (string, string) {

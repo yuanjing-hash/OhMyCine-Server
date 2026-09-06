@@ -1,6 +1,7 @@
 package services
 
 import (
+	"context"
 	"errors"
 	"strconv"
 	"strings"
@@ -9,6 +10,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/google/uuid"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/authz"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
 	"gorm.io/gorm"
 )
@@ -21,9 +23,61 @@ const (
 type PlayerMediaStateService struct {
 	db        *gorm.DB
 	libraries *MediaLibraryService
+	reader    *CatalogReader
+}
+
+// Only the lightweight state reader is request-scoped; never copy the library
+// service, which owns mutexes and running supervisors. Nested reads keep the
+// caller's transaction and exact catalog heads.
+func readPlayerMediaState[T any](s *PlayerMediaStateService, actor Actor, read func(*PlayerMediaStateService) (T, error)) (T, error) {
+	var result T
+	if s == nil || s.libraries == nil {
+		return result, appError(CodeInvalidRequest, "Server 暂不支持媒体状态", nil)
+	}
+	if !actor.HasPermission(authz.PermissionMediaLibrariesRead) {
+		return result, appError(CodePermissionDenied, "无权查看媒体库", nil)
+	}
+	if s.reader != nil {
+		return read(s)
+	}
+	err := s.libraries.withCatalogReadTx(context.Background(), func(tx *gorm.DB) error {
+		ids, err := s.libraries.authorizedMediaLibraryIDsTx(tx, actor, authz.PermissionMediaLibrariesRead, true)
+		if err != nil {
+			return err
+		}
+		reader, err := PinCatalogTx(tx, ids)
+		if err != nil {
+			return err
+		}
+		result, err = read(&PlayerMediaStateService{db: tx, libraries: s.libraries, reader: reader})
+		return err
+	})
+	return result, err
+}
+
+func validateMediaStateWorkTx(tx *gorm.DB, actor Actor, libraryID uint, workKey string) error {
+	if err := ensurePlayerMediaLibraryReadableTx(tx, actor, libraryID); err != nil {
+		return err
+	}
+	reader, err := PinCatalogTx(tx, []uint{libraryID})
+	if err != nil {
+		return err
+	}
+	var entryID uint
+	if err := reader.Entries().Select("id").Where("library_id = ? AND work_key = ?", libraryID, workKey).Limit(1).Scan(&entryID).Error; err != nil {
+		return err
+	}
+	if entryID == 0 {
+		return appError(CodeNotFound, "媒体作品不存在", gorm.ErrRecordNotFound)
+	}
+	return nil
 }
 
 type PlayerCollectionSummary struct {
+	// Revision is the mutable collection/owner CAS version, not a complete
+	// automatic-membership cache key. Catalog media-change revisions invalidate
+	// automatic projections; physical snapshot compaction must not invent one.
+	Revision     uint64 `json:"revision"`
 	ID           string `json:"id"`
 	Name         string `json:"name"`
 	Kind         string `json:"kind"`
@@ -75,43 +129,48 @@ func (s *PlayerMediaStateService) resolveItem(actor Actor, itemID string) (uint,
 }
 
 func (s *PlayerMediaStateService) item(actor Actor, libraryID uint, workKey string) (PlayerMediaItem, error) {
-	if err := s.libraries.ensurePlayerMediaLibraryReadable(actor, libraryID); err != nil {
+	if s.reader == nil {
+		return readPlayerMediaState(s, actor, func(view *PlayerMediaStateService) (PlayerMediaItem, error) {
+			return view.item(actor, libraryID, workKey)
+		})
+	}
+	if err := ensurePlayerMediaLibraryReadableTx(s.db, actor, libraryID); err != nil {
 		return PlayerMediaItem{}, err
 	}
-	detail, err := s.libraries.CatalogDetail(actor, libraryID, encodeCatalogToken(workKey))
+	detail, err := s.libraries.catalogDetailTx(s.db, s.reader, actor, libraryID, encodeCatalogToken(workKey))
 	if err != nil {
 		return PlayerMediaItem{}, err
 	}
-	return s.libraries.playerMediaItem(libraryID, detail.Work)
+	return s.libraries.playerMediaItemTx(s.db, s.reader, libraryID, detail.Work)
 }
 
 func (s *PlayerMediaStateService) SetFavorite(actor Actor, itemID string, favorite bool) (bool, error) {
-	libraryID, workKey, _, err := s.resolveItem(actor, itemID)
+	libraryID, workKey, err := parsePlayerMediaStateItemID(itemID)
 	if err != nil {
 		return false, err
 	}
-	if !favorite {
-		if err := s.db.Where("user_id = ? AND library_id = ? AND work_key = ?", actor.User.ID, libraryID, workKey).Delete(&models.PlayerMediaFavorite{}).Error; err != nil {
-			return false, err
+	err = s.db.Transaction(func(tx *gorm.DB) error {
+		if err := validateMediaStateWorkTx(tx, actor, libraryID, workKey); err != nil {
+			return err
 		}
-		return false, nil
-	}
-	now := time.Now().UTC()
-	row := models.PlayerMediaFavorite{UserID: actor.User.ID, LibraryID: libraryID, WorkKey: workKey}
-	var existing models.PlayerMediaFavorite
-	err = s.db.Where("user_id = ? AND library_id = ? AND work_key = ?", actor.User.ID, libraryID, workKey).First(&existing).Error
-	if errors.Is(err, gorm.ErrRecordNotFound) {
-		row.CreatedAt, row.UpdatedAt = now, now
-		if err := s.db.Create(&row).Error; err != nil {
-			return false, err
+		if !favorite {
+			return tx.Where("user_id = ? AND library_id = ? AND work_key = ?", actor.User.ID, libraryID, workKey).Delete(&models.PlayerMediaFavorite{}).Error
 		}
-	} else if err != nil {
-		return false, err
-	}
-	return true, nil
+		var existing models.PlayerMediaFavorite
+		err := tx.Where("user_id = ? AND library_id = ? AND work_key = ?", actor.User.ID, libraryID, workKey).First(&existing).Error
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			now := time.Now().UTC()
+			return tx.Create(&models.PlayerMediaFavorite{UserID: actor.User.ID, LibraryID: libraryID, WorkKey: workKey, CreatedAt: now, UpdatedAt: now}).Error
+		}
+		return err
+	})
+	return favorite && err == nil, err
 }
 
 func (s *PlayerMediaStateService) FavoriteState(actor Actor, itemID string) (bool, error) {
+	if s.reader == nil {
+		return readPlayerMediaState(s, actor, func(view *PlayerMediaStateService) (bool, error) { return view.FavoriteState(actor, itemID) })
+	}
 	libraryID, workKey, _, err := s.resolveItem(actor, itemID)
 	if err != nil {
 		return false, err
@@ -124,6 +183,9 @@ func (s *PlayerMediaStateService) FavoriteState(actor Actor, itemID string) (boo
 }
 
 func (s *PlayerMediaStateService) Favorites(actor Actor) ([]PlayerMediaItem, error) {
+	if s.reader == nil {
+		return readPlayerMediaState(s, actor, func(view *PlayerMediaStateService) ([]PlayerMediaItem, error) { return view.Favorites(actor) })
+	}
 	var rows []models.PlayerMediaFavorite
 	if err := s.db.Where("user_id = ?", actor.User.ID).Order("updated_at DESC").Limit(maxPlayerMediaStateItems).Find(&rows).Error; err != nil {
 		return nil, err
@@ -133,6 +195,8 @@ func (s *PlayerMediaStateService) Favorites(actor Actor) ([]PlayerMediaItem, err
 		item, err := s.item(actor, row.LibraryID, row.WorkKey)
 		if err == nil {
 			result = append(result, item)
+		} else if ErrorCode(err) != CodeNotFound && ErrorCode(err) != CodePermissionDenied {
+			return nil, err
 		}
 	}
 	return result, nil
@@ -177,8 +241,19 @@ func (s *PlayerMediaStateService) readableCollection(actor Actor, id string, req
 		return models.PlayerMediaCollection{}, appError(CodeInvalidRequest, "合集标识无效", err)
 	}
 	var row models.PlayerMediaCollection
-	if err := s.db.First(&row, "id = ?", id).Error; err != nil {
-		return models.PlayerMediaCollection{}, appError(CodeNotFound, "合集不存在", err)
+	query := s.db.Model(&models.PlayerMediaCollection{})
+	if !requireOwner && s.reader != nil {
+		var err error
+		query, err = s.readableCollectionRows(actor)
+		if err != nil {
+			return row, err
+		}
+	}
+	if err := query.Where("id = ?", id).Take(&row).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return models.PlayerMediaCollection{}, appError(CodeNotFound, "合集不存在", err)
+		}
+		return models.PlayerMediaCollection{}, err
 	}
 	owned := row.OwnerID != nil && *row.OwnerID == actor.User.ID && row.Source == models.PlayerMediaCollectionSourceManual
 	if requireOwner && !owned {
@@ -191,27 +266,32 @@ func (s *PlayerMediaStateService) readableCollection(actor Actor, id string, req
 }
 
 func (s *PlayerMediaStateService) Collections(actor Actor, kind string) ([]PlayerCollectionSummary, error) {
+	if s.reader == nil {
+		return readPlayerMediaState(s, actor, func(view *PlayerMediaStateService) ([]PlayerCollectionSummary, error) {
+			return view.Collections(actor, kind)
+		})
+	}
 	if kind != "" && kind != models.PlayerMediaCollectionKindCollection && kind != models.PlayerMediaCollectionKindPlaylist {
 		return nil, appError(CodeInvalidRequest, "合集类型无效", nil)
 	}
-	query := s.db.Where("(source = ? AND visible = ?) OR (source = ? AND owner_id = ?)", models.PlayerMediaCollectionSourceTMDB, true, models.PlayerMediaCollectionSourceManual, actor.User.ID)
+	query, err := s.readableCollectionRows(actor)
+	if err != nil {
+		return nil, err
+	}
 	if kind != "" {
 		query = query.Where("kind = ?", kind)
 	}
-	var rows []models.PlayerMediaCollection
+	var rows []struct {
+		models.PlayerMediaCollection
+		ItemCount int
+	}
 	if err := query.Order("source, name, id").Limit(maxPlayerMediaStateCollections).Find(&rows).Error; err != nil {
 		return nil, err
 	}
 	result := make([]PlayerCollectionSummary, 0, len(rows))
+	imageClient := s.libraries.catalogImageClientTx(s.db)
 	for _, row := range rows {
-		items, err := s.collectionItems(actor, row.ID)
-		if err != nil {
-			return nil, err
-		}
-		if row.Source == models.PlayerMediaCollectionSourceTMDB && len(items) == 0 {
-			continue
-		}
-		result = append(result, PlayerCollectionSummary{ID: row.ID, Name: row.Name, Kind: row.Kind, Source: row.Source, ItemCount: len(items), PosterPath: row.PosterPath, BackdropPath: row.BackdropPath, PosterURL: s.libraries.catalogImageURL(row.PosterPath, "w500"), BackdropURL: s.libraries.catalogImageURL(row.BackdropPath, "w1280")})
+		result = append(result, PlayerCollectionSummary{ID: row.ID, Name: row.Name, Kind: row.Kind, Source: row.Source, ItemCount: row.ItemCount, Revision: row.Revision, PosterPath: row.PosterPath, BackdropPath: row.BackdropPath, PosterURL: catalogImageURLWithClient(imageClient, row.PosterPath, "w500"), BackdropURL: catalogImageURLWithClient(imageClient, row.BackdropPath, "w1280")})
 	}
 	return result, nil
 }
@@ -225,8 +305,16 @@ func (s *PlayerMediaStateService) BrowserCollections(actor Actor, kind string) (
 }
 
 func (s *PlayerMediaStateService) collectionItems(actor Actor, collectionID string) ([]PlayerMediaItem, error) {
+	collection, err := s.readableCollection(actor, collectionID, false)
+	if err != nil {
+		return nil, err
+	}
+	query, err := s.readableCollectionMemberRows(actor, collection)
+	if err != nil {
+		return nil, err
+	}
 	var rows []models.PlayerMediaCollectionItem
-	if err := s.db.Where("collection_id = ?", collectionID).Order("ordinal, id").Limit(maxPlayerMediaStateItems).Find(&rows).Error; err != nil {
+	if err := query.Order("ordinal, id, library_id, work_key").Limit(maxPlayerMediaStateItems).Scan(&rows).Error; err != nil {
 		return nil, err
 	}
 	result := make([]PlayerMediaItem, 0, len(rows))
@@ -240,12 +328,19 @@ func (s *PlayerMediaStateService) collectionItems(actor Actor, collectionID stri
 		if err == nil {
 			seen[key] = struct{}{}
 			result = append(result, item)
+		} else if ErrorCode(err) != CodeNotFound && ErrorCode(err) != CodePermissionDenied {
+			return nil, err
 		}
 	}
 	return result, nil
 }
 
 func (s *PlayerMediaStateService) CollectionItems(actor Actor, collectionID string) ([]PlayerMediaItem, error) {
+	if s.reader == nil {
+		return readPlayerMediaState(s, actor, func(view *PlayerMediaStateService) ([]PlayerMediaItem, error) {
+			return view.CollectionItems(actor, collectionID)
+		})
+	}
 	if _, err := s.readableCollection(actor, collectionID, false); err != nil {
 		return nil, err
 	}
@@ -261,25 +356,32 @@ func (s *PlayerMediaStateService) BrowserCollectionItems(actor Actor, collection
 }
 
 func (s *PlayerMediaStateService) AddCollectionItem(actor Actor, collectionID, itemID string) error {
-	collection, err := s.readableCollection(actor, collectionID, true)
+	libraryID, workKey, err := parsePlayerMediaStateItemID(itemID)
 	if err != nil {
-		return err
-	}
-	libraryID, workKey, _, err := s.resolveItem(actor, itemID)
-	if err != nil {
-		return err
-	}
-	var existing models.PlayerMediaCollectionItem
-	err = s.db.Where("collection_id = ? AND library_id = ? AND work_key = ? AND origin = ?", collection.ID, libraryID, workKey, models.PlayerMediaCollectionItemOriginManual).First(&existing).Error
-	if err == nil {
-		return nil
-	}
-	if !errors.Is(err, gorm.ErrRecordNotFound) {
 		return err
 	}
 	now := time.Now().UTC()
 	return s.db.Transaction(func(tx *gorm.DB) error {
+		view := &PlayerMediaStateService{db: tx, libraries: s.libraries}
+		collection, err := view.readableCollection(actor, collectionID, true)
+		if err != nil {
+			return err
+		}
+		if err := validateMediaStateWorkTx(tx, actor, libraryID, workKey); err != nil {
+			return err
+		}
+		var existing models.PlayerMediaCollectionItem
+		err = tx.Where("collection_id = ? AND library_id = ? AND work_key = ? AND origin = ?", collection.ID, libraryID, workKey, models.PlayerMediaCollectionItemOriginManual).First(&existing).Error
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, gorm.ErrRecordNotFound) {
+			return err
+		}
 		item := models.PlayerMediaCollectionItem{CollectionID: collection.ID, LibraryID: libraryID, WorkKey: workKey, Origin: models.PlayerMediaCollectionItemOriginManual, CreatedAt: now, UpdatedAt: now}
+		if err := tx.Model(&models.PlayerMediaCollectionItem{}).Where("collection_id = ?", collection.ID).Select("COALESCE(MAX(ordinal),-1)+1").Scan(&item.Ordinal).Error; err != nil {
+			return err
+		}
 		if err := tx.Create(&item).Error; err != nil {
 			return err
 		}

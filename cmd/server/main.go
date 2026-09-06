@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -12,6 +13,8 @@ import (
 	"syscall"
 	"time"
 	_ "time/tzdata"
+
+	"gorm.io/gorm"
 
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/config"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/credential"
@@ -36,6 +39,15 @@ import (
 )
 
 func main() {
+	// This command is part of the updater's explicit capability handshake. It
+	// must stay ahead of config loading, logging, migrations and all workers.
+	if handled, err := updater.RunCompatibilityCommand(os.Args, os.Stdout); handled {
+		if err != nil {
+			_, _ = fmt.Fprintln(os.Stderr, updater.ErrorCode(err))
+			os.Exit(2)
+		}
+		return
+	}
 	if handled, exitCode := runUpdateHelper(os.Args); handled {
 		if exitCode != 0 {
 			os.Exit(exitCode)
@@ -46,6 +58,27 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
+	runtimeDirectory, err := resolveUpdateRuntimeDirectory(cfg)
+	if err != nil {
+		_, _ = fmt.Fprintln(os.Stderr, updater.CodeCompatibilityRequired)
+		os.Exit(1)
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		_, _ = fmt.Fprintln(os.Stderr, updater.CodeCompatibilityRequired)
+		os.Exit(1)
+	}
+	catalogCompatibility, err := updater.CheckStartupCompatibility(cfg.DatabasePath, runtimeDirectory, executable, os.Args[1:])
+	if err != nil {
+		_, _ = fmt.Fprintln(os.Stderr, updater.ErrorCode(err))
+		os.Exit(1)
+	}
+	exclusiveRuntime, err := database.AcquireExclusiveRuntime(cfg.DatabasePath)
+	if err != nil {
+		_, _ = fmt.Fprintln(os.Stderr, "database_exclusive_runtime_unavailable")
+		os.Exit(1)
+	}
+	defer func() { _ = exclusiveRuntime.Close() }()
 	logManager, err := logging.NewManager(cfg.LogDirectory, cfg.Environment, os.Stdout)
 	if err != nil {
 		panic(err)
@@ -56,13 +89,48 @@ func main() {
 		}
 	}()
 	log := logManager.Logger("server", "bootstrap")
+	if err := catalogCompatibility.ReserveFreshDatabase(); err != nil {
+		logging.OperationServerLifecycle.Event(log.Fatal()).Str("error_code", updater.ErrorCode(err)).Msg(logging.OperationServerLifecycle.Message("新数据库初始化保护失败，未打开数据库"))
+	}
 	db, err := database.Open(cfg.DatabasePath)
 	if err != nil {
 		logging.OperationServerLifecycle.Event(log.Fatal()).Err(err).Str("error_code", "database_open_failed").Msg(logging.OperationServerLifecycle.Message("数据库打开失败"))
 	}
+	db, err = exclusiveRuntime.Bind(db)
+	if err != nil {
+		logging.OperationServerLifecycle.Event(log.Fatal()).Str("error_code", "database_exclusive_runtime_unavailable").Msg(logging.OperationServerLifecycle.Message("数据库进程独占保护校验失败"))
+	}
+	if err := validateCatalogDatabaseCompatibility(context.Background(), db, catalogCompatibility); err != nil {
+		logging.OperationServerLifecycle.Event(log.Fatal()).Str("error_code", updater.CodeFormatIncompatible).Msg(logging.OperationServerLifecycle.Message("目录格式不兼容，已停止启动并保留数据库"))
+	}
 	if err := database.Migrate(db); err != nil {
 		logging.OperationServerLifecycle.Event(log.Fatal()).Err(err).Str("error_code", "database_migration_failed").Msg(logging.OperationServerLifecycle.Message("数据库迁移失败"))
 	}
+	for {
+		recovered, err := services.RecoverCatalogPhysicalRuntimeBatch(context.Background(), db)
+		if err != nil {
+			logging.OperationServerLifecycle.Event(log.Fatal()).Str("error_code", "catalog_physical_recovery_failed").Msg(logging.OperationServerLifecycle.Message("文件操作恢复凭据校验失败，未启动后台任务"))
+		}
+		if recovered == 0 {
+			break
+		}
+	}
+	if err := validateCatalogDatabaseCompatibility(context.Background(), db, catalogCompatibility); err != nil {
+		logging.OperationServerLifecycle.Event(log.Fatal()).Str("error_code", updater.CodeFormatIncompatible).Msg(logging.OperationServerLifecycle.Message("目录格式保护校验失败，未启动后台任务"))
+	}
+	// Keep catalogCompatibility as the explicit startup capability for the
+	// future converter. No production conversion is enabled here: it must call
+	// EnsureCatalogFormat before its first new-format activation transaction.
+	catalogReadDB, err := database.OpenReadOnly(cfg.DatabasePath)
+	if err != nil {
+		logging.OperationServerLifecycle.Event(log.Fatal()).Str("error_code", "catalog_reader_initialization_failed").Msg(logging.OperationServerLifecycle.Message("目录只读连接初始化失败"))
+	}
+	catalogReadPool, err := catalogReadDB.DB()
+	if err != nil {
+		logging.OperationServerLifecycle.Event(log.Fatal()).Str("error_code", "catalog_reader_initialization_failed").Msg(logging.OperationServerLifecycle.Message("目录只读连接初始化失败"))
+	}
+	defer func() { _ = catalogReadPool.Close() }()
+	catalogStore := services.NewCatalogSnapshotStore(db, catalogReadDB)
 	credentialStore, err := credential.Open(cfg.CredentialKeyFile, cfg.CredentialMasterKey)
 	if err != nil {
 		logging.OperationServerLifecycle.Event(log.Fatal()).Err(err).Str("error_code", "credential_store_initialization_failed").Msg(logging.OperationServerLifecycle.Message("凭据加密初始化失败"))
@@ -78,6 +146,7 @@ func main() {
 		logging.OperationServerLifecycle.Event(log.Fatal()).Err(err).Str("error_code", "authentication_initialization_failed").Msg(logging.OperationServerLifecycle.Message("认证服务初始化失败"))
 	}
 	admin := services.NewAdminService(db, authorization, auth, audit)
+	admin.SetCatalogSnapshotStore(catalogStore)
 	cloudRegistry := cloudpkg.NewRegistry()
 	if err := cloudRegistry.Register(cloudpkg.ProviderPan115, pan115.New); err != nil {
 		logging.OperationServerLifecycle.Event(log.Fatal()).Err(err).Str("error_code", "pan115_provider_registration_failed").Msg(logging.OperationServerLifecycle.Message("115 驱动注册失败"))
@@ -88,6 +157,7 @@ func main() {
 	if err != nil {
 		logging.OperationServerLifecycle.Event(log.Fatal()).Err(err).Str("error_code", "signed_proxy_initialization_failed").Msg(logging.OperationServerLifecycle.Message("302 代理初始化失败"))
 	}
+	signedProxy.SetCatalogSnapshotStore(catalogStore)
 	if err := signedProxy.Start(context.Background()); err != nil {
 		logging.OperationServerLifecycle.Event(log.Fatal()).Err(err).Str("error_code", "pan115_playback_coordinator_start_failed").Msg(logging.OperationServerLifecycle.Message("115 多设备播放协调器启动失败"))
 	}
@@ -98,6 +168,8 @@ func main() {
 	}
 	providerDirectories := services.NewProviderDirectoryService(connections, credentialStore)
 	storages := services.NewStorageService(db, audit)
+	storages.SetCatalogSnapshotStore(catalogStore)
+	connections.SetCatalogSnapshotStore(catalogStore)
 	storages.SetConnectionService(connections)
 	directories, err := services.NewDirectoryBrowserService(db, nil)
 	if err != nil {
@@ -106,22 +178,31 @@ func main() {
 	directories.SetProviderDirectoryService(providerDirectories)
 	profiles := services.NewMediaClassificationProfileService(db, audit, nil)
 	libraries := services.NewMediaLibraryService(db, audit, logManager.Logger("media_library", "supervisor"))
+	libraries.SetCatalogSnapshotStore(catalogStore)
+	libraries.SetRetirementPhysicalGuard(services.AssertCatalogPhysicalDrainedTx)
 	libraries.SetConnectionService(connections)
 	profiles.SetReferences(libraries)
 	profiles.SetRevisionNotifier(libraries)
 	storages.SetReferenceChecker(libraries)
 	queue := services.NewQueueService(db, audit)
+	queue.SetWriteAdmission(catalogStore.Admission())
 	libraries.SetQueueService(queue)
 	recycleCleanup := services.NewPan115RecycleCleanupService(db, queue, audit, connections, logManager.Logger("connection", "pan115_recycle_cleanup"))
 	mediaChanges := services.NewMediaChangeService(db)
+	mediaChanges.SetWriteAdmission(catalogStore.Admission())
+	storages.SetMediaChangeService(mediaChanges)
+	connections.SetMediaChangeService(mediaChanges)
 	mediaServerRefresh := services.NewMediaServerRefreshService(db, queue, audit, connections)
 	mediaChanges.SetReadyHandler(mediaServerRefresh.EnqueueLibrary)
 	libraries.SetMediaChangeService(mediaChanges)
 	artifacts := services.NewMediaArtifactService(db, queue, signedProxy, logManager.Logger("media_artifact", "worker"))
+	artifacts.SetCatalogSnapshotStore(catalogStore)
 	artifacts.SetConnectionService(connections)
 	artifacts.SetMediaChangeService(mediaChanges)
 	libraries.SetArtifactService(artifacts)
 	libraryStructure := services.NewMediaLibraryStructureService(db, audit, queue, connections, logManager.Logger("media_library", "structure"))
+	libraryStructure.SetCatalogSnapshotStore(catalogStore)
+	libraryStructure.SetCatalogPublicationServices(mediaChanges, artifacts)
 	libraryStructure.SetReconcileNotifier(libraries.RequestReconcile)
 	libraries.SetStructureService(libraryStructure)
 	strmManagement := services.NewSTRMManagementService(db, audit, queue, libraries, artifacts, logManager.Logger("strm", "management"))
@@ -147,7 +228,9 @@ func main() {
 	aiRecognitionSettings := services.NewAIRecognitionSettingsService(db, audit, credentialStore)
 	discoveryService := services.NewDiscoveryService(db, metadataSettings, logManager.Logger("discovery", "service"))
 	mediaCoverage := services.NewMediaCoverageService(db, metadataSettings)
+	mediaCoverage.SetCatalogSnapshotStore(catalogStore)
 	playerHistory := services.NewPlayerHistoryService(db, libraries)
+	playerHistory.SetWriteAdmission(catalogStore.Admission())
 	playerMediaState := services.NewPlayerMediaStateService(db, libraries)
 	playerOverview := services.NewPlayerOverviewService(playerHistory, playerMediaState, libraries)
 	libraries.SetMetadataSettingsService(metadataSettings)
@@ -178,6 +261,8 @@ func main() {
 	transfers.SetConnectionService(connections)
 	transfers.SetDownloaderService(downloaders)
 	transfers.SetMediaChangeService(mediaChanges)
+	transfers.SetCatalogSnapshotStore(catalogStore)
+	transfers.SetMediaArtifactService(artifacts)
 	transfers.SetMediaLibraryStructureService(libraryStructure)
 	transfers.SetMediaLibraryReconciler(libraries)
 	reorganizations := services.NewMediaReorganizationService(db, audit, queue, metadataSettings, connections, logManager.Logger("media_reorganization", "worker"))
@@ -192,6 +277,8 @@ func main() {
 		services.WithLibraryArtworkRoot(filepath.Join(filepath.Dir(cfg.DatabasePath), "cache", "artwork", "categories")),
 	)
 	libraries.SetLibraryArtworkScheduler(libraryArtwork)
+	libraryArtwork.SetCatalogSnapshotStore(catalogStore)
+	libraries.EnableCatalogScanFollowups()
 	pluginDownloads := services.NewPluginDownloadExecutor(downloads, pluginRepositories, pluginHostAPI, mediatool.Discover(cfg.FFmpegPath))
 	downloads.SetPluginDownloadExecutor(pluginDownloads)
 	if err := pluginRepositories.RestorePlugins(context.Background()); err != nil {
@@ -210,10 +297,6 @@ func main() {
 	seeding.SetStagingCleanup(transfers.CleanupAfterSeeding)
 	downloads.SetTransferService(transfers)
 	updateStop := make(chan struct{}, 1)
-	runtimeDirectory, err := resolveUpdateRuntimeDirectory(cfg)
-	if err != nil {
-		logging.OperationServerUpdate.Event(log.Fatal()).Str("error_code", updater.CodePersistence).Msg(logging.OperationServerUpdate.Message("更新运行目录初始化失败"))
-	}
 	updateService, err := services.NewUpdateService(runtimeDirectory, fmt.Sprintf("http://127.0.0.1:%d/api/v1/health", cfg.Port), audit, logManager.Logger("server", "update"), func() {
 		select {
 		case updateStop <- struct{}{}:
@@ -261,6 +344,9 @@ func main() {
 	}
 	if err := registry.Register(services.JobTypeMediaLibraryRecognition, services.NewMediaLibraryRecognitionWorker(libraries)); err != nil {
 		logging.OperationServerLifecycle.Event(log.Fatal()).Str("error_code", "media_library_recognition_worker_registration_failed").Msg(logging.OperationServerLifecycle.Message("媒体库识别 Worker 注册失败"))
+	}
+	if err := registry.Register(services.JobTypeMediaLibraryRetirement, services.NewMediaLibraryRetirementWorker(libraries)); err != nil {
+		logging.OperationServerLifecycle.Event(log.Fatal()).Str("error_code", "media_library_retirement_worker_registration_failed").Msg(logging.OperationServerLifecycle.Message("媒体库索引移除 Worker 注册失败"))
 	}
 	if err := registry.Register("seeding", services.NewSeedingWorker(seeding)); err != nil {
 		logging.OperationServerLifecycle.Event(log.Fatal()).Err(err).Str("error_code", "seeding_worker_registration_failed").Msg(logging.OperationServerLifecycle.Message("做种管理 Worker 注册失败"))
@@ -330,6 +416,36 @@ func main() {
 	if err := mediaServerRefresh.RecoverPending(); err != nil {
 		logging.OperationServerLifecycle.Event(log.Error()).Err(err).Str("error_code", "media_server_refresh_recovery_failed").Msg(logging.OperationServerLifecycle.Message("媒体服务器刷新恢复失败"))
 	}
+	if err := artifacts.RecoverCatalogArtifactBindings(context.Background(), 100); err != nil {
+		logging.OperationServerLifecycle.Event(log.Error()).Str("error_code", services.ErrorCode(err)).Msg(logging.OperationServerLifecycle.Message("媒体产物任务恢复暂未完成，将自动重试"))
+	}
+	changeDispatchCtx, stopChangeDispatch := context.WithCancel(context.Background())
+	changeDispatchDone := make(chan struct{})
+	go func() {
+		defer close(changeDispatchDone)
+		mediaChanges.Run(changeDispatchCtx, func() error {
+			artifactErr := artifacts.RecoverCatalogArtifactBindings(changeDispatchCtx, 100)
+			refreshErr := mediaServerRefresh.RecoverPendingContext(changeDispatchCtx)
+			_, cleanupErr := mediaChanges.CleanupPendingBatch(changeDispatchCtx)
+			return errors.Join(artifactErr, refreshErr, cleanupErr)
+		}, func(err error) {
+			logging.OperationServerLifecycle.Event(log.Error()).Str("error_code", services.ErrorCode(err)).Msg(logging.OperationServerLifecycle.Message("媒体变更通知分发暂未完成，将自动重试"))
+		})
+	}()
+	defer func() { stopChangeDispatch(); <-changeDispatchDone }()
+	scanFollowupCtx, stopScanFollowups := context.WithCancel(context.Background())
+	scanFollowupDone := make(chan struct{})
+	go func() { defer close(scanFollowupDone); libraries.RunCatalogScanFollowups(scanFollowupCtx) }()
+	defer func() { stopScanFollowups(); <-scanFollowupDone }()
+	catalogMaintenanceCtx, stopCatalogMaintenance := context.WithCancel(context.Background())
+	catalogMaintenanceDone := make(chan struct{})
+	go func() {
+		defer close(catalogMaintenanceDone)
+		catalogStore.RunMaintenance(catalogMaintenanceCtx, func(err error) {
+			logging.OperationServerLifecycle.Event(log.Warn()).Str("error_code", services.ErrorCode(err)).Msg(logging.OperationServerLifecycle.Message("媒体目录后台合并或清理暂未完成，将自动重试"))
+		})
+	}()
+	defer func() { stopCatalogMaintenance(); <-catalogMaintenanceDone }()
 	if err := libraries.Start(context.Background()); err != nil {
 		logging.OperationServerLifecycle.Event(log.Fatal()).Err(err).Str("error_code", "media_library_supervisor_start_failed").Msg(logging.OperationServerLifecycle.Message("媒体库监听启动失败"))
 	}
@@ -345,10 +461,18 @@ func main() {
 		ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second,
 		WriteTimeout: 60 * time.Second, IdleTimeout: 2 * time.Minute,
 	}
+	listener, err := net.Listen("tcp", cfg.Address())
+	if err != nil {
+		logging.OperationServerLifecycle.Event(log.Fatal()).Err(err).Str("error_code", "server_listen_failed").Msg(logging.OperationServerLifecycle.Message("服务监听失败"))
+	}
+	if err := catalogCompatibility.CompleteInitialization(); err != nil {
+		_ = listener.Close()
+		logging.OperationServerLifecycle.Event(log.Fatal()).Str("error_code", updater.ErrorCode(err)).Msg(logging.OperationServerLifecycle.Message("新数据库初始化证明保存失败，未开放服务"))
+	}
 
 	go func() {
 		logging.OperationServerLifecycle.Event(log.Info()).Str("address", cfg.Address()).Msg(logging.OperationServerLifecycle.Message("OhMyCine Server 已启动"))
-		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logging.OperationServerLifecycle.Event(log.Fatal()).Err(err).Str("error_code", "server_listen_failed").Msg(logging.OperationServerLifecycle.Message("服务异常停止"))
 		}
 	}()
@@ -374,11 +498,24 @@ func runUpdateHelper(arguments []string) (bool, int) {
 		_, _ = fmt.Fprintln(os.Stderr, updater.CodePlanInvalid)
 		return true, 2
 	}
-	if err := updater.RunHelper(context.Background(), arguments[2], updater.HelperOptions{}); err != nil {
+	cfg, err := config.Load()
+	if err != nil {
+		_, _ = fmt.Fprintln(os.Stderr, updater.CodeCompatibilityRequired)
+		return true, 1
+	}
+	if err := updater.RunHelper(context.Background(), arguments[2], updater.HelperOptions{DatabasePath: cfg.DatabasePath}); err != nil {
 		_, _ = fmt.Fprintln(os.Stderr, updater.ErrorCode(err))
 		return true, 1
 	}
 	return true, 0
+}
+
+func validateCatalogDatabaseCompatibility(ctx context.Context, db *gorm.DB, compatibility *updater.CatalogCompatibility) error {
+	format, err := database.ReadCatalogFormat(ctx, db)
+	if err != nil {
+		return err
+	}
+	return compatibility.ValidateDatabaseFormat(format)
 }
 
 func resolveUpdateRuntimeDirectory(cfg config.Config) (string, error) {

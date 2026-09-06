@@ -61,6 +61,7 @@ func helperFixture(t *testing.T) (*Store, Plan, string, string) {
 
 func helperOptions(plan Plan) HelperOptions {
 	return HelperOptions{
+		DatabasePath:      filepath.Join(plan.RuntimeDirectory, "data", "server.db"),
 		ResolveExecutable: func(int) (string, error) { return plan.CurrentExecutable, nil },
 		WaitForExit:       func(context.Context, int) error { return nil },
 		Start:             func(string, []string) (RunningProcess, error) { return &fakeRunningProcess{}, nil },

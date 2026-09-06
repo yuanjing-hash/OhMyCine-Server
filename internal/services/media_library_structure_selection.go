@@ -54,6 +54,7 @@ type MediaLibraryStructureSelectionPreview struct {
 	Selections        []MediaLibraryStructureSelection `json:"selections"`
 	ConfirmationToken string                           `json:"confirmation_token"`
 	ExpiresAt         time.Time                        `json:"expires_at"`
+	Items             MediaLibraryStructurePreviewPage `json:"items"`
 }
 
 type structureSelectionResolved struct {
@@ -92,7 +93,34 @@ func (s *MediaLibraryStructureService) PreviewSelectionRepair(ctx context.Contex
 	}
 	expires := time.Now().UTC().Add(structureSelectionConfirmationExpiry)
 	draft := models.MediaLibraryStructureRepairDraft{ID: draftID, OwnerID: actor.User.ID, LibraryID: libraryID, DiagnosisJobID: diagnosis.JobID, SourceRevision: autoState.SourceRevision, Generation: plan.Generation, RuleFingerprint: plan.RuleFingerprint, PlanHash: planHash, SelectionsJSON: string(selectionJSON), ExpiresAt: expires, CreatedAt: time.Now().UTC()}
-	if err := s.db.WithContext(ctx).Create(&draft).Error; err != nil {
+	previewItems, err := structurePreviewItems(plan, resolved)
+	if err != nil {
+		return MediaLibraryStructureSelectionPreview{}, err
+	}
+	previewJSON, err := json.Marshal(previewItems)
+	if err != nil || len(previewJSON) > maxStructurePreviewBytes {
+		return MediaLibraryStructureSelectionPreview{}, appError(CodeInvalidRequest, "目录修复预览过大，请分类型或减少选择后重试", err)
+	}
+	draft.PreviewItemsJSON = string(previewJSON)
+	var admission *CatalogWriteAdmission
+	if s.catalogStore != nil {
+		admission = s.catalogStore.Admission()
+	}
+	if err := withForegroundTransaction(ctx, s.db, admission, func(tx *gorm.DB) error {
+		if err := validateCatalogStructureSelectionTx(tx, plan, true); err != nil {
+			return err
+		}
+		if plan.catalogFence != nil {
+			reader, err := PinCatalogTx(tx, []uint{libraryID})
+			if err != nil {
+				return err
+			}
+			if err := validateStructureLogicalFenceTx(tx, reader, *plan.catalogFence); err != nil {
+				return err
+			}
+		}
+		return tx.Create(&draft).Error
+	}); err != nil {
 		return MediaLibraryStructureSelectionPreview{}, err
 	}
 	claim := mediaLibraryStructureClaim{DraftID: draft.ID, ActorID: actor.User.ID, LibraryID: libraryID, Generation: plan.Generation, RuleFingerprint: plan.RuleFingerprint, PlanHash: planHash, ExpiresAt: expires.Unix()}
@@ -107,7 +135,7 @@ func (s *MediaLibraryStructureService) PreviewSelectionRepair(ctx context.Contex
 			skipped++
 		}
 	}
-	return MediaLibraryStructureSelectionPreview{LibraryID: libraryID, Revision: input.Revision, IssueCount: len(selections), RecycleCount: len(plan.RecycleItems), MoveCount: len(plan.Items), SkippedCount: skipped, Selections: selections, ConfirmationToken: token, ExpiresAt: expires}, nil
+	return MediaLibraryStructureSelectionPreview{LibraryID: libraryID, Revision: input.Revision, IssueCount: len(selections), RecycleCount: len(plan.RecycleItems), MoveCount: len(plan.Items), SkippedCount: skipped, Selections: selections, ConfirmationToken: token, ExpiresAt: expires, Items: structurePreviewPage(previewItems, 1, 50)}, nil
 }
 
 func (s *MediaLibraryStructureService) EnqueueSelectionRepair(ctx context.Context, actor Actor, libraryID uint, confirmationToken string, request RequestContext) (models.MediaLibraryStructureRepair, error) {
@@ -194,7 +222,10 @@ func (s *MediaLibraryStructureService) enqueueSelectionPlan(actor Actor, draft m
 			return appError(CodeConflict, "目录修复确认已被使用或已经过期", nil)
 		}
 		repair.JobID = &job.ID
-		if err := tx.Create(&repair).Error; err != nil {
+		if err := s.freezeCatalogStructureRepairTx(tx, &repair, plan); err != nil {
+			return err
+		}
+		if err := RegisterCatalogPhysicalOwnerTx(tx, CatalogPhysicalWriteInput{LibraryID: repair.LibraryID, OwnerKind: CatalogPhysicalRepair, OwnerID: repair.ID, ActorID: repair.OwnerID}, func(tx *gorm.DB) error { return tx.Create(&repair).Error }); err != nil {
 			return err
 		}
 		if err := tx.Model(&models.MediaLibrary{}).Where("id = ?", draft.LibraryID).Updates(map[string]any{"structure_status": models.MediaLibraryStructureRepairing, "structure_error_code": ""}).Error; err != nil {
@@ -288,6 +319,7 @@ func (s *MediaLibraryStructureService) buildSelectionPlan(ctx context.Context, l
 		return StructurePlan{}, diagnosis, nil, err
 	}
 	plan := StructurePlan{Version: 1, LibraryID: libraryID, Generation: base.Generation, RuleFingerprint: base.RuleFingerprint, DiagnosisJobID: diagnosis.JobID, DiagnosisGeneration: diagnosis.Generation, SelectionBound: true}
+	plan.catalogFence = base.catalogFence
 	var autoState models.MediaLibraryStructureAutoState
 	if err := s.db.WithContext(ctx).Where("library_id = ?", libraryID).First(&autoState).Error; err != nil {
 		return StructurePlan{}, diagnosis, nil, err
@@ -328,9 +360,15 @@ func structureConflictReviewError(code string) error {
 // A canonical winner may need no move and therefore be absent from plan.Items;
 // the catalog check below still protects it from a legacy recycle/version plan.
 func (s *MediaLibraryStructureService) validateStructureSelectionSafety(ctx context.Context, plan StructurePlan) error {
+	return s.withCatalogRead(ctx, plan.LibraryID, func(tx *gorm.DB, reader *CatalogReader) error {
+		return s.validateStructureSelectionSafetyTx(tx, reader, plan)
+	})
+}
+
+func (s *MediaLibraryStructureService) validateStructureSelectionSafetyTx(tx *gorm.DB, reader *CatalogReader, plan StructurePlan) error {
 	if len(plan.ResolvedIssues) > 0 {
 		var issue models.MediaLibraryStructureIssue
-		result := s.db.WithContext(ctx).Where("library_id = ? AND diagnosis_job_id = ? AND token IN ? AND code IN ?", plan.LibraryID, plan.DiagnosisJobID, plan.ResolvedIssues, []string{"catalog_duplicate_conflict", "recognition_suspect_conflict"}).Limit(1).Find(&issue)
+		result := tx.Where("library_id = ? AND diagnosis_job_id = ? AND token IN ? AND code IN ?", plan.LibraryID, plan.DiagnosisJobID, plan.ResolvedIssues, []string{"catalog_duplicate_conflict", "recognition_suspect_conflict"}).Limit(1).Find(&issue)
 		if result.Error != nil {
 			return result.Error
 		}
@@ -357,11 +395,13 @@ func (s *MediaLibraryStructureService) validateStructureSelectionSafety(ctx cont
 	// Query the library once, including companion facts. Stream only duplicate
 	// identities and match them against this plan in memory, avoiding repeated
 	// catalog scans or one provider call per file in large selections.
-	rows, err := s.db.WithContext(ctx).Raw(`SELECT provider_id FROM (
-		SELECT provider_id FROM media_library_entries WHERE library_id = ? AND provider_id <> ''
+	rows, err := tx.Raw(`SELECT provider_id FROM (
+		SELECT provider_id FROM (?) AS entries
 		UNION ALL
-		SELECT provider_id FROM media_library_source_assets WHERE library_id = ? AND active = ? AND provider_id <> ''
-	) AS source_facts GROUP BY provider_id HAVING COUNT(*) > 1`, plan.LibraryID, plan.LibraryID, true).Rows()
+		SELECT provider_id FROM (?) AS assets
+	) AS source_facts GROUP BY provider_id HAVING COUNT(*) > 1`,
+		reader.Entries().Select("provider_id").Where("library_id=? AND provider_id<>''", plan.LibraryID),
+		reader.SourceAssets().Select("provider_id").Where("library_id=? AND active=? AND provider_id<>''", plan.LibraryID, true)).Rows()
 	if err != nil {
 		return err
 	}

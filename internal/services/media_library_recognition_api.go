@@ -52,10 +52,30 @@ type MediaRecognitionOverrideInput struct {
 	MediaType string
 }
 
-func (s *MediaLibraryService) Recognitions(actor Actor, libraryID uint, query MediaPageQuery, status string, manualOnly ...bool) (MediaRecognitionPage, error) {
-	if err := s.ensureMediaLibraryReadable(actor, libraryID); err != nil {
-		return MediaRecognitionPage{}, err
+// Recognition resolves a diagnosis-issued token directly, without searching a
+// paged list or trusting a title/path supplied by the browser.
+func (s *MediaLibraryService) Recognition(ctx context.Context, actor Actor, libraryID uint, token string) (MediaRecognitionSummary, error) {
+	id, err := decodeRecognitionToken(token)
+	if err != nil {
+		return MediaRecognitionSummary{}, err
 	}
+	var result MediaRecognitionSummary
+	err = s.withCatalogRead(ctx, []uint{libraryID}, func(tx *gorm.DB, reader *CatalogReader) error {
+		if err := s.ensureMediaLibraryReadableTx(tx, actor, libraryID); err != nil {
+			return err
+		}
+		var record models.MediaLibraryRecognition
+		if err := reader.Recognitions().Where("id = ? AND library_id = ?", id, libraryID).First(&record).Error; err != nil {
+			return recognitionNotFound(err)
+		}
+		var err error
+		result, err = recognitionSummaryTx(reader, record)
+		return err
+	})
+	return result, err
+}
+
+func (s *MediaLibraryService) Recognitions(actor Actor, libraryID uint, query MediaPageQuery, status string, manualOnly ...bool) (MediaRecognitionPage, error) {
 	query, err := normalizeMediaPageQuery(query)
 	if err != nil {
 		return MediaRecognitionPage{}, err
@@ -64,54 +84,62 @@ func (s *MediaLibraryService) Recognitions(actor Actor, libraryID uint, query Me
 	if status != "" && status != mediaRecognitionStatusMatched && status != mediaRecognitionStatusUnrecognized {
 		return MediaRecognitionPage{}, appError(CodeInvalidRequest, "识别状态筛选无效", nil)
 	}
-	db := s.db.Model(&models.MediaLibraryRecognition{}).Where("library_id = ?", libraryID)
-	if status != "" {
-		db = db.Where("status = ?", status)
-	}
-	if len(manualOnly) > 0 && manualOnly[0] {
-		db = db.Where("manual_override = ?", true)
-	}
-	if query.Query != "" {
-		db = db.Where("title LIKE ? ESCAPE '\\'", "%"+escapeLike(query.Query)+"%")
-	}
-	if query.MediaType != "" {
-		mediaType := query.MediaType
-		if mediaType == "series" {
-			mediaType = "tv"
+	var result MediaRecognitionPage
+	err = s.withCatalogRead(context.Background(), []uint{libraryID}, func(tx *gorm.DB, reader *CatalogReader) error {
+		if err := s.ensureMediaLibraryReadableTx(tx, actor, libraryID); err != nil {
+			return err
 		}
-		db = db.Where("media_type = ?", mediaType)
-	}
-	var total int64
-	if err := db.Count(&total).Error; err != nil {
-		return MediaRecognitionPage{}, err
-	}
-	var records []models.MediaLibraryRecognition
-	if err := db.Order("updated_at DESC,id DESC").Offset((query.Page - 1) * query.PageSize).Limit(query.PageSize).Find(&records).Error; err != nil {
-		return MediaRecognitionPage{}, err
-	}
-	items := make([]MediaRecognitionSummary, 0, len(records))
-	for _, record := range records {
-		item, itemErr := s.recognitionSummary(record)
-		if itemErr != nil {
-			return MediaRecognitionPage{}, itemErr
+		db := reader.Recognitions().Where("library_id = ?", libraryID)
+		if status != "" {
+			db = db.Where("status = ?", status)
 		}
-		items = append(items, item)
-	}
-	return MediaRecognitionPage{List: items, Total: total, Page: query.Page, PageSize: query.PageSize}, nil
+		if len(manualOnly) > 0 && manualOnly[0] {
+			db = db.Where("manual_override = ?", true)
+		}
+		if query.Query != "" {
+			db = db.Where("title LIKE ? ESCAPE '\\'", "%"+escapeLike(query.Query)+"%")
+		}
+		if query.MediaType != "" {
+			mediaType := query.MediaType
+			if mediaType == "series" {
+				mediaType = "tv"
+			}
+			db = db.Where("media_type = ?", mediaType)
+		}
+		var total int64
+		if err := db.Count(&total).Error; err != nil {
+			return err
+		}
+		var records []models.MediaLibraryRecognition
+		if err := db.Order("updated_at DESC,id DESC").Offset((query.Page - 1) * query.PageSize).Limit(query.PageSize).Find(&records).Error; err != nil {
+			return err
+		}
+		items := make([]MediaRecognitionSummary, 0, len(records))
+		for _, record := range records {
+			item, itemErr := recognitionSummaryTx(reader, record)
+			if itemErr != nil {
+				return itemErr
+			}
+			items = append(items, item)
+		}
+		result = MediaRecognitionPage{List: items, Total: total, Page: query.Page, PageSize: query.PageSize}
+		return nil
+	})
+	return result, err
 }
 
 func (s *MediaLibraryService) RetryRecognition(ctx context.Context, actor Actor, libraryID uint, token string, request RequestContext) (MediaRecognitionSummary, error) {
 	if !actor.CanResource(authz.PermissionMediaLibrariesScan, models.AuthorizationResourceMediaLibrary, uintID(libraryID)) {
 		return MediaRecognitionSummary{}, appError(CodePermissionDenied, "无权重新识别媒体", nil)
 	}
-	record, library, profile, entries, err := s.recognitionContext(libraryID, token)
+	record, source, entries, err := s.recognitionContext(ctx, libraryID, token, true)
 	if err != nil {
 		return MediaRecognitionSummary{}, err
 	}
 	if record.ManualOverride {
 		return MediaRecognitionSummary{}, appError(CodeConflict, "请先清除人工匹配再重试", nil)
 	}
-	result, err := s.recognizeStoredUnit(ctx, library, profile, entries)
+	result, err := s.recognizeStoredUnit(ctx, source.Library, source.Profile, entries)
 	if err != nil {
 		return MediaRecognitionSummary{}, err
 	}
@@ -121,21 +149,18 @@ func (s *MediaLibraryService) RetryRecognition(ctx context.Context, actor Actor,
 		// administrator can supply an explicit title through manual recovery.
 		result.ErrorCode = mediaLibraryRecognitionInputInvalid
 	}
-	if err := s.persistRecognitionResult(record, profile, result, false); err != nil {
+	if err := s.persistRecognitionResult(record, source.Profile, result, false, source); err != nil {
 		return MediaRecognitionSummary{}, err
 	}
-	if err := s.db.First(&record, record.ID).Error; err != nil {
-		return MediaRecognitionSummary{}, err
-	}
-	_ = s.audit.Record(s.db, &actor.User.ID, "media_recognition.retry", "media_library_recognition", strconv.FormatUint(uint64(record.ID), 10), "success", map[string]any{"library_id": libraryID, "status": record.Status, "error_code": record.ErrorCode}, request)
-	return s.recognitionSummary(record)
+	_ = s.audit.Record(s.db, &actor.User.ID, "media_recognition.retry", "media_library_recognition", strconv.FormatUint(uint64(record.ID), 10), "success", map[string]any{"library_id": libraryID, "status": result.Status, "error_code": result.ErrorCode}, request)
+	return s.recognitionSummaryByID(ctx, libraryID, record.ID)
 }
 
 func (s *MediaLibraryService) RecognitionCandidates(ctx context.Context, actor Actor, libraryID uint, token, title, mediaType string, year *int) ([]tmdb.Candidate, error) {
 	if err := s.ensureMediaLibraryReadable(actor, libraryID); err != nil {
 		return nil, err
 	}
-	record, library, _, _, err := s.recognitionContext(libraryID, token)
+	record, source, _, err := s.recognitionContext(ctx, libraryID, token, false)
 	if err != nil {
 		return nil, err
 	}
@@ -159,7 +184,7 @@ func (s *MediaLibraryService) RecognitionCandidates(ctx context.Context, actor A
 	if err != nil {
 		return nil, err
 	}
-	items, err := client.SearchCandidates(ctx, mediaType, title, year, library.MetadataLanguage, library.MetadataRegion, 10)
+	items, err := client.SearchCandidates(ctx, mediaType, title, year, source.Library.MetadataLanguage, source.Library.MetadataRegion, 10)
 	if err != nil {
 		if tmdb.ErrorCode(err) == tmdb.ErrorNoMatch {
 			return []tmdb.Candidate{}, nil
@@ -192,7 +217,7 @@ func (s *MediaLibraryService) OverrideRecognition(ctx context.Context, actor Act
 	if !actor.CanResource(authz.PermissionMediaLibrariesScan, models.AuthorizationResourceMediaLibrary, uintID(libraryID)) {
 		return MediaRecognitionSummary{}, appError(CodePermissionDenied, "无权人工匹配媒体", nil)
 	}
-	record, library, profile, _, err := s.recognitionContext(libraryID, token)
+	record, source, _, err := s.recognitionContext(ctx, libraryID, token, false)
 	if err != nil {
 		return MediaRecognitionSummary{}, err
 	}
@@ -207,21 +232,18 @@ func (s *MediaLibraryService) OverrideRecognition(ctx context.Context, actor Act
 	if err != nil {
 		return MediaRecognitionSummary{}, err
 	}
-	match, err := client.GetByID(ctx, input.MediaType, input.TMDBID, library.MetadataLanguage)
+	match, err := client.GetByID(ctx, input.MediaType, input.TMDBID, source.Library.MetadataLanguage)
 	if err != nil {
 		return MediaRecognitionSummary{}, appError(tmdb.ErrorCode(err), "TMDB 项目验证失败", nil)
 	}
-	rules, err := classification.DecodeStrict([]byte(profile.RulesJSON))
+	rules, err := classification.DecodeStrict([]byte(source.Profile.RulesJSON))
 	if err != nil {
 		return MediaRecognitionSummary{}, err
 	}
 	metadata := classificationMetadataForMatch(match)
 	classified := classification.Classify(metadata, rules)
 	result := MediaRecognitionResult{Status: mediaRecognitionStatusMatched, Title: match.Title, MediaType: match.MediaType, CategoryName: classified.CategoryName, MatchedRuleID: classified.MatchedRuleID, TMDBID: cloneInt64(&match.ID), ReleaseYear: cloneInt(match.ReleaseYear), Confidence: cloneFloat64(&match.Confidence), Metadata: metadata, Snapshot: match.Snapshot}
-	if err := s.persistRecognitionResult(record, profile, result, true); err != nil {
-		return MediaRecognitionSummary{}, err
-	}
-	if err := s.db.First(&record, record.ID).Error; err != nil {
+	if err := s.persistRecognitionResult(record, source.Profile, result, true, source); err != nil {
 		return MediaRecognitionSummary{}, err
 	}
 	if s.structure != nil {
@@ -232,55 +254,73 @@ func (s *MediaLibraryService) OverrideRecognition(ctx context.Context, actor Act
 		}
 	}
 	_ = s.audit.Record(s.db, &actor.User.ID, "media_recognition.override", "media_library_recognition", strconv.FormatUint(uint64(record.ID), 10), "success", map[string]any{"library_id": libraryID, "media_type": match.MediaType, "tmdb_id": match.ID}, request)
-	return s.recognitionSummary(record)
+	return s.recognitionSummaryByID(ctx, libraryID, record.ID)
 }
 
 func (s *MediaLibraryService) ClearRecognitionOverride(ctx context.Context, actor Actor, libraryID uint, token string, request RequestContext) (MediaRecognitionSummary, error) {
 	if !actor.CanResource(authz.PermissionMediaLibrariesScan, models.AuthorizationResourceMediaLibrary, uintID(libraryID)) {
 		return MediaRecognitionSummary{}, appError(CodePermissionDenied, "无权清除人工匹配", nil)
 	}
-	record, _, _, _, err := s.recognitionContext(libraryID, token)
+	record, source, entries, err := s.recognitionContext(ctx, libraryID, token, true)
 	if err != nil {
 		return MediaRecognitionSummary{}, err
 	}
 	if !record.ManualOverride {
 		return MediaRecognitionSummary{}, appError(CodeConflict, "当前项目没有人工匹配", nil)
 	}
-	if err := s.db.Model(&record).Update("manual_override", false).Error; err != nil {
+	// Keep the manual result authoritative until the replacement recognition
+	// and its CAS commit succeed; a failed network call must not clear it first.
+	result, err := s.recognizeStoredUnit(ctx, source.Library, source.Profile, entries)
+	if err != nil {
 		return MediaRecognitionSummary{}, err
 	}
-	item, err := s.RetryRecognition(ctx, actor, libraryID, token, request)
-	if err == nil {
-		_ = s.audit.Record(s.db, &actor.User.ID, "media_recognition.override_clear", "media_library_recognition", strconv.FormatUint(uint64(record.ID), 10), "success", map[string]any{"library_id": libraryID}, request)
+	switch result.ErrorCode {
+	case CodeTMDBUnavailable, tmdb.ErrorAuthFailed, tmdb.ErrorNetworkUnavailable, tmdb.ErrorInvalidResponse, tmdb.ErrorRequestFailed:
+		return MediaRecognitionSummary{}, appError(result.ErrorCode, "重新识别暂不可用，已保留原人工匹配，请稍后重试", nil)
 	}
-	return item, err
+	if result.Status == mediaRecognitionStatusUnrecognized && result.ErrorCode == tmdb.ErrorInvalidRequest {
+		result.ErrorCode = mediaLibraryRecognitionInputInvalid
+	}
+	if err := s.persistRecognitionResult(record, source.Profile, result, false, source); err != nil {
+		return MediaRecognitionSummary{}, err
+	}
+	_ = s.audit.Record(s.db, &actor.User.ID, "media_recognition.override_clear", "media_library_recognition", strconv.FormatUint(uint64(record.ID), 10), "success", map[string]any{"library_id": libraryID}, request)
+	return s.recognitionSummaryByID(ctx, libraryID, record.ID)
 }
 
-func (s *MediaLibraryService) recognitionContext(libraryID uint, token string) (models.MediaLibraryRecognition, models.MediaLibrary, models.MediaClassificationProfile, []models.MediaLibraryEntry, error) {
+func (s *MediaLibraryService) recognitionContext(ctx context.Context, libraryID uint, token string, loadEntries bool) (models.MediaLibraryRecognition, catalogRecognitionContext, []models.MediaLibraryEntry, error) {
 	recognitionID, err := decodeRecognitionToken(token)
 	if err != nil {
-		return models.MediaLibraryRecognition{}, models.MediaLibrary{}, models.MediaClassificationProfile{}, nil, err
+		return models.MediaLibraryRecognition{}, catalogRecognitionContext{}, nil, err
 	}
 	var record models.MediaLibraryRecognition
-	if err := s.db.Where("id = ? AND library_id = ?", recognitionID, libraryID).First(&record).Error; err != nil {
-		return models.MediaLibraryRecognition{}, models.MediaLibrary{}, models.MediaClassificationProfile{}, nil, recognitionNotFound(err)
-	}
-	var library models.MediaLibrary
-	if err := s.db.First(&library, libraryID).Error; err != nil {
-		return models.MediaLibraryRecognition{}, models.MediaLibrary{}, models.MediaClassificationProfile{}, nil, mediaLibraryNotFound(err)
-	}
-	var profile models.MediaClassificationProfile
-	if err := s.db.First(&profile, library.ProfileID).Error; err != nil {
-		return models.MediaLibraryRecognition{}, models.MediaLibrary{}, models.MediaClassificationProfile{}, nil, err
-	}
+	var source catalogRecognitionContext
 	var entries []models.MediaLibraryEntry
-	if err := s.db.Where("library_id = ? AND recognition_id = ?", libraryID, record.ID).Order("relative_path").Find(&entries).Error; err != nil {
-		return models.MediaLibraryRecognition{}, models.MediaLibrary{}, models.MediaClassificationProfile{}, nil, err
-	}
-	if len(entries) == 0 {
-		return models.MediaLibraryRecognition{}, models.MediaLibrary{}, models.MediaClassificationProfile{}, nil, recognitionNotFound(gorm.ErrRecordNotFound)
-	}
-	return record, library, profile, entries, nil
+	err = s.withCatalogRead(ctx, []uint{libraryID}, func(tx *gorm.DB, reader *CatalogReader) error {
+		if err := reader.Recognitions().Where("id = ? AND library_id = ?", recognitionID, libraryID).First(&record).Error; err != nil {
+			return recognitionNotFound(err)
+		}
+		var err error
+		source, err = catalogRecognitionContextTx(ctx, tx, reader, libraryID)
+		if err != nil {
+			return err
+		}
+		limit := 1
+		if loadEntries {
+			limit = CatalogMaxDeltaRows + 1
+		}
+		if err := reader.Entries().Where("library_id = ? AND recognition_id = ?", libraryID, record.ID).Order("relative_path").Limit(limit).Find(&entries).Error; err != nil {
+			return err
+		}
+		if len(entries) == 0 {
+			return recognitionNotFound(gorm.ErrRecordNotFound)
+		}
+		if len(entries) > CatalogMaxDeltaRows {
+			return recognitionWriteError(ErrCatalogBudget)
+		}
+		return nil
+	})
+	return record, source, entries, err
 }
 
 func (s *MediaLibraryService) recognizeStoredUnit(ctx context.Context, library models.MediaLibrary, profile models.MediaClassificationProfile, entries []models.MediaLibraryEntry) (MediaRecognitionResult, error) {
@@ -327,7 +367,23 @@ func (s *MediaLibraryService) recognizeStoredUnit(ctx context.Context, library m
 	return recognizeMedia(ctx, lookup, MediaRecognitionRequest{PackageName: packageName, Files: files, SourceKind: mediarecognition.SourceLibraryScan, MediaTypeHint: mediaTypeHint, BuiltinPackCodes: organization.BuiltinRecognitionPacks, BuiltinProcessor: processor, RecognitionRules: organization.RecognitionRules, Classification: rules, Language: library.MetadataLanguage, Region: library.MetadataRegion, AIAssist: s.aiRecognition}), nil
 }
 
-func (s *MediaLibraryService) persistRecognitionResult(record models.MediaLibraryRecognition, profile models.MediaClassificationProfile, result MediaRecognitionResult, manual bool) error {
+func (s *MediaLibraryService) persistRecognitionResult(record models.MediaLibraryRecognition, profile models.MediaClassificationProfile, result MediaRecognitionResult, manual bool, contexts ...catalogRecognitionContext) error {
+	var source catalogRecognitionContext
+	var err error
+	if len(contexts) > 0 {
+		source = contexts[0]
+	} else {
+		source, err = s.captureRecognitionWriteContext(record.LibraryID)
+		if err != nil {
+			return err
+		}
+	}
+	if source.Head.Mode == "versioned" {
+		return s.persistVersionedRecognitionResults(source, []catalogMetadataResult{{Record: record, Profile: profile, Result: result}}, manual)
+	}
+	if source.Head.Mode == "converting" {
+		return recognitionWriteError(ErrCatalogFence)
+	}
 	lock := s.scanLock(record.LibraryID)
 	lock.Lock()
 	defer lock.Unlock()
@@ -339,7 +395,14 @@ func (s *MediaLibraryService) persistRecognitionResult(record models.MediaLibrar
 	now := time.Now().UTC()
 	var committedChange models.MediaLibraryChange
 	var artifactGeneration uint64
-	err = s.db.Transaction(func(tx *gorm.DB) error {
+	err = s.db.WithContext(source.Context).Transaction(func(tx *gorm.DB) error {
+		reader, err := PinCatalogTx(tx, []uint{record.LibraryID})
+		if err != nil {
+			return err
+		}
+		if err := validateCatalogRecognitionContext(tx, reader, source, []models.MediaLibraryRecognition{record}); err != nil {
+			return recognitionWriteError(err)
+		}
 		var library models.MediaLibrary
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&library, record.LibraryID).Error; err != nil {
 			return err
@@ -408,13 +471,29 @@ func (s *MediaLibraryService) persistRecognitionResult(record models.MediaLibrar
 	return nil
 }
 
-func (s *MediaLibraryService) recognitionSummary(record models.MediaLibraryRecognition) (MediaRecognitionSummary, error) {
+func (s *MediaLibraryService) recognitionSummaryByID(ctx context.Context, libraryID, recognitionID uint) (MediaRecognitionSummary, error) {
+	var result MediaRecognitionSummary
+	err := s.withCatalogRead(ctx, []uint{libraryID}, func(_ *gorm.DB, reader *CatalogReader) error {
+		var record models.MediaLibraryRecognition
+		if err := reader.Recognitions().Where("library_id = ? AND id = ?", libraryID, recognitionID).First(&record).Error; err != nil {
+			return recognitionNotFound(err)
+		}
+		var err error
+		result, err = recognitionSummaryTx(reader, record)
+		return err
+	})
+	return result, err
+}
+
+func recognitionSummaryTx(reader *CatalogReader, record models.MediaLibraryRecognition) (MediaRecognitionSummary, error) {
 	var count int64
-	if err := s.db.Model(&models.MediaLibraryEntry{}).Where("library_id = ? AND recognition_id = ?", record.LibraryID, record.ID).Count(&count).Error; err != nil {
+	if err := reader.Entries().Where("library_id = ? AND recognition_id = ?", record.LibraryID, record.ID).Count(&count).Error; err != nil {
 		return MediaRecognitionSummary{}, err
 	}
 	var first models.MediaLibraryEntry
-	_ = s.db.Where("library_id = ? AND recognition_id = ?", record.LibraryID, record.ID).Order("relative_path").First(&first).Error
+	if err := reader.Entries().Where("library_id = ? AND recognition_id = ?", record.LibraryID, record.ID).Order("relative_path").First(&first).Error; err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+		return MediaRecognitionSummary{}, err
+	}
 	return MediaRecognitionSummary{Token: encodeRecognitionToken(record.ID), Status: record.Status, ErrorCode: record.ErrorCode, Title: record.Title, MediaType: record.MediaType, ReleaseYear: cloneInt(record.ReleaseYear), TMDBID: cloneInt64(record.TMDBID), Confidence: cloneFloat64(record.Confidence), CategoryName: record.CategoryName, ManualOverride: record.ManualOverride, FileCount: count, SourceSummary: safeMediaDisplayName(path.Base(first.RelativePath)), SourceDirectory: recognitionSourceDirectory(first.RelativePath), UpdatedAt: record.UpdatedAt}, nil
 }
 

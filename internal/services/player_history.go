@@ -1,6 +1,7 @@
 package services
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -18,6 +19,7 @@ import (
 )
 
 const playerHistorySyncLimit = 500
+const playerHistoryFutureTolerance = 5 * time.Minute
 
 type PlayerHistoryChange struct {
 	SyncKey          string   `json:"sync_key"`
@@ -42,6 +44,9 @@ type PlayerHistoryChange struct {
 	PosterURL        string   `json:"poster_url,omitempty"`
 	BackdropURL      string   `json:"backdrop_url,omitempty"`
 	TitleLogoURL     string   `json:"title_logo_url,omitempty"`
+	PosterAssetID    string   `json:"poster_asset_id,omitempty"`
+	BackdropAssetID  string   `json:"backdrop_asset_id,omitempty"`
+	TitleLogoAssetID string   `json:"title_logo_asset_id,omitempty"`
 	PosterPath       string   `json:"poster_path,omitempty"`
 	BackdropPath     string   `json:"backdrop_path,omitempty"`
 	EpisodeStillPath string   `json:"episode_still_path,omitempty"`
@@ -57,6 +62,7 @@ type PlayerHistorySyncResult struct {
 	Cursor   uint64                   `json:"cursor"`
 	Changes  []PlayerHistoryChange    `json:"changes"`
 	Rejected []PlayerHistoryRejection `json:"rejected,omitempty"`
+	Warnings []PlayerHistoryRejection `json:"warnings,omitempty"`
 }
 
 type PlayerHistoryRejection struct {
@@ -73,27 +79,46 @@ type PlayerHistoryPage struct {
 }
 
 type PlayerHistoryService struct {
-	db        *gorm.DB
-	libraries *MediaLibraryService
+	db             *gorm.DB
+	libraries      *MediaLibraryService
+	now            func() time.Time
+	artworkSlots   chan struct{}
+	writeAdmission *CatalogWriteAdmission
 }
 
 func NewPlayerHistoryService(db *gorm.DB, libraries ...*MediaLibraryService) *PlayerHistoryService {
-	service := &PlayerHistoryService{db: db}
+	service := &PlayerHistoryService{db: db, now: time.Now, artworkSlots: make(chan struct{}, 2)}
 	if len(libraries) > 0 {
 		service.libraries = libraries[0]
 	}
 	return service
 }
 
+func (s *PlayerHistoryService) SetWriteAdmission(admission *CatalogWriteAdmission) {
+	s.writeAdmission = admission
+}
+
 func (s *PlayerHistoryService) Sync(actor Actor, cursor uint64, changes []PlayerHistoryChange) (PlayerHistorySyncResult, error) {
+	return s.SyncContext(context.Background(), actor, cursor, changes)
+}
+
+func (s *PlayerHistoryService) SyncContext(ctx context.Context, actor Actor, cursor uint64, changes []PlayerHistoryChange) (PlayerHistorySyncResult, error) {
 	if len(changes) > playerHistorySyncLimit {
 		return PlayerHistorySyncResult{}, appError(CodeInvalidRequest, "一次最多同步 500 条播放记录", nil)
 	}
 	normalized := make([]PlayerHistoryChange, 0, len(changes))
 	rejected := make([]PlayerHistoryRejection, 0)
 	var firstRecordError error
+	now := time.Now()
+	if s.now != nil {
+		now = s.now()
+	}
+	latestAllowed := now.Add(playerHistoryFutureTolerance).UnixMilli()
 	for _, change := range changes {
 		item, err := normalizePlayerHistoryChange(change)
+		if err == nil && item.UpdatedAt > latestAllowed {
+			err = appError(CodeHistoryClockAhead, "设备时间明显超前，请校准设备时间后重试", nil)
+		}
 		if err != nil {
 			if len(changes) == 1 {
 				return PlayerHistorySyncResult{}, err
@@ -109,7 +134,7 @@ func (s *PlayerHistoryService) Sync(actor Actor, cursor uint64, changes []Player
 	if len(normalized) == 0 && firstRecordError != nil {
 		return PlayerHistorySyncResult{}, firstRecordError
 	}
-	err := s.db.Transaction(func(tx *gorm.DB) error {
+	err := withForegroundTransaction(ctx, s.db, s.writeAdmission, func(tx *gorm.DB) error {
 		for _, original := range normalized {
 			if original.SourceKind == "server" && s.libraries != nil {
 				authority, err := s.resolveServerHistoryAuthority(tx, actor, original)
@@ -136,12 +161,17 @@ func (s *PlayerHistoryService) Sync(actor Actor, cursor uint64, changes []Player
 		return PlayerHistorySyncResult{}, err
 	}
 	var rows []models.PlayerPlaybackHistory
-	if err := s.db.Where("user_id = ? AND revision > ?", actor.User.ID, cursor).Order("revision ASC").Limit(playerHistorySyncLimit).Find(&rows).Error; err != nil {
+	if err := s.db.WithContext(ctx).Where("user_id = ? AND revision > ?", actor.User.ID, cursor).Order("revision ASC").Limit(playerHistorySyncLimit).Find(&rows).Error; err != nil {
 		return PlayerHistorySyncResult{}, err
 	}
 	result := PlayerHistorySyncResult{Cursor: cursor, Changes: make([]PlayerHistoryChange, 0, len(rows)), Rejected: rejected}
 	for _, row := range rows {
 		result.Changes = append(result.Changes, playerHistoryChangeDTO(row))
+		if row.ClientUpdatedAt > latestAllowed {
+			// Preserve legacy ordering/merge facts. Old clients cannot safely
+			// apply a lower timestamp as a corrective delta.
+			result.Warnings = append(result.Warnings, PlayerHistoryRejection{SyncKey: row.SyncKey, Code: CodeHistoryClockAhead})
+		}
 		if row.Revision > result.Cursor {
 			result.Cursor = row.Revision
 		}
@@ -151,7 +181,7 @@ func (s *PlayerHistoryService) Sync(actor Actor, cursor uint64, changes []Player
 
 func isPlayerHistoryRecordError(err error) bool {
 	switch ErrorCode(err) {
-	case CodeInvalidRequest, CodeNotFound, CodePermissionDenied:
+	case CodeInvalidRequest, CodeNotFound, CodePermissionDenied, CodeHistoryClockAhead:
 		return true
 	default:
 		return false
@@ -230,29 +260,15 @@ func (s *PlayerHistoryService) List(actor Actor, page, pageSize int, sourceKind 
 func (s *PlayerHistoryService) listAvailableServerHistory(actor Actor, page, pageSize int) (PlayerHistoryPage, error) {
 	wantedOffset := (page - 1) * pageSize
 	result := PlayerHistoryPage{List: make([]PlayerHistoryChange, 0, pageSize), Page: page, PageSize: pageSize}
-	query := s.db.Where("user_id = ? AND source_kind = ? AND deleted = ?", actor.User.ID, "server", false).
-		Order("client_updated_at DESC, sync_key ASC")
-	for rawOffset := 0; ; rawOffset += playerHistorySyncLimit {
-		var rows []models.PlayerPlaybackHistory
-		if err := query.Limit(playerHistorySyncLimit).Offset(rawOffset).Find(&rows).Error; err != nil {
-			return PlayerHistoryPage{}, err
+	err := s.visitAvailableHistory(actor, true, false, func(change PlayerHistoryChange) bool {
+		if result.Total >= int64(wantedOffset) && len(result.List) < pageSize {
+			result.List = append(result.List, change)
 		}
-		available, err := s.availableServerHistoryRows(actor, rows)
-		if err != nil {
-			return PlayerHistoryPage{}, err
-		}
-		for index, row := range rows {
-			if !available[index] {
-				continue
-			}
-			if result.Total >= int64(wantedOffset) && len(result.List) < pageSize {
-				result.List = append(result.List, playerHistoryChangeDTO(row))
-			}
-			result.Total++
-		}
-		if len(rows) < playerHistorySyncLimit {
-			break
-		}
+		result.Total++
+		return true
+	})
+	if err != nil {
+		return PlayerHistoryPage{}, err
 	}
 	result.HasMore = int64(wantedOffset+len(result.List)) < result.Total
 	return result, nil
@@ -264,33 +280,24 @@ func (s *PlayerHistoryService) BrowserList(actor Actor, page, pageSize int) (Bro
 	}
 	wantedOffset := (page - 1) * pageSize
 	result := BrowserHistoryPage{List: make([]BrowserHistoryItem, 0, pageSize), Page: page, PageSize: pageSize}
-	query := s.db.Where("user_id = ? AND deleted = ?", actor.User.ID, false).Order("client_updated_at DESC, sync_key ASC")
-	for rawOffset := 0; ; rawOffset += playerHistorySyncLimit {
-		var rows []models.PlayerPlaybackHistory
-		if err := query.Limit(playerHistorySyncLimit).Offset(rawOffset).Find(&rows).Error; err != nil {
-			return BrowserHistoryPage{}, err
+	selected := make([]PlayerHistoryChange, 0, pageSize)
+	err := s.visitAvailableHistory(actor, false, false, func(change PlayerHistoryChange) bool {
+		_, ok := browserHistoryItem(change, nil)
+		if !ok {
+			return true
 		}
-		available, err := s.browserHistoryAvailability(actor, rows)
-		if err != nil {
-			return BrowserHistoryPage{}, err
+		if result.Total >= int64(wantedOffset) && len(selected) < pageSize {
+			selected = append(selected, change)
 		}
-		for index, row := range rows {
-			if !available[index] {
-				continue
-			}
-			projected, ok := browserHistoryItem(playerHistoryChangeDTO(row), s.libraries)
-			if !ok {
-				continue
-			}
-			if result.Total >= int64(wantedOffset) && len(result.List) < pageSize {
-				result.List = append(result.List, projected)
-			}
-			result.Total++
-		}
-		if len(rows) < playerHistorySyncLimit {
-			break
-		}
+		result.Total++
+		return true
+	})
+	if err != nil {
+		return BrowserHistoryPage{}, err
 	}
+	// Image configuration may use another connection; decorate only after the
+	// pinned catalogue/history snapshot has been released.
+	result.List = browserHistoryItems(selected, s.libraries)
 	result.HasMore = int64(wantedOffset+len(result.List)) < result.Total
 	return result, nil
 }
@@ -304,42 +311,110 @@ func (s *PlayerHistoryService) BrowserContinueWatching(actor Actor, limit int) (
 	if limit < 1 || limit > 100 {
 		return nil, false, appError(CodeInvalidRequest, "继续观看数量无效", nil)
 	}
-	items := make([]BrowserHistoryItem, 0, limit+1)
-	query := s.db.Where("user_id = ? AND deleted = ?", actor.User.ID, false).Order("client_updated_at DESC, sync_key ASC")
-	for rawOffset := 0; ; rawOffset += playerHistorySyncLimit {
-		var rows []models.PlayerPlaybackHistory
-		if err := query.Limit(playerHistorySyncLimit).Offset(rawOffset).Find(&rows).Error; err != nil {
-			return nil, false, err
+	selected := make([]PlayerHistoryChange, 0, limit+1)
+	err := s.visitAvailableHistory(actor, false, true, func(change PlayerHistoryChange) bool {
+		if _, ok := browserHistoryItem(change, nil); ok {
+			selected = append(selected, change)
 		}
-		available, err := s.browserHistoryAvailability(actor, rows)
+		return len(selected) <= limit
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	return boundedOverviewList(browserHistoryItems(selected, s.libraries), limit, false)
+}
+
+// ServerContinueWatching applies catalog authorization before taking limit+1;
+// has_more counts eligible Server rows, never unrelated/completed history.
+func (s *PlayerHistoryService) ServerContinueWatching(actor Actor, limit int, libraries map[uint]struct{}) ([]PlayerHistoryChange, bool, error) {
+	if limit < 1 || limit > 100 {
+		return nil, false, appError(CodeInvalidRequest, "继续观看数量无效", nil)
+	}
+	items := make([]PlayerHistoryChange, 0, limit+1)
+	err := s.visitAvailableHistory(actor, true, true, func(change PlayerHistoryChange) bool {
+		id, _ := strconv.ParseUint(change.LibraryID, 10, 32)
+		if _, allowed := libraries[uint(id)]; allowed {
+			items = append(items, change)
+		}
+		return len(items) <= limit
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	return boundedOverviewList(items, limit, false)
+}
+
+// Shared bounded traversal: account/source scope, canonical catalog eligibility,
+// and progress eligibility precede page/count projection. Keyset traversal avoids
+// repeatedly scanning a growing OFFSET for accounts with large relay histories.
+func (s *PlayerHistoryService) visitAvailableHistory(actor Actor, serverOnly, continueOnly bool, visit func(PlayerHistoryChange) bool) error {
+	return s.withHistoryCatalogReadTx(func(tx *gorm.DB) error {
+		return s.visitAvailableHistoryTx(tx, actor, serverOnly, continueOnly, visit)
+	})
+}
+
+func (s *PlayerHistoryService) withHistoryCatalogReadTx(read func(*gorm.DB) error) error {
+	libraries := s.libraries
+	if libraries == nil {
+		libraries = &MediaLibraryService{db: s.db}
+	}
+	return libraries.withCatalogReadTx(context.Background(), read)
+}
+
+func (s *PlayerHistoryService) visitAvailableHistoryTx(tx *gorm.DB, actor Actor, serverOnly, continueOnly bool, visit func(PlayerHistoryChange) bool) error {
+	query := tx.Where("user_id = ? AND deleted = ?", actor.User.ID, false)
+	if serverOnly {
+		query = query.Where("source_kind = ?", "server")
+	}
+	if continueOnly {
+		query = query.Where("completed = ? AND position > 0 AND (duration IS NULL OR duration <= 0 OR (position * 1.0 / duration) < ?)", false, 0.92)
+	}
+	var lastTime int64
+	var lastKey string
+	for {
+		var rows []models.PlayerPlaybackHistory
+		batch := query.Session(&gorm.Session{}).Order("client_updated_at DESC, sync_key ASC").Limit(playerHistorySyncLimit)
+		if lastKey != "" {
+			batch = batch.Where("client_updated_at < ? OR (client_updated_at = ? AND sync_key > ?)", lastTime, lastTime, lastKey)
+		}
+		if err := batch.Find(&rows).Error; err != nil {
+			return err
+		}
+		available, err := s.browserHistoryAvailabilityTx(tx, actor, rows)
 		if err != nil {
-			return nil, false, err
+			return err
 		}
 		for index, row := range rows {
 			if !available[index] {
 				continue
 			}
 			change := playerHistoryChangeDTO(row)
-			if !playerOverviewContinueEligible(change) {
+			if continueOnly && !playerOverviewContinueEligible(change) {
 				continue
 			}
-			projected, ok := browserHistoryItem(change, s.libraries)
-			if !ok {
-				continue
-			}
-			items = append(items, projected)
-			if len(items) > limit {
-				return items[:limit], true, nil
+			if !visit(change) {
+				return nil
 			}
 		}
 		if len(rows) < playerHistorySyncLimit {
-			break
+			return nil
 		}
+		last := rows[len(rows)-1]
+		lastTime, lastKey = last.ClientUpdatedAt, last.SyncKey
 	}
-	return items, false, nil
 }
 
 func (s *PlayerHistoryService) browserHistoryAvailability(actor Actor, rows []models.PlayerPlaybackHistory) ([]bool, error) {
+	var available []bool
+	err := s.withHistoryCatalogReadTx(func(tx *gorm.DB) error {
+		var err error
+		available, err = s.browserHistoryAvailabilityTx(tx, actor, rows)
+		return err
+	})
+	return available, err
+}
+
+func (s *PlayerHistoryService) browserHistoryAvailabilityTx(tx *gorm.DB, actor Actor, rows []models.PlayerPlaybackHistory) ([]bool, error) {
 	available := make([]bool, len(rows))
 	serverRows := make([]models.PlayerPlaybackHistory, 0, len(rows))
 	serverIndexes := make([]int, 0, len(rows))
@@ -351,7 +426,7 @@ func (s *PlayerHistoryService) browserHistoryAvailability(actor Actor, rows []mo
 		serverRows = append(serverRows, row)
 		serverIndexes = append(serverIndexes, index)
 	}
-	serverAvailable, err := s.availableServerHistoryRows(actor, serverRows)
+	serverAvailable, err := s.availableServerHistoryRows(tx, actor, serverRows)
 	if err != nil {
 		return nil, err
 	}
@@ -413,7 +488,7 @@ func parseCanonicalServerHistoryIdentity(value string) (parsedCanonicalServerHis
 	}
 }
 
-func (s *PlayerHistoryService) availableServerHistoryRows(actor Actor, rows []models.PlayerPlaybackHistory) ([]bool, error) {
+func (s *PlayerHistoryService) availableServerHistoryRows(tx *gorm.DB, actor Actor, rows []models.PlayerPlaybackHistory) ([]bool, error) {
 	type candidate struct {
 		index    int
 		identity parsedCanonicalServerHistoryIdentity
@@ -440,10 +515,14 @@ func (s *PlayerHistoryService) availableServerHistoryRows(actor Actor, rows []mo
 		libraryIDs = append(libraryIDs, libraryID)
 	}
 	var enabledLibraryIDs []uint
-	if err := s.db.Table("media_libraries").Select("media_libraries.id").
+	if err := tx.Table("media_libraries").Select("media_libraries.id").
 		Joins("JOIN storages ON storages.id = media_libraries.storage_id").
 		Where("media_libraries.id IN ? AND media_libraries.enabled = ? AND storages.enabled = ?", libraryIDs, true, true).
 		Scan(&enabledLibraryIDs).Error; err != nil {
+		return nil, err
+	}
+	reader, err := PinCatalogTx(tx, enabledLibraryIDs)
+	if err != nil {
 		return nil, err
 	}
 	for _, libraryID := range enabledLibraryIDs {
@@ -452,7 +531,7 @@ func (s *PlayerHistoryService) availableServerHistoryRows(actor Actor, rows []mo
 			workKeys = append(workKeys, workKey)
 		}
 		var entries []models.MediaLibraryEntry
-		if err := s.db.Where("library_id = ? AND work_key IN ?", libraryID, workKeys).Find(&entries).Error; err != nil {
+		if err := reader.Entries().Where("library_id = ? AND work_key IN ?", libraryID, workKeys).Find(&entries).Error; err != nil {
 			return nil, err
 		}
 		entriesByWork := make(map[string][]models.MediaLibraryEntry)
@@ -567,12 +646,19 @@ func (s *PlayerHistoryService) resolveServerHistoryAuthority(tx *gorm.DB, actor 
 	if available == 0 {
 		return serverHistoryAuthority{}, appError(CodeNotFound, "播放历史媒体不存在", gorm.ErrRecordNotFound)
 	}
-	entryQuery := tx.Where("library_id = ? AND work_key = ?", parsed.libraryID, parsed.workKey)
+	reader, err := PinCatalogTx(tx, []uint{parsed.libraryID})
+	if err != nil {
+		return serverHistoryAuthority{}, err
+	}
+	entryQuery := reader.Entries().Where("library_id = ? AND work_key = ?", parsed.libraryID, parsed.workKey)
 	if parsed.entryID != 0 {
 		entryQuery = entryQuery.Where("id = ?", parsed.entryID)
 	}
 	var entry models.MediaLibraryEntry
 	if err := entryQuery.Order("id").First(&entry).Error; err != nil {
+		if err != gorm.ErrRecordNotFound {
+			return serverHistoryAuthority{}, err
+		}
 		return serverHistoryAuthority{}, appError(CodeNotFound, "播放历史媒体不存在", err)
 	}
 	isSeries := entry.MediaType == "tv" || strings.HasPrefix(entry.WorkKey, "series:")
@@ -583,9 +669,10 @@ func (s *PlayerHistoryService) resolveServerHistoryAuthority(tx *gorm.DB, actor 
 	var recognition models.MediaLibraryRecognition
 	var recognitionErr error
 	if entry.RecognitionID != nil {
-		recognitionErr = tx.First(&recognition, *entry.RecognitionID).Error
+		recognitionErr = reader.Recognitions().Where("library_id = ?", parsed.libraryID).First(&recognition, *entry.RecognitionID).Error
 	} else {
-		recognitionErr = tx.Table("media_library_recognitions").Joins("JOIN media_library_entries ON media_library_entries.recognition_id = media_library_recognitions.id").Where("media_library_entries.library_id = ? AND media_library_entries.work_key = ?", parsed.libraryID, parsed.workKey).Order("media_library_recognitions.updated_at DESC").First(&recognition).Error
+		recognitionIDs := reader.Entries().Select("recognition_id").Where("library_id = ? AND work_key = ? AND recognition_id IS NOT NULL", parsed.libraryID, parsed.workKey)
+		recognitionErr = reader.Recognitions().Where("library_id = ? AND id IN (?)", parsed.libraryID, recognitionIDs).Order("updated_at DESC, id DESC").First(&recognition).Error
 	}
 	var snapshot tmdb.Snapshot
 	if recognitionErr == nil && recognition.MetadataJSON != "" && recognition.MetadataJSON != "{}" {
@@ -707,6 +794,9 @@ func (s *PlayerHistoryService) mergeCanonicalServerHistory(tx *gorm.DB, actor Ac
 		}
 		candidate := playerHistoryChangeDTO(row)
 		resolved, resolveErr := s.resolveServerHistoryAuthority(tx, actor, candidate)
+		if resolveErr != nil && !isPlayerHistoryRecordError(resolveErr) {
+			return resolveErr
+		}
 		if resolveErr == nil && resolved.HistoryIdentity == authority.HistoryIdentity {
 			matched = append(matched, row)
 		}
@@ -737,7 +827,11 @@ func (s *PlayerHistoryService) mergeCanonicalServerHistory(tx *gorm.DB, actor Ac
 	target := canonical
 	copyPlayerHistoryState(&target, winner)
 	if !winnerFromIncoming {
-		if resolved, resolveErr := s.resolveServerHistoryAuthority(tx, actor, winner); resolveErr == nil && resolved.HistoryIdentity == authority.HistoryIdentity {
+		resolved, resolveErr := s.resolveServerHistoryAuthority(tx, actor, winner)
+		if resolveErr != nil && !isPlayerHistoryRecordError(resolveErr) {
+			return resolveErr
+		}
+		if resolveErr == nil && resolved.HistoryIdentity == authority.HistoryIdentity {
 			target.SourceLocator = winner.SourceLocator
 			target.SourceID = winner.SourceID
 			target.ItemID = resolved.ItemToken
@@ -867,6 +961,9 @@ func equalFloatPointers(left, right *float64) bool {
 }
 
 func normalizePlayerHistoryChange(change PlayerHistoryChange) (PlayerHistoryChange, error) {
+	// Asset associations are server-owned. Progress sync cannot attach or
+	// detach them, including when an old client echoes a stale DTO.
+	change.PosterAssetID, change.BackdropAssetID, change.TitleLogoAssetID = "", "", ""
 	change.SyncKey = strings.ToLower(strings.TrimSpace(change.SyncKey))
 	change.HistoryIdentity = strings.TrimSpace(change.HistoryIdentity)
 	change.SourceKind = strings.ToLower(strings.TrimSpace(change.SourceKind))
@@ -919,6 +1016,7 @@ func playerHistoryChangeDTO(row models.PlayerPlaybackHistory) PlayerHistoryChang
 		SeriesTitle: row.SeriesTitle, EpisodeTitle: row.EpisodeTitle, SeasonNumber: cloneInt(row.SeasonNumber),
 		EpisodeNumber: cloneInt(row.EpisodeNumber), StreamIdentity: row.StreamIdentity, MediaType: row.MediaType,
 		PosterURL: row.PosterURL, BackdropURL: row.BackdropURL, TitleLogoURL: row.TitleLogoURL,
+		PosterAssetID: row.PosterAssetID, BackdropAssetID: row.BackdropAssetID, TitleLogoAssetID: row.TitleLogoAssetID,
 		PosterPath: row.PosterPath, BackdropPath: row.BackdropPath, EpisodeStillPath: row.EpisodeStillPath,
 		Position: row.Position, Duration: cloneHistoryFloat64(row.Duration), Completed: row.Completed,
 		Deleted: row.Deleted, UpdatedAt: row.ClientUpdatedAt, Revision: row.Revision,

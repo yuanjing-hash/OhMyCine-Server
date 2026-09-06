@@ -5,7 +5,6 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/metadata/tmdb"
 	"gorm.io/gorm"
@@ -25,6 +24,15 @@ type tmdbCollectionMember struct {
 // the committed catalog view. Partial scans may prove additions but never
 // absence; only a complete scan is allowed to remove unseen TMDB-owned rows.
 func reconcileTMDBCollectionsTx(tx *gorm.DB, libraryID uint, partial bool, now time.Time) error {
+	reader, err := PinCatalogTx(tx, []uint{libraryID})
+	if err != nil {
+		return err
+	}
+	if head, _ := reader.Head(libraryID); head.Mode == "versioned" {
+		// Converted publishers prepare immutable membership before Seal. Never
+		// reconstruct globally visible collections from their identity anchors.
+		return ErrCatalogInvalid
+	}
 	var entries []models.MediaLibraryEntry
 	if err := tx.Where("library_id = ? AND media_type = ? AND match_status = ? AND recognition_id IS NOT NULL AND tmdb_id IS NOT NULL", libraryID, "movie", mediaRecognitionStatusMatched).Find(&entries).Error; err != nil {
 		return err
@@ -96,9 +104,13 @@ func reconcileTMDBCollectionsTx(tx *gorm.DB, libraryID uint, partial bool, now t
 		var collection models.PlayerMediaCollection
 		err := tx.Where("source = ? AND tmdb_collection_id = ?", models.PlayerMediaCollectionSourceTMDB, collectionTMDBID).First(&collection).Error
 		if errors.Is(err, gorm.ErrRecordNotFound) {
+			stableID, err := catalogCollectionIdentityTx(tx, collectionTMDBID)
+			if err != nil {
+				return err
+			}
 			id := collectionTMDBID
 			collection = models.PlayerMediaCollection{
-				ID: uuid.NewString(), Source: models.PlayerMediaCollectionSourceTMDB,
+				ID: stableID, Source: models.PlayerMediaCollectionSourceTMDB,
 				Kind: models.PlayerMediaCollectionKindCollection, Name: candidate.metadata.Name,
 				TMDBCollectionID: &id, PosterPath: candidate.metadata.PosterPath,
 				BackdropPath: candidate.metadata.BackdropPath, Revision: 1,

@@ -13,6 +13,8 @@
 | 06 | [Server 开发路线图](06-roadmap.md) | Server/CLI 当前状态、后续能力和质量门禁 |
 | 07 | [安全设计](07-security-design.md) | 威胁模型、凭据存储、302代理、配置同步、插件与部署安全 |
 | 08 | [Server Web UI 设计](08-server-web-ui-design.md) | 管理端导航、顶栏、混合型仪表盘、权限可见性与响应式规则 |
+| 09 | [可靠性与管理闭环](09-server-reliability.md) | 多版本、任务授权、历史图片、分页管理与性能边界 |
+| 10 | [升级恢复方案](10-upgrade-recovery-design.md) | 仅设计：一致性备份、密钥匹配、程序回退与数据恢复 |
 
 ## 快速开始
 

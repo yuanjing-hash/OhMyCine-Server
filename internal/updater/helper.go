@@ -22,6 +22,9 @@ type RunningProcess interface {
 }
 
 type HelperOptions struct {
+	// Must be resolved from the same deployment config as Server startup. Never
+	// assume runtime/data when the user configured a different database path.
+	DatabasePath      string
 	WaitForExit       func(context.Context, int) error
 	ResolveExecutable func(int) (string, error)
 	Rename            func(string, string) error
@@ -116,6 +119,17 @@ func RunHelper(ctx context.Context, planPath string, options HelperOptions) erro
 		return err
 	}
 	options = normalizeHelperOptions(options)
+	databasePath, err := compatibilityAbsolutePath(options.DatabasePath)
+	if err != nil {
+		return err
+	}
+	floor, err := readCatalogFloor(databasePath)
+	if err != nil {
+		return err
+	}
+	if floor > CatalogFormat {
+		return coded(CodeFormatIncompatible, errors.New("helper does not support database catalog format"))
+	}
 	currentDigest, err := hashFile(plan.CurrentExecutable, MaxCandidateBytes)
 	if err != nil || currentDigest != plan.CurrentSHA256 {
 		return coded(CodePlanInvalid, errors.New("installed executable digest changed"))
@@ -166,6 +180,18 @@ func RunHelper(ctx context.Context, planPath string, options HelperOptions) erro
 		_ = setPhase(PhaseFailed, ErrorCode(cause), true)
 		return cause
 	}
+	candidateDigest, err := hashFile(plan.Candidate, MaxCandidateBytes)
+	if err != nil {
+		return restartUnchanged(err)
+	}
+	nonce, err := newOperationID()
+	if err != nil {
+		return restartUnchanged(coded(CodeCompatibilityRequired, errors.New("helper capability could not be created")))
+	}
+	receipt := compatibilityReceipt{Schema: 1, OperationID: plan.OperationID, Nonce: nonce, CandidateSHA256: candidateDigest, DatabasePath: databasePath}
+	if err := durableCompatibilityJSON(compatibilityPath(store.runtimeRoot), receipt); err != nil {
+		return restartUnchanged(coded(CodeCompatibilityRequired, errors.New("helper capability could not be persisted")))
+	}
 	if err := setPhase(PhaseReplacing, "", false); err != nil {
 		return restartUnchanged(err)
 	}
@@ -179,8 +205,20 @@ func RunHelper(ctx context.Context, planPath string, options HelperOptions) erro
 	}
 	restore := func(cause error, running RunningProcess) error {
 		if running != nil {
-			_ = running.Kill()
+			if err := running.Kill(); err != nil {
+				blocked := coded(CodeRollbackBlocked, errors.New("candidate stop could not be proven; automatic rollback refused"))
+				_ = setPhase(PhaseFailed, ErrorCode(blocked), true)
+				return blocked
+			}
 			_ = running.Wait()
+		}
+		// Inspect AFTER the candidate is stopped: it may have raised the floor
+		// just before startup/health failed. Unknown state is also fail closed.
+		currentFloor, floorErr := readCatalogFloor(databasePath)
+		if floorErr != nil || currentFloor > 0 {
+			blocked := coded(CodeRollbackBlocked, errors.New("automatic binary rollback is unsafe; preserve candidate, backup and database for forward repair"))
+			_ = setPhase(PhaseFailed, ErrorCode(blocked), true)
+			return blocked
 		}
 		failedCandidate := plan.Candidate + ".failed"
 		_ = options.Remove(failedCandidate)
@@ -210,7 +248,8 @@ func RunHelper(ctx context.Context, planPath string, options HelperOptions) erro
 	if err := setPhase(PhaseRestarting, "", false); err != nil {
 		return restore(err, nil)
 	}
-	newProcess, err := options.Start(plan.CurrentExecutable, plan.OriginalArgs)
+	candidateArgs := append(StripCompatibilityArguments(plan.OriginalArgs), CompatibilityFlag, receipt.Nonce)
+	newProcess, err := options.Start(plan.CurrentExecutable, candidateArgs)
 	if err != nil {
 		return restore(coded(CodeRestartFailed, err), nil)
 	}
@@ -224,6 +263,12 @@ func RunHelper(ctx context.Context, planPath string, options HelperOptions) erro
 		return restore(coded(CodeHealthCheckFailed, err), newProcess)
 	}
 	_ = newProcess.Release()
+	receipt.Completed = true
+	if err := durableCompatibilityJSON(compatibilityPath(store.runtimeRoot), receipt); err != nil {
+		failure := coded(CodeCompatibilityRequired, errors.New("helper completion proof could not be persisted"))
+		_ = setPhase(PhaseFailed, ErrorCode(failure), true)
+		return failure
+	}
 	state.CurrentVersion = plan.TargetVersion
 	if err := setPhase(PhaseSucceeded, "", true); err != nil {
 		return err

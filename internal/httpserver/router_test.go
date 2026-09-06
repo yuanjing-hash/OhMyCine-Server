@@ -37,6 +37,7 @@ type testClient struct {
 	cookie      *http.Cookie
 	csrf        string
 	queue       *services.QueueService
+	queueEvents *services.QueueEventHub
 	db          *gorm.DB
 	connections *services.ConnectionService
 	signedProxy *services.SignedProxyService
@@ -44,6 +45,8 @@ type testClient struct {
 	changes     *services.MediaChangeService
 	sites       *services.SiteService
 	lastHeader  http.Header
+	libraries   *services.MediaLibraryService
+	history     *services.PlayerHistoryService
 }
 type testEnvelope struct {
 	Code    int             `json:"code"`
@@ -151,7 +154,7 @@ func (routerCloudDriver) Copy(context.Context, string, string) error   { return 
 func (routerCloudDriver) Rename(context.Context, string, string) error { return nil }
 func (routerCloudDriver) Recycle(context.Context, string) error        { return nil }
 
-func newTestClient(t *testing.T) *testClient {
+func newTestClient(t *testing.T, cloudDrivers ...cloudpkg.Driver) *testClient {
 	t.Helper()
 	testRoot := t.TempDir()
 	cfg := config.Config{Host: "127.0.0.1", Port: 3000, DatabasePath: filepath.Join(testRoot, "server.db"), LogDirectory: filepath.Join(testRoot, "logs"), CredentialKeyFile: filepath.Join(testRoot, "credentials.key"), Environment: "test", PublicOrigin: "http://localhost:3000", SessionIdleTTL: 2 * time.Hour, SessionMaxTTL: 7 * 24 * time.Hour}
@@ -211,6 +214,9 @@ func newTestClient(t *testing.T) *testClient {
 	if err := cloudRegistry.Register(cloudpkg.ProviderPan115, func(config cloudpkg.Config) (cloudpkg.Driver, error) {
 		if _, err := pan115.ParseCookie(config.Cookie); err != nil {
 			return nil, cloudpkg.Error(cloudpkg.CodeCookieInvalid, false, err)
+		}
+		if len(cloudDrivers) > 0 {
+			return cloudDrivers[0], nil
 		}
 		return routerCloudDriver{}, nil
 	}); err != nil {
@@ -288,7 +294,7 @@ func newTestClient(t *testing.T) *testClient {
 	api.SetSeedingSettingsService(seedingSettings)
 	api.SetSeedingService(seeding)
 	api.SetPluginRepositoryService(services.NewPluginRepositoryService(db, audit, nil, log))
-	return &testClient{router: New(cfg, api, auth, log), queue: queue, db: db, connections: connections, signedProxy: signedProxy, embyGateway: embyGateway, changes: changes, sites: sites}
+	return &testClient{router: New(cfg, api, auth, log), queue: queue, queueEvents: events, db: db, connections: connections, signedProxy: signedProxy, embyGateway: embyGateway, changes: changes, sites: sites, libraries: libraries, history: playerHistory}
 }
 
 func TestPlayerAcquisitionListRequiresDeviceAuthScopesOwnerAndValidatesInput(t *testing.T) {
@@ -2311,6 +2317,36 @@ func TestMediaLibraryAPICRUDRBACAndAutomaticInitialization(t *testing.T) {
 	}
 	if err := json.Unmarshal(recognitionEnvelope.Data, &recognitionPage); err != nil || len(recognitionPage.List) != 1 || recognitionPage.List[0].Token == "" || recognitionPage.List[0].SourceDirectory != "媒体库根目录" {
 		t.Fatalf("recognitions=%+v err=%v", recognitionPage, err)
+	}
+	exactRecognitionPath := "/api/v1/media-libraries/" + uintString(library.ID) + "/recognitions/" + recognitionPage.List[0].Token
+	status, exactRecognition := owner.request(t, http.MethodGet, exactRecognitionPath, nil, false)
+	if status != http.StatusOK || owner.lastHeader.Get("Cache-Control") != "no-store" || !bytes.Contains(exactRecognition.Data, []byte(recognitionPage.List[0].Token)) || bytes.Contains(exactRecognition.Data, []byte(root)) || bytes.Contains(exactRecognition.Data, []byte("provider_id")) {
+		t.Fatalf("exact recognition status=%d cache=%q data=%s", status, owner.lastHeader.Get("Cache-Control"), exactRecognition.Data)
+	}
+	if status, _ := owner.request(t, http.MethodGet, "/api/v1/media-libraries/"+uintString(secondLibrary.ID)+"/recognitions/"+recognitionPage.List[0].Token, nil, false); status != http.StatusNotFound {
+		t.Fatalf("cross-library exact recognition status=%d", status)
+	}
+	previewItemsPath := "/api/v1/media-libraries/" + uintString(library.ID) + "/structure/selection-preview/items"
+	previewPageInput := map[string]any{"confirmation_token": "invalid", "page": 1, "page_size": 50}
+	if status, _ := owner.request(t, http.MethodPost, previewItemsPath, previewPageInput, false); status != http.StatusForbidden {
+		t.Fatalf("preview page without CSRF status=%d", status)
+	}
+	if status, _ := owner.request(t, http.MethodPost, previewItemsPath, previewPageInput, true); status != http.StatusBadRequest || owner.lastHeader.Get("Cache-Control") != "no-store" {
+		t.Fatalf("preview page invalid claim status=%d cache=%q", status, owner.lastHeader.Get("Cache-Control"))
+	}
+	anonymous := newTestClientWithRouter(owner.router)
+	if status, _ := anonymous.request(t, http.MethodGet, exactRecognitionPath, nil, false); status != http.StatusUnauthorized {
+		t.Fatalf("anonymous exact recognition status=%d", status)
+	}
+	selectionStatusPath := "/api/v1/media-libraries/" + uintString(library.ID) + "/structure/selection-status"
+	selectionStatusInput := map[string]any{"issue_tokens": []string{"stale-issue"}}
+	if status, _ := owner.request(t, http.MethodPost, selectionStatusPath, selectionStatusInput, false); status != http.StatusForbidden {
+		t.Fatalf("selection status without CSRF status=%d", status)
+	}
+	status, selectionStatusEnvelope := owner.request(t, http.MethodPost, selectionStatusPath, selectionStatusInput, true)
+	var selectionStatus services.MediaLibraryStructureSelectionStatus
+	if status != http.StatusOK || owner.lastHeader.Get("Cache-Control") != "no-store" || json.Unmarshal(selectionStatusEnvelope.Data, &selectionStatus) != nil || selectionStatus.Revision == "" || len(selectionStatus.InvalidIssueTokens) != 1 || selectionStatus.InvalidIssueTokens[0] != "stale-issue" {
+		t.Fatalf("selection status=%d data=%s", status, selectionStatusEnvelope.Data)
 	}
 	status, invalidCandidateEnvelope := owner.request(t, http.MethodGet, "/api/v1/media-libraries/"+uintString(library.ID)+"/recognitions/"+recognitionPage.List[0].Token+"/tmdb-candidates?title=C:%5Cprivate%5Cmovie&media_type=movie", nil, false)
 	if status != http.StatusBadRequest || owner.lastHeader.Get("Cache-Control") != "no-store" || !bytes.Contains(invalidCandidateEnvelope.Data, []byte(services.CodeInvalidRequest)) || bytes.Contains(invalidCandidateEnvelope.Data, []byte(root)) {

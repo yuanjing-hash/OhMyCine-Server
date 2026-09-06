@@ -583,6 +583,18 @@ func TestDisabledLibraryWaitsUntilEnabledAndWatcherReconcilesChanges(t *testing.
 	service.SetMediaChangeService(changes)
 	var notifiedRevision atomic.Uint64
 	changes.SetReadyHandler(func(_ uint, revision uint64) { notifiedRevision.Store(revision) })
+	// Ready callbacks are delivered by the durable fanout worker, not inline
+	// during catalog publication. Exercise the same lifecycle as the Server.
+	dispatchCtx, stopDispatch := context.WithCancel(context.Background())
+	dispatchDone := make(chan struct{})
+	go func() {
+		defer close(dispatchDone)
+		changes.Run(dispatchCtx, nil, func(err error) { t.Errorf("dispatch media change: %v", err) })
+	}()
+	t.Cleanup(func() {
+		stopDispatch()
+		<-dispatchDone
+	})
 	input := testLibraryInput("Deferred library", storage, profile, false)
 	created, err := service.Create(context.Background(), actor, input, RequestContext{})
 	if err != nil {

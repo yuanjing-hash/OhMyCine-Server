@@ -40,6 +40,7 @@ export interface UserHistoryItem {
 }
 
 export interface UserCollectionSummary {
+	 revision?: number
   id: string
   name: string
   kind: 'collection' | 'playlist'
@@ -135,6 +136,12 @@ export function normalizeUserCollections(value: unknown): UserCollectionSummary[
   return array(record(value).list).map(normalizeCollection).filter(item => !!item.id)
 }
 
+export interface UserMediaPage<T> { list: T[]; total: number; page: number; page_size: number; has_more: boolean; revision?: number }
+export function normalizeUserMediaPage<T>(value: unknown, normalize: (value: unknown) => T[]): UserMediaPage<T> {
+  const source = record(value)
+  return { list: normalize(value), total: nonNegativeNumber(source.total), page: positiveNumber(source.page, 1), page_size: positiveNumber(source.page_size, 24), has_more: source.has_more === true, revision: nonNegativeNumber(source.revision) }
+}
+
 export function historyProgress(item: UserHistoryItem): number {
   if (!item.duration || item.duration <= 0) return 0
   return Math.max(0, Math.min(100, item.position / item.duration * 100))
@@ -183,6 +190,7 @@ function normalizeHistoryItem(value: unknown): UserHistoryItem {
 function normalizeCollection(value: unknown): UserCollectionSummary {
   const source = record(value)
   return {
+	 revision: nonNegativeNumber(source.revision),
     id: text(source.id), name: text(source.name) || '未命名合集', kind: source.kind === 'playlist' ? 'playlist' : 'collection',
     source: source.source === 'manual' ? 'manual' : 'tmdb', item_count: nonNegativeNumber(source.item_count),
     ...(text(source.poster_url) ? { poster_url: text(source.poster_url) } : {}),

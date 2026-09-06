@@ -5,6 +5,7 @@ import { Permissions } from '@/auth/generated-permissions'
 import { useAuthStore } from '@/stores/auth'
 import { buildVisibleNavigation, dashboardNavigation, type NavigationGroupID } from '@/navigation'
 import ThemeToggle from '@/components/ThemeToggle.vue'
+import NotificationCenter from '@/components/NotificationCenter.vue'
 
 type PanelID = 'search' | 'logs' | 'notifications' | 'account'
 
@@ -245,8 +246,7 @@ onBeforeUnmount(() => {
           </div>
 
           <div v-else-if="activePanel === 'notifications'" class="tool-panel__body">
-            <span class="status-chip status-chip--planned">尚未实现</span>
-            <p class="tool-empty">通知历史、未读状态与 WebSocket 权限投影尚未实现，因此这里没有虚假未读数或演示事件。</p>
+            <NotificationCenter @navigate="navigateFromPanel" />
           </div>
 
           <div v-else class="tool-panel__body">

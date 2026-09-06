@@ -301,26 +301,47 @@ func (s *MediaServerRefreshService) Retry(actor Actor, id uint, request RequestC
 }
 
 func (s *MediaServerRefreshService) EnqueueLibrary(libraryID uint, _ uint64) {
-	var targets []models.MediaServerRefreshTarget
-	if err := s.db.Where("library_id = ? AND enabled = ? AND last_status <> ? AND desired_revision > successful_revision", libraryID, true, models.JobStatusFailed).Find(&targets).Error; err != nil {
-		return
-	}
-	for _, target := range targets {
-		_, _ = s.enqueue(target)
-	}
+	_ = s.recoverPendingTargets(context.Background(), libraryID)
 }
 
 func (s *MediaServerRefreshService) RecoverPending() error {
-	var targets []models.MediaServerRefreshTarget
-	if err := s.db.Where("enabled = ? AND last_status <> ? AND (desired_revision > successful_revision OR manual_generation > successful_manual_generation)", true, models.JobStatusFailed).Find(&targets).Error; err != nil {
-		return err
-	}
-	for _, target := range targets {
-		if _, err := s.enqueue(target); err != nil {
+	return s.RecoverPendingContext(context.Background())
+}
+
+func (s *MediaServerRefreshService) RecoverPendingContext(ctx context.Context) error {
+	return s.recoverPendingTargets(ctx, 0)
+}
+
+func (s *MediaServerRefreshService) recoverPendingTargets(ctx context.Context, libraryID uint) error {
+	var after uint
+	for {
+		if err := ctx.Err(); err != nil {
 			return err
 		}
+		query := s.db.WithContext(ctx).Where("enabled = ? AND last_status <> ? AND id > ? AND (desired_revision > successful_revision OR manual_generation > successful_manual_generation)", true, models.JobStatusFailed, after)
+		if libraryID != 0 {
+			query = query.Where("library_id = ?", libraryID)
+		}
+		// Existing live jobs own retry/paused/running state. Do not reset their
+		// queue generations every poll. A missing/terminal job is recoverable.
+		query = query.Where(`NOT EXISTS (SELECT 1 FROM jobs WHERE jobs.id = media_server_refresh_targets.last_job_id AND jobs.status IN ?)`, []string{models.JobStatusQueued, models.JobStatusRunning, models.JobStatusRetryWait, models.JobStatusPaused, models.JobStatusWaitingUserAction})
+		var targets []models.MediaServerRefreshTarget
+		if err := query.Order("id").Limit(mediaChangeDispatchBatch).Find(&targets).Error; err != nil {
+			return err
+		}
+		if len(targets) == 0 {
+			return nil
+		}
+		for _, target := range targets {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if _, err := s.enqueue(target); err != nil {
+				return err
+			}
+		}
+		after = targets[len(targets)-1].ID
 	}
-	return nil
 }
 
 func (s *MediaServerRefreshService) EnqueueTarget(id uint) error {

@@ -344,15 +344,16 @@ func (s *STRMManagementService) restoreRetryFailure(run models.MediaArtifactRun,
 }
 
 type artifactCleanupPlan struct {
-	Library      models.MediaLibrary
-	Run          *models.MediaArtifactRun
-	Policy       mediaArtifactPolicy
-	Root         string
-	RootIdentity string
-	Targets      map[uint]artifactCleanupTarget
-	Artifacts    []models.MediaArtifact
-	Snapshot     string
-	Automatic    bool
+	Library        models.MediaLibrary
+	Run            *models.MediaArtifactRun
+	Policy         mediaArtifactPolicy
+	Root           string
+	RootIdentity   string
+	Targets        map[uint]artifactCleanupTarget
+	Artifacts      []models.MediaArtifact
+	Snapshot       string
+	Automatic      bool
+	PhysicalPermit *CatalogPhysicalWritePermit
 }
 
 type artifactCleanupTarget struct {
@@ -413,6 +414,35 @@ func (s *STRMManagementService) buildCleanupPlan(libraryID uint, runID string, a
 		}
 		if run.Status != models.MediaArtifactStatusCompleted || run.Generation != plan.Policy.Generation || plan.Policy.LibraryID != libraryID {
 			return plan, &artifactCleanupSkip{reason: "artifact_cleanup_run_incomplete"}
+		}
+		if plan.Policy.CatalogBindingID != "" {
+			bindingService := &MediaArtifactService{db: s.db}
+			readDB := s.db
+			if s.artifacts != nil && s.artifacts.catalogStore != nil {
+				readDB = s.artifacts.catalogStore.readDB
+			}
+			if err := readDB.Transaction(func(tx *gorm.DB) error {
+				var binding models.CatalogArtifactBinding
+				if err := tx.First(&binding, "id = ?", plan.Policy.CatalogBindingID).Error; err != nil {
+					return err
+				}
+				if binding.State != "completed" {
+					return ErrCatalogFence
+				}
+				return bindingService.validateArtifactBindingTx(tx, plan.Policy, nil, nil, false)
+			}); err != nil {
+				if errors.Is(err, ErrCatalogFence) {
+					return plan, &artifactCleanupSkip{reason: "artifact_cleanup_snapshot_changed"}
+				}
+				return plan, cleanupFailure("artifact_cleanup_snapshot_unavailable")
+			}
+		} else {
+			var head models.CatalogHead
+			if err := s.db.First(&head, "library_id = ?", libraryID).Error; err == nil && head.Mode == "versioned" {
+				return plan, &artifactCleanupSkip{reason: "artifact_cleanup_snapshot_missing"}
+			} else if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+				return plan, err
+			}
 		}
 		targetKind = plan.Policy.TargetKind
 		rootPath = plan.Policy.ProjectionRoot
@@ -572,6 +602,9 @@ func (s *STRMManagementService) PreviewCleanup(actor Actor, libraryID uint) (STR
 }
 
 func (s *STRMManagementService) ExecuteCleanup(actor Actor, libraryID uint, token string, request RequestContext) (int, error) {
+	if s == nil || s.libraries == nil {
+		return 0, appError(CodeConflict, "产物清理执行服务尚未就绪", nil)
+	}
 	if !actor.CanResource(authz.PermissionSTRMCleanup, models.AuthorizationResourceMediaLibrary, uintID(libraryID)) {
 		return 0, appError(CodePermissionDenied, "无权清理 STRM 产物", nil)
 	}
@@ -618,6 +651,9 @@ func (s *STRMManagementService) lockCleanupBoundary(libraryID uint) func() {
 }
 
 func (s *STRMManagementService) executeCleanupPlan(ctx context.Context, plan artifactCleanupPlan) (int, int, error) {
+	if permit, ok := ctx.Value(artifactCleanupPermitContextKey{}).(CatalogPhysicalWritePermit); ok {
+		plan.PhysicalPermit = &permit
+	}
 	guard := artifactCleanupGuard{LibraryID: plan.Library.ID, Generation: plan.Library.ArtifactGeneration, AppliedGeneration: plan.Library.ArtifactAppliedGeneration, RootIdentity: plan.RootIdentity, Snapshot: plan.Snapshot, Automatic: plan.Automatic}
 	if plan.Run != nil {
 		guard.RunID = plan.Run.ID
@@ -642,6 +678,7 @@ func (s *STRMManagementService) executeCleanupPlan(ctx context.Context, plan art
 			return removed, removedDirectories, cleanupFailure("artifact_cleanup_ownership_changed")
 		}
 		originalStatus := current.Status
+		fresh.PhysicalPermit = plan.PhysicalPermit
 		if err := s.claimCleanupArtifact(fresh, current); err != nil {
 			return removed, removedDirectories, err
 		}
@@ -682,14 +719,14 @@ func (s *STRMManagementService) executeCleanupPlan(ctx context.Context, plan art
 				return removed, removedDirectories, cleanupFailure("artifact_cleanup_target_changed")
 			}
 			if err := s.removeFile(target); err != nil && !errors.Is(err, os.ErrNotExist) {
-				s.restoreCleanupArtifact(current, originalStatus)
+				// The external call has begun: keep its durable cleanup claim even
+				// when it reports failure. Retry must reconcile this exact manifest.
 				return removed, removedDirectories, cleanupFailure("artifact_cleanup_delete_failed")
 			}
 		}
 		pruned, err := s.removeEmptyCleanupAncestors(ctx, cleanupTarget.Root, cleanupTarget.RootIdentity, target)
 		removedDirectories += pruned
 		if err != nil {
-			s.restoreCleanupArtifact(current, originalStatus)
 			return removed, removedDirectories, err
 		}
 		if err := s.deleteClaimedCleanupArtifact(plan, current); err != nil {
@@ -708,6 +745,19 @@ func (s *STRMManagementService) executeCleanupPlan(ctx context.Context, plan art
 
 func (s *STRMManagementService) claimCleanupArtifact(plan artifactCleanupPlan, artifact models.MediaArtifact) error {
 	return s.db.Transaction(func(tx *gorm.DB) error {
+		// This existing exact per-file claim is the physical evidence for manual
+		// cleanup too. Exclusive drain must inspect it even if its old artifact
+		// generation was already completed or settled.
+		if err := AssertCatalogPhysicalAdmissionTx(tx, plan.Library.ID); err != nil {
+			return err
+		}
+		var unresolved uint64
+		if err := tx.Model(&models.CatalogArtifactWriteReceipt{}).Select("id").Where("library_id = ? AND target_kind = ? AND relative_path = ? AND phase IN ?", artifact.LibraryID, artifact.TargetKind, artifact.RelativePath, []string{"prepared", "conflict"}).Limit(1).Scan(&unresolved).Error; err != nil {
+			return err
+		}
+		if unresolved != 0 {
+			return cleanupFailure("artifact_cleanup_write_unresolved")
+		}
 		var library models.MediaLibrary
 		if err := tx.First(&library, plan.Library.ID).Error; err != nil {
 			return err
@@ -717,6 +767,9 @@ func (s *STRMManagementService) claimCleanupArtifact(plan artifactCleanupPlan, a
 		}
 		if plan.Run != nil && (plan.Run.ID == "" || plan.Run.Generation != library.ArtifactAppliedGeneration) {
 			return cleanupFailure("artifact_cleanup_run_changed")
+		}
+		if err := s.recordArtifactCleanupClaimTx(tx, plan, artifact); err != nil {
+			return err
 		}
 		result := tx.Model(&models.MediaArtifact{}).Where("id = ? AND library_id = ? AND run_id = ? AND target_kind = ? AND kind = ? AND managed = ? AND active = ? AND relative_path = ? AND content_fingerprint = ? AND status = ?", artifact.ID, artifact.LibraryID, artifact.RunID, cleanupPlanTargetKind(plan), artifact.Kind, true, false, artifact.RelativePath, artifact.ContentFingerprint, artifact.Status).Update("status", models.MediaArtifactStatusCleanup)
 		if result.Error != nil {
@@ -730,7 +783,16 @@ func (s *STRMManagementService) claimCleanupArtifact(plan artifactCleanupPlan, a
 }
 
 func (s *STRMManagementService) restoreCleanupArtifact(artifact models.MediaArtifact, status string) {
-	_ = s.db.Model(&models.MediaArtifact{}).Where("id = ? AND run_id = ? AND managed = ? AND active = ? AND status = ?", artifact.ID, artifact.RunID, true, false, models.MediaArtifactStatusCleanup).Update("status", status).Error
+	if status == models.MediaArtifactStatusCleanup {
+		return // Prior interrupted physical work still owns this marker.
+	}
+	_ = s.db.Transaction(func(tx *gorm.DB) error {
+		result := tx.Model(&models.MediaArtifact{}).Where("id = ? AND run_id = ? AND managed = ? AND active = ? AND status = ?", artifact.ID, artifact.RunID, true, false, models.MediaArtifactStatusCleanup).Update("status", status)
+		if result.Error != nil || result.RowsAffected != 1 {
+			return result.Error
+		}
+		return tx.Where("artifact_id = ?", artifact.ID).Delete(&models.CatalogArtifactCleanupClaim{}).Error
+	})
 }
 
 func (s *STRMManagementService) deleteClaimedCleanupArtifact(plan artifactCleanupPlan, artifact models.MediaArtifact) error {
@@ -966,6 +1028,9 @@ func cleanupDirectoryEmpty(path string) (empty bool, exists bool, err error) {
 }
 
 func (s *STRMManagementService) AutoCleanup(ctx context.Context, runID string) ArtifactCleanupResult {
+	if s == nil || s.libraries == nil {
+		return ArtifactCleanupResult{ErrorCode: "artifact_cleanup_service_unavailable"}
+	}
 	var run models.MediaArtifactRun
 	if err := s.db.First(&run, "id = ?", runID).Error; err != nil {
 		return ArtifactCleanupResult{ErrorCode: "artifact_cleanup_run_unavailable"}

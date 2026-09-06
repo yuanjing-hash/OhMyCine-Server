@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
-import { defaultVideoExtensions, draftFromLibrary, emptyMediaLibraryDraft, isMediaLibraryDraftValid, mediaLibraryDraftFingerprint, mediaLibrarySourceDisplayPath, payloadFromDraft, presentLibraryStatus, supportsSTRM } from '@/media-libraries'
+import { defaultVideoExtensions, draftFromLibrary, emptyMediaLibraryDraft, isMediaLibraryDraftValid, mediaLibraryDeletionNotice, mediaLibraryDraftFingerprint, mediaLibrarySourceDisplayPath, payloadFromDraft, presentLibraryStatus, supportsSTRM } from '@/media-libraries'
 import type { StorageSummary } from '@/types/api'
 
 function storage(type: string, direct = false, signed = false): StorageSummary {
@@ -10,6 +10,13 @@ function storage(type: string, direct = false, signed = false): StorageSummary {
 }
 
 describe('media library form boundary', () => {
+  it('distinguishes accepted retirement from completed deletion', () => {
+    expect(mediaLibraryDeletionNotice({ deleted: false, status: 'deleting', job_id: 'job' })).toContain('尚未删除完成')
+    expect(mediaLibraryDeletionNotice({ deleted: true })).toContain('已删除')
+    expect(() => mediaLibraryDeletionNotice({ deleted: false })).toThrow('明确的移除结果')
+    expect(presentLibraryStatus('listening', { status: 'deleting', job_id: 'job' }).label).toBe('正在移除索引')
+    expect(presentLibraryStatus('listening', { status: 'deleting', job_id: 'job', error_code: 'paused' }).label).toBe('移除需处理')
+  })
   it('submits an opaque relative-root token without reconstructing a path', () => {
     const draft = emptyMediaLibraryDraft(1, 2)
     draft.relative_root_token = 'opaque-selection'
@@ -186,14 +193,15 @@ describe('media library form boundary', () => {
     for (const text of ['目录结构诊断正在后台', '目录结构诊断系统失败', '诊断全程只读，不会移动文件', 'processed_items', 'classifications.duplicate_target', 'classifications.sidecar_target_conflict']) expect(source).toContain(text)
     expect(source).toContain('async function viewStructureDiagnostics()')
     expect(source).toContain('await showStructureDiagnostics(false)')
-    expect(source).toContain('else await loadStructureIssues(libraryID)')
+    expect(source).toContain('await loadStructureIssues(libraryID)')
+    expect(source).toContain('if (!enqueue) { await pollStructureDiagnostics(libraryID); return }')
     expect(source).toContain('@click="viewStructureDiagnostics">查看诊断进度</button>')
     expect(source).not.toContain('@click="openStructureDiagnostics">查看诊断进度</button>')
   })
 
   it('loads the complete actionable structure projection with server pagination', () => {
     const source = readFileSync(new URL('./views/MediaLibrariesView.vue', import.meta.url), 'utf8')
-    for (const text of ['完整问题列表', '需要决定', '预览全部已选操作', '只预览并提交当前类型', '去手动整理', '去规则管理', '视频目标冲突', '伴随文件冲突', '重新检查', 'structureIssuePageSize', 'changeStructureIssuePage']) expect(source).toContain(text)
+    for (const text of ['完整问题列表', '需要决定', '预览全部已选操作', '只预览并提交当前类型', '手动识别此项', '去规则管理', '视频目标冲突', '伴随文件冲突', '重新检查', 'structureIssuePageSize', 'changeStructureIssuePage']) expect(source).toContain(text)
     for (const text of ['自动识别失败或无匹配', '目录结构初步检查完成 · 等待识别结果', '等待中的媒体不会计入“需要处理”', '本次来源版本的收敛检查', 'recognition_enqueue_failed']) expect(source).toContain(text)
     expect(source).toContain('/structure/issues?')
     expect(source).toContain("actionable: 'true'")
@@ -205,7 +213,7 @@ describe('media library form boundary', () => {
 
   it('shows every persisted member in one target-conflict group', () => {
     const source = readFileSync(new URL('./views/MediaLibrariesView.vue', import.meta.url), 'utf8')
-    for (const text of ['当前路径 / 冲突来源', '同一目标的全部来源', 'issue.members', 'member.source_path', '保留这一份', '按推荐保留', '全部保留为版本', '本次跳过']) expect(source).toContain(text)
+    for (const text of ['当前路径 / 冲突来源', '同一目标的全部来源', 'issue.members', 'member.source_path', '保留这一份', '按推荐保留', '保留全部文件（自动区分重名）', '本次跳过']) expect(source).toContain(text)
     expect(source).not.toContain('个来源已省略')
   })
 
@@ -222,7 +230,7 @@ describe('media library form boundary', () => {
       '多个真实文件会得到同一目标',
       '不要删除来源文件',
       '核对并修正识别',
-      "catalogMatch.value = 'review'",
+      '@click="openStructureRecognition(issue)"',
       "catalogMatch.value === 'manual' || catalogMatch.value === 'review' ? 'matched' : 'unrecognized'",
       "item.status === 'matched' ? '修正识别' : '手动整理'",
       '(sourceTitle || item.title).trim()',

@@ -86,6 +86,10 @@ func TestPrepareCreatesIndependentHelperAndPrivateBoundPlan(t *testing.T) {
 	if err := os.WriteFile(current, []byte("old-server-binary"), 0o700); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := client.Prepare(context.Background(), selected, store, PrepareRequest{CurrentExecutable: current, ParentPID: os.Getpid(), HealthURL: "http://127.0.0.1:3000/api/v1/health"}); ErrorCode(err) != CodeCompatibilityRequired {
+		t.Fatalf("legacy candidate reached helper handoff: %v", err)
+	}
+	client.probeCompatibility = func(context.Context, string) error { return nil }
 	prepared, err := client.Prepare(context.Background(), selected, store, PrepareRequest{CurrentExecutable: current, ParentPID: os.Getpid(), OriginalArgs: []string{"--config", "server.json"}, HealthURL: "http://127.0.0.1:3000/api/v1/health"})
 	if err != nil {
 		t.Fatal(err)

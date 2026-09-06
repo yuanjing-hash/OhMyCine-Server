@@ -1,5 +1,8 @@
 ﻿<script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { useRoute, useRouter } from 'vue-router';
+import { createLatestRequest } from '@/latest-request';
+import { useJobLiveRefresh } from '@/use-job-live-refresh';
 import { Permissions } from "@/auth/generated-permissions";
 import { useAuthStore } from "@/stores/auth";
 import { APIError } from "@/api/client";
@@ -36,6 +39,10 @@ const auth = useAuthStore(),
   timeline = ref<JobEvent[]>([]),
   dragged = ref<number | null>(null);
 let drawerTrigger: HTMLElement | null = null;
+const route = useRoute(), router = useRouter();
+const listRequest = createLatestRequest(), detailRequest = createLatestRequest();
+const detailID = ref(''), detailError = ref(''), detailLoading = ref(false), ordering = ref(false);
+let alive = true;
 const canControl = computed(() =>
     auth.canAny([Permissions.JobsControlOwn, Permissions.JobsControlAll]),
   ),
@@ -55,9 +62,10 @@ const canControl = computed(() =>
       priority.value !== "" &&
       jobs.value.length > 1,
   );
-const completeLane = computed(() => laneReady.value && total.value === jobs.value.length);
-async function load() {
-  loading.value = true;
+const completeLane = computed(() => !ordering.value && !loading.value && laneReady.value && total.value === jobs.value.length);
+async function load(quiet = false) {
+  const request = listRequest.begin();
+  if (!quiet) loading.value = true;
   error.value = "";
   try {
     const q = new URLSearchParams({ page: String(page.value), page_size: String(laneOnly.value ? 200 : pageSize.value) });
@@ -65,25 +73,97 @@ async function load() {
     if (jobType.value) q.set("job_type", jobType.value);
     if (priority.value) q.set("priority", priority.value);
     if (provider.value) q.set("provider", provider.value);
-    const r = await listJobs(q);
+    const r = await listJobs(q, request.signal);
+    if (!request.isCurrent()) return;
     jobs.value = r.list;
     total.value = r.total;
   } catch (c) {
+    if (!request.isCurrent()) return;
+    if (c instanceof APIError && [401, 403].includes(c.status)) jobs.value = [];
     error.value = c instanceof Error ? c.message : "任务加载失败";
   } finally {
-    loading.value = false;
+    if (request.isCurrent()) loading.value = false;
+    request.finish();
   }
 }
-async function open(job: Job) {
-  drawerTrigger = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-  const [detail, a, t] = await Promise.all([getJob(job.id), getAttempts(job.id), getTimeline(job.id)]);
-  selected.value = detail;
-  attempts.value = a.list;
-  timeline.value = t.list;
-  window.setTimeout(() => document.querySelector<HTMLElement>(".task-drawer .icon-button")?.focus());
+async function loadDetail(id: string, quiet = false) {
+  const request = detailRequest.begin();
+  detailError.value = '';
+  if (!quiet) { selected.value = null; attempts.value = []; timeline.value = []; detailLoading.value = true; }
+  try {
+    const [detail, a, t] = await Promise.all([getJob(id, request.signal), getAttempts(id, request.signal), getTimeline(id, request.signal)]);
+    if (!request.isCurrent()) return;
+    selected.value = detail;
+    attempts.value = a.list;
+    timeline.value = t.list;
+  } catch (reason) {
+    if (!request.isCurrent()) return;
+    detailError.value = reason instanceof Error ? reason.message : '任务详情读取失败';
+    if (reason instanceof APIError && [401, 403, 404].includes(reason.status)) { selected.value = null; attempts.value = []; timeline.value = []; }
+  } finally {
+    if (request.isCurrent()) detailLoading.value = false;
+    request.finish();
+    if (!quiet) { await nextTick(); if (request.isCurrent()) document.querySelector<HTMLElement>('.task-drawer .icon-button')?.focus(); }
+  }
 }
-function closeDrawer(){selected.value=null;window.setTimeout(()=>drawerTrigger?.focus())}
-function handleEscape(event:KeyboardEvent){if(event.key==="Escape"&&selected.value)closeDrawer()}
+function open(job: Job) {
+  drawerTrigger = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  void router.replace({ query: { ...route.query, job_id: job.id } });
+}
+function closeDrawer() {
+  detailRequest.cancel(); detailID.value = ''; selected.value = null;
+  const query = { ...route.query }; delete query.job_id;
+  void router.replace({ query });
+  void nextTick(() => { if (alive) drawerTrigger?.focus() });
+}
+function handleEscape(event: KeyboardEvent) {
+  if (!detailID.value) return;
+  if (event.key === 'Escape') { closeDrawer(); return; }
+  if (event.key !== 'Tab') return;
+  const drawer = document.querySelector<HTMLElement>('.task-drawer');
+  const controls = Array.from(drawer?.querySelectorAll<HTMLElement>('button:not(:disabled), a[href], input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex="0"]') ?? []);
+  const first = controls[0], last = controls[controls.length - 1];
+  if (!first || !last) return;
+  if (!drawer?.contains(document.activeElement) || (!event.shiftKey && document.activeElement === last)) { event.preventDefault(); first.focus(); }
+  else if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+}
+function queryText(value: unknown, pattern: RegExp) { return typeof value === 'string' && pattern.test(value) ? value : '' }
+function applyFilters() { page.value = 1; changePage(1) }
+function changePage(value: number) {
+  const query: Record<string, string> = { page: String(value) };
+  if (status.value) query.status = status.value;
+  if (jobType.value) query.job_type = jobType.value;
+  if (priority.value) query.priority = priority.value;
+  if (provider.value) query.provider = provider.value;
+  if (laneOnly.value) query.lane = '1';
+  if (detailID.value) query.job_id = detailID.value;
+  void router.replace({ query });
+}
+let previousListKey = '';
+watch(() => route.fullPath, () => {
+  if (route.path !== '/automation/tasks') return;
+  status.value = Object.hasOwn(statusLabels, String(route.query.status)) ? String(route.query.status) : '';
+  jobType.value = queryText(route.query.job_type, /^[a-zA-Z0-9_-]{1,64}$/);
+  priority.value = queryText(route.query.priority, /^-?\d{1,6}$/);
+  provider.value = queryText(route.query.provider, /^[a-zA-Z0-9_-]{1,64}$/);
+  laneOnly.value = route.query.lane === '1';
+  page.value = Math.max(1, Math.min(100000, Number(queryText(route.query.page, /^\d{1,6}$/)) || 1));
+  if (laneOnly.value) { status.value = 'queued'; page.value = 1; }
+  const key = JSON.stringify([status.value, jobType.value, priority.value, provider.value, laneOnly.value, page.value]);
+  if (key !== previousListKey) { previousListKey = key; void load() }
+  const id = queryText(route.query.job_id, /^[a-zA-Z0-9_-]{1,128}$/);
+  if (id !== detailID.value) {
+    detailRequest.cancel(); detailID.value = id; selected.value = null;
+    if (id) void loadDetail(id);
+  }
+}, { immediate: true });
+async function refresh() {
+  if (!alive) return;
+  await Promise.all([load(true), ...(detailID.value ? [loadDetail(detailID.value, true)] : [])]);
+}
+useJobLiveRefresh(async () => {
+  await Promise.all([...(listRequest.pending ? [] : [load(true)]), ...(detailID.value && !detailRequest.pending ? [loadDetail(detailID.value, true)] : [])]);
+});
 async function action(job: Job, name: "pause" | "resume" | "cancel" | "retry") {
   if (
     (name === "cancel" || name === "retry") &&
@@ -94,18 +174,18 @@ async function action(job: Job, name: "pause" | "resume" | "cancel" | "retry") {
     return;
   try {
     await controlJob(job.id, name);
-    await load();
+    await refresh();
   } catch (c) {
-    error.value = c instanceof Error ? c.message : "操作失败";
+    if (alive) error.value = c instanceof Error ? c.message : "操作失败";
   }
 }
 async function respond(job: Job, response: string) {
   try {
     await respondAction(job, response);
-    await load();
-    selected.value = null;
+    await refresh();
+    if (alive && detailID.value === job.id) closeDrawer();
   } catch (c) {
-    error.value = c instanceof Error ? c.message : "响应失败";
+    if (alive) error.value = c instanceof Error ? c.message : "响应失败";
   }
 }
 async function move(index: number, offset: number) {
@@ -114,12 +194,14 @@ async function move(index: number, offset: number) {
   if (next < 0 || next >= jobs.value.length) return;
   const ordered = [...jobs.value];
   [ordered[index], ordered[next]] = [ordered[next], ordered[index]];
+  ordering.value = true;
   try {
-    jobs.value = (
-      await reorderLane(ordered[0].job_type, ordered[0].priority, ordered)
-    ).list;
+    await reorderLane(ordered[0].job_type, ordered[0].priority, ordered);
+    if (!alive) return;
+    await refresh();
     notice.value = "队列顺序已保存";
   } catch (c) {
+    if (!alive) return;
     notice.value =
       c instanceof APIError && c.errorCode === "queue_order_conflict"
         ? "队列已变化，已刷新真实顺序"
@@ -129,7 +211,9 @@ async function move(index: number, offset: number) {
       : c instanceof Error
         ? c.message
         : "排序失败";
-    await load();
+    if (alive) await refresh();
+  } finally {
+    if (alive) ordering.value = false;
   }
 }
 async function drop(index: number) {
@@ -138,28 +222,20 @@ async function drop(index: number) {
     item = ordered.splice(dragged.value, 1)[0];
   ordered.splice(index, 0, item);
   dragged.value = null;
+  ordering.value = true;
   try {
-    jobs.value = (
-      await reorderLane(ordered[0].job_type, ordered[0].priority, ordered)
-    ).list;
+    await reorderLane(ordered[0].job_type, ordered[0].priority, ordered);
+    if (alive) await refresh();
   } catch {
+    if (!alive) return;
     notice.value = "队列已变化，已刷新真实顺序";
-    await load();
+    if (alive) await refresh();
+  } finally {
+    if (alive) ordering.value = false;
   }
 }
-onMounted(load);
-let refreshTimer: number | undefined;
-let socket: WebSocket | undefined;
-function startLiveUpdates() {
-  refreshTimer = window.setInterval(load, 15_000);
-  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-  socket = new WebSocket(`${protocol}//${window.location.host}/api/v1/jobs/events/ws`);
-  socket.onmessage = () => load();
-  socket.onclose = () => { socket = undefined; };
-}
-onMounted(startLiveUpdates);
 onMounted(()=>window.addEventListener("keydown",handleEscape));
-onBeforeUnmount(() => { if (refreshTimer) window.clearInterval(refreshTimer); socket?.close(); window.removeEventListener("keydown",handleEscape); });
+onBeforeUnmount(() => { alive = false; listRequest.cancel(); detailRequest.cancel(); window.removeEventListener("keydown",handleEscape); });
 </script>
 <template>
   <section class="mx-auto max-w-[96rem]">
@@ -171,7 +247,7 @@ onBeforeUnmount(() => { if (refreshTimer) window.clearInterval(refreshTimer); so
           不进入此队列。
         </p>
       </div>
-      <button class="btn-secondary" @click="load">刷新</button>
+      <button class="btn-secondary" @click="refresh">刷新</button>
     </header>
     <div class="task-summary mt-6">
       <article
@@ -189,7 +265,7 @@ onBeforeUnmount(() => { if (refreshTimer) window.clearInterval(refreshTimer); so
       </article>
     </div>
     <div class="panel mt-4 task-filters">
-      <label><span class="label">状态</span><select v-model="status" class="input" @change="load">
+      <label><span class="label">状态</span><select v-model="status" class="input" @change="applyFilters">
         <option value="">全部</option>
         <option v-for="(label, key) in statusLabels" :key="key" :value="key">
           {{ label }}
@@ -198,24 +274,24 @@ onBeforeUnmount(() => { if (refreshTimer) window.clearInterval(refreshTimer); so
         v-model.trim="jobType"
         class="input"
         placeholder="download / transfer"
-        @change="load"
+        @change="applyFilters"
       /></label><label><span class="label">优先级</span><input
         v-model.trim="priority"
         class="input"
         inputmode="numeric"
         placeholder="10"
-        @change="load"
+        @change="applyFilters"
       /></label><label><span class="label">Provider</span><input
         v-model.trim="provider"
         class="input"
         placeholder="provider"
-        @change="load"
+        @change="applyFilters"
       /></label><label class="task-checkbox"><input
         v-model="laneOnly"
         type="checkbox"
         @change="
           status = laneOnly ? 'queued' : status;
-          load();
+          applyFilters();
         "
       />
         单 lane 排序</label>
@@ -233,7 +309,7 @@ onBeforeUnmount(() => { if (refreshTimer) window.clearInterval(refreshTimer); so
       </p>
       <p v-if="loading" class="p-6 text-muted">正在读取持久化队列…</p>
       <p v-else-if="!jobs.length" class="p-6 text-muted">
-        查询成功，当前筛选范围内没有任务。
+        {{ error ? '任务读取失败，请重试。' : '查询成功，当前筛选范围内没有任务。' }}
       </p>
       <table v-else class="semantic-table task-table w-full">
         <thead>
@@ -352,19 +428,19 @@ onBeforeUnmount(() => { if (refreshTimer) window.clearInterval(refreshTimer); so
         </tbody>
       </table>
       <footer
-        v-if="jobs.length"
+        v-if="total || page > 1"
         class="border-t border-[var(--border)] p-3 text-sm text-muted"
       >
         显示 {{ jobs.length }} / {{ total }} 条
         <span v-if="!laneOnly" class="ml-4 inline-flex items-center gap-2">
-          <button class="btn-secondary" :disabled="page === 1" @click="page--; load()">上一页</button>
+          <button class="btn-secondary" :disabled="page === 1" @click="changePage(page - 1)">上一页</button>
           <span>第 {{ page }} 页</span>
-          <button class="btn-secondary" :disabled="page * pageSize >= total" @click="page++; load()">下一页</button>
+          <button class="btn-secondary" :disabled="page * pageSize >= total" @click="changePage(page + 1)">下一页</button>
         </span>
       </footer>
     </div>
     <div
-      v-if="selected"
+      v-if="detailID"
       class="task-drawer-backdrop"
       @click.self="closeDrawer()"
     >
@@ -372,12 +448,13 @@ onBeforeUnmount(() => { if (refreshTimer) window.clearInterval(refreshTimer); so
         class="task-drawer"
         role="dialog"
         aria-modal="true"
-        :aria-label="`${selected.display_name} 详情`"
+        :aria-label="`${selected?.display_name || '任务'} 详情`"
       >
         <header>
           <div>
-            <small>{{ selected.job_type }}</small>
-            <h2>{{ selected.display_name }}</h2>
+            <small>{{ selected?.job_type }}</small>
+            <h2>{{ selected?.display_name || '任务详情' }}</h2>
+            <span v-if="selected" class="status-chip">{{ statusLabels[selected.status] }}</span>
           </div>
           <button
             class="icon-button"
@@ -387,8 +464,10 @@ onBeforeUnmount(() => { if (refreshTimer) window.clearInterval(refreshTimer); so
             ×
           </button>
         </header>
+        <p v-if="detailLoading" class="p-4" role="status">正在读取任务详情…</p>
+        <p v-if="detailError" class="semantic-error m-4 p-4" role="alert">{{ detailError }} <button class="btn-secondary" @click="loadDetail(detailID)">重试</button></p>
         <section
-          v-if="selected.action_request"
+          v-if="selected?.action_request"
           class="semantic-warning m-4 p-4"
         >
           <strong>{{ selected.action_request.prompt }}</strong>

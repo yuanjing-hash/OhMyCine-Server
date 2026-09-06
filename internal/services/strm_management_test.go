@@ -19,6 +19,7 @@ import (
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/authz"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/database"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
+	"gorm.io/gorm"
 )
 
 func strmManagementFixture(t *testing.T) (*STRMManagementService, *QueueService, Actor, models.MediaLibrary, string) {
@@ -62,7 +63,7 @@ func strmManagementFixture(t *testing.T) (*STRMManagementService, *QueueService,
 	return service, queue, actor, library, root
 }
 
-func createAutoCleanupScenario(t *testing.T, service *STRMManagementService, library models.MediaLibrary, root, scanKind string, partial bool, runStatus string) (models.MediaArtifactRun, models.MediaArtifact, string) {
+func createAutoCleanupScenario(t *testing.T, service *STRMManagementService, library models.MediaLibrary, root, scanKind string, partial bool, runStatus string, physicalPermit ...*CatalogPhysicalWritePermit) (models.MediaArtifactRun, models.MediaArtifact, string) {
 	t.Helper()
 	_, rootIdentity, err := canonicalProjectionRoot(root)
 	if err != nil {
@@ -87,8 +88,38 @@ func createAutoCleanupScenario(t *testing.T, service *STRMManagementService, lib
 		t.Fatal(err)
 	}
 	run := models.MediaArtifactRun{ID: uuid.NewString(), LibraryID: library.ID, Generation: generation, PolicyJSON: string(policy), Status: runStatus, CreatedAt: now, UpdatedAt: now}
-	if err := service.db.Create(&run).Error; err != nil {
-		t.Fatal(err)
+	if len(physicalPermit) == 0 {
+		if err := service.db.Create(&run).Error; err != nil {
+			t.Fatal(err)
+		}
+	} else {
+		job, err := service.queue.Enqueue(EnqueueJobInput{System: true, JobType: JobTypeMediaArtifact, Priority: 100, DisplayName: "cleanup", Provider: "media_library", ResourceKey: mediaArtifactResourceKey(library.ID), CoalescingKey: run.ID, Payload: mediaArtifactJobPayload{ArtifactRunID: run.ID}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		run.JobID = &job.ID
+		input := CatalogPhysicalWriteInput{LibraryID: library.ID, OwnerKind: CatalogPhysicalArtifact, OwnerID: run.ID, ArtifactReceiptVersion: 1}
+		if err := service.db.Transaction(func(tx *gorm.DB) error {
+			return RegisterCatalogPhysicalOwnerTx(tx, input, func(tx *gorm.DB) error { return tx.Create(&run).Error })
+		}); err != nil {
+			t.Fatal(err)
+		}
+		// A nil output registers only; a worker integration test claims/enters
+		// through the public worker after all fixture setup has finished.
+		if physicalPermit[0] != nil {
+			claim, err := service.queue.Claim([]string{JobTypeMediaArtifact})
+			if err != nil || claim == nil {
+				t.Fatalf("cleanup claim=%v %v", claim, err)
+			}
+			input.Job = claim
+			if err := service.db.Transaction(func(tx *gorm.DB) error {
+				var err error
+				*physicalPermit[0], err = EnterCatalogPhysicalWriteTx(tx, input)
+				return err
+			}); err != nil {
+				t.Fatal(err)
+			}
+		}
 	}
 	if err := service.db.Model(&models.MediaLibrary{}).Where("id = ?", library.ID).Updates(map[string]any{"artifact_generation": generation, "artifact_applied_generation": generation, "artifact_status": models.MediaArtifactStatusCompleted}).Error; err != nil {
 		t.Fatal(err)
@@ -713,12 +744,14 @@ func TestAutomaticSTRMCleanupPreservesNonEmptyArtifactAncestors(t *testing.T) {
 
 func TestAutomaticSTRMCleanupRetriesDirectoryFailureAfterFileDeletion(t *testing.T) {
 	service, _, _, library, root := strmManagementFixture(t)
-	run, artifact, original := createAutoCleanupScenario(t, service, library, root, "full", false, models.MediaArtifactStatusCompleted)
+	var permit CatalogPhysicalWritePermit
+	run, artifact, original := createAutoCleanupScenario(t, service, library, root, "full", false, models.MediaArtifactStatusCompleted, &permit)
+	ctx := withArtifactCleanupPermit(context.Background(), permit)
 	path := relocateCleanupArtifact(t, service, artifact, original, root, "/电影/外语电影/七武士 (1954)/七武士 (1954).strm")
 	workDirectory := filepath.Dir(path)
 	service.removeDir = func(string) error { return errors.New("injected directory delete failure") }
 
-	first := service.AutoCleanup(context.Background(), run.ID)
+	first := service.AutoCleanup(ctx, run.ID)
 	if first.Removed != 0 || first.ErrorCode != "artifact_cleanup_directory_delete_failed" {
 		t.Fatalf("first=%+v", first)
 	}
@@ -729,7 +762,7 @@ func TestAutomaticSTRMCleanupRetriesDirectoryFailureAfterFileDeletion(t *testing
 		t.Fatalf("failed directory unexpectedly changed: %v", err)
 	}
 	var persisted models.MediaArtifact
-	if err := service.db.First(&persisted, "id = ?", artifact.ID).Error; err != nil || persisted.Status != models.MediaArtifactStatusCompleted {
+	if err := service.db.First(&persisted, "id = ?", artifact.ID).Error; err != nil || persisted.Status != models.MediaArtifactStatusCleanup {
 		t.Fatalf("retry manifest=%+v err=%v", persisted, err)
 	}
 	if err := service.db.First(&run, "id = ?", run.ID).Error; err != nil || run.CleanupStatus != models.MediaArtifactCleanupFailed || run.CleanupErrorCode != "artifact_cleanup_directory_delete_failed" || run.RemovedCount != 0 {
@@ -737,7 +770,7 @@ func TestAutomaticSTRMCleanupRetriesDirectoryFailureAfterFileDeletion(t *testing
 	}
 
 	service.removeDir = os.Remove
-	second := service.AutoCleanup(context.Background(), run.ID)
+	second := service.AutoCleanup(ctx, run.ID)
 	if second.ErrorCode != "" || second.Removed != 1 {
 		t.Fatalf("second=%+v", second)
 	}

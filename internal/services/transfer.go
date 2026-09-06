@@ -37,6 +37,8 @@ type TransferService struct {
 	downloader              *DownloaderService
 	connections             *ConnectionService
 	mediaChanges            *MediaChangeService
+	catalogStore            *CatalogSnapshotStore
+	artifacts               *MediaArtifactService
 	structure               *MediaLibraryStructureService
 	libraryReconciler       transferMediaLibraryReconciler
 	verifyCompletedManifest func(context.Context, *models.DownloadTask, downloadpkg.Manifest) (downloadpkg.Manifest, error)
@@ -64,6 +66,13 @@ func (s *TransferService) SetDownloaderService(downloader *DownloaderService) {
 }
 func (s *TransferService) SetMediaChangeService(changes *MediaChangeService) {
 	s.mediaChanges = changes
+}
+
+func (s *TransferService) SetCatalogSnapshotStore(store *CatalogSnapshotStore) {
+	s.catalogStore = store
+}
+func (s *TransferService) SetMediaArtifactService(artifacts *MediaArtifactService) {
+	s.artifacts = artifacts
 }
 func (s *TransferService) SetMediaLibraryStructureService(structure *MediaLibraryStructureService) {
 	s.structure = structure
@@ -187,11 +196,14 @@ func (s *TransferService) EnqueuePackage(download models.DownloadTask, manifest,
 		}
 	}
 	_, err = s.queue.EnqueueWith(EnqueueJobInput{OwnerID: download.OwnerID, JobType: "transfer", DisplayName: "入库：" + download.DisplayName, Provider: provider, ResourceKey: resourceKey, Payload: transferJobPayload{TransferTaskID: id}}, func(tx *gorm.DB, job models.Job) error {
+		if err := AssertCatalogPhysicalAdmissionTx(tx, record.LibraryID); err != nil {
+			return err
+		}
 		if err := ensureDownloadPipelineActive(tx, download.ID); err != nil {
 			return err
 		}
 		record.JobID = job.ID
-		return tx.Create(&record).Error
+		return RegisterCatalogPhysicalOwnerTx(tx, CatalogPhysicalWriteInput{LibraryID: record.LibraryID, OwnerKind: CatalogPhysicalTransfer, OwnerID: record.ID, ActorID: record.OwnerID}, func(tx *gorm.DB) error { return tx.Create(&record).Error })
 	})
 	if err != nil {
 		var raced models.TransferTask
@@ -335,16 +347,16 @@ func (w *TransferWorker) Run(ctx context.Context, runtime JobRuntime, job Claime
 	}
 	switch route {
 	case transferRoutePan115Native:
-		return w.runCloudTransfer(ctx, runtime, task, download, manifest, started)
+		return w.runCloudTransfer(ctx, runtime, job, task, download, manifest, started)
 	case transferRouteLocalToPan115:
-		return w.runCloudUpload(ctx, runtime, task, download, manifest, started)
+		return w.runCloudUpload(ctx, runtime, job, task, download, manifest, started)
 	case transferRoutePan115ToOtherCloud:
 		materializedTask, managedRoot, materializeErr := w.materializePan115Source(ctx, runtime, task, download, manifest)
 		if materializeErr != nil {
 			return w.cloudFailure(materializedTask, materializeErr)
 		}
 		download.StagingAbsolutePath = filepath.Dir(filepath.Dir(managedRoot))
-		return w.runCloudUpload(ctx, runtime, materializedTask, download, manifest, started)
+		return w.runCloudUpload(ctx, runtime, job, materializedTask, download, manifest, started)
 	case transferRoutePan115ToLocal:
 		materializedTask, managedRoot, materializeErr := w.materializePan115Source(ctx, runtime, task, download, manifest)
 		if materializeErr != nil {
@@ -417,6 +429,11 @@ func (w *TransferWorker) Run(ctx context.Context, runtime JobRuntime, job Claime
 		}
 	}
 	total := int64(len(plan))
+	permit, err := enterCatalogPhysicalWrite(ctx, w.service.db, CatalogPhysicalWriteInput{LibraryID: task.LibraryID, OwnerKind: CatalogPhysicalTransfer, OwnerID: task.ID, Job: &job})
+	if err != nil {
+		return w.fail(task, "transfer_write_admission_failed", "媒体库文件操作暂不可执行，请恢复原任务后重试")
+	}
+	defer quiesceCatalogPhysicalWrite(w.service.db, permit, w.service.log)
 	for index, item := range plan {
 		if err := ctx.Err(); err != nil {
 			return WorkerResult{}
@@ -474,6 +491,9 @@ func (w *TransferWorker) Run(ctx context.Context, runtime JobRuntime, job Claime
 			return err
 		}
 		if err := tx.Model(&task).Updates(map[string]any{"phase": models.TransferTaskStatusCompleted, "processed_files": len(plan), "finished_at": now, "updated_at": now}).Error; err != nil {
+			return err
+		}
+		if err := SettleCatalogPhysicalWriteTx(tx, permit, &job); err != nil {
 			return err
 		}
 		return w.service.audit.Record(tx, &task.OwnerID, "transfer.complete", "transfer_task", task.ID, "success", map[string]any{"download_task_id": task.DownloadTaskID, "media_library_id": task.LibraryID, "mode": download.TransferMode, "files": len(plan)}, RequestContext{})
@@ -705,7 +725,7 @@ func buildTransferTargets(download models.DownloadTask, manifest downloadpkg.Man
 		if err != nil {
 			return nil, err
 		}
-		if download.ScrapeMediaType == "movie" && values.Version != "" && !strings.Contains(fileTemplate, "{version}") && !strings.Contains(strings.ToLower(base), strings.ToLower(values.Version)) {
+		if values.Version != "" && !strings.Contains(fileTemplate, "{version}") && !strings.Contains(strings.ToLower(base), strings.ToLower(values.Version)) {
 			base = appendMovieReleaseVersion(base, values.Version)
 		}
 		ext := strings.ToLower(pathpkg.Ext(normalizedSource))

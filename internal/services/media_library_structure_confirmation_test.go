@@ -15,6 +15,8 @@ import (
 func structureConfirmationFixture(t *testing.T) (*MediaLibraryStructureService, Actor, models.MediaLibrary) {
 	t.Helper()
 	queue, actor, _ := queueFixture(t)
+	// Physical execution validates the real wall-clock lease, as production does.
+	queue.SetClock(realClock{})
 	actor.Permissions[authz.PermissionMediaLibrariesRead] = struct{}{}
 	actor.Permissions[authz.PermissionMediaLibrariesScan] = struct{}{}
 	var profile models.MediaClassificationProfile

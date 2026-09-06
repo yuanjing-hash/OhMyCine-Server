@@ -30,48 +30,34 @@ import (
 const maxSourceAssetExtraExtensions = 16
 
 type MediaLibraryService struct {
-	db                *gorm.DB
-	audit             *AuditService
-	log               zerolog.Logger
-	mu                sync.Mutex
-	supervisors       map[uint]supervisorHandle
-	scanLocks         map[uint]*sync.Mutex
-	connections       *ConnectionService
-	metadata          *MetadataSettingsService
-	aiRecognition     *AIRecognitionSettingsService
-	ingest            MediaLibraryIngestEnqueuer
-	artifacts         *MediaArtifactService
-	changes           *MediaChangeService
-	closed            bool
-	lifeEventCtx      context.Context
-	lifeEventStop     context.CancelFunc
-	lifeEventDone     <-chan struct{}
-	lifeEventWG       sync.WaitGroup
-	lifeEventRechecks map[uint]struct{}
-	lifeEventMu       sync.Mutex
-	lifeEvents        map[string]downloaderLifeEventCandidate
-	backends          *MediaLibraryBackendRegistry
-	structure         *MediaLibraryStructureService
-	libraryArtwork    MediaLibraryArtworkScheduler
-	queue             *QueueService
-}
-
-func (s *MediaLibraryService) authorizedMediaLibraryIDs(actor Actor, permission string, enabledOnly bool) ([]uint, error) {
-	query := s.db.Model(&models.MediaLibrary{})
-	if enabledOnly {
-		query = query.Where("enabled = ?", true)
-	}
-	var ids []uint
-	if err := query.Order("id").Pluck("id", &ids).Error; err != nil {
-		return nil, err
-	}
-	allowed := ids[:0]
-	for _, id := range ids {
-		if actor.CanResource(permission, models.AuthorizationResourceMediaLibrary, uintID(id)) {
-			allowed = append(allowed, id)
-		}
-	}
-	return allowed, nil
+	db                      *gorm.DB
+	catalogStore            *CatalogSnapshotStore
+	catalogScanCommit       CatalogScanCommit
+	catalogFollowupMu       sync.Mutex
+	audit                   *AuditService
+	log                     zerolog.Logger
+	mu                      sync.Mutex
+	supervisors             map[uint]supervisorHandle
+	scanLocks               map[uint]*sync.Mutex
+	connections             *ConnectionService
+	metadata                *MetadataSettingsService
+	aiRecognition           *AIRecognitionSettingsService
+	ingest                  MediaLibraryIngestEnqueuer
+	artifacts               *MediaArtifactService
+	changes                 *MediaChangeService
+	closed                  bool
+	lifeEventCtx            context.Context
+	lifeEventStop           context.CancelFunc
+	lifeEventDone           <-chan struct{}
+	lifeEventWG             sync.WaitGroup
+	lifeEventRechecks       map[uint]struct{}
+	lifeEventMu             sync.Mutex
+	lifeEvents              map[string]downloaderLifeEventCandidate
+	backends                *MediaLibraryBackendRegistry
+	structure               *MediaLibraryStructureService
+	libraryArtwork          MediaLibraryArtworkScheduler
+	queue                   *QueueService
+	retirementPhysicalGuard func(*gorm.DB, uint) error
 }
 
 // MediaLibraryIngestEnqueuer is the narrow boundary from provider directory
@@ -144,18 +130,19 @@ type UpdateMediaLibraryInput struct {
 }
 type MediaLibraryDetail struct {
 	models.MediaLibrary
-	StorageName                  string   `json:"storage_name"`
-	ConnectionID                 *uint    `json:"connection_id,omitempty"`
-	AutoListenDefault            bool     `json:"auto_listen_default"`
-	ProfileName                  string   `json:"profile_name"`
-	VideoExtensions              []string `json:"video_extensions"`
-	STRMAssetDefaultExtensions   []string `json:"strm_asset_default_extensions"`
-	STRMAssetExtraExtensions     []string `json:"strm_asset_extra_extensions"`
-	STRMAssetEffectiveExtensions []string `json:"strm_asset_effective_extensions"`
-	IgnorePatterns               []string `json:"ignore_patterns"`
-	EntryCount                   int64    `json:"entry_count"`
-	IngestDownloaderName         string   `json:"ingest_downloader_name"`
-	STRMLocalPath                string   `json:"strm_local_path"`
+	StorageName                  string                         `json:"storage_name"`
+	ConnectionID                 *uint                          `json:"connection_id,omitempty"`
+	AutoListenDefault            bool                           `json:"auto_listen_default"`
+	ProfileName                  string                         `json:"profile_name"`
+	VideoExtensions              []string                       `json:"video_extensions"`
+	STRMAssetDefaultExtensions   []string                       `json:"strm_asset_default_extensions"`
+	STRMAssetExtraExtensions     []string                       `json:"strm_asset_extra_extensions"`
+	STRMAssetEffectiveExtensions []string                       `json:"strm_asset_effective_extensions"`
+	IgnorePatterns               []string                       `json:"ignore_patterns"`
+	EntryCount                   int64                          `json:"entry_count"`
+	IngestDownloaderName         string                         `json:"ingest_downloader_name"`
+	STRMLocalPath                string                         `json:"strm_local_path"`
+	Retirement                   *MediaLibraryRetirementSummary `json:"retirement,omitempty"`
 }
 
 func NewMediaLibraryService(db *gorm.DB, audit *AuditService, log zerolog.Logger) *MediaLibraryService {
@@ -174,6 +161,15 @@ func NewMediaLibraryService(db *gorm.DB, audit *AuditService, log zerolog.Logger
 }
 func (s *MediaLibraryService) SetConnectionService(connections *ConnectionService) {
 	s.connections = connections
+}
+
+// SetCatalogSnapshotStore installs the separate deferred/query-only reader pool.
+// Configure this before serving requests; services must never be copied to swap DBs.
+func (s *MediaLibraryService) SetCatalogSnapshotStore(store *CatalogSnapshotStore) {
+	s.catalogStore = store
+}
+func (s *MediaLibraryService) SetCatalogScanCommit(commit CatalogScanCommit) {
+	s.catalogScanCommit = commit
 }
 func (s *MediaLibraryService) SetMetadataSettingsService(metadata *MetadataSettingsService) {
 	s.metadata = metadata
@@ -204,9 +200,6 @@ func (s *MediaLibraryService) Start(ctx context.Context) error {
 	}
 	for _, library := range libraries {
 		s.startSupervisor(ctx, library.ID)
-	}
-	if err := s.cleanupTerminalMediaLibraryScanStaging(time.Now().UTC()); err != nil {
-		return err
 	}
 	if err := s.recoverMediaLibraryRecognitionJobs(); err != nil {
 		return err
@@ -257,7 +250,7 @@ func (s *MediaLibraryService) List(actor Actor) ([]MediaLibraryDetail, error) {
 		if !actor.CanResource(authz.PermissionMediaLibrariesRead, models.AuthorizationResourceMediaLibrary, uintID(record.ID)) {
 			continue
 		}
-		detail, err := s.detail(record)
+		detail, err := s.detail(record, actor)
 		if err != nil {
 			return nil, err
 		}
@@ -276,7 +269,7 @@ func (s *MediaLibraryService) Get(actor Actor, id uint) (MediaLibraryDetail, err
 	if !actor.CanResource(authz.PermissionMediaLibrariesRead, models.AuthorizationResourceMediaLibrary, uintID(record.ID)) {
 		return MediaLibraryDetail{}, appError(CodePermissionDenied, "无权查看这个媒体库", nil)
 	}
-	return s.detail(record)
+	return s.detail(record, actor)
 }
 
 func (s *MediaLibraryService) Create(ctx context.Context, actor Actor, input MediaLibraryInput, request RequestContext) (MediaLibraryDetail, error) {
@@ -402,10 +395,16 @@ func (s *MediaLibraryService) Update(ctx context.Context, actor Actor, id uint, 
 	s.stopSupervisor(id)
 	lock := s.scanLock(id)
 	lock.Lock()
-	if err := s.db.Transaction(func(tx *gorm.DB) error {
+	if err := s.writeCatalogConfiguration(ctx, true, func(tx *gorm.DB) error {
+		if err := requireMediaLibraryNotRetiringTx(tx, id); err != nil {
+			return err
+		}
 		var current models.MediaLibrary
-		if err := tx.Select("default_ingest_connection_id").First(&current, id).Error; err != nil {
+		if err := tx.First(&current, id).Error; err != nil {
 			return mediaLibraryNotFound(err)
+		}
+		if mediaLibrarySourceChanged(existing, current) || current.ProfileID != existing.ProfileID {
+			return appError(CodeConflict, "媒体库来源或规则已变化，请刷新后重试", ErrCatalogFence)
 		}
 		record.DefaultIngestConnectionID = current.DefaultIngestConnectionID
 		if current.DefaultIngestConnectionID != nil && !preservesDefault(*current.DefaultIngestConnectionID) {
@@ -414,7 +413,30 @@ func (s *MediaLibraryService) Update(ctx context.Context, actor Actor, id uint, 
 			}
 			record.DefaultIngestConnectionID = nil
 		}
-		if sourceChanged {
+		var oldStorage, nextStorage models.Storage
+		if err := tx.First(&oldStorage, current.StorageID).Error; err != nil {
+			return err
+		}
+		if err := tx.First(&nextStorage, record.StorageID).Error; err != nil {
+			return err
+		}
+		var currentProfile models.MediaClassificationProfile
+		if err := tx.First(&currentProfile, record.ProfileID).Error; err != nil {
+			return err
+		}
+		// Manual metadata/artifact work does not take the scan lock. Preserve its
+		// latest logical counters rather than the stale pre-validation snapshot.
+		record.ArtifactGeneration, record.ArtifactAppliedGeneration = current.ArtifactGeneration, current.ArtifactAppliedGeneration
+		record.ArtifactStatus, record.ArtifactError, record.ArtifactUpdatedAt = current.ArtifactStatus, current.ArtifactError, current.ArtifactUpdatedAt
+		if !sourceChanged {
+			record.BaselineGeneration, record.DirtyGeneration = current.BaselineGeneration, current.DirtyGeneration
+			record.LastScanAt, record.LastSuccessfulScanAt = current.LastScanAt, current.LastSuccessfulScanAt
+		}
+		versioned, err := applyCatalogLibraryChangeTx(tx, current, &record, oldStorage, nextStorage, currentProfile)
+		if err != nil {
+			return err
+		}
+		if sourceChanged && !versioned {
 			// Structure issues and confirmation drafts are projections of the old
 			// source boundary. Clear them in the same transaction as catalog facts
 			// so a newly selected root can never expose or execute old decisions.
@@ -447,7 +469,15 @@ func (s *MediaLibraryService) Update(ctx context.Context, actor Actor, id uint, 
 		if err := tx.Omit("content_revision").Save(&record).Error; err != nil {
 			return err
 		}
-		if sourceChanged {
+		if sourceChanged && versioned {
+			if s.changes == nil {
+				return ErrCatalogInvalid
+			}
+			if _, err := s.changes.RecordTx(tx, id, record.DirtyGeneration, models.MediaLibraryChangeRemoval, true); err != nil {
+				return err
+			}
+		}
+		if sourceChanged && !versioned {
 			var autoState models.MediaLibraryStructureAutoState
 			if err := tx.Where("library_id = ?", id).First(&autoState).Error; errors.Is(err, gorm.ErrRecordNotFound) {
 				autoState = models.MediaLibraryStructureAutoState{LibraryID: id, SourceRevision: 1, Status: "pending", UpdatedAt: time.Now().UTC()}
@@ -477,6 +507,9 @@ func (s *MediaLibraryService) Update(ctx context.Context, actor Actor, id uint, 
 		return MediaLibraryDetail{}, mediaLibraryConstraint(err)
 	}
 	lock.Unlock()
+	if s.changes != nil {
+		s.changes.NotifyCommitted(record.ID, record.ContentRevision)
+	}
 	if record.Enabled {
 		s.startSupervisor(context.Background(), id)
 	}
@@ -581,6 +614,19 @@ func (s *MediaLibraryService) Delete(actor Actor, id uint, request RequestContex
 		var record models.MediaLibrary
 		if err := tx.First(&record, id).Error; err != nil {
 			return mediaLibraryNotFound(err)
+		}
+		if err := requireMediaLibraryNotRetiringTx(tx, id); err != nil {
+			return err
+		}
+		var heads int64
+		if err := tx.Model(&models.CatalogHead{}).Where("library_id=?", id).Count(&heads).Error; err != nil {
+			return err
+		}
+		if heads != 0 {
+			return appError(CodeConflict, "该媒体库需要异步移除索引，请使用媒体库管理删除入口", nil)
+		}
+		if err := AssertCatalogPhysicalDrainedTx(tx, id); err != nil {
+			return err
 		}
 		if record.DefaultIngestConnectionID != nil {
 			if err := requireNoEnabledLifeEventListener(context.Background(), tx, *record.DefaultIngestConnectionID); err != nil {
@@ -710,6 +756,9 @@ func (s *MediaLibraryService) StorageReferences(storageID uint) ([]string, error
 	return names, nil
 }
 func (s *MediaLibraryService) ProfileRevisionChanged(profileID uint, revision uint64) error {
+	if s.catalogStore != nil {
+		return s.refreshCatalogProfileLibraries(profileID)
+	}
 	var profile models.MediaClassificationProfile
 	if err := s.db.First(&profile, profileID).Error; err != nil {
 		return err
@@ -718,7 +767,9 @@ func (s *MediaLibraryService) ProfileRevisionChanged(profileID uint, revision ui
 	if err != nil {
 		return err
 	}
-	return s.db.Model(&models.MediaLibrary{}).Where("profile_id = ? AND profile_revision <> ?", profileID, revision).Updates(map[string]any{"reclassification_due": true, "movie_directory_template": organization.MovieDirectoryTemplate, "movie_filename_template": organization.MovieFilenameTemplate, "tv_directory_template": organization.TVDirectoryTemplate, "tv_filename_template": organization.TVFilenameTemplate}).Error
+	return s.db.Model(&models.MediaLibrary{}).Where("profile_id = ? AND profile_revision <> ?", profileID, revision).
+		Where("NOT EXISTS (SELECT 1 FROM media_library_retirements r WHERE r.library_id=media_libraries.id AND r.phase<>'completed')").
+		Updates(map[string]any{"reclassification_due": true, "movie_directory_template": organization.MovieDirectoryTemplate, "movie_filename_template": organization.MovieFilenameTemplate, "tv_directory_template": organization.TVDirectoryTemplate, "tv_filename_template": organization.TVFilenameTemplate}).Error
 }
 
 func (s *MediaLibraryService) validateInput(ctx context.Context, id uint, actor Actor, input MediaLibraryInput) (models.MediaLibrary, error) {
@@ -1119,13 +1170,51 @@ func validateImportTemplate(value string, directory bool) error {
 	return nil
 }
 
-func (s *MediaLibraryService) detail(record models.MediaLibrary) (MediaLibraryDetail, error) {
+func (s *MediaLibraryService) detail(record models.MediaLibrary, actors ...Actor) (MediaLibraryDetail, error) {
+	var detail MediaLibraryDetail
+	readDB := s.db
+	if s.catalogStore != nil && s.catalogStore.readDB != nil {
+		readDB = s.catalogStore.readDB
+	}
+	err := readDB.Transaction(func(tx *gorm.DB) error {
+		for _, actor := range actors {
+			if !actor.CanResource(authz.PermissionMediaLibrariesRead, models.AuthorizationResourceMediaLibrary, uintID(record.ID)) {
+				return appError(CodePermissionDenied, "无权查看这个媒体库", nil)
+			}
+		}
+		// Do not combine a stale list/update result with a newer catalog head.
+		if err := tx.First(&record, record.ID).Error; err != nil {
+			return mediaLibraryNotFound(err)
+		}
+		retirement, err := mediaLibraryRetirementTx(tx, record.ID)
+		if err != nil {
+			return err
+		}
+		if retirement != nil && retirement.Phase != "completed" {
+			detail, err = mediaLibraryDetailTx(tx, nil, record)
+			if err == nil {
+				detail.Retirement = retirementSummary(*retirement)
+				detail.Enabled = false
+			}
+			return err
+		}
+		reader, err := PinCatalogTx(tx, []uint{record.ID})
+		if err != nil {
+			return err
+		}
+		detail, err = mediaLibraryDetailTx(tx, reader, record)
+		return err
+	})
+	return detail, err
+}
+
+func mediaLibraryDetailTx(tx *gorm.DB, reader *CatalogReader, record models.MediaLibrary) (MediaLibraryDetail, error) {
 	var storage models.Storage
 	var profile models.MediaClassificationProfile
-	if err := s.db.First(&storage, record.StorageID).Error; err != nil {
+	if err := tx.First(&storage, record.StorageID).Error; err != nil {
 		return MediaLibraryDetail{}, err
 	}
-	if err := s.db.First(&profile, record.ProfileID).Error; err != nil {
+	if err := tx.First(&profile, record.ProfileID).Error; err != nil {
 		return MediaLibraryDetail{}, err
 	}
 	extensions := append([]string(nil), defaultVideoExtensions...)
@@ -1133,11 +1222,17 @@ func (s *MediaLibraryService) detail(record models.MediaLibrary) (MediaLibraryDe
 	_ = json.Unmarshal([]byte(record.STRMAssetExtraExtensionsJSON), &extraAssetExtensions)
 	_ = json.Unmarshal([]byte(record.IgnorePatternsJSON), &ignores)
 	var count int64
-	_ = s.db.Model(&models.MediaLibraryEntry{}).Where("library_id = ?", record.ID).Count(&count).Error
+	if reader != nil {
+		var err error
+		count, err = reader.EntryCount()
+		if err != nil {
+			return MediaLibraryDetail{}, err
+		}
+	}
 	ingestDownloaderName := ""
 	if record.IngestDownloaderID != nil {
 		var downloader models.Downloader
-		if err := s.db.Select("name").First(&downloader, "id = ?", *record.IngestDownloaderID).Error; err == nil {
+		if err := tx.Select("name").First(&downloader, "id = ?", *record.IngestDownloaderID).Error; err == nil {
 			ingestDownloaderName = downloader.Name
 		} else if !errors.Is(err, gorm.ErrRecordNotFound) {
 			return MediaLibraryDetail{}, err
@@ -1839,6 +1934,10 @@ func (s *MediaLibraryService) reconcile(ctx context.Context, id uint, kind strin
 	if err := s.db.First(&profile, library.ProfileID).Error; err != nil {
 		return models.MediaLibraryScanRun{}, err
 	}
+	versionedScan, modeErr := s.catalogScanVersioned(ctx, id)
+	if modeErr != nil {
+		return models.MediaLibraryScanRun{}, modeErr
+	}
 	extensions := append([]string(nil), defaultVideoExtensions...)
 	var extraAssetExtensions, ignores []string
 	_ = json.Unmarshal([]byte(library.STRMAssetExtraExtensionsJSON), &extraAssetExtensions)
@@ -1926,6 +2025,13 @@ func (s *MediaLibraryService) reconcile(ctx context.Context, id uint, kind strin
 		operation.Event(s.log.Error()).Str("error_code", CodeMediaLibraryScanFailed).Uint("library_id", id).Uint("scan_run_id", run.ID).Str("scan_kind", kind).Int64("duration_ms", time.Since(started).Milliseconds()).Msg(operation.Message("失败"))
 		return run, appError(CodeMediaLibraryScanFailed, "媒体库扫描失败", scanErr)
 	}
+	if versionedScan {
+		published, err := s.publishCatalogScan(ctx, library, storage, profile, run, result, storage.Type == models.StorageTypePan115 && s.queue != nil, s.catalogScanCommit)
+		if err != nil {
+			return s.failFastScanPersistence(run, operation, started, mediaLibraryPersistenceStageEntries, err)
+		}
+		return published, nil
+	}
 	if storage.Type == models.StorageTypePan115 && s.queue != nil {
 		if result.Scoped {
 			result, scanErr = s.mergeScopedPan115Catalog(ctx, id, result)
@@ -1974,6 +2080,9 @@ func (s *MediaLibraryService) reconcile(ctx context.Context, id uint, kind strin
 	var committedChange models.MediaLibraryChange
 	metadataProjectionChanged := false
 	transactionErr := s.db.Transaction(func(tx *gorm.DB) error {
+		if err := requireLegacyCatalogWriteTx(tx, id); err != nil {
+			return wrapMediaLibraryPersistence(mediaLibraryPersistenceStageConfiguration, err)
+		}
 		var currentLibrary models.MediaLibrary
 		if err := tx.First(&currentLibrary, id).Error; err != nil {
 			return wrapMediaLibraryPersistence(mediaLibraryPersistenceStageConfiguration, err)
@@ -1982,7 +2091,11 @@ func (s *MediaLibraryService) reconcile(ctx context.Context, id uint, kind strin
 		if err := tx.First(&currentProfile, currentLibrary.ProfileID).Error; err != nil {
 			return wrapMediaLibraryPersistence(mediaLibraryPersistenceStageConfiguration, err)
 		}
-		if mediaLibrarySourceChanged(library, currentLibrary) || currentLibrary.ProfileID != profile.ID || currentProfile.Revision != profile.Revision || currentLibrary.DirtyGeneration != library.DirtyGeneration {
+		var currentStorage models.Storage
+		if err := tx.First(&currentStorage, currentLibrary.StorageID).Error; err != nil {
+			return wrapMediaLibraryPersistence(mediaLibraryPersistenceStageConfiguration, err)
+		}
+		if mediaLibraryScanSourceFingerprint(currentLibrary, currentStorage, currentProfile) != run.SourceFingerprint {
 			return wrapMediaLibraryPersistence(mediaLibraryPersistenceStageConfiguration, errMediaLibraryConfigurationChanged)
 		}
 		var existing []models.MediaLibraryEntry

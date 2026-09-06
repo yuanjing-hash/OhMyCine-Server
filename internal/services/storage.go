@@ -18,11 +18,24 @@ import (
 )
 
 type StorageService struct {
-	db          *gorm.DB
-	audit       *AuditService
-	driver      storagefs.LocalDriver
-	references  []StorageReferenceChecker
-	connections *ConnectionService
+	db           *gorm.DB
+	audit        *AuditService
+	driver       storagefs.LocalDriver
+	references   []StorageReferenceChecker
+	connections  *ConnectionService
+	catalogStore *CatalogSnapshotStore
+	changes      *MediaChangeService
+}
+
+func (s *StorageService) SetMediaChangeService(changes *MediaChangeService) { s.changes = changes }
+
+func (s *StorageService) SetCatalogSnapshotStore(store *CatalogSnapshotStore) { s.catalogStore = store }
+
+func (s *StorageService) writeConfiguration(ctx context.Context, write func(*gorm.DB) error) error {
+	if s.catalogStore == nil {
+		return s.db.WithContext(ctx).Transaction(write)
+	}
+	return s.catalogStore.Admission().WithForeground(ctx, func() error { return s.db.WithContext(ctx).Transaction(write) })
 }
 
 type StorageReferenceChecker interface {
@@ -179,6 +192,7 @@ func (s *StorageService) UpdateContext(ctx context.Context, actor Actor, id uint
 	if record.Type == models.StorageTypePan115 {
 		return s.updatePan115(ctx, actor, record, input, request)
 	}
+	expected := record
 	if input.Type != nil && strings.TrimSpace(*input.Type) != models.StorageTypeLocal {
 		s.auditFailure(actor, "storage.update", request)
 		return StorageSummary{}, appError(CodeStorageTypeUnsupported, "当前仅支持本地存储", nil)
@@ -218,7 +232,10 @@ func (s *StorageService) UpdateContext(ctx context.Context, actor Actor, id uint
 		return StorageSummary{}, appError(storagefs.CodeUnreadable, "无法读取存储根路径", nil)
 	}
 	applyProbe(&record, probe)
-	err = s.db.Transaction(func(tx *gorm.DB) error {
+	err = s.writeConfiguration(ctx, func(tx *gorm.DB) error {
+		if err := applyCatalogStorageChangeTx(tx, expected, record, s.changes); err != nil {
+			return err
+		}
 		if err := tx.Save(&record).Error; err != nil {
 			return err
 		}
@@ -226,6 +243,9 @@ func (s *StorageService) UpdateContext(ctx context.Context, actor Actor, id uint
 	})
 	if err != nil {
 		return StorageSummary{}, err
+	}
+	if s.changes != nil {
+		s.changes.NotifyCommitted(0, 0) // Broadcast hint; durable rows own each library revision.
 	}
 	return s.storageSummary(record), nil
 }
@@ -255,8 +275,8 @@ func (s *StorageService) TestContext(ctx context.Context, actor Actor, id uint, 
 	if probe.ErrorCode != "" {
 		outcome = "failure"
 	}
-	err := s.db.Transaction(func(tx *gorm.DB) error {
-		if err := tx.Save(&record).Error; err != nil {
+	err := s.writeConfiguration(ctx, func(tx *gorm.DB) error {
+		if err := saveStorageProbeTx(tx, record); err != nil {
 			return err
 		}
 		return s.audit.Record(tx, &actor.User.ID, "storage.test", "storage", uintID(record.ID), outcome, map[string]any{"error_code": probe.ErrorCode}, request)
@@ -304,6 +324,7 @@ func (s *StorageService) createPan115(ctx context.Context, actor Actor, input St
 }
 
 func (s *StorageService) updatePan115(ctx context.Context, actor Actor, record models.Storage, input UpdateStorageInput, request RequestContext) (StorageSummary, error) {
+	expected := record
 	if input.Type != nil && strings.TrimSpace(*input.Type) != models.StorageTypePan115 {
 		return StorageSummary{}, appError(CodeStorageTypeUnsupported, "不能修改数据源类型", nil)
 	}
@@ -344,13 +365,19 @@ func (s *StorageService) updatePan115(ctx context.Context, actor Actor, record m
 	capabilities, _ := json.Marshal(cloudStorageCapabilities(driver.Capabilities()))
 	record.Capabilities = string(capabilities)
 	applyProbe(&record, cloudStorageProbe(connection, ""))
-	if err := s.db.Transaction(func(tx *gorm.DB) error {
+	if err := s.writeConfiguration(ctx, func(tx *gorm.DB) error {
+		if err := applyCatalogStorageChangeTx(tx, expected, record, s.changes); err != nil {
+			return err
+		}
 		if err := tx.Save(&record).Error; err != nil {
 			return err
 		}
 		return s.audit.Record(tx, &actor.User.ID, "storage.update", "storage", uintID(record.ID), "success", map[string]any{"type": record.Type, "connection_id": connection.ID, "enabled": record.Enabled}, request)
 	}); err != nil {
 		return StorageSummary{}, err
+	}
+	if s.changes != nil {
+		s.changes.NotifyCommitted(0, 0) // Broadcast hint; durable rows own each library revision.
 	}
 	return s.storageSummary(record), nil
 }
@@ -376,8 +403,8 @@ func (s *StorageService) saveProbe(actor Actor, record *models.Storage, probe st
 	if probe.ErrorCode != "" {
 		outcome = "failure"
 	}
-	return s.db.Transaction(func(tx *gorm.DB) error {
-		if err := tx.Save(record).Error; err != nil {
+	return s.writeConfiguration(context.Background(), func(tx *gorm.DB) error {
+		if err := saveStorageProbeTx(tx, *record); err != nil {
 			return err
 		}
 		return s.audit.Record(tx, &actor.User.ID, "storage.test", "storage", uintID(record.ID), outcome, map[string]any{"error_code": probe.ErrorCode}, request)

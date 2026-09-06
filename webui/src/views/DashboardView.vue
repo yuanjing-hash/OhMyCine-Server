@@ -1,8 +1,11 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { createLatestRequest } from '@/latest-request'
+import { useJobLiveRefresh } from '@/use-job-live-refresh'
 import { api } from '@/api/client'
 import { getVisibleDashboardCards } from '@/dashboard/cards'
 import { useAuthStore } from '@/stores/auth'
+import { Permissions } from '@/auth/generated-permissions'
 
 interface Summary {
   initialized: boolean
@@ -17,27 +20,53 @@ const auth = useAuthStore()
 const summary = ref<Summary | null>(null)
 const loading = ref(true)
 const error = ref('')
+interface Fact { label: string; value: number | null; unit?: string; link?: string }
+interface FactSection { status: 'ok' | 'unavailable'; list: Fact[]; has_more?: boolean; error_code?: string }
+const operations = ref<Record<string, FactSection>>({})
+const operationsError = ref('')
+const baselineReads = createLatestRequest(), operationReads = createLatestRequest()
 const updatedAt = ref<Date | null>(null)
 const cards = computed(() => getVisibleDashboardCards(auth.user?.permissions ?? []))
 
 async function loadBaseline() {
+  const request = baselineReads.begin()
   loading.value = true
   error.value = ''
   try {
-    summary.value = await api<Summary>('/api/v1/dashboard')
+    const data = await api<Summary>('/api/v1/dashboard', { signal: request.signal })
+    if (!request.isCurrent()) return
+    summary.value = data
     updatedAt.value = new Date()
   } catch (reason) {
-    error.value = reason instanceof Error ? reason.message : 'Server 基线加载失败'
+    if (request.isCurrent()) error.value = reason instanceof Error ? reason.message : 'Server 基线加载失败'
   } finally {
-    loading.value = false
+    if (request.isCurrent()) loading.value = false
+    request.finish()
   }
+}
+
+async function loadOperations() {
+  const request = operationReads.begin()
+  try {
+    const data = await api<{ sections: Record<string, FactSection> }>('/api/v1/dashboard/operations', { signal: request.signal })
+    if (request.isCurrent()) { operations.value = data.sections; operationsError.value = '' }
+  } catch (reason) { if (request.isCurrent()) operationsError.value = reason instanceof Error ? reason.message : '运行状态读取失败' }
+  finally { request.finish() }
+}
+const statusLabels: Record<string, string> = { queued: '排队', running: '运行中', waiting_user_action: '等待处理', retry_wait: '等待重试', paused: '暂停', completed: '已完成', failed: '失败', cancelled: '已取消' }
+function formatFact(fact: Fact) {
+  if (fact.value == null) return '未知 / 无新鲜采样'
+  if (fact.unit === 'bytes' || fact.unit === 'bytes/s') return `${(fact.value / 1024 / 1024).toFixed(1)} MiB${fact.unit === 'bytes/s' ? '/s' : ''}`
+  return String(fact.value)
 }
 
 function formatTime(value: Date | null) {
   return value ? value.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : '尚未更新'
 }
 
-onMounted(loadBaseline)
+onMounted(() => { void loadBaseline(); void loadOperations() })
+useJobLiveRefresh(loadOperations, () => auth.can(Permissions.DashboardRead), () => auth.can(Permissions.JobsReadAll) || auth.can(Permissions.JobsReadOwn))
+onUnmounted(() => { baselineReads.cancel(); operationReads.cancel() })
 </script>
 
 <template>
@@ -89,10 +118,17 @@ onMounted(loadBaseline)
           </div>
         </template>
 
+        <template v-else-if="card.state === 'live'">
+          <h2>{{ card.title }}</h2><p>{{ card.description }}</p>
+          <div v-if="operationsError || operations[card.id]?.status === 'unavailable'" class="semantic-error mt-3 p-3" role="alert">{{ operationsError || `该栏目暂时不可用（${operations[card.id]?.error_code}）` }} <button class="btn-secondary" @click="loadOperations">重试</button></div>
+          <dl v-else-if="operations[card.id]" class="mt-4 space-y-3"><div v-for="fact in operations[card.id]!.list" :key="fact.label" class="flex items-center justify-between gap-3"><dt class="text-sm text-muted"><RouterLink v-if="fact.link" :to="fact.link">{{ statusLabels[fact.label] ?? fact.label }}</RouterLink><span v-else>{{ fact.label }}</span></dt><dd class="m-0">{{ formatFact(fact) }}</dd></div><p v-if="!operations[card.id]!.list.length">当前范围没有记录。</p></dl>
+          <p v-else>正在读取运行状态…</p>
+          <p v-if="!operationsError && operations[card.id]?.has_more">仅展示前 50 项，请到对应管理页面查看全部。</p>
+        </template>
         <template v-else>
           <div class="planned-card__heading">
             <span class="card-kicker">{{ card.owner }}</span>
-            <span class="status-chip status-chip--planned">规划 / 未配置</span>
+            <span class="status-chip status-chip--planned">仪表盘卡片待接入</span>
           </div>
           <h2>{{ card.title }}</h2>
           <p>{{ card.description }}</p>

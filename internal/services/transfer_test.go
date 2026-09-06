@@ -512,6 +512,7 @@ func TestTransferPlanSummaryBoundsAndRejectsUnsafePaths(t *testing.T) {
 func transferFixture(t *testing.T, mode, policy string, existingTarget bool) (*QueueService, Actor, models.DownloadTask, string, string) {
 	t.Helper()
 	queue, actor, _ := queueFixture(t)
+	queue.SetClock(realClock{})
 	var profile models.MediaClassificationProfile
 	if err := queue.db.Where("code = ?", "default-v1").First(&profile).Error; err != nil {
 		t.Fatal(err)
@@ -578,6 +579,11 @@ func TestTransferWorkerCopiesAndMovesIntoMediaLibrary(t *testing.T) {
 			if result.ErrorCode != "" || result.Wait != nil {
 				t.Fatalf("result=%+v", result)
 			}
+			var task models.TransferTask
+			if err := queue.db.Where("job_id = ?", claimed.Job.ID).First(&task).Error; err != nil {
+				t.Fatal(err)
+			}
+			assertPhysicalOwnerState(t, queue.db, CatalogPhysicalTransfer, task.ID, "settled")
 			if payload, err := os.ReadFile(destination); err != nil || string(payload) != "video-data" {
 				t.Fatalf("destination payload=%q err=%v", payload, err)
 			}
@@ -693,7 +699,7 @@ func TestBuildTransferTargetsPreservesMovieReleaseVersionAcrossTemplates(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(targets) != 1 || !strings.HasSuffix(targets[0].Relative, "七武士 (1954) - 2160p UHD BluRay REMUX HDR10 Dolby Vision.mkv") {
+	if len(targets) != 1 || !strings.HasSuffix(targets[0].Relative, "七武士 (1954) - 2160p UHD BluRay REMUX HDR10 Dolby Vision H265 DTS-HD MA 2.0.mkv") {
 		t.Fatalf("legacy template target=%+v", targets)
 	}
 
@@ -702,7 +708,7 @@ func TestBuildTransferTargetsPreservesMovieReleaseVersionAcrossTemplates(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(targets) != 1 || !strings.HasSuffix(targets[0].Relative, "七武士 (1954) [2160p UHD BluRay REMUX HDR10 Dolby Vision].mkv") {
+	if len(targets) != 1 || !strings.HasSuffix(targets[0].Relative, "七武士 (1954) [2160p UHD BluRay REMUX HDR10 Dolby Vision H265 DTS-HD MA 2.0].mkv") {
 		t.Fatalf("version placeholder target=%+v", targets)
 	}
 	if strings.Count(targets[0].Relative, "2160p") != 1 {
@@ -1009,7 +1015,7 @@ func TestPan115SingleEpisodeBuildsCloudTransferTargetFromPersistedEpisode(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(targets) != 1 || targets[0].Relative != "日本剧/迪迦奥特曼/Season 01/迪迦奥特曼 - S01E06.mkv" {
+	if len(targets) != 1 || targets[0].Relative != "日本剧/迪迦奥特曼/Season 01/迪迦奥特曼 - S01E06 - BDRip H264 10bit PCM.mkv" {
 		t.Fatalf("targets=%+v", targets)
 	}
 }

@@ -136,6 +136,9 @@ type PlayerPlaybackHistory struct {
 	PosterURL        string    `gorm:"size:2048;not null;default:''" json:"poster_url,omitempty"`
 	BackdropURL      string    `gorm:"size:2048;not null;default:''" json:"backdrop_url,omitempty"`
 	TitleLogoURL     string    `gorm:"size:2048;not null;default:''" json:"title_logo_url,omitempty"`
+	PosterAssetID    string    `gorm:"not null;default:''" json:"poster_asset_id,omitempty"`
+	BackdropAssetID  string    `gorm:"not null;default:''" json:"backdrop_asset_id,omitempty"`
+	TitleLogoAssetID string    `gorm:"not null;default:''" json:"title_logo_asset_id,omitempty"`
 	PosterPath       string    `gorm:"size:512;not null;default:''" json:"poster_path,omitempty"`
 	BackdropPath     string    `gorm:"size:512;not null;default:''" json:"backdrop_path,omitempty"`
 	EpisodeStillPath string    `gorm:"size:512;not null;default:''" json:"episode_still_path,omitempty"`
@@ -561,25 +564,27 @@ type Pan115PlaybackLease struct {
 // Storage is a registered provider root. It does not classify media or choose a
 // final placement; those responsibilities belong to later library/destination domains.
 type Storage struct {
-	ID                  uint       `gorm:"primaryKey" json:"id"`
-	Name                string     `gorm:"size:128;not null" json:"name"`
-	NameNormalized      string     `gorm:"size:128;not null;uniqueIndex" json:"-"`
-	Type                string     `gorm:"size:32;not null" json:"type"`
-	RootPath            string     `gorm:"type:text;not null" json:"root_path"`
-	RootDisplayPath     string     `gorm:"type:text;not null;default:''" json:"root_display_path"`
-	RootPathNormalized  string     `gorm:"type:text;not null;uniqueIndex" json:"-"`
-	ConnectionID        *uint      `gorm:"index" json:"connection_id"`
-	Enabled             bool       `gorm:"not null;default:true" json:"enabled"`
-	Capabilities        string     `gorm:"type:text;not null" json:"-"`
-	LastProbeExists     bool       `gorm:"not null;default:false" json:"-"`
-	LastProbeReadable   bool       `gorm:"not null;default:false" json:"-"`
-	LastProbeAvailable  bool       `gorm:"not null;default:false" json:"-"`
-	LastProbeFreeBytes  *uint64    `json:"-"`
-	LastProbeTotalBytes *uint64    `json:"-"`
-	LastProbeErrorCode  string     `gorm:"size:64;not null;default:''" json:"-"`
-	LastProbeCheckedAt  *time.Time `json:"-"`
-	CreatedAt           time.Time  `json:"created_at"`
-	UpdatedAt           time.Time  `json:"updated_at"`
+	ID                        uint       `gorm:"primaryKey" json:"id"`
+	Name                      string     `gorm:"size:128;not null" json:"name"`
+	NameNormalized            string     `gorm:"size:128;not null;uniqueIndex" json:"-"`
+	Type                      string     `gorm:"size:32;not null" json:"type"`
+	RootPath                  string     `gorm:"type:text;not null" json:"root_path"`
+	RootDisplayPath           string     `gorm:"type:text;not null;default:''" json:"root_display_path"`
+	RootPathNormalized        string     `gorm:"type:text;not null;uniqueIndex" json:"-"`
+	ConnectionID              *uint      `gorm:"index" json:"connection_id"`
+	CatalogConnectionEpoch    uint64     `gorm:"->;not null;default:0" json:"-"`
+	CatalogConnectionRevision uint64     `gorm:"->;not null;default:0" json:"-"`
+	Enabled                   bool       `gorm:"not null;default:true" json:"enabled"`
+	Capabilities              string     `gorm:"type:text;not null" json:"-"`
+	LastProbeExists           bool       `gorm:"not null;default:false" json:"-"`
+	LastProbeReadable         bool       `gorm:"not null;default:false" json:"-"`
+	LastProbeAvailable        bool       `gorm:"not null;default:false" json:"-"`
+	LastProbeFreeBytes        *uint64    `json:"-"`
+	LastProbeTotalBytes       *uint64    `json:"-"`
+	LastProbeErrorCode        string     `gorm:"size:64;not null;default:''" json:"-"`
+	LastProbeCheckedAt        *time.Time `json:"-"`
+	CreatedAt                 time.Time  `json:"created_at"`
+	UpdatedAt                 time.Time  `json:"updated_at"`
 }
 
 // ProviderEvent is a normalized, credential-free inbox record. The composite
@@ -822,18 +827,19 @@ type MediaLibraryStructureIssueMember struct {
 // short-lived selection preview. The browser receives only the signed opaque
 // claim; source/provider facts remain in the selected private repair plan.
 type MediaLibraryStructureRepairDraft struct {
-	ID              string     `gorm:"primaryKey;size:36" json:"-"`
-	OwnerID         uint       `gorm:"not null;index" json:"-"`
-	LibraryID       uint       `gorm:"not null;index" json:"-"`
-	DiagnosisJobID  string     `gorm:"size:36;not null;index" json:"-"`
-	SourceRevision  uint64     `gorm:"not null" json:"-"`
-	Generation      uint64     `gorm:"not null" json:"-"`
-	RuleFingerprint string     `gorm:"size:64;not null" json:"-"`
-	PlanHash        string     `gorm:"size:64;not null" json:"-"`
-	SelectionsJSON  string     `gorm:"type:text;not null" json:"-"`
-	ExpiresAt       time.Time  `gorm:"not null;index" json:"-"`
-	ConsumedAt      *time.Time `gorm:"index" json:"-"`
-	CreatedAt       time.Time  `gorm:"not null" json:"-"`
+	ID               string     `gorm:"primaryKey;size:36" json:"-"`
+	OwnerID          uint       `gorm:"not null;index" json:"-"`
+	LibraryID        uint       `gorm:"not null;index" json:"-"`
+	DiagnosisJobID   string     `gorm:"size:36;not null;index" json:"-"`
+	SourceRevision   uint64     `gorm:"not null" json:"-"`
+	Generation       uint64     `gorm:"not null" json:"-"`
+	RuleFingerprint  string     `gorm:"size:64;not null" json:"-"`
+	PlanHash         string     `gorm:"size:64;not null" json:"-"`
+	SelectionsJSON   string     `gorm:"type:text;not null" json:"-"`
+	PreviewItemsJSON string     `gorm:"type:text;not null;default:''" json:"-"`
+	ExpiresAt        time.Time  `gorm:"not null;index" json:"-"`
+	ConsumedAt       *time.Time `gorm:"index" json:"-"`
+	CreatedAt        time.Time  `gorm:"not null" json:"-"`
 }
 
 // MediaLibraryStructureRepair is the durable authority for one diagnostic or
@@ -1137,6 +1143,7 @@ type MediaArtifactRun struct {
 // changed or removed by reconciliation; an unmanaged on-disk name collision is
 // never adopted implicitly.
 type MediaArtifact struct {
+	CatalogBindingID     string     `json:"-"`
 	ID                   uint       `gorm:"primaryKey" json:"id"`
 	OpaqueID             string     `gorm:"size:64;not null;uniqueIndex" json:"-"`
 	RunID                string     `gorm:"size:36;not null;index" json:"run_id"`
@@ -1727,6 +1734,7 @@ const (
 // provider-relative media names and must never be serialized by an API.
 type TransferTask struct {
 	ID                   string     `gorm:"primaryKey;size:36" json:"id"`
+	ManagedRevision      uint64     `gorm:"not null;default:0" json:"-"`
 	OwnerID              uint       `gorm:"not null;index" json:"owner_id"`
 	JobID                string     `gorm:"size:36;not null;uniqueIndex" json:"job_id"`
 	DownloadTaskID       string     `gorm:"size:36;not null;uniqueIndex" json:"download_task_id"`

@@ -19,6 +19,7 @@ import (
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
 	storagefs "github.com/yuanjing-hash/OhMyCine-Server/internal/storage"
 	cloudpkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/metadata/releaseversion"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/metadata/tmdb"
 	"gorm.io/gorm"
 )
@@ -110,6 +111,7 @@ type PlayerMediaVersion struct {
 	ItemToken        string    `json:"item_token"`
 	HistoryIdentity  string    `json:"history_identity"`
 	Title            string    `json:"title"`
+	VersionName      string    `json:"version_name,omitempty"`
 	DisplayTitle     string    `json:"display_title"`
 	DisplaySubtitle  string    `json:"display_subtitle,omitempty"`
 	SeriesTitle      string    `json:"series_title,omitempty"`
@@ -167,15 +169,29 @@ func PlayerStreamUnavailableError() error {
 }
 
 func (s *MediaLibraryService) PlayerLibraries(actor Actor) ([]PlayerMediaLibrary, error) {
+	var result []PlayerMediaLibrary
+	err := s.withCatalogReadTx(context.Background(), func(tx *gorm.DB) error {
+		var err error
+		result, err = s.playerLibrariesTx(tx, actor)
+		return err
+	})
+	return result, err
+}
+
+func (s *MediaLibraryService) playerLibrariesTx(tx *gorm.DB, actor Actor) ([]PlayerMediaLibrary, error) {
 	if !actor.HasPermission(authz.PermissionMediaLibrariesRead) {
 		return nil, appError(CodePermissionDenied, "无权查看媒体库", nil)
 	}
-	libraryIDs, err := s.authorizedMediaLibraryIDs(actor, authz.PermissionMediaLibrariesRead, true)
+	libraryIDs, err := s.authorizedMediaLibraryIDsTx(tx, actor, authz.PermissionMediaLibrariesRead, true)
 	if err != nil {
 		return nil, err
 	}
 	if len(libraryIDs) == 0 {
 		return []PlayerMediaLibrary{}, nil
+	}
+	reader, err := PinCatalogTx(tx, libraryIDs)
+	if err != nil {
+		return nil, err
 	}
 	type row struct {
 		ID                   uint
@@ -190,10 +206,10 @@ func (s *MediaLibraryService) PlayerLibraries(actor Actor) ([]PlayerMediaLibrary
 		WorkCount            int64
 	}
 	var rows []row
-	err = s.db.Table("media_libraries").
+	err = tx.Table("media_libraries").
 		Select("media_libraries.id, media_libraries.name, storages.type AS storage_type, media_libraries.sort_order, media_libraries.status, media_libraries.strm_enabled, media_libraries.signed_proxy_enabled, media_libraries.last_successful_scan_at, COUNT(media_library_entries.id) AS entry_count, COUNT(DISTINCT CASE WHEN media_library_entries.work_key <> '' THEN media_library_entries.work_key END) AS work_count").
 		Joins("JOIN storages ON storages.id = media_libraries.storage_id").
-		Joins("LEFT JOIN media_library_entries ON media_library_entries.library_id = media_libraries.id").
+		Joins("LEFT JOIN (?) AS media_library_entries ON media_library_entries.library_id = media_libraries.id", reader.Entries()).
 		Where("media_libraries.enabled = ? AND storages.enabled = ? AND media_libraries.id IN ?", true, true, libraryIDs).
 		Group("media_libraries.id").Order("media_libraries.sort_order, media_libraries.id").Scan(&rows).Error
 	if err != nil {
@@ -209,15 +225,25 @@ func (s *MediaLibraryService) PlayerLibraries(actor Actor) ([]PlayerMediaLibrary
 }
 
 func (s *MediaLibraryService) PlayerCategories(actor Actor, libraryID uint) ([]PlayerMediaCategory, error) {
-	if err := s.ensurePlayerMediaLibraryReadable(actor, libraryID); err != nil {
+	var result []PlayerMediaCategory
+	err := s.withCatalogRead(context.Background(), []uint{libraryID}, func(tx *gorm.DB, reader *CatalogReader) error {
+		var err error
+		result, err = s.playerCategoriesTx(tx, reader, actor, libraryID)
+		return err
+	})
+	return result, err
+}
+
+func (s *MediaLibraryService) playerCategoriesTx(tx *gorm.DB, reader *CatalogReader, actor Actor, libraryID uint) ([]PlayerMediaCategory, error) {
+	if err := ensurePlayerMediaLibraryReadableTx(tx, actor, libraryID); err != nil {
 		return nil, err
 	}
 	var library models.MediaLibrary
-	if err := s.db.Select("id", "profile_id").First(&library, libraryID).Error; err != nil {
+	if err := tx.Select("id", "profile_id").First(&library, libraryID).Error; err != nil {
 		return nil, err
 	}
 	var profile models.MediaClassificationProfile
-	if err := s.db.Select("id", "rules_json").First(&profile, library.ProfileID).Error; err != nil {
+	if err := tx.Select("id", "rules_json").First(&profile, library.ProfileID).Error; err != nil {
 		return nil, appError(CodeMediaLibraryProfileUnavailable, "媒体库分类规则不可用", err)
 	}
 	rules, err := classification.DecodeStrict([]byte(profile.RulesJSON))
@@ -230,7 +256,7 @@ func (s *MediaLibraryService) PlayerCategories(actor Actor, libraryID uint) ([]P
 		ItemCount    int64
 	}
 	var rows []countRow
-	if err := s.db.Model(&models.MediaLibraryEntry{}).
+	if err := reader.Entries().
 		Select("category_name, CASE WHEN media_type = 'tv' THEN 'series' ELSE 'movie' END AS media_type, COUNT(DISTINCT work_key) AS item_count").
 		Where("library_id = ? AND work_key <> '' AND category_name <> ''", libraryID).
 		Group("category_name, CASE WHEN media_type = 'tv' THEN 'series' ELSE 'movie' END").
@@ -286,16 +312,26 @@ func playerLibraryArtworkURL(storageType string) string {
 }
 
 func (s *MediaLibraryService) PlayerCatalog(actor Actor, libraryID uint, query MediaPageQuery) (PlayerMediaItemPage, error) {
-	if err := s.ensurePlayerMediaLibraryReadable(actor, libraryID); err != nil {
+	var result PlayerMediaItemPage
+	err := s.withCatalogRead(context.Background(), []uint{libraryID}, func(tx *gorm.DB, reader *CatalogReader) error {
+		var err error
+		result, err = s.playerCatalogTx(tx, reader, actor, libraryID, query)
+		return err
+	})
+	return result, err
+}
+
+func (s *MediaLibraryService) playerCatalogTx(tx *gorm.DB, reader *CatalogReader, actor Actor, libraryID uint, query MediaPageQuery) (PlayerMediaItemPage, error) {
+	if err := ensurePlayerMediaLibraryReadableTx(tx, actor, libraryID); err != nil {
 		return PlayerMediaItemPage{}, err
 	}
-	page, err := s.Catalog(actor, libraryID, query)
+	page, err := s.catalogTx(tx, reader, actor, libraryID, query)
 	if err != nil {
 		return PlayerMediaItemPage{}, err
 	}
 	items := make([]PlayerMediaItem, 0, len(page.List))
 	for _, item := range page.List {
-		projected, err := s.playerMediaItem(libraryID, item)
+		projected, err := s.playerMediaItemTx(tx, reader, libraryID, item)
 		if err != nil {
 			return PlayerMediaItemPage{}, err
 		}
@@ -305,34 +341,45 @@ func (s *MediaLibraryService) PlayerCatalog(actor Actor, libraryID uint, query M
 }
 
 func (s *MediaLibraryService) PlayerCatalogDetail(ctx context.Context, actor Actor, libraryID uint, token string) (PlayerMediaDetail, error) {
-	if err := s.ensurePlayerMediaLibraryReadable(actor, libraryID); err != nil {
-		return PlayerMediaDetail{}, err
-	}
-	detail, err := s.CatalogDetail(actor, libraryID, token)
-	if err != nil {
-		return PlayerMediaDetail{}, err
-	}
-	item, err := s.playerMediaItem(libraryID, detail.Work)
-	if err != nil {
-		return PlayerMediaDetail{}, err
-	}
 	workKey, err := decodeCatalogToken(token)
 	if err != nil {
 		return PlayerMediaDetail{}, err
 	}
-	streamMode, err := s.playerDirectStreamMode(libraryID)
-	if err != nil {
-		return PlayerMediaDetail{}, err
-	}
+	var item PlayerMediaItem
+	var streamMode string
 	var entries []models.MediaLibraryEntry
-	if err := s.db.Where("library_id = ? AND work_key = ?", libraryID, workKey).Order("COALESCE(season, 0), COALESCE(episode, 0), relative_path").Find(&entries).Error; err != nil {
+	var source playerEpisodeMetadataSource
+	err = s.withCatalogRead(ctx, []uint{libraryID}, func(tx *gorm.DB, reader *CatalogReader) error {
+		if err := ensurePlayerMediaLibraryReadableTx(tx, actor, libraryID); err != nil {
+			return err
+		}
+		detail, err := s.catalogDetailTx(tx, reader, actor, libraryID, token)
+		if err != nil {
+			return err
+		}
+		item, err = s.playerMediaItemTx(tx, reader, libraryID, detail.Work)
+		if err != nil {
+			return err
+		}
+		streamMode, err = playerDirectStreamModeTx(tx, libraryID)
+		if err != nil {
+			return err
+		}
+		if err := reader.Entries().Where("library_id = ? AND work_key = ?", libraryID, workKey).Order("COALESCE(season,0),COALESCE(episode,0),relative_path").Find(&entries).Error; err != nil {
+			return err
+		}
+		source, err = playerEpisodeMetadataSourceTx(tx, reader, libraryID, workKey)
+		return err
+	})
+	if err != nil {
 		return PlayerMediaDetail{}, err
 	}
 	episodeMetadata := map[playerEpisodeKey]tmdb.EpisodeSnapshot{}
 	if item.Kind == "series" {
-		episodeMetadata = s.playerEpisodeMetadata(ctx, libraryID, workKey, entries)
+		episodeMetadata = s.playerEpisodeMetadata(ctx, source, entries)
 	}
 	versions := make([]PlayerMediaVersion, 0, len(entries))
+	versionLabels := playerVersionLabels(entries)
 	for _, entry := range entries {
 		season, episode := resolvedCatalogEpisodeFacts(entry)
 		episodeSnapshot := tmdb.EpisodeSnapshot{}
@@ -348,7 +395,7 @@ func (s *MediaLibraryService) PlayerCatalogDetail(ctx context.Context, actor Act
 		exactIdentity := "server:entry:" + strconv.FormatUint(uint64(entry.ID), 10)
 		switch streamMode {
 		case models.StorageTypeLocal:
-			file, _, openErr := openLocalPlayerEntry(s.db, entry)
+			file, _, openErr := openLocalPlayerEntrySource(entry, source.Library, source.Storage)
 			if openErr == nil {
 				playable = true
 				deliveryKind = playerDeliveryServerStream
@@ -365,6 +412,10 @@ func (s *MediaLibraryService) PlayerCatalogDetail(ctx context.Context, actor Act
 			streamPath = "/api/v1/player/media-entries/" + strconv.FormatUint(uint64(entry.ID), 10) + "/stream"
 		}
 		title := entry.Title
+		versionName := versionLabels[entry.ID]
+		if item.Kind != "series" && versionName != "" {
+			title += " · " + versionName
+		}
 		if item.Kind == "series" {
 			title = strings.TrimSpace(episodeSnapshot.Name)
 			if title == "" {
@@ -385,6 +436,7 @@ func (s *MediaLibraryService) PlayerCatalogDetail(ctx context.Context, actor Act
 			displaySubtitle = playerHistoryEpisodeSubtitle(season, episode, episodeTitle)
 		}
 		versions = append(versions, PlayerMediaVersion{ID: entry.ID, ItemToken: itemToken, HistoryIdentity: historyIdentity, Title: title, DisplayTitle: displayTitle, DisplaySubtitle: displaySubtitle, SeriesTitle: seriesTitle, EpisodeTitle: episodeTitle, Season: season, Episode: episode, Overview: episodeSnapshot.Overview, StillPath: episodeStillPath, PosterPath: item.PosterPath, BackdropPath: item.BackdropPath, EpisodeStillPath: episodeStillPath, AirDate: episodeSnapshot.AirDate, RuntimeMinutes: episodeSnapshot.RuntimeMinutes, Rating: episodeSnapshot.VoteAverage, Size: entry.Size, ModifiedAt: entry.ModifiedAt, Playable: playable, StreamPath: streamPath, DeliveryKind: deliveryKind, ExactIdentity: exactIdentity})
+		versions[len(versions)-1].VersionName = versionName
 	}
 	sort.SliceStable(versions, func(i, j int) bool {
 		leftSeason, rightSeason := pointerIntValue(versions[i].Season), pointerIntValue(versions[j].Season)
@@ -400,7 +452,34 @@ func (s *MediaLibraryService) PlayerCatalogDetail(ctx context.Context, actor Act
 	return PlayerMediaDetail{Item: item, Versions: versions}, nil
 }
 
-func (s *MediaLibraryService) playerDirectStreamMode(libraryID uint) (string, error) {
+// Only allowlisted technical labels leave the Server, never the source path
+// or an arbitrary release suffix. Equal labels remain distinct file choices.
+func playerVersionLabels(entries []models.MediaLibraryEntry) map[uint]string {
+	labels := make(map[uint]string, len(entries))
+	groups := make(map[string][]uint)
+	for _, entry := range entries {
+		label := releaseversion.Parse(entry.RelativePath)
+		labels[entry.ID] = label
+		season, episode := resolvedCatalogEpisodeFacts(entry)
+		key := fmt.Sprintf("%d/%d/%s", pointerIntValue(season), pointerIntValue(episode), label)
+		groups[key] = append(groups[key], entry.ID)
+	}
+	for _, ids := range groups {
+		if len(ids) < 2 {
+			continue
+		}
+		for _, id := range ids {
+			label := labels[id]
+			if label != "" {
+				label += " · "
+			}
+			labels[id] = label + fmt.Sprintf("版本 %d", id)
+		}
+	}
+	return labels
+}
+
+func playerDirectStreamModeTx(tx *gorm.DB, libraryID uint) (string, error) {
 	type row struct {
 		StorageType    string
 		LibraryEnabled bool
@@ -408,7 +487,7 @@ func (s *MediaLibraryService) playerDirectStreamMode(libraryID uint) (string, er
 		ConnectionID   uint
 	}
 	var item row
-	err := s.db.Table("media_libraries").
+	err := tx.Table("media_libraries").
 		Select("storages.type AS storage_type, media_libraries.enabled AS library_enabled, storages.enabled AS storage_enabled, COALESCE(storages.connection_id, 0) AS connection_id").
 		Joins("JOIN storages ON storages.id = media_libraries.storage_id").
 		Where("media_libraries.id = ?", libraryID).Take(&item).Error
@@ -428,18 +507,32 @@ func (s *MediaLibraryService) playerDirectStreamMode(libraryID uint) (string, er
 }
 
 func (s *MediaLibraryService) PlayerSearch(actor Actor, query MediaPageQuery) (PlayerMediaItemPage, error) {
+	var result PlayerMediaItemPage
+	err := s.withCatalogReadTx(context.Background(), func(tx *gorm.DB) error { var err error; result, err = s.playerSearchTx(tx, actor, query); return err })
+	return result, err
+}
+
+func (s *MediaLibraryService) playerSearchTx(tx *gorm.DB, actor Actor, query MediaPageQuery) (PlayerMediaItemPage, error) {
 	query, err := normalizeMediaPageQuery(query)
 	if err != nil {
 		return PlayerMediaItemPage{}, err
 	}
-	libraries, err := s.PlayerLibraries(actor)
+	libraries, err := s.playerLibrariesTx(tx, actor)
 	if err != nil {
 		return PlayerMediaItemPage{}, err
 	}
 	all := make([]PlayerMediaItem, 0)
+	ids := make([]uint, 0, len(libraries))
+	for _, library := range libraries {
+		ids = append(ids, library.ID)
+	}
+	reader, err := PinCatalogTx(tx, ids)
+	if err != nil {
+		return PlayerMediaItemPage{}, err
+	}
 	for _, library := range libraries {
 		for pageNumber := 1; ; pageNumber++ {
-			page, err := s.PlayerCatalog(actor, library.ID, MediaPageQuery{Page: pageNumber, PageSize: 100, Query: query.Query, MediaType: query.MediaType, MatchStatus: query.MatchStatus})
+			page, err := s.playerCatalogTx(tx, reader, actor, library.ID, MediaPageQuery{Page: pageNumber, PageSize: 100, Query: query.Query, MediaType: query.MediaType, MatchStatus: query.MatchStatus})
 			if err != nil {
 				return PlayerMediaItemPage{}, err
 			}
@@ -471,12 +564,12 @@ func (s *MediaLibraryService) PlayerSearch(actor Actor, query MediaPageQuery) (P
 	return PlayerMediaItemPage{List: all[start:end], Total: total, Page: query.Page, PageSize: query.PageSize}, nil
 }
 
-func (s *MediaLibraryService) ensurePlayerMediaLibraryReadable(actor Actor, libraryID uint) error {
+func ensurePlayerMediaLibraryReadableTx(tx *gorm.DB, actor Actor, libraryID uint) error {
 	if !actor.CanResource(authz.PermissionMediaLibrariesRead, models.AuthorizationResourceMediaLibrary, uintID(libraryID)) {
 		return appError(CodePermissionDenied, "无权查看媒体库", nil)
 	}
 	var count int64
-	err := s.db.Table("media_libraries").
+	err := tx.Table("media_libraries").
 		Joins("JOIN storages ON storages.id = media_libraries.storage_id").
 		Where("media_libraries.id = ? AND media_libraries.enabled = ? AND storages.enabled = ?", libraryID, true, true).
 		Count(&count).Error
@@ -489,14 +582,14 @@ func (s *MediaLibraryService) ensurePlayerMediaLibraryReadable(actor Actor, libr
 	return nil
 }
 
-func (s *MediaLibraryService) playerMediaItem(libraryID uint, item MediaCatalogItem) (PlayerMediaItem, error) {
+func (s *MediaLibraryService) playerMediaItemTx(tx *gorm.DB, reader *CatalogReader, libraryID uint, item MediaCatalogItem) (PlayerMediaItem, error) {
 	workKey, err := decodeCatalogToken(item.ID)
 	if err != nil {
 		return PlayerMediaItem{}, err
 	}
 	var recognition models.MediaLibraryRecognition
-	err = s.db.Table("media_library_recognitions").
-		Joins("JOIN media_library_entries ON media_library_entries.recognition_id = media_library_recognitions.id").
+	err = reader.Recognitions().
+		Joins("JOIN (?) AS media_library_entries ON media_library_entries.recognition_id = media_library_recognitions.id", reader.Entries()).
 		Where("media_library_entries.library_id = ? AND media_library_entries.work_key = ?", libraryID, workKey).
 		Order("media_library_recognitions.updated_at DESC").First(&recognition).Error
 	var snapshot tmdb.Snapshot
@@ -516,6 +609,7 @@ func (s *MediaLibraryService) playerMediaItem(libraryID uint, item MediaCatalogI
 	if item.Kind == "movie" {
 		historyIdentity = playerHistoryCanonicalIdentity(libraryID, item.ID, item.Kind, nil, nil, 0)
 	}
+	imageClient := s.catalogImageClientTx(tx)
 	return PlayerMediaItem{
 		ID: item.ID, ItemToken: playerHistoryWorkToken(libraryID, item.ID), HistoryIdentity: historyIdentity, LibraryID: libraryID, Title: item.Title, OriginalTitle: snapshot.OriginalTitle,
 		Kind: item.Kind, ReleaseYear: item.ReleaseYear, Overview: snapshot.Overview, Tagline: snapshot.Tagline,
@@ -523,7 +617,7 @@ func (s *MediaLibraryService) playerMediaItem(libraryID uint, item MediaCatalogI
 		Directors: personNames(snapshot.Directors), Writers: personNames(snapshot.Writers), Cast: personNames(snapshot.Cast),
 		People: playerMediaPeople(snapshot),
 		TMDBID: snapshot.TMDBID, IMDbID: snapshot.IMDbID, PosterPath: safeTMDBImagePath(snapshot.PosterPath), BackdropPath: safeTMDBImagePath(snapshot.BackdropPath),
-		PosterURL: s.catalogImageURL(snapshot.PosterPath, "w500"), BackdropURL: s.catalogImageURL(snapshot.BackdropPath, "w1280"),
+		PosterURL: catalogImageURLWithClient(imageClient, snapshot.PosterPath, "w500"), BackdropURL: catalogImageURLWithClient(imageClient, snapshot.BackdropPath, "w1280"),
 		StillPaths: snapshotStillPaths(snapshot), WorkIdentity: identity, FileCount: item.FileCount,
 		SeasonCount: item.SeasonCount, EpisodeCount: item.EpisodeCount, ModifiedAt: item.ModifiedAt,
 		CategoryName: item.CategoryName, MatchStatus: item.MatchStatus,
@@ -655,29 +749,88 @@ func EmbyInstanceFingerprint(systemID string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// SetCatalogSnapshotStore is startup-only wiring for the same deferred reader
+// used by catalog browsing. A missing store never permits versioned fallback.
+func (s *SignedProxyService) SetCatalogSnapshotStore(store *CatalogSnapshotStore) {
+	s.catalogStore = store
+}
+
+type playerStreamSource struct {
+	Entry   models.MediaLibraryEntry
+	Library models.MediaLibrary
+	Storage models.Storage
+	Head    models.CatalogHead
+}
+
+func (s *SignedProxyService) playerStreamSource(ctx context.Context, actor Actor, entryID uint) (playerStreamSource, error) {
+	var source playerStreamSource
+	// Fresh facade, not a copy of a service containing mutexes. Only the
+	// explicit read-pool boundary is reused; no service metadata is delegated.
+	facade := &MediaLibraryService{db: s.db, catalogStore: s.catalogStore}
+	err := facade.withCatalogReadTx(ctx, func(tx *gorm.DB) error {
+		var anchor struct{ LibraryID uint }
+		// Anchors may locate the owner only. No anchor locator is played.
+		if err := tx.Table("media_library_entries").Select("library_id").Where("id=?", entryID).Take(&anchor).Error; err != nil {
+			return appError(CodeNotFound, "媒体文件不存在", err)
+		}
+		if err := ensurePlayerMediaLibraryReadableTx(tx, actor, anchor.LibraryID); err != nil {
+			return err
+		}
+		reader, err := PinCatalogTx(tx, []uint{anchor.LibraryID})
+		if err != nil {
+			return err
+		}
+		source.Head, _ = reader.Head(anchor.LibraryID)
+		if err := reader.Entries().Where("id=? AND library_id=?", entryID, anchor.LibraryID).First(&source.Entry).Error; err != nil {
+			return appError(CodeNotFound, "媒体文件不存在", err)
+		}
+		if err := tx.First(&source.Library, anchor.LibraryID).Error; err != nil {
+			return err
+		}
+		return tx.First(&source.Storage, source.Library.StorageID).Error
+	})
+	return source, err
+}
+
+func samePlayerStreamSource(left, right playerStreamSource) bool {
+	return left.Entry.ID == right.Entry.ID && left.Entry.LibraryID == right.Entry.LibraryID && left.Entry.RelativePath == right.Entry.RelativePath && left.Entry.ProviderID == right.Entry.ProviderID && left.Entry.Size == right.Entry.Size && left.Entry.ModifiedAt.Equal(right.Entry.ModifiedAt) && left.Library.StorageID == right.Library.StorageID && left.Library.RelativeRoot == right.Library.RelativeRoot && left.Library.ProviderRootID == right.Library.ProviderRootID && left.Storage.Type == right.Storage.Type && left.Storage.RootPath == right.Storage.RootPath && uintPointerValue(left.Storage.ConnectionID) == uintPointerValue(right.Storage.ConnectionID) && (left.Head.Mode != "versioned" || (right.Head.Mode == "versioned" && left.Head.SourceEpoch == right.Head.SourceEpoch && left.Head.SourceFingerprint == right.Head.SourceFingerprint))
+}
+
+func uintPointerValue(value *uint) uint {
+	if value == nil {
+		return 0
+	}
+	return *value
+}
+
+func (s *SignedProxyService) revalidatePlayerStreamSource(ctx context.Context, actor Actor, source playerStreamSource) error {
+	current, err := s.playerStreamSource(ctx, actor, source.Entry.ID)
+	if err != nil {
+		return err
+	}
+	if !samePlayerStreamSource(source, current) {
+		return PlayerStreamUnavailableError()
+	}
+	return nil
+}
+
 func (s *SignedProxyService) ResolvePlayerEntry(ctx context.Context, actor Actor, entryID uint, userAgent, remoteAddr string) (PlayerStreamResolution, error) {
 	if !actor.HasPermission(authz.PermissionMediaLibrariesRead) {
 		return PlayerStreamResolution{}, appError(CodePermissionDenied, "无权播放该媒体", nil)
 	}
-	var entry models.MediaLibraryEntry
-	if err := s.db.First(&entry, entryID).Error; err != nil {
-		return PlayerStreamResolution{}, appError(CodeNotFound, "媒体文件不存在", err)
+	source, err := s.playerStreamSource(ctx, actor, entryID)
+	if err != nil {
+		return PlayerStreamResolution{}, err
 	}
-	if !actor.CanResource(authz.PermissionMediaLibrariesRead, models.AuthorizationResourceMediaLibrary, uintID(entry.LibraryID)) {
-		return PlayerStreamResolution{}, appError(CodePermissionDenied, "无权播放该媒体", nil)
-	}
-	var library models.MediaLibrary
-	if err := s.db.First(&library, entry.LibraryID).Error; err != nil || !library.Enabled {
-		return PlayerStreamResolution{}, appError(CodeProxyTargetUnavailable, "播放目标不可用", err)
-	}
-	var storage models.Storage
-	if err := s.db.First(&storage, library.StorageID).Error; err != nil || !storage.Enabled {
-		return PlayerStreamResolution{}, appError(CodeProxyTargetUnavailable, "播放目标不可用", err)
-	}
+	entry, library, storage := source.Entry, source.Library, source.Storage
 	if storage.Type == models.StorageTypeLocal {
-		file, info, err := openLocalPlayerEntry(s.db, entry)
+		file, info, err := openLocalPlayerEntrySource(entry, library, storage)
 		if err != nil {
 			return PlayerStreamResolution{}, appError(CodeProxyTargetUnavailable, "播放目标不可用", err)
+		}
+		if err := s.revalidatePlayerStreamSource(ctx, actor, source); err != nil {
+			_ = file.Close()
+			return PlayerStreamResolution{}, err
 		}
 		return PlayerStreamResolution{Kind: playerStreamKindLocal, File: file, Name: filepath.Base(filepath.FromSlash(entry.RelativePath)), ModifiedAt: info.ModTime()}, nil
 	}
@@ -701,9 +854,15 @@ func (s *SignedProxyService) ResolvePlayerEntry(ctx context.Context, actor Actor
 	if err != nil || !within {
 		return PlayerStreamResolution{}, appError(CodeProxyTargetUnavailable, "播放目标不可用", err)
 	}
+	if err := s.revalidatePlayerStreamSource(ctx, actor, source); err != nil {
+		return PlayerStreamResolution{}, err
+	}
 	target := signedProxyTarget{LibraryID: library.ID, ConnectionID: *storage.ConnectionID, ProviderItemID: item.ID, StorageType: storage.Type, LibraryEnabled: true, StorageEnabled: true}
 	redirect, err := s.resolveTargetWithItem(ctx, playerEntryProxyIdentity(library.ID, entry.ID, item.ID), target, userAgent, playbackClientFingerprint(remoteAddr, userAgent), &item)
 	if err != nil {
+		return PlayerStreamResolution{}, err
+	}
+	if err := s.revalidatePlayerStreamSource(ctx, actor, source); err != nil {
 		return PlayerStreamResolution{}, err
 	}
 	return PlayerStreamResolution{Kind: playerStreamKindRedirect, RedirectURL: redirect.URL}, nil
@@ -722,6 +881,13 @@ func openLocalPlayerEntry(db *gorm.DB, entry models.MediaLibraryEntry) (*os.File
 	var storage models.Storage
 	if err := db.First(&storage, library.StorageID).Error; err != nil || !storage.Enabled || storage.Type != models.StorageTypeLocal {
 		return nil, nil, appError(CodeProxyTargetUnavailable, "播放目标不可用", err)
+	}
+	return openLocalPlayerEntrySource(entry, library, storage)
+}
+
+func openLocalPlayerEntrySource(entry models.MediaLibraryEntry, library models.MediaLibrary, storage models.Storage) (*os.File, os.FileInfo, error) {
+	if entry.LibraryID != library.ID || library.StorageID != storage.ID || !library.Enabled || !storage.Enabled || storage.Type != models.StorageTypeLocal {
+		return nil, nil, PlayerStreamUnavailableError()
 	}
 	libraryRoot, err := medialibrary.ResolveRoot(storage.RootPath, library.RelativeRoot)
 	if err != nil {

@@ -189,6 +189,7 @@ export interface MediaClassificationProfileDetail extends MediaClassificationPro
 
 export type MediaLibraryStatus = 'disabled' | 'initializing' | 'attaching_listener' | 'catch_up_reconciliation' | 'listening' | 'initialization_failed'
 export interface MediaLibraryDetail {
+	retirement?: { status: 'deleting'; job_id: string; error_code?: string }
   id: number; name: string; storage_id: number; storage_name: string; profile_id: number; profile_name: string
   connection_id?: number; auto_listen_default: boolean
   profile_revision: number; relative_root: string; enabled: boolean; recursive: boolean
@@ -215,6 +216,7 @@ export interface MediaLibraryScanRun {
   persistence_stage: string; database_error_class: string; catalog_published_at: string | null
   error_code: string; partial: boolean; started_at: string; finished_at: string | null
 }
+export interface MediaLibraryDeletionResult { deleted: boolean; status?: 'deleting'; job_id?: string }
 export interface MediaLibraryEntry {
   id: number; library_id: number; relative_path: string; size: number; modified_at: string
   media_type: 'movie' | 'tv' | 'unknown'; title: string; series_title: string; season: number | null; episode: number | null
@@ -257,7 +259,10 @@ export interface MediaLibraryStructureBulkSelection { codes: string[]; action: '
 export interface MediaLibraryStructureSelectionPreview {
   library_id: number; revision: string; issue_count: number; recycle_count: number; move_count: number; skipped_count: number
   selections: MediaLibraryStructureSelection[]; confirmation_token: string; expires_at: string
+  items?: MediaLibraryStructurePreviewItemPage
 }
+export interface MediaLibraryStructurePreviewItem { action: 'keep' | 'move' | 'recycle'; kind: 'video' | 'sidecar'; current_path: string; expected_path: string }
+export type MediaLibraryStructurePreviewItemPage = PageResponse<MediaLibraryStructurePreviewItem>
 export interface MediaLibraryStructureClassifications { unrecognized: number; missing_season_episode: number; invalid_path: number; template_unavailable: number; duplicate_target: number; sidecar_target_conflict: number }
 export interface MediaLibraryStructureDiagnostics { library_id: number; job_id?: string; scan_run_id?: number; generation: number; scan_kind: string; status: MediaLibraryDetail['structure_status']; total_items: number; processed_items: number; issue_count: number; repairable_count: number; unrecognized: number; classifications: MediaLibraryStructureClassifications; error_code: string; started_at?: string; checked_at?: string; issues: MediaLibraryStructureIssue[]; revision: string }
 export interface MediaLibraryStructurePreview { library_id: number; revision: string; issue_count: number; repairable_count: number; move_count: number; issues: MediaLibraryStructureIssue[]; confirmation_token: string; expires_at: string }

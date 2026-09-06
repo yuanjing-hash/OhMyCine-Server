@@ -1,7 +1,9 @@
 package services
 
 import (
+	"context"
 	"errors"
+	"sort"
 	"sync"
 	"time"
 
@@ -16,11 +18,16 @@ const defaultMediaChangeRetention = 4096
 // Server library changes. Its in-memory channel is only a wake hint; SQLite is
 // always authoritative for reconnect and restart recovery.
 type MediaChangeService struct {
-	db       *gorm.DB
-	mu       sync.Mutex
-	wake     chan struct{}
-	onReady  func(uint, uint64)
-	retained int
+	db             *gorm.DB
+	mu             sync.Mutex
+	wake           chan struct{}
+	onReady        func(uint, uint64)
+	retained       int
+	writeAdmission *CatalogWriteAdmission
+}
+
+func (s *MediaChangeService) SetWriteAdmission(admission *CatalogWriteAdmission) {
+	s.writeAdmission = admission
 }
 
 func NewMediaChangeService(db *gorm.DB) *MediaChangeService {
@@ -83,8 +90,31 @@ func (s *MediaChangeService) RecordTx(tx *gorm.DB, libraryID uint, generation ui
 
 func (s *MediaChangeService) MarkGenerationReadyTx(tx *gorm.DB, libraryID uint, generation uint64) ([]models.MediaLibraryChange, error) {
 	var changes []models.MediaLibraryChange
-	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("library_id = ? AND generation = ? AND state = ?", libraryID, generation, models.MediaLibraryChangePending).Order("revision").Find(&changes).Error; err != nil {
-		return nil, err
+	var cleanup models.MediaChangePendingCleanup
+	cleanupErr := tx.First(&cleanup, "library_id = ?", libraryID).Error
+	if cleanupErr != nil && !errors.Is(cleanupErr, gorm.ErrRecordNotFound) {
+		return nil, cleanupErr
+	}
+	pending := func() *gorm.DB {
+		query := tx.Where("library_id = ? AND state = ?", libraryID, models.MediaLibraryChangePending)
+		if cleanupErr == nil {
+			query = query.Where("NOT (generation <= ? AND sequence <= ?)", cleanup.Generation, cleanup.MaxSequence)
+		}
+		return query
+	}
+	// The feed carries library invalidations, not per-file deltas. A complete
+	// generation represents every older change of the same kind; keep at most
+	// one catalog, metadata and removal invalidation in this short writer.
+	for _, kind := range []string{models.MediaLibraryChangeCatalog, models.MediaLibraryChangeMetadata, models.MediaLibraryChangeRemoval} {
+		var latest models.MediaLibraryChange
+		err := pending().Where("generation = ? AND kind = ?", generation, kind).Order("revision DESC").First(&latest).Error
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		changes = append(changes, latest)
 	}
 	if len(changes) == 0 {
 		// Artifact jobs intentionally coalesce to the newest complete generation.
@@ -93,8 +123,8 @@ func (s *MediaChangeService) MarkGenerationReadyTx(tx *gorm.DB, libraryID uint, 
 		// change is still represented by the completed artifacts and must not be
 		// deleted silently. Older pending rows are superseded by that projection.
 		var carried models.MediaLibraryChange
-		err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-			Where("library_id = ? AND generation < ? AND state = ?", libraryID, generation, models.MediaLibraryChangePending).
+		err := pending().
+			Where("generation < ?", generation).
 			Order("revision DESC").First(&carried).Error
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, nil
@@ -103,20 +133,30 @@ func (s *MediaChangeService) MarkGenerationReadyTx(tx *gorm.DB, libraryID uint, 
 			return nil, err
 		}
 		changes = []models.MediaLibraryChange{carried}
-		if err := tx.Where("library_id = ? AND generation < ? AND state = ? AND sequence <> ?", libraryID, generation, models.MediaLibraryChangePending, carried.Sequence).Delete(&models.MediaLibraryChange{}).Error; err != nil {
-			return nil, err
-		}
-	} else if err := tx.Where("library_id = ? AND generation < ? AND state = ?", libraryID, generation, models.MediaLibraryChangePending).Delete(&models.MediaLibraryChange{}).Error; err != nil {
-		// A change in the completed generation supersedes every older pending
-		// projection; only this generation is externally observable.
-		return nil, err
 	}
+	sort.Slice(changes, func(i, j int) bool { return changes[i].Revision < changes[j].Revision })
 	now := time.Now().UTC()
+	var maxSequence uint64
 	for index := range changes {
-		if err := tx.Model(&models.MediaLibraryChange{}).Where("sequence = ? AND state = ?", changes[index].Sequence, models.MediaLibraryChangePending).Updates(map[string]any{"state": models.MediaLibraryChangeReady, "ready_at": now}).Error; err != nil {
+		maxSequence = max(maxSequence, changes[index].Sequence)
+		// Pending sequences were never issued as public cursors. Assign at actual
+		// publication so a late artifact cannot appear behind another library's
+		// already-consumed ready cursor. Library revision and content stay stable.
+		deleted := tx.Where("sequence = ? AND state = ?", changes[index].Sequence, models.MediaLibraryChangePending).Delete(&models.MediaLibraryChange{})
+		if deleted.Error != nil {
+			return nil, deleted.Error
+		}
+		if deleted.RowsAffected != 1 {
+			return nil, ErrCatalogFence
+		}
+		changes[index].Sequence = 0
+		changes[index].State, changes[index].ReadyAt = models.MediaLibraryChangeReady, &now
+		if err := tx.Create(&changes[index]).Error; err != nil {
 			return nil, err
 		}
-		changes[index].State, changes[index].ReadyAt = models.MediaLibraryChangeReady, &now
+	}
+	if err := s.recordPendingCleanupTx(tx, libraryID, generation, maxSequence, now); err != nil {
+		return nil, err
 	}
 	latest := changes[len(changes)-1].Revision
 	if err := s.advanceTargetsTx(tx, libraryID, latest, now); err != nil {
@@ -126,9 +166,12 @@ func (s *MediaChangeService) MarkGenerationReadyTx(tx *gorm.DB, libraryID uint, 
 }
 
 func (s *MediaChangeService) advanceTargetsTx(tx *gorm.DB, libraryID uint, revision uint64, now time.Time) error {
-	return tx.Model(&models.MediaServerRefreshTarget{}).
-		Where("library_id = ? AND enabled = ? AND desired_revision < ?", libraryID, true, revision).
-		Updates(map[string]any{"desired_revision": revision, "updated_at": now}).Error
+	// The catalog commit writes one durable marker, never every refresh target.
+	return tx.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "library_id"}},
+		DoUpdates: clause.Assignments(map[string]any{"revision": revision, "after_target_id": 0, "updated_at": now}),
+		Where:     clause.Where{Exprs: []clause.Expression{clause.Expr{SQL: "media_change_dispatches.revision < excluded.revision"}}},
+	}).Create(&models.MediaChangeDispatch{LibraryID: libraryID, Revision: revision, UpdatedAt: now}).Error
 }
 
 // NotifyCommitted must be called only after the transaction that wrote or
@@ -137,12 +180,9 @@ func (s *MediaChangeService) NotifyCommitted(libraryID uint, revision uint64) {
 	s.mu.Lock()
 	close(s.wake)
 	s.wake = make(chan struct{})
-	handler := s.onReady
 	s.mu.Unlock()
-	if handler != nil {
-		handler(libraryID, revision)
-	}
-	go s.prune()
+	// Dispatch is owned by the lifecycle worker. A request neither fans out
+	// synchronously nor spawns an unbounded goroutine for each committed change.
 }
 
 func (s *MediaChangeService) prune() {
@@ -156,8 +196,12 @@ func (s *MediaChangeService) prune() {
 	}
 	latestPerLibrary := s.db.Model(&models.MediaLibraryChange{}).
 		Select("MAX(sequence)").Where("state = ?", models.MediaLibraryChangeReady).Group("library_id")
-	_ = s.db.Where("state = ? AND sequence <= ? AND sequence NOT IN (?)", models.MediaLibraryChangeReady, cutoff, latestPerLibrary).
-		Delete(&models.MediaLibraryChange{}).Error
+	ids := s.db.Model(&models.MediaLibraryChange{}).Select("sequence").
+		Where("state = ? AND sequence <= ? AND sequence NOT IN (?)", models.MediaLibraryChangeReady, cutoff, latestPerLibrary).
+		Order("sequence").Limit(mediaChangeDispatchBatch)
+	_ = withBackgroundTransaction(context.Background(), s.db, s.writeAdmission, func(tx *gorm.DB) error {
+		return tx.Where("sequence IN (?)", ids).Delete(&models.MediaLibraryChange{}).Error
+	})
 }
 
 type MediaChangePage struct {

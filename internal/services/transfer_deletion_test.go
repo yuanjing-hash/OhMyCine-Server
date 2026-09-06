@@ -252,7 +252,7 @@ func TestTransferDeletionRejectsBoundaryChangeAfterPreview(t *testing.T) {
 
 func TestTransferDeletionPan115LibraryScopeRecyclesStableManagedItem(t *testing.T) {
 	fixture := newCloudTransferFixture(t, models.MediaLibraryTransferCopy, models.MediaLibraryConflictRename, false)
-	if result := fixture.run(t); result.ErrorCode != "" {
+	if result := runCompletedDeletionTransfer(t, fixture); result.ErrorCode != "" {
 		t.Fatalf("transfer=%+v", result)
 	}
 	var transfer models.TransferTask
@@ -285,7 +285,7 @@ func TestTransferDeletionPan115LibraryScopeRecyclesStableManagedItem(t *testing.
 
 func TestTransferDeletionPan115PartialFailureRetainsRemainingOwnership(t *testing.T) {
 	fixture := newCloudTransferFixture(t, models.MediaLibraryTransferCopy, models.MediaLibraryConflictRename, false)
-	if result := fixture.run(t); result.ErrorCode != "" {
+	if result := runCompletedDeletionTransfer(t, fixture); result.ErrorCode != "" {
 		t.Fatalf("transfer=%+v", result)
 	}
 	var transfer models.TransferTask
@@ -318,18 +318,29 @@ func TestTransferDeletionPan115PartialFailureRetainsRemainingOwnership(t *testin
 	if err := fixture.queue.db.Model(&models.MediaManagedItem{}).Where("transfer_task_id = ? AND active = ?", transfer.ID, false).Count(&inactive).Error; err != nil {
 		t.Fatal(err)
 	}
-	if active != 1 || inactive != 1 {
+	if active != 2 || inactive != 0 {
 		t.Fatalf("partial ownership active=%d inactive=%d", active, inactive)
 	}
 	var transferCount int64
 	if err := fixture.queue.db.Model(&models.TransferTask{}).Where("id = ?", transfer.ID).Count(&transferCount).Error; err != nil || transferCount != 1 {
 		t.Fatalf("transfer count=%d err=%v", transferCount, err)
 	}
+	fixture.driver.recycleFailID = ""
+	retry, err := fixture.service.PreviewDeletion(context.Background(), actor, transfer.ID, TransferDeletionPreviewInput{Scope: models.TransferDeletionScopeRecordAndLibrary}, RequestContext{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.service.ConfirmDeletion(context.Background(), actor, transfer.ID, retry.ConfirmationToken, RequestContext{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.queue.db.Transaction(func(tx *gorm.DB) error { return AssertCatalogPhysicalDrainedTx(tx, fixture.library.ID) }); err != nil {
+		t.Fatalf("legacy retry stranded physical evidence: %v", err)
+	}
 }
 
 func TestTransferDeletionPan115SourceRecycleFailureWithUnavailableStatIsNotSuccess(t *testing.T) {
 	fixture := newCloudTransferFixture(t, models.MediaLibraryTransferCopy, models.MediaLibraryConflictRename, false)
-	if result := fixture.run(t); result.ErrorCode != "" {
+	if result := runCompletedDeletionTransfer(t, fixture); result.ErrorCode != "" {
 		t.Fatalf("transfer=%+v", result)
 	}
 	var transfer models.TransferTask
@@ -363,7 +374,7 @@ func TestTransferDeletionPan115SourceRecycleFailureWithUnavailableStatIsNotSucce
 
 func TestTransferDeletionRecordOnlyLargePan115ManifestUsesNoProviderCalls(t *testing.T) {
 	fixture := newCloudTransferFixture(t, models.MediaLibraryTransferCopy, models.MediaLibraryConflictRename, false)
-	if result := fixture.run(t); result.ErrorCode != "" {
+	if result := runCompletedDeletionTransfer(t, fixture); result.ErrorCode != "" {
 		t.Fatalf("transfer=%+v", result)
 	}
 	var transfer models.TransferTask
@@ -407,7 +418,7 @@ func TestTransferDeletionPan115MissingRootConvergesAndCancelsOfflineTask(t *test
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			fixture := newCloudTransferFixture(t, models.MediaLibraryTransferCopy, models.MediaLibraryConflictRename, false)
-			if result := fixture.run(t); result.ErrorCode != "" {
+			if result := runCompletedDeletionTransfer(t, fixture); result.ErrorCode != "" {
 				t.Fatalf("transfer=%+v", result)
 			}
 			var transfer models.TransferTask
@@ -442,7 +453,7 @@ func TestTransferDeletionPan115MissingRootConvergesAndCancelsOfflineTask(t *test
 
 func TestTransferDeletionPan115RecyclesOnlyOwnedPackageRoot(t *testing.T) {
 	fixture := newCloudTransferFixture(t, models.MediaLibraryTransferCopy, models.MediaLibraryConflictRename, false)
-	if result := fixture.run(t); result.ErrorCode != "" {
+	if result := runCompletedDeletionTransfer(t, fixture); result.ErrorCode != "" {
 		t.Fatalf("transfer=%+v", result)
 	}
 	var transfer models.TransferTask
@@ -474,7 +485,7 @@ func TestTransferDeletionPan115RecyclesOnlyOwnedPackageRoot(t *testing.T) {
 
 func TestTransferDeletionPan115PartialMovePreservesDetachedItems(t *testing.T) {
 	fixture := newCloudTransferFixture(t, models.MediaLibraryTransferCopy, models.MediaLibraryConflictRename, false)
-	if result := fixture.run(t); result.ErrorCode != "" {
+	if result := runCompletedDeletionTransfer(t, fixture); result.ErrorCode != "" {
 		t.Fatalf("transfer=%+v", result)
 	}
 	var transfer models.TransferTask
@@ -518,7 +529,7 @@ func TestTransferDeletionPan115PartialMovePreservesDetachedItems(t *testing.T) {
 
 func TestTransferDeletionPan115PreviewScalesWithParentDirectories(t *testing.T) {
 	fixture := newCloudTransferFixture(t, models.MediaLibraryTransferCopy, models.MediaLibraryConflictRename, false)
-	if result := fixture.run(t); result.ErrorCode != "" {
+	if result := runCompletedDeletionTransfer(t, fixture); result.ErrorCode != "" {
 		t.Fatalf("transfer=%+v", result)
 	}
 	var transfer models.TransferTask
@@ -630,7 +641,7 @@ func TestTransferDeletionPan115ProviderFailuresDoNotConvergeAsMissing(t *testing
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			fixture := newCloudTransferFixture(t, models.MediaLibraryTransferCopy, models.MediaLibraryConflictRename, false)
-			if result := fixture.run(t); result.ErrorCode != "" {
+			if result := runCompletedDeletionTransfer(t, fixture); result.ErrorCode != "" {
 				t.Fatalf("transfer=%+v", result)
 			}
 			var transfer models.TransferTask
@@ -654,7 +665,7 @@ func TestTransferDeletionPan115ProviderFailuresDoNotConvergeAsMissing(t *testing
 
 func TestTransferDeletionHonorsCallerDeadline(t *testing.T) {
 	fixture := newCloudTransferFixture(t, models.MediaLibraryTransferCopy, models.MediaLibraryConflictRename, false)
-	if result := fixture.run(t); result.ErrorCode != "" {
+	if result := runCompletedDeletionTransfer(t, fixture); result.ErrorCode != "" {
 		t.Fatalf("transfer=%+v", result)
 	}
 	var transfer models.TransferTask

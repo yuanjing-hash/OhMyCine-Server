@@ -69,6 +69,7 @@ type uploadTransferFixture struct {
 func newUploadTransferFixture(t *testing.T, policy string, conflict bool) uploadTransferFixture {
 	t.Helper()
 	queue, actor, _ := queueFixture(t)
+	queue.SetClock(realClock{})
 	var profile models.MediaClassificationProfile
 	if err := queue.db.Where("code = ?", "default-v1").First(&profile).Error; err != nil {
 		t.Fatal(err)

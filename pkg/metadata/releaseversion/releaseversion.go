@@ -7,8 +7,8 @@ import (
 )
 
 const (
-	tokenStart = `(?:^|[. _\-\[\](){}])`
-	tokenEnd   = `(?:$|[. _\-\[\](){}])`
+	tokenStart = `(?:^|[. _\-\[\](){}【】（）])`
+	tokenEnd   = `(?:$|[. _\-\[\](){}【】（）])`
 )
 
 type labeledPattern struct {
@@ -61,6 +61,34 @@ var (
 		{label: "HDR", pattern: token(`hdr`)},
 	}
 	dolbyVisionPattern = token(`dovi|dolby[. _-]+vision|dv`)
+	videoPatterns      = []labeledPattern{
+		{label: "H265", pattern: token(`(?:h[. _-]?265|x265|hevc)`)},
+		{label: "H264", pattern: token(`(?:h[. _-]?264|x264|avc)`)},
+		{label: "AV1", pattern: token(`av1`)},
+		{label: "VP9", pattern: token(`vp9`)},
+		{label: "MPEG2", pattern: token(`mpeg[. _-]?2`)},
+	}
+	depthPatterns = []labeledPattern{
+		{label: "12bit", pattern: token(`12[. _-]?bit`)},
+		{label: "10bit", pattern: token(`10[. _-]?bit`)},
+		{label: "8bit", pattern: token(`8[. _-]?bit`)},
+	}
+	audioPatterns = []labeledPattern{
+		{label: "DTS-HD MA", pattern: token(`dts[. _-]?hd[. _-]?ma`)},
+		{label: "DTS-HD HRA", pattern: token(`dts[. _-]?hd[. _-]?hra`)},
+		{label: "DTS-X", pattern: token(`dts[. _-]?x`)},
+		{label: "DTS-HD", pattern: token(`dts[. _-]?hd`)},
+		{label: "TrueHD", pattern: token(`true[. _-]?hd(?:[. _-]?[257]\.[01])?`)},
+		{label: "DDP", pattern: token(`(?:ddp|dd\+|e[. _-]?ac[. _-]?3)(?:[. _-]?[257]\.[01])?`)},
+		{label: "AC3", pattern: token(`(?:ac[. _-]?3|dd)(?:[. _-]?[257]\.[01])?`)},
+		{label: "DTS", pattern: token(`dts(?:[. _-]?[257]\.[01])?`)},
+		{label: "AAC", pattern: token(`aac(?:[. _-]?[257]\.[01])?`)},
+		{label: "FLAC", pattern: token(`flac`)},
+		{label: "PCM", pattern: token(`l?pcm`)},
+		{label: "MP3", pattern: token(`mp3`)},
+	}
+	atmosPattern   = token(`atmos`)
+	channelPattern = regexp.MustCompile(`(?i)(?:^|[. _\-]|ddp|aac|truehd|dts|ac3)([257]\.[01])(?:$|[. _\-\[\](){}])`)
 )
 
 func token(expression string) *regexp.Regexp {
@@ -68,9 +96,9 @@ func token(expression string) *regexp.Regexp {
 }
 
 // Parse extracts a conservative, provider-neutral release version label from
-// a source filename. It intentionally ignores codecs, audio formats, release
-// groups and site adornments so the result is stable across downloaders and
-// cloud providers.
+// a source filename. Codecs and audio distinguish playable versions; release
+// groups and site adornments are not exported. Equal labels do NOT prove that
+// two physical files have identical content.
 func Parse(sourcePath string) string {
 	name := path.Base(strings.ReplaceAll(strings.TrimSpace(sourcePath), `\`, "/"))
 	name = strings.TrimSuffix(name, path.Ext(name))
@@ -87,6 +115,15 @@ func Parse(sourcePath string) string {
 	labels = appendMatches(labels, name, hdrPatterns, true)
 	if dolbyVisionPattern.MatchString(name) {
 		labels = appendUnique(labels, "Dolby Vision")
+	}
+	labels = appendMatches(labels, name, videoPatterns, true)
+	labels = appendMatches(labels, name, depthPatterns, true)
+	labels = appendMatches(labels, name, audioPatterns, true)
+	if channels := channelPattern.FindStringSubmatch(name); len(channels) > 1 {
+		labels = appendUnique(labels, channels[1])
+	}
+	if atmosPattern.MatchString(name) {
+		labels = appendUnique(labels, "Atmos")
 	}
 	return strings.Join(labels, " ")
 }

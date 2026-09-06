@@ -2,6 +2,7 @@ package services
 
 import (
 	"context"
+	"errors"
 	"path"
 	"sort"
 	"strconv"
@@ -23,7 +24,37 @@ type playerEpisodeKey struct {
 	episode int
 }
 
-func (s *MediaLibraryService) playerEpisodeMetadata(ctx context.Context, libraryID uint, workKey string, entries []models.MediaLibraryEntry) map[playerEpisodeKey]tmdb.EpisodeSnapshot {
+type playerEpisodeMetadataSource struct {
+	Recognition       models.MediaLibraryRecognition
+	Library           models.MediaLibrary
+	Storage           models.Storage
+	Profile           models.MediaClassificationProfile
+	Head              models.CatalogHead
+	SourceFingerprint string
+}
+
+func playerEpisodeMetadataSourceTx(tx *gorm.DB, reader *CatalogReader, libraryID uint, workKey string) (playerEpisodeMetadataSource, error) {
+	var source playerEpisodeMetadataSource
+	if err := tx.First(&source.Library, libraryID).Error; err != nil {
+		return source, err
+	}
+	if err := tx.First(&source.Storage, source.Library.StorageID).Error; err != nil {
+		return source, err
+	}
+	if err := tx.First(&source.Profile, source.Library.ProfileID).Error; err != nil {
+		return source, err
+	}
+	source.Head, _ = reader.Head(libraryID)
+	source.SourceFingerprint = mediaLibraryScanSourceFingerprint(source.Library, source.Storage, source.Profile)
+	err := reader.Recognitions().Joins("JOIN (?) AS media_library_entries ON media_library_entries.recognition_id=media_library_recognitions.id", reader.Entries()).Where("media_library_entries.library_id=? AND media_library_entries.work_key=?", libraryID, workKey).Order("media_library_recognitions.updated_at DESC,media_library_recognitions.id").First(&source.Recognition).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return source, nil
+	}
+	return source, err
+}
+
+func (s *MediaLibraryService) playerEpisodeMetadata(ctx context.Context, source playerEpisodeMetadataSource, entries []models.MediaLibraryEntry) map[playerEpisodeKey]tmdb.EpisodeSnapshot {
+	libraryID := source.Library.ID
 	wanted := make(map[playerEpisodeKey]struct{}, len(entries))
 	for _, entry := range entries {
 		season, episode := resolvedCatalogEpisodeFacts(entry)
@@ -40,15 +71,8 @@ func (s *MediaLibraryService) playerEpisodeMetadata(ctx context.Context, library
 		return map[playerEpisodeKey]tmdb.EpisodeSnapshot{}
 	}
 
-	var recognition models.MediaLibraryRecognition
-	err := s.db.WithContext(ctx).Table("media_library_recognitions").
-		Joins("JOIN media_library_entries ON media_library_entries.recognition_id = media_library_recognitions.id").
-		Where("media_library_entries.library_id = ? AND media_library_entries.work_key = ?", libraryID, workKey).
-		Order("media_library_recognitions.updated_at DESC").First(&recognition).Error
-	if err != nil {
-		if err != gorm.ErrRecordNotFound {
-			s.log.Warn().Uint("library_id", libraryID).Str("error_code", "player_episode_snapshot_read_failed").Msg("读取分集元数据快照失败")
-		}
+	recognition := source.Recognition
+	if recognition.ID == 0 {
 		return map[playerEpisodeKey]tmdb.EpisodeSnapshot{}
 	}
 	classificationMetadata, snapshot, err := decodeRecognitionMetadata(recognition.MetadataJSON)
@@ -61,10 +85,7 @@ func (s *MediaLibraryService) playerEpisodeMetadata(ctx context.Context, library
 		snapshot.MediaType = "tv"
 		snapshot.Title = recognition.Title
 	}
-	var library models.MediaLibrary
-	if err := s.db.WithContext(ctx).Select("id", "metadata_language").First(&library, libraryID).Error; err != nil {
-		return map[playerEpisodeKey]tmdb.EpisodeSnapshot{}
-	}
+	library := source.Library
 	metadataLanguage := strings.TrimSpace(library.MetadataLanguage)
 	if snapshot.EpisodeLanguage != metadataLanguage {
 		snapshot.EpisodeSnapshots = nil
@@ -182,14 +203,87 @@ func (s *MediaLibraryService) playerEpisodeMetadata(ctx context.Context, library
 	}
 	metadataJSON, marshalErr := marshalRecognitionMetadata(MediaRecognitionResult{Metadata: classificationMetadata, Snapshot: snapshot})
 	if marshalErr == nil {
-		update := s.db.WithContext(ctx).Model(&models.MediaLibraryRecognition{}).
-			Where("id = ? AND metadata_json = ?", recognition.ID, recognition.MetadataJSON).
-			UpdateColumn("metadata_json", metadataJSON)
-		if update.Error != nil {
+		if err := s.persistPlayerEpisodeMetadata(ctx, source, string(metadataJSON)); err != nil {
 			s.log.Warn().Uint("library_id", libraryID).Str("error_code", "player_episode_snapshot_write_failed").Msg("保存分集元数据快照失败")
 		}
 	}
 	return result
+}
+
+// Optional enrichment is fetched outside a read transaction. Its persistence
+// is still a catalog write: a versioned library gets one normalized recognition
+// delta, never an update to a legacy identity anchor or a sealed snapshot.
+func (s *MediaLibraryService) persistPlayerEpisodeMetadata(ctx context.Context, source playerEpisodeMetadataSource, metadataJSON string) error {
+	validate := func(tx *gorm.DB, reader *CatalogReader) error {
+		head, _ := reader.Head(source.Library.ID)
+		if source.Head.Mode == "versioned" {
+			if head.Mode != "versioned" || head.Revision != source.Head.Revision || head.SourceEpoch != source.Head.SourceEpoch || head.SourceFingerprint != source.Head.SourceFingerprint || head.ConfigFingerprint != source.Head.ConfigFingerprint {
+				return ErrCatalogFence
+			}
+		} else if head.Mode == "versioned" || head.Mode == "converting" {
+			return ErrCatalogFence
+		}
+		var library models.MediaLibrary
+		var storage models.Storage
+		var profile models.MediaClassificationProfile
+		if err := tx.First(&library, source.Library.ID).Error; err != nil {
+			return err
+		}
+		if err := tx.First(&storage, library.StorageID).Error; err != nil {
+			return err
+		}
+		if err := tx.First(&profile, library.ProfileID).Error; err != nil {
+			return err
+		}
+		if !library.Enabled || !storage.Enabled || library.ProfileID != source.Library.ProfileID || library.ProfileRevision != source.Library.ProfileRevision || profile.Revision != source.Profile.Revision || profile.RulesJSON != source.Profile.RulesJSON || mediaLibraryScanSourceFingerprint(library, storage, profile) != source.SourceFingerprint {
+			return ErrCatalogFence
+		}
+		var current models.MediaLibraryRecognition
+		if err := reader.Recognitions().Where("library_id=? AND id=?", library.ID, source.Recognition.ID).First(&current).Error; err != nil {
+			return err
+		}
+		if current.SourceKey != source.Recognition.SourceKey || current.LastGeneration != source.Recognition.LastGeneration || current.MetadataJSON != source.Recognition.MetadataJSON || current.ManualOverride != source.Recognition.ManualOverride || current.InputFingerprint != source.Recognition.InputFingerprint || current.ProfileID != source.Recognition.ProfileID || current.ProfileRevision != source.Recognition.ProfileRevision || !current.UpdatedAt.Equal(source.Recognition.UpdatedAt) {
+			return ErrCatalogFence
+		}
+		return nil
+	}
+	if source.Head.Mode != "versioned" {
+		return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			reader, err := PinCatalogTx(tx, []uint{source.Library.ID})
+			if err != nil {
+				return err
+			}
+			if err := validate(tx, reader); err != nil {
+				return err
+			}
+			update := tx.Model(&models.MediaLibraryRecognition{}).Where("id=? AND library_id=? AND metadata_json=?", source.Recognition.ID, source.Library.ID, source.Recognition.MetadataJSON).UpdateColumn("metadata_json", metadataJSON)
+			if update.Error != nil {
+				return update.Error
+			}
+			if update.RowsAffected != 1 {
+				return ErrCatalogFence
+			}
+			return nil
+		})
+	}
+	next := source.Recognition
+	next.MetadataJSON = metadataJSON
+	var change models.MediaLibraryChange
+	err := s.publishCatalogRecognitionDelta(ctx, source.Head, []models.MediaLibraryRecognition{next}, validate, func(tx *gorm.DB) error {
+		if s.changes != nil {
+			var err error
+			change, err = s.changes.RecordTx(tx, source.Library.ID, source.Library.BaselineGeneration, models.MediaLibraryChangeMetadata, true)
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if s.changes != nil && change.Revision > 0 {
+		s.changes.NotifyCommitted(change.LibraryID, change.Revision)
+	}
+	return nil
 }
 
 func episodeMetadataForWanted(values []tmdb.EpisodeSnapshot, wanted map[playerEpisodeKey]struct{}) map[playerEpisodeKey]tmdb.EpisodeSnapshot {

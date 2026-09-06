@@ -2,10 +2,11 @@
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { api } from '@/api/client'
+import UserMediaManager from '@/components/UserMediaManager.vue'
 import { mediaCatalogEndpoint, mediaCatalogOpenTargets, mediaCatalogPageCount, mediaCatalogPageSizes, type MediaCatalogPageSize, type MediaCatalogTypeFilter } from '@/media-catalog'
 import {
-  emptyUserMediaOverview, historyProgress, normalizeUserCollections, normalizeUserHistoryPage,
-  normalizeUserMediaItems, normalizeUserMediaOverview, userMediaEndpoints,
+  emptyUserMediaOverview, historyProgress, normalizeUserHistoryPage,
+  normalizeUserMediaOverview, userMediaEndpoints,
   type UserCollectionSummary, type UserHistoryItem, type UserHistoryPage, type UserMediaItem,
   type UserMediaLibrarySummary, type UserMediaOverview,
 } from '@/user-media-overview'
@@ -21,10 +22,7 @@ const overviewLoaded = ref(false)
 const overviewError = ref('')
 const libraries = ref<UserMediaLibrarySummary[]>([])
 const history = ref<UserHistoryPage>({ list: [], total: 0, page: 1, page_size: 24, has_more: false })
-const favorites = ref<UserMediaItem[]>([])
-const collections = ref<UserCollectionSummary[]>([])
 const selectedCollection = ref<UserCollectionSummary | null>(null)
-const collectionItems = ref<UserMediaItem[]>([])
 const sectionLoading = ref(false)
 const sectionError = ref('')
 
@@ -47,7 +45,6 @@ let sectionGeneration = 0
 
 const categories = computed(() => result.value.categories ?? [])
 const pages = computed(() => mediaCatalogPageCount(result.value.total, pageSize.value))
-const visibleCollections = computed(() => collections.value.filter(item => item.source === (activeView.value === 'manual' ? 'manual' : 'tmdb')))
 
 async function loadOverview() {
   overviewController?.abort()
@@ -80,30 +77,11 @@ async function loadSection(mode: LibraryView, requestedPage = 1) {
   sectionLoading.value = true
   sectionError.value = ''
   selectedCollection.value = null
-  collectionItems.value = []
   try {
     if (mode === 'history') history.value = normalizeUserHistoryPage(await api<unknown>(userMediaEndpoints.history(requestedPage, 24), { signal: sectionController.signal }))
-    else if (mode === 'favorites') favorites.value = normalizeUserMediaItems(await api<unknown>(userMediaEndpoints.favorites, { signal: sectionController.signal }))
-    else if (mode === 'automatic' || mode === 'manual') collections.value = normalizeUserCollections(await api<unknown>(userMediaEndpoints.collections(), { signal: sectionController.signal }))
   } catch (reason) {
     if (reason instanceof DOMException && reason.name === 'AbortError') return
     if (generation === sectionGeneration) sectionError.value = message(reason, '内容加载失败')
-  } finally { if (generation === sectionGeneration) sectionLoading.value = false }
-}
-
-async function loadCollectionItems(item: UserCollectionSummary) {
-  const generation = ++sectionGeneration
-  sectionController?.abort()
-  sectionController = new AbortController()
-  selectedCollection.value = item
-  collectionItems.value = []
-  sectionLoading.value = true
-  sectionError.value = ''
-  try {
-    collectionItems.value = normalizeUserMediaItems(await api<unknown>(userMediaEndpoints.collectionItems(item.id), { signal: sectionController.signal }))
-  } catch (reason) {
-    if (reason instanceof DOMException && reason.name === 'AbortError') return
-    if (generation === sectionGeneration) sectionError.value = message(reason, '合集内容加载失败')
   } finally { if (generation === sectionGeneration) sectionLoading.value = false }
 }
 
@@ -127,16 +105,18 @@ async function loadCatalog() {
 
 function activate(mode: LibraryView) {
   activeView.value = mode
+  selectedCollection.value = null
+  sectionController?.abort(); ++sectionGeneration
   if (mode === 'overview') { if (!overviewLoaded.value) void loadOverview(); return }
   if (mode === 'catalog') { if (!catalogLoaded.value) void loadCatalog(); return }
-  void loadSection(mode)
+  if (mode === 'history') void loadSection(mode)
 }
 function openMedia(item: UserMediaItem) { void router.push({ name: 'library-catalog-detail', params: { libraryID: String(item.library_id), workID: item.work_id } }) }
 function openHistory(item: UserHistoryItem) {
   if (item.playable)
     void router.push({ name: 'library-catalog-detail', params: { libraryID: String(item.library_id), workID: item.work_id } })
 }
-function openOverviewCollection(item: UserCollectionSummary) { activeView.value = item.source === 'manual' ? 'manual' : 'automatic'; collections.value = [item]; void loadCollectionItems(item) }
+function openOverviewCollection(item: UserCollectionSummary) { selectedCollection.value = item; activeView.value = item.source === 'manual' ? 'manual' : 'automatic' }
 function openOverviewLibrary(item: UserMediaLibrarySummary) {
   const changed = selectedLibrary.value !== item.id
   activeView.value = 'catalog'
@@ -212,15 +192,7 @@ onUnmounted(() => { overviewController?.abort(); sectionController?.abort(); cat
       <template v-else><div v-if="history.list.length" class="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-5 2xl:grid-cols-7"><button v-for="item in history.list" :key="`${item.source_kind}:${item.library_id}:${item.work_id}:${item.subtitle || ''}`" class="discovery-poster" :class="{ 'cursor-default': !item.playable }" @click="openHistory(item)"><div class="discovery-poster__image"><img v-if="item.poster_url" :src="item.poster_url" :alt="`${item.title} 海报`" loading="lazy"><span v-else>暂无海报</span></div><strong :title="item.title">{{ item.title }}</strong><small>{{ item.subtitle || (item.completed ? '已看完' : '已观看') }}</small><small>{{ item.source_name }} · {{ formatDate(item.updated_at) }}</small><span class="history-progress" aria-hidden="true"><i :style="{ width: `${historyProgress(item)}%` }"></i></span></button></div><div v-else class="panel py-14 text-center text-muted">当前账号还没有同步播放历史。</div><footer v-if="history.total" class="panel flex flex-wrap items-center justify-between gap-3 py-3"><span class="text-sm text-muted">共 {{ history.total }} 条记录</span><div class="flex items-center gap-2"><button class="btn-secondary" :disabled="history.page <= 1" @click="loadSection('history', history.page - 1)">上一页</button><span class="text-sm">第 {{ history.page }} 页</span><button class="btn-secondary" :disabled="!history.has_more" @click="loadSection('history', history.page + 1)">下一页</button></div></footer></template>
     </template>
 
-    <template v-else-if="activeView === 'favorites'">
-      <div v-if="sectionLoading" class="panel py-14 text-center text-muted">正在读取收藏…</div><div v-else-if="sectionError" class="semantic-error p-4"><strong>收藏暂时不可用</strong><p class="mt-1 text-sm">{{ sectionError }}</p><button class="btn-secondary mt-3" @click="loadSection('favorites')">重试</button></div><div v-else-if="favorites.length" class="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-5 2xl:grid-cols-7"><button v-for="item in favorites" :key="`${item.library_id}:${item.work_id}`" class="discovery-poster" @click="openMedia(item)"><div class="discovery-poster__image"><img v-if="item.poster_url" :src="item.poster_url" :alt="`${item.title} 海报`" loading="lazy"><span v-else>暂无海报</span></div><strong :title="item.title">{{ item.title }}</strong><small>{{ item.kind === 'series' ? `${item.season_count} 季 · ${item.episode_count} 集` : item.release_year || '电影' }}</small></button></div><div v-else class="panel py-14 text-center text-muted">暂时没有收藏作品。</div>
-    </template>
-
-    <template v-else-if="activeView === 'automatic' || activeView === 'manual'">
-      <div v-if="sectionError" class="semantic-error p-4"><strong>合集暂时不可用</strong><p class="mt-1 text-sm">{{ sectionError }}</p><button class="btn-secondary mt-3" @click="loadSection(activeView)">重试</button></div><div v-else-if="sectionLoading" class="panel py-14 text-center text-muted">正在读取合集…</div>
-      <template v-else-if="selectedCollection"><header class="panel"><button class="btn-secondary mb-3" @click="loadSection(activeView)">返回合集</button><h2 class="m-0 text-xl">{{ selectedCollection.name }}</h2><p class="page-description mt-1">{{ selectedCollection.source === 'tmdb' ? 'TMDB 自动合集' : '我的合集' }} · {{ selectedCollection.item_count }} 部作品</p></header><div v-if="collectionItems.length" class="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-5 2xl:grid-cols-7"><button v-for="item in collectionItems" :key="`${item.library_id}:${item.work_id}`" class="discovery-poster" @click="openMedia(item)"><div class="discovery-poster__image"><img v-if="item.poster_url" :src="item.poster_url" :alt="`${item.title} 海报`" loading="lazy"><span v-else>暂无海报</span></div><strong :title="item.title">{{ item.title }}</strong><small>{{ item.release_year || (item.kind === 'series' ? '电视剧' : '电影') }}</small></button></div><div v-else class="panel py-14 text-center text-muted">这个合集里暂时没有可访问的在库作品。</div></template>
-      <div v-else-if="visibleCollections.length" class="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-5 2xl:grid-cols-7"><button v-for="item in visibleCollections" :key="item.id" class="discovery-poster" @click="loadCollectionItems(item)"><div class="discovery-poster__image"><img v-if="item.poster_url" :src="item.poster_url" :alt="`${item.name} 海报`" loading="lazy"><span v-else>暂无海报</span></div><strong :title="item.name">{{ item.name }}</strong><small>{{ item.item_count }} 部作品</small></button></div><div v-else class="panel py-14 text-center text-muted">{{ activeView === 'automatic' ? '当前没有可展示的自动合集。' : '暂时没有自建合集。' }}</div>
-    </template>
+    <UserMediaManager v-else-if="activeView === 'favorites' || activeView === 'automatic' || activeView === 'manual'" :key="activeView" :mode="activeView" :initial-collection="selectedCollection" @changed="overviewLoaded = false" />
 
     <template v-else>
       <nav class="panel flex gap-2 overflow-x-auto p-2" aria-label="选择媒体库"><button class="btn-secondary shrink-0" :class="{ tabActive: selectedLibrary == null }" @click="selectLibrary(null)">全部库</button><button v-for="library in libraries" :key="library.id" class="btn-secondary shrink-0" :class="{ tabActive: selectedLibrary === library.id }" @click="selectLibrary(library.id)">{{ library.name }}</button></nav>

@@ -60,7 +60,9 @@ try {
     if (-not $SkipGoQuality) {
         Push-Location $script:ServerDirectory
         try {
-            Write-Step 'Running Go tests'; Invoke-Checked $go @('test', './...') 'go test failed'
+            # The integration package owns hundreds of isolated database tests;
+            # this bounds the whole test package, not any production job lease.
+            Write-Step 'Running Go tests'; Invoke-Checked $go @('test', './...', '-timeout', '30m') 'go test failed'
             Write-Step 'Running Go vet'; Invoke-Checked $go @('vet', './...') 'go vet failed'
             $qualityBinary = Join-Path $script:WindowsRuntimeDirectory 'tests\quality\ohmycine-server.exe'
             New-Item -ItemType Directory -Force -Path ([IO.Path]::GetDirectoryName($qualityBinary)) | Out-Null

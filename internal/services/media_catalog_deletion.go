@@ -48,6 +48,7 @@ type MediaCatalogDeletionResult struct {
 
 type mediaCatalogDeletionSnapshot struct {
 	Version        int                        `json:"version"`
+	CatalogFence   *catalogDeletionFence      `json:"catalog_fence,omitempty"`
 	BoundaryDigest string                     `json:"boundary_digest"`
 	LibraryRootID  string                     `json:"library_root_id,omitempty"`
 	Items          []mediaCatalogDeletionItem `json:"items"`
@@ -77,11 +78,19 @@ func (s *MediaLibraryService) PreviewCatalogDeletion(ctx context.Context, actor 
 	if !actor.CanResource(authz.PermissionMediaLibrariesMediaDelete, models.AuthorizationResourceMediaLibrary, uintID(libraryID)) {
 		return MediaCatalogDeletionPreviewResult{}, appError(CodePermissionDenied, "无权删除媒体库作品源文件", nil)
 	}
-	library, storage, workKey, entries, err := s.catalogDeletionBoundary(libraryID, workToken)
+	workKey, err := decodeCatalogToken(workToken)
 	if err != nil {
 		return MediaCatalogDeletionPreviewResult{}, err
 	}
-	snapshot := mediaCatalogDeletionSnapshot{Version: 2, BoundaryDigest: catalogDeletionBoundaryDigest(library, storage), Items: make([]mediaCatalogDeletionItem, 0, len(entries))}
+	write, err := s.captureCatalogDeletion(ctx, libraryID, workKey, nil)
+	if err != nil {
+		return MediaCatalogDeletionPreviewResult{}, err
+	}
+	library, storage, entries := write.Library, write.Storage, write.Entries
+	if len(entries) == 0 {
+		return MediaCatalogDeletionPreviewResult{}, appError(CodeNotFound, "媒体作品不存在", nil)
+	}
+	snapshot := mediaCatalogDeletionSnapshot{Version: 3, CatalogFence: &write.Fence, BoundaryDigest: catalogDeletionBoundaryDigest(library, storage), Items: make([]mediaCatalogDeletionItem, 0, len(entries))}
 	missing := 0
 	switch storage.Type {
 	case models.StorageTypeLocal:
@@ -101,7 +110,7 @@ func (s *MediaLibraryService) PreviewCatalogDeletion(ctx context.Context, actor 
 				snapshot.Items = append(snapshot.Items, item)
 				continue
 			}
-			if statErr != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Size() != entry.Size || ensureSafeDirectoryPath(root, filepath.Dir(target), false) != nil {
+			if statErr != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Size() != entry.Size || (write.Head.Mode == "versioned" && !entry.ModifiedAt.IsZero() && !info.ModTime().Equal(entry.ModifiedAt)) || ensureSafeDirectoryPath(root, filepath.Dir(target), false) != nil {
 				return MediaCatalogDeletionPreviewResult{}, appError(CodeMediaCatalogDeletionChanged, "媒体文件已变化，请先重新扫描", statErr)
 			}
 			snapshot.Items = append(snapshot.Items, item)
@@ -145,7 +154,14 @@ func (s *MediaLibraryService) PreviewCatalogDeletion(ctx context.Context, actor 
 	stateRaw, _ := json.Marshal(mediaCatalogDeletionState{Version: 1, Completed: map[uint]bool{}})
 	preview := models.MediaCatalogDeletionPreview{ID: uuid.NewString(), TokenHash: tokenHash, ActorID: actor.User.ID, LibraryID: library.ID, WorkKey: workKey, EntryDigest: catalogDeletionDigest(entries), StorageType: storage.Type, SnapshotJSON: string(snapshotRaw), StateJSON: string(stateRaw), ExpiresAt: now.Add(mediaCatalogDeletionPreviewTTL), CreatedAt: now, UpdatedAt: now}
 	if err := s.db.Transaction(func(tx *gorm.DB) error {
-		if err := tx.Create(&preview).Error; err != nil {
+		reader, err := PinCatalogTx(tx, []uint{libraryID})
+		if err != nil {
+			return err
+		}
+		if err := validateCatalogDeletionTx(tx, reader, write, true); err != nil {
+			return err
+		}
+		if err := saveCatalogDeletionPreviewTx(tx, &preview, snapshot); err != nil {
 			return err
 		}
 		return s.audit.Record(tx, &actor.User.ID, "media_catalog.deletion_preview", "media_library", fmt.Sprint(library.ID), "success", map[string]any{"work_hash": catalogWorkHash(workKey), "files": len(entries), "storage_type": storage.Type}, request)
@@ -193,23 +209,39 @@ func (s *MediaLibraryService) ConfirmCatalogDeletion(ctx context.Context, actor 
 	}
 	var snapshot mediaCatalogDeletionSnapshot
 	var state mediaCatalogDeletionState
-	if json.Unmarshal([]byte(preview.SnapshotJSON), &snapshot) != nil || snapshot.Version != 2 || json.Unmarshal([]byte(preview.StateJSON), &state) != nil || state.Version != 1 {
+	if json.Unmarshal([]byte(preview.SnapshotJSON), &snapshot) != nil || (snapshot.Version != 2 && snapshot.Version != 3) || json.Unmarshal([]byte(preview.StateJSON), &state) != nil || state.Version != 1 {
 		return MediaCatalogDeletionResult{}, appError(CodeMediaCatalogDeletionChanged, "删除预览损坏，请重新预览", nil)
 	}
 	if state.Completed == nil {
 		state.Completed = map[uint]bool{}
 	}
-	library, storage, _, entries, err := s.catalogDeletionBoundary(libraryID, workToken)
+	write, err := s.captureCatalogDeletion(ctx, libraryID, workKey, nil)
 	if err != nil {
 		return MediaCatalogDeletionResult{}, err
+	}
+	library, storage, entries := write.Library, write.Storage, write.Entries
+	if (snapshot.CatalogFence == nil && write.Head.Mode == "versioned") || (snapshot.Version == 3 && snapshot.CatalogFence == nil) || (snapshot.CatalogFence != nil && *snapshot.CatalogFence != write.Fence) {
+		return MediaCatalogDeletionResult{}, appError(CodeMediaCatalogDeletionChanged, "媒体目录已变化，请重新预览", nil)
 	}
 	if storage.Type != preview.StorageType || snapshot.BoundaryDigest != catalogDeletionBoundaryDigest(library, storage) || catalogDeletionDigest(entries) != preview.EntryDigest || !snapshotMatchesEntries(snapshot.Items, entries) {
 		return MediaCatalogDeletionResult{}, appError(CodeMediaCatalogDeletionChanged, "媒体作品或文件清单已变化，请重新预览", nil)
 	}
+	defer s.abandonCatalogDeletion(&write)
+	if err := s.prepareCatalogDeletion(ctx, &write); err != nil {
+		return MediaCatalogDeletionResult{}, catalogDeletionWriteError(err)
+	}
 	// Claim this execution with a short transaction. A stale request cannot run
 	// beside another confirm; a failed request clears the claim after its last
 	// durable checkpoint.
+	var physicalPermit CatalogPhysicalWritePermit
 	if err := s.db.Transaction(func(tx *gorm.DB) error {
+		reader, err := PinCatalogTx(tx, []uint{libraryID})
+		if err != nil {
+			return err
+		}
+		if err := validateCatalogDeletionTx(tx, reader, write, true); err != nil {
+			return err
+		}
 		var locked models.MediaCatalogDeletionPreview
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&locked, "id = ?", preview.ID).Error; err != nil {
 			return err
@@ -221,10 +253,15 @@ func (s *MediaLibraryService) ConfirmCatalogDeletion(ctx context.Context, actor 
 		if locked.StartedAt != nil && locked.StartedAt.After(time.Now().UTC().Add(-transferDeletionTimeout)) {
 			return appError(CodeConflict, "删除任务正在执行", nil)
 		}
-		return tx.Model(&locked).Updates(map[string]any{"started_at": now, "updated_at": now}).Error
+		if err := tx.Model(&locked).Updates(map[string]any{"started_at": now, "updated_at": now}).Error; err != nil {
+			return err
+		}
+		physicalPermit, err = EnterCatalogPhysicalWriteTx(tx, CatalogPhysicalWriteInput{LibraryID: libraryID, OwnerKind: CatalogPhysicalDeletion, OwnerID: locked.ID, ActorID: actor.User.ID, ClaimAt: now})
+		return err
 	}); err != nil {
 		return MediaCatalogDeletionResult{}, err
 	}
+	defer quiesceCatalogPhysicalWrite(s.db, physicalPermit, s.log)
 	fail := func(cause error) (MediaCatalogDeletionResult, error) {
 		raw, _ := json.Marshal(state)
 		_ = s.db.Model(&models.MediaCatalogDeletionPreview{}).Where("id = ?", preview.ID).Updates(map[string]any{"state_json": string(raw), "started_at": nil, "last_error_code": CodeMediaCatalogDeletionPartial, "updated_at": time.Now().UTC()}).Error
@@ -240,6 +277,9 @@ func (s *MediaLibraryService) ConfirmCatalogDeletion(ctx context.Context, actor 
 			if state.Completed[item.EntryID] {
 				continue
 			}
+			if err := s.validateCatalogDeletion(ctx, write, false); err != nil {
+				return fail(err)
+			}
 			target, resolveErr := catalogLocalDeletionTarget(root, item.RelativePath)
 			if resolveErr != nil {
 				return fail(resolveErr)
@@ -247,7 +287,7 @@ func (s *MediaLibraryService) ConfirmCatalogDeletion(ctx context.Context, actor 
 			info, statErr := os.Lstat(target)
 			if errors.Is(statErr, os.ErrNotExist) {
 				state.Missing++
-			} else if statErr != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Size() != item.Size || ensureSafeDirectoryPath(root, filepath.Dir(target), false) != nil {
+			} else if statErr != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Size() != item.Size || (write.Head.Mode == "versioned" && !item.ModifiedAt.IsZero() && !info.ModTime().Equal(item.ModifiedAt)) || ensureSafeDirectoryPath(root, filepath.Dir(target), false) != nil {
 				return fail(errors.New("local media file changed"))
 			} else if removeErr := os.Remove(target); removeErr != nil {
 				return fail(removeErr)
@@ -280,6 +320,9 @@ func (s *MediaLibraryService) ConfirmCatalogDeletion(ctx context.Context, actor 
 			if state.Completed[item.EntryID] {
 				continue
 			}
+			if err := s.validateCatalogDeletion(ctx, write, false); err != nil {
+				return fail(err)
+			}
 			current, statErr := providerItemWithinRoot(ctx, driver, item.ProviderItemID, root.ID)
 			if code, _ := cloudpkg.ErrorInfo(statErr); code == cloudpkg.CodeNotFound {
 				state.Missing++
@@ -299,14 +342,13 @@ func (s *MediaLibraryService) ConfirmCatalogDeletion(ctx context.Context, actor 
 	requiresArtifacts := mediaLibraryRequiresArtifacts(storage.Type, library, s.artifacts != nil)
 	var changeRevision, generation uint64
 	changeReady := false
-	if err := s.db.Transaction(func(tx *gorm.DB) error {
-		var current []models.MediaLibraryEntry
-		if err := tx.Where("library_id = ? AND work_key = ?", libraryID, workKey).Order("id").Find(&current).Error; err != nil {
-			return err
+	for _, item := range snapshot.Items {
+		if !state.Completed[item.EntryID] {
+			return fail(ErrCatalogInvalid)
 		}
-		if catalogDeletionDigest(current) != preview.EntryDigest {
-			return appError(CodeMediaCatalogDeletionChanged, "媒体作品或文件清单已变化，请重新预览", nil)
-		}
+	}
+	if err := s.commitCatalogDeletion(ctx, &write, func(tx *gorm.DB) error {
+		current := write.Entries
 		ids, paths, recognitionIDs := make([]uint, 0, len(current)), make([]string, 0, len(current)), make([]uint, 0)
 		for _, entry := range current {
 			ids = append(ids, entry.ID)
@@ -316,14 +358,19 @@ func (s *MediaLibraryService) ConfirmCatalogDeletion(ctx context.Context, actor 
 			}
 		}
 		if len(ids) > 0 {
-			if err := tx.Where("library_id = ? AND id IN ?", libraryID, ids).Delete(&models.MediaLibraryEntry{}).Error; err != nil {
-				return err
+			if write.Head.Mode != "versioned" {
+				if err := tx.Where("library_id = ? AND id IN ?", libraryID, ids).Delete(&models.MediaLibraryEntry{}).Error; err != nil {
+					return err
+				}
 			}
 			if err := tx.Model(&models.MediaManagedItem{}).Where("library_id = ? AND relative_path IN ? AND active = ?", libraryID, paths, true).Updates(map[string]any{"active": false, "updated_at": time.Now().UTC()}).Error; err != nil {
 				return err
 			}
 		}
 		for _, recognitionID := range recognitionIDs {
+			if write.Head.Mode == "versioned" {
+				break
+			}
 			var count int64
 			if err := tx.Model(&models.MediaLibraryEntry{}).Where("recognition_id = ?", recognitionID).Count(&count).Error; err != nil {
 				return err
@@ -334,7 +381,12 @@ func (s *MediaLibraryService) ConfirmCatalogDeletion(ctx context.Context, actor 
 				}
 			}
 		}
-		if err := tx.Model(&models.MediaLibrary{}).Where("id = ?", libraryID).Updates(map[string]any{"dirty_generation": gorm.Expr("dirty_generation + 1"), "artifact_generation": gorm.Expr("artifact_generation + 1")}).Error; err != nil {
+		generations := map[string]any{"dirty_generation": gorm.Expr("dirty_generation + 1"), "artifact_generation": gorm.Expr("artifact_generation + 1")}
+		if write.Head.Mode == "versioned" {
+			next := max(max(library.DirtyGeneration, library.ArtifactGeneration), library.BaselineGeneration) + 1
+			generations = map[string]any{"dirty_generation": next, "artifact_generation": next}
+		}
+		if err := tx.Model(&models.MediaLibrary{}).Where("id = ?", libraryID).Updates(generations).Error; err != nil {
 			return err
 		}
 		var updated models.MediaLibrary
@@ -342,7 +394,11 @@ func (s *MediaLibraryService) ConfirmCatalogDeletion(ctx context.Context, actor 
 			return err
 		}
 		generation = updated.ArtifactGeneration
-		if requiresArtifacts {
+		if requiresArtifacts && write.Head.Mode == "versioned" {
+			if _, err := s.artifacts.BindCatalogGenerationTx(tx, libraryID, generation); err != nil {
+				return err
+			}
+		} else if requiresArtifacts {
 			// A deletion generation is a complete projection of all remaining
 			// facts. Carry unchanged metadata and source assets forward so the
 			// artifact worker can remove only artifacts whose source disappeared.
@@ -368,6 +424,9 @@ func (s *MediaLibraryService) ConfirmCatalogDeletion(ctx context.Context, actor 
 		if err := tx.Model(&models.MediaCatalogDeletionPreview{}).Where("id = ?", preview.ID).Updates(map[string]any{"consumed_at": finished, "started_at": nil, "last_error_code": "", "updated_at": finished}).Error; err != nil {
 			return err
 		}
+		if err := SettleCatalogPhysicalWriteTx(tx, physicalPermit, nil); err != nil {
+			return err
+		}
 		return s.audit.Record(tx, &actor.User.ID, "media_catalog.deletion_confirm", "media_library", fmt.Sprint(libraryID), "success", map[string]any{"work_hash": catalogWorkHash(workKey), "files": len(ids), "removed": state.Removed, "missing": state.Missing, "storage_type": storage.Type}, request)
 	}); err != nil {
 		return fail(err)
@@ -376,36 +435,12 @@ func (s *MediaLibraryService) ConfirmCatalogDeletion(ctx context.Context, actor 
 		s.changes.NotifyCommitted(libraryID, changeRevision)
 	}
 	if requiresArtifacts && generation > 0 {
-		_ = s.artifacts.ScheduleGeneration(libraryID, generation)
+		if err := s.artifacts.ScheduleGeneration(libraryID, generation); err != nil {
+			s.log.Warn().Uint("library_id", libraryID).Str("error_code", "artifact_schedule_pending").Msg("删除已保存，媒体产物任务等待恢复调度")
+		}
 	}
 	s.wakeCatalogDeletionReconcile(libraryID)
 	return MediaCatalogDeletionResult{Deleted: true, RemovedFiles: state.Removed, MissingFiles: state.Missing}, nil
-}
-
-func (s *MediaLibraryService) catalogDeletionBoundary(libraryID uint, workToken string) (models.MediaLibrary, models.Storage, string, []models.MediaLibraryEntry, error) {
-	workKey, err := decodeCatalogToken(workToken)
-	if err != nil {
-		return models.MediaLibrary{}, models.Storage{}, "", nil, err
-	}
-	var library models.MediaLibrary
-	if err := s.db.First(&library, libraryID).Error; err != nil {
-		return library, models.Storage{}, "", nil, mediaLibraryNotFound(err)
-	}
-	var storage models.Storage
-	if err := s.db.First(&storage, library.StorageID).Error; err != nil {
-		return library, storage, "", nil, err
-	}
-	var entries []models.MediaLibraryEntry
-	if err := s.db.Where("library_id = ? AND work_key = ?", libraryID, workKey).Order("id").Limit(maxReorganizationItems + 1).Find(&entries).Error; err != nil {
-		return library, storage, "", nil, err
-	}
-	if len(entries) == 0 {
-		return library, storage, "", nil, appError(CodeNotFound, "媒体作品不存在", nil)
-	}
-	if len(entries) > maxReorganizationItems {
-		return library, storage, "", nil, appError(CodeMediaCatalogDeletionUnavailable, "作品文件过多，不能在单次安全删除中处理", nil)
-	}
-	return library, storage, workKey, entries, nil
 }
 
 func deletionItemFromEntry(entry models.MediaLibraryEntry) mediaCatalogDeletionItem {
@@ -470,6 +505,7 @@ func snapshotMatchesEntries(items []mediaCatalogDeletionItem, entries []models.M
 		if !ok || filepath.ToSlash(entry.RelativePath) != item.RelativePath || entry.ProviderID != item.ProviderItemID || entry.Size != item.Size || entry.ModifiedAt.UTC().UnixNano() != item.ModifiedAt.UTC().UnixNano() {
 			return false
 		}
+		delete(byID, item.EntryID)
 	}
 	return true
 }

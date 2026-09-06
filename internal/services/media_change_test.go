@@ -39,6 +39,12 @@ func TestMediaChangeReadyCommitAdvancesRevisionAndTargets(t *testing.T) {
 	if err := db.First(&library, library.ID).Error; err != nil || library.ContentRevision != 1 {
 		t.Fatalf("library revision=%d err=%v", library.ContentRevision, err)
 	}
+	if err := db.First(&target, target.ID).Error; err != nil || target.DesiredRevision != 0 {
+		t.Fatalf("publication fanned out targets inline: desired=%d err=%v", target.DesiredRevision, err)
+	}
+	if found, err := changes.DispatchBatch(context.Background()); err != nil || !found {
+		t.Fatalf("dispatch found=%v err=%v", found, err)
+	}
 	if err := db.First(&target, target.ID).Error; err != nil || target.DesiredRevision != 1 {
 		t.Fatalf("target desired=%d err=%v", target.DesiredRevision, err)
 	}
@@ -250,7 +256,7 @@ func TestMediaChangePendingWaitsForMatchingArtifactGeneration(t *testing.T) {
 		t.Fatal(err)
 	}
 	page, err := changes.ReadyAfter(0, 10)
-	if err != nil || len(page.Changes) != 1 || page.Changes[0].Sequence != pending.Sequence {
+	if err != nil || len(page.Changes) != 1 || page.Changes[0].Sequence <= pending.Sequence || page.Changes[0].Revision != pending.Revision {
 		t.Fatalf("page=%+v err=%v", page, err)
 	}
 }
@@ -277,7 +283,7 @@ func TestNewerCompleteArtifactGenerationCarriesLatestOlderPendingChange(t *testi
 		if err != nil {
 			return err
 		}
-		if len(ready) != 1 || ready[0].Sequence != latest.Sequence || ready[0].State != models.MediaLibraryChangeReady {
+		if len(ready) != 1 || ready[0].Sequence <= latest.Sequence || ready[0].Revision != latest.Revision || ready[0].State != models.MediaLibraryChangeReady {
 			t.Fatalf("carried ready=%+v latest=%+v", ready, latest)
 		}
 		return nil
@@ -285,6 +291,7 @@ func TestNewerCompleteArtifactGenerationCarriesLatestOlderPendingChange(t *testi
 		t.Fatal(err)
 	}
 	var obsoleteCount int64
+	drainPendingMediaChangeCleanup(t, changes)
 	if err := db.Model(&models.MediaLibraryChange{}).Where("sequence = ?", first.Sequence).Count(&obsoleteCount).Error; err != nil || obsoleteCount != 0 {
 		t.Fatalf("obsolete pending count=%d err=%v", obsoleteCount, err)
 	}
@@ -311,7 +318,7 @@ func TestMatchingArtifactGenerationSupersedesOlderPendingChange(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		if len(ready) != 1 || ready[0].Sequence != current.Sequence {
+		if len(ready) != 1 || ready[0].Sequence <= current.Sequence || ready[0].Revision != current.Revision {
 			t.Fatalf("ready=%+v current=%+v", ready, current)
 		}
 		return nil
@@ -319,6 +326,7 @@ func TestMatchingArtifactGenerationSupersedesOlderPendingChange(t *testing.T) {
 		t.Fatal(err)
 	}
 	var obsoleteCount int64
+	drainPendingMediaChangeCleanup(t, changes)
 	if err := db.Model(&models.MediaLibraryChange{}).Where("sequence = ?", old.Sequence).Count(&obsoleteCount).Error; err != nil || obsoleteCount != 0 {
 		t.Fatalf("obsolete pending count=%d err=%v", obsoleteCount, err)
 	}

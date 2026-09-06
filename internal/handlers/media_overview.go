@@ -42,6 +42,20 @@ func (a *API) MediaLibraryFavorites(c *gin.Context) {
 		return
 	}
 	actor, _ := middleware.ActorFrom(c)
+	if c.Query("page") != "" || c.Query("page_size") != "" {
+		page, size, err := historyPageParameters(c)
+		if err != nil {
+			writeError(c, a.log, err)
+			return
+		}
+		result, err := a.playerMediaState.FavoritePage(actor, page, size)
+		if err != nil {
+			writeError(c, a.log, err)
+			return
+		}
+		success(c, http.StatusOK, result)
+		return
+	}
 	items, err := a.playerMediaState.BrowserFavorites(actor)
 	if err != nil {
 		writeError(c, a.log, err)
@@ -56,6 +70,20 @@ func (a *API) MediaLibraryCollections(c *gin.Context) {
 		return
 	}
 	actor, _ := middleware.ActorFrom(c)
+	if c.Query("page") != "" || c.Query("page_size") != "" {
+		page, size, err := historyPageParameters(c)
+		if err != nil {
+			writeError(c, a.log, err)
+			return
+		}
+		result, err := a.playerMediaState.CollectionPage(actor, c.Query("kind"), c.Query("source"), page, size)
+		if err != nil {
+			writeError(c, a.log, err)
+			return
+		}
+		success(c, http.StatusOK, result)
+		return
+	}
 	items, err := a.playerMediaState.BrowserCollections(actor, c.Query("kind"))
 	if err != nil {
 		writeError(c, a.log, err)
@@ -70,12 +98,67 @@ func (a *API) MediaLibraryCollectionItems(c *gin.Context) {
 		return
 	}
 	actor, _ := middleware.ActorFrom(c)
+	if c.Query("page") != "" || c.Query("page_size") != "" {
+		page, size, err := historyPageParameters(c)
+		if err != nil {
+			writeError(c, a.log, err)
+			return
+		}
+		result, err := a.playerMediaState.CollectionItemPage(actor, c.Param("id"), page, size)
+		if err != nil {
+			writeError(c, a.log, err)
+			return
+		}
+		success(c, http.StatusOK, result)
+		return
+	}
 	items, err := a.playerMediaState.BrowserCollectionItems(actor, c.Param("id"))
 	if err != nil {
 		writeError(c, a.log, err)
 		return
 	}
 	success(c, http.StatusOK, gin.H{"list": items, "total": len(items)})
+}
+
+func (a *API) RenameMediaCollection(c *gin.Context) {
+	if a.playerMediaState == nil {
+		writeError(c, a.log, invalid("Server 暂不支持合集", nil))
+		return
+	}
+	var input struct {
+		Name     string `json:"name"`
+		Revision uint64 `json:"revision"`
+	}
+	if err := strictJSON(c, &input); err != nil {
+		writeError(c, a.log, invalid("合集参数无效", err))
+		return
+	}
+	if err := a.playerMediaState.RenameCollection(mustActor(c), c.Param("id"), input.Name, input.Revision); err != nil {
+		writeError(c, a.log, err)
+		return
+	}
+	success(c, http.StatusOK, gin.H{"updated": true})
+}
+
+func (a *API) MoveMediaCollectionItem(c *gin.Context) {
+	if a.playerMediaState == nil {
+		writeError(c, a.log, invalid("Server 暂不支持合集", nil))
+		return
+	}
+	var input struct {
+		ItemID   string `json:"item_id"`
+		BeforeID string `json:"before_item_id"`
+		Revision uint64 `json:"revision"`
+	}
+	if err := strictJSON(c, &input); err != nil {
+		writeError(c, a.log, invalid("合集排序参数无效", err))
+		return
+	}
+	if err := a.playerMediaState.MoveCollectionItem(mustActor(c), c.Param("id"), input.ItemID, input.BeforeID, input.Revision); err != nil {
+		writeError(c, a.log, err)
+		return
+	}
+	success(c, http.StatusOK, gin.H{"updated": true})
 }
 
 func historyPageParameters(c *gin.Context) (int, int, error) {

@@ -47,6 +47,10 @@ func TestLocalStructureBackendMovesCompanionsAndRemovesEmptyOldDirectories(t *te
 	if _, err := os.Stat(old); !os.IsNotExist(err) {
 		t.Fatalf("old directory still exists: %v", err)
 	}
+	// A crash after file moves and empty-directory cleanup must remain resumable.
+	if err := (localMediaLibraryStructureBackend{}).Apply(context.Background(), StructureBoundary{Library: models.MediaLibrary{RelativeRoot: "/"}, Storage: models.Storage{RootPath: root}}, items, nil); err != nil {
+		t.Fatalf("replay after source directory removal: %v", err)
+	}
 }
 
 type structureCloudDriver struct {

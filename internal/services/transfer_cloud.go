@@ -104,7 +104,7 @@ func cloudTransferError(code string, retryable bool, cause error) error {
 	return &cloudTransferFailure{code: code, retryable: retryable, cause: cause}
 }
 
-func (w *TransferWorker) runCloudTransfer(ctx context.Context, runtime JobRuntime, task models.TransferTask, download models.DownloadTask, manifest downloadpkg.Manifest, started time.Time) WorkerResult {
+func (w *TransferWorker) runCloudTransfer(ctx context.Context, runtime JobRuntime, job ClaimedJob, task models.TransferTask, download models.DownloadTask, manifest downloadpkg.Manifest, started time.Time) WorkerResult {
 	timings := cloudpkg.NewOperationTimingCollector()
 	ctx = cloudpkg.WithOperationTimingCollector(ctx, timings)
 	ctx = cloudpkg.WithReadClass(ctx, cloudpkg.ReadClassPipeline)
@@ -190,6 +190,11 @@ func (w *TransferWorker) runCloudTransfer(ctx context.Context, runtime JobRuntim
 	// Build the directory DAG before any move/copy. A season or title directory
 	// shared by many files is reconciled exactly once per attempt instead of
 	// paying a provider Stat/List round trip for every episode.
+	permit, err := enterCatalogPhysicalWrite(ctx, w.service.db, CatalogPhysicalWriteInput{LibraryID: task.LibraryID, OwnerKind: CatalogPhysicalTransfer, OwnerID: task.ID, Job: &job})
+	if err != nil {
+		return w.cloudFailure(task, cloudTransferError("transfer_write_admission_failed", true, err))
+	}
+	defer quiesceCatalogPhysicalWrite(w.service.db, permit, w.service.log)
 	validatedDirectories := map[string]struct{}{".": {}}
 	for _, directory := range uniqueCloudTargetDirectories(targets) {
 		if _, err := w.ensureCloudDirectory(ctx, mutations, &task, &state, directory, validatedDirectories); err != nil {
@@ -416,6 +421,9 @@ func (w *TransferWorker) runCloudTransfer(ctx context.Context, runtime JobRuntim
 			return err
 		}
 		if err := tx.Model(&task).Updates(map[string]any{"phase": models.TransferTaskStatusCompleted, "processed_files": len(targets), "last_error_code": "", "finished_at": now, "updated_at": now}).Error; err != nil {
+			return err
+		}
+		if err := SettleCatalogPhysicalWriteTx(tx, permit, &job); err != nil {
 			return err
 		}
 		return w.service.audit.Record(tx, &task.OwnerID, "transfer.complete", "transfer_task", task.ID, "success", map[string]any{"download_task_id": task.DownloadTaskID, "media_library_id": task.LibraryID, "mode": download.TransferMode, "files": len(targets), "provider": cloudpkg.ProviderPan115}, RequestContext{})

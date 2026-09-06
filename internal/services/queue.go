@@ -1,6 +1,7 @@
 package services
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -46,6 +47,11 @@ type QueueService struct {
 	interruptAcknowledged func(string, string) error
 	retryAccepted         func(*gorm.DB, models.Job, time.Time) error
 	events                *QueueEventHub
+	writeAdmission        *CatalogWriteAdmission
+}
+
+func (s *QueueService) SetWriteAdmission(admission *CatalogWriteAdmission) {
+	s.writeAdmission = admission
 }
 
 func (s *QueueService) SetInterrupt(fn func(string, string)) { s.interrupt = fn }
@@ -351,8 +357,9 @@ func (s *QueueService) canControl(actor Actor, ownerID *uint) bool {
 }
 
 func (s *QueueService) List(actor Actor, filter JobListFilter) (JobPage, error) {
-	if !actor.Can(authz.PermissionJobsReadAll) && !actor.Can(authz.PermissionJobsReadOwn) {
-		return JobPage{}, appError(CodePermissionDenied, "没有查看任务的权限", nil)
+	query, err := readableJobsQuery(s.db, actor)
+	if err != nil {
+		return JobPage{}, err
 	}
 	if filter.Page < 1 {
 		filter.Page = 1
@@ -362,10 +369,6 @@ func (s *QueueService) List(actor Actor, filter JobListFilter) (JobPage, error) 
 	}
 	if filter.PageSize > 200 {
 		filter.PageSize = 200
-	}
-	query := s.db.Model(&models.Job{})
-	if !actor.Can(authz.PermissionJobsReadAll) {
-		query = query.Where("owner_id = ?", actor.User.ID)
 	}
 	if filter.OwnerID != nil {
 		query = query.Where("owner_id = ?", *filter.OwnerID)
@@ -1059,7 +1062,7 @@ func (s *QueueService) renewLease(id, token string) (time.Duration, error) {
 func (s *QueueService) heartbeat(id, token string, progress *float64, processed, total *int64, speed *float64, eta *int64, publishProgress bool) (time.Duration, error) {
 	var published models.Job
 	var leaseDuration time.Duration
-	err := s.db.Transaction(func(tx *gorm.DB) error {
+	err := withForegroundTransaction(context.Background(), s.db, s.writeAdmission, func(tx *gorm.DB) error {
 		job, err := s.verifyLease(tx, id, token)
 		if err != nil {
 			return err

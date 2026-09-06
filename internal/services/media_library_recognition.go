@@ -35,33 +35,23 @@ func (s *MediaLibraryService) stabilizeExistingRecognitionUnits(ctx context.Cont
 		return units, nil
 	}
 	var entries []models.MediaLibraryEntry
-	if err := s.db.WithContext(ctx).Select("relative_path", "provider_id", "recognition_id").Where("library_id = ? AND recognition_id IS NOT NULL", libraryID).Find(&entries).Error; err != nil {
+	if err := s.db.WithContext(ctx).Select("id", "relative_path", "provider_id", "recognition_id", "size", "modified_at").Where("library_id = ? AND recognition_id IS NOT NULL", libraryID).Find(&entries).Error; err != nil {
 		return nil, err
 	}
 	if len(entries) == 0 {
 		return units, nil
 	}
-	byPath := make(map[string]uint, len(entries))
-	byProvider := make(map[string]uint, len(entries))
-	recognitionIDs := make([]uint, 0, len(entries))
-	seenRecognitionIDs := make(map[uint]struct{}, len(entries))
-	for _, entry := range entries {
-		if entry.RecognitionID == nil {
-			continue
-		}
-		byPath[entry.RelativePath] = *entry.RecognitionID
-		if entry.ProviderID != "" {
-			byProvider[entry.ProviderID] = *entry.RecognitionID
-		}
-		if _, seen := seenRecognitionIDs[*entry.RecognitionID]; !seen {
-			seenRecognitionIDs[*entry.RecognitionID] = struct{}{}
-			recognitionIDs = append(recognitionIDs, *entry.RecognitionID)
-		}
-	}
 	var records []models.MediaLibraryRecognition
-	if err := s.db.WithContext(ctx).Where("library_id = ? AND id IN ?", libraryID, recognitionIDs).Find(&records).Error; err != nil {
+	if err := s.db.WithContext(ctx).Where("library_id = ?", libraryID).Find(&records).Error; err != nil {
 		return nil, err
 	}
+	return stabilizeRecognitionUnits(units, entries, records), nil
+}
+
+// stabilizeRecognitionUnits examines already pinned facts, without further DB IO.
+func stabilizeRecognitionUnits(units []medialibrary.RecognitionUnit, entries []models.MediaLibraryEntry, records []models.MediaLibraryRecognition) []medialibrary.RecognitionUnit {
+	entriesIndex := indexExistingRecognitionEntries(entries)
+	units = partitionExistingManualRecognitionUnits(units, entriesIndex, records)
 	byID := make(map[uint]models.MediaLibraryRecognition, len(records))
 	for _, record := range records {
 		byID[record.ID] = record
@@ -71,12 +61,8 @@ func (s *MediaLibraryService) stabilizeExistingRecognitionUnits(ctx context.Cont
 	for index := range units {
 		ids := make(map[uint]struct{})
 		for _, file := range units[index].Files {
-			if id := byPath[file.RelativePath]; id != 0 {
+			if id := existingRecognitionEntryID(file, entriesIndex); id != 0 {
 				ids[id] = struct{}{}
-			} else if file.ProviderID != "" {
-				if id := byProvider[file.ProviderID]; id != 0 {
-					ids[id] = struct{}{}
-				}
 			}
 		}
 		if len(ids) == 1 {
@@ -95,7 +81,7 @@ func (s *MediaLibraryService) stabilizeExistingRecognitionUnits(ctx context.Cont
 		}
 		result[index].SourceKey = byID[id].SourceKey
 	}
-	return result, nil
+	return result
 }
 
 type recognitionMetadataEnvelope struct {
@@ -136,6 +122,14 @@ func (g *mediaRecognitionRateGate) Wait(ctx context.Context) error {
 }
 
 func (s *MediaLibraryService) recognizeLibraryUnits(ctx context.Context, library models.MediaLibrary, profile models.MediaClassificationProfile, units []medialibrary.RecognitionUnit) ([]mediaLibraryRecognizedUnit, error) {
+	var existing []models.MediaLibraryRecognition
+	if err := s.db.WithContext(ctx).Where("library_id = ?", library.ID).Find(&existing).Error; err != nil {
+		return nil, err
+	}
+	return s.recognizeLibraryUnitsWithExisting(ctx, library, profile, units, existing)
+}
+
+func (s *MediaLibraryService) recognizeLibraryUnitsWithExisting(ctx context.Context, library models.MediaLibrary, profile models.MediaClassificationProfile, units []medialibrary.RecognitionUnit, existing []models.MediaLibraryRecognition) ([]mediaLibraryRecognizedUnit, error) {
 	rules, err := classification.DecodeStrict([]byte(profile.RulesJSON))
 	if err != nil {
 		return nil, err
@@ -154,10 +148,6 @@ func (s *MediaLibraryService) recognizeLibraryUnits(ctx context.Context, library
 		if clientErr == nil {
 			lookup = client
 		}
-	}
-	var existing []models.MediaLibraryRecognition
-	if err := s.db.WithContext(ctx).Where("library_id = ?", library.ID).Find(&existing).Error; err != nil {
-		return nil, err
 	}
 	bySource := make(map[string]models.MediaLibraryRecognition, len(existing))
 	for _, record := range existing {

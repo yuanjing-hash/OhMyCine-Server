@@ -1,4 +1,4 @@
-import type { MediaLibraryDetail, MediaLibraryStatus, MediaLibraryWritePayload, StorageSummary } from '@/types/api'
+import type { MediaLibraryDeletionResult, MediaLibraryDetail, MediaLibraryStatus, MediaLibraryWritePayload, StorageSummary } from '@/types/api'
 import { api } from '@/api/client'
 
 export interface DefaultIngestLibrarySummary { connection_id: number; media_library_id: number; media_library_name: string }
@@ -125,5 +125,11 @@ const statusPresentation: Record<MediaLibraryStatus, { label: string; className:
   initialization_failed: { label: '初始化失败', className: 'status-chip status-chip--error' },
 }
 
-export function presentLibraryStatus(status: MediaLibraryStatus) { return statusPresentation[status] }
+export function presentLibraryStatus(status: MediaLibraryStatus, retirement?: MediaLibraryDetail['retirement']) { return retirement ? { label: retirement.error_code ? '移除需处理' : '正在移除索引', className: 'status-chip status-chip--warning' } : statusPresentation[status] }
 export function isActiveLibraryStatus(status: MediaLibraryStatus) { return ['initializing', 'attaching_listener', 'catch_up_reconciliation'].includes(status) }
+
+export function mediaLibraryDeletionNotice(result: MediaLibraryDeletionResult): string {
+  if (result.deleted === true) return '媒体库配置和索引已删除；来源媒体文件和播放历史未改变。'
+  if (result.deleted === false && result.status === 'deleting' && result.job_id) return '已提交媒体库索引移除任务；正在后台处理，尚未删除完成。来源文件和播放历史会保留。'
+  throw new Error('未收到明确的移除结果，请刷新媒体库状态后查看。')
+}

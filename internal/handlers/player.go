@@ -99,8 +99,17 @@ func (a *API) PlayerBootstrap(c *gin.Context) {
 		"server": gin.H{"name": "OhMyCine Server", "api_version": "v1"},
 		"user":   services.CurrentUserFromActor(actor), "device": playerDeviceDTO(device),
 		"media_library_count": mediaLibraryCount,
-		"capabilities":        playerCapabilities(actor), "emby_instances": embyInstances,
+		"capabilities":        a.playerCapabilitiesWithServices(actor), "emby_instances": embyInstances,
 	})
+}
+
+func (a *API) playerCapabilitiesWithServices(actor services.Actor) []string {
+	capabilities := playerCapabilities(actor)
+	if a.playerHistory != nil {
+		capabilities = append(capabilities, "history_artwork_upload_v1")
+	}
+	sort.Strings(capabilities)
+	return capabilities
 }
 
 func playerCapabilities(actor services.Actor) []string {
@@ -282,7 +291,7 @@ func (a *API) PlayerHistorySync(c *gin.Context) {
 		writeError(c, a.log, &services.AppError{Code: services.CodeInvalidRequest, Message: "Server 暂不支持播放历史同步"})
 		return
 	}
-	result, err := a.playerHistory.Sync(mustActor(c), payload.Cursor, payload.Changes)
+	result, err := a.playerHistory.SyncContext(c.Request.Context(), mustActor(c), payload.Cursor, payload.Changes)
 	if err != nil {
 		writeError(c, a.log, err)
 		return

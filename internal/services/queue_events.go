@@ -60,7 +60,19 @@ func (h *QueueEventHub) Publish(event JobEvent) {
 			if last := sub.lastProgress[event.JobID]; event.At.Sub(last) < time.Second {
 				continue
 			}
+			if len(sub.lastProgress) >= 512 {
+				for id, at := range sub.lastProgress {
+					if event.At.Sub(at) >= time.Second {
+						delete(sub.lastProgress, id)
+					}
+				}
+				if len(sub.lastProgress) >= 512 {
+					continue
+				}
+			}
 			sub.lastProgress[event.JobID] = event.At
+		} else {
+			delete(sub.lastProgress, event.JobID)
 		}
 		select {
 		case sub.ch <- event:
@@ -68,6 +80,10 @@ func (h *QueueEventHub) Publish(event JobEvent) {
 		}
 	}
 }
+
+// CanReceiveJobEvent repeats the hub policy with current database authority
+// immediately before an event leaves the HTTP/WebSocket boundary.
+func CanReceiveJobEvent(actor Actor, event JobEvent) bool { return canReceiveJobEvent(actor, event) }
 
 func canReceiveJobEvent(actor Actor, event JobEvent) bool {
 	if event.JobType == JobTypeFollowSearch {

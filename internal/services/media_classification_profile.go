@@ -292,6 +292,14 @@ func (s *MediaClassificationProfileService) Update(actor Actor, id uint, input U
 	nextRevision := input.Revision + 1
 	now := time.Now().UTC()
 	err = s.db.Transaction(func(tx *gorm.DB) error {
+		// Every accepted Profile update advances the rule revision, including
+		// a renamed profile, and therefore changes the catalog config fence.
+		if err := requireCatalogScopeNotRetiringTx(tx, "profile_id=?", id); err != nil {
+			return err
+		}
+		if err := assertCatalogPhysicalScopeDrainedTx(tx, "profile_id=?", id); err != nil {
+			return err
+		}
 		result := tx.Model(&models.MediaClassificationProfile{}).Where("id = ? AND revision = ? AND protected = 0", id, input.Revision).Updates(map[string]any{"name": name, "name_normalized": normalized, "rules_json": rulesJSON, "builtin_recognition_packs_json": organization.BuiltinRecognitionPacksJSON, "recognition_rules_json": organization.RecognitionRulesJSON, "movie_directory_template": organization.MovieDirectoryTemplate, "movie_filename_template": organization.MovieFilenameTemplate, "tv_directory_template": organization.TVDirectoryTemplate, "tv_filename_template": organization.TVFilenameTemplate, "schema_version": 1, "revision": nextRevision, "updated_at": now})
 		if result.Error != nil {
 			return result.Error

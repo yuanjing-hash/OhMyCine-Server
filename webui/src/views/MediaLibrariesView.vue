@@ -1,16 +1,19 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { RouterLink } from 'vue-router'
-import { api } from '@/api/client'
+import { api, APIError } from '@/api/client'
+import { createLatestRequest } from '@/latest-request'
 import { Permissions } from '@/auth/generated-permissions'
 import DirectoryPickerDialog from '@/components/DirectoryPickerDialog.vue'
 import MediaReorganizationDialog from '@/components/MediaReorganizationDialog.vue'
 import MediaLibrarySettingsFields from '@/components/MediaLibrarySettingsFields.vue'
-import { clearDefaultIngestLibrary, draftFromLibrary, emptyMediaLibraryDraft, isActiveLibraryStatus, isMediaLibraryDraftValid, mediaLibraryDraftFingerprint, mediaLibrarySourceDisplayPath, payloadFromDraft, presentLibraryStatus, setDefaultIngestLibrary, supportsSidecarUpload, supportsSTRM, type MediaLibraryDraft } from '@/media-libraries'
+import StructureRecognitionEditor from '@/components/StructureRecognitionEditor.vue'
+import StructurePreviewItems from '@/components/StructurePreviewItems.vue'
+import { clearDefaultIngestLibrary, draftFromLibrary, emptyMediaLibraryDraft, isActiveLibraryStatus, isMediaLibraryDraftValid, mediaLibraryDeletionNotice, mediaLibraryDraftFingerprint, mediaLibrarySourceDisplayPath, payloadFromDraft, presentLibraryStatus, setDefaultIngestLibrary, supportsSidecarUpload, supportsSTRM, type MediaLibraryDraft } from '@/media-libraries'
 import { mediaCatalogDetailEndpoint, mediaCatalogEndpoint, mediaCatalogPageCount, mediaCatalogPageSizes, mediaCatalogVisibleRange, type MediaCatalogMatchFilter, type MediaCatalogPageSize, type MediaCatalogTypeFilter } from '@/media-catalog'
 import { structureBulkConflictCodes, structureIssueActions, structureNeedsDecisionCount } from '@/media-library-structure'
 import { useAuthStore } from '@/stores/auth'
-import type { ListResponse, MediaCatalogDetail, MediaCatalogItem, MediaCatalogManagedTransfer, MediaClassificationProfileSummary, MediaLibraryDetail, MediaLibraryScanRun, MediaLibraryStructureBulkSelection, MediaLibraryStructureDiagnostics, MediaLibraryStructureIssue, MediaLibraryStructureIssuePage, MediaLibraryStructureIssueSummary, MediaLibraryStructureRepair, MediaLibraryStructureSelection, MediaLibraryStructureSelectionPreview, MediaRecognitionSummary, PageResponse, StorageSummary, TMDBCandidate } from '@/types/api'
+import type { ListResponse, MediaCatalogDetail, MediaCatalogItem, MediaCatalogManagedTransfer, MediaClassificationProfileSummary, MediaLibraryDeletionResult, MediaLibraryDetail, MediaLibraryScanRun, MediaLibraryStructureBulkSelection, MediaLibraryStructureDiagnostics, MediaLibraryStructureIssue, MediaLibraryStructureIssuePage, MediaLibraryStructureIssueSummary, MediaLibraryStructureRepair, MediaLibraryStructureSelection, MediaLibraryStructureSelectionPreview, MediaRecognitionSummary, PageResponse, StorageSummary, TMDBCandidate } from '@/types/api'
 
 type DetailTab = 'status' | 'runs' | 'entries' | 'settings'
 type PickerTarget = 'source' | 'strm'
@@ -59,6 +62,23 @@ const editBaseline = ref('')
 const editSaveFeedback = ref<{ state: 'idle' | 'saving' | 'success' | 'error'; message: string }>({ state: 'idle', message: '' })
 const draggedLibraryID = ref<number | null>(null)
 const structureOpen = ref(false)
+const structureDialog = ref<HTMLElement | null>(null)
+const structureStatusError = ref('')
+const structureSubmitUncertain = ref(false)
+const structureManualToken = ref('')
+const structureManualNotice = ref('')
+const structureManualSaved = ref<MediaRecognitionSummary | null>(null)
+const structureDraftNeedsValidation = ref(false)
+const structureDraftValidationLoading = ref(false)
+const structureDraftValidationError = ref('')
+const structureDraftValidationRequest = createLatestRequest()
+const structureStatusRequest = createLatestRequest()
+const structureIssuesRequest = createLatestRequest()
+const structurePreviewRequest = createLatestRequest()
+let structureSession = 0
+let structureFailures = 0
+let structureTrigger: HTMLElement | null = null
+let structureManualTrigger: HTMLElement | null = null
 const structureLoading = ref(false)
 const structureDiagnostics = ref<MediaLibraryStructureDiagnostics | null>(null)
 const structureIssueFilter = ref('all')
@@ -74,6 +94,7 @@ const structureBulkConflictAction = ref<'' | 'keep_recommended' | 'skip'>('')
 const structureSelectionLoading = ref(false)
 const structureSelectionError = ref('')
 const structureSelectionPreview = ref<MediaLibraryStructureSelectionPreview | null>(null)
+const structurePreviewReady = ref(false)
 const promptedStructureIDs = new Set<number>()
 let pollTimer: number | undefined
 let structurePollTimer: number | undefined
@@ -90,7 +111,7 @@ const editFingerprint = computed(() => editDraft.value ? mediaLibraryDraftFinger
 const editDirty = computed(() => Boolean(editDraft.value && editBaseline.value && editFingerprint.value !== editBaseline.value))
 const editFormValid = computed(() => Boolean(editDraft.value && isMediaLibraryDraftValid(editDraft.value, editStorage.value)))
 const selectedSourceDisplay = computed(() => selected.value ? mediaLibrarySourceDisplayPath(selected.value, storages.value.find(item => item.id === selected.value?.storage_id)) : '')
-const shouldPoll = computed(() => activeTab.value !== 'settings' && !editDirty.value && (libraries.value.some(item => isActiveLibraryStatus(item.status) || (item.enabled && (item.status === 'initialization_failed' || item.structure_status === 'pending' || item.structure_status === 'queued' || item.structure_status === 'running' || item.structure_status === 'repairing'))) || runs.value.some(run => run.status === 'running' || run.status === 'catalog_ready')))
+const shouldPoll = computed(() => libraries.value.some(item => item.retirement) || (activeTab.value !== 'settings' && !editDirty.value && (libraries.value.some(item => isActiveLibraryStatus(item.status) || (item.enabled && (item.status === 'initialization_failed' || item.structure_status === 'pending' || item.structure_status === 'queued' || item.structure_status === 'running' || item.structure_status === 'repairing'))) || runs.value.some(run => run.status === 'running' || run.status === 'catalog_ready'))))
 const catalogPages = computed(() => mediaCatalogPageCount(catalogTotal.value, catalogPageSize.value))
 const catalogRange = computed(() => mediaCatalogVisibleRange(catalogPage.value, catalogPageSize.value, catalogTotal.value))
 const structureAttentionCount = computed(() => structureNeedsDecisionCount(structureDiagnostics.value))
@@ -119,7 +140,7 @@ function structureIssueLabel(code: string) { return ({ media_unrecognized: '自�
 function structureIssueAction(issue: MediaLibraryStructureIssue) { if (issue.repairable) return '可生成安全整理预览'; return ({ media_unrecognized: '进入媒体清单手动识别', missing_season_episode: '无需处理，保持原文件', invalid_path: '在来源侧修正文件名后重新检查', template_unavailable: '调整分类与命名规则后重新检查', recognition_suspect_conflict: '先核对并修正作品识别；不要删除来源文件', catalog_duplicate_conflict: '先执行一次完整扫描；若仍存在再检查数据源重复事实', duplicate_target: '确认确为同一作品的多个版本后，再决定保留哪一份', sidecar_target_conflict: '请在来源侧改名或清理冲突的字幕、NFO、图片' } as Record<string,string>)[issue.code] ?? '检查来源文件后重新诊断' }
 function structureStatusLabel(status: MediaLibraryStructureDiagnostics['status']) { return ({ pending: '等待首次诊断', queued: '已进入后台队列', running: '后台诊断中', healthy: '目录结构健康', issues: '发现目录结构问题', repairing: '修复任务执行中', failed: '目录结构诊断系统失败' } as Record<string,string>)[status] ?? '状态待确认' }
 function structureIssueStateLabel(issue: MediaLibraryStructureIssueSummary) { return ({ manual_identity_resolved: '已人工识别 · 尚未整理文件', pending_repair: '待选择整理方式', unrecognized: '等待人工识别', needs_attention: '等待用户决定' } as Record<string,string>)[issue.state] ?? issue.state }
-function structureSelectionLabel(action: MediaLibraryStructureSelection['action']) { return ({ repair: '整理此项', keep_recommended: '保留推荐来源', keep_member: '保留指定来源', keep_all_versions: '全部保留为版本', skip: '本次跳过' } as Record<MediaLibraryStructureSelection['action'], string>)[action] }
+function structureSelectionLabel(action: MediaLibraryStructureSelection['action']) { return ({ repair: '整理此项', keep_recommended: '保留推荐来源', keep_member: '保留指定来源', keep_all_versions: '保留全部文件（自动区分重名）', skip: '本次跳过' } as Record<MediaLibraryStructureSelection['action'], string>)[action] }
 
 async function persistOrder(next: MediaLibraryDetail[]) {
   const previous = libraries.value
@@ -173,17 +194,17 @@ async function load(options: { quiet?: boolean; preferred?: number } = {}) {
     selectedID.value = libraries.value.some(item => item.id === preferred) ? preferred : libraries.value[0]?.id ?? null
     if (selected.value) await loadActivity(selected.value.id)
     const selectedLibrary = selected.value
-    if (selectedLibrary?.structure_status === 'issues' && !promptedStructureIDs.has(selectedLibrary.id)) {
+    if (!selectedLibrary?.retirement && selectedLibrary?.structure_status === 'issues' && !promptedStructureIDs.has(selectedLibrary.id)) {
       promptedStructureIDs.add(selectedLibrary.id)
       void viewStructureDiagnostics()
     }
-    schedulePoll()
   } catch (reason) {
     if (!options.quiet) error.value = message(reason)
-  } finally { refreshing.value = false; loading.value = false }
+  } finally { refreshing.value = false; loading.value = false; schedulePoll() }
 }
 
 async function loadActivity(id: number) {
+	if (libraries.value.find(item => item.id === id)?.retirement) { runsRequest?.abort(); runs.value = []; resetCatalog(); return }
 	await Promise.all([loadRuns(id), activeTab.value === 'entries' ? loadCatalog(id) : Promise.resolve()])
 }
 
@@ -442,9 +463,9 @@ async function retryNow() {
 }
 
 async function removeLibrary() {
-  if (!selected.value || !window.confirm(`确认删除媒体库“${selected.value.name}”？只会删除配置、索引和扫描记录，不会删除来源媒体文件。`)) return
+  if (!selected.value || selected.value.retirement || !window.confirm(`确认移除媒体库“${selected.value.name}”？只会删除配置、索引及此库失效的收藏和合集成员，不会删除来源媒体文件、播放历史、合集本体或其他库成员。大库会在后台分批处理。`)) return
   const id = selected.value.id
-  await run(async () => { await api(`/api/v1/media-libraries/${id}`, { method: 'DELETE', body: '{}' }); selectedID.value = null; notice.value = '媒体库配置和索引已删除；来源媒体文件未改变。'; await load() })
+  await run(async () => { const result = await api<MediaLibraryDeletionResult>(`/api/v1/media-libraries/${id}`, { method: 'DELETE', body: '{}' }); notice.value = mediaLibraryDeletionNotice(result); if (result.deleted) selectedID.value = null; await load(result.deleted ? {} : { preferred: id }) })
 }
 
 async function setAutoListenDefault() {
@@ -476,39 +497,58 @@ async function viewStructureDiagnostics() {
 
 async function showStructureDiagnostics(enqueue: boolean) {
   if (!selected.value) return
-  window.clearTimeout(structurePollTimer)
+  invalidateStructureRequests()
+  const session = structureSession
   const libraryID = selected.value.id
+  if (!structureOpen.value) structureTrigger = document.activeElement instanceof HTMLElement ? document.activeElement : null
   structureOpen.value = true; structureLoading.value = true; structureDiagnostics.value = null; structureIssueFilter.value = 'all'; structureIssuePage.value = 1; structureIssues.value = []; structureIssueTotal.value = 0; structureIssuesError.value = ''; structureSelectionDraft.value = {}; structureSelectionCodes.value = {}; structureBulkConflictAction.value = ''; structureSelectionPreview.value = null; structureSelectionError.value = ''
+  structureStatusError.value = ''; structureSubmitUncertain.value = false; structureFailures = 0; structureManualToken.value = ''; structureManualNotice.value = ''
+  structureDraftNeedsValidation.value = false; structureDraftValidationError.value = ''
+  structureManualSaved.value = null
+  void nextTick(() => { if (ownsStructure(session, libraryID)) structureDialog.value?.querySelector<HTMLElement>('button')?.focus() })
+  if (!enqueue) { await pollStructureDiagnostics(libraryID); return }
+  const request = structureStatusRequest.begin()
   try {
-    const diagnostics = enqueue
-      ? await api<MediaLibraryStructureDiagnostics>(`/api/v1/media-libraries/${libraryID}/structure/diagnose`, { method: 'POST', body: '{}' })
-      : await api<MediaLibraryStructureDiagnostics>(`/api/v1/media-libraries/${libraryID}/structure`)
+    const diagnostics = await api<MediaLibraryStructureDiagnostics>(`/api/v1/media-libraries/${libraryID}/structure/diagnose`, { method: 'POST', body: '{}', signal: request.signal })
+    if (!request.isCurrent() || !ownsStructure(session, libraryID)) return
     structureDiagnostics.value = diagnostics
-    if (diagnostics.status === 'queued' || diagnostics.status === 'running') structurePollTimer = window.setTimeout(() => void pollStructureDiagnostics(libraryID), 750)
-    else await loadStructureIssues(libraryID)
+    scheduleStructurePoll(libraryID)
+  } catch (reason) {
+    if (!request.isCurrent() || !ownsStructure(session, libraryID)) return
+    if (reason instanceof APIError && reason.status >= 400 && reason.status < 500) {
+      structureStatusError.value = `检测提交未被接受：${message(reason)}`
+    } else {
+      structureSubmitUncertain.value = true
+      structureStatusError.value = '提交结果暂未确认，正在只读核对后台状态；不会自动重复提交检测。'
+      scheduleStructurePoll(libraryID)
+    }
+  } finally {
+    if (request.isCurrent() && ownsStructure(session, libraryID)) structureLoading.value = false
+    request.finish()
   }
-  catch (reason) { error.value = message(reason); structureOpen.value = false }
-  finally { structureLoading.value = false }
 }
 
 async function loadStructureIssues(libraryID = selected.value?.id, resetPage = false) {
-  if (!libraryID) return
+  if (!libraryID || !structureOpen.value) return
+  const session = structureSession
+  const request = structureIssuesRequest.begin()
   if (resetPage) structureIssuePage.value = 1
   structureIssuesLoading.value = true
   structureIssuesError.value = ''
   try {
     const params = new URLSearchParams({ page: String(structureIssuePage.value), page_size: String(structureIssuePageSize.value), actionable: 'true' })
     if (structureIssueFilter.value !== 'all') params.set('code', structureIssueFilter.value)
-    const result = await api<MediaLibraryStructureIssuePage>(`/api/v1/media-libraries/${libraryID}/structure/issues?${params}`)
-    if (selected.value?.id !== libraryID) return
+    const result = await api<MediaLibraryStructureIssuePage>(`/api/v1/media-libraries/${libraryID}/structure/issues?${params}`, { signal: request.signal })
+    if (!request.isCurrent() || !ownsStructure(session, libraryID)) return
     structureIssues.value = result.list
     structureIssueTotal.value = result.total
     structureIssuePage.value = result.page
     structureIssuePageSize.value = result.page_size
   } catch (reason) {
-    structureIssuesError.value = message(reason)
+    if (request.isCurrent() && ownsStructure(session, libraryID)) structureIssuesError.value = message(reason)
   } finally {
-    structureIssuesLoading.value = false
+    if (request.isCurrent() && ownsStructure(session, libraryID)) structureIssuesLoading.value = false
+    request.finish()
   }
 }
 
@@ -526,22 +566,25 @@ async function changeStructureIssuePage(page: number) {
 function setStructureSelection(issue: MediaLibraryStructureIssueSummary, action: MediaLibraryStructureSelection['action'], memberToken = '') {
   if (!structureIssueActions(issue).includes(action)) return
   if (action === 'keep_member' && !issue.members.some(member => member.token === memberToken)) return
+  if (!structureSelectionDraft.value[issue.token] && structureSelectedCount.value >= 5000) { structureSelectionError.value = '单次草稿最多选择 5000 项，请分批预览处理。'; return }
   const next = { ...structureSelectionDraft.value }
   next[issue.token] = { issue_token: issue.token, action, ...(memberToken ? { member_token: memberToken } : {}) }
   structureSelectionDraft.value = next
   structureSelectionCodes.value = { ...structureSelectionCodes.value, [issue.token]: issue.code }
+  structurePreviewRequest.cancel(); structureSelectionLoading.value = false
   structureSelectionPreview.value = null
   structureSelectionError.value = ''
 }
 
 function setStructureBulkConflictAction(action: 'keep_recommended' | 'skip') {
+  structurePreviewRequest.cancel(); structureSelectionLoading.value = false
   structureBulkConflictAction.value = action
   structureSelectionPreview.value = null
   structureSelectionError.value = ''
 }
 
 async function previewStructureSelections(currentTypeOnly = false) {
-  if (!selected.value || !structureDiagnostics.value) return
+  if (!selected.value || !structureDiagnostics.value || structureDraftNeedsValidation.value) return
   const code = currentTypeOnly && structureIssueFilter.value !== 'all' ? structureIssueFilter.value : ''
   const selections = Object.values(structureSelectionDraft.value).filter(item => !code || structureSelectionCodes.value[item.issue_token] === code)
   const bulkActions: MediaLibraryStructureBulkSelection[] = []
@@ -555,23 +598,37 @@ async function previewStructureSelections(currentTypeOnly = false) {
   }
   structureSelectionLoading.value = true
   structureSelectionError.value = ''
+  const session = structureSession
+  const libraryID = selected.value.id
+  const request = structurePreviewRequest.begin()
   try {
-    structureSelectionPreview.value = await api<MediaLibraryStructureSelectionPreview>(`/api/v1/media-libraries/${selected.value.id}/structure/selection-preview`, { method: 'POST', body: JSON.stringify({ revision: structureDiagnostics.value.revision, selections, bulk_actions: bulkActions }) })
+    const preview = await api<MediaLibraryStructureSelectionPreview>(`/api/v1/media-libraries/${libraryID}/structure/selection-preview`, { method: 'POST', body: JSON.stringify({ revision: structureDiagnostics.value.revision, selections, bulk_actions: bulkActions }), signal: request.signal })
+    if (request.isCurrent() && ownsStructure(session, libraryID)) structureSelectionPreview.value = preview
   } catch (reason) {
+    if (!request.isCurrent() || !ownsStructure(session, libraryID)) return
     structureSelectionPreview.value = null
     structureSelectionError.value = message(reason)
   } finally {
-    structureSelectionLoading.value = false
+    if (request.isCurrent() && ownsStructure(session, libraryID)) structureSelectionLoading.value = false
+    request.finish()
   }
 }
 
 async function repairStructureSelections() {
-  if (!selected.value || !structureSelectionPreview.value) return
+  if (!selected.value || !structureSelectionPreview.value || !structurePreviewReady.value) return
   const preview = structureSelectionPreview.value
   if (!window.confirm(`确认执行 ${preview.move_count} 个整理动作，并将 ${preview.recycle_count} 个落选文件移入可恢复回收站？本次还会跳过 ${preview.skipped_count} 项。`)) return
   const id = selected.value.id
+  const session = structureSession
   await run(async () => {
-    const repair = await api<MediaLibraryStructureRepair>(`/api/v1/media-libraries/${id}/structure/selection-repair`, { method: 'POST', body: JSON.stringify({ confirmation_token: preview.confirmation_token }) })
+    let repair: MediaLibraryStructureRepair
+    try {
+      repair = await api<MediaLibraryStructureRepair>(`/api/v1/media-libraries/${id}/structure/selection-repair`, { method: 'POST', body: JSON.stringify({ confirmation_token: preview.confirmation_token }) })
+    } catch (reason) {
+      if (ownsStructure(session, id)) { structureSelectionError.value = `执行结果未确认，请先核对后台任务：${message(reason)}`; structureSelectionPreview.value = null }
+      return
+    }
+    if (!ownsStructure(session, id)) return
     notice.value = `已提交 ${repair.total_items} 个目录处理动作；完成后会自动重新扫描。`
     structureOpen.value = false
     structureDiagnostics.value = null
@@ -580,30 +637,106 @@ async function repairStructureSelections() {
   })
 }
 
-async function openUnrecognizedIssues() {
-  structureOpen.value = false
-  activeTab.value = 'entries'
-  catalogMatch.value = 'unrecognized'
-  catalogPage.value = 1
-  await loadCatalog()
+function openStructureRecognition(issue: MediaLibraryStructureIssueSummary) {
+  if (!issue.recognition_token) { structureIssuesError.value = '当前问题没有可直接定位的识别记录，请重新检查后再试；不会按标题猜测作品。'; return }
+  structureManualTrigger = document.activeElement instanceof HTMLElement ? document.activeElement : null
+  structureManualToken.value = issue.recognition_token
+  structureManualNotice.value = ''
 }
 
-async function openRecognitionReview() {
-  structureOpen.value = false
-  activeTab.value = 'entries'
-  catalogMatch.value = 'review'
-  catalogPage.value = 1
-  await loadCatalog()
+function returnFromStructureRecognition(saved?: MediaRecognitionSummary) {
+  structureManualToken.value = ''
+  void nextTick(() => structureManualTrigger?.focus())
+  if (saved && selectedID.value) {
+    structureManualSaved.value = saved
+    structureManualNotice.value = '作品身份已保存，文件尚未整理。正在核对已选草稿；分页和筛选保持不变。'
+    structurePreviewRequest.cancel()
+    structureSelectionLoading.value = false
+    structureSelectionPreview.value = null
+    structureDraftNeedsValidation.value = true
+    void validateStructureDraft()
+    void pollStructureDiagnostics(selectedID.value)
+  }
+}
+
+async function validateStructureDraft() {
+  const libraryID = selectedID.value
+  if (!libraryID || !structureOpen.value) return
+  const session = structureSession
+  const request = structureDraftValidationRequest.begin()
+  structureDraftValidationLoading.value = true; structureDraftValidationError.value = ''
+  try {
+    const result = await api<{ revision: string; invalid_issue_tokens: string[] }>(`/api/v1/media-libraries/${libraryID}/structure/selection-status`, { method: 'POST', body: JSON.stringify({ issue_tokens: Object.keys(structureSelectionDraft.value) }), signal: request.signal })
+    if (!request.isCurrent() || !ownsStructure(session, libraryID)) return
+    const draft = { ...structureSelectionDraft.value }, codes = { ...structureSelectionCodes.value }
+    let removed = 0
+    for (const token of result.invalid_issue_tokens) {
+      if (draft[token]) { delete draft[token]; delete codes[token]; removed++ }
+    }
+    structureSelectionDraft.value = draft; structureSelectionCodes.value = codes
+    structureDraftNeedsValidation.value = false
+    structureManualNotice.value = `作品身份已保存，文件尚未整理。分页、筛选和未受影响的草稿已保留；${removed ? `${removed} 项旧问题已变化，对应选择已清除，请为新结果重新选择。` : '已选问题仍然有效。'}执行前必须重新预览。`
+  } catch (reason) {
+    if (request.isCurrent() && ownsStructure(session, libraryID)) structureDraftValidationError.value = `身份已保存，但草稿核对暂未完成：${message(reason)}。重新核对只读取状态，不会再次保存识别或移动文件。`
+  } finally {
+    if (request.isCurrent() && ownsStructure(session, libraryID)) structureDraftValidationLoading.value = false
+    request.finish()
+  }
 }
 
 async function pollStructureDiagnostics(libraryID: number) {
-  if (!structureOpen.value || selected.value?.id !== libraryID) return
+  if (!structureOpen.value || selected.value?.id !== libraryID || document.hidden) return
+  window.clearTimeout(structurePollTimer)
+  const session = structureSession
+  const request = structureStatusRequest.begin()
   try {
-    const diagnostics = await api<MediaLibraryStructureDiagnostics>(`/api/v1/media-libraries/${libraryID}/structure`)
+    const diagnostics = await api<MediaLibraryStructureDiagnostics>(`/api/v1/media-libraries/${libraryID}/structure`, { signal: request.signal })
+    if (!request.isCurrent() || !ownsStructure(session, libraryID)) return
     structureDiagnostics.value = diagnostics
-    if (diagnostics.status === 'queued' || diagnostics.status === 'running') structurePollTimer = window.setTimeout(() => void pollStructureDiagnostics(libraryID), 750)
-    else { await loadStructureIssues(libraryID); await load({ quiet: true, preferred: libraryID }) }
-  } catch (reason) { error.value = message(reason) }
+    structureStatusError.value = ''; structureFailures = 0
+    if (diagnostics.status === 'queued' || diagnostics.status === 'running') {
+      structureSubmitUncertain.value = false
+      scheduleStructurePoll(libraryID)
+    } else {
+      if (structureSubmitUncertain.value) structureStatusError.value = '已读取现有诊断，但无法确认刚才的检测是否受理；没有重复提交。可核对结果后手动重新检查。'
+      await loadStructureIssues(libraryID)
+    }
+  } catch (reason) {
+    if (!request.isCurrent() || !ownsStructure(session, libraryID)) return
+    structureStatusError.value = `状态暂时读取失败，保留上次进度并自动重试：${message(reason)}`
+    structureFailures++
+    if (!(reason instanceof APIError && [401, 403, 404].includes(reason.status))) scheduleStructurePoll(libraryID, Math.min(15000, 750 * 2 ** Math.min(structureFailures, 5)))
+    else { structureDiagnostics.value = null; structureIssues.value = []; structureSelectionPreview.value = null; structureSelectionDraft.value = {}; structureSelectionCodes.value = {} }
+  } finally {
+    if (request.isCurrent() && ownsStructure(session, libraryID)) structureLoading.value = false
+    request.finish()
+  }
+}
+
+function ownsStructure(session: number, libraryID: number) { return structureSession === session && structureOpen.value && selectedID.value === libraryID }
+function scheduleStructurePoll(libraryID: number, delay = 750) {
+  window.clearTimeout(structurePollTimer)
+  if (!document.hidden && structureOpen.value) structurePollTimer = window.setTimeout(() => void pollStructureDiagnostics(libraryID), delay)
+}
+function invalidateStructureRequests() {
+  structureSession++; window.clearTimeout(structurePollTimer)
+  structureStatusRequest.cancel(); structureIssuesRequest.cancel(); structurePreviewRequest.cancel(); structureDraftValidationRequest.cancel()
+  structureLoading.value = false; structureIssuesLoading.value = false; structureSelectionLoading.value = false
+  structureDraftValidationLoading.value = false
+}
+function structureVisibilityChanged() {
+  if (document.hidden) invalidateStructureRequests()
+  else if (structureOpen.value && selectedID.value) { void pollStructureDiagnostics(selectedID.value); if (structureDraftNeedsValidation.value) void validateStructureDraft() }
+}
+function structureKeydown(event: KeyboardEvent) {
+  if (!structureOpen.value) return
+  if (event.key === 'Escape' && !saving.value) { event.preventDefault(); if (structureManualToken.value) returnFromStructureRecognition(); else structureOpen.value = false }
+  if (event.key !== 'Tab') return
+  const controls = Array.from(structureDialog.value?.querySelectorAll<HTMLElement>('button:not(:disabled),input:not(:disabled),select:not(:disabled),a[href]') ?? []).filter(item => !item.closest('[hidden]'))
+  const first = controls[0], last = controls.at(-1)
+  if (!first || !last) return
+  if (!structureDialog.value?.contains(document.activeElement) || (!event.shiftKey && document.activeElement === last)) { event.preventDefault(); first.focus() }
+  else if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus() }
 }
 
 async function repairStructure(workID: string) {
@@ -619,20 +752,28 @@ async function repairStructure(workID: string) {
 async function run(action: () => Promise<void>) { saving.value = true; error.value = ''; notice.value = ''; try { await action() } catch (reason) { error.value = message(reason) } finally { saving.value = false } }
 
 watch(selectedID, async id => {
+	structureOpen.value = false; invalidateStructureRequests(); structureManualToken.value = ''
 	runs.value = []; resetCatalog(); activeTab.value = 'status'
   editSaveFeedback.value = { state: 'idle', message: '' }
   if (id) { const library = libraries.value.find(item => item.id === id); if (library) replaceEditDraft(library); else clearEditDraft(); try { await loadActivity(id) } catch (reason) { error.value = message(reason) } }
   else clearEditDraft()
 })
 watch(selected, library => { if (library && !editDirty.value && !saving.value) replaceEditDraft(library) })
+watch(() => selected.value?.retirement, retirement => {
+  if (!retirement) return
+  structureOpen.value = false; invalidateStructureRequests(); structureManualToken.value = ''
+  pickerOpen.value = false; reorganizationTarget.value = null; runsRequest?.abort(); runs.value = []; resetCatalog(); activeTab.value = 'status'
+}, { flush: 'sync' })
 watch(editFingerprint, fingerprint => {
   if (fingerprint !== editBaseline.value && editSaveFeedback.value.state !== 'saving') editSaveFeedback.value = { state: 'idle', message: '' }
 })
-watch(activeTab, tab => { if (tab === 'entries' && selectedID.value) void loadCatalog(selectedID.value) })
+watch(activeTab, tab => { if (tab === 'entries' && selectedID.value && !selected.value?.retirement) void loadCatalog(selectedID.value) })
 watch(() => createDraft.value.storage_id, () => { resetSourceSelection(createDraft.value, createStorage.value); normalizeSTRM(createDraft.value, createStorage.value) })
 watch(() => editDraft.value?.storage_id, () => { if (editDraft.value && editDraft.value.storage_id !== selected.value?.storage_id) resetSourceSelection(editDraft.value, editStorage.value); if (editDraft.value) normalizeSTRM(editDraft.value, editStorage.value) })
-onMounted(() => void load())
-onBeforeUnmount(() => { window.clearTimeout(pollTimer); window.clearTimeout(structurePollTimer); runsRequest?.abort(); resetCatalog() })
+watch(structureOpen, open => { if (!open) { invalidateStructureRequests(); structureManualToken.value = ''; void nextTick(() => structureTrigger?.focus()) } }, { flush: 'sync' })
+watch(structureSelectionPreview, () => { structurePreviewReady.value = false }, { flush: 'sync' })
+onMounted(() => { void load(); document.addEventListener('visibilitychange', structureVisibilityChanged); window.addEventListener('keydown', structureKeydown) })
+onBeforeUnmount(() => { window.clearTimeout(pollTimer); invalidateStructureRequests(); runsRequest?.abort(); resetCatalog(); document.removeEventListener('visibilitychange', structureVisibilityChanged); window.removeEventListener('keydown', structureKeydown) })
 
 function replaceEditDraft(library: MediaLibraryDetail) {
   const draft = draftFromLibrary(library, storages.value.find(item => item.id === library.storage_id))
@@ -688,8 +829,8 @@ function clearEditDraft() {
         >
           <button class="btn-quiet shrink-0 cursor-grab px-2" type="button" aria-label="拖动媒体库排序" title="拖动排序">⋮⋮</button>
           <button type="button" class="min-w-0 flex-1 p-2 text-left" @click="selectedID = library.id">
-            <div class="flex items-center justify-between gap-3"><strong class="truncate">{{ library.name }}</strong><span :class="presentLibraryStatus(library.status).className">{{ presentLibraryStatus(library.status).label }}</span></div>
-            <div class="text-subtle mt-2 text-xs">第 {{ index + 1 }} 顺位 · {{ library.storage_name }} · {{ mediaLibrarySourceDisplayPath(library, storages.find(item => item.id === library.storage_id)) }}（相对根 {{ library.relative_root }}） · {{ library.entry_count }} 条目</div>
+            <div class="flex items-center justify-between gap-3"><strong class="truncate">{{ library.name }}</strong><span :class="presentLibraryStatus(library.status, library.retirement).className">{{ presentLibraryStatus(library.status, library.retirement).label }}</span></div>
+            <div class="text-subtle mt-2 text-xs">第 {{ index + 1 }} 顺位 · {{ library.storage_name }} · {{ mediaLibrarySourceDisplayPath(library, storages.find(item => item.id === library.storage_id)) }}（相对根 {{ library.relative_root }}） · {{ library.retirement ? '索引移除中' : `${library.entry_count} 条目` }}</div>
             <div class="text-subtle mt-1 text-xs">{{ library.transfer_mode === 'move' ? '移动' : library.transfer_mode === 'copy' ? '复制' : '软链接' }} · {{ library.profile_name }}</div>
             <div v-if="library.reclassification_due" class="semantic-warning-text mt-2 text-xs">分类规则已更新，待重分类</div>
           </button>
@@ -699,7 +840,13 @@ function clearEditDraft() {
           </div>
         </div>
       </aside>
-      <main v-if="selected" class="min-w-0">
+      <main v-if="selected?.retirement" class="panel min-w-0" aria-live="polite">
+        <h2 class="m-0">{{ selected.name }} · {{ selected.retirement.error_code ? '索引移除需要处理' : '正在移除索引' }}</h2>
+        <p>媒体库已停用，正在分批移除配置和索引，尚未完成。来源媒体、实际产物文件和全部播放历史保留；只清除此库失效的收藏和合集成员。</p>
+        <p v-if="selected.retirement.error_code" class="semantic-warning p-3">任务已暂停，已处理的批次会保留。请在任务中心检查原因并重试；不会重新启用已开始清理的媒体库。</p>
+        <RouterLink class="btn-secondary" :to="{ name: 'tasks', query: { job_id: selected.retirement.job_id } }">查看移除任务</RouterLink>
+      </main>
+      <main v-else-if="selected" class="min-w-0">
         <section class="panel">
           <div class="flex flex-wrap items-start justify-between gap-4"><div><div class="flex flex-wrap items-center gap-2"><h2 class="m-0">{{ selected.name }}</h2><span :class="presentLibraryStatus(selected.status).className">{{ presentLibraryStatus(selected.status).label }}</span></div><p class="text-subtle mb-0 mt-2 text-sm">{{ selected.storage_name }} · {{ selectedSourceDisplay }}（相对根 {{ selected.relative_root }}） · Profile {{ selected.profile_name }} r{{ selected.profile_revision }}</p></div><div class="flex flex-wrap gap-2"><button v-if="auth.can(Permissions.MediaLibrariesScan)" type="button" class="btn-secondary" :disabled="saving || structureLoading" @click="openStructureDiagnostics">检查目录结构</button><button v-if="selected.status === 'initialization_failed' && auth.can(Permissions.MediaLibrariesScan)" type="button" class="btn-primary" :disabled="saving" @click="retryNow">立即重试</button><button v-if="selected.enabled && selected.status !== 'initializing' && auth.can(Permissions.MediaLibrariesScan)" type="button" class="btn-secondary" :disabled="saving" @click="scanNow('incremental')">立即增量</button><button v-if="selected.enabled && selected.status !== 'initializing' && auth.can(Permissions.MediaLibrariesScan)" type="button" class="btn-secondary" :disabled="saving" @click="scanNow('full')">立即全量</button><button v-if="auth.can(Permissions.MediaLibrariesDelete)" type="button" class="btn-danger" :disabled="saving" @click="removeLibrary">删除配置</button></div></div>
           <p v-if="selected.status === 'initialization_failed'" class="semantic-error mt-4 p-3 text-sm">初始化失败：{{ selected.status_error_code || 'media_library_scan_failed' }}。失败库不会启动监听；下次自动重试：{{ dateTime(selected.next_retry_at) }}。</p>
@@ -788,59 +935,68 @@ function clearEditDraft() {
     <DirectoryPickerDialog :open="pickerOpen" :storage-id="pickerTarget === 'source' ? activeDraft?.storage_id : null" :restrict-to-storage="pickerTarget === 'source'" @close="pickerOpen = false" @select="directorySelected" />
     <MediaReorganizationDialog v-if="reorganizationTarget" :open="true" :transfer-task-id="reorganizationTarget.transfer.transfer_task_id" :download-task-id="reorganizationTarget.transfer.download_task_id" :display-name="reorganizationTarget.work.title" :current-title="reorganizationTarget.work.title" :current-media-type="reorganizationTarget.work.kind === 'movie' ? 'movie' : 'tv'" @close="reorganizationTarget = null" @queued="catalogReorganizationQueued" />
     <div v-if="structureOpen" class="fixed inset-0 z-80 grid place-items-center bg-black/65 p-4" @click.self="!saving && (structureOpen = false)">
-      <section class="panel max-h-[90vh] w-full max-w-6xl overflow-y-auto" role="dialog" aria-modal="true" aria-labelledby="structure-dialog-title">
+      <section ref="structureDialog" class="panel max-h-[90vh] w-full max-w-6xl overflow-y-auto" role="dialog" aria-modal="true" aria-labelledby="structure-dialog-title">
         <header class="flex items-start justify-between gap-4"><div><h2 id="structure-dialog-title" class="m-0 text-xl">目录诊断与整理</h2><p class="page-description mt-1 text-sm">诊断全程只读，不会移动文件。这里只显示需要决定或可以整理的问题；正常文件和缺集提示不会混进列表。任何移动或回收都要预览后再次确认。</p></div><button class="btn-secondary" type="button" :disabled="saving" @click="structureOpen = false">关闭</button></header>
-        <div v-if="structureLoading" class="py-12 text-center text-muted">正在安排后台目录结构诊断…</div>
-        <template v-else-if="structureDiagnostics">
-          <div class="semantic-inset mt-4 flex flex-wrap items-center justify-between gap-3 p-3 text-sm"><div><strong>{{ structureRecognitionInProgress ? '目录结构初步检查完成 · 等待识别结果' : structureStatusLabel(structureDiagnostics.status) }}</strong><span v-if="structureDiagnostics.status === 'queued' || structureDiagnostics.status === 'running'" class="text-subtle ml-2">{{ structureDiagnostics.processed_items }} / {{ structureDiagnostics.total_items }} 已检查</span><span v-if="structureDiagnostics.scan_run_id" class="text-subtle ml-2">扫描 #{{ structureDiagnostics.scan_run_id }} · Generation {{ structureDiagnostics.generation }}</span></div><button v-if="structureDiagnostics.status === 'healthy' || structureDiagnostics.status === 'issues'" type="button" class="btn-secondary" :disabled="saving || structureLoading" @click="openStructureDiagnostics">重新检查</button></div>
+        <StructureRecognitionEditor v-if="structureManualToken && selectedID" :library-id="selectedID" :recognition-token="structureManualToken" @close="returnFromStructureRecognition()" @saved="returnFromStructureRecognition($event)" />
+        <div :hidden="Boolean(structureManualToken)">
+          <p v-if="structureStatusError" class="semantic-warning mt-3 p-3 text-sm" role="status">{{ structureStatusError }} <button type="button" class="btn-secondary" @click="selectedID && pollStructureDiagnostics(selectedID)">只刷新状态</button></p>
+          <p v-if="structureManualNotice" class="semantic-success mt-3 p-3 text-sm" role="status">{{ structureManualNotice }}</p>
+          <section v-if="structureManualSaved" class="semantic-inset mt-3 p-3 text-sm" aria-label="刚保存的识别结果"><strong>刚保存的识别：{{ structureManualSaved.title }}</strong><span class="ml-2">{{ structureManualSaved.media_type === 'tv' ? '剧集' : '电影' }}<template v-if="structureManualSaved.release_year"> · {{ structureManualSaved.release_year }}</template><template v-if="structureManualSaved.tmdb_id"> · TMDB {{ structureManualSaved.tmdb_id }}</template></span><p class="mb-0 mt-1 text-xs">这是 Server 复验后保存的作品身份，文件尚未整理。该项可能已经转入目录命名或其他问题类型，因此不再出现在“未识别”筛选中。</p><button v-if="structureIssueFilter !== 'all'" class="btn-secondary mt-2" type="button" @click="setStructureIssueFilter('all')">查看全部问题</button></section>
+          <p v-if="structureDraftNeedsValidation" class="semantic-warning mt-3 p-3 text-sm" role="status">{{ structureDraftValidationError || '正在核对保存识别后哪些已选问题仍然有效；完成前不能生成执行预览。' }} <button class="btn-secondary" type="button" :disabled="structureDraftValidationLoading" @click="validateStructureDraft">{{ structureDraftValidationLoading ? '正在核对…' : '重新核对草稿' }}</button></p>
+          <div v-if="structureLoading && !structureDiagnostics" class="py-12 text-center text-muted">正在读取后台目录结构诊断…</div>
+          <template v-else-if="structureDiagnostics">
+            <div class="semantic-inset mt-4 flex flex-wrap items-center justify-between gap-3 p-3 text-sm"><div><strong>{{ structureRecognitionInProgress ? '目录结构初步检查完成 · 等待识别结果' : structureStatusLabel(structureDiagnostics.status) }}</strong><span v-if="structureDiagnostics.status === 'queued' || structureDiagnostics.status === 'running'" class="text-subtle ml-2">{{ structureDiagnostics.processed_items }} / {{ structureDiagnostics.total_items }} 已检查</span><span v-if="structureDiagnostics.scan_run_id" class="text-subtle ml-2">扫描 #{{ structureDiagnostics.scan_run_id }} · Generation {{ structureDiagnostics.generation }}</span></div><button v-if="structureDiagnostics.status === 'healthy' || structureDiagnostics.status === 'issues'" type="button" class="btn-secondary" :disabled="saving || structureLoading" @click="openStructureDiagnostics">重新检查</button></div>
 
-          <p v-if="structureRecognitionInProgress" class="semantic-inset mt-3 p-3 text-sm">后台元数据识别尚未完成；等待中的媒体不会计入“需要处理”，识别完成后会执行本次来源版本的收敛检查。</p>
+            <p v-if="structureRecognitionInProgress" class="semantic-inset mt-3 p-3 text-sm">后台元数据识别尚未完成；等待中的媒体不会计入“需要处理”，识别完成后会执行本次来源版本的收敛检查。</p>
 
-          <div class="mt-4 grid gap-3 sm:grid-cols-3">
-            <div class="semantic-inset p-3"><span class="text-subtle text-xs">可整理</span><strong class="mt-1 block">{{ structureDiagnostics.repairable_count }}</strong><small class="text-subtle">选择后生成安全预览</small></div>
-            <div class="semantic-inset p-3"><span class="text-subtle text-xs">需要决定</span><strong class="mt-1 block">{{ structureAttentionCount }}</strong><small class="text-subtle">识别失败、规则或目标冲突</small></div>
-            <div class="semantic-inset p-3"><span class="text-subtle text-xs">已检查</span><strong class="mt-1 block">{{ structureDiagnostics.processed_items }} / {{ structureDiagnostics.total_items }}</strong><small class="text-subtle">诊断没有移动文件</small></div>
-          </div>
+            <div class="mt-4 grid gap-3 sm:grid-cols-3">
+              <div class="semantic-inset p-3"><span class="text-subtle text-xs">可整理</span><strong class="mt-1 block">{{ structureDiagnostics.repairable_count }}</strong><small class="text-subtle">选择后生成安全预览</small></div>
+              <div class="semantic-inset p-3"><span class="text-subtle text-xs">需要决定</span><strong class="mt-1 block">{{ structureAttentionCount }}</strong><small class="text-subtle">识别失败、规则或目标冲突</small></div>
+              <div class="semantic-inset p-3"><span class="text-subtle text-xs">已检查</span><strong class="mt-1 block">{{ structureDiagnostics.processed_items }} / {{ structureDiagnostics.total_items }}</strong><small class="text-subtle">诊断没有移动文件</small></div>
+            </div>
 
-          <div v-if="structureDiagnostics.status === 'issues'" class="mt-4 flex flex-wrap items-center gap-2">
-            <button type="button" class="btn-secondary" @click="setStructureIssueFilter('all')">全部问题</button>
-            <button v-if="structureDiagnostics.classifications.unrecognized" type="button" class="btn-secondary" @click="openUnrecognizedIssues">识别失败或无匹配 {{ structureDiagnostics.classifications.unrecognized }} · 去手动整理</button>
-            <button v-if="structureDiagnostics.classifications.invalid_path" type="button" class="btn-secondary" @click="setStructureIssueFilter('invalid_path')">非法路径 {{ structureDiagnostics.classifications.invalid_path }}</button>
-            <RouterLink v-if="structureDiagnostics.classifications.template_unavailable" class="btn-secondary" to="/system/media-rules" @click="structureOpen = false">模板问题 {{ structureDiagnostics.classifications.template_unavailable }} · 去规则管理</RouterLink>
-            <button v-if="structureDiagnostics.classifications.duplicate_target" type="button" class="btn-secondary" @click="setStructureIssueFilter('duplicate_target')">视频目标冲突 {{ structureDiagnostics.classifications.duplicate_target }}</button>
-            <button v-if="structureDiagnostics.classifications.sidecar_target_conflict" type="button" class="btn-secondary" @click="setStructureIssueFilter('sidecar_target_conflict')">伴随文件冲突 {{ structureDiagnostics.classifications.sidecar_target_conflict }}</button>
-          </div>
+            <div v-if="structureDiagnostics.status === 'issues'" class="mt-4 flex flex-wrap items-center gap-2">
+              <button type="button" class="btn-secondary" @click="setStructureIssueFilter('all')">全部问题</button>
+              <button v-if="structureDiagnostics.classifications.unrecognized" type="button" class="btn-secondary" @click="setStructureIssueFilter('media_unrecognized')">识别失败或无匹配 {{ structureDiagnostics.classifications.unrecognized }}</button>
+              <button v-if="structureDiagnostics.classifications.invalid_path" type="button" class="btn-secondary" @click="setStructureIssueFilter('invalid_path')">非法路径 {{ structureDiagnostics.classifications.invalid_path }}</button>
+              <RouterLink v-if="structureDiagnostics.classifications.template_unavailable" class="btn-secondary" to="/system/media-rules" @click="structureOpen = false">模板问题 {{ structureDiagnostics.classifications.template_unavailable }} · 去规则管理</RouterLink>
+              <button v-if="structureDiagnostics.classifications.duplicate_target" type="button" class="btn-secondary" @click="setStructureIssueFilter('duplicate_target')">视频目标冲突 {{ structureDiagnostics.classifications.duplicate_target }}</button>
+              <button v-if="structureDiagnostics.classifications.sidecar_target_conflict" type="button" class="btn-secondary" @click="setStructureIssueFilter('sidecar_target_conflict')">伴随文件冲突 {{ structureDiagnostics.classifications.sidecar_target_conflict }}</button>
+            </div>
 
-          <div v-if="structureDiagnostics.status === 'issues' && auth.can(Permissions.MediaLibrariesScan)" class="semantic-success mt-4 p-3 text-sm">
-            <div class="flex flex-wrap items-center justify-between gap-3"><div><strong>处理草稿不会立即改文件</strong><p class="mb-0 mt-1 text-xs">跨页选择会一直保留；可以只预览并提交当前问题类型。</p></div><div class="flex flex-wrap gap-2"><button class="btn-secondary" type="button" @click="setStructureBulkConflictAction('keep_recommended')">真实文件冲突按推荐保留</button><button class="btn-secondary" type="button" @click="setStructureBulkConflictAction('skip')">全部冲突跳过</button></div></div>
-            <p v-if="structureBulkConflictAction" class="mb-0 mt-2 text-xs">跨页批量草稿：{{ structureBulkConflictAction === 'keep_recommended' ? '仅视频及伴随文件目标冲突按唯一推荐来源保留；识别冲突与目录事实重复不参与，无法唯一推荐的自动跳过' : '全部冲突跳过' }}。单项选择优先于批量草稿。</p>
-            <div class="mt-3 flex flex-wrap items-center gap-2"><button class="btn-secondary" type="button" :disabled="structureSelectionLoading || saving" @click="previewStructureSelections(false)">{{ structureSelectionLoading ? '正在生成预览…' : '预览全部已选操作' }}</button><button v-if="structureIssueFilter !== 'all'" class="btn-secondary" type="button" :disabled="structureSelectionLoading || saving" @click="previewStructureSelections(true)">只预览并提交当前类型</button><button v-if="structureSelectionPreview" class="btn-primary" type="button" :disabled="saving" @click="repairStructureSelections">确认执行预览</button></div>
-            <p v-if="structureSelectionPreview" class="mb-0 mt-3 text-xs">预览已冻结：{{ structureSelectionPreview.issue_count }} 项，{{ structureSelectionPreview.move_count }} 个整理动作，{{ structureSelectionPreview.recycle_count }} 个文件进入回收站，{{ structureSelectionPreview.skipped_count }} 项跳过。若目录或来源版本变化，Server 会拒绝执行。</p>
-          </div>
-          <p v-if="structureSelectionError" role="alert" class="semantic-error mt-3 p-3 text-sm">处理草稿预览失败：{{ structureSelectionError }}</p>
-          <p v-if="structureAttentionCount" class="semantic-warning mt-4 p-3 text-sm">冲突项不会自动执行。选择“保留推荐/指定来源”时，落选文件只会进入可恢复回收站或受管回收目录：115 使用网盘回收站并沿用该连接的定时清空配置，本地文件保留在媒体库内的受管回收目录；不支持可恢复回收的来源会被 Server 拒绝，绝不会永久删除。</p>
-          <p v-if="structureDiagnostics.status === 'failed'" class="semantic-error mt-4 p-3 text-sm">目录结构诊断发生系统错误。媒体目录仍然可用，并且没有移动任何文件。</p>
+            <div v-if="structureDiagnostics.status === 'issues' && auth.can(Permissions.MediaLibrariesScan)" class="semantic-success mt-4 p-3 text-sm">
+              <div class="flex flex-wrap items-center justify-between gap-3"><div><strong>处理草稿不会立即改文件</strong><p class="mb-0 mt-1 text-xs">跨页选择会一直保留；可以只预览并提交当前问题类型。</p></div><div class="flex flex-wrap gap-2"><button class="btn-secondary" type="button" @click="setStructureBulkConflictAction('keep_recommended')">真实文件冲突按推荐保留</button><button class="btn-secondary" type="button" @click="setStructureBulkConflictAction('skip')">全部冲突跳过</button></div></div>
+              <p v-if="structureBulkConflictAction" class="mb-0 mt-2 text-xs">跨页批量草稿：{{ structureBulkConflictAction === 'keep_recommended' ? '仅视频及伴随文件目标冲突按唯一推荐来源保留；识别冲突与目录事实重复不参与，无法唯一推荐的自动跳过' : '全部冲突跳过' }}。单项选择优先于批量草稿。</p>
+              <div class="mt-3 flex flex-wrap items-center gap-2"><button class="btn-secondary" type="button" :disabled="structureSelectionLoading || saving || structureDraftNeedsValidation" @click="previewStructureSelections(false)">{{ structureSelectionLoading ? '正在生成预览…' : '预览全部已选操作' }}</button><button v-if="structureIssueFilter !== 'all'" class="btn-secondary" type="button" :disabled="structureSelectionLoading || saving || structureDraftNeedsValidation" @click="previewStructureSelections(true)">只预览并提交当前类型</button><button v-if="structureSelectionPreview" class="btn-primary" type="button" :disabled="saving || !structurePreviewReady" @click="repairStructureSelections">确认执行预览</button></div>
+              <p v-if="structureSelectionPreview" class="mb-0 mt-3 text-xs">预览已冻结：{{ structureSelectionPreview.issue_count }} 项，{{ structureSelectionPreview.move_count }} 个整理动作，{{ structureSelectionPreview.recycle_count }} 个文件进入回收站，{{ structureSelectionPreview.skipped_count }} 项跳过。若目录或来源版本变化，Server 会拒绝执行。</p>
+            </div>
+            <p v-if="structureSelectionError" role="alert" class="semantic-error mt-3 p-3 text-sm">处理草稿预览失败：{{ structureSelectionError }}</p>
+            <StructurePreviewItems v-if="structureSelectionPreview && selectedID" :key="structureSelectionPreview.confirmation_token" :library-id="selectedID" :preview="structureSelectionPreview" @ready="structurePreviewReady = $event" />
+            <p v-if="structureAttentionCount" class="semantic-warning mt-4 p-3 text-sm">冲突项不会自动执行。选择“保留推荐/指定来源”时，落选文件只会进入可恢复回收站或受管回收目录：115 使用网盘回收站并沿用该连接的定时清空配置，本地文件保留在媒体库内的受管回收目录；不支持可恢复回收的来源会被 Server 拒绝，绝不会永久删除。</p>
+            <p v-if="structureDiagnostics.status === 'failed'" class="semantic-error mt-4 p-3 text-sm">目录结构诊断发生系统错误。媒体目录仍然可用，并且没有移动任何文件。</p>
 
-          <div v-if="structureDiagnostics.status === 'healthy' || structureDiagnostics.status === 'issues'" class="mt-4">
-            <div class="mb-2 flex flex-wrap items-center justify-between gap-2 text-xs"><div><strong>完整问题列表</strong><span class="text-subtle ml-2">{{ structureIssueTotal }} 项 · 已选择 {{ structureSelectedCount }} 项</span></div><label class="flex items-center gap-2">筛选<select class="input py-1" :value="structureIssueFilter" @change="setStructureIssueFilter(($event.target as HTMLSelectElement).value)"><option value="all">全部</option><option value="path_mismatch">目录命名</option><option value="cloud_transfer_root_misplaced">网盘根目录错位</option><option value="media_unrecognized">未识别</option><option value="recognition_suspect_conflict">识别冲突</option><option value="catalog_duplicate_conflict">目录事实重复</option><option value="duplicate_target">视频目标冲突</option><option value="sidecar_target_conflict">伴随文件冲突</option><option value="invalid_path">非法路径</option><option value="template_unavailable">模板问题</option></select></label></div>
-            <p v-if="structureIssuesError" role="alert" class="semantic-error p-3 text-sm">问题列表加载失败：{{ structureIssuesError }}</p>
-            <div class="max-h-[32rem] overflow-auto"><table class="semantic-table w-full text-left text-xs"><thead><tr><th>类型 / 状态</th><th>作品身份</th><th>问题</th><th>当前路径 / 冲突来源</th><th>期望路径</th><th>本次操作</th></tr></thead><tbody><tr v-for="issue in structureIssues" :key="issue.token"><td><div>{{ issue.kind === 'video' ? '视频' : '伴随文件' }}</div><small class="text-subtle">{{ structureIssueStateLabel(issue) }}</small></td><td><strong>{{ issue.title || '尚未识别' }}</strong><div v-if="issue.state === 'manual_identity_resolved'" class="mt-1 space-y-1"><span class="status-chip status-chip--ready">已人工识别</span><div>{{ issue.media_type === 'tv' ? '剧集' : '电影' }}<template v-if="issue.release_year"> · {{ issue.release_year }}</template><template v-if="issue.tmdb_id"> · TMDB {{ issue.tmdb_id }}</template></div><small v-if="issue.poster_path" class="text-subtle">已保存 TMDB 海报</small><small class="semantic-warning-text block">身份已保存，文件尚未整理</small></div></td><td>{{ structureIssueLabel(issue.code) }}</td><td class="min-w-64 break-all"><div v-if="issue.current_path" class="font-mono">{{ issue.current_path }}</div><div v-if="issue.members.length" class="semantic-inset mt-2 space-y-2 p-2"><strong class="font-sans">同一目标的全部来源（{{ issue.members.length }}）</strong><div v-for="member in issue.members" :key="member.token" class="flex items-center justify-between gap-2"><span class="font-mono">{{ member.source_path }}</span><button v-if="structureIssueActions(issue).includes('keep_member') && auth.can(Permissions.MediaLibrariesScan)" class="btn-secondary shrink-0" type="button" @click="setStructureSelection(issue, 'keep_member', member.token)">保留这一份</button><span v-if="member.recommended && structureIssueActions(issue).includes('keep_recommended')" class="status-chip status-chip--ready">推荐</span></div></div></td><td class="min-w-56 break-all font-mono">{{ issue.expected_path || '—' }}</td><td><div v-if="auth.can(Permissions.MediaLibrariesScan)" class="flex min-w-40 flex-col gap-2">
-              <button v-if="structureIssueActions(issue).includes('review_recognition')" type="button" class="btn-secondary" @click="openRecognitionReview">核对并修正识别</button>
-              <template v-if="structureIssueActions(issue).includes('rescan_catalog')">
-                <button type="button" class="btn-secondary" :disabled="saving || !selected?.enabled || selected?.status === 'initializing'" @click="scanNow('full')">完整扫描核对目录</button>
-                <small class="text-subtle">扫描完成后点“重新检查”更新目录事实；不会回收来源文件。</small>
-              </template>
-              <button v-if="structureIssueActions(issue).includes('keep_recommended')" class="btn-secondary" type="button" @click="setStructureSelection(issue, 'keep_recommended')">按推荐保留</button>
-              <button v-if="structureIssueActions(issue).includes('keep_all_versions')" class="btn-secondary" type="button" @click="setStructureSelection(issue, 'keep_all_versions')">全部保留为版本</button>
-              <button v-if="structureIssueActions(issue).includes('repair')" class="btn-secondary" type="button" @click="setStructureSelection(issue, 'repair')">选择整理</button>
-              <button v-if="structureIssueActions(issue).includes('manual_recognition')" type="button" class="btn-secondary" @click="openUnrecognizedIssues">去手动识别</button>
-              <RouterLink v-if="structureIssueActions(issue).includes('edit_rules')" class="btn-secondary" to="/system/media-rules" @click="structureOpen = false">去规则管理</RouterLink>
-              <button v-if="structureIssueActions(issue).includes('skip')" class="btn-secondary" type="button" @click="setStructureSelection(issue, 'skip')">本次跳过</button>
-            </div><span v-else>{{ structureIssueAction(issue) }}</span><small v-if="structureSelectionDraft[issue.token]" class="semantic-success-text mt-2 block">已加入草稿：{{ structureSelectionLabel(structureSelectionDraft[issue.token]!.action) }}</small></td></tr><tr v-if="!structureIssuesLoading && structureIssues.length === 0"><td colspan="6" class="py-8 text-center text-muted">当前筛选没有需要处理的问题</td></tr><tr v-if="structureIssuesLoading"><td colspan="6" class="py-8 text-center text-muted">正在加载完整问题列表…</td></tr></tbody></table></div>
-            <footer class="mt-3 flex flex-wrap items-center justify-between gap-3 text-xs"><label>每页 <select v-model.number="structureIssuePageSize" class="input py-1" @change="loadStructureIssues(selected?.id, true)"><option :value="50">50</option><option :value="100">100</option><option :value="200">200</option></select> 项</label><div class="flex items-center gap-2"><button type="button" class="btn-secondary" :disabled="structureIssuesLoading || structureIssuePage <= 1" @click="changeStructureIssuePage(structureIssuePage - 1)">上一页</button><span>第 {{ structureIssuePage }} / {{ structureIssuePages }} 页</span><button type="button" class="btn-secondary" :disabled="structureIssuesLoading || structureIssuePage >= structureIssuePages" @click="changeStructureIssuePage(structureIssuePage + 1)">下一页</button></div></footer>
-          </div>
-          <footer class="semantic-divider mt-4 flex flex-wrap justify-end gap-3 border-t pt-4"><button class="btn-secondary" type="button" :disabled="saving" @click="structureOpen = false">关闭</button><button v-if="structureSelectionPreview && auth.can(Permissions.MediaLibrariesScan)" class="btn-primary" type="button" :disabled="saving" @click="repairStructureSelections">确认执行：整理 {{ structureSelectionPreview.move_count }} · 回收 {{ structureSelectionPreview.recycle_count }}</button></footer>
-        </template>
+            <div v-if="structureDiagnostics.status === 'healthy' || structureDiagnostics.status === 'issues'" class="mt-4">
+              <div class="mb-2 flex flex-wrap items-center justify-between gap-2 text-xs"><div><strong>完整问题列表</strong><span class="text-subtle ml-2">{{ structureIssueTotal }} 项 · 已选择 {{ structureSelectedCount }} 项</span></div><label class="flex items-center gap-2">筛选<select class="input py-1" :value="structureIssueFilter" @change="setStructureIssueFilter(($event.target as HTMLSelectElement).value)"><option value="all">全部</option><option value="path_mismatch">目录命名</option><option value="cloud_transfer_root_misplaced">网盘根目录错位</option><option value="media_unrecognized">未识别</option><option value="recognition_suspect_conflict">识别冲突</option><option value="catalog_duplicate_conflict">目录事实重复</option><option value="duplicate_target">视频目标冲突</option><option value="sidecar_target_conflict">伴随文件冲突</option><option value="invalid_path">非法路径</option><option value="template_unavailable">模板问题</option></select></label></div>
+              <p v-if="structureIssuesError" role="alert" class="semantic-error p-3 text-sm">问题列表加载失败：{{ structureIssuesError }} <button type="button" class="btn-secondary" :disabled="structureIssuesLoading" @click="loadStructureIssues()">重试读取列表</button></p>
+              <div class="max-h-[32rem] overflow-auto"><table class="semantic-table w-full text-left text-xs"><thead><tr><th>类型 / 状态</th><th>作品身份</th><th>问题</th><th>当前路径 / 冲突来源</th><th>期望路径</th><th>本次操作</th></tr></thead><tbody><tr v-for="issue in structureIssues" :key="issue.token"><td><div>{{ issue.kind === 'video' ? '视频' : '伴随文件' }}</div><small class="text-subtle">{{ structureIssueStateLabel(issue) }}</small></td><td><strong>{{ issue.title || '尚未识别' }}</strong><div v-if="issue.state === 'manual_identity_resolved'" class="mt-1 space-y-1"><span class="status-chip status-chip--ready">已人工识别</span><div>{{ issue.media_type === 'tv' ? '剧集' : '电影' }}<template v-if="issue.release_year"> · {{ issue.release_year }}</template><template v-if="issue.tmdb_id"> · TMDB {{ issue.tmdb_id }}</template></div><small v-if="issue.poster_path" class="text-subtle">已保存 TMDB 海报</small><small class="semantic-warning-text block">身份已保存，文件尚未整理</small></div></td><td>{{ structureIssueLabel(issue.code) }}</td><td class="min-w-64 break-all"><div v-if="issue.current_path" class="font-mono">{{ issue.current_path }}</div><div v-if="issue.members.length" class="semantic-inset mt-2 space-y-2 p-2"><strong class="font-sans">同一目标的全部来源（{{ issue.members.length }}）</strong><div v-for="member in issue.members" :key="member.token" class="flex items-center justify-between gap-2"><span class="font-mono">{{ member.source_path }}</span><button v-if="structureIssueActions(issue).includes('keep_member') && auth.can(Permissions.MediaLibrariesScan)" class="btn-secondary shrink-0" type="button" @click="setStructureSelection(issue, 'keep_member', member.token)">保留这一份</button><span v-if="member.recommended && structureIssueActions(issue).includes('keep_recommended')" class="status-chip status-chip--ready">推荐</span></div></div></td><td class="min-w-56 break-all font-mono">{{ issue.expected_path || '—' }}</td><td><div v-if="auth.can(Permissions.MediaLibrariesScan)" class="flex min-w-40 flex-col gap-2">
+                <button v-if="structureIssueActions(issue).includes('review_recognition')" type="button" class="btn-secondary" @click="openStructureRecognition(issue)">核对并修正识别</button>
+                <template v-if="structureIssueActions(issue).includes('rescan_catalog')">
+                  <button type="button" class="btn-secondary" :disabled="saving || !selected?.enabled || selected?.status === 'initializing'" @click="scanNow('full')">完整扫描核对目录</button>
+                  <small class="text-subtle">扫描完成后点“重新检查”更新目录事实；不会回收来源文件。</small>
+                </template>
+                <button v-if="structureIssueActions(issue).includes('keep_recommended')" class="btn-secondary" type="button" @click="setStructureSelection(issue, 'keep_recommended')">按推荐保留</button>
+                <button v-if="structureIssueActions(issue).includes('keep_all_versions')" class="btn-secondary" type="button" @click="setStructureSelection(issue, 'keep_all_versions')">保留全部文件（自动区分重名）</button>
+                <small v-if="structureIssueActions(issue).includes('keep_all_versions')" class="text-subtle">每份都保留，不回收文件；这不代表已证明编码或内容不同。先预览各文件最终名称，确认后才执行。</small>
+                <button v-if="structureIssueActions(issue).includes('repair')" class="btn-secondary" type="button" @click="setStructureSelection(issue, 'repair')">选择整理</button>
+                <button v-if="structureIssueActions(issue).includes('manual_recognition')" type="button" class="btn-secondary" @click="openStructureRecognition(issue)">手动识别此项</button>
+                <RouterLink v-if="structureIssueActions(issue).includes('edit_rules')" class="btn-secondary" to="/system/media-rules" @click="structureOpen = false">去规则管理</RouterLink>
+                <button v-if="structureIssueActions(issue).includes('skip')" class="btn-secondary" type="button" @click="setStructureSelection(issue, 'skip')">本次跳过</button>
+              </div><span v-else>{{ structureIssueAction(issue) }}</span><small v-if="structureSelectionDraft[issue.token]" class="semantic-success-text mt-2 block">已加入草稿：{{ structureSelectionLabel(structureSelectionDraft[issue.token]!.action) }}</small></td></tr><tr v-if="!structureIssuesLoading && structureIssues.length === 0"><td colspan="6" class="py-8 text-center text-muted">当前筛选没有需要处理的问题</td></tr><tr v-if="structureIssuesLoading"><td colspan="6" class="py-8 text-center text-muted">正在加载完整问题列表…</td></tr></tbody></table></div>
+              <footer class="mt-3 flex flex-wrap items-center justify-between gap-3 text-xs"><label>每页 <select v-model.number="structureIssuePageSize" class="input py-1" @change="loadStructureIssues(selected?.id, true)"><option :value="50">50</option><option :value="100">100</option><option :value="200">200</option></select> 项</label><div class="flex items-center gap-2"><button type="button" class="btn-secondary" :disabled="structureIssuesLoading || structureIssuePage <= 1" @click="changeStructureIssuePage(structureIssuePage - 1)">上一页</button><span>第 {{ structureIssuePage }} / {{ structureIssuePages }} 页</span><button type="button" class="btn-secondary" :disabled="structureIssuesLoading || structureIssuePage >= structureIssuePages" @click="changeStructureIssuePage(structureIssuePage + 1)">下一页</button></div></footer>
+            </div>
+            <footer class="semantic-divider mt-4 flex flex-wrap justify-end gap-3 border-t pt-4"><button class="btn-secondary" type="button" :disabled="saving" @click="structureOpen = false">关闭</button><button v-if="structureSelectionPreview && auth.can(Permissions.MediaLibrariesScan)" class="btn-primary" type="button" :disabled="saving || !structurePreviewReady" @click="repairStructureSelections">确认执行：整理 {{ structureSelectionPreview.move_count }} · 回收 {{ structureSelectionPreview.recycle_count }}</button></footer>
+          </template>
+        </div>
       </section>
     </div>
   </section>

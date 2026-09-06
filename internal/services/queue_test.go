@@ -667,6 +667,28 @@ func TestQueueEventHubScopesOwnersAndThrottlesProgress(t *testing.T) {
 	}
 }
 
+func TestQueueEventHubBoundsProgressMemoryAndDropsSlowConsumerEvents(t *testing.T) {
+	hub := NewQueueEventHub()
+	events, stop := hub.Subscribe(Actor{Permissions: map[string]struct{}{authz.PermissionJobsReadAll: {}}})
+	now := time.Now().UTC()
+	for i := 0; i < 10000; i++ {
+		hub.Publish(JobEvent{Type: "job.progress", JobID: fmt.Sprint(i), At: now})
+	}
+	if len(events) > 32 {
+		t.Fatal("unbounded event queue")
+	}
+	for _, sub := range hub.subscribers {
+		if len(sub.lastProgress) > 512 {
+			t.Fatal("unbounded progress state")
+		}
+	}
+	stop()
+	stop()
+	if len(hub.subscribers) != 0 {
+		t.Fatal("unsubscribe leaked state")
+	}
+}
+
 func TestQueueEventHubScopesFollowEventsToFollowReaders(t *testing.T) {
 	hub := NewQueueEventHub()
 	owner := Actor{User: models.User{ID: 1}, Permissions: map[string]struct{}{authz.PermissionFollowsReadOwn: {}}}

@@ -46,6 +46,7 @@ type BrowserHistoryPage struct {
 }
 
 type BrowserCollectionSummary struct {
+	Revision    uint64 `json:"revision"`
 	ID          string `json:"id"`
 	Name        string `json:"name"`
 	Kind        string `json:"kind"`
@@ -99,7 +100,8 @@ func browserMediaItems(items []PlayerMediaItem) []BrowserMediaItem {
 
 func browserCollection(item PlayerCollectionSummary) BrowserCollectionSummary {
 	return BrowserCollectionSummary{
-		ID: item.ID, Name: item.Name, Kind: item.Kind, Source: item.Source,
+		Revision: item.Revision,
+		ID:       item.ID, Name: item.Name, Kind: item.Kind, Source: item.Source,
 		ItemCount: item.ItemCount, PosterURL: item.PosterURL, BackdropURL: item.BackdropURL,
 	}
 }
@@ -136,6 +138,12 @@ func browserHistoryItem(item PlayerHistoryChange, libraries *MediaLibraryService
 		Duration: cloneHistoryFloat64(item.Duration), Completed: item.Completed, UpdatedAt: item.UpdatedAt,
 	}
 	if item.SourceKind != "server" {
+		if url := browserHistoryArtworkURL(item.PosterAssetID); url != "" {
+			result.PosterURL = url
+		}
+		if url := browserHistoryArtworkURL(item.BackdropAssetID); url != "" {
+			result.BackdropURL = url
+		}
 		return result, result.WorkID != ""
 	}
 	parsed, err := parseServerHistoryToken(item.ItemToken)

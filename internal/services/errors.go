@@ -4,6 +4,7 @@ import "errors"
 
 const (
 	CodeInvalidRequest                        = "INVALID_REQUEST"
+	CodeHistoryClockAhead                     = "history_clock_ahead"
 	CodeNotAuthenticated                      = "NOT_AUTHENTICATED"
 	CodePermissionDenied                      = "PERMISSION_DENIED"
 	CodeNotFound                              = "NOT_FOUND"

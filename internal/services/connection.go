@@ -27,13 +27,15 @@ import (
 )
 
 type ConnectionService struct {
-	db          *gorm.DB
-	audit       *AuditService
-	credentials *credential.Store
-	registry    *cloudpkg.Registry
-	log         zerolog.Logger
-	mu          sync.Mutex
-	drivers     map[uint]cloudpkg.Driver
+	db           *gorm.DB
+	catalogStore *CatalogSnapshotStore
+	changes      *MediaChangeService
+	audit        *AuditService
+	credentials  *credential.Store
+	registry     *cloudpkg.Registry
+	log          zerolog.Logger
+	mu           sync.Mutex
+	drivers      map[uint]cloudpkg.Driver
 }
 
 func NewConnectionService(db *gorm.DB, audit *AuditService, credentials *credential.Store, registry *cloudpkg.Registry, log zerolog.Logger) *ConnectionService {
@@ -281,6 +283,8 @@ func (s *ConnectionService) Update(actor Actor, id uint, input UpdateConnectionI
 	if input.Revision == 0 || input.Revision != record.Revision {
 		return ConnectionSummary{}, appError(CodeConflict, "连接配置已变化，请刷新后重试", nil)
 	}
+	previous := record
+	credentialChanged := false
 	if input.Name != nil {
 		name, normalized, err := normalizeConnectionName(*input.Name)
 		if err != nil {
@@ -325,11 +329,18 @@ func (s *ConnectionService) Update(actor Actor, id uint, input UpdateConnectionI
 		if err != nil {
 			return ConnectionSummary{}, connectionProviderError(err)
 		}
-		ciphertext, err := s.credentials.Encrypt(connectionPurpose(id, record.Provider), normalizedCookie)
+		oldCredential, err := s.credentials.Decrypt(connectionPurpose(id, record.Provider), previous.CredentialCiphertext)
 		if err != nil {
 			return ConnectionSummary{}, err
 		}
-		record.CredentialCiphertext = ciphertext
+		credentialChanged = oldCredential != normalizedCookie
+		if credentialChanged {
+			ciphertext, err := s.credentials.Encrypt(connectionPurpose(id, record.Provider), normalizedCookie)
+			if err != nil {
+				return ConnectionSummary{}, err
+			}
+			record.CredentialCiphertext = ciphertext
+		}
 	}
 	if input.APIKey != nil && strings.TrimSpace(*input.APIKey) != "" {
 		if !isMediaServerProvider(record.Provider) {
@@ -339,11 +350,18 @@ func (s *ConnectionService) Update(actor Actor, id uint, input UpdateConnectionI
 		if err != nil {
 			return ConnectionSummary{}, appError(CodeEmbyAPIKeyInvalid, "Emby API Key 无效", nil)
 		}
-		ciphertext, err := s.credentials.Encrypt(connectionPurpose(id, record.Provider), apiKey)
+		oldCredential, err := s.credentials.Decrypt(connectionPurpose(id, record.Provider), previous.CredentialCiphertext)
 		if err != nil {
 			return ConnectionSummary{}, err
 		}
-		record.CredentialCiphertext = ciphertext
+		credentialChanged = oldCredential != apiKey
+		if credentialChanged {
+			ciphertext, err := s.credentials.Encrypt(connectionPurpose(id, record.Provider), apiKey)
+			if err != nil {
+				return ConnectionSummary{}, err
+			}
+			record.CredentialCiphertext = ciphertext
+		}
 	}
 	if input.RecyclePassword != nil {
 		if record.Provider != models.ConnectionProviderPan115 {
@@ -412,7 +430,10 @@ func (s *ConnectionService) Update(actor Actor, id uint, input UpdateConnectionI
 	record.AccountID, record.AccountName, record.AccountVIP = "", "", false
 	record.QuotaUsedBytes, record.QuotaTotalBytes = nil, nil
 	record.Revision++
-	if err := s.db.Transaction(func(tx *gorm.DB) error {
+	if err := s.writeCatalogConnection(func(tx *gorm.DB) error {
+		if err := s.applyCatalogConnectionChangeTx(tx, previous, record, credentialChanged); err != nil {
+			return err
+		}
 		result := tx.Model(&models.Connection{}).Where("id = ? AND revision = ?", id, input.Revision).Updates(map[string]any{
 			"name": record.Name, "name_normalized": record.NameNormalized, "endpoint": record.Endpoint, "credential_ciphertext": record.CredentialCiphertext, "recycle_credential_ciphertext": record.RecycleCredentialCiphertext,
 			"recycle_cleanup_enabled": record.RecycleCleanupEnabled, "recycle_cleanup_cron": record.RecycleCleanupCron, "recycle_cleanup_next_run_at": record.RecycleCleanupNextRunAt,
@@ -443,6 +464,9 @@ func (s *ConnectionService) Update(actor Actor, id uint, input UpdateConnectionI
 		return ConnectionSummary{}, err
 	}
 	s.invalidate(id)
+	if s.changes != nil {
+		s.changes.NotifyCommitted(0, 0)
+	}
 	return connectionSummary(record), nil
 }
 

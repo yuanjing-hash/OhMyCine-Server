@@ -12,6 +12,7 @@ import (
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/medialibrary"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
 	cloudpkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud"
+	"gorm.io/gorm"
 )
 
 const maxProviderChangeScopeItems = 512
@@ -284,11 +285,13 @@ func decodeProviderEventPayload(value string) (providerEventPayload, bool) {
 func (s *MediaLibraryService) knownPan115CatalogProviderIDs(ctx context.Context, libraryID uint) (map[string]struct{}, error) {
 	identities := make(map[string]struct{})
 	var entryIDs []string
-	if err := s.db.WithContext(ctx).Model(&models.MediaLibraryEntry{}).Where("library_id = ?", libraryID).Pluck("provider_id", &entryIDs).Error; err != nil {
-		return nil, err
-	}
 	var assetIDs []string
-	if err := s.db.WithContext(ctx).Model(&models.MediaLibrarySourceAsset{}).Where("library_id = ?", libraryID).Pluck("provider_id", &assetIDs).Error; err != nil {
+	if err := s.withCatalogRead(ctx, []uint{libraryID}, func(tx *gorm.DB, reader *CatalogReader) error {
+		if err := reader.Entries().Pluck("provider_id", &entryIDs).Error; err != nil {
+			return err
+		}
+		return reader.SourceAssets().Pluck("provider_id", &assetIDs).Error
+	}); err != nil {
 		return nil, err
 	}
 	for _, providerID := range append(entryIDs, assetIDs...) {
@@ -314,6 +317,10 @@ func (s *MediaLibraryService) mergeScopedPan115Catalog(ctx context.Context, libr
 	if err := s.db.WithContext(ctx).Where("library_id = ?", libraryID).Order("relative_path").Find(&sourceAssets).Error; err != nil {
 		return medialibrary.Result{}, err
 	}
+	return mergeScopedPan115CatalogFacts(delta, entries, sourceAssets)
+}
+
+func mergeScopedPan115CatalogFacts(delta medialibrary.Result, entries []models.MediaLibraryEntry, sourceAssets []models.MediaLibrarySourceAsset) (medialibrary.Result, error) {
 	files := make(map[string]medialibrary.File, len(entries)+len(delta.Files))
 	assets := make(map[string]medialibrary.SourceAsset, len(sourceAssets)+len(delta.Assets))
 	for _, entry := range entries {

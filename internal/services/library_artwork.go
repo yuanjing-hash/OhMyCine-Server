@@ -27,6 +27,7 @@ import (
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/plugins/contract"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/plugins/hostapi"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/metadata/tmdb"
 	"gorm.io/gorm"
 )
 
@@ -63,11 +64,12 @@ type artworkCandidate struct {
 // indexed by Server. It never exposes candidate URLs, provider identities, or
 // credentials: callers receive only an opaque content digest and JPEG bytes.
 type LibraryArtworkService struct {
-	db       *gorm.DB
-	metadata *MetadataSettingsService
-	plugins  *PluginRepositoryService
-	assets   PluginArtworkAssetGateway
-	log      zerolog.Logger
+	catalogStore *CatalogSnapshotStore
+	db           *gorm.DB
+	metadata     *MetadataSettingsService
+	plugins      *PluginRepositoryService
+	assets       PluginArtworkAssetGateway
+	log          zerolog.Logger
 
 	mu    sync.RWMutex
 	cache map[string][]byte
@@ -82,6 +84,10 @@ type LibraryArtworkService struct {
 	workerStop         context.CancelFunc
 	workerWG           sync.WaitGroup
 	categoryCandidates func(uint, string, string) ([]artworkCandidate, error)
+}
+
+func (s *LibraryArtworkService) SetCatalogSnapshotStore(store *CatalogSnapshotStore) {
+	s.catalogStore = store
 }
 
 type LibraryArtworkOption func(*LibraryArtworkService) error
@@ -232,14 +238,49 @@ func (s *LibraryArtworkService) ReconcileMediaLibrary(ctx context.Context, libra
 	type categoryRow struct {
 		CategoryName string
 		MediaType    string
+		Candidates   []artworkCandidate `gorm:"-"`
 	}
 	var rows []categoryRow
-	if err := s.db.Model(&models.MediaLibraryEntry{}).
-		Select("category_name, CASE WHEN media_type = 'tv' THEN 'series' ELSE 'movie' END AS media_type").
-		Where("library_id = ? AND work_key <> '' AND category_name <> ''", libraryID).
-		Group("category_name, CASE WHEN media_type = 'tv' THEN 'series' ELSE 'movie' END").
-		Order("media_type, category_name").Scan(&rows).Error; err != nil {
+	facade := &MediaLibraryService{db: s.db, catalogStore: s.catalogStore, metadata: s.metadata}
+	var source catalogRecognitionContext
+	if err := facade.withCatalogRead(ctx, []uint{libraryID}, func(tx *gorm.DB, reader *CatalogReader) error {
+		var err error
+		source, err = catalogRecognitionContextTx(ctx, tx, reader, libraryID)
+		if err != nil {
+			return err
+		}
+		if !source.Library.Enabled || !source.Storage.Enabled {
+			return ErrCatalogFence
+		}
+		if err := reader.Entries().Select("category_name, CASE WHEN media_type = 'tv' THEN 'series' ELSE 'movie' END AS media_type").Where("library_id = ? AND work_key <> '' AND category_name <> ''", libraryID).Group("category_name, CASE WHEN media_type = 'tv' THEN 'series' ELSE 'movie' END").Order("media_type, category_name").Scan(&rows).Error; err != nil {
+			return err
+		}
+		if s.categoryCandidates == nil {
+			client := facade.catalogImageClientTx(tx)
+			for i := range rows {
+				rows[i].Candidates, err = mediaCategoryCandidatesTx(reader, client, libraryID, rows[i].CategoryName, rows[i].MediaType)
+				if err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}); err != nil {
 		return err
+	}
+	guard := func(tx *gorm.DB) error {
+		reader, err := PinCatalogTx(tx, []uint{libraryID})
+		if err != nil {
+			return err
+		}
+		var current models.MediaLibrary
+		if err := tx.Select("id", "content_revision", "baseline_generation").First(&current, libraryID).Error; err != nil {
+			return err
+		}
+		if current.ContentRevision != source.Library.ContentRevision || current.BaselineGeneration != source.Library.BaselineGeneration {
+			return ErrCatalogFence
+		}
+		return validateCatalogRecognitionContext(tx, reader, source, nil)
 	}
 	seen := make([]string, 0, len(rows))
 	for _, row := range rows {
@@ -248,16 +289,29 @@ func (s *LibraryArtworkService) ReconcileMediaLibrary(ctx context.Context, libra
 		}
 		categoryKey := mediaCategoryArtworkKey(row.MediaType, row.CategoryName)
 		seen = append(seen, categoryKey)
-		if err := s.reconcileCategory(ctx, libraryID, categoryKey, row.CategoryName, row.MediaType); err != nil {
+		candidates := row.Candidates
+		if s.categoryCandidates != nil {
+			var err error
+			candidates, err = s.categoryCandidates(libraryID, row.CategoryName, row.MediaType)
+			if err != nil {
+				return err
+			}
+		}
+		if err := s.reconcileCategoryCandidates(ctx, libraryID, categoryKey, row.CategoryName, row.MediaType, candidates, guard); err != nil {
 			s.log.Warn().Str("module", "library_artwork").Uint("library_id", libraryID).Str("category", row.CategoryName).Str("error_code", libraryArtworkErrorGenerate).Msg("媒体库分类封面生成失败，保留上一版本")
 		}
 	}
 	if complete {
-		query := s.db.Where("scope_kind = ? AND library_id = ?", libraryArtworkScopeCategory, libraryID)
-		if len(seen) > 0 {
-			query = query.Where("category_key NOT IN ?", seen)
-		}
-		if err := query.Delete(&models.MediaCategoryArtwork{}).Error; err != nil {
+		if err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			if err := guard(tx); err != nil {
+				return err
+			}
+			query := tx.Where("scope_kind = ? AND library_id = ?", libraryArtworkScopeCategory, libraryID)
+			if len(seen) > 0 {
+				query = query.Where("category_key NOT IN ?", seen)
+			}
+			return query.Delete(&models.MediaCategoryArtwork{}).Error
+		}); err != nil {
 			return err
 		}
 	}
@@ -273,6 +327,10 @@ func (s *LibraryArtworkService) reconcileCategory(ctx context.Context, libraryID
 	if err != nil {
 		return err
 	}
+	return s.reconcileCategoryCandidates(ctx, libraryID, categoryKey, categoryName, mediaType, candidates, nil)
+}
+
+func (s *LibraryArtworkService) reconcileCategoryCandidates(ctx context.Context, libraryID uint, categoryKey, categoryName, mediaType string, candidates []artworkCandidate, guard func(*gorm.DB) error) error {
 	candidates = normalizeArtworkCandidates(candidates)
 	if len(candidates) == 0 {
 		return nil
@@ -293,7 +351,14 @@ func (s *LibraryArtworkService) reconcileCategory(ctx context.Context, libraryID
 	record.CategoryName, record.MediaType = categoryName, mediaType
 	record.PendingGenerationKey, record.CandidateDigest = generationKey, candidateDigest
 	record.TemplateVersion, record.Status, record.LastErrorCode, record.UpdatedAt = libraryArtworkTemplateVersion, "pending", "", now
-	if err := s.db.Save(&record).Error; err != nil {
+	if err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if guard != nil {
+			if err := guard(tx); err != nil {
+				return err
+			}
+		}
+		return tx.Save(&record).Error
+	}); err != nil {
 		return err
 	}
 	asset, err := s.generate(ctx, categoryName, candidates)
@@ -307,7 +372,12 @@ func (s *LibraryArtworkService) reconcileCategory(ctx context.Context, libraryID
 		return err
 	}
 	generatedAt := s.currentTime()
-	return s.db.Transaction(func(tx *gorm.DB) error {
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if guard != nil {
+			if err := guard(tx); err != nil {
+				return err
+			}
+		}
 		var current models.MediaCategoryArtwork
 		if err := tx.First(&current, record.ID).Error; err != nil {
 			return err
@@ -538,7 +608,18 @@ func (s *LibraryArtworkService) artworkURL(digest string) string {
 }
 
 func (s *LibraryArtworkService) mediaCategoryCandidates(libraryID uint, categoryName, mediaType string) ([]artworkCandidate, error) {
-	if s.metadata == nil {
+	facade := &MediaLibraryService{db: s.db, catalogStore: s.catalogStore, metadata: s.metadata}
+	var candidates []artworkCandidate
+	err := facade.withCatalogRead(context.Background(), []uint{libraryID}, func(tx *gorm.DB, reader *CatalogReader) error {
+		var err error
+		candidates, err = mediaCategoryCandidatesTx(reader, facade.catalogImageClientTx(tx), libraryID, categoryName, mediaType)
+		return err
+	})
+	return candidates, err
+}
+
+func mediaCategoryCandidatesTx(reader *CatalogReader, client *tmdb.Client, libraryID uint, categoryName, mediaType string) ([]artworkCandidate, error) {
+	if client == nil {
 		return nil, nil
 	}
 	categoryName = strings.TrimSpace(categoryName)
@@ -548,14 +629,10 @@ func (s *LibraryArtworkService) mediaCategoryCandidates(libraryID uint, category
 	} else if mediaType != "movie" {
 		return nil, nil
 	}
-	client, err := s.metadata.Client()
-	if err != nil {
-		return nil, nil
-	}
 	var rows []models.MediaLibraryRecognition
-	err = s.db.Model(&models.MediaLibraryRecognition{}).
+	err := reader.Recognitions().
 		Where("media_library_recognitions.library_id = ?", libraryID).
-		Where("EXISTS (SELECT 1 FROM media_library_entries WHERE media_library_entries.library_id = ? AND media_library_entries.recognition_id = media_library_recognitions.id AND media_library_entries.category_name = ? AND media_library_entries.media_type = ?)", libraryID, categoryName, entryMediaType).
+		Where("EXISTS (?)", reader.Entries().Select("1").Where("media_library_entries.library_id = ? AND media_library_entries.recognition_id = media_library_recognitions.id AND media_library_entries.category_name = ? AND media_library_entries.media_type = ?", libraryID, categoryName, entryMediaType)).
 		Order("media_library_recognitions.updated_at DESC, media_library_recognitions.id DESC").
 		Limit(64).Find(&rows).Error
 	if err != nil {

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
+	"gorm.io/gorm"
 )
 
 type structureNoRecycleBackend struct{}
@@ -116,6 +117,13 @@ func TestStructureSelectionKeepsRecommendedAndRecyclesLoser(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	var proof models.CatalogPhysicalWrite
+	if err := service.db.Where("owner_kind=? AND owner_id=?", CatalogPhysicalRepair, repair.ID).First(&proof).Error; err != nil || proof.State != "admitted" || repair.JobID == nil || proof.JobID != *repair.JobID {
+		t.Fatalf("selection repair did not register fresh physical owner: %+v err=%v", proof, err)
+	}
+	if err := service.db.Transaction(func(tx *gorm.DB) error { return AssertCatalogPhysicalDrainedTx(tx, library.ID) }); err != nil {
+		t.Fatalf("unentered selection repair blocked drain: %v", err)
+	}
 	claimed, err := service.queue.Claim([]string{JobTypeMediaLibraryRepair})
 	if err != nil || claimed == nil || repair.JobID == nil || claimed.Job.ID != *repair.JobID {
 		t.Fatalf("claim repair=%+v record=%+v err=%v", claimed, repair, err)
@@ -125,6 +133,9 @@ func TestStructureSelectionKeepsRecommendedAndRecyclesLoser(t *testing.T) {
 	}
 	if err := service.queue.Complete(claimed.Job.ID, claimed.LeaseToken); err != nil {
 		t.Fatal(err)
+	}
+	if err := service.db.First(&proof, proof.ID).Error; err != nil || proof.State != "settled" {
+		t.Fatalf("selection repair left unsettled physical evidence: %+v err=%v", proof, err)
 	}
 	var storage models.Storage
 	if err := service.db.First(&storage, library.StorageID).Error; err != nil {
@@ -151,6 +162,51 @@ func TestStructureSelectionKeepsRecommendedAndRecyclesLoser(t *testing.T) {
 	remaining, err := service.StructureIssues(context.Background(), actor, library.ID, MediaLibraryStructureIssueQuery{Page: 1, PageSize: 10, Actionable: true})
 	if err != nil || remaining.Total != 0 {
 		t.Fatalf("resolved issue remained visible: %+v err=%v", remaining, err)
+	}
+}
+
+func TestStructureSelectionAdmissionRefusesRetirementWithoutConsumingDraft(t *testing.T) {
+	service, actor, library, diagnostics := prepareStructureSelectionConflicts(t, 1)
+	page, err := service.StructureIssues(context.Background(), actor, library.ID, MediaLibraryStructureIssueQuery{Page: 1, PageSize: 1, Actionable: true})
+	if err != nil || len(page.List) != 1 {
+		t.Fatalf("issues=%+v err=%v", page, err)
+	}
+	input := MediaLibraryStructureSelectionInput{Revision: diagnostics.Revision, Selections: []MediaLibraryStructureSelection{{IssueToken: page.List[0].Token, Action: StructureSelectionKeepAllVersions}}}
+	preview, err := service.PreviewSelectionRepair(context.Background(), actor, library.ID, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := service.verifyStructureClaim(preview.ConfirmationToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var draft models.MediaLibraryStructureRepairDraft
+	if err := service.db.First(&draft, "id=?", claim.DraftID).Error; err != nil {
+		t.Fatal(err)
+	}
+	plan, _, _, err := service.buildSelectionPlan(context.Background(), library.ID, input, draft.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Retirement commits after preview construction but before queue admission.
+	if err := service.db.Create(&models.MediaLibraryRetirement{ID: "selection-retirement", LibraryID: library.ID, ActorID: actor.User.ID, Phase: "draining", Revision: 1}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.enqueueSelectionPlan(actor, draft, plan, RequestContext{}); ErrorCode(err) != CodeConflict {
+		t.Fatalf("retiring library accepted selection repair: %v", err)
+	}
+	if err := service.db.First(&draft, "id=?", draft.ID).Error; err != nil || draft.ConsumedAt != nil {
+		t.Fatalf("failed admission consumed confirmation: %+v err=%v", draft, err)
+	}
+	for _, model := range []any{&models.MediaLibraryStructureRepair{}, &models.CatalogPhysicalWrite{}} {
+		var count int64
+		if err := service.db.Model(model).Where("library_id=?", library.ID).Count(&count).Error; err != nil || count != 0 {
+			t.Fatalf("failed admission left owner/proof count=%d err=%v", count, err)
+		}
+	}
+	var jobs int64
+	if err := service.db.Model(&models.Job{}).Where("job_type=?", JobTypeMediaLibraryRepair).Count(&jobs).Error; err != nil || jobs != 0 {
+		t.Fatalf("failed admission left repair job count=%d err=%v", jobs, err)
 	}
 }
 

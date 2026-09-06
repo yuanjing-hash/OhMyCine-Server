@@ -20,6 +20,13 @@ func (fake *playerOverviewHistoryFake) List(Actor, int, int, string) (PlayerHist
 	return fake.page, fake.err
 }
 
+func (fake *playerOverviewHistoryFake) ServerContinueWatching(_ Actor, _ int, libraries map[uint]struct{}) ([]PlayerHistoryChange, bool, error) {
+	if fake.err != nil {
+		return nil, false, fake.err
+	}
+	return playerOverviewHistoryItems(fake.page, libraries, true)
+}
+
 type playerOverviewStateFake struct {
 	favorites      []PlayerMediaItem
 	collections    []PlayerCollectionSummary

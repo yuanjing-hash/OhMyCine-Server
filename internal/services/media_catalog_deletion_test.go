@@ -329,8 +329,15 @@ func TestPan115CatalogDeletionQueuesArtifactsBeforePublishingRefresh(t *testing.
 	if result.ErrorCode != "" || result.RetryAt != nil {
 		t.Fatalf("artifact result=%+v", result)
 	}
-	if err := fixture.service.db.First(&change, change.Sequence).Error; err != nil || change.State != models.MediaLibraryChangeReady {
-		t.Fatalf("published change=%+v err=%v", change, err)
+	var publishedChange models.MediaLibraryChange
+	if err := fixture.service.db.First(&publishedChange, "library_id = ? AND revision = ?", change.LibraryID, change.Revision).Error; err != nil || publishedChange.State != models.MediaLibraryChangeReady || publishedChange.Sequence <= change.Sequence {
+		t.Fatalf("published change=%+v err=%v", publishedChange, err)
+	}
+	change = publishedChange
+	// Publication persists notification intent; a bounded lifecycle dispatcher
+	// advances targets outside the artifact/catalog commit transaction.
+	if found, err := NewMediaChangeService(fixture.service.db).DispatchBatch(context.Background()); err != nil || !found {
+		t.Fatalf("refresh dispatch found=%v err=%v", found, err)
 	}
 	if err := fixture.service.db.First(&target, target.ID).Error; err != nil || target.DesiredRevision != change.Revision {
 		t.Fatalf("refresh target=%+v change=%+v err=%v", target, change, err)

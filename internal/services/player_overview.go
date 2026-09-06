@@ -51,6 +51,7 @@ type PlayerOverview struct {
 
 type playerOverviewHistoryReader interface {
 	List(actor Actor, page, pageSize int, sourceKind string) (PlayerHistoryPage, error)
+	ServerContinueWatching(actor Actor, limit int, libraries map[uint]struct{}) ([]PlayerHistoryChange, bool, error)
 }
 
 type playerOverviewStateReader interface {
@@ -150,11 +151,13 @@ func (s *PlayerOverviewService) Overview(actor Actor) PlayerOverview {
 	go func() {
 		defer wait.Done()
 		result.Sections.ContinueWatching = loadPlayerOverviewSection(func() ([]PlayerHistoryChange, bool, error) {
-			loadHistory()
-			if historyErr != nil {
-				return nil, false, historyErr
+			if librariesErr != nil {
+				return nil, false, librariesErr
 			}
-			return playerOverviewHistoryItems(historyPage, allowedLibraries, true)
+			if s == nil || s.history == nil {
+				return nil, false, appError(CodeInvalidRequest, "Server 暂不支持播放历史", nil)
+			}
+			return s.history.ServerContinueWatching(actor, playerOverviewContinueLimit, allowedLibraries)
 		})
 	}()
 	go func() {

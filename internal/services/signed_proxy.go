@@ -97,6 +97,7 @@ type proxyFlight struct {
 // provider URLs. Persistent storage never receives the resolved upstream URL.
 type SignedProxyService struct {
 	db           *gorm.DB
+	catalogStore *CatalogSnapshotStore
 	credentials  *credential.Store
 	connections  *ConnectionService
 	publicOrigin string

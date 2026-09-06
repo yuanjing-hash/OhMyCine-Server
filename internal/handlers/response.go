@@ -26,8 +26,10 @@ func writeError(c *gin.Context, log zerolog.Logger, err error) {
 	status := http.StatusInternalServerError
 	code := services.ErrorCode(err)
 	switch code {
-	case services.CodeTransferDeletionScopeInvalid:
+	case services.CodeTransferDeletionScopeInvalid, services.CodeHistoryClockAhead, services.CodeHistoryArtworkInvalid:
 		status = http.StatusBadRequest
+	case services.CodeHistoryArtworkQuota:
+		status = http.StatusTooManyRequests
 	case services.CodeTransferDeletionBoundaryChanged, services.CodeTransferDeletionPartial:
 		status = http.StatusConflict
 	case services.CodeTransferDeletionUnavailable:

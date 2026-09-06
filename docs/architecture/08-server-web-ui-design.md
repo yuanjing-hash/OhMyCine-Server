@@ -401,7 +401,15 @@ Server 更新是系统设置页中的管理员专属面板，不进入普通用�
 
 `/discovery/library` 默认展示当前登录用户可访问的 Server 媒体总览：继续观看、我的收藏、TMDB 自动合集、我的合集、最近入库和媒体库。完整播放历史、收藏、两类合集及原有全部作品海报墙通过同页标签或“查看全部”按需加载；首屏不预取完整 catalog，也不再并列显示语义重复的“最近历史”摘要栏。
 
-管理端使用浏览器 Session 专用的 `/api/v1/media-libraries/overview|history|favorites|collections` 只读接口，均要求 `media_libraries.read` 且返回 `Cache-Control: no-store`。接口复用 Server catalog authority，但只投影安全展示字段；Emby/Jellyfin 和其他 Player 来源的历史仍可由 Server 中转做跨设备同步，却不会进入此页。已删除、禁用、无权或无法定位到当前 catalog 的历史/收藏/合集成员不展示，浏览器响应不包含来源地址、来源 ID、Player item token、provider ID、物理路径、凭据或播放流地址。
+管理端使用浏览器 Session 专用的 `/api/v1/media-libraries/overview|history|favorites|collections` 读取接口，均要求 `media_libraries.read` 且返回 `Cache-Control: no-store`。账号历史可以显示 Emby/Jellyfin 和其他 Player 来源的安全标题、来源名和受控图片，但不能作为 Server 库内作品播放；Server 来源目录及 Player Server 总览仍只展示本库内容。已删除、禁用、无权或无法定位到当前 catalog 的 Server 历史/收藏/合集成员不展示，浏览器响应不包含来源地址、来源 ID、Player item token、provider ID、物理路径、凭据或播放流地址。
+
+同页收藏/合集标签支持完整分页、添加/移除作品，手工合集可创建、重命名、删除和按 revision 排序；所有写入使用 Session + CSRF，不删除媒体文件。自动合集只读。通知下拉从任务事实去重并持久化已读状态，跳转准确任务详情，已读不等于已处理。仪表盘真实分区、接口及尚未接入能力见 [可靠性与管理闭环](09-server-reliability.md)。
+
+### 媒体库索引后台移除
+
+删除媒体库只移除配置、目录索引和此库失效的收藏/合集成员，不触碰来源媒体、实际 NFO/JPG/STRM 文件、账号播放历史、合集本体或其他库成员。未转换的小库完成后仍返回 HTTP 200；快照目录或正在转换的库返回 HTTP 202 `{deleted:false,status:"deleting",job_id}`，表示已排队而非已删除。
+
+前端保留“正在移除索引”的库行与任务中心入口，后台按最多 250 行独立事务处理；刷新短暂失败继续轮询。删除中不显示空目录冒充正常结果，不允许扫描、编辑或整理，并关闭其他会话发起移除时仍打开的诊断窗口。目录、配置、物理写入和新任务共用持久移除门禁；未确认完成的文件操作必须先恢复原任务，服务返回冲突且保持原库与恢复证据不变。HTTP 200/202 结果和列表/详情轮询均为 `no-store`。
 
 - [Server 后端设计](02-server-design.md)
 - [安全设计](07-security-design.md)

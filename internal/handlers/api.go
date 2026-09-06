@@ -221,6 +221,10 @@ func (a *API) Dashboard(c *gin.Context) {
 	}
 	success(c, http.StatusOK, data)
 }
+
+func (a *API) DashboardOperations(c *gin.Context) {
+	success(c, http.StatusOK, gin.H{"sections": a.admin.DashboardOperations(c.Request.Context(), mustActor(c))})
+}
 func (a *API) Permissions(c *gin.Context) {
 	data, err := a.admin.ListPermissions()
 	if err != nil {

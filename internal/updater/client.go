@@ -35,7 +35,8 @@ var trustedHosts = map[string]struct{}{
 }
 
 type GitHubClient struct {
-	http *http.Client
+	http               *http.Client
+	probeCompatibility func(context.Context, string) error
 }
 
 func NewGitHubClient(client *http.Client) *GitHubClient {
@@ -61,7 +62,7 @@ func NewGitHubClient(client *http.Client) *GitHubClient {
 		}
 		return validateTrustedURL(request.URL)
 	}
-	return &GitHubClient{http: client}
+	return &GitHubClient{http: client, probeCompatibility: verifyBinaryCompatibility}
 }
 
 func validateTrustedURL(candidate *url.URL) error {

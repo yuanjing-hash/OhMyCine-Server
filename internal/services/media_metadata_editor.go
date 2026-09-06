@@ -275,7 +275,7 @@ func (s *MediaLibraryService) CatalogMetadata(ctx context.Context, actor Actor, 
 	if err := s.ensureMediaLibraryReadable(actor, libraryID); err != nil {
 		return MediaMetadataDocument{}, err
 	}
-	records, err := s.catalogMetadataRecognitions(libraryID, workToken)
+	records, _, err := s.catalogMetadataContext(ctx, libraryID, workToken)
 	if err != nil {
 		return MediaMetadataDocument{}, err
 	}
@@ -292,7 +292,7 @@ func (s *MediaLibraryService) UpdateCatalogMetadata(ctx context.Context, actor A
 	if !actor.CanResource(authz.PermissionMediaLibrariesScan, models.AuthorizationResourceMediaLibrary, uintID(libraryID)) {
 		return MediaMetadataDocument{}, appError(CodePermissionDenied, "无权编辑媒体库元数据", nil)
 	}
-	records, err := s.catalogMetadataRecognitions(libraryID, workToken)
+	records, source, err := s.catalogMetadataContext(ctx, libraryID, workToken)
 	if err != nil {
 		return MediaMetadataDocument{}, err
 	}
@@ -302,12 +302,11 @@ func (s *MediaLibraryService) UpdateCatalogMetadata(ctx context.Context, actor A
 	}
 	_, imageAuthority, _ := decodeRecognitionMetadata(latest.MetadataJSON)
 	imageAuthority = s.enrichMetadataImageOptions(ctx, libraryID, imageAuthority)
-	var saved tmdb.Snapshot
 	updates := make([]catalogMetadataResult, 0, len(records))
 	for _, record := range records {
-		var profile models.MediaClassificationProfile
-		if err := s.db.First(&profile, record.ProfileID).Error; err != nil {
-			return MediaMetadataDocument{}, err
+		profile := source.Profile
+		if profile.ID != record.ProfileID || profile.Revision != record.ProfileRevision {
+			return MediaMetadataDocument{}, recognitionWriteError(ErrCatalogFence)
 		}
 		rules, err := classification.DecodeStrict([]byte(profile.RulesJSON))
 		if err != nil {
@@ -342,13 +341,18 @@ func (s *MediaLibraryService) UpdateCatalogMetadata(ctx context.Context, actor A
 		classified := classification.Classify(result.Metadata, rules)
 		result.CategoryName, result.MatchedRuleID = classified.CategoryName, classified.MatchedRuleID
 		updates = append(updates, catalogMetadataResult{Record: record, Profile: profile, Result: result})
-		saved = edited
 	}
-	if err := s.persistCatalogMetadataResults(updates); err != nil {
+	if err := s.persistCatalogMetadataResults(updates, source); err != nil {
 		return MediaMetadataDocument{}, err
 	}
 	_ = s.audit.Record(s.db, &actor.User.ID, "media_library.metadata.update", "media_library", uintID(libraryID), "success", map[string]any{"recognition_count": len(records)}, request)
-	if err := s.db.First(&latest, latest.ID).Error; err != nil {
+	if err := s.withCatalogRead(ctx, []uint{libraryID}, func(_ *gorm.DB, reader *CatalogReader) error {
+		return reader.Recognitions().Where("library_id = ?", libraryID).First(&latest, latest.ID).Error
+	}); err != nil {
+		return MediaMetadataDocument{}, err
+	}
+	_, saved, err := decodeRecognitionMetadata(latest.MetadataJSON)
+	if err != nil {
 		return MediaMetadataDocument{}, err
 	}
 	return s.metadataDocument(libraryID, workToken, latest, saved), nil
@@ -360,18 +364,51 @@ type catalogMetadataResult struct {
 	Result  MediaRecognitionResult
 }
 
-func (s *MediaLibraryService) persistCatalogMetadataResults(updates []catalogMetadataResult) error {
+func (s *MediaLibraryService) persistCatalogMetadataResults(updates []catalogMetadataResult, contexts ...catalogRecognitionContext) error {
 	if len(updates) == 0 {
 		return appError(CodeInvalidRequest, "元数据更新为空", nil)
 	}
 	libraryID := updates[0].Record.LibraryID
+	var source catalogRecognitionContext
+	var err error
+	if len(contexts) > 0 {
+		source = contexts[0]
+	} else {
+		source, err = s.captureRecognitionWriteContext(libraryID)
+		if err != nil {
+			return err
+		}
+	}
+	if source.Head.Mode == "versioned" {
+		return s.persistVersionedRecognitionResults(source, updates, true)
+	}
+	if source.Head.Mode == "converting" {
+		return recognitionWriteError(ErrCatalogFence)
+	}
+	before := make([]models.MediaLibraryRecognition, 0, len(updates))
+	metadataJSONs := make([]string, 0, len(updates))
+	for _, update := range updates {
+		before = append(before, update.Record)
+		metadataJSON, err := marshalRecognitionMetadata(update.Result)
+		if err != nil {
+			return err
+		}
+		metadataJSONs = append(metadataJSONs, metadataJSON)
+	}
 	lock := s.scanLock(libraryID)
 	lock.Lock()
 	defer lock.Unlock()
 	now := time.Now().UTC()
 	var committedChange models.MediaLibraryChange
 	var artifactGeneration uint64
-	err := s.db.Transaction(func(tx *gorm.DB) error {
+	err = s.db.WithContext(source.Context).Transaction(func(tx *gorm.DB) error {
+		reader, err := PinCatalogTx(tx, []uint{libraryID})
+		if err != nil {
+			return err
+		}
+		if err := validateCatalogRecognitionContext(tx, reader, source, before); err != nil {
+			return recognitionWriteError(err)
+		}
 		var library models.MediaLibrary
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&library, libraryID).Error; err != nil {
 			return err
@@ -392,11 +429,8 @@ func (s *MediaLibraryService) persistCatalogMetadataResults(updates []catalogMet
 			artifactGeneration = max(generation, library.ArtifactGeneration) + 1
 			generation = artifactGeneration
 		}
-		for _, update := range updates {
-			metadataJSON, err := marshalRecognitionMetadata(update.Result)
-			if err != nil {
-				return err
-			}
+		for index, update := range updates {
+			metadataJSON := metadataJSONs[index]
 			result := update.Result
 			recognitionUpdates := map[string]any{"profile_id": update.Profile.ID, "profile_revision": update.Profile.Revision, "status": result.Status, "error_code": result.ErrorCode, "media_type": result.MediaType, "title": result.Title, "release_year": result.ReleaseYear, "tmdb_id": result.TMDBID, "confidence": result.Confidence, "category_name": result.CategoryName, "matched_rule_id": result.MatchedRuleID, "metadata_json": metadataJSON, "manual_override": true, "last_generation": generation, "updated_at": now}
 			changed := tx.Model(&models.MediaLibraryRecognition{}).Where("id = ? AND library_id = ? AND updated_at = ?", update.Record.ID, libraryID, update.Record.UpdatedAt).Updates(recognitionUpdates)
@@ -472,26 +506,39 @@ func (s *MediaLibraryService) enrichMetadataImageOptions(ctx context.Context, li
 	return snapshot
 }
 
-func (s *MediaLibraryService) catalogMetadataRecognitions(libraryID uint, workToken string) ([]models.MediaLibraryRecognition, error) {
+func (s *MediaLibraryService) catalogMetadataContext(ctx context.Context, libraryID uint, workToken string) ([]models.MediaLibraryRecognition, catalogRecognitionContext, error) {
 	workKey, err := decodeCatalogToken(workToken)
 	if err != nil {
-		return nil, err
-	}
-	var ids []uint
-	if err := s.db.Model(&models.MediaLibraryEntry{}).Where("library_id = ? AND work_key = ? AND recognition_id IS NOT NULL", libraryID, workKey).Distinct().Order("recognition_id").Pluck("recognition_id", &ids).Error; err != nil {
-		return nil, err
-	}
-	if len(ids) == 0 {
-		return nil, appError(CodeConflict, "当前作品没有可编辑的识别元数据", nil)
+		return nil, catalogRecognitionContext{}, err
 	}
 	var records []models.MediaLibraryRecognition
-	if err := s.db.Where("library_id = ? AND id IN ?", libraryID, ids).Order("id").Find(&records).Error; err != nil {
-		return nil, err
-	}
-	if len(records) != len(ids) {
-		return nil, appError(CodeConflict, "作品识别记录已变化", nil)
-	}
-	return records, nil
+	var source catalogRecognitionContext
+	err = s.withCatalogRead(ctx, []uint{libraryID}, func(tx *gorm.DB, reader *CatalogReader) error {
+		var err error
+		source, err = catalogRecognitionContextTx(ctx, tx, reader, libraryID)
+		if err != nil {
+			return err
+		}
+		var ids []uint
+		if err := reader.Entries().Where("library_id = ? AND work_key = ? AND recognition_id IS NOT NULL", libraryID, workKey).Distinct().Order("recognition_id").Limit(CatalogMaxDeltaRows+1).Pluck("recognition_id", &ids).Error; err != nil {
+			return err
+		}
+		if len(ids) == 0 {
+			return appError(CodeConflict, "当前作品没有可编辑的识别元数据", nil)
+		}
+		if len(ids) > CatalogMaxDeltaRows {
+			return recognitionWriteError(ErrCatalogBudget)
+		}
+		source.WorkKey, source.RecognitionIDs = workKey, ids
+		if err := reader.Recognitions().Where("library_id = ? AND id IN ?", libraryID, ids).Order("id").Find(&records).Error; err != nil {
+			return err
+		}
+		if len(records) != len(ids) {
+			return appError(CodeConflict, "作品识别记录已变化", nil)
+		}
+		return nil
+	})
+	return records, source, err
 }
 
 func (s *MediaLibraryService) metadataDocument(libraryID uint, workToken string, record models.MediaLibraryRecognition, snapshot tmdb.Snapshot) MediaMetadataDocument {

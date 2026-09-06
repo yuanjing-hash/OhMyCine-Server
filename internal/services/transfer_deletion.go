@@ -77,29 +77,35 @@ type TransferDeletionResult struct {
 }
 
 type transferDeletionBoundary struct {
-	transfer       models.TransferTask
-	download       models.DownloadTask
-	library        models.MediaLibrary
-	storage        models.Storage
-	transferJob    models.Job
-	downloadJob    models.Job
-	seeding        *models.SeedingTask
-	seedingJob     *models.Job
-	managed        []models.MediaManagedItem
-	sourceManifest downloadpkg.Manifest
-	sourceMissing  int
-	sourceDetached int
-	sourcePresent  int
-	sourceRootGone bool
-	libraryMissing int
+	transfer        models.TransferTask
+	download        models.DownloadTask
+	library         models.MediaLibrary
+	storage         models.Storage
+	transferJob     models.Job
+	downloadJob     models.Job
+	seeding         *models.SeedingTask
+	seedingJob      *models.Job
+	managed         []models.MediaManagedItem
+	sourceManifest  downloadpkg.Manifest
+	sourceMissing   int
+	sourceDetached  int
+	sourcePresent   int
+	sourceRootGone  bool
+	libraryMissing  int
+	catalog         catalogDeletionWrite
+	physicalPermit  *CatalogPhysicalWritePermit
+	physicalOwnerID string
 }
 
 type transferDeletionState struct {
-	Version          int           `json:"version"`
-	SourceCompleted  bool          `json:"source_completed"`
-	LibraryCompleted map[uint]bool `json:"library_completed"`
-	SourceRemoved    int           `json:"source_removed"`
-	LibraryRemoved   int           `json:"library_removed"`
+	Version            int                   `json:"version"`
+	CatalogFence       *catalogDeletionFence `json:"catalog_fence,omitempty"`
+	CatalogDigest      string                `json:"catalog_digest,omitempty"`
+	CatalogAssetDigest string                `json:"catalog_asset_digest,omitempty"`
+	SourceCompleted    bool                  `json:"source_completed"`
+	LibraryCompleted   map[uint]bool         `json:"library_completed"`
+	SourceRemoved      int                   `json:"source_removed"`
+	LibraryRemoved     int                   `json:"library_removed"`
 }
 
 func validTransferDeletionScope(scope string) bool {
@@ -138,7 +144,13 @@ func (s *TransferService) PreviewDeletion(ctx context.Context, actor Actor, tran
 		return TransferDeletionPreviewResult{}, err
 	}
 	now := time.Now().UTC()
-	state, _ := json.Marshal(transferDeletionState{Version: 1, LibraryCompleted: map[uint]bool{}})
+	initialState := transferDeletionState{Version: 2, LibraryCompleted: map[uint]bool{}}
+	if deletionIncludesLibrary(scope) {
+		initialState.CatalogFence = &boundary.catalog.Fence
+		initialState.CatalogDigest = catalogDeletionDigest(boundary.catalog.Entries)
+		initialState.CatalogAssetDigest = catalogDeletionAssetDigest(boundary.catalog.Assets)
+	}
+	state, _ := json.Marshal(initialState)
 	preview := models.TransferDeletionPreview{
 		ID: uuid.NewString(), TokenHash: tokenHash, ActorID: actor.User.ID,
 		TransferTaskID: boundary.transfer.ID, DownloadTaskID: boundary.download.ID,
@@ -151,7 +163,7 @@ func (s *TransferService) PreviewDeletion(ctx context.Context, actor Actor, tran
 		preview.SeedingJobRevision = boundary.seedingJob.Revision
 	}
 	if err := s.db.Transaction(func(tx *gorm.DB) error {
-		if err := tx.Create(&preview).Error; err != nil {
+		if err := saveTransferDeletionPreviewTx(tx, &preview); err != nil {
 			return err
 		}
 		return s.audit.Record(tx, &actor.User.ID, "transfer.deletion_preview", "transfer_task", boundary.transfer.ID, "success", map[string]any{"scope": scope, "source_items": len(boundary.sourceManifest.Files), "library_items": len(boundary.managed)}, request)
@@ -200,7 +212,30 @@ func (s *TransferService) ConfirmDeletion(ctx context.Context, actor Actor, tran
 	if err != nil {
 		return TransferDeletionResult{}, err
 	}
+	state := transferDeletionState{Version: 1, LibraryCompleted: map[uint]bool{}}
+	if json.Unmarshal([]byte(preview.StateJSON), &state) != nil || (state.Version != 1 && state.Version != 2) {
+		return TransferDeletionResult{}, appError(CodeTransferDeletionBoundaryChanged, "删除预览损坏，请重新预览", nil)
+	}
+	catalogService := s.deletionCatalogService()
+	defer catalogService.abandonCatalogDeletion(&boundary.catalog)
+	if deletionIncludesLibrary(preview.Scope) {
+		if (state.CatalogFence == nil && boundary.catalog.Head.Mode == "versioned") || (state.Version == 2 && state.CatalogFence == nil) || (state.CatalogFence != nil && (*state.CatalogFence != boundary.catalog.Fence || state.CatalogDigest != catalogDeletionDigest(boundary.catalog.Entries) || state.CatalogAssetDigest != catalogDeletionAssetDigest(boundary.catalog.Assets))) {
+			return TransferDeletionResult{}, appError(CodeTransferDeletionBoundaryChanged, "媒体目录已变化，请重新预览", nil)
+		}
+		if err := catalogService.prepareCatalogDeletion(ctx, &boundary.catalog); err != nil {
+			return TransferDeletionResult{}, catalogDeletionWriteError(err)
+		}
+	}
 	if err := s.db.Transaction(func(tx *gorm.DB) error {
+		if deletionIncludesLibrary(preview.Scope) {
+			r, err := PinCatalogTx(tx, []uint{boundary.library.ID})
+			if err != nil {
+				return err
+			}
+			if err := validateCatalogDeletionTx(tx, r, boundary.catalog, true); err != nil {
+				return err
+			}
+		}
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&preview, "token_hash = ?", tokenHash).Error; err != nil {
 			return appError(CodeTransferDeletionPreviewExpired, "删除确认已失效，请重新预览", nil)
 		}
@@ -233,13 +268,25 @@ func (s *TransferService) ConfirmDeletion(ctx context.Context, actor Actor, tran
 			return appError(CodeTransferDeletionBoundaryChanged, "做种状态已变化，请重新预览", nil)
 		}
 		preview.ConsumedAt, preview.UpdatedAt = &consumeNow, consumeNow
-		return tx.Model(&preview).Updates(map[string]any{"consumed_at": consumeNow, "updated_at": consumeNow}).Error
+		if err := tx.Model(&preview).Updates(map[string]any{"consumed_at": consumeNow, "updated_at": consumeNow}).Error; err != nil {
+			return err
+		}
+		if deletionIncludesLibrary(preview.Scope) {
+			permit, err := EnterCatalogPhysicalWriteTx(tx, CatalogPhysicalWriteInput{LibraryID: preview.LibraryID, OwnerKind: CatalogPhysicalTransferDeletion, OwnerID: preview.ID, ActorID: actor.User.ID, ClaimAt: consumeNow})
+			if err != nil {
+				return err
+			}
+			boundary.physicalPermit = &permit
+			boundary.physicalOwnerID = preview.ID
+		}
+		return nil
 	}); err != nil {
 		return TransferDeletionResult{}, err
 	}
+	if boundary.physicalPermit != nil {
+		defer quiesceCatalogPhysicalWrite(s.db, *boundary.physicalPermit, s.log)
+	}
 
-	state := transferDeletionState{Version: 1, LibraryCompleted: map[uint]bool{}}
-	_ = json.Unmarshal([]byte(preview.StateJSON), &state)
 	if state.LibraryCompleted == nil {
 		state.LibraryCompleted = map[uint]bool{}
 	}
@@ -269,7 +316,7 @@ func (s *TransferService) ConfirmDeletion(ctx context.Context, actor Actor, tran
 			return TransferDeletionResult{}, appError(CodeTransferDeletionPartial, "媒体库文件删除未完整完成，记录和未完成清单已保留；请重新预览", deleteErr)
 		}
 	}
-	if err := s.finalizeTransferDeletion(actor, boundary, preview.Scope, state, request); err != nil {
+	if err := s.finalizeTransferDeletion(ctx, actor, &boundary, preview.Scope, state, request); err != nil {
 		if persistErr := s.persistDeletionState(preview.ID, state, CodeTransferDeletionPartial); persistErr != nil {
 			err = errors.Join(err, fmt.Errorf("persist final deletion state: %w", persistErr))
 		}
@@ -345,6 +392,47 @@ func (s *TransferService) loadTransferDeletionBoundaryWithDB(ctx context.Context
 		}
 		if len(b.managed) == 0 || len(b.managed) > maxReorganizationItems {
 			return b, appError(CodeTransferDeletionUnavailable, "没有完整媒体库托管清单，不能安全删除", nil)
+		}
+		paths := make([]string, 0, len(b.managed)*2)
+		byPath := make(map[string]models.MediaManagedItem, len(b.managed))
+		for _, item := range b.managed {
+			key := strings.TrimPrefix(filepath.ToSlash(item.RelativePath), "/")
+			paths = append(paths, key, "/"+key)
+			byPath[key] = item
+		}
+		var err error
+		b.catalog, err = s.deletionCatalogService().captureCatalogDeletion(ctx, b.library.ID, "", paths)
+		if err != nil {
+			return b, err
+		}
+		if catalogDeletionBoundaryDigest(b.library, b.storage) != b.catalog.Fence.BoundaryDigest {
+			return b, ErrCatalogFence
+		}
+		if b.catalog.Head.Mode == "versioned" {
+			if b.download.TargetStorageID == nil || *b.download.TargetStorageID != b.storage.ID {
+				return b, ErrCatalogFence
+			}
+			if b.storage.Type == models.StorageTypeLocal {
+				original, e1 := medialibrary.ResolveRoot(b.download.TargetStorageRoot, b.download.TargetRelativeRoot)
+				current, e2 := medialibrary.ResolveRoot(b.storage.RootPath, b.library.RelativeRoot)
+				if e1 != nil || e2 != nil || filepath.Clean(original) != filepath.Clean(current) {
+					return b, ErrCatalogFence
+				}
+			} else if b.download.TargetProviderRootID != b.library.ProviderRootID || b.download.TargetConnectionID == nil || b.storage.ConnectionID == nil || *b.download.TargetConnectionID != *b.storage.ConnectionID {
+				return b, ErrCatalogFence
+			}
+		}
+		for _, entry := range b.catalog.Entries {
+			item, ok := byPath[strings.TrimPrefix(filepath.ToSlash(entry.RelativePath), "/")]
+			if !ok || entry.Size != item.Size || entry.ProviderID != item.ProviderItemID {
+				return b, appError(CodeTransferDeletionBoundaryChanged, "媒体文件身份已变化，请重新预览", nil)
+			}
+		}
+		for _, asset := range b.catalog.Assets {
+			item, ok := byPath[strings.TrimPrefix(filepath.ToSlash(asset.RelativePath), "/")]
+			if !ok || asset.Size != item.Size || asset.ProviderID != item.ProviderItemID || (asset.ParentProviderID != "" && asset.ParentProviderID != item.ProviderParentID) {
+				return b, appError(CodeTransferDeletionBoundaryChanged, "媒体附属文件身份已变化，请重新预览", nil)
+			}
 		}
 		if err := s.validateLibraryDeletionBoundary(ctx, &b); err != nil {
 			return b, err
@@ -679,6 +767,15 @@ func deleteLocalSourceManifest(download models.DownloadTask, files []downloadpkg
 
 func (s *TransferService) deleteTransferLibrary(ctx context.Context, b transferDeletionBoundary, state *transferDeletionState) (int, error) {
 	removed := 0
+	modified := make(map[string]time.Time)
+	if b.catalog.Head.Mode == "versioned" {
+		for _, entry := range b.catalog.Entries {
+			modified[strings.TrimPrefix(filepath.ToSlash(entry.RelativePath), "/")] = entry.ModifiedAt
+		}
+		for _, asset := range b.catalog.Assets {
+			modified[strings.TrimPrefix(filepath.ToSlash(asset.RelativePath), "/")] = asset.ModifiedAt
+		}
+	}
 	if b.storage.Type == models.StorageTypeLocal {
 		root, err := medialibrary.ResolveRoot(b.storage.RootPath, b.library.RelativeRoot)
 		if err != nil {
@@ -692,10 +789,14 @@ func (s *TransferService) deleteTransferLibrary(ctx context.Context, b transferD
 			if state.LibraryCompleted[item.ID] {
 				continue
 			}
+			if err := s.validateTransferDeletionItem(ctx, b, item); err != nil {
+				return removed, err
+			}
 			target := filepath.Join(root, filepath.FromSlash(item.RelativePath))
+			expectedModified := modified[strings.TrimPrefix(filepath.ToSlash(item.RelativePath), "/")]
 			info, err := os.Lstat(target)
 			if !errors.Is(err, os.ErrNotExist) {
-				if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Size() != item.Size || ensureWithin(root, target) != nil || ensureSafeDirectoryPath(root, filepath.Dir(target), false) != nil {
+				if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Size() != item.Size || (!expectedModified.IsZero() && !expectedModified.Equal(info.ModTime())) || ensureWithin(root, target) != nil || ensureSafeDirectoryPath(root, filepath.Dir(target), false) != nil {
 					return removed, errors.New("managed library file changed")
 				}
 				if err := os.Remove(target); err != nil {
@@ -705,8 +806,10 @@ func (s *TransferService) deleteTransferLibrary(ctx context.Context, b transferD
 				pruneEmptyStagingDirectories(root, filepath.Dir(target))
 			}
 			state.LibraryCompleted[item.ID] = true
-			if err := s.markManagedDeletionProgress(item); err != nil {
-				return removed, err
+			if b.catalog.Head.Mode != "versioned" && b.physicalPermit == nil {
+				if err := s.markManagedDeletionProgress(item); err != nil {
+					return removed, err
+				}
 			}
 		}
 		return removed, nil
@@ -727,6 +830,9 @@ func (s *TransferService) deleteTransferLibrary(ctx context.Context, b transferD
 		if state.LibraryCompleted[item.ID] {
 			continue
 		}
+		if err := s.validateTransferDeletionItem(ctx, b, item); err != nil {
+			return removed, err
+		}
 		current, err := providerItemWithinRoot(ctx, driver, item.ProviderItemID, root.ID)
 		if err == nil {
 			if current.IsDir || current.Size != item.Size || (item.ProviderParentID != "" && current.ParentID != item.ProviderParentID) {
@@ -740,8 +846,10 @@ func (s *TransferService) deleteTransferLibrary(ctx context.Context, b transferD
 			return removed, err
 		}
 		state.LibraryCompleted[item.ID] = true
-		if err := s.markManagedDeletionProgress(item); err != nil {
-			return removed, err
+		if b.catalog.Head.Mode != "versioned" && b.physicalPermit == nil {
+			if err := s.markManagedDeletionProgress(item); err != nil {
+				return removed, err
+			}
 		}
 	}
 	return removed, nil
@@ -781,29 +889,108 @@ func (s *TransferService) persistDeletionFailure(preview models.TransferDeletion
 	})
 }
 
-func (s *TransferService) finalizeTransferDeletion(actor Actor, b transferDeletionBoundary, scope string, state transferDeletionState, request RequestContext) error {
+func (s *TransferService) deletionCatalogService() *MediaLibraryService {
+	return &MediaLibraryService{db: s.db, catalogStore: s.catalogStore}
+}
+
+func (s *TransferService) validateTransferDeletionItem(ctx context.Context, b transferDeletionBoundary, item models.MediaManagedItem) error {
+	return s.deletionCatalogService().withCatalogRead(ctx, []uint{b.library.ID}, func(tx *gorm.DB, r *CatalogReader) error {
+		if err := validateCatalogDeletionTx(tx, r, b.catalog, false); err != nil {
+			return err
+		}
+		if b.catalog.Head.Mode != "versioned" && b.physicalPermit == nil {
+			return nil
+		}
+		var current models.MediaManagedItem
+		if err := tx.First(&current, item.ID).Error; err != nil {
+			return err
+		}
+		if !current.Managed || !current.Active || managedManifestDigest([]models.MediaManagedItem{current}) != managedManifestDigest([]models.MediaManagedItem{item}) {
+			return ErrCatalogFence
+		}
+		var transfer models.TransferTask
+		var job models.Job
+		if err := tx.First(&transfer, "id=?", b.transfer.ID).Error; err != nil {
+			return err
+		}
+		if err := tx.First(&job, "id=?", b.transferJob.ID).Error; err != nil {
+			return err
+		}
+		if transfer.OwnerID != b.transfer.OwnerID || transfer.LibraryID != b.library.ID || job.Revision != b.transferJob.Revision || !isDeletableTransferJobStatus(job.Status) || jobHasActiveLease(job, time.Now().UTC()) {
+			return ErrCatalogFence
+		}
+		return nil
+	})
+}
+
+func (s *TransferService) finalizeTransferDeletion(ctx context.Context, actor Actor, b *transferDeletionBoundary, scope string, state transferDeletionState, request RequestContext) error {
 	deletedJobs := []models.Job{}
 	var changeRevision uint64
-	err := s.db.Transaction(func(tx *gorm.DB) error {
+	var artifactGeneration uint64
+	requiresArtifacts := deletionIncludesLibrary(scope) && mediaLibraryRequiresArtifacts(b.storage.Type, b.library, s.artifacts != nil)
+	if deletionIncludesLibrary(scope) {
+		for _, item := range b.managed {
+			if !state.LibraryCompleted[item.ID] {
+				return ErrCatalogInvalid
+			}
+		}
+	}
+	commit := func(tx *gorm.DB) error {
 		if deletionIncludesLibrary(scope) {
+			if b.catalog.Head.Mode == "versioned" || b.physicalPermit != nil {
+				var currentManaged []models.MediaManagedItem
+				query := tx.Where("transfer_task_id=? AND library_id=? AND managed=? AND active=?", b.transfer.ID, b.library.ID, true, true).Order("id")
+				if b.catalog.Head.Mode == "versioned" {
+					query = query.Limit(maxReorganizationItems + 1)
+				}
+				if err := query.Find(&currentManaged).Error; err != nil {
+					return err
+				}
+				if managedManifestDigest(currentManaged) != managedManifestDigest(b.managed) {
+					return ErrCatalogFence
+				}
+				var currentTransfer models.TransferTask
+				var currentJob models.Job
+				if err := tx.First(&currentTransfer, "id=?", b.transfer.ID).Error; err != nil {
+					return err
+				}
+				if err := tx.First(&currentJob, "id=?", b.transferJob.ID).Error; err != nil {
+					return err
+				}
+				if currentTransfer.OwnerID != b.transfer.OwnerID || currentTransfer.LibraryID != b.library.ID || currentJob.Revision != b.transferJob.Revision || !isDeletableTransferJobStatus(currentJob.Status) || jobHasActiveLease(currentJob, time.Now().UTC()) {
+					return ErrCatalogFence
+				}
+			}
 			paths := make([]string, 0, len(b.managed))
 			for _, item := range b.managed {
 				paths = append(paths, item.RelativePath)
 			}
 			if len(paths) > 0 {
-				if err := tx.Where("library_id = ? AND relative_path IN ?", b.library.ID, paths).Delete(&models.MediaLibraryEntry{}).Error; err != nil {
-					return err
+				if b.catalog.Head.Mode != "versioned" {
+					if err := tx.Where("library_id = ? AND relative_path IN ?", b.library.ID, paths).Delete(&models.MediaLibraryEntry{}).Error; err != nil {
+						return err
+					}
 				}
 			}
 			if err := tx.Model(&models.MediaLibrary{}).Where("id = ?", b.library.ID).Update("dirty_generation", gorm.Expr("dirty_generation + 1")).Error; err != nil {
 				return err
 			}
-			if s.mediaChanges != nil {
-				var current models.MediaLibrary
-				if err := tx.First(&current, b.library.ID).Error; err != nil {
+			var current models.MediaLibrary
+			if err := tx.First(&current, b.library.ID).Error; err != nil {
+				return err
+			}
+			if requiresArtifacts && b.catalog.Head.Mode == "versioned" {
+				artifactGeneration = max(max(current.DirtyGeneration, current.ArtifactGeneration), current.BaselineGeneration) + 1
+				current.DirtyGeneration = artifactGeneration
+				if err := tx.Model(&models.MediaLibrary{}).Where("id=?", b.library.ID).Update("dirty_generation", artifactGeneration).Error; err != nil {
 					return err
 				}
-				change, err := s.mediaChanges.RecordTx(tx, b.library.ID, current.DirtyGeneration, models.MediaLibraryChangeRemoval, true)
+				if _, err := s.artifacts.BindCatalogGenerationTx(tx, b.library.ID, artifactGeneration); err != nil {
+					return err
+				}
+			}
+			if s.mediaChanges != nil {
+				change, err := s.mediaChanges.RecordTx(tx, b.library.ID, current.DirtyGeneration, models.MediaLibraryChangeRemoval, artifactGeneration == 0)
 				if err != nil {
 					return err
 				}
@@ -814,6 +1001,14 @@ func (s *TransferService) finalizeTransferDeletion(actor Actor, b transferDeleti
 		}
 		if err := s.audit.Record(tx, &actor.User.ID, "transfer.deletion_confirm", "transfer_task", b.transfer.ID, "success", map[string]any{"scope": scope, "source_removed": state.SourceRemoved, "library_removed": state.LibraryRemoved, "library_id": b.library.ID}, request); err != nil {
 			return err
+		}
+		if b.physicalPermit != nil {
+			if err := tx.Model(&models.TransferDeletionPreview{}).Where("id=?", b.physicalOwnerID).Updates(map[string]any{"completed_at": time.Now().UTC(), "last_error_code": ""}).Error; err != nil {
+				return err
+			}
+			if err := SettleCatalogPhysicalWriteTx(tx, *b.physicalPermit, nil); err != nil {
+				return err
+			}
 		}
 		reorgJobs, err := cleanupTransferHistoryDependencies(tx, b.transfer.ID)
 		if err != nil {
@@ -846,7 +1041,13 @@ func (s *TransferService) finalizeTransferDeletion(actor Actor, b transferDeleti
 			deletedJobs = append(deletedJobs, b.downloadJob)
 		}
 		return nil
-	})
+	}
+	var err error
+	if deletionIncludesLibrary(scope) {
+		err = s.deletionCatalogService().commitCatalogDeletion(ctx, &b.catalog, commit)
+	} else {
+		err = s.db.WithContext(ctx).Transaction(commit)
+	}
 	if err != nil {
 		return err
 	}
@@ -857,6 +1058,11 @@ func (s *TransferService) finalizeTransferDeletion(actor Actor, b transferDeleti
 	}
 	if changeRevision > 0 && s.mediaChanges != nil {
 		s.mediaChanges.NotifyCommitted(b.library.ID, changeRevision)
+	}
+	if artifactGeneration > 0 {
+		if err := s.artifacts.ScheduleGeneration(b.library.ID, artifactGeneration); err != nil {
+			s.log.Warn().Uint("library_id", b.library.ID).Str("error_code", "artifact_schedule_pending").Msg("删除已保存，媒体产物任务等待恢复调度")
+		}
 	}
 	return nil
 }

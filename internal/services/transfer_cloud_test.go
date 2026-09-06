@@ -277,6 +277,7 @@ type cloudTransferFixture struct {
 func newCloudTransferFixture(t *testing.T, mode, policy string, conflict bool) cloudTransferFixture {
 	t.Helper()
 	queue, actor, _ := queueFixture(t)
+	queue.SetClock(realClock{})
 	var profile models.MediaClassificationProfile
 	if err := queue.db.Where("code = ?", "default-v1").First(&profile).Error; err != nil {
 		t.Fatal(err)
@@ -835,7 +836,7 @@ func TestCloudTransferMoveResumesAfterPlacedItemRenameFailure(t *testing.T) {
 	if err := fixture.queue.db.Where("download_task_id = ?", fixture.download.ID).First(&transfer).Error; err != nil {
 		t.Fatal(err)
 	}
-	second := worker.runCloudTransfer(context.Background(), runtime, transfer, fixture.download, fixture.manifest, time.Now())
+	second := worker.runCloudTransfer(context.Background(), runtime, *claimed, transfer, fixture.download, fixture.manifest, time.Now())
 	if second.ErrorCode != "" || second.RetryAt != nil || second.Wait != nil {
 		t.Fatalf("second result=%+v", second)
 	}

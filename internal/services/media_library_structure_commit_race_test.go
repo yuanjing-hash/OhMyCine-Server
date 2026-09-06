@@ -35,6 +35,12 @@ func TestStructureDiagnosisCommitFencesConcurrentCatalogChanges(t *testing.T) {
 				if tx.Statement.Table != "media_libraries" || changed {
 					return
 				}
+				// Catalog capture now also reads the library inside its pinned
+				// transaction. Inject at the final AUTOCOMMIT precheck, not from
+				// inside an immediate writer (which would self-deadlock the fixture).
+				if _, pinned := tx.Statement.ConnPool.(gorm.TxCommitter); pinned {
+					return
+				}
 				queries++
 				// The second library read is the final pre-transaction check.
 				// Its result is already materialized, exactly like another writer

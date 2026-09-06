@@ -60,6 +60,20 @@ func enqueueLegacyStructureRepair(t *testing.T, s *MediaLibraryStructureService,
 	return repair
 }
 
+func completeLegacyStructureRepairForTest(t *testing.T, s *MediaLibraryStructureService, repair models.MediaLibraryStructureRepair) {
+	t.Helper()
+	claimed, err := s.queue.Claim([]string{JobTypeMediaLibraryRepair})
+	if err != nil || claimed == nil || repair.JobID == nil || claimed.Job.ID != *repair.JobID {
+		t.Fatalf("claim repair=%+v err=%v", claimed, err)
+	}
+	if result := NewMediaLibraryRepairWorker(s).Run(context.Background(), fastScanTestRuntime{}, *claimed); result.ErrorCode != "" {
+		t.Fatalf("repair=%+v", result)
+	}
+	if err := s.queue.Complete(claimed.Job.ID, claimed.LeaseToken); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestLegacyStructureRepairClearsOnlyCompletedPathIssues(t *testing.T) {
 	for _, mode := range []string{"full", "work", "ensure_work_layout"} {
 		t.Run(mode, func(t *testing.T) {
@@ -70,9 +84,7 @@ func TestLegacyStructureRepairClearsOnlyCompletedPathIssues(t *testing.T) {
 				}
 			} else {
 				repair := enqueueLegacyStructureRepair(t, s, actor, library, diagnostics, mode)
-				if result := s.runRepair(context.Background(), fastScanTestRuntime{}, repair.ID); result.ErrorCode != "" {
-					t.Fatalf("repair=%+v", result)
-				}
+				completeLegacyStructureRepairForTest(t, s, repair)
 			}
 			want := 3
 			if mode == "full" {
@@ -127,8 +139,8 @@ func TestLegacyStructureRepairDoesNotReplaceActiveDiagnosis(t *testing.T) {
 					if err := s.EnsureWorkLayout(context.Background(), actor.User.ID, library.ID, 9000, "movie"); err != nil {
 						t.Fatal(err)
 					}
-				} else if result := s.runRepair(context.Background(), fastScanTestRuntime{}, repair.ID); result.ErrorCode != "" {
-					t.Fatalf("repair=%+v", result)
+				} else {
+					completeLegacyStructureRepairForTest(t, s, repair)
 				}
 				var diagnosis models.MediaLibraryStructureDiagnosis
 				if err := s.db.Where("library_id = ?", library.ID).First(&diagnosis).Error; err != nil || diagnosis.Status != status || diagnosis.IssueCount != 4 {

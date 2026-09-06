@@ -211,11 +211,16 @@ func (a *API) DeleteMediaLibrary(c *gin.Context) {
 	if !ok {
 		return
 	}
-	if err := a.libraries.Delete(actor, id, middleware.RequestContextFrom(c)); err != nil {
+	result, err := a.libraries.DeleteRequest(c.Request.Context(), actor, id, middleware.RequestContextFrom(c))
+	if err != nil {
 		writeError(c, a.log, err)
 		return
 	}
-	success(c, http.StatusOK, gin.H{"deleted": true})
+	status := http.StatusOK
+	if !result.Deleted {
+		status = http.StatusAccepted
+	}
+	success(c, status, result)
 }
 func (a *API) ScanMediaLibrary(c *gin.Context) {
 	actor, _ := middleware.ActorFrom(c)
@@ -272,6 +277,20 @@ func (a *API) MediaLibraryEntries(c *gin.Context) {
 	}
 	success(c, http.StatusOK, page)
 }
+func (a *API) MediaLibraryRecognition(c *gin.Context) {
+	actor, _ := middleware.ActorFrom(c)
+	id, ok := pathID(c)
+	if !ok {
+		return
+	}
+	result, err := a.libraries.Recognition(c.Request.Context(), actor, id, c.Param("token"))
+	if err != nil {
+		writeError(c, a.log, err)
+		return
+	}
+	success(c, http.StatusOK, result)
+}
+
 func (a *API) MediaLibraryRecognitions(c *gin.Context) {
 	actor, _ := middleware.ActorFrom(c)
 	id, ok := pathID(c)
@@ -631,6 +650,27 @@ func (a *API) PreviewMediaLibraryStructureRepair(c *gin.Context) {
 	success(c, http.StatusOK, result)
 }
 
+func (a *API) MediaLibraryStructureSelectionStatus(c *gin.Context) {
+	actor, _ := middleware.ActorFrom(c)
+	id, ok := pathID(c)
+	if !ok {
+		return
+	}
+	var payload struct {
+		IssueTokens []string `json:"issue_tokens"`
+	}
+	if err := strictJSON(c, &payload); err != nil {
+		writeError(c, a.log, invalid("媒体库修复选择无效", err))
+		return
+	}
+	result, err := a.libraryStructure.SelectionStatus(c.Request.Context(), actor, id, payload.IssueTokens)
+	if err != nil {
+		writeError(c, a.log, err)
+		return
+	}
+	success(c, http.StatusOK, result)
+}
+
 func (a *API) PreviewMediaLibraryStructureSelection(c *gin.Context) {
 	actor, _ := middleware.ActorFrom(c)
 	id, ok := pathID(c)
@@ -669,6 +709,29 @@ func (a *API) RepairMediaLibraryStructureSelection(c *gin.Context) {
 		return
 	}
 	success(c, http.StatusAccepted, mediaLibraryStructureRepairDTO(repair))
+}
+
+func (a *API) MediaLibraryStructurePreviewItems(c *gin.Context) {
+	actor, _ := middleware.ActorFrom(c)
+	id, ok := pathID(c)
+	if !ok {
+		return
+	}
+	var payload struct {
+		ConfirmationToken string `json:"confirmation_token"`
+		Page              int    `json:"page"`
+		PageSize          int    `json:"page_size"`
+	}
+	if err := strictJSON(c, &payload); err != nil {
+		writeError(c, a.log, invalid("目录预览分页参数无效", err))
+		return
+	}
+	result, err := a.libraryStructure.SelectionPreviewItems(c.Request.Context(), actor, id, payload.ConfirmationToken, payload.Page, payload.PageSize)
+	if err != nil {
+		writeError(c, a.log, err)
+		return
+	}
+	success(c, http.StatusOK, result)
 }
 
 func (a *API) RepairMediaLibraryStructure(c *gin.Context) {

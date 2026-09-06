@@ -11,14 +11,13 @@ describe('mixed dashboard card contract', () => {
     expect(dashboardCards.at(-1)?.id).toBe('discovery-hero')
   })
 
-  it('has one real baseline owner and explicit planned states for unimplemented domains', () => {
-    expect(dashboardCards.filter(card => card.state === 'live').map(card => card.id)).toEqual(['server-status'])
-    expect(dashboardCards.filter(card => card.id !== 'server-status').every(card => card.state === 'planned')).toBe(true)
+  it('marks only wired read models as live', () => {
+    expect(dashboardCards.filter(card => card.state === 'live').map(card => card.id)).toEqual(['server-status', 'media-summary', 'storage-summary', 'connection-health', 'active-tasks', 'scheduler-jobs', 'download-summary'])
   })
 
   it('omits protected domain cards instead of leaking their counts', () => {
     const visible = getVisibleDashboardCards([Permissions.DashboardRead])
-    expect(visible.map(card => card.id)).toEqual(['server-status', 'media-summary'])
+    expect(visible.map(card => card.id)).toEqual(['server-status'])
 
     const transferVisible = getVisibleDashboardCards([Permissions.TransfersReadOwn])
     expect(transferVisible.map(card => card.id)).toEqual(['recent-imports'])
