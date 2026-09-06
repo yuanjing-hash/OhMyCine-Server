@@ -275,7 +275,13 @@ func TestCatalogConversionPublishedReceiptSurvivesLostACK(t *testing.T) {
 }
 
 func TestCatalogConversionRevokedRecoveryRebuildsNewConfigWithoutChangingLegacy(t *testing.T) {
-	s, input, library, _, entries := catalogConversionFixture(t)
+	s, input, library, _, _ := catalogConversionFixture(t)
+	// Compare persisted facts before/after recovery, not GORM's in-memory Create
+	// values: SQLite round trips may represent the same instant in another zone.
+	var entries []models.MediaLibraryEntry
+	if err := s.writeDB.Where("library_id=?", library.ID).Order("id").Find(&entries).Error; err != nil {
+		t.Fatal(err)
+	}
 	candidate, token, err := s.startCatalogConversion(context.Background(), input)
 	if err != nil {
 		t.Fatal(err)

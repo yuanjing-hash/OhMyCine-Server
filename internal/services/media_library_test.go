@@ -23,6 +23,7 @@ import (
 	serverlog "github.com/yuanjing-hash/OhMyCine-Server/internal/logging"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/medialibrary"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
+	storagefs "github.com/yuanjing-hash/OhMyCine-Server/internal/storage"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/metadata/tmdb"
 	"gorm.io/gorm"
@@ -53,7 +54,7 @@ func mediaLibraryTestService(t *testing.T) (*MediaLibraryService, *gorm.DB, Acto
 		t.Fatal(err)
 	}
 	root := t.TempDir()
-	storage := models.Storage{Name: "Test storage", NameNormalized: "test storage", Type: models.StorageTypeLocal, RootPath: root, RootPathNormalized: strings.ToLower(root), Enabled: true, Capabilities: `{}`}
+	storage := models.Storage{Name: "Test storage", NameNormalized: "test storage", Type: models.StorageTypeLocal, RootPath: root, RootPathNormalized: storagefs.NormalizeForComparison(root), Enabled: true, Capabilities: `{}`}
 	if err := db.Create(&storage).Error; err != nil {
 		t.Fatal(err)
 	}
@@ -880,7 +881,7 @@ func TestMediaLibraryImportPolicyAndOrder(t *testing.T) {
 		t.Fatal(err)
 	}
 	root := t.TempDir()
-	secondStorage := models.Storage{Name: "Second storage", NameNormalized: "second storage", Type: models.StorageTypeLocal, RootPath: root, RootPathNormalized: strings.ToLower(root), Enabled: true, Capabilities: `{}`}
+	secondStorage := models.Storage{Name: "Second storage", NameNormalized: "second storage", Type: models.StorageTypeLocal, RootPath: root, RootPathNormalized: storagefs.NormalizeForComparison(root), Enabled: true, Capabilities: `{}`}
 	if err := db.Create(&secondStorage).Error; err != nil {
 		t.Fatal(err)
 	}
@@ -934,7 +935,7 @@ func TestLiveMediaLibraryRootIsReadOnly(t *testing.T) {
 	before := snapshotTree(t, root)
 	service, db, actor, storage, profile := mediaLibraryTestService(t)
 	storage.RootPath = root
-	storage.RootPathNormalized = strings.ToLower(filepath.Clean(root))
+	storage.RootPathNormalized = storagefs.NormalizeForComparison(root)
 	if err := db.Save(&storage).Error; err != nil {
 		t.Fatal(err)
 	}
