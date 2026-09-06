@@ -2,7 +2,9 @@ package services
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -264,6 +266,162 @@ func TestStructureSelectionBulkCoversAllPagesAndExplicitSelectionWins(t *testing
 	}
 	if preview.IssueCount != 3 || preview.SkippedCount != 1 || preview.RecycleCount != 2 || preview.MoveCount != 2 {
 		t.Fatalf("bulk preview did not cover authoritative result set: %+v", preview)
+	}
+}
+
+func TestStructureSelectionAutomaticallyIncludesRepairableVideoAndSidecar(t *testing.T) {
+	service, actor, library := structureConfirmationFixture(t)
+	if err := service.db.Model(&models.MediaLibrary{}).Where("id = ?", library.ID).Updates(map[string]any{
+		"movie_directory_template": "电影/{title} ({year})",
+		"movie_filename_template":  "{title} ({year})",
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := service.db.Create(&models.MediaLibraryStructureAutoState{LibraryID: library.ID, SourceRevision: 1, Status: "pending", UpdatedAt: time.Now().UTC()}).Error; err != nil {
+		t.Fatal(err)
+	}
+	year, tmdbID := 1995, int64(123)
+	entries := []models.MediaLibraryEntry{
+		{LibraryID: library.ID, RelativePath: "/旧目录/影片.mkv", ProviderID: "video", MediaType: "movie", Title: "影片", WorkKey: "movie:tmdb:123", MatchStatus: mediaRecognitionStatusMatched, TMDBID: &tmdbID, ReleaseYear: &year, LastGeneration: library.BaselineGeneration},
+		{LibraryID: library.ID, RelativePath: "/未知/unknown.mkv", ProviderID: "unknown-video", MatchStatus: mediaRecognitionStatusUnrecognized, LastGeneration: library.BaselineGeneration},
+	}
+	asset := models.MediaLibrarySourceAsset{LibraryID: library.ID, Generation: library.BaselineGeneration, ProviderID: "poster", ParentProviderID: "old-directory", RelativePath: "/旧目录/poster.jpg", Name: "poster.jpg", Extension: ".jpg", Size: 10, Active: true}
+	if err := service.db.Create(&entries).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := service.db.Create(&asset).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := service.EnqueueDiagnosis(context.Background(), library.ID, 0, library.BaselineGeneration, "manual"); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := service.queue.Claim([]string{JobTypeMediaLibraryStructureDiagnosis})
+	if err != nil || claimed == nil {
+		t.Fatalf("claim diagnosis=%+v err=%v", claimed, err)
+	}
+	if result := NewMediaLibraryStructureDiagnosisWorker(service).Run(context.Background(), fastScanTestRuntime{}, *claimed); result.ErrorCode != "" {
+		t.Fatalf("diagnosis=%+v", result)
+	}
+	if err := service.queue.Complete(claimed.Job.ID, claimed.LeaseToken); err != nil {
+		t.Fatal(err)
+	}
+	diagnostics, err := service.Diagnostics(context.Background(), actor, library.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if diagnostics.IssueCount != 3 || diagnostics.RepairableCount != 2 || diagnostics.Unrecognized != 1 {
+		t.Fatalf("diagnostics=%+v", diagnostics)
+	}
+	preview, err := service.PreviewSelectionRepair(context.Background(), actor, library.ID, MediaLibraryStructureSelectionInput{Revision: diagnostics.Revision, IncludeAutomaticRepairs: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if preview.IssueCount != 2 || preview.MoveCount != 2 || preview.RecycleCount != 0 || preview.SkippedCount != 0 {
+		t.Fatalf("automatic preview=%+v", preview)
+	}
+	kinds := map[string]bool{}
+	for _, item := range preview.Items.List {
+		kinds[item.Kind] = true
+	}
+	if !kinds["video"] || !kinds["sidecar"] {
+		t.Fatalf("automatic preview omitted video or sidecar: %+v", preview.Items.List)
+	}
+}
+
+func TestStructureSelectionMoveOrderingMatchesStableDependencySemantics(t *testing.T) {
+	items := []StructurePlanItem{
+		{SourceRelative: "a.mkv", TargetRelative: "b.mkv"},
+		{SourceRelative: "c.mkv", TargetRelative: "free-c.mkv"},
+		{SourceRelative: "b.mkv", TargetRelative: "free-b.mkv"},
+		{SourceRelative: "d.mkv", TargetRelative: "e.mkv"},
+		{SourceRelative: "e.mkv", TargetRelative: "free-e.mkv"},
+	}
+	ordered := orderStructureSelectionMoves(items)
+	want := []string{"c.mkv", "b.mkv", "a.mkv", "e.mkv", "d.mkv"}
+	if len(ordered) != len(want) {
+		t.Fatalf("ordered %d moves, want %d", len(ordered), len(want))
+	}
+	for index, source := range want {
+		if ordered[index].SourceRelative != source {
+			t.Fatalf("order[%d]=%q want %q; full=%+v", index, ordered[index].SourceRelative, source, ordered)
+		}
+	}
+}
+
+func TestStructureSelectionMoveOrderingPreservesSortedCycleFallback(t *testing.T) {
+	items := []StructurePlanItem{
+		{SourceRelative: "z.mkv", TargetRelative: "free.mkv"},
+		{SourceRelative: "b.mkv", TargetRelative: "a.mkv"},
+		{SourceRelative: "a.mkv", TargetRelative: "b.mkv"},
+	}
+	ordered := orderStructureSelectionMoves(items)
+	want := []string{"z.mkv", "a.mkv", "b.mkv"}
+	for index, source := range want {
+		if ordered[index].SourceRelative != source {
+			t.Fatalf("cycle fallback[%d]=%q want %q; full=%+v", index, ordered[index].SourceRelative, source, ordered)
+		}
+	}
+}
+
+func TestStructureSelectionPlanIndexPreservesUnicodeEqualFoldPathMatching(t *testing.T) {
+	base := StructurePlan{
+		Items:          []StructurePlanItem{{Kind: "video", SourceRelative: `Folder/ſample.mkv`, TargetRelative: `Target/Movie.mkv`}},
+		ConflictGroups: []StructureConflictGroup{{Code: "duplicate_target", TargetRelative: `Target/ſpecial.mkv`}},
+	}
+	index := newStructureSelectionPlanIndex(base)
+	if _, exists := index.items[structureSelectionItemKey("video", `folder/sample.MKV`, `target/movie.MKV`)]; !exists {
+		t.Fatal("indexed item lookup no longer matches the former Unicode EqualFold semantics")
+	}
+	if _, exists := index.conflictGroups[structureSelectionConflictKey("duplicate_target", `target/special.MKV`)]; !exists {
+		t.Fatal("indexed conflict lookup no longer matches the former Unicode EqualFold semantics")
+	}
+}
+
+func TestStructureSelectionLargeAutomaticBatchPlanningCompletesWithinBound(t *testing.T) {
+	const itemCount = 16773
+	base := StructurePlan{Items: make([]StructurePlanItem, itemCount)}
+	issues := make([]models.MediaLibraryStructureIssue, itemCount)
+	for index := 0; index < itemCount; index++ {
+		source := fmt.Sprintf("incoming/%05d.mkv", index)
+		target := fmt.Sprintf("library/%05d.mkv", index)
+		base.Items[index] = StructurePlanItem{Kind: "video", SourceRelative: source, TargetRelative: target, ProviderID: fmt.Sprintf("provider-%05d", index)}
+		issues[index] = models.MediaLibraryStructureIssue{Token: fmt.Sprintf("issue-%05d", index), Kind: "video", Code: "path_mismatch", CurrentPath: source, ExpectedPath: target, Repairable: true}
+	}
+
+	started := time.Now()
+	index := newStructureSelectionPlanIndex(base)
+	plan := StructurePlan{}
+	for _, issue := range issues {
+		selection := MediaLibraryStructureSelection{IssueToken: issue.Token, Action: StructureSelectionRepair}
+		if err := appendIndexedStructureSelection(&plan, base, index, issue, nil, selection, "large-draft"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	plan.Items = orderStructureSelectionMoves(plan.Items)
+	elapsed := time.Since(started)
+	if len(plan.Items) != itemCount || len(plan.ResolvedIssues) != itemCount {
+		t.Fatalf("large plan items=%d resolved=%d", len(plan.Items), len(plan.ResolvedIssues))
+	}
+	if elapsed > 5*time.Second {
+		t.Fatalf("large automatic selection planning took %s; expected indexed bounded planning", elapsed)
+	}
+}
+
+func TestStructureSelectionLargePreviewResponseOmitsDuplicateSelectionList(t *testing.T) {
+	selections := make([]MediaLibraryStructureSelection, maxStructurePreviewResponseSelections+1)
+	if got := structurePreviewResponseSelections(selections); got != nil {
+		t.Fatalf("large response repeated %d frozen selections", len(got))
+	}
+	if got := structurePreviewResponseSelections(selections[:maxStructurePreviewResponseSelections]); len(got) != maxStructurePreviewResponseSelections {
+		t.Fatalf("bounded compatibility response selections=%d", len(got))
+	}
+	preview := MediaLibraryStructureSelectionPreview{IssueCount: len(selections), Selections: structurePreviewResponseSelections(selections)}
+	raw, err := json.Marshal(preview)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), `"selections"`) {
+		t.Fatalf("large initial response still contains duplicate selections: %s", raw)
 	}
 }
 

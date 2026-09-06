@@ -82,6 +82,35 @@ func TestStructureIssuesPersistAndPageBeyondLegacySampleLimit(t *testing.T) {
 	}
 }
 
+func TestStructureIssuesUseBoundedBatchStatements(t *testing.T) {
+	service, _, library := structureConfirmationFixture(t)
+	const issueTotal = 10_000
+	issues := make([]StructureIssue, 0, issueTotal)
+	for index := 0; index < issueTotal; index++ {
+		issues = append(issues, StructureIssue{Code: "path_mismatch", Kind: "video", CurrentPath: fmt.Sprintf("source/%04d.mkv", index), ExpectedPath: fmt.Sprintf("target/%04d.mkv", index), Repairable: true})
+	}
+	counter := &traceCountingGORMLogger{}
+	db := service.db.Session(&gorm.Session{Logger: counter})
+	if err := db.Transaction(func(tx *gorm.DB) error {
+		return insertStructureIssuesTx(tx, library.ID, "batch-diagnosis", library.BaselineGeneration, issues, time.Now().UTC(), "")
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if statements := counter.count.Load(); statements > 50 {
+		t.Fatalf("structure issue publication used %d SQL statements, want bounded batches", statements)
+	}
+	var issueCount, memberCount int64
+	if err := service.db.Model(&models.MediaLibraryStructureIssue{}).Where("diagnosis_job_id = ?", "batch-diagnosis").Count(&issueCount).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := service.db.Model(&models.MediaLibraryStructureIssueMember{}).Count(&memberCount).Error; err != nil {
+		t.Fatal(err)
+	}
+	if issueCount != issueTotal || memberCount != issueTotal {
+		t.Fatalf("issue_count=%d member_count=%d", issueCount, memberCount)
+	}
+}
+
 func TestStructureIssuesDefensivelyRedactsInvalidPersistedPaths(t *testing.T) {
 	service, actor, library := structureConfirmationFixture(t)
 	now := time.Now().UTC()
@@ -157,6 +186,13 @@ func TestRefreshRecognitionProjectionPersistsIdentityWithoutMovingFilesOrEnqueue
 	if err := service.db.Create(&models.MediaLibraryStructureIssueMember{IssueID: oldIssue.ID, Token: "old-member", SourcePath: oldIssue.CurrentPath, CreatedAt: now}).Error; err != nil {
 		t.Fatal(err)
 	}
+	reviewSession := models.MediaLibraryStructureReviewSession{ID: "manual-projection-review", OwnerID: actor.User.ID, LibraryID: library.ID, DiagnosisJobID: diagnosis.JobID, Revision: 1, CreatedAt: now, UpdatedAt: now}
+	if err := service.db.Create(&reviewSession).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := service.db.Create(&models.MediaLibraryStructureReviewChoice{SessionID: reviewSession.ID, SubjectKey: "issue:" + oldIssue.Token, SubjectKind: "issue", IssueToken: oldIssue.Token, Action: StructureSelectionSkip, State: "draft", CreatedAt: now, UpdatedAt: now}).Error; err != nil {
+		t.Fatal(err)
+	}
 	var jobsBefore int64
 	if err := service.db.Model(&models.Job{}).Count(&jobsBefore).Error; err != nil {
 		t.Fatal(err)
@@ -176,6 +212,16 @@ func TestRefreshRecognitionProjectionPersistsIdentityWithoutMovingFilesOrEnqueue
 			t.Fatalf("projected issue=%+v", issue)
 		}
 	}
+	var staleChoices int64
+	if err := service.db.Model(&models.MediaLibraryStructureReviewChoice{}).Where("session_id = ? AND issue_token = ?", reviewSession.ID, oldIssue.Token).Count(&staleChoices).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := service.db.First(&reviewSession, "id = ?", reviewSession.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if staleChoices != 0 || reviewSession.Revision != 2 {
+		t.Fatalf("obsolete review choice was not invalidated: choices=%d revision=%d", staleChoices, reviewSession.Revision)
+	}
 	var jobsAfter int64
 	if err := service.db.Model(&models.Job{}).Count(&jobsAfter).Error; err != nil {
 		t.Fatal(err)
@@ -186,6 +232,21 @@ func TestRefreshRecognitionProjectionPersistsIdentityWithoutMovingFilesOrEnqueue
 	content, err := os.ReadFile(physical)
 	if err != nil || string(content) != "unchanged" {
 		t.Fatalf("manual identity changed file before repair: content=%q err=%v", content, err)
+	}
+	if err := service.db.Model(&models.MediaLibraryRecognition{}).Where("id = ?", recognition.ID).Update("manual_override", false).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := service.RefreshRecognitionProjection(context.Background(), library.ID, recognition.ID); err != nil {
+		t.Fatal(err)
+	}
+	projected = nil
+	if err := service.db.Where("library_id = ? AND recognition_id = ?", library.ID, recognition.ID).Find(&projected).Error; err != nil {
+		t.Fatal(err)
+	}
+	for _, issue := range projected {
+		if issue.State == "manual_identity_resolved" || issue.Code == "manual_identity_resolved" {
+			t.Fatalf("restored automatic recognition retained manual projection: %+v", issue)
+		}
 	}
 }
 

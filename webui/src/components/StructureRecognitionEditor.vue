@@ -4,8 +4,8 @@ import { api } from '@/api/client'
 import { createLatestRequest } from '@/latest-request'
 import type { ListResponse, MediaRecognitionSummary, TMDBCandidate } from '@/types/api'
 
-const props = defineProps<{ libraryId: number; recognitionToken: string }>()
-const emit = defineEmits<{ close: []; saved: [item: MediaRecognitionSummary] }>()
+const props = defineProps<{ libraryId: number; recognitionToken: string; allowRestore?: boolean }>()
+const emit = defineEmits<{ close: []; saved: [item: MediaRecognitionSummary]; restored: [item: MediaRecognitionSummary] }>()
 const request = createLatestRequest()
 const item = ref<MediaRecognitionSummary | null>(null)
 const titleInput = ref<HTMLInputElement | null>(null)
@@ -54,6 +54,15 @@ async function save(candidate: TMDBCandidate) {
   } catch (reason) { if (current.isCurrent()) error.value = `保存未确认，请核对后再试：${message(reason)}` }
   finally { if (current.isCurrent()) saving.value = false; current.finish() }
 }
+async function restoreAutomatic() {
+  if (saving.value || !item.value?.manual_override || !window.confirm('恢复自动识别？如果 TMDB 暂时不可用，原人工识别会继续保留。')) return
+  const current = request.begin(); saving.value = true; error.value = ''
+  try {
+    const restored = await api<MediaRecognitionSummary>(`${endpoint()}/override`, { method: 'DELETE', signal: current.signal })
+    if (current.isCurrent()) emit('restored', restored)
+  } catch (reason) { if (current.isCurrent()) error.value = `恢复自动识别失败，原人工结果仍保留：${message(reason)}` }
+  finally { if (current.isCurrent()) saving.value = false; current.finish() }
+}
 watch(() => [props.libraryId, props.recognitionToken], () => void load(), { immediate: true })
 onBeforeUnmount(() => request.cancel())
 </script>
@@ -70,6 +79,7 @@ onBeforeUnmount(() => request.cancel())
       <button class="btn-primary" :disabled="loading || saving">{{ loading ? '搜索中…' : '搜索 TMDB' }}</button>
       <p v-if="searched && !loading && candidates.length === 0" class="text-subtle m-0">没有找到候选，请调整标题、类型或年份。</p>
       <button v-for="candidate in candidates" :key="`${candidate.media_type}-${candidate.id}`" class="btn-secondary text-left" type="button" :disabled="saving" @click="save(candidate)">{{ candidate.title }} · {{ candidate.release_year || '年份未知' }} · TMDB {{ candidate.id }} · 保存此识别</button>
+      <button v-if="allowRestore && item.manual_override" class="btn-secondary" type="button" :disabled="saving" @click="restoreAutomatic">恢复自动识别</button>
     </template>
     <p v-else-if="loading" class="text-subtle m-0">正在读取当前问题的识别记录…</p>
     <button class="btn-secondary" type="button" :disabled="saving" @click="emit('close')">取消并返回诊断</button>

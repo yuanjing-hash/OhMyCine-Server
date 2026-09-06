@@ -75,4 +75,20 @@ describe('API CSRF recovery', () => {
     expect(refreshCalls).toBe(1)
     expect(mutationCalls).toEqual(new Map([['/api/v1/jobs/job-1/retry', 2], ['/api/v1/jobs/job-2/retry', 2]]))
   })
+
+  it('broadcasts logout only for an explicit unauthenticated response', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(envelope(401, 40101, { error_code: 'INTERNAL_ERROR' }, '服务器内部错误'))
+      .mockResolvedValueOnce(envelope(401, 40101, { error_code: 'NOT_AUTHENTICATED' }, '登录会话已过期'))
+
+    await expect(api('/api/v1/media-libraries/1/structure'))
+      .rejects.toEqual(expect.objectContaining<Partial<APIError>>({ status: 401, errorCode: 'INTERNAL_ERROR' }))
+    expect(dispatchEvent).not.toHaveBeenCalled()
+
+    await expect(api('/api/v1/media-libraries/1/structure'))
+      .rejects.toEqual(expect.objectContaining<Partial<APIError>>({ status: 401, errorCode: 'NOT_AUTHENTICATED' }))
+    expect(dispatchEvent).toHaveBeenCalledTimes(1)
+    expect(dispatchEvent.mock.calls[0]![0]).toEqual(expect.objectContaining({ type: 'omc:unauthorized' }))
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+  })
 })

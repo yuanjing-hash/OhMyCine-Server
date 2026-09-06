@@ -141,7 +141,7 @@ func main() {
 		logging.OperationServerLifecycle.Event(log.Fatal()).Err(err).Str("error_code", "runtime_logging_initialization_failed").Msg(logging.OperationServerLifecycle.Message("运行日志初始化失败"))
 	}
 	authorization := services.NewAuthorizationService(db)
-	auth, err := services.NewAuthService(db, cfg, authorization, audit)
+	auth, err := services.NewAuthService(db, cfg, authorization, audit, logManager.Logger("authentication", "session"))
 	if err != nil {
 		logging.OperationServerLifecycle.Event(log.Fatal()).Err(err).Str("error_code", "authentication_initialization_failed").Msg(logging.OperationServerLifecycle.Message("认证服务初始化失败"))
 	}

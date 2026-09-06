@@ -152,22 +152,38 @@ type MediaLibraryStructureIssueSummary struct {
 	TMDBID                 *int64                                    `json:"tmdb_id,omitempty"`
 	PosterPath             string                                    `json:"poster_path,omitempty"`
 	ConflictSourceCount    int                                       `json:"conflict_source_count,omitempty"`
+	AffectedFileCount      int                                       `json:"affected_file_count,omitempty"`
 	RecommendedMemberToken string                                    `json:"recommended_member_token,omitempty"`
 	Members                []MediaLibraryStructureIssueMemberSummary `json:"members"`
+	ReviewAction           string                                    `json:"review_action,omitempty"`
+	ReviewMemberToken      string                                    `json:"review_member_token,omitempty"`
+	ReviewState            string                                    `json:"review_state,omitempty"`
 }
 
 type MediaLibraryStructureIssuePage struct {
-	List     []MediaLibraryStructureIssueSummary `json:"list"`
-	Total    int64                               `json:"total"`
-	Page     int                                 `json:"page"`
-	PageSize int                                 `json:"page_size"`
+	List           []MediaLibraryStructureIssueSummary `json:"list"`
+	Total          int64                               `json:"total"`
+	Page           int                                 `json:"page"`
+	PageSize       int                                 `json:"page_size"`
+	ReviewRevision uint64                              `json:"review_revision"`
+	PendingTotal   int64                               `json:"pending_total"`
+	HandledTotal   int64                               `json:"handled_total"`
 }
 
 type MediaLibraryStructureIssueQuery struct {
-	Page       int
-	PageSize   int
-	Code       string
-	Actionable bool
+	Page        int
+	PageSize    int
+	Code        string
+	Actionable  bool
+	ReviewState string
+	OwnerID     uint
+}
+
+type MediaLibraryStructureIssueMemberPage struct {
+	List     []MediaLibraryStructureIssueMemberSummary `json:"list"`
+	Total    int64                                     `json:"total"`
+	Page     int                                       `json:"page"`
+	PageSize int                                       `json:"page_size"`
 }
 
 type mediaLibraryStructureDiagnosisJobPayload struct {
@@ -360,6 +376,11 @@ func (s *MediaLibraryStructureService) StructureIssues(ctx context.Context, acto
 		query.PageSize = 200
 	}
 	query.Code = safeLabel(strings.TrimSpace(query.Code), 64)
+	query.OwnerID = actor.User.ID
+	query.ReviewState = strings.ToLower(strings.TrimSpace(query.ReviewState))
+	if query.ReviewState != "pending" && query.ReviewState != "handled" {
+		query.ReviewState = ""
+	}
 	var result MediaLibraryStructureIssuePage
 	err := s.withCatalogRead(ctx, libraryID, func(tx *gorm.DB, reader *CatalogReader) error {
 		var err error
@@ -382,6 +403,27 @@ func (s *MediaLibraryStructureService) structureIssuesTx(tx *gorm.DB, reader *Ca
 	if query.Actionable {
 		db = db.Where("code <> ?", "missing_season_episode")
 	}
+	var diagnosis models.MediaLibraryStructureDiagnosis
+	if err := tx.Where("library_id = ?", libraryID).First(&diagnosis).Error; err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+		return MediaLibraryStructureIssuePage{}, err
+	}
+	var reviewSession models.MediaLibraryStructureReviewSession
+	if query.OwnerID != 0 && diagnosis.JobID != "" {
+		err := tx.Where("owner_id = ? AND library_id = ? AND diagnosis_job_id = ?", query.OwnerID, libraryID, diagnosis.JobID).First(&reviewSession).Error
+		if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+			return MediaLibraryStructureIssuePage{}, err
+		}
+	}
+	choiceExists := "EXISTS (SELECT 1 FROM media_library_structure_review_choices rc WHERE rc.session_id = ? AND (rc.subject_key = ('issue:' || media_library_structure_issues.token) OR (media_library_structure_issues.recognition_id IS NOT NULL AND rc.subject_key = ('recognition:' || CAST(media_library_structure_issues.recognition_id AS TEXT)))))"
+	if reviewSession.ID != "" {
+		if query.ReviewState == "pending" {
+			db = db.Where("NOT "+choiceExists, reviewSession.ID)
+		} else if query.ReviewState == "handled" {
+			db = db.Where(choiceExists, reviewSession.ID)
+		}
+	} else if query.ReviewState == "handled" {
+		db = db.Where("1 = 0")
+	}
 	var total int64
 	if err := db.Count(&total).Error; err != nil {
 		return MediaLibraryStructureIssuePage{}, err
@@ -398,7 +440,7 @@ func (s *MediaLibraryStructureService) structureIssuesTx(tx *gorm.DB, reader *Ca
 			recognitionIDs = append(recognitionIDs, *row.RecognitionID)
 		}
 	}
-	membersByIssue, err := loadStructureIssueMembersTx(tx, issueIDs)
+	membersByIssue, err := loadStructureIssueMemberPreviewsTx(tx, issueIDs, 8)
 	if err != nil {
 		return MediaLibraryStructureIssuePage{}, err
 	}
@@ -412,10 +454,49 @@ func (s *MediaLibraryStructureService) structureIssuesTx(tx *gorm.DB, reader *Ca
 			recognitionsByID[recognition.ID] = recognition
 		}
 	}
-	result := MediaLibraryStructureIssuePage{List: make([]MediaLibraryStructureIssueSummary, 0, len(rows)), Total: total, Page: query.Page, PageSize: query.PageSize}
+	result := MediaLibraryStructureIssuePage{List: make([]MediaLibraryStructureIssueSummary, 0, len(rows)), Total: total, Page: query.Page, PageSize: query.PageSize, ReviewRevision: reviewSession.Revision}
+	if diagnosis.JobID != "" {
+		base := tx.Model(&models.MediaLibraryStructureIssue{}).Where("library_id = ? AND diagnosis_job_id = ? AND generation = ? AND code <> ?", libraryID, diagnosis.JobID, diagnosis.Generation, "missing_season_episode")
+		if query.Code != "" && query.Code != "all" {
+			base = base.Where("code = ?", query.Code)
+		}
+		if reviewSession.ID == "" {
+			if err := base.Count(&result.PendingTotal).Error; err != nil {
+				return MediaLibraryStructureIssuePage{}, err
+			}
+		} else {
+			if err := base.Where(choiceExists, reviewSession.ID).Count(&result.HandledTotal).Error; err != nil {
+				return MediaLibraryStructureIssuePage{}, err
+			}
+			base = tx.Model(&models.MediaLibraryStructureIssue{}).Where("library_id = ? AND diagnosis_job_id = ? AND generation = ? AND code <> ?", libraryID, diagnosis.JobID, diagnosis.Generation, "missing_season_episode")
+			if query.Code != "" && query.Code != "all" {
+				base = base.Where("code = ?", query.Code)
+			}
+			if err := base.Where("NOT "+choiceExists, reviewSession.ID).Count(&result.PendingTotal).Error; err != nil {
+				return MediaLibraryStructureIssuePage{}, err
+			}
+		}
+	}
+	choicesBySubject := map[string]models.MediaLibraryStructureReviewChoice{}
+	if reviewSession.ID != "" && len(rows) > 0 {
+		keys := make([]string, 0, len(rows)*2)
+		for _, row := range rows {
+			keys = append(keys, "issue:"+row.Token)
+			if row.RecognitionID != nil {
+				keys = append(keys, fmt.Sprintf("recognition:%d", *row.RecognitionID))
+			}
+		}
+		var choices []models.MediaLibraryStructureReviewChoice
+		if err := tx.Where("session_id = ? AND subject_key IN ?", reviewSession.ID, keys).Find(&choices).Error; err != nil {
+			return MediaLibraryStructureIssuePage{}, err
+		}
+		for _, choice := range choices {
+			choicesBySubject[choice.SubjectKey] = choice
+		}
+	}
 	for _, row := range rows {
 		members := membersByIssue[row.ID]
-		item := MediaLibraryStructureIssueSummary{Token: row.Token, Code: row.Code, Kind: row.Kind, State: row.State, Repairable: row.Repairable, Title: safeMediaDisplayName(row.Title), CurrentPath: safeStructurePath(row.CurrentPath), ExpectedPath: safeStructurePath(row.ExpectedPath), ConflictSourceCount: row.ConflictSourceCount, RecommendedMemberToken: row.RecommendedMemberToken, Members: make([]MediaLibraryStructureIssueMemberSummary, 0, len(members))}
+		item := MediaLibraryStructureIssueSummary{Token: row.Token, Code: row.Code, Kind: row.Kind, State: row.State, Repairable: row.Repairable, Title: safeMediaDisplayName(row.Title), CurrentPath: safeStructurePath(row.CurrentPath), ExpectedPath: safeStructurePath(row.ExpectedPath), ConflictSourceCount: row.ConflictSourceCount, AffectedFileCount: row.ConflictSourceCount, RecommendedMemberToken: row.RecommendedMemberToken, Members: make([]MediaLibraryStructureIssueMemberSummary, 0, len(members))}
 		if row.RecognitionID != nil {
 			if recognition, exists := recognitionsByID[*row.RecognitionID]; exists {
 				item.RecognitionToken = encodeRecognitionToken(*row.RecognitionID)
@@ -438,7 +519,13 @@ func (s *MediaLibraryStructureService) structureIssuesTx(tx *gorm.DB, reader *Ca
 			}
 			item.Members = append(item.Members, MediaLibraryStructureIssueMemberSummary{Token: member.Token, SourcePath: sourcePath, Recommended: member.Recommended})
 		}
-		item.ConflictSourceCount = len(item.Members)
+		choice, exists := choicesBySubject["issue:"+row.Token]
+		if !exists && row.RecognitionID != nil {
+			choice, exists = choicesBySubject[fmt.Sprintf("recognition:%d", *row.RecognitionID)]
+		}
+		if exists {
+			item.ReviewAction, item.ReviewMemberToken, item.ReviewState = choice.Action, choice.MemberToken, choice.State
+		}
 		result.List = append(result.List, item)
 	}
 	return result, nil
@@ -460,6 +547,26 @@ func loadStructureIssueMembersTx(tx *gorm.DB, issueIDs []uint) (map[uint][]model
 		for _, member := range members {
 			result[member.IssueID] = append(result[member.IssueID], member)
 		}
+	}
+	return result, nil
+}
+
+func loadStructureIssueMemberPreviewsTx(tx *gorm.DB, issueIDs []uint, perIssue int) (map[uint][]models.MediaLibraryStructureIssueMember, error) {
+	result := make(map[uint][]models.MediaLibraryStructureIssueMember, len(issueIDs))
+	if len(issueIDs) == 0 || perIssue <= 0 {
+		return result, nil
+	}
+	type rankedMember struct {
+		models.MediaLibraryStructureIssueMember
+		RowNumber int `gorm:"column:row_number"`
+	}
+	var members []rankedMember
+	err := tx.Raw(`SELECT id,issue_id,token,source_path,recommended,created_at,row_number FROM (SELECT m.*, ROW_NUMBER() OVER (PARTITION BY issue_id ORDER BY id) AS row_number FROM media_library_structure_issue_members m WHERE issue_id IN ?) ranked WHERE row_number <= ? ORDER BY issue_id,id`, issueIDs, perIssue).Scan(&members).Error
+	if err != nil {
+		return nil, err
+	}
+	for _, member := range members {
+		result[member.IssueID] = append(result[member.IssueID], member.MediaLibraryStructureIssueMember)
 	}
 	return result, nil
 }
@@ -486,6 +593,12 @@ func (s *MediaLibraryStructureService) RefreshRecognitionProjection(ctx context.
 	facts, err := s.loadStructureCatalog(ctx, libraryID)
 	if err != nil {
 		return err
+	}
+	var recognition models.MediaLibraryRecognition
+	if err := s.withCatalogRead(ctx, libraryID, func(_ *gorm.DB, reader *CatalogReader) error {
+		return reader.Recognitions().Where("library_id = ? AND id = ?", libraryID, recognitionID).First(&recognition).Error
+	}); err != nil {
+		return recognitionNotFound(err)
 	}
 	library = facts.Library
 	var affectedEntries []models.MediaLibraryEntry
@@ -534,9 +647,14 @@ func (s *MediaLibraryStructureService) RefreshRecognitionProjection(ctx context.
 			projectedIssues = append(projectedIssues, issue)
 		}
 	}
-	if len(projectedIssues) == 0 {
+	manualIdentity := recognition.ManualOverride && recognition.Status == mediaRecognitionStatusMatched
+	if len(projectedIssues) == 0 && manualIdentity {
 		current := safeStructurePath(affectedEntries[0].RelativePath)
 		projectedIssues = []StructureIssue{{Code: "manual_identity_resolved", Kind: "video", WorkKey: affectedEntries[0].WorkKey, Title: affectedEntries[0].Title, CurrentPath: current, ExpectedPath: current, RecognitionID: recognitionID}}
+	}
+	forcedState := ""
+	if manualIdentity {
+		forcedState = "manual_identity_resolved"
 	}
 	now := time.Now().UTC()
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
@@ -567,10 +685,35 @@ func (s *MediaLibraryStructureService) RefreshRecognitionProjection(ctx context.
 		if len(paths) > 0 {
 			query = tx.Where("library_id = ? AND (recognition_id = ? OR id IN (SELECT issue_id FROM media_library_structure_issue_members WHERE source_path IN ?))", libraryID, recognitionID, paths)
 		}
+		var replaced []models.MediaLibraryStructureIssue
+		if err := query.Find(&replaced).Error; err != nil {
+			return err
+		}
+		if len(replaced) > 0 {
+			tokens := make([]string, 0, len(replaced))
+			for _, issue := range replaced {
+				tokens = append(tokens, issue.Token)
+			}
+			var changedSessions []string
+			if err := tx.Model(&models.MediaLibraryStructureReviewChoice{}).
+				Distinct("session_id").
+				Where("subject_kind = ? AND issue_token IN ? AND session_id IN (SELECT id FROM media_library_structure_review_sessions WHERE library_id = ? AND diagnosis_job_id = ?)", "issue", tokens, libraryID, diagnosis.JobID).
+				Pluck("session_id", &changedSessions).Error; err != nil {
+				return err
+			}
+			if len(changedSessions) > 0 {
+				if err := tx.Where("subject_kind = ? AND issue_token IN ? AND session_id IN ?", "issue", tokens, changedSessions).Delete(&models.MediaLibraryStructureReviewChoice{}).Error; err != nil {
+					return err
+				}
+				if err := tx.Model(&models.MediaLibraryStructureReviewSession{}).Where("id IN ?", changedSessions).Updates(map[string]any{"revision": gorm.Expr("revision + 1"), "updated_at": now}).Error; err != nil {
+					return err
+				}
+			}
+		}
 		if err := query.Delete(&models.MediaLibraryStructureIssue{}).Error; err != nil {
 			return err
 		}
-		if err := insertStructureIssuesTx(tx, libraryID, diagnosis.JobID, diagnosis.Generation, projectedIssues, now, "manual_identity_resolved"); err != nil {
+		if err := insertStructureIssuesTx(tx, libraryID, diagnosis.JobID, diagnosis.Generation, projectedIssues, now, forcedState); err != nil {
 			return err
 		}
 		return refreshStructureSummaryTx(tx, libraryID, now)
@@ -1418,13 +1561,21 @@ func persistStructureIssuesTx(tx *gorm.DB, libraryID uint, jobID string, generat
 	if err := tx.Where("library_id = ?", libraryID).Delete(&models.MediaLibraryStructureIssue{}).Error; err != nil {
 		return err
 	}
+	if err := tx.Where("library_id = ? AND diagnosis_job_id <> ?", libraryID, jobID).Delete(&models.MediaLibraryStructureReviewSession{}).Error; err != nil {
+		return err
+	}
 	return insertStructureIssuesTx(tx, libraryID, jobID, generation, plan.AllIssues, now, "")
 }
 
 func insertStructureIssuesTx(tx *gorm.DB, libraryID uint, jobID string, generation uint64, issues []StructureIssue, now time.Time, forcedState string) error {
+	const batchSize = 500
 	type pendingGroup struct {
 		issue   StructureIssue
 		sources []string
+	}
+	type pendingRow struct {
+		row     models.MediaLibraryStructureIssue
+		members []models.MediaLibraryStructureIssueMember
 	}
 	groups := make(map[string]*pendingGroup, len(issues))
 	order := make([]string, 0, len(issues))
@@ -1433,7 +1584,9 @@ func insertStructureIssuesTx(tx *gorm.DB, libraryID uint, jobID string, generati
 			continue
 		}
 		key := issue.Code + "\x00" + issue.Kind + "\x00" + issue.CurrentPath
-		if issue.ConflictSourceCount > 1 {
+		if issue.Code == "media_unrecognized" && issue.RecognitionID != 0 {
+			key = issue.Code + "\x00recognition\x00" + fmt.Sprintf("%d", issue.RecognitionID)
+		} else if issue.ConflictSourceCount > 1 {
 			key = issue.Code + "\x00" + issue.ExpectedPath
 		}
 		group := groups[key]
@@ -1467,6 +1620,7 @@ func insertStructureIssuesTx(tx *gorm.DB, libraryID uint, jobID string, generati
 		}
 	}
 	sort.Strings(order)
+	pending := make([]pendingRow, 0, len(order))
 	for _, key := range order {
 		group := groups[key]
 		sort.Slice(group.sources, func(i, j int) bool { return strings.ToLower(group.sources[i]) < strings.ToLower(group.sources[j]) })
@@ -1484,9 +1638,6 @@ func insertStructureIssuesTx(tx *gorm.DB, libraryID uint, jobID string, generati
 		if group.issue.RecognitionID != 0 {
 			row.RecognitionID = &group.issue.RecognitionID
 		}
-		if err := tx.Create(&row).Error; err != nil {
-			return err
-		}
 		recommendedIndex := -1
 		for index, source := range group.sources {
 			base := strings.TrimSuffix(pathpkg.Base(source), pathpkg.Ext(source))
@@ -1498,20 +1649,36 @@ func insertStructureIssuesTx(tx *gorm.DB, libraryID uint, jobID string, generati
 				recommendedIndex = index
 			}
 		}
+		members := make([]models.MediaLibraryStructureIssueMember, 0, len(group.sources))
 		for index, source := range group.sources {
-			member := models.MediaLibraryStructureIssueMember{IssueID: row.ID, Token: uuid.NewString(), SourcePath: source, Recommended: recommendedIndex == index, CreatedAt: now}
-			if err := tx.Create(&member).Error; err != nil {
-				return err
-			}
+			member := models.MediaLibraryStructureIssueMember{Token: uuid.NewString(), SourcePath: source, Recommended: recommendedIndex == index, CreatedAt: now}
 			if member.Recommended {
 				row.RecommendedMemberToken = member.Token
 			}
+			members = append(members, member)
 		}
-		if row.RecommendedMemberToken != "" {
-			if err := tx.Model(&models.MediaLibraryStructureIssue{}).Where("id = ?", row.ID).Update("recommended_member_token", row.RecommendedMemberToken).Error; err != nil {
-				return err
-			}
+		pending = append(pending, pendingRow{row: row, members: members})
+	}
+	if len(pending) == 0 {
+		return nil
+	}
+	rows := make([]models.MediaLibraryStructureIssue, len(pending))
+	for index := range pending {
+		rows[index] = pending[index].row
+	}
+	if err := tx.CreateInBatches(&rows, batchSize).Error; err != nil {
+		return err
+	}
+	members := make([]models.MediaLibraryStructureIssueMember, 0)
+	for index := range pending {
+		for memberIndex := range pending[index].members {
+			member := pending[index].members[memberIndex]
+			member.IssueID = rows[index].ID
+			members = append(members, member)
 		}
+	}
+	if len(members) > 0 {
+		return tx.CreateInBatches(&members, batchSize).Error
 	}
 	return nil
 }

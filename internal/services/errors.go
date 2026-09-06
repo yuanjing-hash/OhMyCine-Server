@@ -3,6 +3,7 @@ package services
 import "errors"
 
 const (
+	CodeInternalError                         = "INTERNAL_ERROR"
 	CodeInvalidRequest                        = "INVALID_REQUEST"
 	CodeHistoryClockAhead                     = "history_clock_ahead"
 	CodeNotAuthenticated                      = "NOT_AUTHENTICATED"
@@ -11,6 +12,7 @@ const (
 	CodeConflict                              = "CONFLICT"
 	CodeSetupComplete                         = "SETUP_ALREADY_COMPLETE"
 	CodeInvalidCredentials                    = "INVALID_CREDENTIALS"
+	CodeDatabaseBusy                          = "DATABASE_BUSY"
 	CodeLoginRateLimited                      = "LOGIN_RATE_LIMITED"
 	CodeOwnerProtected                        = "OWNER_PROTECTED"
 	CodeLastAdminRequired                     = "LAST_ADMIN_REQUIRED"
@@ -180,7 +182,7 @@ func ErrorCode(err error) string {
 	if errors.As(err, &target) {
 		return target.Code
 	}
-	return "INTERNAL_ERROR"
+	return CodeInternalError
 }
 
 // ErrorMessage returns the safe message for a domain error.

@@ -64,7 +64,7 @@ func writeError(c *gin.Context, log zerolog.Logger, err error) {
 		status = http.StatusTooManyRequests
 	case services.CodeDirectoryRateLimited:
 		status = http.StatusTooManyRequests
-	case services.CodeDirectoryBusy:
+	case services.CodeDirectoryBusy, services.CodeDatabaseBusy:
 		status = http.StatusServiceUnavailable
 	case services.CodeProxySignatureInvalid, services.CodeProxySignatureExpired:
 		status = http.StatusForbidden

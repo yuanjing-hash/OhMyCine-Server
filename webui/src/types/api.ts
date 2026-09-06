@@ -250,15 +250,17 @@ export interface MediaLibraryStructureIssueSummary {
   token: string; code: string; kind: 'video' | 'sidecar'; state: 'needs_attention' | 'pending_repair' | 'unrecognized' | 'manual_identity_resolved' | string
   repairable: boolean; title?: string; current_path?: string; expected_path?: string; recognition_token?: string
   media_type?: 'movie' | 'tv'; release_year?: number; tmdb_id?: number; poster_path?: string
-  conflict_source_count?: number; recommended_member_token?: string; members: MediaLibraryStructureIssueMember[]
+  conflict_source_count?: number; affected_file_count?: number; recommended_member_token?: string; members: MediaLibraryStructureIssueMember[]
+  review_action?: MediaLibraryStructureSelectionAction | 'manual_recognition'; review_member_token?: string; review_state?: 'draft' | 'submitted'
 }
-export type MediaLibraryStructureIssuePage = PageResponse<MediaLibraryStructureIssueSummary>
+export interface MediaLibraryStructureIssuePage extends PageResponse<MediaLibraryStructureIssueSummary> { review_revision: number; pending_total: number; handled_total: number }
+export type MediaLibraryStructureIssueMemberPage = PageResponse<MediaLibraryStructureIssueMember>
 export type MediaLibraryStructureSelectionAction = 'repair' | 'keep_recommended' | 'keep_member' | 'keep_all_versions' | 'skip'
 export interface MediaLibraryStructureSelection { issue_token: string; action: MediaLibraryStructureSelectionAction; member_token?: string }
 export interface MediaLibraryStructureBulkSelection { codes: string[]; action: 'keep_recommended' | 'skip' }
 export interface MediaLibraryStructureSelectionPreview {
   library_id: number; revision: string; issue_count: number; recycle_count: number; move_count: number; skipped_count: number
-  selections: MediaLibraryStructureSelection[]; confirmation_token: string; expires_at: string
+  selections?: MediaLibraryStructureSelection[]; confirmation_token: string; expires_at: string
   items?: MediaLibraryStructurePreviewItemPage
 }
 export interface MediaLibraryStructurePreviewItem { action: 'keep' | 'move' | 'recycle'; kind: 'video' | 'sidecar'; current_path: string; expected_path: string }

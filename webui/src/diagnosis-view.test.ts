@@ -37,6 +37,119 @@ describe('diagnosis dialog', () => {
     expect(wrapper.find('[role="dialog"]').exists()).toBe(true)
     expect(mocks.api.mock.calls.some(([path]) => path.includes('code=media_unrecognized'))).toBe(true)
   })
+  it('automatically previews deterministic video and sidecar repairs without per-row selection', async () => {
+    const base = mocks.api.getMockImplementation()!
+    const automatic = { ...issue, code: 'path_mismatch', kind: 'sidecar', state: 'pending_repair', repairable: true, title: '影片', current_path: '旧目录/poster.jpg', expected_path: '电影/影片 (1995)/poster.jpg', recognition_token: undefined }
+    mocks.api.mockImplementation((path, options, ...args) => {
+      if (path.endsWith('/structure')) return Promise.resolve({ ...diagnostics(), repairable_count: 1 })
+      if (path.includes('/structure/issues?')) return Promise.resolve({ list: [automatic], total: 1, page: 1, page_size: 50, review_revision: 0, pending_total: 1, handled_total: 0 })
+      if (path.endsWith('/selection-preview')) return Promise.resolve({ revision: 'rev', confirmation_token: 'frozen', move_count: 1, recycle_count: 0, issue_count: 1, skipped_count: 0, items: { list: [{ action: 'move', kind: 'sidecar', current_path: automatic.current_path, expected_path: automatic.expected_path }], total: 1, page: 1, page_size: 50 } })
+      return base(path, options, ...args)
+    })
+    const wrapper = await open()
+    expect(wrapper.get('[role="dialog"]').text()).toContain('将自动整理')
+    expect(wrapper.get('[role="dialog"]').text()).not.toContain('选择整理')
+    await button(wrapper, '开始整理（先预览全部确定项）').trigger('click'); await flushPromises()
+    const previewCall = mocks.api.mock.calls.find(([path]) => path.endsWith('/selection-preview'))!
+    expect(JSON.parse(previewCall[1].body)).toEqual(expect.objectContaining({ include_automatic_repairs: true, selections: [] }))
+    expect(wrapper.get('[aria-label="文件变更预览"]').text()).toContain('poster.jpg')
+  })
+  it('keeps an explicit frozen preview request alive across tab visibility changes', async () => {
+    const base = mocks.api.getMockImplementation()!, pending = deferred<object>()
+    mocks.api.mockImplementation((path, ...args) => path.endsWith('/selection-preview') ? pending.promise : base(path, ...args))
+    const wrapper = await open()
+    await button(wrapper, '开始整理（先预览全部确定项）').trigger('click'); await flushPromises()
+    const previewCall = mocks.api.mock.calls.find(([path]) => path.endsWith('/selection-preview'))!
+    const signal = previewCall[1].signal as AbortSignal
+    const hidden = vi.spyOn(document, 'hidden', 'get').mockReturnValue(true)
+    document.dispatchEvent(new Event('visibilitychange')); await flushPromises()
+    expect(signal.aborted).toBe(false)
+    expect(wrapper.get('[role="dialog"]').text()).toContain('正在生成预览')
+    pending.resolve({ revision: 'rev', confirmation_token: 'frozen', move_count: 1, recycle_count: 0, issue_count: 1, skipped_count: 0, items: { list: [], total: 1, page: 1, page_size: 50 } })
+    await flushPromises()
+    expect(wrapper.find('[aria-label="文件变更预览"]').exists()).toBe(true)
+    hidden.mockRestore()
+  })
+  it('shows preview failures beside the preview action with safe retry guidance', async () => {
+    const base = mocks.api.getMockImplementation()!
+    mocks.api.mockImplementation((path, ...args) => path.endsWith('/selection-preview') ? Promise.reject(Error('连接超时')) : base(path, ...args))
+    const wrapper = await open()
+    await button(wrapper, '开始整理（先预览全部确定项）').trigger('click'); await flushPromises()
+    const action = button(wrapper, '开始整理（先预览全部确定项）').element.closest('.semantic-success')
+    expect(action?.textContent).toContain('生成冻结预览失败：连接超时')
+    expect(action?.textContent).toContain('没有移动任何文件')
+  })
+  it('persists one review choice, shows it in handled, and restores it to pending after undo', async () => {
+    const base = mocks.api.getMockImplementation()!
+    let reviewRevision = 0
+    let reviewAction = ''
+    mocks.api.mockImplementation((path, options, ...args) => {
+      if (path.includes('/structure/issues?')) {
+        const params = new URLSearchParams(path.split('?')[1])
+        const handled = params.get('review_state') === 'handled'
+        const visible = handled ? Boolean(reviewAction) : !reviewAction
+        return Promise.resolve({
+          list: visible ? [{ ...issue, ...(reviewAction ? { review_action: reviewAction, review_state: 'draft' } : {}) }] : [],
+          total: visible ? 1 : 0,
+          page: 1,
+          page_size: 50,
+          review_revision: reviewRevision,
+          pending_total: reviewAction ? 0 : 1,
+          handled_total: reviewAction ? 1 : 0,
+        })
+      }
+      if (path.endsWith('/structure/review/issues/issue') && options?.method === 'PUT') {
+        const payload = JSON.parse(options.body)
+        expect(payload.review_revision).toBe(reviewRevision)
+        reviewAction = payload.action
+        reviewRevision++
+        return Promise.resolve({ review_revision: reviewRevision })
+      }
+      if (path.endsWith('/structure/review/issues/issue') && options?.method === 'DELETE') {
+        const payload = JSON.parse(options.body)
+        expect(payload.review_revision).toBe(reviewRevision)
+        reviewAction = ''
+        reviewRevision++
+        return Promise.resolve({ review_revision: reviewRevision })
+      }
+      return base(path, options, ...args)
+    })
+    const wrapper = await open()
+    await button(wrapper, '本次跳过').trigger('click'); await flushPromises()
+    expect(wrapper.get('[role="dialog"]').text()).toContain('本次已处理 1 项')
+    expect(wrapper.get('[role="dialog"]').text()).toContain('当前筛选没有待处理问题')
+    await button(wrapper, '本次已处理 1').trigger('click'); await flushPromises()
+    expect(wrapper.get('[role="dialog"]').text()).toContain('当前选择：本次跳过')
+    await button(wrapper, '撤销本次选择').trigger('click'); await flushPromises()
+    expect(wrapper.get('[role="dialog"]').text()).toContain('本次检测还没有已处理项目')
+    await button(wrapper, '待处理 1').trigger('click'); await flushPromises()
+    expect(wrapper.get('[role="dialog"]').text()).toContain('待识别')
+  })
+  it('locks every mutation control after a choice is submitted', async () => {
+    const base = mocks.api.getMockImplementation()!
+    mocks.api.mockImplementation((path, ...args) => {
+      if (path.includes('/structure/issues?')) {
+        const handled = new URLSearchParams(path.split('?')[1]).get('review_state') === 'handled'
+        return Promise.resolve({
+          list: handled ? [{ ...issue, review_action: 'skip', review_state: 'submitted' }] : [],
+          total: handled ? 1 : 0,
+          page: 1,
+          page_size: 50,
+          review_revision: 2,
+          pending_total: 0,
+          handled_total: 1,
+        })
+      }
+      return base(path, ...args)
+    })
+    const wrapper = await open()
+    await button(wrapper, '本次已处理 1').trigger('click'); await flushPromises()
+    expect(wrapper.get('[role="dialog"]').text()).toContain('已提交执行')
+    expect(wrapper.get('fieldset').attributes('disabled')).toBeDefined()
+    expect(button(wrapper, '重新选择识别').element.closest('fieldset')).toBe(wrapper.get('fieldset').element)
+    expect(button(wrapper, '撤销本次选择').attributes('disabled')).toBeDefined()
+    expect(button(wrapper, '本次跳过').element.closest('fieldset')).toBe(wrapper.get('fieldset').element)
+  })
   it('preserves progress and recovers after a failed status read', async () => {
     const base = mocks.api.getMockImplementation()!
     let reads = 0
@@ -48,6 +161,19 @@ describe('diagnosis dialog', () => {
     await vi.advanceTimersByTimeAsync(2000); await flushPromises()
     expect(wrapper.get('[role="dialog"]').text()).toContain('发现目录结构问题')
     expect(wrapper.get('[role="dialog"]').text()).not.toContain('暂时不可用')
+  })
+  it('keeps selections and retries a legacy infrastructure error mislabeled as 401', async () => {
+    const wrapper = await open()
+    await button(wrapper, '本次跳过').trigger('click')
+    const base = mocks.api.getMockImplementation()!
+    let reads = 0
+    mocks.api.mockImplementation((path, ...args) => path.endsWith('/structure') ? (++reads === 1 ? Promise.reject(new APIError(401, 'INTERNAL_ERROR', '服务器内部错误')) : Promise.resolve(diagnostics())) : base(path, ...args))
+    document.dispatchEvent(new Event('visibilitychange')); await flushPromises()
+    expect(wrapper.get('[role="dialog"]').text()).toContain('状态暂时读取失败')
+    expect(wrapper.get('[role="dialog"]').text()).toContain('本次已处理 1 项')
+    await vi.advanceTimersByTimeAsync(1500); await flushPromises()
+    expect(wrapper.get('[role="dialog"]').text()).not.toContain('服务器内部错误')
+    expect(wrapper.get('[role="dialog"]').text()).toContain('本次已处理 1 项')
   })
   it('reconciles an uncertain POST using GET only without hiding the dialog', async () => {
     const base = mocks.api.getMockImplementation()!
@@ -121,11 +247,15 @@ describe('diagnosis dialog', () => {
       if (path.endsWith('/recognitions/recognition')) return Promise.resolve({ token: 'recognition', title: '目标', media_type: 'tv', source_directory: '哆啦A梦 (2005)', source_summary: '01.mkv', status: 'unrecognized' })
       if (path.includes('/tmdb-candidates?')) return Promise.resolve({ list: [{ id: 123, title: '正确作品', media_type: 'tv', release_year: 2005 }] })
       if (path.endsWith('/override')) { saved = true; return Promise.resolve({ token: 'recognition', title: '正确作品', status: 'matched', media_type: 'tv', release_year: 2005, tmdb_id: 123, manual_override: true }) }
+      if (path.endsWith('/structure/review/recognitions/recognition')) {
+        expect(JSON.parse(args[0].body).review_revision).toBe(7)
+        return Promise.resolve({ review_revision: 8 })
+      }
       if (path.endsWith('/structure/selection-status')) return Promise.resolve({ revision: 'new-rev', invalid_issue_tokens: ['issue'] })
       if (path.includes('/structure/issues?')) {
         const page = Number(new URLSearchParams(path.split('?')[1]).get('page'))
         const unrecognized = new URLSearchParams(path.split('?')[1]).get('code') === 'media_unrecognized'
-        return Promise.resolve({ list: saved && page === 2 && unrecognized ? [] : [page === 1 ? { ...issue, token: 'unaffected', title: '其他作品' } : saved ? { ...issue, token: 'replacement', code: 'path_mismatch', title: '正确作品', state: 'manual_identity_resolved', repairable: true } : issue], total: 101, page, page_size: 50 })
+        return Promise.resolve({ list: saved && page === 2 && unrecognized ? [] : [page === 1 ? { ...issue, token: 'unaffected', title: '其他作品' } : saved ? { ...issue, token: 'replacement', code: 'path_mismatch', title: '正确作品', state: 'manual_identity_resolved', repairable: true } : issue], total: 101, page, page_size: 50, review_revision: saved ? 7 : 0 })
       }
       return base(path, ...args)
     })
@@ -138,16 +268,16 @@ describe('diagnosis dialog', () => {
     expect(mocks.api.mock.calls.some(([path]) => path.endsWith('/recognitions/recognition'))).toBe(true)
     await button(wrapper, '取消并返回诊断').trigger('click'); await flushPromises()
     expect(wrapper.get('[role="dialog"]').text()).toContain('第 2 / 3 页')
-    expect(wrapper.get('[role="dialog"]').text()).toContain('已加入草稿：本次跳过')
+    expect(wrapper.get('[role="dialog"]').text()).toContain('已保存到本次工作区：本次跳过')
     await button(wrapper, '手动识别此项').trigger('click'); await flushPromises()
     await wrapper.get('[role="dialog"] form').trigger('submit'); await flushPromises()
     await button(wrapper, '正确作品 · 2005 · TMDB 123 · 保存此识别').trigger('click'); await flushPromises()
     expect(wrapper.get('[role="dialog"]').text()).toContain('作品身份已保存，文件尚未整理')
     expect(wrapper.get('[role="dialog"]').text()).toContain('正确作品')
     expect(wrapper.get('[aria-label="刚保存的识别结果"]').text()).toContain('TMDB 123')
-    expect(wrapper.get('[role="dialog"]').text()).toContain('当前筛选没有需要处理的问题')
-    expect(wrapper.get('[role="dialog"]').text()).not.toContain('已加入草稿：本次跳过')
-    expect(wrapper.get('[role="dialog"]').text()).toContain('已选择 1 项')
+    expect(wrapper.get('[role="dialog"]').text()).toContain('当前筛选没有待处理问题')
+    expect(wrapper.get('[role="dialog"]').text()).not.toContain('已保存到本次工作区：本次跳过')
+    expect(wrapper.get('[role="dialog"]').text()).toContain('本次已处理 1 项')
     expect(wrapper.get('[role="dialog"]').text()).toContain('1 项旧问题已变化')
     expect(wrapper.get('[role="dialog"]').text()).toContain('第 2 / 3 页')
     expect(mocks.api.mock.calls.filter(([path]) => path.endsWith('/structure/diagnose') || path.endsWith('/selection-repair'))).toHaveLength(0)
@@ -157,7 +287,7 @@ describe('diagnosis dialog', () => {
     expect(JSON.parse(validation[1].body)).toEqual({ issue_tokens: ['unaffected', 'issue'] })
     await button(wrapper, '上一页').trigger('click'); await flushPromises()
     expect(wrapper.get('[role="dialog"]').text()).toContain('其他作品')
-    expect(wrapper.get('[role="dialog"]').text()).toContain('已加入草稿：本次跳过')
+    expect(wrapper.get('[role="dialog"]').text()).toContain('已保存到本次工作区：本次跳过')
   })
   it('explains retain-all and shows every final filename through a paged frozen preview', async () => {
     const base = mocks.api.getMockImplementation()!
@@ -171,7 +301,9 @@ describe('diagnosis dialog', () => {
     const wrapper = await open()
     await button(wrapper, '保留全部文件（自动区分重名）').trigger('click')
     expect(wrapper.get('[role="dialog"]').text()).toContain('这不代表已证明编码或内容不同')
-    await button(wrapper, '预览全部已选操作').trigger('click'); await flushPromises()
+    await button(wrapper, '开始整理（先预览全部确定项）').trigger('click'); await flushPromises()
+    const previewCall = mocks.api.mock.calls.find(([path]) => path.endsWith('/selection-preview'))!
+    expect(JSON.parse(previewCall[1].body)).toEqual(expect.objectContaining({ include_automatic_repairs: true, selections: [], bulk_actions: [] }))
     expect(wrapper.get('[aria-label="文件变更预览"]').text()).toContain('S02E01 (2).mkv')
     await button(wrapper, '预览下一页').trigger('click'); await flushPromises()
     expect(wrapper.get('[aria-label="文件变更预览"]').text()).toContain('S02E02 (2).mkv')
@@ -223,11 +355,11 @@ describe('diagnosis dialog', () => {
     await wrapper.get('[role="dialog"] form').trigger('submit'); await flushPromises()
     await button(wrapper, '候选 · 年份未知 · TMDB 1 · 保存此识别').trigger('click'); await flushPromises()
     expect(wrapper.get('[role="dialog"]').text()).toContain('身份已保存，但草稿核对暂未完成')
-    expect(wrapper.get('[role="dialog"]').text()).toContain('已选择 1 项')
-    expect(button(wrapper, '预览全部已选操作').attributes('disabled')).toBeDefined()
+    expect(wrapper.get('[role="dialog"]').text()).toContain('本次已处理 1 项')
+    expect(button(wrapper, '开始整理（先预览全部确定项）').attributes('disabled')).toBeDefined()
     await button(wrapper, '重新核对草稿').trigger('click'); await flushPromises()
-    expect(wrapper.get('[role="dialog"]').text()).toContain('已选择 0 项')
-    expect(button(wrapper, '预览全部已选操作').attributes('disabled')).toBeUndefined()
+    expect(wrapper.get('[role="dialog"]').text()).toContain('本次已处理 0 项')
+    expect(button(wrapper, '开始整理（先预览全部确定项）').attributes('disabled')).toBeUndefined()
     expect(mocks.api.mock.calls.filter(([path]) => path.endsWith('/override'))).toHaveLength(1)
     expect(mocks.api.mock.calls.filter(([path]) => path.endsWith('/structure/selection-status'))).toHaveLength(2)
   })
@@ -240,7 +372,7 @@ describe('diagnosis dialog', () => {
     })
     const wrapper = await open()
     await button(wrapper, '本次跳过').trigger('click')
-    await button(wrapper, '预览全部已选操作').trigger('click'); await flushPromises()
+    await button(wrapper, '开始整理（先预览全部确定项）').trigger('click'); await flushPromises()
     expect(wrapper.get('[aria-label="文件变更预览"]').text()).toContain('预览已过期')
     expect(button(wrapper, '确认执行预览').attributes('disabled')).toBeDefined()
   })
@@ -249,11 +381,11 @@ describe('diagnosis dialog', () => {
     mocks.api.mockImplementation((path, ...args) => path.endsWith('/selection-preview') ? pending.promise : base(path, ...args))
     const wrapper = await open()
     await button(wrapper, '本次跳过').trigger('click')
-    await button(wrapper, '预览全部已选操作').trigger('click'); await flushPromises()
+    await button(wrapper, '开始整理（先预览全部确定项）').trigger('click'); await flushPromises()
     await button(wrapper, '全部冲突跳过').trigger('click')
     pending.resolve({ confirmation_token: 'stale' }); await flushPromises()
     expect(wrapper.find('[aria-label="文件变更预览"]').exists()).toBe(false)
-    expect(button(wrapper, '预览全部已选操作').attributes('disabled')).toBeUndefined()
+    expect(button(wrapper, '开始整理（先预览全部确定项）').attributes('disabled')).toBeUndefined()
   })
   it('uses Escape to return from recognition first, then close and restore trigger focus', async () => {
     const wrapper = await open()
@@ -282,7 +414,7 @@ describe('diagnosis dialog', () => {
     vi.spyOn(window, 'confirm').mockReturnValue(true)
     const wrapper = await open()
     await button(wrapper, '本次跳过').trigger('click')
-    await button(wrapper, '预览全部已选操作').trigger('click'); await flushPromises()
+    await button(wrapper, '开始整理（先预览全部确定项）').trigger('click'); await flushPromises()
     await button(wrapper, '确认执行预览').trigger('click'); await flushPromises()
     await wrapper.findAll('button').find(item => item.text().startsWith('库2'))!.trigger('click'); await flushPromises()
     await button(wrapper, '查看诊断与处理入口').trigger('click'); await flushPromises()

@@ -110,9 +110,9 @@ func Auth(auth *services.AuthService, cookieName string) gin.HandlerFunc {
 			abortJSON(c, http.StatusUnauthorized, services.CodeNotAuthenticated, "请先登录")
 			return
 		}
-		actor, _, err := auth.Authenticate(token)
+		actor, _, err := auth.AuthenticateContext(c.Request.Context(), token)
 		if err != nil {
-			abortJSON(c, http.StatusUnauthorized, services.ErrorCode(err), services.ErrorMessage(err))
+			abortAuthenticationError(c, err)
 			return
 		}
 		c.Set(ContextActor, actor)
@@ -133,7 +133,7 @@ func DeviceAuth(auth *services.AuthService) gin.HandlerFunc {
 		}
 		actor, device, err := auth.AuthenticateDevice(parts[1])
 		if err != nil {
-			abortJSON(c, http.StatusUnauthorized, services.ErrorCode(err), services.ErrorMessage(err))
+			abortAuthenticationError(c, err)
 			return
 		}
 		c.Set(ContextActor, actor)
@@ -228,4 +228,17 @@ func stringValue(value any) string { text, _ := value.(string); return text }
 
 func abortJSON(c *gin.Context, status int, errorCode, message string) {
 	c.AbortWithStatusJSON(status, gin.H{"code": status*100 + 1, "message": message, "data": gin.H{"error_code": errorCode}})
+}
+
+func abortAuthenticationError(c *gin.Context, err error) {
+	status := http.StatusInternalServerError
+	code := services.ErrorCode(err)
+	switch code {
+	case services.CodeNotAuthenticated, services.CodeInvalidCredentials:
+		status = http.StatusUnauthorized
+	case services.CodeDatabaseBusy:
+		status = http.StatusServiceUnavailable
+		c.Header("Retry-After", "1")
+	}
+	abortJSON(c, status, code, services.ErrorMessage(err))
 }

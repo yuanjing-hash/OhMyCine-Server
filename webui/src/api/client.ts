@@ -43,7 +43,7 @@ export async function api<T>(path: string, options: RequestInit = {}, config: { 
       await ensureCSRF()
       return api<T>(path, options, { ...config, csrfRetry: false })
     }
-    if (response.status === 401) { clearCSRFToken(); window.dispatchEvent(new CustomEvent('omc:unauthorized')) }
+    if (response.status === 401 && errorCode === 'NOT_AUTHENTICATED') { clearCSRFToken(); window.dispatchEvent(new CustomEvent('omc:unauthorized')) }
     if (response.status === 403) window.dispatchEvent(new CustomEvent('omc:forbidden'))
     throw new APIError(response.status, errorCode, payload.message)
   }

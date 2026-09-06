@@ -823,6 +823,36 @@ type MediaLibraryStructureIssueMember struct {
 	CreatedAt   time.Time `gorm:"not null" json:"created_at"`
 }
 
+// MediaLibraryStructureReviewSession is one user's mutable set of decisions
+// for exactly one published diagnosis. It is deliberately separate from the
+// short-lived, immutable execution draft below.
+type MediaLibraryStructureReviewSession struct {
+	ID             string    `gorm:"primaryKey;size:36" json:"-"`
+	OwnerID        uint      `gorm:"not null;uniqueIndex:idx_structure_review_owner_job,priority:1;index" json:"-"`
+	LibraryID      uint      `gorm:"not null;uniqueIndex:idx_structure_review_owner_job,priority:2;index:idx_structure_review_current,priority:1" json:"-"`
+	DiagnosisJobID string    `gorm:"size:36;not null;uniqueIndex:idx_structure_review_owner_job,priority:3;index:idx_structure_review_current,priority:2" json:"-"`
+	Revision       uint64    `gorm:"not null;default:0" json:"revision"`
+	CreatedAt      time.Time `gorm:"not null" json:"created_at"`
+	UpdatedAt      time.Time `gorm:"not null" json:"updated_at"`
+}
+
+// MediaLibraryStructureReviewChoice contains only an opaque current-diagnosis
+// subject and the user's intent. Provider identities and physical plans never
+// cross this boundary.
+type MediaLibraryStructureReviewChoice struct {
+	ID            uint      `gorm:"primaryKey" json:"-"`
+	SessionID     string    `gorm:"size:36;not null;uniqueIndex:idx_structure_review_choice_subject,priority:1;index" json:"-"`
+	SubjectKey    string    `gorm:"size:96;not null;uniqueIndex:idx_structure_review_choice_subject,priority:2" json:"-"`
+	SubjectKind   string    `gorm:"size:16;not null" json:"-"`
+	IssueToken    string    `gorm:"size:36;not null;default:'';index" json:"-"`
+	RecognitionID *uint     `gorm:"index" json:"-"`
+	Action        string    `gorm:"size:32;not null" json:"action"`
+	MemberToken   string    `gorm:"size:36;not null;default:''" json:"member_token,omitempty"`
+	State         string    `gorm:"size:16;not null;default:'draft'" json:"state"`
+	CreatedAt     time.Time `gorm:"not null" json:"created_at"`
+	UpdatedAt     time.Time `gorm:"not null" json:"updated_at"`
+}
+
 // MediaLibraryStructureRepairDraft stores the server-only authority behind a
 // short-lived selection preview. The browser receives only the signed opaque
 // claim; source/provider facts remain in the selected private repair plan.
@@ -831,6 +861,8 @@ type MediaLibraryStructureRepairDraft struct {
 	OwnerID          uint       `gorm:"not null;index" json:"-"`
 	LibraryID        uint       `gorm:"not null;index" json:"-"`
 	DiagnosisJobID   string     `gorm:"size:36;not null;index" json:"-"`
+	ReviewSessionID  string     `gorm:"size:36;not null;default:'';index" json:"-"`
+	ReviewRevision   uint64     `gorm:"not null;default:0" json:"-"`
 	SourceRevision   uint64     `gorm:"not null" json:"-"`
 	Generation       uint64     `gorm:"not null" json:"-"`
 	RuleFingerprint  string     `gorm:"size:64;not null" json:"-"`

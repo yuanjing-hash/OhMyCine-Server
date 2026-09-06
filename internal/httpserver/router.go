@@ -23,7 +23,9 @@ func New(cfg config.Config, api *handlers.API, auth *services.AuthService, log z
 	_ = router.SetTrustedProxies(nil)
 	router.Use(gin.Recovery(), middleware.RequestID(), middleware.SecurityHeaders(), middleware.Logger(log))
 	router.Use(func(c *gin.Context) {
-		if c.Request.URL.Path == "/api/v1/system/update" || strings.HasPrefix(c.Request.URL.Path, "/api/v1/system/update/") {
+		requestPath := c.Request.URL.Path
+		mediaLibraryStructure := strings.HasPrefix(requestPath, "/api/v1/media-libraries/") && strings.Contains(requestPath, "/structure")
+		if requestPath == "/api/v1/system/update" || strings.HasPrefix(requestPath, "/api/v1/system/update/") || mediaLibraryStructure {
 			c.Header("Cache-Control", "no-store")
 		}
 		c.Next()
@@ -214,6 +216,12 @@ func New(cfg config.Config, api *handlers.API, auth *services.AuthService, log z
 	protected.GET("/media-libraries/:id/runs", middleware.RequirePermission(authz.PermissionMediaLibrariesRead), api.MediaLibraryRuns)
 	protected.GET("/media-libraries/:id/structure", middleware.NoStore(), middleware.RequirePermission(authz.PermissionMediaLibrariesRead), api.MediaLibraryStructure)
 	protected.GET("/media-libraries/:id/structure/issues", middleware.NoStore(), middleware.RequirePermission(authz.PermissionMediaLibrariesRead), api.MediaLibraryStructureIssues)
+	protected.GET("/media-libraries/:id/structure/issues/:token/members", middleware.NoStore(), middleware.RequirePermission(authz.PermissionMediaLibrariesRead), api.MediaLibraryStructureIssueMembers)
+	protected.PUT("/media-libraries/:id/structure/review/issues/:token", middleware.NoStore(), middleware.RequirePermission(authz.PermissionMediaLibrariesScan), api.SaveMediaLibraryStructureReviewChoice)
+	protected.DELETE("/media-libraries/:id/structure/review/issues/:token", middleware.NoStore(), middleware.RequirePermission(authz.PermissionMediaLibrariesScan), api.DeleteMediaLibraryStructureReviewChoice)
+	protected.PUT("/media-libraries/:id/structure/review/recognitions/:token", middleware.NoStore(), middleware.RequirePermission(authz.PermissionMediaLibrariesScan), api.SaveMediaLibraryStructureRecognitionReview)
+	protected.DELETE("/media-libraries/:id/structure/review/recognitions/:token", middleware.NoStore(), middleware.RequirePermission(authz.PermissionMediaLibrariesScan), api.DeleteMediaLibraryStructureRecognitionReview)
+	protected.POST("/media-libraries/:id/structure/review/bulk", middleware.NoStore(), middleware.RequirePermission(authz.PermissionMediaLibrariesScan), api.SaveMediaLibraryStructureReviewBulk)
 	protected.POST("/media-libraries/:id/structure/diagnose", middleware.NoStore(), middleware.RequirePermission(authz.PermissionMediaLibrariesScan), api.DiagnoseMediaLibraryStructure)
 	protected.POST("/media-libraries/:id/structure/preview", middleware.NoStore(), middleware.RequirePermission(authz.PermissionMediaLibrariesScan), api.PreviewMediaLibraryStructureRepair)
 	protected.POST("/media-libraries/:id/structure/selection-status", middleware.NoStore(), middleware.RequirePermission(authz.PermissionMediaLibrariesScan), api.MediaLibraryStructureSelectionStatus)

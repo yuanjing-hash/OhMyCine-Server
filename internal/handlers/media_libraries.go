@@ -603,7 +603,126 @@ func (a *API) MediaLibraryStructureIssues(c *gin.Context) {
 		writeError(c, a.log, invalid("分页参数无效", err))
 		return
 	}
-	result, err := a.libraryStructure.StructureIssues(c.Request.Context(), actor, id, services.MediaLibraryStructureIssueQuery{Page: page, PageSize: pageSize, Code: c.Query("code"), Actionable: c.DefaultQuery("actionable", "true") != "false"})
+	result, err := a.libraryStructure.StructureIssues(c.Request.Context(), actor, id, services.MediaLibraryStructureIssueQuery{Page: page, PageSize: pageSize, Code: c.Query("code"), Actionable: c.DefaultQuery("actionable", "true") != "false", ReviewState: c.Query("review_state")})
+	if err != nil {
+		writeError(c, a.log, err)
+		return
+	}
+	success(c, http.StatusOK, result)
+}
+
+func (a *API) MediaLibraryStructureIssueMembers(c *gin.Context) {
+	actor, _ := middleware.ActorFrom(c)
+	id, ok := pathID(c)
+	if !ok {
+		return
+	}
+	page, err := strconv.Atoi(c.DefaultQuery("page", "1"))
+	if err != nil {
+		writeError(c, a.log, invalid("分页参数无效", err))
+		return
+	}
+	pageSize, err := strconv.Atoi(c.DefaultQuery("page_size", "50"))
+	if err != nil {
+		writeError(c, a.log, invalid("分页参数无效", err))
+		return
+	}
+	result, err := a.libraryStructure.StructureIssueMembers(c.Request.Context(), actor, id, c.Param("token"), page, pageSize)
+	if err != nil {
+		writeError(c, a.log, err)
+		return
+	}
+	success(c, http.StatusOK, result)
+}
+
+func (a *API) SaveMediaLibraryStructureReviewChoice(c *gin.Context) {
+	actor, _ := middleware.ActorFrom(c)
+	id, ok := pathID(c)
+	if !ok {
+		return
+	}
+	var payload services.MediaLibraryStructureReviewChoiceInput
+	if err := strictJSON(c, &payload); err != nil {
+		writeError(c, a.log, invalid("目录处理选择无效", err))
+		return
+	}
+	result, err := a.libraryStructure.SaveStructureReviewChoice(c.Request.Context(), actor, id, c.Param("token"), payload, middleware.RequestContextFrom(c))
+	if err != nil {
+		writeError(c, a.log, err)
+		return
+	}
+	success(c, http.StatusOK, result)
+}
+
+func (a *API) DeleteMediaLibraryStructureReviewChoice(c *gin.Context) {
+	actor, _ := middleware.ActorFrom(c)
+	id, ok := pathID(c)
+	if !ok {
+		return
+	}
+	var payload services.MediaLibraryStructureReviewChoiceInput
+	if err := strictJSON(c, &payload); err != nil {
+		writeError(c, a.log, invalid("目录处理撤销参数无效", err))
+		return
+	}
+	result, err := a.libraryStructure.DeleteStructureReviewChoice(c.Request.Context(), actor, id, c.Param("token"), payload, middleware.RequestContextFrom(c))
+	if err != nil {
+		writeError(c, a.log, err)
+		return
+	}
+	success(c, http.StatusOK, result)
+}
+
+func (a *API) SaveMediaLibraryStructureRecognitionReview(c *gin.Context) {
+	actor, _ := middleware.ActorFrom(c)
+	id, ok := pathID(c)
+	if !ok {
+		return
+	}
+	var payload services.MediaLibraryStructureReviewChoiceInput
+	if err := strictJSON(c, &payload); err != nil {
+		writeError(c, a.log, invalid("识别处理状态无效", err))
+		return
+	}
+	result, err := a.libraryStructure.SaveStructureRecognitionReview(c.Request.Context(), actor, id, c.Param("token"), payload, middleware.RequestContextFrom(c))
+	if err != nil {
+		writeError(c, a.log, err)
+		return
+	}
+	success(c, http.StatusOK, result)
+}
+
+func (a *API) DeleteMediaLibraryStructureRecognitionReview(c *gin.Context) {
+	actor, _ := middleware.ActorFrom(c)
+	id, ok := pathID(c)
+	if !ok {
+		return
+	}
+	var payload services.MediaLibraryStructureReviewChoiceInput
+	if err := strictJSON(c, &payload); err != nil {
+		writeError(c, a.log, invalid("识别处理撤销参数无效", err))
+		return
+	}
+	result, err := a.libraryStructure.DeleteStructureRecognitionReview(c.Request.Context(), actor, id, c.Param("token"), payload, middleware.RequestContextFrom(c))
+	if err != nil {
+		writeError(c, a.log, err)
+		return
+	}
+	success(c, http.StatusOK, result)
+}
+
+func (a *API) SaveMediaLibraryStructureReviewBulk(c *gin.Context) {
+	actor, _ := middleware.ActorFrom(c)
+	id, ok := pathID(c)
+	if !ok {
+		return
+	}
+	var payload services.MediaLibraryStructureReviewBulkInput
+	if err := strictJSON(c, &payload); err != nil {
+		writeError(c, a.log, invalid("批量处理选择无效", err))
+		return
+	}
+	result, err := a.libraryStructure.SaveStructureReviewBulk(c.Request.Context(), actor, id, payload, middleware.RequestContextFrom(c))
 	if err != nil {
 		writeError(c, a.log, err)
 		return

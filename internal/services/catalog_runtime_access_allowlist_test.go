@@ -7,6 +7,7 @@ package services
 // Data-only model references are retained so a new query cannot inherit a pure
 // planner/DTO exemption. Never regenerate this list solely to make CI green.
 var catalogRuntimeAccessAllowlist = map[string]string{
+	"internal/database/migration_structure_review.go:migrateStructureReviewWorkspace":                        "sql:R=1|f65867ba97727d6c",
 	"internal/services/catalog_artifact_worker.go:MediaArtifactService.generateBoundArtifacts":               "model:A=1,model:E=2,model:R=1,query:Find:A=1,query:Find:E=2,query:Find:R=1|a7ebbc45934fd218",
 	"internal/services/catalog_collection_read.go:catalogCollectionMembers":                                  "call:layerSQL=1,sql:E=1|645434ca2f6dd0ea",
 	"internal/services/catalog_compaction.go:CatalogSnapshotStore.copyCatalogCompactionFacts":                "call:effectiveSQL=1|bd904910612724b6",
@@ -102,11 +103,11 @@ var catalogRuntimeAccessAllowlist = map[string]string{
 	"internal/services/media_library_recognition_api.go:MediaLibraryService.recognizeStoredUnit":             "model:E=1|8a687a8fd5310d81",
 	"internal/services/media_library_recognition_api.go:recognitionPackageName":                              "model:E=1|a08ed012745b7140",
 	"internal/services/media_library_recognition_api.go:recognitionSummaryTx":                                "model:E=1,model:R=1,query:First:E=1,query:Where:R=2|0f68bfc6e1b15e53",
-	"internal/services/media_library_retirement_cleanup.go:declaration(libraryRetirementCleanup)":            "sql:A=1,sql:E=1,sql:R=1|6fb16725aee3e094",
+	"internal/services/media_library_retirement_cleanup.go:declaration(libraryRetirementCleanup)":            "sql:A=1,sql:E=1,sql:R=1|01d4fa1288ee22dc",
 	"internal/services/media_library_structure.go:MediaLibraryStructureService.EnsureWorkLayout":             "call:updateStructureCatalogPaths=1|2f4fee82835a5b2f",
-	"internal/services/media_library_structure.go:MediaLibraryStructureService.RefreshRecognitionProjection": "model:E=1|66485b197b009301",
+	"internal/services/media_library_structure.go:MediaLibraryStructureService.RefreshRecognitionProjection": "model:E=1,model:R=1,query:First:R=1|b8c9c06a6d6b0789",
 	"internal/services/media_library_structure.go:MediaLibraryStructureService.runRepair":                    "call:removeStructureCatalogItems=1,call:updateStructureCatalogPaths=1|781c2e0d0d57ce29",
-	"internal/services/media_library_structure.go:MediaLibraryStructureService.structureIssuesTx":            "model:R=2,query:Find:R=1|45aea3f772844448",
+	"internal/services/media_library_structure.go:MediaLibraryStructureService.structureIssuesTx":            "model:R=2,query:Find:R=1|ab571af52d1f1b8a",
 	"internal/services/media_library_structure.go:removeStructureCatalogItems":                               "helper:removeStructureCatalogItems=1,model:A=1,model:E=1,query:Delete:A=1,query:Delete:E=1|a46b1f03b11411a5",
 	"internal/services/media_library_structure.go:updateStructureCatalogPaths":                               "helper:updateStructureCatalogPaths=1,model:A=1,model:E=1,query:Model:A=1,query:Model:E=1|f2f4bad6fa3d9870",
 	"internal/services/media_library_structure_planner.go:StructurePlanner.Build":                            "model:A=1,model:E=1|16bf7db06ea2fae4",

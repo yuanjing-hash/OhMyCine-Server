@@ -7,13 +7,16 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/rs/zerolog"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/authz"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/config"
+	serverlog "github.com/yuanjing-hash/OhMyCine-Server/internal/logging"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
 	"golang.org/x/crypto/bcrypt"
 	"gorm.io/gorm"
@@ -22,9 +25,10 @@ import (
 const bcryptCost = 12
 
 const (
-	deviceClientKind    = "player"
-	deviceTokenPrefix   = "omc_player_"
-	deviceTouchInterval = 5 * time.Minute
+	deviceClientKind     = "player"
+	deviceTokenPrefix    = "omc_player_"
+	deviceTouchInterval  = 5 * time.Minute
+	sessionTouchInterval = 5 * time.Minute
 )
 
 type LoginAttempt struct {
@@ -81,10 +85,12 @@ type AuthService struct {
 	csrfKey   []byte
 	dummyHash []byte
 	setupMu   sync.Mutex
+	touchSlot chan struct{}
+	log       zerolog.Logger
 	now       func() time.Time
 }
 
-func NewAuthService(db *gorm.DB, cfg config.Config, authorization *AuthorizationService, audit *AuditService) (*AuthService, error) {
+func NewAuthService(db *gorm.DB, cfg config.Config, authorization *AuthorizationService, audit *AuditService, log zerolog.Logger) (*AuthService, error) {
 	if cfg.DeviceTokenIdleTTL <= 0 {
 		cfg.DeviceTokenIdleTTL = 30 * 24 * time.Hour
 	}
@@ -99,7 +105,7 @@ func NewAuthService(db *gorm.DB, cfg config.Config, authorization *Authorization
 	if err != nil {
 		return nil, fmt.Errorf("generate login timing hash: %w", err)
 	}
-	return &AuthService{db: db, config: cfg, authz: authorization, audit: audit, limiter: NewLoginLimiter(), csrfKey: csrfKey, dummyHash: dummyHash, now: time.Now}, nil
+	return &AuthService{db: db, config: cfg, authz: authorization, audit: audit, limiter: NewLoginLimiter(), csrfKey: csrfKey, dummyHash: dummyHash, touchSlot: make(chan struct{}, 1), log: log, now: time.Now}, nil
 }
 
 func NormalizeUsername(username string) string { return strings.ToLower(strings.TrimSpace(username)) }
@@ -318,8 +324,10 @@ func (s *AuthService) AuthenticateDevice(token string) (Actor, models.DeviceToke
 		return Actor{}, models.DeviceToken{}, appError(CodeNotAuthenticated, "Player 凭据无效", nil)
 	}
 	var device models.DeviceToken
-	if err := s.db.Where("token_hash = ? AND client_kind = ?", tokenHash(token), deviceClientKind).First(&device).Error; err != nil {
+	if err := s.db.Where("token_hash = ? AND client_kind = ?", tokenHash(token), deviceClientKind).First(&device).Error; errors.Is(err, gorm.ErrRecordNotFound) {
 		return Actor{}, models.DeviceToken{}, appError(CodeNotAuthenticated, "Player 凭据无效", err)
+	} else if err != nil {
+		return Actor{}, models.DeviceToken{}, authenticationStoreError(err)
 	}
 	now := s.now().UTC()
 	if device.RevokedAt != nil || !now.Before(device.IdleExpiresAt) || !now.Before(device.AbsoluteExpiresAt) {
@@ -327,15 +335,10 @@ func (s *AuthService) AuthenticateDevice(token string) (Actor, models.DeviceToke
 	}
 	actor, err := s.authz.Resolve(device.UserID)
 	if err != nil {
-		return Actor{}, models.DeviceToken{}, err
+		return Actor{}, models.DeviceToken{}, authenticationStoreError(err)
 	}
 	if now.Sub(device.LastSeenAt) >= deviceTouchInterval {
-		updates := map[string]any{"last_seen_at": now, "idle_expires_at": minTime(now.Add(s.config.DeviceTokenIdleTTL), device.AbsoluteExpiresAt)}
-		if err := s.db.Model(&device).Updates(updates).Error; err != nil {
-			return Actor{}, models.DeviceToken{}, err
-		}
-		device.LastSeenAt = now
-		device.IdleExpiresAt = updates["idle_expires_at"].(time.Time)
+		s.scheduleActivityTouch(device.ID, &models.DeviceToken{}, "player_device", deviceTouchInterval, now, minTime(now.Add(s.config.DeviceTokenIdleTTL), device.AbsoluteExpiresAt))
 	}
 	return actor, device, nil
 }
@@ -391,26 +394,73 @@ func (s *AuthService) createSession(db *gorm.DB, userID uint, userAgent, ipHint 
 }
 
 func (s *AuthService) Authenticate(token string) (Actor, models.Session, error) {
+	return s.AuthenticateContext(context.Background(), token)
+}
+
+func (s *AuthService) AuthenticateContext(ctx context.Context, token string) (Actor, models.Session, error) {
 	if token == "" {
 		return Actor{}, models.Session{}, appError(CodeNotAuthenticated, "请先登录", nil)
 	}
 	var session models.Session
-	if err := s.db.Where("token_hash = ?", tokenHash(token)).First(&session).Error; err != nil {
+	db := s.db.WithContext(ctx)
+	if err := db.Where("token_hash = ?", tokenHash(token)).First(&session).Error; errors.Is(err, gorm.ErrRecordNotFound) {
 		return Actor{}, models.Session{}, appError(CodeNotAuthenticated, "登录会话无效", err)
+	} else if err != nil {
+		return Actor{}, models.Session{}, authenticationStoreError(err)
 	}
 	now := s.now().UTC()
 	if session.RevokedAt != nil || !now.Before(session.IdleExpiresAt) || !now.Before(session.AbsoluteExpiresAt) {
 		return Actor{}, models.Session{}, appError(CodeNotAuthenticated, "登录会话已过期", nil)
 	}
-	actor, err := s.authz.Resolve(session.UserID)
+	actor, err := s.authz.resolveWithDB(db, session.UserID)
 	if err != nil {
-		return Actor{}, models.Session{}, err
+		return Actor{}, models.Session{}, authenticationStoreError(err)
 	}
-	updates := map[string]any{"last_seen_at": now, "idle_expires_at": minTime(now.Add(s.config.SessionIdleTTL), session.AbsoluteExpiresAt)}
-	if err := s.db.Model(&session).Updates(updates).Error; err != nil {
-		return Actor{}, models.Session{}, err
+	if now.Sub(session.LastSeenAt) < sessionTouchInterval {
+		return actor, session, nil
 	}
+	s.scheduleActivityTouch(session.ID, &models.Session{}, "browser_session", sessionTouchInterval, now, minTime(now.Add(s.config.SessionIdleTTL), session.AbsoluteExpiresAt))
 	return actor, session, nil
+}
+
+// scheduleActivityTouch keeps session/device liveness maintenance outside the
+// authentication critical path. A single global slot bounds goroutines and is
+// sufficient for SQLite's single writer; skipped touches are retried by later
+// requests. The guarded UPDATE rechecks revocation and staleness, so a delayed
+// touch cannot reactivate a revoked credential.
+func (s *AuthService) scheduleActivityTouch(id string, model any, credentialKind string, interval time.Duration, seenAt, idleExpiresAt time.Time) {
+	select {
+	case s.touchSlot <- struct{}{}:
+	default:
+		return
+	}
+	go func() {
+		defer func() { <-s.touchSlot }()
+		err := s.db.Session(&gorm.Session{SkipDefaultTransaction: true}).Model(model).
+			Where("id = ? AND revoked_at IS NULL AND last_seen_at <= ?", id, seenAt.Add(-interval)).
+			Updates(map[string]any{"last_seen_at": seenAt, "idle_expires_at": idleExpiresAt}).Error
+		if err == nil {
+			return
+		}
+		code := "authentication_activity_touch_failed"
+		if isSQLiteBusy(err) {
+			code = "authentication_activity_touch_busy"
+		}
+		serverlog.OperationAuthentication.Event(s.log.Warn()).
+			Str("credential_kind", credentialKind).
+			Str("error_code", code).
+			Msg(serverlog.OperationAuthentication.Message("活跃时间维护暂未完成，将由后续请求重试"))
+	}()
+}
+
+func authenticationStoreError(err error) error {
+	if err == nil || ErrorCode(err) != CodeInternalError {
+		return err
+	}
+	if isSQLiteBusy(err) {
+		return appError(CodeDatabaseBusy, "服务器数据库繁忙，请稍后重试", err)
+	}
+	return err
 }
 
 func (s *AuthService) Logout(token string, actor Actor, request RequestContext) error {
@@ -430,14 +480,17 @@ func (s *AuthService) RevalidateSession(ctx context.Context, token string) (Acto
 	}
 	db := s.db.WithContext(ctx)
 	var session models.Session
-	if err := db.Where("token_hash = ?", tokenHash(token)).First(&session).Error; err != nil {
+	if err := db.Where("token_hash = ?", tokenHash(token)).First(&session).Error; errors.Is(err, gorm.ErrRecordNotFound) {
 		return Actor{}, appError(CodeNotAuthenticated, "登录会话无效", err)
+	} else if err != nil {
+		return Actor{}, authenticationStoreError(err)
 	}
 	now := s.now().UTC()
 	if session.RevokedAt != nil || !now.Before(session.IdleExpiresAt) || !now.Before(session.AbsoluteExpiresAt) {
 		return Actor{}, appError(CodeNotAuthenticated, "登录会话已过期", nil)
 	}
-	return s.authz.resolveWithDB(db, session.UserID)
+	actor, err := s.authz.resolveWithDB(db, session.UserID)
+	return actor, authenticationStoreError(err)
 }
 
 func (s *AuthService) RevokeUserSessions(tx *gorm.DB, userID uint) error {

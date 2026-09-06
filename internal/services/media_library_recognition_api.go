@@ -284,6 +284,13 @@ func (s *MediaLibraryService) ClearRecognitionOverride(ctx context.Context, acto
 	if err := s.persistRecognitionResult(record, source.Profile, result, false, source); err != nil {
 		return MediaRecognitionSummary{}, err
 	}
+	if s.structure != nil {
+		if refreshErr := s.structure.RefreshRecognitionProjection(ctx, libraryID, record.ID); refreshErr != nil {
+			serverlog.OperationMediaLibraryStructureDiagnosis.Event(s.log.Warn()).Uint("library_id", libraryID).
+				Str("scan_kind", "manual_restore").Str("phase", "projection_refresh_failed").Str("error_code", CodeMediaLibraryStructureDiagnosisFailed).
+				Msg(serverlog.OperationMediaLibraryStructureDiagnosis.Message("自动识别结果已恢复，但目录处理投影更新失败"))
+		}
+	}
 	_ = s.audit.Record(s.db, &actor.User.ID, "media_recognition.override_clear", "media_library_recognition", strconv.FormatUint(uint64(record.ID), 10), "success", map[string]any{"library_id": libraryID}, request)
 	return s.recognitionSummaryByID(ctx, libraryID, record.ID)
 }

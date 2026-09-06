@@ -1,6 +1,7 @@
 package services
 
 import (
+	"container/heap"
 	"context"
 	"crypto/hmac"
 	"encoding/json"
@@ -10,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/google/uuid"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/authz"
@@ -18,13 +20,16 @@ import (
 )
 
 const (
-	StructureSelectionRepair             = "repair"
-	StructureSelectionKeepRecommended    = "keep_recommended"
-	StructureSelectionKeepMember         = "keep_member"
-	StructureSelectionKeepAllVersions    = "keep_all_versions"
-	StructureSelectionSkip               = "skip"
-	maxStructureSelections               = 5000
-	structureSelectionConfirmationExpiry = 5 * time.Minute
+	StructureSelectionRepair              = "repair"
+	StructureSelectionKeepRecommended     = "keep_recommended"
+	StructureSelectionKeepMember          = "keep_member"
+	StructureSelectionKeepAllVersions     = "keep_all_versions"
+	StructureSelectionSkip                = "skip"
+	maxStructureSelections                = 5000
+	maxStructureAutomaticSelections       = 25000
+	maxStructurePreviewResponseSelections = maxStructureSelections
+	maxStructureSelectionBytes            = 32 * 1024 * 1024
+	structureSelectionConfirmationExpiry  = 5 * time.Minute
 )
 
 type MediaLibraryStructureSelection struct {
@@ -39,9 +44,13 @@ type MediaLibraryStructureBulkAction struct {
 }
 
 type MediaLibraryStructureSelectionInput struct {
-	Revision    string                            `json:"revision"`
-	Selections  []MediaLibraryStructureSelection  `json:"selections"`
-	BulkActions []MediaLibraryStructureBulkAction `json:"bulk_actions,omitempty"`
+	Revision                string                            `json:"revision"`
+	ReviewRevision          uint64                            `json:"review_revision,omitempty"`
+	ReviewCode              string                            `json:"review_code,omitempty"`
+	IncludeAutomaticRepairs bool                              `json:"include_automatic_repairs,omitempty"`
+	Selections              []MediaLibraryStructureSelection  `json:"selections"`
+	BulkActions             []MediaLibraryStructureBulkAction `json:"bulk_actions,omitempty"`
+	reviewSessionID         string
 }
 
 type MediaLibraryStructureSelectionPreview struct {
@@ -51,7 +60,7 @@ type MediaLibraryStructureSelectionPreview struct {
 	RecycleCount      int                              `json:"recycle_count"`
 	MoveCount         int                              `json:"move_count"`
 	SkippedCount      int                              `json:"skipped_count"`
-	Selections        []MediaLibraryStructureSelection `json:"selections"`
+	Selections        []MediaLibraryStructureSelection `json:"selections,omitempty"`
 	ConfirmationToken string                           `json:"confirmation_token"`
 	ExpiresAt         time.Time                        `json:"expires_at"`
 	Items             MediaLibraryStructurePreviewPage `json:"items"`
@@ -66,6 +75,12 @@ type structureSelectionResolved struct {
 func (s *MediaLibraryStructureService) PreviewSelectionRepair(ctx context.Context, actor Actor, libraryID uint, input MediaLibraryStructureSelectionInput) (MediaLibraryStructureSelectionPreview, error) {
 	if !actor.CanResource(authz.PermissionMediaLibrariesScan, models.AuthorizationResourceMediaLibrary, uintID(libraryID)) {
 		return MediaLibraryStructureSelectionPreview{}, appError(CodePermissionDenied, "无权修复媒体库结构", nil)
+	}
+	var reviewSession models.MediaLibraryStructureReviewSession
+	var err error
+	input, reviewSession, err = s.mergeStructureReviewSelections(ctx, actor, libraryID, input)
+	if err != nil {
+		return MediaLibraryStructureSelectionPreview{}, err
 	}
 	draftID := uuid.NewString()
 	plan, diagnosis, resolved, err := s.buildSelectionPlan(ctx, libraryID, input, draftID)
@@ -84,7 +99,7 @@ func (s *MediaLibraryStructureService) PreviewSelectionRepair(ctx context.Contex
 		selections = append(selections, item.selection)
 	}
 	selectionJSON, err := json.Marshal(MediaLibraryStructureSelectionInput{Revision: input.Revision, Selections: selections})
-	if err != nil || len(selectionJSON) > 2*1024*1024 {
+	if err != nil || len(selectionJSON) > maxStructureSelectionBytes {
 		return MediaLibraryStructureSelectionPreview{}, appError(CodeInvalidRequest, "目录修复选择过多", err)
 	}
 	var autoState models.MediaLibraryStructureAutoState
@@ -92,7 +107,7 @@ func (s *MediaLibraryStructureService) PreviewSelectionRepair(ctx context.Contex
 		return MediaLibraryStructureSelectionPreview{}, err
 	}
 	expires := time.Now().UTC().Add(structureSelectionConfirmationExpiry)
-	draft := models.MediaLibraryStructureRepairDraft{ID: draftID, OwnerID: actor.User.ID, LibraryID: libraryID, DiagnosisJobID: diagnosis.JobID, SourceRevision: autoState.SourceRevision, Generation: plan.Generation, RuleFingerprint: plan.RuleFingerprint, PlanHash: planHash, SelectionsJSON: string(selectionJSON), ExpiresAt: expires, CreatedAt: time.Now().UTC()}
+	draft := models.MediaLibraryStructureRepairDraft{ID: draftID, OwnerID: actor.User.ID, LibraryID: libraryID, DiagnosisJobID: diagnosis.JobID, ReviewSessionID: reviewSession.ID, ReviewRevision: input.ReviewRevision, SourceRevision: autoState.SourceRevision, Generation: plan.Generation, RuleFingerprint: plan.RuleFingerprint, PlanHash: planHash, SelectionsJSON: string(selectionJSON), ExpiresAt: expires, CreatedAt: time.Now().UTC()}
 	previewItems, err := structurePreviewItems(plan, resolved)
 	if err != nil {
 		return MediaLibraryStructureSelectionPreview{}, err
@@ -135,7 +150,18 @@ func (s *MediaLibraryStructureService) PreviewSelectionRepair(ctx context.Contex
 			skipped++
 		}
 	}
-	return MediaLibraryStructureSelectionPreview{LibraryID: libraryID, Revision: input.Revision, IssueCount: len(selections), RecycleCount: len(plan.RecycleItems), MoveCount: len(plan.Items), SkippedCount: skipped, Selections: selections, ConfirmationToken: token, ExpiresAt: expires, Items: structurePreviewPage(previewItems, 1, 50)}, nil
+	responseSelections := structurePreviewResponseSelections(selections)
+	return MediaLibraryStructureSelectionPreview{LibraryID: libraryID, Revision: input.Revision, IssueCount: len(selections), RecycleCount: len(plan.RecycleItems), MoveCount: len(plan.Items), SkippedCount: skipped, Selections: responseSelections, ConfirmationToken: token, ExpiresAt: expires, Items: structurePreviewPage(previewItems, 1, 50)}, nil
+}
+
+func structurePreviewResponseSelections(selections []MediaLibraryStructureSelection) []MediaLibraryStructureSelection {
+	if len(selections) > maxStructurePreviewResponseSelections {
+		// The immutable draft retains every resolved issue. The browser confirms
+		// with its opaque token and does not need a second copy of a large
+		// automatic selection set in the initial HTTP response.
+		return nil
+	}
+	return selections
 }
 
 func (s *MediaLibraryStructureService) EnqueueSelectionRepair(ctx context.Context, actor Actor, libraryID uint, confirmationToken string, request RequestContext) (models.MediaLibraryStructureRepair, error) {
@@ -172,6 +198,15 @@ func (s *MediaLibraryStructureService) EnqueueSelectionRepair(ctx context.Contex
 	if diagnosis.JobID != draft.DiagnosisJobID || autoState.SourceRevision != draft.SourceRevision || claim.Generation != draft.Generation || plan.Generation != draft.Generation || claim.RuleFingerprint != draft.RuleFingerprint || plan.RuleFingerprint != draft.RuleFingerprint || !hmac.Equal([]byte(claim.PlanHash), []byte(draft.PlanHash)) || !hmac.Equal([]byte(planHash), []byte(draft.PlanHash)) {
 		return models.MediaLibraryStructureRepair{}, appError(CodeConflict, "媒体库来源、诊断结果或分类规则已变化，请重新预览", nil)
 	}
+	var review models.MediaLibraryStructureReviewSession
+	reviewErr := s.db.WithContext(ctx).Where("owner_id = ? AND library_id = ? AND diagnosis_job_id = ?", actor.User.ID, libraryID, diagnosis.JobID).First(&review).Error
+	if draft.ReviewSessionID == "" {
+		if reviewErr == nil || !errors.Is(reviewErr, gorm.ErrRecordNotFound) {
+			return models.MediaLibraryStructureRepair{}, appError(CodeConflict, "处理工作区已修改，请重新生成预览", reviewErr)
+		}
+	} else if reviewErr != nil || review.ID != draft.ReviewSessionID || review.Revision != draft.ReviewRevision {
+		return models.MediaLibraryStructureRepair{}, appError(CodeConflict, "处理工作区已修改，请重新生成预览", reviewErr)
+	}
 	return s.enqueueSelectionPlan(actor, draft, plan, request)
 }
 
@@ -196,7 +231,7 @@ func (s *MediaLibraryStructureService) validateSelectionRecycle(ctx context.Cont
 
 func (s *MediaLibraryStructureService) enqueueSelectionPlan(actor Actor, draft models.MediaLibraryStructureRepairDraft, plan StructurePlan, request RequestContext) (models.MediaLibraryStructureRepair, error) {
 	raw, err := json.Marshal(plan)
-	if err != nil || len(raw) > 8*1024*1024 {
+	if err != nil || len(raw) > maxStructureSelectionBytes {
 		return models.MediaLibraryStructureRepair{}, appError(CodeMediaLibraryStructureUnavailable, "媒体库修复计划过大", err)
 	}
 	var library models.MediaLibrary
@@ -214,6 +249,26 @@ func (s *MediaLibraryStructureService) enqueueSelectionPlan(actor Actor, draft m
 	now := time.Now().UTC()
 	repair := models.MediaLibraryStructureRepair{ID: uuid.NewString(), OwnerID: actor.User.ID, LibraryID: draft.LibraryID, Scope: models.MediaLibraryStructureScopeFull, RuleFingerprint: plan.RuleFingerprint, Generation: plan.Generation, PlanJSON: string(raw), StateJSON: `{}`, Phase: "queued", IssueCount: len(plan.ResolvedIssues) + len(plan.SkippedIssues), TotalItems: len(plan.RecycleItems) + len(plan.Items), CreatedAt: now, UpdatedAt: now}
 	job, err := s.queue.EnqueueWith(EnqueueJobInput{OwnerID: actor.User.ID, JobType: JobTypeMediaLibraryRepair, DisplayName: "修复媒体库结构 · " + library.Name, Provider: "media_library", ResourceKey: "library:" + uintID(draft.LibraryID), Payload: mediaLibraryRepairJobPayload{RepairID: repair.ID}}, func(tx *gorm.DB, job models.Job) error {
+		// Revalidate the mutable review workspace inside the same transaction
+		// that consumes the frozen draft. The earlier read is only a fast
+		// rejection; without this fence a concurrent edit could land between
+		// that read and enqueue, allowing a stale preview to execute.
+		if draft.ReviewSessionID == "" {
+			var sessions int64
+			if err := tx.Model(&models.MediaLibraryStructureReviewSession{}).
+				Where("owner_id = ? AND library_id = ? AND diagnosis_job_id = ?", actor.User.ID, draft.LibraryID, draft.DiagnosisJobID).
+				Count(&sessions).Error; err != nil {
+				return err
+			}
+			if sessions != 0 {
+				return appError(CodeConflict, "处理工作区已修改，请重新生成预览", nil)
+			}
+		} else {
+			var review models.MediaLibraryStructureReviewSession
+			if err := tx.Where("id = ? AND owner_id = ? AND library_id = ? AND diagnosis_job_id = ? AND revision = ?", draft.ReviewSessionID, actor.User.ID, draft.LibraryID, draft.DiagnosisJobID, draft.ReviewRevision).First(&review).Error; err != nil {
+				return appError(CodeConflict, "处理工作区已修改，请重新生成预览", err)
+			}
+		}
 		consumed := tx.Model(&models.MediaLibraryStructureRepairDraft{}).Where("id = ? AND owner_id = ? AND library_id = ? AND consumed_at IS NULL AND expires_at > ?", draft.ID, actor.User.ID, draft.LibraryID, now).Update("consumed_at", now)
 		if consumed.Error != nil {
 			return consumed.Error
@@ -230,6 +285,26 @@ func (s *MediaLibraryStructureService) enqueueSelectionPlan(actor Actor, draft m
 		}
 		if err := tx.Model(&models.MediaLibrary{}).Where("id = ?", draft.LibraryID).Updates(map[string]any{"structure_status": models.MediaLibraryStructureRepairing, "structure_error_code": ""}).Error; err != nil {
 			return err
+		}
+		if draft.ReviewSessionID != "" && len(plan.ResolvedIssues)+len(plan.SkippedIssues) > 0 {
+			tokens := append(append([]string{}, plan.ResolvedIssues...), plan.SkippedIssues...)
+			keys := make([]string, 0, len(tokens))
+			for _, token := range tokens {
+				keys = append(keys, "issue:"+token)
+			}
+			updated := tx.Model(&models.MediaLibraryStructureReviewChoice{}).Where("session_id = ? AND subject_key IN ? AND state = ?", draft.ReviewSessionID, keys, "draft").Update("state", "submitted")
+			if updated.Error != nil {
+				return updated.Error
+			}
+			advanced := tx.Model(&models.MediaLibraryStructureReviewSession{}).
+				Where("id = ? AND revision = ?", draft.ReviewSessionID, draft.ReviewRevision).
+				Updates(map[string]any{"revision": draft.ReviewRevision + 1, "updated_at": now})
+			if advanced.Error != nil {
+				return advanced.Error
+			}
+			if advanced.RowsAffected != 1 {
+				return appError(CodeConflict, "处理工作区已修改，请重新生成预览", nil)
+			}
 		}
 		return s.audit.Record(tx, &actor.User.ID, "media_library.structure_selection_repair.enqueue", "media_library", uintID(draft.LibraryID), "success", map[string]any{"issue_count": len(plan.ResolvedIssues), "move_count": len(plan.Items), "recycle_count": len(plan.RecycleItems)}, request)
 	})
@@ -292,8 +367,40 @@ func (s *MediaLibraryStructureService) buildSelectionPlan(ctx context.Context, l
 			selectionByIssue[row.Token] = MediaLibraryStructureSelection{IssueToken: row.Token, Action: action, MemberToken: mapRecommendedMember(action, row.RecommendedMemberToken)}
 		}
 	}
-	if len(selectionByIssue) == 0 || len(selectionByIssue) > maxStructureSelections {
+	selectionLimit := maxStructureSelections
+	if input.IncludeAutomaticRepairs {
+		selectionLimit = maxStructureAutomaticSelections
+		automatic := s.db.WithContext(ctx).
+			Where("library_id = ? AND diagnosis_job_id = ? AND generation = ? AND repairable = ?", libraryID, diagnosis.JobID, diagnosis.Generation, true)
+		if code := safeLabel(strings.TrimSpace(input.ReviewCode), 64); code != "" && code != "all" {
+			automatic = automatic.Where("code = ?", code)
+		}
+		if input.reviewSessionID != "" {
+			automatic = automatic.Where("NOT EXISTS (SELECT 1 FROM media_library_structure_review_choices rc WHERE rc.session_id = ? AND rc.subject_key = ('issue:' || media_library_structure_issues.token) AND rc.state = ?)", input.reviewSessionID, "submitted")
+		}
+		var rows []models.MediaLibraryStructureIssue
+		if err := automatic.Order("code,id").Limit(maxStructureAutomaticSelections + 1).Find(&rows).Error; err != nil {
+			return StructurePlan{}, diagnosis, nil, err
+		}
+		if len(rows) > maxStructureAutomaticSelections {
+			return StructurePlan{}, diagnosis, nil, appError(CodeInvalidRequest, "可自动整理项目超过单次安全上限，请按问题类型预览处理", nil)
+		}
+		for _, row := range rows {
+			if _, explicitlyHandled := selectionByIssue[row.Token]; explicitlyHandled {
+				continue
+			}
+			selectionByIssue[row.Token] = MediaLibraryStructureSelection{IssueToken: row.Token, Action: StructureSelectionRepair}
+		}
+	}
+	if len(selectionByIssue) == 0 {
 		return StructurePlan{}, diagnosis, nil, appError(CodeInvalidRequest, "请选择要处理的问题", nil)
+	}
+	if len(selectionByIssue) > selectionLimit {
+		message := "本次处理选择过多，请分类型预览处理"
+		if input.IncludeAutomaticRepairs {
+			message = "可自动整理项目超过单次安全上限，请按问题类型预览处理"
+		}
+		return StructurePlan{}, diagnosis, nil, appError(CodeInvalidRequest, message, nil)
 	}
 	tokens := make([]string, 0, len(selectionByIssue))
 	for token := range selectionByIssue {
@@ -325,12 +432,13 @@ func (s *MediaLibraryStructureService) buildSelectionPlan(ctx context.Context, l
 		return StructurePlan{}, diagnosis, nil, err
 	}
 	plan.SourceRevision = autoState.SourceRevision
+	selectionIndex := newStructureSelectionPlanIndex(base)
 	resolved := make([]structureSelectionResolved, 0, len(issues))
 	for _, issue := range issues {
 		members := membersByIssue[issue.ID]
 		selection := selectionByIssue[issue.Token]
 		selection.MemberToken = normalizeSelectionMemberToken(selection, issue)
-		if err := appendStructureSelection(&plan, base, issue, members, selection, draftID); err != nil {
+		if err := appendIndexedStructureSelection(&plan, base, selectionIndex, issue, members, selection, draftID); err != nil {
 			return StructurePlan{}, diagnosis, nil, err
 		}
 		resolved = append(resolved, structureSelectionResolved{issue: issue, members: members, selection: selection})
@@ -464,7 +572,63 @@ func normalizeSelectionMemberToken(selection MediaLibraryStructureSelection, iss
 	return ""
 }
 
+type structureSelectionPlanIndex struct {
+	items          map[string]StructurePlanItem
+	conflictGroups map[string]StructureConflictGroup
+}
+
+func structureSelectionItemKey(kind, source, target string) string {
+	return kind + "\x00" + structureSelectionFoldPath(source) + "\x00" + structureSelectionFoldPath(target)
+}
+
+func structureSelectionConflictKey(code, target string) string {
+	return code + "\x00" + structureSelectionFoldPath(target)
+}
+
+// structureSelectionFoldPath produces a stable key for the same Unicode
+// simple-fold equivalence used by strings.EqualFold in the former linear
+// lookup. strings.ToLower is not equivalent for every legal title rune (for
+// example, long s), which could otherwise make a valid frozen preview look
+// stale only after switching to the indexed path.
+func structureSelectionFoldPath(value string) string {
+	return strings.Map(func(current rune) rune {
+		canonical := current
+		for folded := unicode.SimpleFold(current); folded != current; folded = unicode.SimpleFold(folded) {
+			if folded < canonical {
+				canonical = folded
+			}
+		}
+		return canonical
+	}, safeStructurePath(value))
+}
+
+func newStructureSelectionPlanIndex(base StructurePlan) structureSelectionPlanIndex {
+	index := structureSelectionPlanIndex{
+		items:          make(map[string]StructurePlanItem, len(base.Items)),
+		conflictGroups: make(map[string]StructureConflictGroup, len(base.ConflictGroups)),
+	}
+	for _, item := range base.Items {
+		key := structureSelectionItemKey(item.Kind, item.SourceRelative, item.TargetRelative)
+		if _, exists := index.items[key]; !exists {
+			// Preserve the former linear lookup's first-match behavior.
+			index.items[key] = item
+		}
+	}
+	for _, group := range base.ConflictGroups {
+		key := structureSelectionConflictKey(group.Code, group.TargetRelative)
+		if _, exists := index.conflictGroups[key]; !exists {
+			index.conflictGroups[key] = group
+		}
+	}
+	return index
+}
+
 func appendStructureSelection(plan *StructurePlan, base StructurePlan, issue models.MediaLibraryStructureIssue, members []models.MediaLibraryStructureIssueMember, selection MediaLibraryStructureSelection, draftID string) error {
+	index := newStructureSelectionPlanIndex(base)
+	return appendIndexedStructureSelection(plan, base, index, issue, members, selection, draftID)
+}
+
+func appendIndexedStructureSelection(plan *StructurePlan, base StructurePlan, index structureSelectionPlanIndex, issue models.MediaLibraryStructureIssue, members []models.MediaLibraryStructureIssueMember, selection MediaLibraryStructureSelection, draftID string) error {
 	if selection.Action == StructureSelectionSkip {
 		plan.SkippedIssues = append(plan.SkippedIssues, issue.Token)
 		return nil
@@ -476,8 +640,8 @@ func appendStructureSelection(plan *StructurePlan, base StructurePlan, issue mod
 		if selection.Action == StructureSelectionRepair {
 			return appError(CodeInvalidRequest, "冲突问题必须选择保留来源、全部保留为版本或跳过", nil)
 		}
-		group := findStructureConflictGroup(base.ConflictGroups, issue.Code, issue.ExpectedPath)
-		if group == nil || len(group.Members) != len(members) {
+		group, exists := index.conflictGroups[structureSelectionConflictKey(issue.Code, issue.ExpectedPath)]
+		if !exists || len(group.Members) != len(members) {
 			return appError(CodeConflict, "冲突成员已经变化，请重新诊断", nil)
 		}
 		if err := validateDistinctStructureSources(group.Members); err != nil {
@@ -528,28 +692,16 @@ func appendStructureSelection(plan *StructurePlan, base StructurePlan, issue mod
 	if selection.Action != StructureSelectionRepair {
 		return appError(CodeInvalidRequest, "普通问题只能选择修复或跳过", nil)
 	}
-	for _, item := range base.Items {
-		if item.Kind == issue.Kind && strings.EqualFold(safeStructurePath(item.SourceRelative), safeStructurePath(issue.CurrentPath)) && strings.EqualFold(safeStructurePath(item.TargetRelative), safeStructurePath(issue.ExpectedPath)) {
-			plan.Items = append(plan.Items, item)
-			plan.ResolvedIssues = append(plan.ResolvedIssues, issue.Token)
-			return nil
-		}
+	if item, exists := index.items[structureSelectionItemKey(issue.Kind, issue.CurrentPath, issue.ExpectedPath)]; exists {
+		plan.Items = append(plan.Items, item)
+		plan.ResolvedIssues = append(plan.ResolvedIssues, issue.Token)
+		return nil
 	}
 	if issue.State == "manual_identity_resolved" {
 		plan.ResolvedIssues = append(plan.ResolvedIssues, issue.Token)
 		return nil
 	}
 	return appError(CodeConflict, "问题对应的修复计划已经变化，请重新诊断", nil)
-}
-
-func findStructureConflictGroup(groups []StructureConflictGroup, code, target string) *StructureConflictGroup {
-	target = safeStructurePath(target)
-	for index := range groups {
-		if groups[index].Code == code && strings.EqualFold(safeStructurePath(groups[index].TargetRelative), target) {
-			return &groups[index]
-		}
-	}
-	return nil
 }
 
 func appendAllConflictVersions(plan *StructurePlan, base StructurePlan, issue models.MediaLibraryStructureIssue, members []models.MediaLibraryStructureIssueMember, bySource map[string]StructurePlanItem, primaryToken string) error {
@@ -609,28 +761,74 @@ func selectionRecycleRelative(draftID, source string) string {
 }
 
 func orderStructureSelectionMoves(items []StructurePlanItem) []StructurePlanItem {
-	remaining := append([]StructurePlanItem(nil), items...)
-	ordered := make([]StructurePlanItem, 0, len(items))
-	for len(remaining) > 0 {
-		sourceSet := make(map[string]struct{}, len(remaining))
-		for _, item := range remaining {
-			sourceSet[strings.ToLower(item.SourceRelative)] = struct{}{}
+	if len(items) < 2 {
+		return append([]StructurePlanItem(nil), items...)
+	}
+	sourceCounts := make(map[string]int, len(items))
+	waitingBySource := make(map[string][]int, len(items))
+	for index, item := range items {
+		source := strings.ToLower(safeStructurePath(item.SourceRelative))
+		target := strings.ToLower(safeStructurePath(item.TargetRelative))
+		sourceCounts[source]++
+		waitingBySource[target] = append(waitingBySource[target], index)
+	}
+	blocked := make([]bool, len(items))
+	available := make(structureMoveIndexHeap, 0, len(items))
+	for index, item := range items {
+		target := strings.ToLower(safeStructurePath(item.TargetRelative))
+		if sourceCounts[target] > 0 {
+			blocked[index] = true
+		} else {
+			heap.Push(&available, index)
 		}
-		picked := -1
-		for index, item := range remaining {
-			if _, blocked := sourceSet[strings.ToLower(item.TargetRelative)]; !blocked {
-				picked = index
-				break
+	}
+	removed := make([]bool, len(items))
+	ordered := make([]StructurePlanItem, 0, len(items))
+	for available.Len() > 0 {
+		index := heap.Pop(&available).(int)
+		if removed[index] || blocked[index] {
+			continue
+		}
+		removed[index] = true
+		ordered = append(ordered, items[index])
+		source := strings.ToLower(safeStructurePath(items[index].SourceRelative))
+		sourceCounts[source]--
+		if sourceCounts[source] != 0 {
+			continue
+		}
+		delete(sourceCounts, source)
+		for _, waiting := range waitingBySource[source] {
+			if !removed[waiting] && blocked[waiting] {
+				blocked[waiting] = false
+				heap.Push(&available, waiting)
 			}
 		}
-		if picked < 0 {
-			// Cycles are not expected from version expansion. Preserve a stable
-			// order and let the backend fail closed instead of inventing a temp path.
-			sort.Slice(remaining, func(i, j int) bool { return remaining[i].SourceRelative < remaining[j].SourceRelative })
-			return append(ordered, remaining...)
-		}
-		ordered = append(ordered, remaining[picked])
-		remaining = append(remaining[:picked], remaining[picked+1:]...)
 	}
-	return ordered
+	if len(ordered) == len(items) {
+		return ordered
+	}
+	// Cycles are not expected from version expansion. Preserve the former
+	// deterministic fallback and let the backend fail closed instead of
+	// inventing an unreviewed temporary path.
+	remaining := make([]StructurePlanItem, 0, len(items)-len(ordered))
+	for index, item := range items {
+		if !removed[index] {
+			remaining = append(remaining, item)
+		}
+	}
+	sort.Slice(remaining, func(i, j int) bool { return remaining[i].SourceRelative < remaining[j].SourceRelative })
+	return append(ordered, remaining...)
+}
+
+type structureMoveIndexHeap []int
+
+func (h structureMoveIndexHeap) Len() int           { return len(h) }
+func (h structureMoveIndexHeap) Less(i, j int) bool { return h[i] < h[j] }
+func (h structureMoveIndexHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h *structureMoveIndexHeap) Push(value any)    { *h = append(*h, value.(int)) }
+func (h *structureMoveIndexHeap) Pop() any {
+	old := *h
+	last := old[len(old)-1]
+	*h = old[:len(old)-1]
+	return last
 }

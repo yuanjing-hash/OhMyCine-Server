@@ -78,6 +78,40 @@ func TestServerUpdateRoutesSetNoStoreBeforeAuthentication(t *testing.T) {
 	}
 }
 
+func TestStructureReviewRoutesRequireSessionCSRFAndNoStore(t *testing.T) {
+	client := newTestClient(t)
+	readPaths := []string{
+		"/api/v1/media-libraries/1/structure/issues?page=1&page_size=50&review_state=pending",
+		"/api/v1/media-libraries/1/structure/issues/opaque/members?page=1&page_size=50",
+	}
+	for _, path := range readPaths {
+		request := httptest.NewRequest(http.MethodGet, path, nil)
+		response := httptest.NewRecorder()
+		client.router.ServeHTTP(response, request)
+		if response.Code != http.StatusUnauthorized || response.Header().Get("Cache-Control") != "no-store" {
+			t.Fatalf("unauthenticated structure review read path=%s status=%d cache=%q", path, response.Code, response.Header().Get("Cache-Control"))
+		}
+	}
+
+	client.setup(t)
+	writes := []struct {
+		method string
+		path   string
+	}{
+		{http.MethodPut, "/api/v1/media-libraries/1/structure/review/issues/opaque"},
+		{http.MethodDelete, "/api/v1/media-libraries/1/structure/review/issues/opaque"},
+		{http.MethodPut, "/api/v1/media-libraries/1/structure/review/recognitions/opaque"},
+		{http.MethodDelete, "/api/v1/media-libraries/1/structure/review/recognitions/opaque"},
+		{http.MethodPost, "/api/v1/media-libraries/1/structure/review/bulk"},
+	}
+	for _, item := range writes {
+		status, _ := client.request(t, item.method, item.path, map[string]any{}, false)
+		if status != http.StatusForbidden || client.lastHeader.Get("Cache-Control") != "no-store" {
+			t.Fatalf("structure review write without csrf method=%s path=%s status=%d cache=%q", item.method, item.path, status, client.lastHeader.Get("Cache-Control"))
+		}
+	}
+}
+
 func TestBuiltInLibraryArtworkIsPublicInertRaster(t *testing.T) {
 	client := newTestClient(t)
 	request := httptest.NewRequest(http.MethodGet, "/api/v1/assets/library-covers/library-local.png", nil)
@@ -173,7 +207,7 @@ func newTestClient(t *testing.T, cloudDrivers ...cloudpkg.Driver) *testClient {
 	log := NewLogger("test")
 	audit := services.NewAuditService(db)
 	authorization := services.NewAuthorizationService(db)
-	auth, err := services.NewAuthService(db, cfg, authorization, audit)
+	auth, err := services.NewAuthService(db, cfg, authorization, audit, log)
 	if err != nil {
 		t.Fatal(err)
 	}

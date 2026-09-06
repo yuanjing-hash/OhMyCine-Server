@@ -10,7 +10,7 @@ import (
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
 )
 
-const maxStructurePreviewBytes = 8 * 1024 * 1024
+const maxStructurePreviewBytes = 32 * 1024 * 1024
 
 type MediaLibraryStructurePreviewItem struct {
 	Action       string `json:"action"`
