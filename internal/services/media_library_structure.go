@@ -416,9 +416,10 @@ func (s *MediaLibraryStructureService) structureIssuesTx(tx *gorm.DB, reader *Ca
 	}
 	choiceExists := "EXISTS (SELECT 1 FROM media_library_structure_review_choices rc WHERE rc.session_id = ? AND (rc.subject_key = ('issue:' || media_library_structure_issues.token) OR (media_library_structure_issues.recognition_id IS NOT NULL AND rc.subject_key = ('recognition:' || CAST(media_library_structure_issues.recognition_id AS TEXT)))))"
 	if reviewSession.ID != "" {
-		if query.ReviewState == "pending" {
+		switch query.ReviewState {
+		case "pending":
 			db = db.Where("NOT "+choiceExists, reviewSession.ID)
-		} else if query.ReviewState == "handled" {
+		case "handled":
 			db = db.Where(choiceExists, reviewSession.ID)
 		}
 	} else if query.ReviewState == "handled" {
