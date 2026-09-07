@@ -67,6 +67,9 @@ type mediaLibraryStructureRepairResponse struct {
 	IssueCount     int        `json:"issue_count"`
 	TotalItems     int        `json:"total_items"`
 	ProcessedItems int        `json:"processed_items"`
+	SucceededItems int        `json:"succeeded_items"`
+	FailedItems    int        `json:"failed_items"`
+	BlockedItems   int        `json:"blocked_items"`
 	LastErrorCode  string     `json:"last_error_code"`
 	CreatedAt      time.Time  `json:"created_at"`
 	UpdatedAt      time.Time  `json:"updated_at"`
@@ -74,10 +77,15 @@ type mediaLibraryStructureRepairResponse struct {
 }
 
 func mediaLibraryStructureRepairDTO(item models.MediaLibraryStructureRepair) mediaLibraryStructureRepairResponse {
+	phase := item.Phase
+	if phase == "failed" && item.SucceededItems > 0 && item.FailedItems+item.BlockedItems > 0 {
+		phase = "partial_failed"
+	}
 	return mediaLibraryStructureRepairResponse{
 		ID: item.ID, JobID: item.JobID, LibraryID: item.LibraryID, Scope: item.Scope,
-		Generation: item.Generation, Phase: item.Phase, IssueCount: item.IssueCount,
+		Generation: item.Generation, Phase: phase, IssueCount: item.IssueCount,
 		TotalItems: item.TotalItems, ProcessedItems: item.ProcessedItems,
+		SucceededItems: item.SucceededItems, FailedItems: item.FailedItems, BlockedItems: item.BlockedItems,
 		LastErrorCode: item.LastErrorCode, CreatedAt: item.CreatedAt,
 		UpdatedAt: item.UpdatedAt, FinishedAt: item.FinishedAt,
 	}
@@ -898,6 +906,37 @@ func (a *API) MediaLibraryStructureRepairs(c *gin.Context) {
 		list = append(list, mediaLibraryStructureRepairDTO(item))
 	}
 	success(c, http.StatusOK, gin.H{"list": list, "total": len(list)})
+}
+
+func (a *API) MediaLibraryStructureRepairItems(c *gin.Context) {
+	actor, _ := middleware.ActorFrom(c)
+	id, ok := pathID(c)
+	if !ok {
+		return
+	}
+	page, pageSize := 1, 50
+	if raw := c.Query("page"); raw != "" {
+		value, err := strconv.Atoi(raw)
+		if err != nil {
+			writeError(c, a.log, invalid("分页参数无效", err))
+			return
+		}
+		page = value
+	}
+	if raw := c.Query("page_size"); raw != "" {
+		value, err := strconv.Atoi(raw)
+		if err != nil {
+			writeError(c, a.log, invalid("分页参数无效", err))
+			return
+		}
+		pageSize = value
+	}
+	items, err := a.libraryStructure.RepairItems(actor, id, c.Param("repair"), page, pageSize)
+	if err != nil {
+		writeError(c, a.log, err)
+		return
+	}
+	success(c, http.StatusOK, items)
 }
 
 func mediaPageQuery(c *gin.Context, legacyLimit bool) (services.MediaPageQuery, error) {

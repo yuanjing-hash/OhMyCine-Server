@@ -83,6 +83,7 @@ func TestStructureReviewRoutesRequireSessionCSRFAndNoStore(t *testing.T) {
 	readPaths := []string{
 		"/api/v1/media-libraries/1/structure/issues?page=1&page_size=50&review_state=pending",
 		"/api/v1/media-libraries/1/structure/issues/opaque/members?page=1&page_size=50",
+		"/api/v1/media-libraries/1/structure/repairs/opaque/items?page=1&page_size=50",
 	}
 	for _, path := range readPaths {
 		request := httptest.NewRequest(http.MethodGet, path, nil)

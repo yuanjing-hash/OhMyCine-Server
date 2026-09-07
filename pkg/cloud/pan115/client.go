@@ -219,6 +219,7 @@ type Client struct {
 	now             func() time.Time
 	jitter          func() time.Duration
 	riskFails       int
+	transientFails  int
 	backoffTil      time.Time
 	circuitTil      time.Time
 	recyclePassword string
@@ -243,13 +244,13 @@ func New(config cloud.Config) (cloud.Driver, error) {
 		interactiveRate: rate.NewLimiter(rate.Every(250*time.Millisecond), 1), pipelineRate: rate.NewLimiter(rate.Every(250*time.Millisecond), 1),
 		bulkRate: rate.NewLimiter(rate.Every(bulkRequestSpacing), 1), directRate: rate.NewLimiter(rate.Every(time.Second), 1),
 		offlineRate: rate.NewLimiter(rate.Every(2*time.Second), 1), eventRate: rate.NewLimiter(rate.Every(5*time.Second), 1),
-		// MoviePilot's p115 integrations pace provider endpoints independently.
-		// Keep that boundary here: healthy mkdir is only concurrency bounded and
-		// must not wait behind move/rename/delete traffic, while each destructive
-		// operation retains its conservative two-second lane.
-		mkdirRate: rate.NewLimiter(rate.Inf, 1), uploadRate: rate.NewLimiter(rate.Every(2*time.Second), 1),
-		moveRate: rate.NewLimiter(rate.Every(2*time.Second), 1), copyRate: rate.NewLimiter(rate.Every(2*time.Second), 1), renameRate: rate.NewLimiter(rate.Every(2*time.Second), 1),
-		recycleRate: rate.NewLimiter(rate.Every(2*time.Second), 1), purgeRate: rate.NewLimiter(rate.Every(2*time.Second), 1),
+		// Healthy mutations are concurrency bounded by callSlots, not paced at a
+		// permanently slow rate. waitForRecovery/recordOutcome are shared by the
+		// whole account and introduce backoff/circuit breaking only after an
+		// actual 405/429/risk response; successful probes restore full capacity.
+		mkdirRate: rate.NewLimiter(rate.Inf, 1), uploadRate: rate.NewLimiter(rate.Inf, 1),
+		moveRate: rate.NewLimiter(rate.Inf, 1), copyRate: rate.NewLimiter(rate.Inf, 1), renameRate: rate.NewLimiter(rate.Inf, 1),
+		recycleRate: rate.NewLimiter(rate.Inf, 1), purgeRate: rate.NewLimiter(rate.Inf, 1),
 		// Background scans may use up to 32 calls while two global slots remain
 		// available for interactive/playback work.
 		callSlots: make(chan struct{}, maxInFlightCalls), backgroundRead: make(chan struct{}, maxBackgroundCalls), now: time.Now, jitter: defaultJitter, recyclePassword: strings.TrimSpace(config.RecyclePassword),
@@ -1482,13 +1483,36 @@ func (c *Client) recordOutcome(err error) {
 			return
 		}
 		c.riskFails = 0
+		c.transientFails = 0
 		c.backoffTil = time.Time{}
 		c.circuitTil = time.Time{}
 		return
 	}
 	if !isRiskResponse(err) {
+		if !isTransientResponse(err) {
+			c.transientFails = 0
+			return
+		}
+		c.transientFails++
+		// One or two isolated network failures stay item-local. Only a repeated
+		// streak changes the shared account recovery state.
+		if c.transientFails < 3 {
+			return
+		}
+		delay := 2 * time.Second
+		for attempt := 3; attempt < c.transientFails && delay < time.Minute; attempt++ {
+			delay *= 2
+		}
+		if delay > time.Minute {
+			delay = time.Minute
+		}
+		c.backoffTil = c.now().Add(delay + c.jitter())
+		if c.transientFails >= 6 {
+			c.circuitTil = c.now().Add(time.Minute)
+		}
 		return
 	}
+	c.transientFails = 0
 	c.riskFails++
 	delay := 2 * time.Second
 	for attempt := 1; attempt < c.riskFails && delay < 2*time.Minute; attempt++ {
@@ -1511,6 +1535,19 @@ func defaultJitter() time.Duration {
 func isRiskResponse(err error) bool {
 	message := strings.ToLower(err.Error())
 	return strings.Contains(message, "429") || strings.Contains(message, "405") || strings.Contains(message, "rate") || strings.Contains(message, "频繁") || strings.Contains(message, "风控")
+}
+
+func isTransientResponse(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	message := strings.ToLower(err.Error())
+	for _, marker := range []string{"timeout", "timed out", "connection reset", "connection refused", "broken pipe", "unexpected eof", "temporarily unavailable", "http 502", "http 503", "http 504", "网络超时", "连接重置"} {
+		if strings.Contains(message, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func mapFile(file pan115sdk.File) (cloud.Item, error) {

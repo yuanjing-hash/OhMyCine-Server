@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 
@@ -174,6 +175,47 @@ func TestCatalogStructureRepairResumesBookkeepingWithoutFilesOrEarlyReady(t *tes
 	settled := assertPhysicalOwnerState(t, s.db, CatalogPhysicalRepair, repair.ID, "settled")
 	if settled.Revision <= prior.Revision {
 		t.Fatal("repair resume did not replace the previous execution receipt")
+	}
+}
+
+func TestCatalogStructureRepairPublishesOnlyAfterAllCheckpointItemsSucceed(t *testing.T) {
+	s, repair, plan, entries, _ := catalogStructureRepairFixture(t)
+	plan.Items = []StructurePlanItem{
+		{Kind: "video", SourceRelative: entries[0].RelativePath, TargetRelative: "Show/Season 02/Show.S02E01.mkv", ProviderID: entries[0].ProviderID},
+		{Kind: "video", SourceRelative: entries[1].RelativePath, TargetRelative: "Show/Season 02/Show.S02E02.mkv", ProviderID: entries[1].ProviderID},
+	}
+	raw, err := json.Marshal(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repair.PlanJSON, repair.TotalItems = string(raw), len(plan.Items)
+	if err := s.db.Model(&models.MediaLibraryStructureRepair{}).Where("id = ?", repair.ID).Updates(map[string]any{"plan_json": repair.PlanJSON, "total_items": repair.TotalItems}).Error; err != nil {
+		t.Fatal(err)
+	}
+	var before models.CatalogHead
+	if err := s.db.First(&before, "library_id = ?", repair.LibraryID).Error; err != nil {
+		t.Fatal(err)
+	}
+	backend := &checkpointStructureBackend{fail: map[string]bool{entries[1].RelativePath: true}}
+	s.backends.Register(backend)
+	if result := s.runRepair(context.Background(), fastScanTestRuntime{}, repair.ID); result.ErrorCode != CodeMediaLibraryStructureApplyFailed || result.RetryAt != nil {
+		t.Fatalf("partial result=%+v", result)
+	}
+	var partial models.CatalogHead
+	if err := s.db.First(&partial, "library_id = ?", repair.LibraryID).Error; err != nil || partial.Revision != before.Revision {
+		t.Fatalf("partial repair published catalog: before=%+v after=%+v err=%v", before, partial, err)
+	}
+	backend.fail = map[string]bool{}
+	backend.calls = nil
+	if result := s.runRepair(context.Background(), fastScanTestRuntime{}, repair.ID); result.ErrorCode != "" {
+		t.Fatalf("retry result=%+v", result)
+	}
+	if !reflect.DeepEqual(backend.calls, []string{entries[1].RelativePath}) {
+		t.Fatalf("retry replayed a successful physical item: %v", backend.calls)
+	}
+	var completed models.CatalogHead
+	if err := s.db.First(&completed, "library_id = ?", repair.LibraryID).Error; err != nil || completed.Revision <= before.Revision {
+		t.Fatalf("completed retry did not publish catalog: before=%+v after=%+v err=%v", before, completed, err)
 	}
 }
 

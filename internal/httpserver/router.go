@@ -230,6 +230,7 @@ func New(cfg config.Config, api *handlers.API, auth *services.AuthService, log z
 	protected.POST("/media-libraries/:id/structure/selection-repair", middleware.NoStore(), middleware.RequirePermission(authz.PermissionMediaLibrariesScan), api.RepairMediaLibraryStructureSelection)
 	protected.POST("/media-libraries/:id/structure/repair", middleware.NoStore(), middleware.RequirePermission(authz.PermissionMediaLibrariesScan), api.RepairMediaLibraryStructure)
 	protected.GET("/media-libraries/:id/structure/repairs", middleware.NoStore(), middleware.RequirePermission(authz.PermissionMediaLibrariesRead), api.MediaLibraryStructureRepairs)
+	protected.GET("/media-libraries/:id/structure/repairs/:repair/items", middleware.NoStore(), middleware.RequirePermission(authz.PermissionMediaLibrariesRead), api.MediaLibraryStructureRepairItems)
 	protected.GET("/media-libraries/:id/structure/runs", middleware.NoStore(), middleware.RequirePermission(authz.PermissionMediaLibrariesRead), api.MediaLibraryStructureRepairs)
 	protected.GET("/strm/libraries", middleware.NoStore(), middleware.RequirePermission(authz.PermissionSTRMRunsRead), api.STRMLibraries)
 	protected.GET("/strm/runs", middleware.NoStore(), middleware.RequirePermission(authz.PermissionSTRMRunsRead), api.STRMRuns)

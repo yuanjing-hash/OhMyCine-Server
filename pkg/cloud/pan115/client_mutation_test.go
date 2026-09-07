@@ -204,8 +204,29 @@ func TestNewClientUsesIndependentMutationLanes(t *testing.T) {
 	if client.mkdirRate.Limit() != rate.Inf {
 		t.Fatalf("healthy mkdir has fixed pacing: %v", client.mkdirRate.Limit())
 	}
-	if client.moveRate.Limit() == rate.Inf || client.renameRate.Limit() == rate.Inf || client.recycleRate.Limit() == rate.Inf {
-		t.Fatal("destructive mutation lanes lost conservative pacing")
+	if client.moveRate.Limit() != rate.Inf || client.renameRate.Limit() != rate.Inf || client.recycleRate.Limit() != rate.Inf {
+		t.Fatal("healthy destructive mutations must not have fixed pacing")
+	}
+}
+
+func TestRepeatedTransientFailuresTriggerAdaptiveRecovery(t *testing.T) {
+	now := time.Date(2026, 9, 7, 0, 0, 0, 0, time.UTC)
+	client := newMutationTestClient(&mutationTestSDK{bulkSDK: &bulkSDK{}})
+	client.now = func() time.Time { return now }
+	client.jitter = func() time.Duration { return 0 }
+	client.recordOutcome(errors.New("connection reset by peer"))
+	client.recordOutcome(errors.New("temporary timeout"))
+	if !client.backoffTil.IsZero() {
+		t.Fatal("isolated transient failures throttled healthy traffic")
+	}
+	client.recordOutcome(errors.New("HTTP 503 temporarily unavailable"))
+	if !client.backoffTil.Equal(now.Add(2 * time.Second)) {
+		t.Fatalf("backoff=%v", client.backoffTil)
+	}
+	now = now.Add(3 * time.Second)
+	client.recordOutcome(nil)
+	if client.transientFails != 0 || !client.backoffTil.IsZero() {
+		t.Fatal("successful recovery did not restore capacity")
 	}
 }
 

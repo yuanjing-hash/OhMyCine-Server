@@ -14,13 +14,16 @@ func TestMediaLibraryStructureResponsesDoNotExposePrivatePlanIdentity(t *testing
 		ID: "repair-safe", LibraryID: 7, OwnerID: 42, JobID: stringPointer("job-safe"),
 		Scope: models.MediaLibraryStructureScopeWork, WorkKey: "series:tmdb:100",
 		RuleFingerprint: "private-rule", PlanJSON: `{"provider_id":"private-provider"}`,
-		StateJSON: `{"absolute_path":"D:\\private"}`, Phase: "queued", TotalItems: 2,
+		StateJSON: `{"absolute_path":"D:\\private"}`, Phase: "failed", TotalItems: 2, SucceededItems: 1, FailedItems: 1,
 	}
 	payload, err := json.Marshal(mediaLibraryStructureRepairDTO(repair))
 	if err != nil {
 		t.Fatal(err)
 	}
 	serialized := string(payload)
+	if !strings.Contains(serialized, `"phase":"partial_failed"`) || !strings.Contains(serialized, `"failed_items":1`) {
+		t.Fatalf("partial repair projection missing: %s", serialized)
+	}
 	for _, private := range []string{"owner_id", "work_key", "series:tmdb:100", "private-rule", "private-provider", "absolute_path"} {
 		if strings.Contains(serialized, private) {
 			t.Fatalf("private repair identity leaked: %s", serialized)

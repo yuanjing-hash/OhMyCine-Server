@@ -239,7 +239,7 @@ func (s *MediaLibraryStructureService) enqueueSelectionPlan(actor Actor, draft m
 		return models.MediaLibraryStructureRepair{}, mediaLibraryNotFound(err)
 	}
 	var active models.MediaLibraryStructureRepair
-	query := s.db.Where("library_id = ? AND scope = ? AND work_key = '' AND phase IN ?", draft.LibraryID, models.MediaLibraryStructureScopeFull, []string{"queued", "executing", "reconciling"}).Order("created_at DESC").First(&active)
+	query := s.db.Where("library_id = ? AND scope = ? AND work_key = '' AND (phase IN ? OR (phase = 'failed' AND succeeded_items > 0 AND (failed_items > 0 OR blocked_items > 0)))", draft.LibraryID, models.MediaLibraryStructureScopeFull, activeStructureRepairPhases).Order("created_at DESC").First(&active)
 	if query.Error == nil {
 		return models.MediaLibraryStructureRepair{}, appError(CodeConflict, "已有媒体库结构修复任务正在执行", nil)
 	}

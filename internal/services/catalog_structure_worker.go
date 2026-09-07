@@ -186,30 +186,45 @@ func (s *MediaLibraryStructureService) runCatalogStructureRepair(ctx context.Con
 		}); err != nil {
 			return fail(err)
 		}
-		total := len(plan.Items) + len(plan.RecycleItems)
-		progress := func(offset int) StructureProgress {
-			return func(processed, _ int) error {
-				if err := check(); err != nil {
+		execution := s.executeStructureRepairItems(ctx, runtime, repair, plan, boundary, backend, claim)
+		if execution.GlobalErr != nil {
+			if execution.RetryAt != nil {
+				_ = s.structureRepairCheckpointTx(ctx, repair, claim, func(tx *gorm.DB) error {
+					return tx.Model(&models.MediaLibraryStructureRepair{}).Where("id = ?", repair.ID).Updates(map[string]any{"phase": "queued", "last_error_code": execution.GlobalCode, "updated_at": time.Now().UTC()}).Error
+				})
+				return WorkerResult{RetryAt: execution.RetryAt, ErrorCode: execution.GlobalCode, ErrorMessage: "云盘正在风控恢复，已保存成功项进度"}
+			}
+			return fail(execution.GlobalErr)
+		}
+		originalTotal := len(plan.Items) + len(plan.RecycleItems)
+		state.FailedItems, state.BlockedItems, state.OriginalTotalItems = execution.Failed, execution.Blocked, originalTotal
+		if execution.Failed+execution.Blocked > 0 {
+			// Keep the old bound Catalog visible and retain its binding while the
+			// physical filesystem is only partially converged. A retry reuses the
+			// exact frozen plan, skips succeeded checkpoints, and publishes once
+			// every operation has succeeded. This never publishes invented paths.
+			s.abandonCatalogStructureCandidate(&prepared)
+			state.Stage = "physical_partial"
+			if err := s.structureCatalogWriteTx(ctx, func(tx *gorm.DB) error {
+				if err := s.validateCatalogStructureExecutionTx(tx, repair, state, claim, true); err != nil {
 					return err
 				}
-				count, expected := int64(processed+offset), int64(total)
-				if runtime != nil {
-					if err := runtime.Heartbeat(nil, &count, &expected, nil, nil); err != nil {
-						return err
-					}
-				}
-				return s.structureCatalogWriteTx(ctx, func(tx *gorm.DB) error {
-					if err := s.validateCatalogStructureExecutionTx(tx, repair, state, claim, true); err != nil {
-						return err
-					}
-					return tx.Model(&models.MediaLibraryStructureRepair{}).Where("id = ?", repair.ID).Update("processed_items", count).Error
-				})
+				return persistCatalogStructureStateTx(tx, repair.ID, state, map[string]any{"phase": "failed", "last_error_code": CodeMediaLibraryStructureApplyFailed})
+			}); err != nil {
+				return fail(err)
 			}
+			return WorkerResult{ErrorCode: CodeMediaLibraryStructureApplyFailed, ErrorMessage: "目录整理已部分完成；失败项已隔离，重试只会处理剩余项"}
 		}
-		if err := backend.Recycle(ctx, boundary, plan.RecycleItems, progress(0)); err != nil {
+		plan = execution.Plan
+		// Candidates prepared before physical work budget the full authorized
+		// plan only. Rebuild from checked successes before publication.
+		s.abandonCatalogStructureCandidate(&prepared)
+		facts, err = s.catalogStructureMutationFacts(ctx, repair, state, plan, parents)
+		if err != nil {
 			return fail(err)
 		}
-		if err := backend.Apply(ctx, boundary, plan.Items, progress(len(plan.RecycleItems))); err != nil {
+		prepared, err = s.prepareCatalogStructureCandidate(ctx, repair, state, claim, facts)
+		if err != nil {
 			return fail(err)
 		}
 		state.Stage = "physical_completed"

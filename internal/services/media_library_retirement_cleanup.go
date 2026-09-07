@@ -33,6 +33,7 @@ func (step libraryRetirementCleanupStep) run(tx *gorm.DB, libraryID uint) (int64
 }
 
 var libraryRetirementCleanup = []libraryRetirementCleanupStep{
+	{"media_library_structure_repair_items", "repair_id IN (SELECT id FROM media_library_structure_repairs WHERE library_id=?)", "", false},
 	{"catalog_structure_directory_receipts", "repair_id IN (SELECT id FROM media_library_structure_repairs WHERE library_id=?)", "", false},
 	{"media_library_structure_issue_members", "issue_id IN (SELECT id FROM media_library_structure_issues WHERE library_id=?)", "", false},
 	{"media_library_structure_review_choices", "session_id IN (SELECT id FROM media_library_structure_review_sessions WHERE library_id=?)", "", false},

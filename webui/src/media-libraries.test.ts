@@ -201,7 +201,7 @@ describe('media library form boundary', () => {
 
   it('loads the complete actionable structure projection with server pagination', () => {
     const source = readFileSync(new URL('./views/MediaLibrariesView.vue', import.meta.url), 'utf8')
-    for (const text of ['本次检测处理工作区', '需要决定', '开始整理（先预览全部确定项）', '仅预览当前类型', '手动识别此项', '去规则管理', '视频目标冲突', '伴随文件冲突', '重新检查', 'structureIssuePageSize', 'changeStructureIssuePage']) expect(source).toContain(text)
+    for (const text of ['本次检测处理工作区', '需要决定', '预览', '开始整理', '仅预览当前类型', '手动识别此项', '去规则管理', '视频目标冲突', '伴随文件冲突', '重新检查', 'structureIssuePageSize', 'changeStructureIssuePage']) expect(source).toContain(text)
     for (const text of ['自动识别失败或无匹配', '目录结构初步检查完成 · 等待识别结果', '等待中的媒体不会计入“需要处理”', '本次来源版本的收敛检查', 'recognition_enqueue_failed']) expect(source).toContain(text)
     expect(source).toContain('/structure/issues?')
     expect(source).toContain("actionable: 'true'")

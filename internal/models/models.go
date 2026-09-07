@@ -892,10 +892,34 @@ type MediaLibraryStructureRepair struct {
 	IssueCount      int        `gorm:"not null;default:0" json:"issue_count"`
 	TotalItems      int        `gorm:"not null;default:0" json:"total_items"`
 	ProcessedItems  int        `gorm:"not null;default:0" json:"processed_items"`
+	SucceededItems  int        `gorm:"not null;default:0" json:"succeeded_items"`
+	FailedItems     int        `gorm:"not null;default:0" json:"failed_items"`
+	BlockedItems    int        `gorm:"not null;default:0" json:"blocked_items"`
 	LastErrorCode   string     `gorm:"size:96;not null;default:''" json:"last_error_code"`
 	CreatedAt       time.Time  `gorm:"not null;index:idx_media_library_structure_repairs_library,priority:2,sort:desc" json:"created_at"`
 	UpdatedAt       time.Time  `gorm:"not null" json:"updated_at"`
 	FinishedAt      *time.Time `json:"finished_at,omitempty"`
+}
+
+// MediaLibraryStructureRepairItem is the crash-safe checkpoint for one
+// physical operation. Provider identities remain in the private frozen plan.
+type MediaLibraryStructureRepairItem struct {
+	ID                uint       `gorm:"primaryKey" json:"-"`
+	RepairID          string     `gorm:"size:36;not null;uniqueIndex:idx_structure_repair_item_ordinal,priority:1;index" json:"-"`
+	Ordinal           int        `gorm:"not null;uniqueIndex:idx_structure_repair_item_ordinal,priority:2" json:"ordinal"`
+	Action            string     `gorm:"size:16;not null" json:"action"`
+	Kind              string     `gorm:"size:16;not null" json:"kind"`
+	SourceRelative    string     `gorm:"size:2048;not null;default:''" json:"source_path"`
+	TargetRelative    string     `gorm:"size:2048;not null;default:''" json:"target_path,omitempty"`
+	DependencyOrdinal *int       `json:"-"`
+	Status            string     `gorm:"size:16;not null;index;default:'pending'" json:"status"`
+	AttemptCount      int        `gorm:"not null;default:0" json:"attempt_count"`
+	ErrorCode         string     `gorm:"size:96;not null;default:''" json:"error_code"`
+	ErrorMessage      string     `gorm:"size:512;not null;default:''" json:"error_message"`
+	StartedAt         *time.Time `json:"-"`
+	FinishedAt        *time.Time `json:"-"`
+	CreatedAt         time.Time  `gorm:"not null" json:"-"`
+	UpdatedAt         time.Time  `gorm:"not null" json:"updated_at"`
 }
 
 const (

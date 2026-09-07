@@ -54,6 +54,8 @@ func validateStructureMutation(boundary StructureBoundary) error {
 
 type StructureProgress func(processed, total int) error
 
+var activeStructureRepairPhases = []string{"queued", "executing", "reconciling"}
+
 type MediaLibraryStructureBackend interface {
 	StorageType() string
 	ValidateRecycle(context.Context, StructureBoundary) error
@@ -1018,7 +1020,7 @@ func (s *MediaLibraryStructureService) enqueueRepairPlan(actor Actor, library mo
 		scope = models.MediaLibraryStructureScopeWork
 	}
 	var active models.MediaLibraryStructureRepair
-	query := s.db.Where("library_id = ? AND scope = ? AND work_key = ? AND phase IN ?", libraryID, scope, workKey, []string{"queued", "executing", "reconciling"}).Order("created_at DESC").First(&active)
+	query := s.db.Where("library_id = ? AND scope = ? AND work_key = ? AND (phase IN ? OR (phase = 'failed' AND succeeded_items > 0 AND (failed_items > 0 OR blocked_items > 0)))", libraryID, scope, workKey, activeStructureRepairPhases).Order("created_at DESC").First(&active)
 	if query.Error == nil {
 		return active, nil
 	}
@@ -1853,49 +1855,39 @@ func (s *MediaLibraryStructureService) runRepair(ctx context.Context, runtime Jo
 		return s.failRepair(repair, CodeMediaLibraryStructureBoundaryChanged, "媒体库文件操作暂不可执行，请恢复原任务后重试")
 	}
 	defer quiesceCatalogPhysicalWrite(s.db, permit, s.log)
-	if err := backend.Recycle(ctx, boundary, plan.RecycleItems, progressAt(0)); err != nil {
-		code := CodeMediaLibraryStructureApplyFailed
-		switch {
-		case errors.Is(err, errStructureConflict):
-			code = CodeMediaLibraryStructureConflict
-		case errors.Is(err, errStructureFileLocked):
-			code = CodeMediaLibraryStructureFileLocked
-		case errors.Is(err, errStructurePermissionDenied):
-			code = CodeMediaLibraryStructurePermissionDenied
+	_ = progressAt // item checkpoints own progress updates now
+	execution := s.executeStructureRepairItems(ctx, runtime, repair, plan, boundary, backend, claim)
+	if execution.GlobalErr != nil {
+		if execution.RetryAt != nil {
+			_ = s.db.Model(&repair).Updates(map[string]any{"phase": "queued", "last_error_code": execution.GlobalCode, "updated_at": time.Now().UTC()}).Error
+			return WorkerResult{RetryAt: execution.RetryAt, ErrorCode: execution.GlobalCode, ErrorMessage: "云盘正在风控恢复，已保存成功项进度"}
 		}
-		return s.failRepair(repair, code, "媒体库冲突来源回收失败")
+		return s.failRepair(repair, execution.GlobalCode, "媒体库结构修复已安全停止")
 	}
-	if err := backend.Apply(ctx, boundary, plan.Items, progressAt(len(plan.RecycleItems))); err != nil {
-		code := CodeMediaLibraryStructureApplyFailed
-		switch {
-		case errors.Is(err, errStructureConflict):
-			code = CodeMediaLibraryStructureConflict
-		case errors.Is(err, errStructureFileLocked):
-			code = CodeMediaLibraryStructureFileLocked
-		case errors.Is(err, errStructurePermissionDenied):
-			code = CodeMediaLibraryStructurePermissionDenied
-		}
-		return s.failRepair(repair, code, "媒体库结构修复失败")
-	}
-	providerParents, err := s.repairedManagedProviderParents(ctx, library, storage, plan.Items)
+	appliedPlan := execution.Plan
+	providerParents, err := s.repairedManagedProviderParents(ctx, library, storage, appliedPlan.Items)
 	if err != nil {
 		return s.failRepair(repair, CodeMediaLibraryStructureApplyFailed, "媒体库结构修复结果验证失败")
 	}
 	finished := time.Now().UTC()
 	err = s.db.Transaction(func(tx *gorm.DB) error {
-		if err := removeStructureCatalogItems(tx, repair.LibraryID, plan.RecycleItems); err != nil {
+		if err := removeStructureCatalogItems(tx, repair.LibraryID, appliedPlan.RecycleItems); err != nil {
 			return err
 		}
-		if err := updateStructureCatalogPaths(tx, repair.LibraryID, plan.Items, providerParents); err != nil {
+		if err := updateStructureCatalogPaths(tx, repair.LibraryID, appliedPlan.Items, providerParents); err != nil {
 			return err
 		}
 		if !plan.SelectionBound {
-			if _, err := resolveCompletedStructureMovesTx(tx, repair.LibraryID, plan.Items); err != nil {
+			if _, err := resolveCompletedStructureMovesTx(tx, repair.LibraryID, appliedPlan.Items); err != nil {
 				return err
 			}
 		}
-		if len(plan.ResolvedIssues) > 0 {
-			if err := tx.Where("library_id = ? AND diagnosis_job_id = ? AND token IN ?", repair.LibraryID, plan.DiagnosisJobID, plan.ResolvedIssues).Delete(&models.MediaLibraryStructureIssue{}).Error; err != nil {
+		resolvedIssues := plan.ResolvedIssues
+		if execution.Failed+execution.Blocked > 0 {
+			resolvedIssues = nil
+		}
+		if len(resolvedIssues) > 0 {
+			if err := tx.Where("library_id = ? AND diagnosis_job_id = ? AND token IN ?", repair.LibraryID, plan.DiagnosisJobID, resolvedIssues).Delete(&models.MediaLibraryStructureIssue{}).Error; err != nil {
 				return err
 			}
 		}
@@ -1904,7 +1896,7 @@ func (s *MediaLibraryStructureService) runRepair(ctx context.Context, runtime Jo
 				return err
 			}
 		}
-		if totalMutations > 0 {
+		if execution.Succeeded > 0 {
 			if err := tx.Model(&models.MediaLibrary{}).Where("id = ?", repair.LibraryID).UpdateColumn("dirty_generation", gorm.Expr("dirty_generation + 1")).Error; err != nil {
 				return err
 			}
@@ -1912,19 +1904,30 @@ func (s *MediaLibraryStructureService) runRepair(ctx context.Context, runtime Jo
 		if err := refreshStructureSummaryTx(tx, repair.LibraryID, finished); err != nil {
 			return err
 		}
-		if err := tx.Model(&repair).Updates(map[string]any{"phase": "completed", "processed_items": totalMutations, "last_error_code": "", "finished_at": finished, "updated_at": finished}).Error; err != nil {
+		phase, lastError := "completed", ""
+		if execution.Failed+execution.Blocked > 0 {
+			phase, lastError = "failed", CodeMediaLibraryStructureApplyFailed
+		}
+		if err := tx.Model(&repair).Updates(map[string]any{"phase": phase, "processed_items": totalMutations, "succeeded_items": execution.Succeeded, "failed_items": execution.Failed, "blocked_items": execution.Blocked, "last_error_code": lastError, "finished_at": finished, "updated_at": finished}).Error; err != nil {
 			return err
 		}
 		if err := SettleCatalogPhysicalWriteTx(tx, permit, claim); err != nil {
 			return err
 		}
-		return s.audit.Record(tx, &repair.OwnerID, "media_library.structure_repair.complete", "media_library", uintID(repair.LibraryID), "success", map[string]any{"scope": repair.Scope, "move_count": len(plan.Items), "recycle_count": len(plan.RecycleItems)}, RequestContext{})
+		outcome := "success"
+		if execution.Failed+execution.Blocked > 0 {
+			outcome = "partial"
+		}
+		return s.audit.Record(tx, &repair.OwnerID, "media_library.structure_repair.complete", "media_library", uintID(repair.LibraryID), outcome, map[string]any{"scope": repair.Scope, "move_count": len(appliedPlan.Items), "recycle_count": len(appliedPlan.RecycleItems), "failed_count": execution.Failed, "blocked_count": execution.Blocked}, RequestContext{})
 	})
 	if err != nil {
 		return s.failRepair(repair, CodeMediaLibraryStructureApplyFailed, "媒体库修复结果保存失败")
 	}
 	if s.reconcile != nil {
 		s.reconcile(repair.LibraryID)
+	}
+	if execution.Failed+execution.Blocked > 0 {
+		return WorkerResult{ErrorCode: CodeMediaLibraryStructureApplyFailed, ErrorMessage: "目录整理已部分完成；失败项已隔离，可单独重试"}
 	}
 	return WorkerResult{}
 }

@@ -43,6 +43,9 @@ type structureCatalogRepairState struct {
 	DiagnosisGeneration      uint64                `json:"diagnosis_generation,omitempty"`
 	SourceRevision           uint64                `json:"source_revision,omitempty"`
 	SelectionBound           bool                  `json:"selection_bound,omitempty"`
+	FailedItems              int                   `json:"failed_items,omitempty"`
+	BlockedItems             int                   `json:"blocked_items,omitempty"`
+	OriginalTotalItems       int                   `json:"original_total_items,omitempty"`
 }
 
 func (state structureCatalogRepairState) binding() CatalogSnapshotBinding {
@@ -91,7 +94,7 @@ func (s *MediaLibraryStructureService) freezeCatalogStructureRepairTx(tx *gorm.D
 		return appError(CodeConflict, "目录索引已变化，请重新预览", ErrCatalogFence)
 	}
 	var active int64
-	if err := tx.Model(&models.MediaLibraryStructureRepair{}).Where("library_id = ? AND id <> ? AND phase IN ?", repair.LibraryID, repair.ID, []string{"queued", "executing", "reconciling"}).Limit(1).Count(&active).Error; err != nil {
+	if err := tx.Model(&models.MediaLibraryStructureRepair{}).Where("library_id = ? AND id <> ? AND (phase IN ? OR (phase = 'failed' AND succeeded_items > 0 AND (failed_items > 0 OR blocked_items > 0)))", repair.LibraryID, repair.ID, activeStructureRepairPhases).Limit(1).Count(&active).Error; err != nil {
 		return err
 	}
 	if active > 0 {
