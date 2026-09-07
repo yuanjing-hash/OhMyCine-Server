@@ -1870,12 +1870,18 @@ func (s *MediaLibraryStructureService) runRepair(ctx context.Context, runtime Jo
 	boundary := StructureBoundary{Library: library, Storage: storage}
 	permit, err := enterCatalogPhysicalWrite(ctx, s.db, CatalogPhysicalWriteInput{LibraryID: repair.LibraryID, OwnerKind: CatalogPhysicalRepair, OwnerID: repair.ID, Job: claim, ActorID: repair.OwnerID})
 	if err != nil {
+		if ErrorCode(err) == "pan115_auth_expired" {
+			return s.waitRepairCredentials(ctx, repair, claim)
+		}
 		return s.failRepair(repair, CodeMediaLibraryStructureBoundaryChanged, "媒体库文件操作暂不可执行，请恢复原任务后重试")
 	}
 	defer s.finishStructurePhysicalWrite(permit)
 	_ = progressAt // item checkpoints own progress updates now
 	execution := s.executeStructureRepairItems(ctx, runtime, repair, plan, boundary, backend, claim)
 	if execution.GlobalErr != nil {
+		if execution.GlobalCode == "pan115_auth_expired" {
+			return s.waitRepairCredentials(ctx, repair, claim)
+		}
 		if execution.RetryAt != nil {
 			_ = s.db.Model(&repair).Updates(map[string]any{"phase": "queued", "last_error_code": execution.GlobalCode, "updated_at": time.Now().UTC()}).Error
 			return WorkerResult{RetryAt: execution.RetryAt, ErrorCode: execution.GlobalCode, ErrorMessage: "云盘正在风控恢复，已保存成功项进度"}

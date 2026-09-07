@@ -223,6 +223,9 @@ type Client struct {
 	backoffTil      time.Time
 	circuitTil      time.Time
 	recyclePassword string
+	beforeCall      func(context.Context) error
+	onCallResult    func(error)
+	authExpired     bool
 }
 
 func New(config cloud.Config) (cloud.Driver, error) {
@@ -240,6 +243,7 @@ func New(config cloud.Config) (cloud.Driver, error) {
 	// for offline submission and remains compatible with the read APIs.
 	sdk := pan115sdk.New(pan115sdk.WithClient(httpClient), pan115sdk.UA(pan115sdk.UA115Browser)).ImportCredential(credential)
 	return &Client{
+		beforeCall: config.BeforeCall, onCallResult: config.OnCallResult,
 		sdk: &sdkAdapter{sdk}, downloadHTTP: newDownloadHTTPClient(), listRate: rate.NewLimiter(rate.Every(2*time.Second), 1),
 		interactiveRate: rate.NewLimiter(rate.Every(250*time.Millisecond), 1), pipelineRate: rate.NewLimiter(rate.Every(250*time.Millisecond), 1),
 		bulkRate: rate.NewLimiter(rate.Every(bulkRequestSpacing), 1), directRate: rate.NewLimiter(rate.Every(time.Second), 1),
@@ -443,6 +447,9 @@ func (c *Client) Upload(ctx context.Context, request cloud.UploadRequest) (cloud
 	if _, err := file.Seek(0, io.SeekStart); err != nil {
 		return cloud.Item{}, cloud.Error(cloud.CodeResponseInvalid, false, err)
 	}
+	if err := c.guardCredential(ctx); err != nil {
+		return cloud.Item{}, err
+	}
 	if err := c.waitForRecovery(ctx); err != nil {
 		return cloud.Item{}, mapError(err)
 	}
@@ -454,9 +461,16 @@ func (c *Client) Upload(ctx context.Context, request cloud.UploadRequest) (cloud
 	case <-ctx.Done():
 		return cloud.Item{}, mapError(ctx.Err())
 	}
+	if err := c.guardCredential(ctx); err != nil {
+		<-c.callSlots
+		return cloud.Item{}, err
+	}
 	uploadErr := sdk.UploadFastOrByMultipart(parentID, name, request.Size, file, pan115sdk.UploadMultipartWithThreadsNum(1))
 	<-c.callSlots
 	c.recordOutcome(uploadErr)
+	if c.onCallResult != nil {
+		c.onCallResult(mapError(uploadErr))
+	}
 	if uploadErr != nil {
 		return cloud.Item{}, mapError(uploadErr)
 	}
@@ -1370,6 +1384,19 @@ func validContentRangeStart(value string, offset int64) bool {
 	return err == nil && start == offset
 }
 
+func (c *Client) guardCredential(ctx context.Context) error {
+	c.stateMu.Lock()
+	expired := c.authExpired
+	c.stateMu.Unlock()
+	if expired {
+		return cloud.Error(cloud.CodeAuthExpired, false, nil)
+	}
+	if c.beforeCall != nil {
+		return c.beforeCall(ctx)
+	}
+	return nil
+}
+
 func (c *Client) waitAndCall(ctx context.Context, limiter *rate.Limiter, call func() error) error {
 	waitStarted := time.Now()
 	waitRecorded := false
@@ -1379,6 +1406,9 @@ func (c *Client) waitAndCall(ctx context.Context, limiter *rate.Limiter, call fu
 		}
 	}()
 	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := c.guardCredential(ctx); err != nil {
 		return err
 	}
 	if err := c.waitForRecovery(ctx); err != nil {
@@ -1399,6 +1429,10 @@ func (c *Client) waitAndCall(ctx context.Context, limiter *rate.Limiter, call fu
 		<-c.callSlots
 		return err
 	}
+	if err := c.guardCredential(ctx); err != nil {
+		<-c.callSlots
+		return err
+	}
 	cloud.RecordProviderWait(ctx, time.Since(waitStarted))
 	waitRecorded = true
 	done := make(chan error, 1)
@@ -1412,6 +1446,9 @@ func (c *Client) waitAndCall(ctx context.Context, limiter *rate.Limiter, call fu
 		// in flight. Otherwise a late 405/429 would be silently dropped and the
 		// next operation could bypass the shared account recovery state.
 		c.recordOutcome(err)
+		if c.onCallResult != nil {
+			c.onCallResult(mapError(err))
+		}
 		done <- err
 	}()
 	select {
@@ -1451,6 +1488,10 @@ func (c *Client) waitReadAndCall(ctx context.Context, limiter *rate.Limiter, cal
 
 func (c *Client) waitForRecovery(ctx context.Context) error {
 	c.stateMu.Lock()
+	if c.authExpired {
+		c.stateMu.Unlock()
+		return cloud.Error(cloud.CodeAuthExpired, false, nil)
+	}
 	now := c.now()
 	if c.circuitTil.After(now) {
 		c.stateMu.Unlock()
@@ -1474,6 +1515,12 @@ func (c *Client) waitForRecovery(ctx context.Context) error {
 func (c *Client) recordOutcome(err error) {
 	c.stateMu.Lock()
 	defer c.stateMu.Unlock()
+	if err != nil {
+		if code, _ := cloud.ErrorInfo(mapError(err)); code == cloud.CodeAuthExpired {
+			c.authExpired = true
+			return
+		}
+	}
 	if err == nil {
 		// Calls already in flight when another endpoint reports risk can finish
 		// successfully afterwards. Such a late success must not erase the shared
@@ -1579,6 +1626,10 @@ func directURLExpiry(parsed *url.URL, now time.Time) time.Time {
 func mapError(err error) error {
 	if err == nil {
 		return nil
+	}
+	var providerError *cloud.ProviderError
+	if errors.As(err, &providerError) {
+		return err
 	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return cloud.Error(cloud.CodeUnavailable, true, err)

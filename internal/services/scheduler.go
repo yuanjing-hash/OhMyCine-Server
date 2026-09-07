@@ -342,6 +342,13 @@ func (s *Scheduler) dispatch(ctx context.Context) {
 				}
 				return
 			}
+			if result.ErrorCode == "pan115_auth_expired" && result.RetryAt == nil {
+				if blocked, err := libraryJobBlocked(s.queue.db, job.Job); err == nil && blocked {
+					next := time.Now().UTC()
+					result.RetryAt = &next
+					result.ErrorMessage = "等待更新登录凭据，任务进度已保留"
+				}
+			}
 			if result.RetryAt != nil {
 				if err := s.queue.RetryLater(job.Job.ID, job.LeaseToken, result.ErrorCode, result.ErrorMessage, *result.RetryAt); err != nil {
 					serverlog.OperationTaskQueue.Event(s.log.Error()).Str("job_id", job.Job.ID).Str("job_type", job.Job.JobType).Str("error_code", "queue_retry_persist_failed").Msg(serverlog.OperationTaskQueue.Message("重试状态保存失败"))

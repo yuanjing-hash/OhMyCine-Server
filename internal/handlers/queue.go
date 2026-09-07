@@ -87,21 +87,58 @@ func (a *API) Job(c *gin.Context) {
 }
 func (a *API) JobAttempts(c *gin.Context) {
 	actor, _ := middleware.ActorFrom(c)
-	data, err := a.queue.Attempts(actor, c.Param("id"))
+	page, size, ok := jobHistoryPaging(c)
+	if !ok {
+		writeError(c, a.log, invalid("分页参数无效", nil))
+		return
+	}
+	data, err := a.queue.AttemptsPage(actor, c.Param("id"), page, size)
 	if err != nil {
 		writeError(c, a.log, err)
 		return
 	}
-	success(c, http.StatusOK, gin.H{"list": data, "total": len(data)})
+	success(c, http.StatusOK, data)
 }
 func (a *API) JobTimeline(c *gin.Context) {
 	actor, _ := middleware.ActorFrom(c)
-	data, err := a.queue.Timeline(actor, c.Param("id"))
+	page, size, ok := jobHistoryPaging(c)
+	if !ok {
+		writeError(c, a.log, invalid("分页参数无效", nil))
+		return
+	}
+	data, err := a.queue.TimelinePage(actor, c.Param("id"), page, size)
 	if err != nil {
 		writeError(c, a.log, err)
 		return
 	}
-	success(c, http.StatusOK, gin.H{"list": data, "total": len(data)})
+	success(c, http.StatusOK, data)
+}
+func jobHistoryPaging(c *gin.Context) (int, int, bool) {
+	page, err := strconv.Atoi(c.DefaultQuery("page", "1"))
+	if err != nil {
+		return 0, 0, false
+	}
+	size, err := strconv.Atoi(c.DefaultQuery("page_size", "50"))
+	return page, size, err == nil
+}
+func (a *API) JobRepairDetails(c *gin.Context) {
+	actor, _ := middleware.ActorFrom(c)
+	page, err := strconv.Atoi(c.DefaultQuery("page", "1"))
+	if err != nil {
+		writeError(c, a.log, invalid("page 无效", err))
+		return
+	}
+	size, err := strconv.Atoi(c.DefaultQuery("page_size", "50"))
+	if err != nil {
+		writeError(c, a.log, invalid("page_size 无效", err))
+		return
+	}
+	data, err := a.queue.RepairDetails(actor, c.Param("id"), c.Query("status"), page, size)
+	if err != nil {
+		writeError(c, a.log, err)
+		return
+	}
+	success(c, http.StatusOK, data)
 }
 func (a *API) JobControl(action string) gin.HandlerFunc {
 	return func(c *gin.Context) {

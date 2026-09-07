@@ -35,6 +35,10 @@ type Config struct {
 	ConnectionID    uint
 	Cookie          string
 	RecyclePassword string
+	// Optional connection-owner lifecycle hooks. They carry no credentials and
+	// let adapters fence a saved credential before I/O and report safe outcomes.
+	BeforeCall   func(context.Context) error
+	OnCallResult func(error)
 }
 
 type Account struct {

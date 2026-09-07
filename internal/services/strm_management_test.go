@@ -46,8 +46,11 @@ func strmManagementFixture(t *testing.T) (*STRMManagementService, *QueueService,
 	if err := db.Create(&storage).Error; err != nil {
 		t.Fatal(err)
 	}
-	library := models.MediaLibrary{Name: "STRM", NameNormalized: "strm", StorageID: storage.ID, ProfileID: profile.ID, ProfileRevision: profile.Revision, RelativeRoot: "/", Enabled: true, Recursive: true, VideoExtensionsJSON: `[".mkv"]`, STRMAssetExtraExtensionsJSON: `[]`, IgnorePatternsJSON: `[]`, STRMEnabled: true, SignedProxyEnabled: true, STRMLocalRoot: root, MetadataArtifactsEnabled: true, ArtifactGeneration: 2, ArtifactAppliedGeneration: 2, ArtifactStatus: models.MediaArtifactStatusCompleted, Status: models.MediaLibraryStatusListening, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()}
+	library := models.MediaLibrary{Name: "STRM", NameNormalized: "strm", StorageID: storage.ID, ProfileID: profile.ID, ProfileRevision: profile.Revision, RelativeRoot: "/", Enabled: true, Recursive: true, VideoExtensionsJSON: `[".mkv"]`, STRMAssetExtraExtensionsJSON: `[]`, IgnorePatternsJSON: `[]`, STRMEnabled: true, SignedProxyEnabled: true, STRMLocalRoot: root, MetadataArtifactsEnabled: true, BaselineGeneration: 2, ArtifactGeneration: 2, ArtifactAppliedGeneration: 2, ArtifactStatus: models.MediaArtifactStatusCompleted, Status: models.MediaLibraryStatusListening, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()}
 	if err := db.Create(&library).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Create(&models.MediaLibraryStructureAutoState{LibraryID: library.ID, SourceRevision: 1, DiagnosedRevision: 1, Status: "completed", UpdatedAt: time.Now().UTC()}).Error; err != nil {
 		t.Fatal(err)
 	}
 	user := models.User{Username: "strm-admin", UsernameNormalized: "strm-admin", DisplayName: "STRM Admin", PasswordHash: "unused", Status: models.UserStatusActive}
@@ -254,7 +257,7 @@ func TestSTRMManagementReconcileUsesDurableQueue(t *testing.T) {
 	}
 }
 
-func TestSTRMManagementReconcileImmediatelySchedulesCurrentCatalogWithoutRepairLockContention(t *testing.T) {
+func TestSTRMManagementReconcileWaitsForActiveStructureRepair(t *testing.T) {
 	service, queue, actor, library, _ := strmManagementFixture(t)
 	service.artifacts = NewMediaArtifactService(service.db, queue, &SignedProxyService{}, zerolog.Nop())
 	if err := service.db.Model(&models.MediaLibrary{}).Where("id = ?", library.ID).Updates(map[string]any{
@@ -264,13 +267,20 @@ func TestSTRMManagementReconcileImmediatelySchedulesCurrentCatalogWithoutRepairL
 	}).Error; err != nil {
 		t.Fatal(err)
 	}
-	repair, err := queue.Enqueue(EnqueueJobInput{
-		System:      true,
+	now := time.Now().UTC()
+	repairOwner := models.MediaLibraryStructureRepair{ID: uuid.NewString(), OwnerID: actor.User.ID, LibraryID: library.ID, Scope: models.MediaLibraryStructureScopeFull, RuleFingerprint: strings.Repeat("a", 64), Generation: 3, PlanJSON: `{}`, StateJSON: `{}`, Phase: "queued", CreatedAt: now, UpdatedAt: now}
+	repair, err := queue.EnqueueWith(EnqueueJobInput{
+		OwnerID:     actor.User.ID,
 		JobType:     JobTypeMediaLibraryRepair,
 		DisplayName: "fixture repair",
 		Provider:    "media_library",
 		ResourceKey: "library:" + strconv.FormatUint(uint64(library.ID), 10),
-		Payload:     map[string]any{"library_id": library.ID},
+		Payload:     mediaLibraryRepairJobPayload{RepairID: repairOwner.ID},
+	}, func(tx *gorm.DB, job models.Job) error {
+		repairOwner.JobID = &job.ID
+		return RegisterCatalogPhysicalOwnerTx(tx, CatalogPhysicalWriteInput{LibraryID: library.ID, OwnerKind: CatalogPhysicalRepair, OwnerID: repairOwner.ID, ActorID: actor.User.ID}, func(tx *gorm.DB) error {
+			return tx.Create(&repairOwner).Error
+		})
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -280,34 +290,12 @@ func TestSTRMManagementReconcileImmediatelySchedulesCurrentCatalogWithoutRepairL
 		t.Fatalf("repair claim=%+v err=%v", claimedRepair, err)
 	}
 
-	strmJob, err := service.RequestReconcile(actor, library.ID, "incremental")
-	if err != nil {
-		t.Fatal(err)
+	if _, err := service.RequestReconcile(actor, library.ID, "incremental"); ErrorCode(err) != CodeConflict {
+		t.Fatalf("active repair reconcile error=%v code=%s", err, ErrorCode(err))
 	}
-	if strmJob.ResourceKey != strmReconcileResourceKey(library.ID) || strmJob.Priority != 100 {
-		t.Fatalf("STRM job=%+v", strmJob)
-	}
-	var run models.MediaArtifactRun
-	if err := service.db.Where("library_id = ? AND generation = ?", library.ID, 3).First(&run).Error; err != nil {
-		t.Fatalf("current catalog artifact run was not created immediately: %v", err)
-	}
-	if run.Status != models.MediaArtifactStatusQueued {
-		t.Fatalf("artifact run status=%q", run.Status)
-	}
-	var artifactJob models.Job
-	if err := service.db.First(&artifactJob, "job_type = ?", JobTypeMediaArtifact).Error; err != nil {
-		t.Fatal(err)
-	}
-	if artifactJob.ResourceKey != mediaArtifactResourceKey(library.ID) || artifactJob.Priority != 100 {
-		t.Fatalf("artifact job=%+v", artifactJob)
-	}
-	claimedArtifact, err := queue.Claim([]string{JobTypeMediaArtifact})
-	if err != nil || claimedArtifact == nil || claimedArtifact.Job.ID != artifactJob.ID {
-		t.Fatalf("artifact was blocked by active repair: claim=%+v err=%v", claimedArtifact, err)
-	}
-	claimedSTRM, err := queue.Claim([]string{JobTypeSTRMReconcile})
-	if err != nil || claimedSTRM == nil || claimedSTRM.Job.ID != strmJob.ID {
-		t.Fatalf("STRM reconcile was blocked by active repair: claim=%+v err=%v", claimedSTRM, err)
+	var competing int64
+	if err := service.db.Model(&models.Job{}).Where("job_type IN ?", []string{JobTypeMediaArtifact, JobTypeSTRMReconcile}).Count(&competing).Error; err != nil || competing != 0 {
+		t.Fatalf("repair admitted competing jobs=%d err=%v", competing, err)
 	}
 }
 

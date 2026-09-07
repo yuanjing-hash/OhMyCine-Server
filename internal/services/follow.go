@@ -562,20 +562,43 @@ func (s *FollowService) EnqueueDue(ctx context.Context, limit int) error {
 		limit = 100
 	}
 	now := s.now()
-	var rows []models.FollowSubscription
-	if err := s.db.WithContext(ctx).Where("status IN ? AND next_run_at IS NOT NULL AND next_run_at <= ?", []string{models.FollowStatusActive, models.FollowStatusCompleted}, now).Order("next_run_at,id").Limit(limit).Find(&rows).Error; err != nil {
-		return err
-	}
-	for _, record := range rows {
-		if ctx.Err() != nil {
-			return ctx.Err()
+	var cursorTime time.Time
+	var cursorID string
+	for {
+		var rows []models.FollowSubscription
+		query := s.db.WithContext(ctx).Where("status IN ? AND next_run_at IS NOT NULL AND next_run_at <= ?", []string{models.FollowStatusActive, models.FollowStatusCompleted}, now)
+		if cursorID != "" {
+			query = query.Where("next_run_at > ? OR (next_run_at = ? AND id > ?)", cursorTime, cursorTime, cursorID)
 		}
-		_, _ = s.enqueueRecord(ctx, record, "scheduled")
+		if err := query.Order("next_run_at,id").Limit(limit).Find(&rows).Error; err != nil {
+			return err
+		}
+		if len(rows) == 0 {
+			return nil
+		}
+		cursorTime, cursorID = *rows[len(rows)-1].NextRunAt, rows[len(rows)-1].ID
+		for _, record := range rows {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			_, _ = s.enqueueRecord(ctx, record, "scheduled")
+		}
+		if len(rows) < limit {
+			return nil
+		}
 	}
-	return nil
 }
 
 func (s *FollowService) enqueueRecord(_ context.Context, record models.FollowSubscription, trigger string) (string, error) {
+	if trigger != "manual" {
+		blocked, err := followReadinessBlocked(s.db, record.ID)
+		if err != nil {
+			return "", err
+		}
+		if blocked {
+			return "", nil
+		}
+	}
 	if trigger != "manual" && trigger != "created" {
 		trigger = "scheduled"
 	}

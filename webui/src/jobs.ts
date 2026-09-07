@@ -82,10 +82,10 @@ export const statusLabels: Record<JobStatus, string> = {
 };
 export const listJobs = (query: URLSearchParams, signal?: AbortSignal) =>
   api<Page<Job>>(`/api/v1/jobs?${query}`, { signal });
-export const getAttempts = (id: string, signal?: AbortSignal) =>
-  api<{ list: JobAttempt[] }>(`/api/v1/jobs/${encodeURIComponent(id)}/attempts`, { signal });
-export const getTimeline = (id: string, signal?: AbortSignal) =>
-  api<{ list: JobEvent[] }>(`/api/v1/jobs/${encodeURIComponent(id)}/timeline`, { signal });
+export const getAttempts = (id: string, signal?: AbortSignal, page = 1) =>
+  api<Page<JobAttempt>>(`/api/v1/jobs/${encodeURIComponent(id)}/attempts?page=${page}&page_size=50`, { signal });
+export const getTimeline = (id: string, signal?: AbortSignal, page = 1) =>
+  api<Page<JobEvent>>(`/api/v1/jobs/${encodeURIComponent(id)}/timeline?page=${page}&page_size=50`, { signal });
 export const controlJob = (
   id: string,
   action: "pause" | "resume" | "cancel" | "retry",
@@ -108,3 +108,6 @@ export const reorderLane = (jobType: string, priority: number, jobs: Job[]) =>
 export const unknown = (value: number | null | undefined, suffix = "") =>
   value === null || value === undefined ? "未知" : `${value}${suffix}`;
 export const getJob = (id: string, signal?: AbortSignal) => api<Job>(`/api/v1/jobs/${encodeURIComponent(id)}`, { signal });
+export interface RepairDetailItem { ordinal: number; action: string; source_path: string; target_path: string; status: string; error_message: string }
+export interface RepairDetails extends Page<RepairDetailItem> { phase: string; counts: Record<string, number>; current_action: string; current_item: string; current_batch_size: number }
+export const getRepairDetails = (id: string, page: number, status: string, signal?: AbortSignal) => api<RepairDetails>(`/api/v1/jobs/${encodeURIComponent(id)}/repair-details?page=${page}&page_size=50&status=${encodeURIComponent(status)}`, { signal });

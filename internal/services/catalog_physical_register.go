@@ -37,6 +37,13 @@ func RegisterCatalogPhysicalOwnerTx(tx *gorm.DB, input CatalogPhysicalWriteInput
 	if err := AssertCatalogPhysicalAdmissionTx(tx, input.LibraryID); err != nil {
 		return err
 	}
+	readiness, err := libraryReadiness(tx, input.LibraryID)
+	if err != nil {
+		return err
+	}
+	if readiness.ReadinessStatus == "busy" || readiness.ReadinessStatus == "repairing" || readiness.ReadinessStatus == "repair_failed" {
+		return catalogPhysicalUnsettledError()
+	}
 	if create == nil || input.OwnerID == "" {
 		return ErrCatalogInvalid
 	}

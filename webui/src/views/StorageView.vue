@@ -126,7 +126,23 @@ async function saveCloudStorage() {
   const cleanupChanged = Boolean(connection && (cloudEdit.value.recycleCleanupEnabled !== connection.recycle_cleanup_enabled || cloudEdit.value.recycleCleanupCron.trim() !== connection.recycle_cleanup_cron))
   let confirmed = false
   if (connection && cloudEdit.value.recycleCleanupEnabled && !connection.recycle_cleanup_enabled) { confirmed = window.confirm('定时清空会永久删除该 115 账号回收站内的全部内容，无法恢复。确认启用？'); if (!confirmed) return }
-  await run(async () => { if ((cloudEdit.value.cookie.trim() || cloudEdit.value.recyclePassword.trim() || cloudEdit.value.clearRecyclePassword || cleanupChanged) && connection && auth.can(Permissions.ConnectionsUpdate)) { const connectionPayload: Record<string, unknown> = { revision: connection.revision, recycle_cleanup_enabled: cloudEdit.value.recycleCleanupEnabled, recycle_cleanup_cron: cloudEdit.value.recycleCleanupCron, recycle_cleanup_confirmed: confirmed }; if (cloudEdit.value.cookie.trim()) connectionPayload.cookie = cloudEdit.value.cookie; if (cloudEdit.value.recyclePassword.trim()) connectionPayload.recycle_password = cloudEdit.value.recyclePassword; if (cloudEdit.value.clearRecyclePassword) connectionPayload.remove_recycle_password = true; await api(`/api/v1/connections/${connection.id}`, { method: 'PATCH', body: JSON.stringify(connectionPayload) }); cloudEdit.value.cookie = ''; cloudEdit.value.recyclePassword = ''; cloudEdit.value.clearRecyclePassword = false }; const payload: Record<string, unknown> = { name: localEdit.value.name, enabled: localEdit.value.enabled, connection_id: item.connection_id }; if (localEdit.value.pickerToken) payload.provider_picker_token = localEdit.value.pickerToken; await api(`/api/v1/storages/${item.id}`, { method: 'PATCH', body: JSON.stringify(payload) }); notify('115 数据源已保存', 'success') })
+  // Capture the directory draft before a successful Connection update refreshes watchers.
+  const storageChanged = localEdit.value.name !== item.name || localEdit.value.enabled !== item.enabled || Boolean(localEdit.value.pickerToken)
+  const payload: Record<string, unknown> = { name: localEdit.value.name, enabled: localEdit.value.enabled, connection_id: item.connection_id }
+  if (localEdit.value.pickerToken) payload.provider_picker_token = localEdit.value.pickerToken
+  await run(async () => {
+    if ((cloudEdit.value.cookie.trim() || cloudEdit.value.recyclePassword.trim() || cloudEdit.value.clearRecyclePassword || cleanupChanged) && connection && auth.can(Permissions.ConnectionsUpdate)) {
+      const connectionPayload: Record<string, unknown> = { revision: connection.revision, recycle_cleanup_enabled: cloudEdit.value.recycleCleanupEnabled, recycle_cleanup_cron: cloudEdit.value.recycleCleanupCron, recycle_cleanup_confirmed: confirmed }
+      if (cloudEdit.value.cookie.trim()) connectionPayload.cookie = cloudEdit.value.cookie
+      if (cloudEdit.value.recyclePassword.trim()) connectionPayload.recycle_password = cloudEdit.value.recyclePassword
+      if (cloudEdit.value.clearRecyclePassword) connectionPayload.remove_recycle_password = true
+      const saved = await api<ConnectionSummary>(`/api/v1/connections/${connection.id}`, { method: 'PATCH', body: JSON.stringify(connectionPayload) })
+      connections.value = connections.value.map(current => current.id === saved.id ? saved : current)
+      cloudEdit.value.cookie = ''; cloudEdit.value.recyclePassword = ''; cloudEdit.value.clearRecyclePassword = false
+    }
+    if (storageChanged) await api(`/api/v1/storages/${item.id}`, { method: 'PATCH', body: JSON.stringify(payload) })
+    notify('115 数据源已保存', 'success')
+  })
 }
 function finishConnection() {
   if (!selectedConnection.value || !canBrowsePan115ForCreate.value) return

@@ -129,6 +129,7 @@ type UpdateMediaLibraryInput struct {
 	RevisionUpdated bool
 }
 type MediaLibraryDetail struct {
+	MediaLibraryReadiness
 	models.MediaLibrary
 	StorageName                  string                         `json:"storage_name"`
 	ConnectionID                 *uint                          `json:"connection_id,omitempty"`
@@ -250,11 +251,18 @@ func (s *MediaLibraryService) List(actor Actor) ([]MediaLibraryDetail, error) {
 		if !actor.CanResource(authz.PermissionMediaLibrariesRead, models.AuthorizationResourceMediaLibrary, uintID(record.ID)) {
 			continue
 		}
-		detail, err := s.detail(record, actor)
+		detail, err := s.detailWithoutReadiness(record, actor)
 		if err != nil {
 			return nil, err
 		}
 		out = append(out, detail)
+	}
+	readiness, err := libraryReadinessRows(s.db, nil)
+	if err != nil {
+		return nil, err
+	}
+	for i := range out {
+		out[i].MediaLibraryReadiness = readiness[out[i].ID]
 	}
 	return out, nil
 }
@@ -1171,6 +1179,15 @@ func validateImportTemplate(value string, directory bool) error {
 }
 
 func (s *MediaLibraryService) detail(record models.MediaLibrary, actors ...Actor) (MediaLibraryDetail, error) {
+	detail, err := s.detailWithoutReadiness(record, actors...)
+	if err != nil {
+		return detail, err
+	}
+	detail.MediaLibraryReadiness, err = libraryReadiness(s.db, record.ID)
+	return detail, err
+}
+
+func (s *MediaLibraryService) detailWithoutReadiness(record models.MediaLibrary, actors ...Actor) (MediaLibraryDetail, error) {
 	var detail MediaLibraryDetail
 	readDB := s.db
 	if s.catalogStore != nil && s.catalogStore.readDB != nil {
@@ -1410,6 +1427,13 @@ const maxMediaLibraryIngestChildren = 5000
 // this operation; direct children, not event payloads, decide what is adopted.
 func (s *MediaLibraryService) sweepIngest(ctx context.Context, libraryID uint) error {
 	if s.ingest == nil {
+		return nil
+	}
+	readiness, err := libraryReadiness(s.db.WithContext(ctx), libraryID)
+	if err != nil {
+		return err
+	}
+	if !readiness.Ready {
 		return nil
 	}
 	var library models.MediaLibrary
@@ -1930,6 +1954,19 @@ func (s *MediaLibraryService) reconcile(ctx context.Context, id uint, kind strin
 	}
 	if err := s.db.First(&storage, library.StorageID).Error; err != nil {
 		return models.MediaLibraryScanRun{}, err
+	}
+	readiness, readinessErr := libraryReadiness(s.db.WithContext(ctx), id)
+	if readinessErr != nil {
+		return models.MediaLibraryScanRun{}, readinessErr
+	}
+	// A submitted repair owns the library until every physical result has been
+	// verified, including partial failures and restart recovery. Keep accumulated
+	// events durable; successful repair completion wakes one reconciliation.
+	if readiness.ReadinessStatus == "repairing" || readiness.ReadinessStatus == "repair_failed" || readiness.ReadinessStatus == "credentials_required" {
+		return models.MediaLibraryScanRun{}, errMediaLibraryEventReconcileDeferred
+	}
+	if readiness.ReadinessStatus == "checking" && (kind == "event" || kind == "incremental" || kind == "full") {
+		return models.MediaLibraryScanRun{}, errMediaLibraryEventReconcileDeferred
 	}
 	// Provider life events remain in their durable delivery rows and in the
 	// listener accumulator while a catalog-owned external mutation is in

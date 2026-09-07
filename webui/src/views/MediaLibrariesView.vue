@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import LibraryReadiness from '@/components/LibraryReadiness.vue'
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { RouterLink } from 'vue-router'
 import { api, APIError } from '@/api/client'
@@ -964,6 +965,7 @@ function clearEditDraft() {
           <button class="btn-quiet shrink-0 cursor-grab px-2" type="button" aria-label="拖动媒体库排序" title="拖动排序">⋮⋮</button>
           <button type="button" class="min-w-0 flex-1 p-2 text-left" @click="selectedID = library.id">
             <div class="flex items-center justify-between gap-3"><strong class="truncate">{{ library.name }}</strong><span :class="presentLibraryStatus(library.status, library.retirement).className">{{ presentLibraryStatus(library.status, library.retirement).label }}</span></div>
+            <LibraryReadiness :library="library" />
             <div class="text-subtle mt-2 text-xs">第 {{ index + 1 }} 顺位 · {{ library.storage_name }} · {{ mediaLibrarySourceDisplayPath(library, storages.find(item => item.id === library.storage_id)) }}（相对根 {{ library.relative_root }}） · {{ library.retirement ? '索引移除中' : `${library.entry_count} 条目` }}</div>
             <div class="text-subtle mt-1 text-xs">{{ library.transfer_mode === 'move' ? '移动' : library.transfer_mode === 'copy' ? '复制' : '软链接' }} · {{ library.profile_name }}</div>
             <div v-if="library.reclassification_due" class="semantic-warning-text mt-2 text-xs">分类规则已更新，待重分类</div>
@@ -982,6 +984,7 @@ function clearEditDraft() {
       </main>
       <main v-else-if="selected" class="min-w-0">
         <section class="panel">
+          <LibraryReadiness :library="selected" />
           <div class="flex flex-wrap items-start justify-between gap-4"><div><div class="flex flex-wrap items-center gap-2"><h2 class="m-0">{{ selected.name }}</h2><span :class="presentLibraryStatus(selected.status).className">{{ presentLibraryStatus(selected.status).label }}</span></div><p class="text-subtle mb-0 mt-2 text-sm">{{ selected.storage_name }} · {{ selectedSourceDisplay }}（相对根 {{ selected.relative_root }}） · Profile {{ selected.profile_name }} r{{ selected.profile_revision }}</p></div><div class="flex flex-wrap gap-2"><button v-if="auth.can(Permissions.MediaLibrariesScan)" type="button" class="btn-secondary" :disabled="saving || structureLoading" @click="openStructureDiagnostics">检查目录结构</button><button v-if="selected.status === 'initialization_failed' && auth.can(Permissions.MediaLibrariesScan)" type="button" class="btn-primary" :disabled="saving" @click="retryNow">立即重试</button><button v-if="selected.enabled && selected.status !== 'initializing' && auth.can(Permissions.MediaLibrariesScan)" type="button" class="btn-secondary" :disabled="saving" @click="scanNow('incremental')">立即增量</button><button v-if="selected.enabled && selected.status !== 'initializing' && auth.can(Permissions.MediaLibrariesScan)" type="button" class="btn-secondary" :disabled="saving" @click="scanNow('full')">立即全量</button><button v-if="auth.can(Permissions.MediaLibrariesDelete)" type="button" class="btn-danger" :disabled="saving" @click="removeLibrary">删除配置</button></div></div>
           <p v-if="selected.status === 'initialization_failed'" class="semantic-error mt-4 p-3 text-sm">初始化失败：{{ selected.status_error_code || 'media_library_scan_failed' }}。失败库不会启动监听；下次自动重试：{{ dateTime(selected.next_retry_at) }}。</p>
           <p v-if="selected.reclassification_due" class="semantic-warning mt-4 p-3 text-sm">所选 Profile 已更新。下一次扫描会重新应用分类，但不会移动、重命名或写回来源文件。<RouterLink class="semantic-link ml-1" to="/system/media-rules">打开规则管理</RouterLink></p>

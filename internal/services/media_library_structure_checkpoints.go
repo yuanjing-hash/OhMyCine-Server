@@ -319,6 +319,11 @@ func (s *MediaLibraryStructureService) executeStructureRepairItems(ctx context.C
 		}
 	}
 	total := len(rows)
+	setCurrent := func(action, item string, size int) error {
+		return s.structureRepairCheckpointTx(ctx, repair, claim, func(tx *gorm.DB) error {
+			return tx.Model(&models.MediaLibraryStructureRepair{}).Where("id = ?", repair.ID).Updates(map[string]any{"current_action": action, "current_item": safeStructurePath(item), "current_batch_size": size}).Error
+		})
+	}
 	lastHeartbeat := time.Now()
 	transitions := 0
 	heartbeat := func(force bool) error {
@@ -378,6 +383,10 @@ func (s *MediaLibraryStructureService) executeStructureRepairItems(ctx context.C
 					continue
 				}
 				var batchErr error
+				if err := setCurrent(action, readyRows[0].SourceRelative, len(readyRows)); err != nil {
+					result.GlobalErr, result.GlobalCode = err, CodeMediaLibraryStructureApplyFailed
+					return result
+				}
 				if action == "recycle" {
 					items := make([]StructureRecycleItem, 0, len(readyRows))
 					for _, row := range readyRows {
@@ -390,6 +399,10 @@ func (s *MediaLibraryStructureService) executeStructureRepairItems(ctx context.C
 						items = append(items, plan.Items[row.Ordinal-len(plan.RecycleItems)])
 					}
 					batchErr = backend.Apply(ctx, boundary, items, nil)
+				}
+				if err := setCurrent("", "", 0); err != nil {
+					result.GlobalErr, result.GlobalCode = err, CodeMediaLibraryStructureApplyFailed
+					return result
 				}
 				if batchErr != nil {
 					if code, _, global, retryAt := structureRepairFailure(ctx, batchErr); global {
@@ -443,10 +456,18 @@ func (s *MediaLibraryStructureService) executeStructureRepairItems(ctx context.C
 			progressed = true
 			attempted[row.Ordinal] = true
 			var operationErr error
+			if err := setCurrent(row.Action, row.SourceRelative, 1); err != nil {
+				result.GlobalErr, result.GlobalCode = err, CodeMediaLibraryStructureApplyFailed
+				return result
+			}
 			if row.Action == "recycle" {
 				operationErr = backend.Recycle(ctx, boundary, []StructureRecycleItem{plan.RecycleItems[row.Ordinal]}, nil)
 			} else {
 				operationErr = backend.Apply(ctx, boundary, []StructurePlanItem{plan.Items[row.Ordinal-len(plan.RecycleItems)]}, nil)
+			}
+			if err := setCurrent("", "", 0); err != nil {
+				result.GlobalErr, result.GlobalCode = err, CodeMediaLibraryStructureApplyFailed
+				return result
 			}
 			if operationErr != nil {
 				code, safeMessage, global, retryAt := structureRepairFailure(ctx, operationErr)

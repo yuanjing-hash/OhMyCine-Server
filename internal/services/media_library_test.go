@@ -580,6 +580,11 @@ func TestPan115InitialScanDoesNotRepeatUnchangedCatchUp(t *testing.T) {
 
 func TestDisabledLibraryWaitsUntilEnabledAndWatcherReconcilesChanges(t *testing.T) {
 	service, db, actor, storage, profile := mediaLibraryTestService(t)
+	audit := NewAuditService(db)
+	queue := NewQueueService(db, audit)
+	structure := NewMediaLibraryStructureService(db, audit, queue, nil, zerolog.Nop())
+	service.SetQueueService(queue)
+	service.SetStructureService(structure)
 	changes := NewMediaChangeService(db)
 	service.SetMediaChangeService(changes)
 	var notifiedRevision atomic.Uint64
@@ -611,9 +616,36 @@ func TestDisabledLibraryWaitsUntilEnabledAndWatcherReconcilesChanges(t *testing.
 		t.Fatal(err)
 	}
 	waitForLibrary(t, db, created.ID, func(item models.MediaLibrary) bool { return item.Status == models.MediaLibraryStatusListening })
+	var diagnosis *ClaimedJob
+	deadline := time.Now().Add(8 * time.Second)
+	for time.Now().Before(deadline) && diagnosis == nil {
+		diagnosis, err = queue.Claim([]string{JobTypeMediaLibraryStructureDiagnosis})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if diagnosis == nil {
+			time.Sleep(40 * time.Millisecond)
+		}
+	}
+	if diagnosis == nil {
+		t.Fatal("initial structure diagnosis was not queued")
+	}
 
 	mediaPath := filepath.Join(storage.RootPath, "Arrived.S02E03.mp4")
 	if err := os.WriteFile(mediaPath, []byte("video"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Let the sole filesystem event reach reconcile while readiness is still
+	// checking. The listener must retain that dirty wake without another event.
+	time.Sleep(900 * time.Millisecond)
+	var deferredCount int64
+	if err := db.Model(&models.MediaLibraryEntry{}).Where("library_id = ? AND relative_path = ?", created.ID, "/Arrived.S02E03.mp4").Count(&deferredCount).Error; err != nil || deferredCount != 0 {
+		t.Fatalf("checking library reconciled early: count=%d err=%v", deferredCount, err)
+	}
+	if result := NewMediaLibraryStructureDiagnosisWorker(structure).Run(context.Background(), fastScanTestRuntime{}, *diagnosis); result.ErrorCode != "" {
+		t.Fatalf("initial structure diagnosis failed: %+v", result)
+	}
+	if err := queue.Complete(diagnosis.Job.ID, diagnosis.LeaseToken); err != nil {
 		t.Fatal(err)
 	}
 	waitForLibrary(t, db, created.ID, func(models.MediaLibrary) bool {

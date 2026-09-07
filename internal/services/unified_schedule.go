@@ -513,68 +513,89 @@ func (s *UnifiedScheduleService) Poll(ctx context.Context) error {
 	s.pollMu.Lock()
 	defer s.pollMu.Unlock()
 	now := s.now()
-	var rows []models.ScheduleDefinition
-	if err := s.db.WithContext(ctx).Where("enabled = ? AND next_run_at IS NOT NULL AND next_run_at <= ?", true, now).Order("next_run_at,id").Limit(100).Find(&rows).Error; err != nil {
-		return err
-	}
-	for _, row := range rows {
-		scheduledAt := *row.NextRunAt
-		next, err := PreviewSchedule(row.CronExpression, row.Timezone, 1, scheduledAt)
-		if err != nil {
-			s.db.Model(&row).Updates(map[string]any{"enabled": false, "last_status": "failed", "last_error_code": CodeInvalidRequest, "next_run_at": nil})
-			continue
+	var cursorTime time.Time
+	var cursorID string
+	for {
+		var rows []models.ScheduleDefinition
+		query := s.db.WithContext(ctx).Where("enabled = ? AND next_run_at IS NOT NULL AND next_run_at <= ?", true, now)
+		if cursorID != "" {
+			query = query.Where("next_run_at > ? OR (next_run_at = ? AND id > ?)", cursorTime, cursorTime, cursorID)
 		}
-		if row.MisfirePolicy == "skip" && now.Sub(scheduledAt) > time.Minute {
-			cursor := next[0]
-			for !cursor.After(now) {
-				following, previewErr := PreviewSchedule(row.CronExpression, row.Timezone, 1, cursor)
-				if previewErr != nil {
-					break
-				}
-				cursor = following[0]
+		if err := query.Order("next_run_at,id").Limit(100).Find(&rows).Error; err != nil {
+			return err
+		}
+		if len(rows) == 0 {
+			return nil
+		}
+		cursorTime, cursorID = *rows[len(rows)-1].NextRunAt, rows[len(rows)-1].ID
+		for _, row := range rows {
+			blocked, gateErr := scheduleReadinessBlocked(s.db, row)
+			if gateErr != nil {
+				return gateErr
 			}
-			finished := now
-			run := models.ScheduleRun{ID: uuid.NewString(), ScheduleID: row.ID, ScheduledAt: scheduledAt, Status: "skipped_misfire", ErrorCode: "schedule_misfire_skipped", FinishedAt: &finished, CreatedAt: now, UpdatedAt: now}
-			if err := s.db.Transaction(func(tx *gorm.DB) error {
+			if blocked {
+				continue
+			}
+			scheduledAt := *row.NextRunAt
+			next, err := PreviewSchedule(row.CronExpression, row.Timezone, 1, scheduledAt)
+			if err != nil {
+				s.db.Model(&row).Updates(map[string]any{"enabled": false, "last_status": "failed", "last_error_code": CodeInvalidRequest, "next_run_at": nil})
+				continue
+			}
+			if row.MisfirePolicy == "skip" && now.Sub(scheduledAt) > time.Minute {
+				cursor := next[0]
+				for !cursor.After(now) {
+					following, previewErr := PreviewSchedule(row.CronExpression, row.Timezone, 1, cursor)
+					if previewErr != nil {
+						break
+					}
+					cursor = following[0]
+				}
+				finished := now
+				run := models.ScheduleRun{ID: uuid.NewString(), ScheduleID: row.ID, ScheduledAt: scheduledAt, Status: "skipped_misfire", ErrorCode: "schedule_misfire_skipped", FinishedAt: &finished, CreatedAt: now, UpdatedAt: now}
+				if err := s.db.Transaction(func(tx *gorm.DB) error {
+					if err := tx.Create(&run).Error; err != nil {
+						return err
+					}
+					return tx.Model(&row).Updates(map[string]any{"next_run_at": cursor, "last_run_at": scheduledAt, "last_status": run.Status, "updated_at": now}).Error
+				}); err != nil {
+					return err
+				}
+				continue
+			}
+			var active int64
+			if err := s.db.Model(&models.ScheduleRun{}).Where("schedule_id = ? AND status IN ?", row.ID, []string{"queued", "running"}).Count(&active).Error; err != nil {
+				return err
+			}
+			if active > 0 && row.OverlapPolicy == "skip" {
+				finished := now
+				run := models.ScheduleRun{ID: uuid.NewString(), ScheduleID: row.ID, ScheduledAt: scheduledAt, Status: "skipped_overlap", ErrorCode: "schedule_overlap_skipped", FinishedAt: &finished, CreatedAt: now, UpdatedAt: now}
+				if err := s.db.Transaction(func(tx *gorm.DB) error {
+					if err := tx.Create(&run).Error; err != nil {
+						return err
+					}
+					return tx.Model(&row).Updates(map[string]any{"next_run_at": next[0], "last_run_at": scheduledAt, "last_status": run.Status, "updated_at": now}).Error
+				}); err != nil {
+					return err
+				}
+				continue
+			}
+			runID := uuid.NewString()
+			_, err = s.queue.EnqueueWith(EnqueueJobInput{OwnerID: row.OwnerID, JobType: JobTypeUnifiedSchedule, DisplayName: "计划任务 · " + row.Name, Provider: "scheduler", ResourceKey: "schedule:" + row.ID, Payload: scheduleJobPayload{RunID: runID, DefinitionID: row.ID, Revision: row.Revision}}, func(tx *gorm.DB, job models.Job) error {
+				run := models.ScheduleRun{ID: runID, ScheduleID: row.ID, JobID: job.ID, ScheduledAt: scheduledAt, Status: "queued", Attempt: 1, CreatedAt: now, UpdatedAt: now}
 				if err := tx.Create(&run).Error; err != nil {
 					return err
 				}
-				return tx.Model(&row).Updates(map[string]any{"next_run_at": cursor, "last_run_at": scheduledAt, "last_status": run.Status, "updated_at": now}).Error
-			}); err != nil {
+				return tx.Model(&models.ScheduleDefinition{}).Where("id = ? AND revision = ?", row.ID, row.Revision).Updates(map[string]any{"next_run_at": next[0], "last_run_at": scheduledAt, "last_status": "queued", "updated_at": now}).Error
+			})
+			if err != nil {
 				return err
 			}
-			continue
 		}
-		var active int64
-		if err := s.db.Model(&models.ScheduleRun{}).Where("schedule_id = ? AND status IN ?", row.ID, []string{"queued", "running"}).Count(&active).Error; err != nil {
-			return err
-		}
-		if active > 0 && row.OverlapPolicy == "skip" {
-			finished := now
-			run := models.ScheduleRun{ID: uuid.NewString(), ScheduleID: row.ID, ScheduledAt: scheduledAt, Status: "skipped_overlap", ErrorCode: "schedule_overlap_skipped", FinishedAt: &finished, CreatedAt: now, UpdatedAt: now}
-			if err := s.db.Transaction(func(tx *gorm.DB) error {
-				if err := tx.Create(&run).Error; err != nil {
-					return err
-				}
-				return tx.Model(&row).Updates(map[string]any{"next_run_at": next[0], "last_run_at": scheduledAt, "last_status": run.Status, "updated_at": now}).Error
-			}); err != nil {
-				return err
-			}
-			continue
-		}
-		runID := uuid.NewString()
-		_, err = s.queue.EnqueueWith(EnqueueJobInput{OwnerID: row.OwnerID, JobType: JobTypeUnifiedSchedule, DisplayName: "计划任务 · " + row.Name, Provider: "scheduler", ResourceKey: "schedule:" + row.ID, Payload: scheduleJobPayload{RunID: runID, DefinitionID: row.ID, Revision: row.Revision}}, func(tx *gorm.DB, job models.Job) error {
-			run := models.ScheduleRun{ID: runID, ScheduleID: row.ID, JobID: job.ID, ScheduledAt: scheduledAt, Status: "queued", Attempt: 1, CreatedAt: now, UpdatedAt: now}
-			if err := tx.Create(&run).Error; err != nil {
-				return err
-			}
-			return tx.Model(&models.ScheduleDefinition{}).Where("id = ? AND revision = ?", row.ID, row.Revision).Updates(map[string]any{"next_run_at": next[0], "last_run_at": scheduledAt, "last_status": "queued", "updated_at": now}).Error
-		})
-		if err != nil {
-			return err
+		if len(rows) < 100 {
+			return nil
 		}
 	}
-	return nil
 }
 
 func NewUnifiedScheduleWorker(service *UnifiedScheduleService) Worker { return WorkerFunc(service.run) }

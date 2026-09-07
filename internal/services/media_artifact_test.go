@@ -100,17 +100,22 @@ func TestMediaArtifactRefreshPreservesOverlappingRunningOwner(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	run := models.MediaArtifactRun{ID: "fast-scan-running-refresh", LibraryID: library.ID, Generation: library.ArtifactGeneration, PolicyJSON: string(policyJSON), Status: models.MediaArtifactStatusRunning, CleanupStatus: models.MediaArtifactCleanupPending, StartedAt: &now, CreatedAt: now, UpdatedAt: now}
-	if err := management.db.Create(&run).Error; err != nil {
-		t.Fatal(err)
-	}
-	job, err := queue.Enqueue(EnqueueJobInput{System: true, JobType: JobTypeMediaArtifact, Priority: 100, DisplayName: "overlap", Provider: "media_library", ResourceKey: mediaArtifactResourceKey(library.ID), CoalescingKey: "latest_generation", Payload: mediaArtifactJobPayload{ArtifactRunID: run.ID}})
+	run := models.MediaArtifactRun{ID: "fast-scan-running-refresh", LibraryID: library.ID, Generation: library.ArtifactGeneration, PolicyJSON: string(policyJSON), Status: models.MediaArtifactStatusQueued, CleanupStatus: models.MediaArtifactCleanupPending, CreatedAt: now, UpdatedAt: now}
+	job, err := queue.EnqueueWith(EnqueueJobInput{System: true, JobType: JobTypeMediaArtifact, Priority: 100, DisplayName: "overlap", Provider: "media_library", ResourceKey: mediaArtifactResourceKey(library.ID), CoalescingKey: "latest_generation", Payload: mediaArtifactJobPayload{ArtifactRunID: run.ID}}, func(tx *gorm.DB, job models.Job) error {
+		run.JobID = &job.ID
+		return RegisterCatalogPhysicalOwnerTx(tx, CatalogPhysicalWriteInput{LibraryID: library.ID, OwnerKind: CatalogPhysicalArtifact, OwnerID: run.ID}, func(tx *gorm.DB) error {
+			return tx.Create(&run).Error
+		})
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	claimed, err := queue.Claim([]string{JobTypeMediaArtifact})
 	if err != nil || claimed == nil || claimed.Job.ID != job.ID {
 		t.Fatalf("claim=%+v err=%v", claimed, err)
+	}
+	if err := management.db.Model(&run).Updates(map[string]any{"status": models.MediaArtifactStatusRunning, "started_at": now}).Error; err != nil {
+		t.Fatal(err)
 	}
 	artifacts := NewMediaArtifactService(management.db, queue, &SignedProxyService{}, zerolog.Nop())
 	if err := artifacts.RefreshGeneration(library.ID, library.ArtifactGeneration); err == nil {

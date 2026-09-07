@@ -189,6 +189,7 @@ export interface MediaClassificationProfileDetail extends MediaClassificationPro
 
 export type MediaLibraryStatus = 'disabled' | 'initializing' | 'attaching_listener' | 'catch_up_reconciliation' | 'listening' | 'initialization_failed'
 export interface MediaLibraryDetail {
+  ready?: boolean; readiness_status?: 'ready' | 'disabled' | 'unavailable' | 'credentials_required' | 'repairing' | 'repair_failed' | 'busy' | 'initializing' | 'checking'
 	retirement?: { status: 'deleting'; job_id: string; error_code?: string }
   id: number; name: string; storage_id: number; storage_name: string; profile_id: number; profile_name: string
   connection_id?: number; auto_listen_default: boolean

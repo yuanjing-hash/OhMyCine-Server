@@ -154,6 +154,17 @@ describe('task interaction lifecycle', () => {
     await flushPromises()
   })
 
+  it('pages timeline and attempts independently when their totals differ', async () => {
+    mocks.timeline.mockImplementation(async (_id: string, _signal: AbortSignal, current = 1) => ({ list: [{ id: current, event_type: 'status_changed', from_status: 'queued', to_status: 'running', code: '', created_at: '2026-09-05T00:00:00Z' }], total: 101, page: current, page_size: 50 }))
+    mocks.attempts.mockImplementation(async (_id: string, _signal: AbortSignal, current = 1) => ({ list: current === 1 ? [{ id: 1, attempt_number: 1, status: 'running', error_code: '', error_message: '', started_at: '2026-09-05T00:00:00Z', finished_at: null }] : [], total: 1, page: current, page_size: 50 }))
+    const { wrapper } = await open('/automation/tasks?job_id=initial')
+    await wrapper.findAll('button').find(button => button.text() === '下一页时间线')!.trigger('click')
+    await flushPromises()
+    expect(mocks.timeline.mock.calls.at(-1)?.[2]).toBe(2)
+    expect(mocks.attempts.mock.calls.at(-1)?.[2]).toBe(1)
+    expect(wrapper.get('[role="dialog"]').text()).toContain('第 1 次')
+  })
+
   it('aborts pending reads and closes the socket on unmount', async () => {
     const { wrapper } = await open()
     const signal = mocks.list.mock.calls[0][1] as AbortSignal | undefined

@@ -433,7 +433,7 @@ func (s *QueueService) Attempts(actor Actor, id string) ([]models.JobAttempt, er
 		return nil, appError(CodePermissionDenied, "没有查看任务的权限", nil)
 	}
 	var attempts []models.JobAttempt
-	if err := s.db.Where("job_id = ?", id).Order("attempt_number DESC").Find(&attempts).Error; err != nil {
+	if err := s.db.Where("job_id = ?", id).Order("attempt_number DESC").Limit(200).Find(&attempts).Error; err != nil {
 		return nil, err
 	}
 	return attempts, nil
@@ -448,8 +448,11 @@ func (s *QueueService) Timeline(actor Actor, id string) ([]models.JobStatusEvent
 		return nil, appError(CodePermissionDenied, "没有查看任务的权限", nil)
 	}
 	var events []models.JobStatusEvent
-	if err := s.db.Where("job_id = ?", id).Order("id").Find(&events).Error; err != nil {
+	if err := s.db.Where("job_id = ?", id).Order("id DESC").Limit(200).Find(&events).Error; err != nil {
 		return nil, err
+	}
+	for left, right := 0, len(events)-1; left < right; left, right = left+1, right-1 {
+		events[left], events[right] = events[right], events[left]
 	}
 	return events, nil
 }
@@ -963,6 +966,7 @@ func (s *QueueService) Claim(jobTypes []string) (*ClaimedJob, error) {
 		if err := q.Find(&policies).Error; err != nil {
 			return err
 		}
+		readinessCache := make(map[uint]MediaLibraryReadiness)
 		for _, policy := range policies {
 			var active int64
 			if err := tx.Model(&models.Job{}).Where("job_type = ? AND status = ? AND lease_expires_at > ?", policy.JobType, models.JobStatusRunning, now).Count(&active).Error; err != nil {
@@ -976,6 +980,13 @@ func (s *QueueService) Claim(jobTypes []string) (*ClaimedJob, error) {
 				return err
 			}
 			for _, candidate := range candidates {
+				blocked, gateErr := libraryJobBlocked(tx, candidate, readinessCache)
+				if gateErr != nil {
+					return gateErr
+				}
+				if blocked {
+					continue
+				}
 				if policy.ResourceConcurrency > 0 && candidate.ResourceKey != "" {
 					var resourceActive int64
 					if err := tx.Model(&models.Job{}).Where("resource_key = ? AND status = ? AND lease_expires_at > ?", candidate.ResourceKey, models.JobStatusRunning, now).Count(&resourceActive).Error; err != nil {

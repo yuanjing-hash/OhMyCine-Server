@@ -119,6 +119,7 @@ func (l *localMediaLibraryListener) Run(ctx context.Context, reconcile func(cont
 	defer incremental.Stop()
 	var debounce *time.Timer
 	var debounceC <-chan time.Time
+	deferredDelay := time.Second
 	defer func() {
 		if debounce != nil {
 			debounce.Stop()
@@ -150,7 +151,19 @@ func (l *localMediaLibraryListener) Run(ctx context.Context, reconcile func(cont
 			}
 			debounceC = debounce.C
 		case <-debounceC:
-			_ = reconcile(ctx, "event")
+			if err := reconcile(ctx, "event"); errors.Is(err, errMediaLibraryEventReconcileDeferred) {
+				// The filesystem has no durable provider-event inbox to wake us
+				// again. Keep this coalesced dirty event until readiness returns,
+				// with bounded backoff so a repair cannot create a busy loop.
+				debounce.Reset(deferredDelay)
+				debounceC = debounce.C
+				deferredDelay *= 2
+				if deferredDelay > time.Minute {
+					deferredDelay = time.Minute
+				}
+				continue
+			}
+			deferredDelay = time.Second
 			debounceC = nil
 		case <-incremental.C:
 			_ = reconcile(ctx, "incremental")

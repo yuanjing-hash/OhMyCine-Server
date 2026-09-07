@@ -153,6 +153,45 @@ func EnterCatalogPhysicalWriteTx(tx *gorm.DB, input CatalogPhysicalWriteInput) (
 	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
 		return permit, err
 	}
+	readiness, readinessErr := libraryReadiness(tx, input.LibraryID)
+	if readinessErr != nil {
+		return permit, readinessErr
+	}
+	if readiness.ReadinessStatus == "credentials_required" {
+		return permit, appError("pan115_auth_expired", "登录凭据已失效，请更新后恢复原任务", nil)
+	}
+	if readiness.ReadinessStatus == "busy" {
+		// Only the exact owner whose external call has already exited may
+		// reconcile its unknown result. Another owner's evidence is never a
+		// permit to cross the library-wide physical fence.
+		if err != nil || existing.State != "quiescent" {
+			return permit, catalogPhysicalUnsettledError()
+		}
+		other, otherErr := otherPendingCatalogPhysicalWrite(tx, input.LibraryID, input.OwnerKind, input.OwnerID)
+		if otherErr != nil {
+			return permit, otherErr
+		}
+		if other {
+			return permit, catalogPhysicalUnsettledError()
+		}
+	}
+	// Recheck at actual I/O entry: a repair may have been submitted after a
+	// normal job claimed its lease. Exact quiescent owners can still reconcile.
+	if readiness.ReadinessStatus == "repairing" || readiness.ReadinessStatus == "repair_failed" {
+		if input.OwnerKind != CatalogPhysicalRepair {
+			if existing.State != "quiescent" {
+				return permit, appError(CodeConflict, "媒体库正在整理，请等待整理完成", nil)
+			}
+		} else {
+			currentOwner, currentErr := currentLibraryRepairOwner(tx, input.LibraryID)
+			if currentErr != nil {
+				return permit, currentErr
+			}
+			if currentOwner == "" || currentOwner != input.OwnerID {
+				return permit, catalogPhysicalUnsettledError()
+			}
+		}
+	}
 	if err == nil && ((existing.State != "settled" && existing.State != "quiescent" && existing.State != "admitted") || existing.LibraryID != input.LibraryID || existing.Revision >= math.MaxInt64) {
 		return permit, catalogPhysicalUnsettledError()
 	}

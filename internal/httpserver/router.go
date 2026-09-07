@@ -130,7 +130,9 @@ func New(cfg config.Config, api *handlers.API, auth *services.AuthService, log z
 	mediaLibraryUserAPI.POST("/media-libraries/collections/:id/reorder", middleware.RequirePermission(authz.PermissionMediaLibrariesRead), api.MoveMediaCollectionItem)
 
 	protected := v1.Group("")
-	protected.Use(middleware.Auth(auth, api.CookieName()), middleware.CSRF(auth))
+	// Private browser responses must remain non-cacheable even when
+	// authentication or CSRF rejects the request before a route handler runs.
+	protected.Use(middleware.NoStore(), middleware.Auth(auth, api.CookieName()), middleware.CSRF(auth))
 	protected.POST("/auth/logout", api.Logout)
 	protected.GET("/auth/me", api.Me)
 	protected.GET("/auth/csrf", api.CSRF)
@@ -245,6 +247,7 @@ func New(cfg config.Config, api *handlers.API, auth *services.AuthService, log z
 	protected.GET("/jobs/:id", middleware.NoStore(), jobRead, api.Job)
 	protected.GET("/jobs/:id/attempts", middleware.NoStore(), jobRead, api.JobAttempts)
 	protected.GET("/jobs/:id/timeline", middleware.NoStore(), jobRead, api.JobTimeline)
+	protected.GET("/jobs/:id/repair-details", middleware.NoStore(), jobRead, api.JobRepairDetails)
 	protected.POST("/jobs/:id/pause", jobRead, jobControl, api.JobControl("pause"))
 	protected.POST("/jobs/:id/resume", jobRead, jobControl, api.JobControl("resume"))
 	protected.POST("/jobs/:id/cancel", jobRead, jobControl, api.JobControl("cancel"))

@@ -292,6 +292,18 @@ func TestMediaLibraryIngestSweepUsesDirectChildrenAndSkipsSystemFolders(t *testi
 	if err := fixture.libraries.sweepIngest(context.Background(), library.ID); err != nil {
 		t.Fatal(err)
 	}
+	if len(recorder.items) != 0 {
+		t.Fatalf("unready library adopted items=%v", recorder.items)
+	}
+	if err := fixture.db.Model(&models.MediaLibrary{}).Where("id = ?", library.ID).Updates(map[string]any{"baseline_generation": 1, "status": models.MediaLibraryStatusListening}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.db.Model(&models.MediaLibraryStructureAutoState{}).Where("library_id = ?", library.ID).Updates(map[string]any{"diagnosed_revision": gorm.Expr("source_revision"), "status": "completed"}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.libraries.sweepIngest(context.Background(), library.ID); err != nil {
+		t.Fatal(err)
+	}
 	if len(recorder.items) != 1 || recorder.items[0] != "manual" {
 		t.Fatalf("adopted items=%v, want [manual]", recorder.items)
 	}

@@ -172,6 +172,14 @@ func (w *FollowSearchWorker) Run(ctx context.Context, runtime JobRuntime, job Cl
 	_ = runtime.Checkpoint(map[string]any{"stage": "submit", "missing": missingCoordinates, "selected": candidateFingerprints(selected)})
 	submitted := 0
 	for _, candidate := range selected {
+		blocked, gateErr := followReadinessBlocked(w.follows.db, subscription.ID)
+		if gateErr != nil {
+			return WorkerResult{ErrorCode: CodeConflict, ErrorMessage: "无法确认目标媒体库是否准备好"}
+		}
+		if blocked {
+			next := time.Now().UTC()
+			return WorkerResult{RetryAt: &next, ErrorCode: "media_library_not_ready", ErrorMessage: "等待目标媒体库准备好，已保留追更进度"}
+		}
 		if ctx.Err() != nil {
 			return w.stopRun(run, models.FollowRunCancelled, "follow_cancelled", "追更任务已取消")
 		}

@@ -288,6 +288,69 @@ func TestCatalogPhysicalRegisteredEntryBecomesDrainBlocking(t *testing.T) {
 	}
 }
 
+func TestCatalogPhysicalRepairAdmissionAndEntryStayWithOldestExactOwner(t *testing.T) {
+	db, first, input := catalogPhysicalRepairFixture(t, false)
+	if err := db.Delete(&first).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Transaction(func(tx *gorm.DB) error {
+		return RegisterCatalogPhysicalOwnerTx(tx, input, func(tx *gorm.DB) error { return tx.Create(&first).Error })
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	second := first
+	second.ID = "competing-repair"
+	second.CreatedAt = first.CreatedAt.Add(time.Second)
+	second.UpdatedAt = second.CreatedAt
+	secondInput := input
+	secondInput.OwnerID = second.ID
+	if err := db.Transaction(func(tx *gorm.DB) error {
+		return RegisterCatalogPhysicalOwnerTx(tx, secondInput, func(tx *gorm.DB) error { return tx.Create(&second).Error })
+	}); err == nil {
+		t.Fatal("competing repair was admitted while the original repair owned readiness")
+	}
+	var secondRows int64
+	if err := db.Model(&models.MediaLibraryStructureRepair{}).Where("id=?", second.ID).Count(&secondRows).Error; err != nil || secondRows != 0 {
+		t.Fatalf("rejected repair was persisted: count=%d err=%v", secondRows, err)
+	}
+
+	var firstPermit CatalogPhysicalWritePermit
+	if err := db.Transaction(func(tx *gorm.DB) error {
+		var err error
+		firstPermit, err = EnterCatalogPhysicalWriteTx(tx, input)
+		return err
+	}); err != nil {
+		t.Fatalf("exact admitted repair did not enter: %v", err)
+	}
+	if err := db.Transaction(func(tx *gorm.DB) error { return QuiesceCatalogPhysicalWriteTx(tx, firstPermit) }); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate a legacy/raced second admitted row. The oldest unresolved owner
+	// remains authoritative; the later row cannot use the first repair's block
+	// as a generic exemption.
+	if err := db.Create(&second).Error; err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if err := db.Create(&models.CatalogPhysicalWrite{LibraryID: input.LibraryID, OwnerKind: CatalogPhysicalRepair, OwnerID: second.ID, Revision: 1, State: "admitted", OwnerDigest: "fixture", EnteredAt: now, UpdatedAt: now}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Transaction(func(tx *gorm.DB) error {
+		_, err := EnterCatalogPhysicalWriteTx(tx, secondInput)
+		return err
+	}); err == nil {
+		t.Fatal("later repair crossed the original exact-owner recovery gate")
+	}
+	if err := db.Transaction(func(tx *gorm.DB) error {
+		_, err := EnterCatalogPhysicalWriteTx(tx, input)
+		return err
+	}); err != nil {
+		t.Fatalf("oldest exact quiescent owner could not recover: %v", err)
+	}
+}
+
 func TestCatalogPhysicalHistoricalArtifactCompletionAndAmbiguity(t *testing.T) {
 	db, repair, input := catalogPhysicalRepairFixture(t, false)
 	if err := db.Delete(&repair).Error; err != nil {

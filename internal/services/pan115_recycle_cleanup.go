@@ -92,6 +92,13 @@ func (s *Pan115RecycleCleanupService) Poll(ctx context.Context) error {
 		return err
 	}
 	for _, record := range records {
+		blocked, err := connectionReadinessBlocked(s.db.WithContext(ctx), record.ID)
+		if err != nil {
+			return err
+		}
+		if blocked {
+			continue
+		}
 		resourceKey := "connection:" + strconv.FormatUint(uint64(record.ID), 10)
 		var active int64
 		if err := s.db.WithContext(ctx).Model(&models.Job{}).
@@ -104,7 +111,7 @@ func (s *Pan115RecycleCleanupService) Poll(ctx context.Context) error {
 		if active > 0 {
 			continue
 		}
-		_, err := s.queue.Enqueue(EnqueueJobInput{
+		_, err = s.queue.Enqueue(EnqueueJobInput{
 			System: true, JobType: JobTypePan115RecycleCleanup, Priority: 10,
 			DisplayName: "清空 115 回收站", ResourceKey: resourceKey,
 			CoalescingKey: "scheduled", Payload: pan115RecycleCleanupJobPayload{ConnectionID: record.ID, Revision: record.Revision},

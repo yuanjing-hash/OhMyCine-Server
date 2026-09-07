@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
+	cloudpkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud"
 	"gorm.io/gorm"
 )
 
@@ -19,6 +20,10 @@ func (s *MediaLibraryStructureService) runCatalogStructureRepair(ctx context.Con
 	plan.catalogFence = &state.Fence
 	physicalDone := state.Stage == "physical_completed"
 	fail := func(err error) WorkerResult {
+		cloudCode, _ := cloudpkg.ErrorInfo(err)
+		if cloudCode == cloudpkg.CodeAuthExpired || ErrorCode(err) == cloudpkg.CodeAuthExpired {
+			return s.waitRepairCredentials(ctx, repair, claim)
+		}
 		code := CodeMediaLibraryStructureApplyFailed
 		if errors.Is(err, ErrCatalogFence) {
 			code = CodeMediaLibraryStructureBoundaryChanged

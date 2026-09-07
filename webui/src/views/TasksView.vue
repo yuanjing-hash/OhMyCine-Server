@@ -1,5 +1,6 @@
 ﻿<script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import JobRepairDetails from '@/components/JobRepairDetails.vue';
 import { useRoute, useRouter } from 'vue-router';
 import { createLatestRequest } from '@/latest-request';
 import { useJobLiveRefresh } from '@/use-job-live-refresh';
@@ -39,6 +40,7 @@ const auth = useAuthStore(),
   timeline = ref<JobEvent[]>([]),
   dragged = ref<number | null>(null);
 let drawerTrigger: HTMLElement | null = null;
+const attemptPage = ref(1), attemptTotal = ref(0), timelinePage = ref(1), timelineTotal = ref(0);
 const route = useRoute(), router = useRouter();
 const listRequest = createLatestRequest(), detailRequest = createLatestRequest();
 const detailID = ref(''), detailError = ref(''), detailLoading = ref(false), ordering = ref(false);
@@ -91,11 +93,13 @@ async function loadDetail(id: string, quiet = false) {
   detailError.value = '';
   if (!quiet) { selected.value = null; attempts.value = []; timeline.value = []; detailLoading.value = true; }
   try {
-    const [detail, a, t] = await Promise.all([getJob(id, request.signal), getAttempts(id, request.signal), getTimeline(id, request.signal)]);
+    const [detail, a, t] = await Promise.all([getJob(id, request.signal), getAttempts(id, request.signal, attemptPage.value), getTimeline(id, request.signal, timelinePage.value)]);
     if (!request.isCurrent()) return;
     selected.value = detail;
     attempts.value = a.list;
     timeline.value = t.list;
+    attemptTotal.value = a.total ?? a.list.length;
+    timelineTotal.value = t.total ?? t.list.length;
   } catch (reason) {
     if (!request.isCurrent()) return;
     detailError.value = reason instanceof Error ? reason.message : '任务详情读取失败';
@@ -107,6 +111,7 @@ async function loadDetail(id: string, quiet = false) {
   }
 }
 function open(job: Job) {
+  attemptPage.value = 1; timelinePage.value = 1;
   drawerTrigger = document.activeElement instanceof HTMLElement ? document.activeElement : null;
   void router.replace({ query: { ...route.query, job_id: job.id } });
 }
@@ -153,7 +158,7 @@ watch(() => route.fullPath, () => {
   if (key !== previousListKey) { previousListKey = key; void load() }
   const id = queryText(route.query.job_id, /^[a-zA-Z0-9_-]{1,128}$/);
   if (id !== detailID.value) {
-    detailRequest.cancel(); detailID.value = id; selected.value = null;
+    detailRequest.cancel(); detailID.value = id; selected.value = null; attemptPage.value = 1; timelinePage.value = 1;
     if (id) void loadDetail(id);
   }
 }, { immediate: true });
@@ -484,20 +489,23 @@ onBeforeUnmount(() => { alive = false; listRequest.cancel(); detailRequest.cance
           </div>
         </section>
         <section class="p-4">
+          <JobRepairDetails v-if="selected?.job_type === 'media_library_repair'" :job-id="selected.id" :revision="selected.revision" :active="selected.status === 'running'" />
           <h3>状态时间线</h3>
           <ol class="task-timeline">
             <li v-for="event in timeline" :key="event.id">
-              <strong>{{ event.event_type }}</strong><span>{{ event.from_status || "开始" }} →
-                {{ event.to_status || "—" }}</span><time>{{ new Date(event.created_at).toLocaleString() }}</time>
+              <strong>任务状态更新</strong><span>{{ statusLabels[event.from_status as JobStatus] || "开始" }} →
+                {{ statusLabels[event.to_status as JobStatus] || "—" }}</span><time>{{ new Date(event.created_at).toLocaleString() }}</time>
             </li>
           </ol>
+          <div v-if="selected" class="flex items-center gap-3"><button class="btn-secondary" :disabled="detailLoading || timelinePage <= 1" @click="timelinePage--; loadDetail(detailID, true)">上一页时间线</button><span>第 {{ timelinePage }} 页</span><button class="btn-secondary" :disabled="detailLoading || timelinePage * 50 >= timelineTotal" @click="timelinePage++; loadDetail(detailID, true)">下一页时间线</button></div>
           <h3 class="mt-6">执行尝试</h3>
           <ol class="task-timeline">
             <li v-for="attempt in attempts" :key="attempt.id">
               <strong>第 {{ attempt.attempt_number }} 次 ·
-                {{ attempt.status }}</strong><span>{{ attempt.error_message || "无错误" }}</span><time>{{ new Date(attempt.started_at).toLocaleString() }}</time>
+                {{ statusLabels[attempt.status as JobStatus] || '执行结束' }}</strong><span>{{ attempt.error_message || "无错误" }}</span><time>{{ new Date(attempt.started_at).toLocaleString() }}</time>
             </li>
           </ol>
+          <div v-if="selected" class="flex items-center gap-3"><button class="btn-secondary" :disabled="detailLoading || attemptPage <= 1" @click="attemptPage--; loadDetail(detailID, true)">上一页尝试</button><span>第 {{ attemptPage }} 页</span><button class="btn-secondary" :disabled="detailLoading || attemptPage * 50 >= attemptTotal" @click="attemptPage++; loadDetail(detailID, true)">下一页尝试</button></div>
         </section>
       </aside>
     </div>

@@ -106,7 +106,7 @@ func (a *API) UpdateConnection(c *gin.Context) {
 	if payload.Name != "" {
 		name = &payload.Name
 	}
-	item, err := a.connections.Update(actor, id, services.UpdateConnectionInput{Name: name, Cookie: payload.Cookie, RecyclePassword: payload.RecyclePassword, RemoveRecyclePassword: payload.RemoveRecyclePassword, RecycleCleanupEnabled: payload.RecycleCleanupEnabled, RecycleCleanupCron: payload.RecycleCleanupCron, RecycleCleanupConfirmed: payload.RecycleCleanupConfirmed, Endpoint: payload.Endpoint, APIKey: payload.APIKey, Enabled: payload.Enabled, Revision: payload.Revision}, middleware.RequestContextFrom(c))
+	item, err := a.connections.UpdateContext(c.Request.Context(), actor, id, services.UpdateConnectionInput{Name: name, Cookie: payload.Cookie, RecyclePassword: payload.RecyclePassword, RemoveRecyclePassword: payload.RemoveRecyclePassword, RecycleCleanupEnabled: payload.RecycleCleanupEnabled, RecycleCleanupCron: payload.RecycleCleanupCron, RecycleCleanupConfirmed: payload.RecycleCleanupConfirmed, Endpoint: payload.Endpoint, APIKey: payload.APIKey, Enabled: payload.Enabled, Revision: payload.Revision}, middleware.RequestContextFrom(c))
 	if err != nil {
 		writeError(c, a.log, err)
 		return

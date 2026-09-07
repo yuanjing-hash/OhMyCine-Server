@@ -50,7 +50,7 @@ func catalogConnectionFixture(t *testing.T, versioned bool) (*CatalogSnapshotSto
 	return s, service, actor, library, connection
 }
 
-func TestCatalogConnectionActualCredentialResetAndSameValuePreservation(t *testing.T) {
+func TestCatalogConnectionCrossAccountRejectedAndSameValuePreserved(t *testing.T) {
 	s, service, actor, library, connection := catalogConnectionFixture(t, true)
 	var before models.CatalogHead
 	if err := s.writeDB.First(&before, "library_id=?", library.ID).Error; err != nil {
@@ -66,8 +66,8 @@ func TestCatalogConnectionActualCredentialResetAndSameValuePreservation(t *testi
 		t.Fatalf("same-value credentials reset source: %+v %v", preserved, err)
 	}
 	cookie = strings.Replace(testPan115Cookie, "100_A1", "200_A1", 1)
-	if _, err := service.Update(actor, connection.ID, UpdateConnectionInput{Cookie: &cookie, Revision: updated.Revision}, RequestContext{}); err != nil {
-		t.Fatal(err)
+	if _, err := service.Update(actor, connection.ID, UpdateConnectionInput{Cookie: &cookie, Revision: updated.Revision}, RequestContext{}); ErrorCode(err) != CodeConflict {
+		t.Fatalf("cross-account update was not refused: %v", err)
 	}
 	var head models.CatalogHead
 	var storage models.Storage
@@ -77,14 +77,14 @@ func TestCatalogConnectionActualCredentialResetAndSameValuePreservation(t *testi
 	if err := s.writeDB.First(&storage, library.StorageID).Error; err != nil {
 		t.Fatal(err)
 	}
-	if head.SourceEpoch != before.SourceEpoch+1 || storage.CatalogConnectionEpoch != 1 || storage.CatalogConnectionRevision != 1 || len(catalogReadEntries(t, s, library.ID, "")) != 0 {
-		t.Fatalf("old account catalog remained readable: head=%+v epochs=%d/%d", head, storage.CatalogConnectionEpoch, storage.CatalogConnectionRevision)
+	if !catalogSameHead(before, head) || storage.CatalogConnectionEpoch != 0 || storage.CatalogConnectionRevision != 0 || len(catalogReadEntries(t, s, library.ID, "")) != 2 {
+		t.Fatal("rejected account switch changed catalog")
 	}
 	var anchorCount, removals int64
 	if err := s.writeDB.Model(&models.MediaLibraryEntry{}).Where("library_id=?", library.ID).Count(&anchorCount).Error; err != nil {
 		t.Fatal(err)
 	}
-	if err := s.writeDB.Model(&models.MediaLibraryChange{}).Where("library_id=? AND kind=? AND state=?", library.ID, models.MediaLibraryChangeRemoval, models.MediaLibraryChangeReady).Count(&removals).Error; err != nil || anchorCount != 2 || removals != 1 {
+	if err := s.writeDB.Model(&models.MediaLibraryChange{}).Where("library_id=? AND kind=? AND state=?", library.ID, models.MediaLibraryChangeRemoval, models.MediaLibraryChangeReady).Count(&removals).Error; err != nil || anchorCount != 2 || removals != 0 {
 		t.Fatalf("anchors/removal=%d/%d err=%v", anchorCount, removals, err)
 	}
 }
@@ -94,7 +94,7 @@ func TestCatalogConnectionLegacySourceChangeRefusesButEnabledFencesScan(t *testi
 	storage, profile := catalogSourceContext(t, s, library)
 	before := mediaLibraryScanSourceFingerprint(library, storage, profile)
 	cookie := strings.Replace(testPan115Cookie, "100_A1", "200_A1", 1)
-	if _, err := service.Update(actor, connection.ID, UpdateConnectionInput{Cookie: &cookie, Revision: connection.Revision}, RequestContext{}); !errors.Is(err, ErrCatalogFence) || ErrorCode(err) != CodeConflict {
+	if _, err := service.Update(actor, connection.ID, UpdateConnectionInput{Cookie: &cookie, Revision: connection.Revision}, RequestContext{}); ErrorCode(err) != CodeConflict {
 		t.Fatalf("legacy account switch allowed: %v", err)
 	}
 	enabled := false

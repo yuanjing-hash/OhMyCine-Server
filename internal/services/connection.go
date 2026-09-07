@@ -27,19 +27,20 @@ import (
 )
 
 type ConnectionService struct {
-	db           *gorm.DB
-	catalogStore *CatalogSnapshotStore
-	changes      *MediaChangeService
-	audit        *AuditService
-	credentials  *credential.Store
-	registry     *cloudpkg.Registry
-	log          zerolog.Logger
-	mu           sync.Mutex
-	drivers      map[uint]cloudpkg.Driver
+	db              *gorm.DB
+	catalogStore    *CatalogSnapshotStore
+	changes         *MediaChangeService
+	audit           *AuditService
+	credentials     *credential.Store
+	registry        *cloudpkg.Registry
+	log             zerolog.Logger
+	mu              sync.Mutex
+	drivers         map[uint]cloudpkg.Driver
+	driverRevisions map[uint]uint64
 }
 
 func NewConnectionService(db *gorm.DB, audit *AuditService, credentials *credential.Store, registry *cloudpkg.Registry, log zerolog.Logger) *ConnectionService {
-	return &ConnectionService{db: db, audit: audit, credentials: credentials, registry: registry, log: log, drivers: map[uint]cloudpkg.Driver{}}
+	return &ConnectionService{db: db, audit: audit, credentials: credentials, registry: registry, log: log, drivers: map[uint]cloudpkg.Driver{}, driverRevisions: map[uint]uint64{}}
 }
 
 type ConnectionInput struct {
@@ -273,6 +274,10 @@ func (s *ConnectionService) Create(actor Actor, input ConnectionInput, request R
 }
 
 func (s *ConnectionService) Update(actor Actor, id uint, input UpdateConnectionInput, request RequestContext) (ConnectionSummary, error) {
+	return s.UpdateContext(context.Background(), actor, id, input, request)
+}
+
+func (s *ConnectionService) UpdateContext(ctx context.Context, actor Actor, id uint, input UpdateConnectionInput, request RequestContext) (ConnectionSummary, error) {
 	if !actor.Can(authz.PermissionConnectionsUpdate) {
 		return ConnectionSummary{}, appError(CodePermissionDenied, "无权编辑连接", nil)
 	}
@@ -285,6 +290,7 @@ func (s *ConnectionService) Update(actor Actor, id uint, input UpdateConnectionI
 	}
 	previous := record
 	credentialChanged := false
+	sameAccountRotation := false
 	if input.Name != nil {
 		name, normalized, err := normalizeConnectionName(*input.Name)
 		if err != nil {
@@ -335,6 +341,12 @@ func (s *ConnectionService) Update(actor Actor, id uint, input UpdateConnectionI
 		}
 		credentialChanged = oldCredential != normalizedCookie
 		if credentialChanged {
+			account, err := s.probePan115Rotation(ctx, previous, oldCredential, normalizedCookie)
+			if err != nil {
+				return ConnectionSummary{}, err
+			}
+			sameAccountRotation = true
+			setConnectionAccount(&record, account)
 			ciphertext, err := s.credentials.Encrypt(connectionPurpose(id, record.Provider), normalizedCookie)
 			if err != nil {
 				return ConnectionSummary{}, err
@@ -426,20 +438,42 @@ func (s *ConnectionService) Update(actor Actor, id uint, input UpdateConnectionI
 	} else {
 		record.RecycleCleanupNextRunAt = nil
 	}
-	record.LastHealthStatus, record.LastHealthErrorCode, record.LastHealthCheckedAt = "unknown", "", nil
-	record.AccountID, record.AccountName, record.AccountVIP = "", "", false
-	record.QuotaUsedBytes, record.QuotaTotalBytes = nil, nil
+	if record.Provider != models.ConnectionProviderPan115 {
+		record.LastHealthStatus, record.LastHealthErrorCode, record.LastHealthCheckedAt = "unknown", "", nil
+		record.AccountID, record.AccountName, record.AccountVIP = "", "", false
+		record.QuotaUsedBytes, record.QuotaTotalBytes = nil, nil
+	} else if sameAccountRotation {
+		now := time.Now().UTC()
+		record.LastHealthStatus, record.LastHealthErrorCode, record.LastHealthCheckedAt = "online", "", &now
+	}
 	record.Revision++
 	if err := s.writeCatalogConnection(func(tx *gorm.DB) error {
-		if err := s.applyCatalogConnectionChangeTx(tx, previous, record, credentialChanged); err != nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		var current models.Connection
+		if err := tx.First(&current, id).Error; err != nil {
+			return connectionNotFound(err)
+		}
+		if current.Revision != previous.Revision || current.AccountID != previous.AccountID {
+			return appError(CodeConflict, "连接配置或账号信息已变化，请刷新后重试", nil)
+		}
+		if record.Provider == models.ConnectionProviderPan115 && !sameAccountRotation {
+			// A provider call may have confirmed expiry since this edit began.
+			// Cosmetic/recycle edits must not revive that same credential.
+			record.LastHealthStatus, record.LastHealthErrorCode, record.LastHealthCheckedAt = current.LastHealthStatus, current.LastHealthErrorCode, current.LastHealthCheckedAt
+			record.AccountName, record.AccountVIP = current.AccountName, current.AccountVIP
+			record.QuotaUsedBytes, record.QuotaTotalBytes = current.QuotaUsedBytes, current.QuotaTotalBytes
+		}
+		if err := s.applyCatalogConnectionChangeTx(tx, previous, record, credentialChanged && !sameAccountRotation); err != nil {
 			return err
 		}
 		result := tx.Model(&models.Connection{}).Where("id = ? AND revision = ?", id, input.Revision).Updates(map[string]any{
 			"name": record.Name, "name_normalized": record.NameNormalized, "endpoint": record.Endpoint, "credential_ciphertext": record.CredentialCiphertext, "recycle_credential_ciphertext": record.RecycleCredentialCiphertext,
 			"recycle_cleanup_enabled": record.RecycleCleanupEnabled, "recycle_cleanup_cron": record.RecycleCleanupCron, "recycle_cleanup_next_run_at": record.RecycleCleanupNextRunAt,
-			"enabled": record.Enabled, "account_id": "", "account_name": "", "account_vip": false,
-			"quota_used_bytes": nil, "quota_total_bytes": nil, "last_health_status": "unknown",
-			"last_health_error_code": "", "last_health_checked_at": nil, "revision": record.Revision, "updated_at": time.Now().UTC(),
+			"enabled": record.Enabled, "account_id": record.AccountID, "account_name": record.AccountName, "account_vip": record.AccountVIP,
+			"quota_used_bytes": record.QuotaUsedBytes, "quota_total_bytes": record.QuotaTotalBytes, "last_health_status": record.LastHealthStatus,
+			"last_health_error_code": record.LastHealthErrorCode, "last_health_checked_at": record.LastHealthCheckedAt, "revision": record.Revision, "updated_at": time.Now().UTC(),
 		})
 		if result.Error != nil {
 			return result.Error
@@ -516,13 +550,27 @@ func (s *ConnectionService) Test(ctx context.Context, actor Actor, id uint, requ
 	}
 	if record.ID != 0 {
 		testedRevision := record.Revision
+		testedAccountID := record.AccountID
+		if err == nil && record.Provider == models.ConnectionProviderPan115 && record.AccountID != "" && record.AccountID != account.ID {
+			err = appError(CodeConflict, "115 返回的账号与连接绑定不一致，请检查 Cookie", nil)
+			status, errorCode, outcome = "offline", CodeConflict, "failure"
+		}
 		record.LastHealthStatus, record.LastHealthErrorCode, record.LastHealthCheckedAt = status, safeLabel(errorCode, 96), &now
 		if err == nil {
 			record.AccountID, record.AccountName, record.AccountVIP = safeLabel(account.ID, 128), safeLabel(account.Name, 256), account.VIP
 			record.QuotaUsedBytes, record.QuotaTotalBytes = account.UsedBytes, account.TotalBytes
 		}
 		if saveErr := s.db.Transaction(func(tx *gorm.DB) error {
-			result := tx.Model(&models.Connection{}).Where("id = ? AND revision = ?", record.ID, testedRevision).Updates(map[string]any{
+			if record.Provider == models.ConnectionProviderPan115 {
+				var current models.Connection
+				if loadErr := tx.First(&current, record.ID).Error; loadErr != nil {
+					return loadErr
+				}
+				if current.LastHealthStatus == "offline" && current.LastHealthErrorCode == cloudpkg.CodeAuthExpired && record.LastHealthErrorCode != cloudpkg.CodeAuthExpired {
+					return appError(CodeConflict, "连接凭据已确认失效，请更新 Cookie 后重试", nil)
+				}
+			}
+			result := tx.Model(&models.Connection{}).Where("id = ? AND revision = ? AND account_id = ?", record.ID, testedRevision, testedAccountID).Updates(map[string]any{
 				"account_id": record.AccountID, "account_name": record.AccountName, "account_vip": record.AccountVIP,
 				"quota_used_bytes": record.QuotaUsedBytes, "quota_total_bytes": record.QuotaTotalBytes,
 				"last_health_status": record.LastHealthStatus, "last_health_error_code": record.LastHealthErrorCode,
@@ -591,6 +639,10 @@ func (s *ConnectionService) Driver(actor Actor, id uint) (models.Connection, clo
 }
 
 func (s *ConnectionService) driver(id uint) (models.Connection, cloudpkg.Driver, error) {
+	// Serialize construction with invalidation. Builders only parse local config;
+	// Probe and all other provider I/O occur after this lock is released.
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	var record models.Connection
 	if err := s.db.First(&record, id).Error; err != nil {
 		return record, nil, connectionNotFound(err)
@@ -601,10 +653,8 @@ func (s *ConnectionService) driver(id uint) (models.Connection, cloudpkg.Driver,
 	if record.Provider != cloudpkg.ProviderPan115 {
 		return record, nil, appError(CodeConnectionProviderUnsupported, "该连接不是存储驱动", nil)
 	}
-	s.mu.Lock()
 	cached := s.drivers[id]
-	s.mu.Unlock()
-	if cached != nil {
+	if cached != nil && (s.driverRevisions[id] == record.Revision || s.driverRevisions[id] == 0) {
 		return record, cached, nil
 	}
 	cookie, err := s.credentials.Decrypt(connectionPurpose(id, record.Provider), record.CredentialCiphertext)
@@ -618,23 +668,22 @@ func (s *ConnectionService) driver(id uint) (models.Connection, cloudpkg.Driver,
 			return record, nil, err
 		}
 	}
-	driver, err := s.registry.Build(record.Provider, cloudpkg.Config{ConnectionID: id, Cookie: cookie, RecyclePassword: recyclePassword})
+	driver, err := s.registry.Build(record.Provider, cloudpkg.Config{ConnectionID: id, Cookie: cookie, RecyclePassword: recyclePassword,
+		BeforeCall:   func(ctx context.Context) error { return s.guardConnectionCredential(ctx, record.ID, record.Revision) },
+		OnCallResult: func(err error) { s.recordConnectionCredentialFailure(record.ID, record.Revision, err) },
+	})
 	if err != nil {
 		return record, nil, connectionProviderError(err)
 	}
-	s.mu.Lock()
-	if existing := s.drivers[id]; existing != nil {
-		driver = existing
-	} else {
-		s.drivers[id] = driver
-	}
-	s.mu.Unlock()
+	s.drivers[id] = driver
+	s.driverRevisions[id] = record.Revision
 	return record, driver, nil
 }
 
 func (s *ConnectionService) invalidate(id uint) {
 	s.mu.Lock()
 	delete(s.drivers, id)
+	delete(s.driverRevisions, id)
 	s.mu.Unlock()
 }
 

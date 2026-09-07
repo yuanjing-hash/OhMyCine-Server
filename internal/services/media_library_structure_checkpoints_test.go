@@ -190,7 +190,9 @@ func TestStructureRepairBatchCheckpointsScaleWithProviderBatches(t *testing.T) {
 	if !reflect.DeepEqual(backend.batches, []int{100, 100, 35}) {
 		t.Fatalf("backend batches=%v", backend.batches)
 	}
-	if got := aggregateUpdates.Load(); got != 3 {
-		t.Fatalf("aggregate checkpoint updates=%d want=3", got)
+	// Each batch writes its in-flight summary, clears it after the external
+	// call, and checkpoints verified outcomes once. No per-item transactions.
+	if got := aggregateUpdates.Load(); got != 9 {
+		t.Fatalf("aggregate checkpoint updates=%d want=9", got)
 	}
 }
