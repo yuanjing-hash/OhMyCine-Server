@@ -1,6 +1,7 @@
 package services
 
 import (
+	"context"
 	"errors"
 	"math"
 	"time"
@@ -9,6 +10,46 @@ import (
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
 	"gorm.io/gorm"
 )
+
+// catalogPhysicalWriteEntered reports only an external call that is currently
+// in flight. Admitted owners have performed no I/O and quiescent owners have
+// already left the call boundary, so neither may hold provider-event scans.
+func catalogPhysicalWriteEntered(ctx context.Context, db *gorm.DB, libraryID uint) (bool, error) {
+	if libraryID == 0 {
+		return false, ErrCatalogInvalid
+	}
+	var row struct{ ID uint64 }
+	err := db.WithContext(ctx).Model(&models.CatalogPhysicalWrite{}).Select("id").
+		Where("library_id = ? AND state = ?", libraryID, "entered").Limit(1).Take(&row).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return false, nil
+	}
+	return row.ID != 0, err
+}
+
+// settleAdmittedCatalogPhysicalWriteTx records that a queued owner was
+// terminally superseded before it ever entered external I/O. This is narrower
+// than SettleCatalogPhysicalWriteTx: only immutable positive no-I/O evidence
+// may take this path.
+func settleAdmittedCatalogPhysicalWriteTx(tx *gorm.DB, proof models.CatalogPhysicalWrite) error {
+	if err := requireCatalogTransaction(tx); err != nil {
+		return err
+	}
+	if proof.ID == 0 || proof.Revision == 0 || proof.State != "admitted" || proof.OwnerKind == "" || proof.OwnerID == "" || proof.JobID == "" {
+		return ErrCatalogInvalid
+	}
+	now := time.Now().UTC()
+	result := tx.Model(&models.CatalogPhysicalWrite{}).
+		Where("id = ? AND library_id = ? AND owner_kind = ? AND owner_id = ? AND revision = ? AND state = 'admitted' AND job_id = ? AND job_lease_hash = ''", proof.ID, proof.LibraryID, proof.OwnerKind, proof.OwnerID, proof.Revision, proof.JobID).
+		Updates(map[string]any{"state": "settled", "settled_at": now, "updated_at": now})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return ErrCatalogFence
+	}
+	return nil
+}
 
 const (
 	CatalogPhysicalTransfer         = "transfer"

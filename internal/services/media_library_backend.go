@@ -15,6 +15,8 @@ import (
 	cloudpkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud"
 )
 
+var errMediaLibraryEventReconcileDeferred = errors.New("media library provider event reconciliation deferred by physical write")
+
 // MediaLibraryScanRequest contains only provider-neutral library scan facts.
 // A backend owns the translation from these facts to its concrete storage API.
 type MediaLibraryScanRequest struct {
@@ -403,6 +405,7 @@ func (l *providerMediaLibraryListener) Run(ctx context.Context, reconcile func(c
 	defer incremental.Stop()
 	var debounce *time.Timer
 	var debounceC <-chan time.Time
+	deferredDelay := 5 * time.Second
 	defer func() {
 		if debounce != nil {
 			debounce.Stop()
@@ -441,6 +444,15 @@ func (l *providerMediaLibraryListener) Run(ctx context.Context, reconcile func(c
 					if debounceDelay <= 0 {
 						debounceDelay = 2 * time.Second
 					}
+					if errors.Is(err, errMediaLibraryEventReconcileDeferred) {
+						debounceDelay = deferredDelay
+						deferredDelay *= 2
+						if deferredDelay > time.Minute {
+							deferredDelay = time.Minute
+						}
+					} else {
+						deferredDelay = 5 * time.Second
+					}
 					if debounce == nil {
 						debounce = time.NewTimer(debounceDelay)
 					} else {
@@ -449,6 +461,7 @@ func (l *providerMediaLibraryListener) Run(ctx context.Context, reconcile func(c
 					debounceC = debounce.C
 					continue
 				}
+				deferredDelay = 5 * time.Second
 			}
 			debounceC = nil
 		case <-incremental.C:

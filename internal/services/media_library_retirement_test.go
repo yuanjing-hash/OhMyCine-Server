@@ -276,7 +276,7 @@ func TestLibraryRetirementBatchBoundAndLeaseFence(t *testing.T) {
 	}
 	claim, row := claimRetirement(t, s, library, actor)
 	w := NewMediaLibraryRetirementWorker(s)
-	for i := 0; i < 60 && row.Phase != "completed"; i++ {
+	for i := 0; i < len(libraryRetirementCleanup)*2+16 && row.Phase != "completed"; i++ {
 		var before, after int64
 		s.db.Model(&models.MediaLibraryStructureIssueMember{}).Count(&before)
 		_, _, err := w.step(context.Background(), claim, &row)

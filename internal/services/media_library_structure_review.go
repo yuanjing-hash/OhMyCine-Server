@@ -80,14 +80,11 @@ func (s *MediaLibraryStructureService) SaveStructureReviewBulk(ctx context.Conte
 			return appError(CodeConflict, "目录诊断结果不存在，请重新检测", err)
 		}
 		var rows []models.MediaLibraryStructureIssue
-		if err := tx.Where("library_id = ? AND diagnosis_job_id = ? AND generation = ? AND code IN ? AND conflict_source_count > 1", libraryID, diagnosis.JobID, diagnosis.Generation, codes).Order("id").Limit(maxStructureSelections + 1).Find(&rows).Error; err != nil {
+		if err := tx.Where("library_id = ? AND diagnosis_job_id = ? AND generation = ? AND code IN ? AND conflict_source_count > 1", libraryID, diagnosis.JobID, diagnosis.Generation, codes).Order("id").Find(&rows).Error; err != nil {
 			return err
 		}
 		if len(rows) == 0 {
 			return appError(CodeInvalidRequest, "当前筛选没有可批量处理的冲突", nil)
-		}
-		if len(rows) > maxStructureSelections {
-			return appError(CodeInvalidRequest, "批量处理项目过多，请分类型处理", nil)
 		}
 		now := time.Now().UTC()
 		var session models.MediaLibraryStructureReviewSession
@@ -106,13 +103,10 @@ func (s *MediaLibraryStructureService) SaveStructureReviewBulk(ctx context.Conte
 		if session.Revision != input.ReviewRevision {
 			return appError(CodeConflict, "处理工作区已被其他页面修改，请刷新后重试", nil)
 		}
-		rowTokens := make([]string, 0, len(rows))
-		for _, row := range rows {
-			rowTokens = append(rowTokens, row.Token)
-		}
 		var submitted int64
 		if err := tx.Model(&models.MediaLibraryStructureReviewChoice{}).
-			Where("session_id = ? AND subject_kind = ? AND issue_token IN ? AND state = ?", session.ID, "issue", rowTokens, "submitted").
+			Joins("JOIN media_library_structure_issues i ON i.token = media_library_structure_review_choices.issue_token AND i.library_id = ? AND i.diagnosis_job_id = ? AND i.generation = ? AND i.code IN ? AND i.conflict_source_count > 1", libraryID, diagnosis.JobID, diagnosis.Generation, codes).
+			Where("media_library_structure_review_choices.session_id = ? AND media_library_structure_review_choices.subject_kind = ? AND media_library_structure_review_choices.state = ?", session.ID, "issue", "submitted").
 			Count(&submitted).Error; err != nil {
 			return err
 		}
@@ -177,11 +171,8 @@ func (s *MediaLibraryStructureService) mergeStructureReviewSelections(ctx contex
 		query = query.Joins("JOIN media_library_structure_issues i ON i.token = media_library_structure_review_choices.issue_token AND i.library_id = ? AND i.diagnosis_job_id = ? AND i.generation = ? AND i.code = ?", libraryID, diagnosis.JobID, diagnosis.Generation, code)
 	}
 	var choices []models.MediaLibraryStructureReviewChoice
-	if err := query.Order("media_library_structure_review_choices.id").Limit(maxStructureSelections + 1).Find(&choices).Error; err != nil {
+	if err := query.Order("media_library_structure_review_choices.id").Find(&choices).Error; err != nil {
 		return input, session, err
-	}
-	if len(choices) > maxStructureSelections {
-		return input, session, appError(CodeInvalidRequest, "本次处理选择过多，请分类型预览提交", nil)
 	}
 	byIssue := make(map[string]MediaLibraryStructureSelection, len(choices)+len(input.Selections))
 	for _, choice := range choices {

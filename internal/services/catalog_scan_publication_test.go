@@ -348,6 +348,7 @@ func TestCatalogScanNoopPartialDoesNotConsumeDeltaLayers(t *testing.T) {
 	if err := service.db.First(&head, "library_id=?", library.ID).Error; err != nil {
 		t.Fatal(err)
 	}
+	baselineGeneration := library.BaselineGeneration + 1
 	noops := 0
 	hook := func(tx *gorm.DB, p CatalogScanPublication) error {
 		if !p.NoContentChange || p.Candidate != nil || p.Head.Revision != head.Revision {
@@ -365,6 +366,9 @@ func TestCatalogScanNoopPartialDoesNotConsumeDeltaLayers(t *testing.T) {
 		}
 		if published.Status != "success" || published.Added != 0 || published.Updated != 0 || published.Removed != 0 {
 			t.Fatalf("noop run: %+v", published)
+		}
+		if published.Generation != baselineGeneration {
+			t.Fatalf("no-op advanced generation: got=%d want=%d", published.Generation, baselineGeneration)
 		}
 	}
 	var layers int64

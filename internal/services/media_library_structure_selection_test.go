@@ -326,6 +326,28 @@ func TestStructureSelectionAutomaticallyIncludesRepairableVideoAndSidecar(t *tes
 	if !kinds["video"] || !kinds["sidecar"] {
 		t.Fatalf("automatic preview omitted video or sidecar: %+v", preview.Items.List)
 	}
+	claim, err := service.verifyStructureClaim(preview.ConfirmationToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var draft models.MediaLibraryStructureRepairDraft
+	if err := service.db.First(&draft, "id = ?", claim.DraftID).Error; err != nil {
+		t.Fatal(err)
+	}
+	var frozenIntent MediaLibraryStructureSelectionInput
+	if err := json.Unmarshal([]byte(draft.SelectionsJSON), &frozenIntent); err != nil || !frozenIntent.IncludeAutomaticRepairs || len(frozenIntent.Selections) != 0 {
+		t.Fatalf("automatic preview did not preserve compact intent: %+v err=%v", frozenIntent, err)
+	}
+	if draft.PreviewItemsJSON != structurePreviewRowsMarker {
+		t.Fatalf("preview was not stored relationally: %q", draft.PreviewItemsJSON)
+	}
+	var previewRows int64
+	if err := service.db.Model(&models.MediaLibraryStructureRepairDraftPreviewItem{}).Where("draft_id = ?", draft.ID).Count(&previewRows).Error; err != nil || previewRows != int64(preview.Items.Total) {
+		t.Fatalf("relational preview rows=%d total=%d err=%v", previewRows, preview.Items.Total, err)
+	}
+	if _, err := service.EnqueueSelectionRepair(context.Background(), actor, library.ID, preview.ConfirmationToken, RequestContext{}); err != nil {
+		t.Fatalf("automatic preview could not cross the confirmation boundary: %v", err)
+	}
 }
 
 func TestStructureSelectionMoveOrderingMatchesStableDependencySemantics(t *testing.T) {

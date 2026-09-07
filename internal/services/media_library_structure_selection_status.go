@@ -2,6 +2,7 @@ package services
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"time"
 
@@ -24,9 +25,6 @@ func (s *MediaLibraryStructureService) SelectionStatus(ctx context.Context, acto
 	if !actor.CanResource(authz.PermissionMediaLibrariesScan, models.AuthorizationResourceMediaLibrary, uintID(libraryID)) {
 		return result, appError(CodePermissionDenied, "无权核对目录修复选择", nil)
 	}
-	if len(tokens) > maxStructureSelections {
-		return result, appError(CodeInvalidRequest, "目录修复选择过多", nil)
-	}
 	unique := make([]string, 0, len(tokens))
 	seen := make(map[string]bool, len(tokens))
 	for _, token := range tokens {
@@ -38,36 +36,45 @@ func (s *MediaLibraryStructureService) SelectionStatus(ctx context.Context, acto
 			seen[token] = true
 		}
 	}
-	// One statement pins the summary and membership together without reserving
-	// SQLite's writer. A left join still returns the library when no token lives.
-	var rows []struct {
+	// This is reconciliation only, not execution authority. Keep each read
+	// bounded and let PreviewSelectionRepair perform the final current-revision
+	// fence; do not reserve SQLite's writer merely to pin this UI check.
+	var summary struct {
 		ID                  uint
 		BaselineGeneration  uint64
 		StructureStatus     string
 		StructureIssueCount int
 		StructureErrorCode  string
 		StructureCheckedAt  *time.Time
-		IssueToken          *string
 	}
-	err := s.db.WithContext(ctx).Table("media_libraries AS l").
-		Select("l.id,l.baseline_generation,l.structure_status,l.structure_issue_count,l.structure_error_code,l.structure_checked_at,i.token AS issue_token").
-		Joins("LEFT JOIN media_library_structure_diagnoses AS d ON d.library_id=l.id AND d.status IN ?", []string{models.MediaLibraryStructureHealthy, models.MediaLibraryStructureIssues}).
-		Joins("LEFT JOIN media_library_structure_issues AS i ON i.library_id=l.id AND i.diagnosis_job_id=d.job_id AND i.generation=d.generation AND i.token IN ?", unique).
-		Where("l.id = ?", libraryID).Scan(&rows).Error
-	if err != nil {
+	valid := make(map[string]bool, len(unique))
+	db := s.db.WithContext(ctx)
+	if err := db.Table("media_libraries AS l").Select("l.id,l.baseline_generation,l.structure_status,l.structure_issue_count,l.structure_error_code,l.structure_checked_at").Where("l.id = ?", libraryID).Take(&summary).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return result, mediaLibraryNotFound(err)
+		}
 		return result, err
 	}
-	if len(rows) == 0 {
-		return result, mediaLibraryNotFound(gorm.ErrRecordNotFound)
+	var diagnosis models.MediaLibraryStructureDiagnosis
+	diagnosisFound := true
+	if err := db.Where("library_id = ? AND status IN ?", libraryID, []string{models.MediaLibraryStructureHealthy, models.MediaLibraryStructureIssues}).First(&diagnosis).Error; errors.Is(err, gorm.ErrRecordNotFound) {
+		diagnosisFound = false
+	} else if err != nil {
+		return result, err
 	}
-	first := rows[0]
-	result.Revision = structureDiagnosticRevision(models.MediaLibrary{ID: first.ID, BaselineGeneration: first.BaselineGeneration, StructureStatus: first.StructureStatus, StructureIssueCount: first.StructureIssueCount, StructureErrorCode: first.StructureErrorCode, StructureCheckedAt: first.StructureCheckedAt})
-	valid := make(map[string]bool, len(rows))
-	for _, row := range rows {
-		if row.IssueToken != nil {
-			valid[*row.IssueToken] = true
+	if diagnosisFound {
+		for start := 0; start < len(unique); start += CatalogBatchRows {
+			part := unique[start:min(start+CatalogBatchRows, len(unique))]
+			var found []string
+			if err := db.Model(&models.MediaLibraryStructureIssue{}).Where("library_id = ? AND diagnosis_job_id = ? AND generation = ? AND token IN ?", libraryID, diagnosis.JobID, diagnosis.Generation, part).Pluck("token", &found).Error; err != nil {
+				return result, err
+			}
+			for _, token := range found {
+				valid[token] = true
+			}
 		}
 	}
+	result.Revision = structureDiagnosticRevision(models.MediaLibrary{ID: summary.ID, BaselineGeneration: summary.BaselineGeneration, StructureStatus: summary.StructureStatus, StructureIssueCount: summary.StructureIssueCount, StructureErrorCode: summary.StructureErrorCode, StructureCheckedAt: summary.StructureCheckedAt})
 	for _, token := range unique {
 		if !valid[token] {
 			result.InvalidIssueTokens = append(result.InvalidIssueTokens, token)

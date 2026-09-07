@@ -37,6 +37,9 @@ func (s *MediaLibraryService) commitCatalogScanFollowupTx(tx *gorm.DB, p Catalog
 	}
 	requiresArtifacts := mediaLibraryRequiresArtifacts(storage.Type, library, s.artifacts != nil)
 	generate := requiresArtifacts && mediaLibraryArtifactGenerationRequired(p.Run.Kind, p.Run, p.MetadataChanged)
+	if p.NoContentChange {
+		generate = false
+	}
 	// A metadata worker's final no-op must not create another binding for a
 	// generation it just finished. Earlier changed batches already bound it.
 	if p.RecognitionOnly && p.NoContentChange {
@@ -220,6 +223,9 @@ func (s *MediaLibraryService) RecoverCatalogScanFollowups(ctx context.Context, l
 	}
 	s.catalogFollowupMu.Lock()
 	defer s.catalogFollowupMu.Unlock()
+	if err := s.supersedeObsoleteCatalogJobs(ctx, limit); err != nil {
+		return err
+	}
 	var rows []models.CatalogScanFollowup
 	if err := s.catalogStore.readDB.WithContext(ctx).Where("recognition_pending = 1 OR artifact_pending = 1 OR artwork_pending = 1 OR diagnosis_pending = 1").Order("updated_at,library_id").Limit(limit).Find(&rows).Error; err != nil {
 		return err
@@ -248,6 +254,165 @@ func (s *MediaLibraryService) RecoverCatalogScanFollowups(ctx context.Context, l
 		}
 	}
 	return errors.Join(failures...)
+}
+
+const catalogGenerationSupersededCode = "catalog_generation_superseded"
+
+// supersedeObsoleteCatalogJobs drains only queue rows with complete no-I/O
+// evidence. Running/retry/paused rows and queued artifact owners that are not
+// still admitted are intentionally left for their ordinary worker recovery.
+func (s *MediaLibraryService) supersedeObsoleteCatalogJobs(ctx context.Context, limit int) error {
+	if s.queue == nil || s.catalogStore == nil || limit < 1 {
+		return nil
+	}
+	var cancelled []models.Job
+	err := s.catalogStore.writeCatalogBatch(ctx, func(tx *gorm.DB) error {
+		var jobs []models.Job
+		if err := tx.Where("job_type IN ? AND status = ? AND lease_token_hash = '' AND lease_expires_at IS NULL AND started_generation = 0 AND interrupt_status = ''", []string{JobTypeMediaLibraryRecognition, JobTypeMediaArtifact}, models.JobStatusQueued).
+			Order("created_at,id").Limit(limit).Find(&jobs).Error; err != nil {
+			return err
+		}
+		now := time.Now().UTC()
+		for _, job := range jobs {
+			proven, err := s.supersedeObsoleteCatalogProjectionTx(tx, job, now)
+			if err != nil {
+				return err
+			}
+			if !proven {
+				continue
+			}
+			updates := map[string]any{
+				"status":             models.JobStatusCancelled,
+				"revision":           job.Revision + 1,
+				"finished_at":        now,
+				"last_error_code":    catalogGenerationSupersededCode,
+				"last_error_message": "已由当前媒体库 generation 接管",
+				"cancellation_asked": false,
+				"updated_at":         now,
+			}
+			releaseLease(updates)
+			changed := tx.Model(&models.Job{}).Where("id = ? AND status = ? AND revision = ? AND lease_token_hash = '' AND lease_expires_at IS NULL AND started_generation = 0", job.ID, models.JobStatusQueued, job.Revision).Updates(updates)
+			if changed.Error != nil {
+				return changed.Error
+			}
+			if changed.RowsAffected != 1 {
+				return ErrCatalogFence
+			}
+			if err := recordJobEvent(tx, job.ID, "catalog.generation_superseded", models.JobStatusQueued, models.JobStatusCancelled, nil, catalogGenerationSupersededCode, now); err != nil {
+				return err
+			}
+			job.Status, job.LastErrorCode, job.LastErrorMessage = models.JobStatusCancelled, catalogGenerationSupersededCode, "已由当前媒体库 generation 接管"
+			job.Revision++
+			job.FinishedAt, job.UpdatedAt = &now, now
+			cancelled = append(cancelled, job)
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	for _, job := range cancelled {
+		s.queue.publish(job, "job.status_changed")
+	}
+	return nil
+}
+
+func (s *MediaLibraryService) supersedeObsoleteCatalogProjectionTx(tx *gorm.DB, job models.Job, now time.Time) (bool, error) {
+	switch job.JobType {
+	case JobTypeMediaLibraryRecognition:
+		var payload mediaLibraryRecognitionJobPayload
+		if json.Unmarshal([]byte(job.PayloadJSON), &payload) != nil || payload.LibraryID == 0 || payload.ScanRunID == 0 || payload.Generation == 0 {
+			return false, nil
+		}
+		var library models.MediaLibrary
+		if err := tx.Select("id", "baseline_generation").First(&library, payload.LibraryID).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return false, nil
+			}
+			return false, err
+		}
+		if payload.Generation >= library.BaselineGeneration {
+			return false, nil
+		}
+		var run models.MediaLibraryScanRun
+		if err := tx.First(&run, "id = ? AND library_id = ? AND generation = ?", payload.ScanRunID, payload.LibraryID, payload.Generation).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return false, nil
+			}
+			return false, err
+		}
+		if run.Status != "catalog_ready" {
+			return false, nil
+		}
+		changed := tx.Model(&models.MediaLibraryScanRun{}).Where("id = ? AND status = ? AND generation = ?", run.ID, "catalog_ready", run.Generation).
+			Updates(map[string]any{"status": "superseded", "phase": "superseded", "error_code": catalogGenerationSupersededCode, "finished_at": now})
+		return changed.RowsAffected == 1, changed.Error
+	case JobTypeMediaArtifact:
+		var payload mediaArtifactJobPayload
+		if json.Unmarshal([]byte(job.PayloadJSON), &payload) != nil || payload.ArtifactRunID == "" {
+			return false, nil
+		}
+		var run models.MediaArtifactRun
+		if err := tx.First(&run, "id = ?", payload.ArtifactRunID).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return false, nil
+			}
+			return false, err
+		}
+		if run.JobID == nil || *run.JobID != job.ID || run.Status != models.MediaArtifactStatusQueued {
+			return false, nil
+		}
+		var library models.MediaLibrary
+		if err := tx.Select("id", "artifact_generation").First(&library, run.LibraryID).Error; err != nil {
+			return false, err
+		}
+		if library.ArtifactGeneration == 0 || run.Generation >= library.ArtifactGeneration {
+			return false, nil
+		}
+		var owner models.CatalogPhysicalWrite
+		if err := tx.Where("owner_kind = ? AND owner_id = ? AND library_id = ? AND job_id = ?", CatalogPhysicalArtifact, run.ID, run.LibraryID, job.ID).First(&owner).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return false, nil
+			}
+			return false, err
+		}
+		if owner.State != "admitted" {
+			return false, nil
+		}
+		var policy mediaArtifactPolicy
+		if err := json.Unmarshal([]byte(run.PolicyJSON), &policy); err != nil || policy.LibraryID != run.LibraryID || policy.Generation != run.Generation {
+			return false, nil
+		}
+		changed := tx.Model(&models.MediaArtifactRun{}).Where("id = ? AND job_id = ? AND status = ? AND generation = ?", run.ID, job.ID, models.MediaArtifactStatusQueued, run.Generation).
+			Updates(map[string]any{"status": models.MediaArtifactStatusSuperseded, "cleanup_status": models.MediaArtifactCleanupSkipped, "cleanup_at": now, "finished_at": now, "error_code": catalogGenerationSupersededCode, "updated_at": now})
+		if changed.Error != nil || changed.RowsAffected != 1 {
+			return false, changed.Error
+		}
+		if policy.CatalogBindingID != "" {
+			var binding models.CatalogArtifactBinding
+			if err := tx.First(&binding, "id = ? AND library_id = ? AND generation = ?", policy.CatalogBindingID, run.LibraryID, run.Generation).Error; err != nil {
+				return false, err
+			}
+			if binding.State != "completed" && binding.State != "superseded" {
+				snapshot, err := artifactCatalogSnapshot(binding)
+				if err != nil {
+					return false, err
+				}
+				if err := ReleaseCatalogBindingTx(tx, snapshot, "artifact", binding.ID); err != nil {
+					return false, err
+				}
+				if err := tx.Model(&binding).Updates(map[string]any{"state": "superseded", "updated_at": now}).Error; err != nil {
+					return false, err
+				}
+			}
+		}
+		if err := settleAdmittedCatalogPhysicalWriteTx(tx, owner); err != nil {
+			return false, err
+		}
+		return true, nil
+	default:
+		return false, nil
+	}
 }
 
 func (s *MediaLibraryService) recoverCatalogScanFollowup(ctx context.Context, row models.CatalogScanFollowup) error {

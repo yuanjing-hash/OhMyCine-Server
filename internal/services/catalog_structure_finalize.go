@@ -139,9 +139,6 @@ func (s *MediaLibraryStructureService) finalizeCatalogStructureRepair(ctx contex
 				s.log.Warn().Uint("library_id", repair.LibraryID).Str("error_code", "structure_artifact_schedule_pending").Msg("目录修复已完成，媒体产物任务等待恢复调度")
 			}
 		}
-		if s.reconcile != nil {
-			s.reconcile(repair.LibraryID)
-		}
 		return nil
 	}
 }

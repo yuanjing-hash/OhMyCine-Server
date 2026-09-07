@@ -63,6 +63,14 @@ type MediaLibraryStructureBackend interface {
 	Apply(context.Context, StructureBoundary, []StructurePlanItem, StructureProgress) error
 }
 
+// mediaLibraryStructureBatchBackend marks a backend whose multi-item Apply
+// and Recycle methods preserve per-item idempotency and reconcile ambiguous
+// provider acknowledgements. Other backends retain the isolated one-item path.
+type mediaLibraryStructureBatchBackend interface {
+	MediaLibraryStructureBackend
+	SupportsStructureRepairBatch() bool
+}
+
 type MediaLibraryStructureBackendRegistry struct {
 	mu       sync.RWMutex
 	backends map[string]MediaLibraryStructureBackend
@@ -111,6 +119,15 @@ type MediaLibraryStructureService struct {
 	backends     *MediaLibraryStructureBackendRegistry
 	reconcile    func(uint)
 	confirmKey   []byte
+}
+
+func (s *MediaLibraryStructureService) finishStructurePhysicalWrite(permit CatalogPhysicalWritePermit) {
+	quiesceCatalogPhysicalWrite(s.db, permit, s.log)
+	// One coalesced wake covers success, partial failure, retry-at and recovery
+	// exits. RequestReconcile is buffered by the per-library supervisor.
+	if s.reconcile != nil {
+		s.reconcile(permit.evidence.LibraryID)
+	}
 }
 
 type MediaLibraryStructureDiagnostics struct {
@@ -1152,7 +1169,7 @@ func (s *MediaLibraryStructureService) EnsureWorkLayout(ctx context.Context, own
 	if err != nil {
 		return err
 	}
-	defer quiesceCatalogPhysicalWrite(s.db, permit, s.log)
+	defer s.finishStructurePhysicalWrite(permit)
 	if err := backend.Apply(ctx, StructureBoundary{Library: library, Storage: storage}, plan.Items, nil); err != nil {
 		code := CodeMediaLibraryStructureApplyFailed
 		if errors.Is(err, errStructureConflict) {
@@ -1815,9 +1832,10 @@ func (s *MediaLibraryStructureService) runRepair(ctx context.Context, runtime Jo
 			return s.failRepair(repair, CodeMediaLibraryStructureBoundaryChanged, "媒体库来源已变化，请重新预览")
 		}
 		selectedIssueTokens := append(append([]string(nil), plan.ResolvedIssues...), plan.SkippedIssues...)
-		if len(selectedIssueTokens) > 0 {
+		for start := 0; start < len(selectedIssueTokens); start += CatalogBatchRows {
+			part := selectedIssueTokens[start:min(start+CatalogBatchRows, len(selectedIssueTokens))]
 			var current int64
-			if err := s.db.Model(&models.MediaLibraryStructureIssue{}).Where("library_id = ? AND diagnosis_job_id = ? AND generation = ? AND token IN ?", repair.LibraryID, plan.DiagnosisJobID, diagnosisGeneration, selectedIssueTokens).Count(&current).Error; err != nil || current != int64(len(selectedIssueTokens)) {
+			if err := s.db.Model(&models.MediaLibraryStructureIssue{}).Where("library_id = ? AND diagnosis_job_id = ? AND generation = ? AND token IN ?", repair.LibraryID, plan.DiagnosisJobID, diagnosisGeneration, part).Count(&current).Error; err != nil || current != int64(len(part)) {
 				return s.failRepair(repair, CodeMediaLibraryStructureBoundaryChanged, "目录问题选择已变化，请重新预览")
 			}
 		}
@@ -1854,7 +1872,7 @@ func (s *MediaLibraryStructureService) runRepair(ctx context.Context, runtime Jo
 	if err != nil {
 		return s.failRepair(repair, CodeMediaLibraryStructureBoundaryChanged, "媒体库文件操作暂不可执行，请恢复原任务后重试")
 	}
-	defer quiesceCatalogPhysicalWrite(s.db, permit, s.log)
+	defer s.finishStructurePhysicalWrite(permit)
 	_ = progressAt // item checkpoints own progress updates now
 	execution := s.executeStructureRepairItems(ctx, runtime, repair, plan, boundary, backend, claim)
 	if execution.GlobalErr != nil {
@@ -1922,9 +1940,6 @@ func (s *MediaLibraryStructureService) runRepair(ctx context.Context, runtime Jo
 	})
 	if err != nil {
 		return s.failRepair(repair, CodeMediaLibraryStructureApplyFailed, "媒体库修复结果保存失败")
-	}
-	if s.reconcile != nil {
-		s.reconcile(repair.LibraryID)
 	}
 	if execution.Failed+execution.Blocked > 0 {
 		return WorkerResult{ErrorCode: CodeMediaLibraryStructureApplyFailed, ErrorMessage: "目录整理已部分完成；失败项已隔离，可单独重试"}
@@ -2244,6 +2259,8 @@ type pan115MediaLibraryStructureBackend struct {
 
 func (pan115MediaLibraryStructureBackend) StorageType() string { return models.StorageTypePan115 }
 
+func (pan115MediaLibraryStructureBackend) SupportsStructureRepairBatch() bool { return true }
+
 func (b pan115MediaLibraryStructureBackend) ValidateRecycle(_ context.Context, boundary StructureBoundary) error {
 	if boundary.Storage.ConnectionID == nil || b.driver == nil {
 		return errors.New("provider connection is unavailable")
@@ -2278,42 +2295,203 @@ func (b pan115MediaLibraryStructureBackend) Recycle(ctx context.Context, boundar
 	if rootID == "" {
 		rootID = boundary.Storage.RootPath
 	}
-	for index, item := range items {
+	ctx = cloudpkg.WithReadClass(ctx, cloudpkg.ReadClassPipeline)
+	batchMutations, hasBatch := driver.(cloudpkg.BatchMutationDriver)
+	type preparedRecycle struct {
+		item     StructureRecycleItem
+		parentID string
+	}
+	pending := make([]preparedRecycle, 0, len(items))
+	directoryIndex := newProviderStructureDirectoryIndex(ctx, driver, rootID)
+	completed := 0
+	for _, item := range items {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		if strings.TrimSpace(item.ProviderID) == "" {
 			return errors.New("provider recycle identity is missing")
 		}
-		stat, err := driver.Stat(cloudpkg.WithReadClass(ctx, cloudpkg.ReadClassBackground), item.ProviderID)
-		if err != nil {
-			if code, _ := cloudpkg.ErrorInfo(err); code == cloudpkg.CodeNotFound {
-				if progress != nil {
-					if err := progress(index+1, len(items)); err != nil {
-						return err
-					}
-				}
+		parentRelative := pathpkg.Dir(safeStructurePath(item.SourceRelative))
+		parentID, parentErr := directoryIndex.directoryID(parentRelative)
+		var current cloudpkg.Item
+		var exists bool
+		if parentErr == nil {
+			listing, listErr := directoryIndex.directory(parentID, false)
+			if listErr != nil {
+				return listErr
+			}
+			current, exists = listing.byID[item.ProviderID]
+		}
+		if !exists {
+			// Missing from the frozen source directory is expected only when a
+			// previous attempt committed before its checkpoint. A rare Stat then
+			// distinguishes a completed recycle from an item moved elsewhere;
+			// the healthy path remains one List per source directory.
+			_, statErr := driver.Stat(ctx, item.ProviderID)
+			if providerStructureItemMissing(statErr) {
+				completed++
 				continue
 			}
-			return err
-		}
-		within, err := providerParentWithinRoot(ctx, driver, stat.ParentID, rootID)
-		if err != nil || !within || stat.IsDir || stat.Name != pathpkg.Base(item.SourceRelative) || (item.Size > 0 && stat.Size != item.Size) {
+			if statErr != nil {
+				return statErr
+			}
 			return errors.New("provider recycle source identity changed")
+		}
+		if parentErr != nil || current.IsDir || current.ParentID != parentID || current.Name != pathpkg.Base(item.SourceRelative) || (item.Size > 0 && current.Size != item.Size) {
+			return errors.New("provider recycle source identity changed")
+		}
+		pending = append(pending, preparedRecycle{item: item, parentID: parentID})
+	}
+	for start := 0; start < len(pending); start += cloudpkg.MaxBatchMutationItems {
+		end := min(start+cloudpkg.MaxBatchMutationItems, len(pending))
+		chunk := pending[start:end]
+		ids := make([]string, 0, len(chunk))
+		for _, current := range chunk {
+			ids = append(ids, current.item.ProviderID)
 		}
 		if err := validateStructureMutation(boundary); err != nil {
 			return err
 		}
-		if err := mutations.Recycle(ctx, item.ProviderID); err != nil {
-			return err
+		var callErr error
+		if hasBatch {
+			callErr = executeCloudBatchMutation(ctx, func() error { return batchMutations.RecycleMany(ctx, ids) })
+		} else {
+			for _, itemID := range ids {
+				if callErr = mutations.Recycle(ctx, itemID); callErr != nil {
+					break
+				}
+			}
 		}
+		byParent := make(map[string][]string)
+		for _, current := range chunk {
+			byParent[current.parentID] = append(byParent[current.parentID], current.item.ProviderID)
+		}
+		allAbsent := true
+		for parentID, expectedIDs := range byParent {
+			listing, listErr := directoryIndex.directory(parentID, true)
+			if listErr != nil {
+				if callErr != nil {
+					return callErr
+				}
+				return listErr
+			}
+			for _, itemID := range expectedIDs {
+				if _, exists := listing.byID[itemID]; exists {
+					allAbsent = false
+				}
+			}
+		}
+		if !allAbsent {
+			if callErr != nil {
+				return callErr
+			}
+			return cloudpkg.Error(cloudpkg.CodeMutationUnknown, true, errors.New("provider recycle batch result is incomplete"))
+		}
+		// A provider error after every identity is observed absent is an
+		// ambiguous acknowledgement, not a failed recycle.
+		completed += len(chunk)
 		if progress != nil {
-			if err := progress(index+1, len(items)); err != nil {
+			if err := progress(completed, len(items)); err != nil {
 				return err
 			}
 		}
 	}
+	if progress != nil && completed == len(items) && len(pending) == 0 {
+		return progress(completed, len(items))
+	}
 	return nil
+}
+
+func providerStructureItemMissing(err error) bool {
+	if errors.Is(err, fs.ErrNotExist) {
+		return true
+	}
+	code, _ := cloudpkg.ErrorInfo(err)
+	return code == cloudpkg.CodeNotFound
+}
+
+type providerStructureDirectoryListing struct {
+	byID   map[string]cloudpkg.Item
+	byName map[string][]cloudpkg.Item
+}
+
+type providerStructureDirectoryIndex struct {
+	ctx         context.Context
+	driver      cloudpkg.Driver
+	rootID      string
+	pathIDs     map[string]string
+	directories map[string]providerStructureDirectoryListing
+}
+
+func newProviderStructureDirectoryIndex(ctx context.Context, driver cloudpkg.Driver, rootID string) *providerStructureDirectoryIndex {
+	return &providerStructureDirectoryIndex{
+		ctx:         cloudpkg.WithReadClass(ctx, cloudpkg.ReadClassPipeline),
+		driver:      driver,
+		rootID:      rootID,
+		pathIDs:     map[string]string{"": rootID, ".": rootID},
+		directories: make(map[string]providerStructureDirectoryListing),
+	}
+}
+
+func (i *providerStructureDirectoryIndex) directory(parentID string, refresh bool) (providerStructureDirectoryListing, error) {
+	if !refresh {
+		if cached, ok := i.directories[parentID]; ok {
+			return cached, nil
+		}
+	}
+	listing := providerStructureDirectoryListing{byID: make(map[string]cloudpkg.Item), byName: make(map[string][]cloudpkg.Item)}
+	for offset := int64(0); ; {
+		page, err := i.driver.List(i.ctx, parentID, cloudpkg.PageRequest{Offset: offset, Limit: 200})
+		if err != nil {
+			return providerStructureDirectoryListing{}, err
+		}
+		if len(page.Items) == 0 && page.HasMore {
+			return providerStructureDirectoryListing{}, cloudpkg.Error(cloudpkg.CodeResponseInvalid, true, errors.New("provider directory page made no progress"))
+		}
+		for _, child := range page.Items {
+			if child.ID == "" || child.ParentID != parentID {
+				return providerStructureDirectoryListing{}, cloudpkg.Error(cloudpkg.CodeResponseInvalid, true, errors.New("provider directory listing identity is invalid"))
+			}
+			if _, duplicate := listing.byID[child.ID]; duplicate {
+				return providerStructureDirectoryListing{}, cloudpkg.Error(cloudpkg.CodeResponseInvalid, true, errors.New("provider directory listing contains duplicate identity"))
+			}
+			listing.byID[child.ID] = child
+			key := strings.ToLower(child.Name)
+			listing.byName[key] = append(listing.byName[key], child)
+		}
+		if !page.HasMore {
+			break
+		}
+		offset += int64(len(page.Items))
+	}
+	i.directories[parentID] = listing
+	return listing, nil
+}
+
+func (i *providerStructureDirectoryIndex) directoryID(relative string) (string, error) {
+	relative = pathpkg.Clean(strings.TrimPrefix(strings.ReplaceAll(strings.TrimSpace(relative), "\\", "/"), "/"))
+	if relative == "" || relative == "." {
+		return i.rootID, nil
+	}
+	parent, walked := i.rootID, "."
+	for _, segment := range strings.Split(relative, "/") {
+		walked = pathpkg.Join(walked, segment)
+		if cached := i.pathIDs[walked]; cached != "" {
+			parent = cached
+			continue
+		}
+		listing, err := i.directory(parent, false)
+		if err != nil {
+			return "", err
+		}
+		matches := listing.byName[strings.ToLower(segment)]
+		if len(matches) != 1 || !matches[0].IsDir || matches[0].Name != segment {
+			return "", errors.New("provider source directory identity changed")
+		}
+		parent = matches[0].ID
+		i.pathIDs[walked] = parent
+	}
+	return parent, nil
 }
 
 func (b pan115MediaLibraryStructureBackend) Apply(ctx context.Context, boundary StructureBoundary, items []StructurePlanItem, progress StructureProgress) error {
@@ -2332,37 +2510,88 @@ func (b pan115MediaLibraryStructureBackend) Apply(ctx context.Context, boundary 
 	if rootID == "" {
 		rootID = boundary.Storage.RootPath
 	}
+	ctx = cloudpkg.WithReadClass(ctx, cloudpkg.ReadClassPipeline)
 	directoryCache := map[string]string{"": rootID, ".": rootID}
+	index := newProviderStructureDirectoryIndex(ctx, driver, rootID)
 	oldParents := map[string]struct{}{}
-	for index, item := range items {
+	type preparedMove struct {
+		item         StructurePlanItem
+		stat         cloudpkg.Item
+		targetParent string
+		targetName   string
+	}
+	prepared := make([]preparedMove, 0, len(items))
+	targetChildren := make(map[string]providerStructureDirectoryListing)
+	plannedTargets := make(map[string]string)
+	for _, item := range items {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		if item.ProviderID == "" {
 			return errors.New("provider item identity is missing")
 		}
-		stat, err := driver.Stat(cloudpkg.WithReadClass(ctx, cloudpkg.ReadClassBackground), item.ProviderID)
-		if err != nil || stat.IsDir || (item.Size > 0 && stat.Size != item.Size) {
-			return errors.New("provider item identity changed")
-		}
-		within, err := providerParentWithinRoot(ctx, driver, stat.ParentID, rootID)
-		if err != nil || !within {
-			// Only a signed, internally generated historical repair plan may move
-			// a managed item out of the 115 provider root. Keep the exception
-			// exact: it never authorizes another external directory as a source.
-			if !item.AllowProviderRootSource || stat.ParentID != "0" || rootID == "0" || stat.Name != pathpkg.Base(item.TargetRelative) {
-				return errors.New("provider item escaped library root")
-			}
-		}
 		targetDirectory := pathpkg.Dir(item.TargetRelative)
 		if targetDirectory == "." {
 			targetDirectory = ""
 		}
 		targetParent := boundary.preparedParents[targetDirectory]
-		if targetParent == "" {
-			if boundary.preparedParents != nil {
-				return ErrCatalogFence
+		if targetParent == "" && boundary.preparedParents != nil {
+			return ErrCatalogFence
+		}
+		targetName := pathpkg.Base(item.TargetRelative)
+		var stat cloudpkg.Item
+		sourceDirectory := pathpkg.Dir(safeStructurePath(item.SourceRelative))
+		sourceParent, sourceDirErr := index.directoryID(sourceDirectory)
+		if sourceDirErr == nil {
+			sourceListing, listErr := index.directory(sourceParent, false)
+			if listErr != nil {
+				return listErr
 			}
+			stat = sourceListing.byID[item.ProviderID]
+			if stat.ID != "" && (stat.ParentID != sourceParent || stat.Name != pathpkg.Base(item.SourceRelative)) {
+				return errors.New("provider item identity changed")
+			}
+		}
+		if stat.ID == "" {
+			// A prior attempt may already have reached the exact target before
+			// losing its checkpoint. Prove that from the target directory listing
+			// instead of issuing a rate-limited Stat for every normal item.
+			recoveryTargetParent := targetParent
+			if recoveryTargetParent == "" {
+				recoveryTargetParent, _ = index.directoryID(targetDirectory)
+			}
+			var candidate cloudpkg.Item
+			if recoveryTargetParent != "" {
+				targetListing, listErr := index.directory(recoveryTargetParent, false)
+				if listErr != nil {
+					return listErr
+				}
+				candidate = targetListing.byID[item.ProviderID]
+			}
+			// Move+rename is deliberately sequential. A lost acknowledgement may
+			// leave the exact item in the target parent under its frozen source
+			// name; that state is safe to resume with only the remaining rename.
+			candidateNameValid := candidate.Name == targetName || candidate.Name == pathpkg.Base(item.SourceRelative)
+			if candidate.ID == item.ProviderID && !candidate.IsDir && candidateNameValid && (item.Size <= 0 || candidate.Size == item.Size) {
+				stat = candidate
+			} else if item.AllowProviderRootSource {
+				// The historical cid=0 repair is the sole source that cannot be
+				// proven by walking from the library root. Keep its exceptional Stat.
+				candidate, statErr := driver.Stat(ctx, item.ProviderID)
+				if statErr != nil || candidate.IsDir || candidate.ParentID != "0" || rootID == "0" || candidate.Name != targetName || (item.Size > 0 && candidate.Size != item.Size) {
+					return errors.New("provider item escaped library root")
+				}
+				stat = candidate
+			} else {
+				return errors.New("provider item identity changed")
+			}
+		}
+		if stat.IsDir || stat.ID != item.ProviderID || (item.Size > 0 && stat.Size != item.Size) {
+			return errors.New("provider item identity changed")
+		}
+		// Creating a missing destination is a physical mutation too. Do it only
+		// after the frozen source identity has been proven from inside the root.
+		if targetParent == "" {
 			if err := validateStructureMutation(boundary); err != nil {
 				return err
 			}
@@ -2370,8 +2599,9 @@ func (b pan115MediaLibraryStructureBackend) Apply(ctx context.Context, boundary 
 			if err != nil {
 				return err
 			}
+			index.pathIDs[targetDirectory] = targetParent
 		}
-		targetName := pathpkg.Base(item.TargetRelative)
+		within := stat.ParentID != "0"
 		// A provider move may have committed immediately before the worker lost
 		// its lease or the database checkpoint failed. Accept only the exact
 		// planned destination on retry; any other in-library location remains a
@@ -2379,38 +2609,127 @@ func (b pan115MediaLibraryStructureBackend) Apply(ctx context.Context, boundary 
 		if item.AllowProviderRootSource && within && (stat.ParentID != targetParent || stat.Name != targetName) {
 			return errors.New("historical provider-root repair source changed")
 		}
-		conflictID, err := providerChildID(ctx, driver, targetParent, targetName)
-		if err != nil {
-			return err
-		}
-		if conflictID != "" && conflictID != item.ProviderID {
-			return errStructureConflict
-		}
-		if stat.ParentID != targetParent || stat.Name != targetName {
-			if stat.ParentID != "" {
-				oldParents[stat.ParentID] = struct{}{}
-			}
-			if stat.ParentID != targetParent {
-				if err := validateStructureMutation(boundary); err != nil {
-					return err
-				}
-				if err := mutations.Move(ctx, item.ProviderID, targetParent); err != nil {
-					return err
-				}
-			}
-			if stat.Name != targetName {
-				if err := validateStructureMutation(boundary); err != nil {
-					return err
-				}
-				if err := mutations.Rename(ctx, item.ProviderID, targetName); err != nil {
-					return err
-				}
-			}
-		}
-		if progress != nil {
-			if err := progress(index+1, len(items)); err != nil {
+		children, childrenLoaded := targetChildren[targetParent]
+		if !childrenLoaded {
+			children, err = index.directory(targetParent, false)
+			if err != nil {
 				return err
 			}
+			targetChildren[targetParent] = children
+		}
+		conflicts := children.byName[strings.ToLower(targetName)]
+		if len(conflicts) > 1 || (len(conflicts) == 1 && conflicts[0].ID != item.ProviderID) {
+			return errStructureConflict
+		}
+		targetKey := targetParent + "\x00" + strings.ToLower(targetName)
+		if prior := plannedTargets[targetKey]; prior != "" && prior != item.ProviderID {
+			return errStructureConflict
+		}
+		plannedTargets[targetKey] = item.ProviderID
+		if stat.ParentID != targetParent && stat.ParentID != "" {
+			oldParents[stat.ParentID] = struct{}{}
+		}
+		prepared = append(prepared, preparedMove{item: item, stat: stat, targetParent: targetParent, targetName: targetName})
+	}
+	batchMutations, hasBatch := driver.(cloudpkg.BatchMutationDriver)
+	batchGroups := make(map[string][]preparedMove)
+	sequential := make([]preparedMove, 0)
+	completed := 0
+	for _, move := range prepared {
+		if move.stat.ParentID == move.targetParent && move.stat.Name == move.targetName {
+			completed++
+			continue
+		}
+		if hasBatch && move.stat.ParentID != move.targetParent && move.stat.Name == move.targetName {
+			batchGroups[move.targetParent] = append(batchGroups[move.targetParent], move)
+		} else {
+			sequential = append(sequential, move)
+		}
+	}
+	parents := make([]string, 0, len(batchGroups))
+	for parentID := range batchGroups {
+		parents = append(parents, parentID)
+	}
+	sort.Strings(parents)
+	for _, parentID := range parents {
+		group := batchGroups[parentID]
+		for start := 0; start < len(group); start += cloudpkg.MaxBatchMutationItems {
+			end := min(start+cloudpkg.MaxBatchMutationItems, len(group))
+			chunk := group[start:end]
+			ids := make([]string, 0, len(chunk))
+			for _, move := range chunk {
+				ids = append(ids, move.item.ProviderID)
+			}
+			if err := validateStructureMutation(boundary); err != nil {
+				return err
+			}
+			callErr := executeCloudBatchMutation(ctx, func() error { return batchMutations.MoveMany(ctx, ids, parentID) })
+			listing, listErr := index.directory(parentID, true)
+			if listErr != nil {
+				if callErr != nil {
+					return callErr
+				}
+				return listErr
+			}
+			allExact := true
+			for _, move := range chunk {
+				stat, exists := listing.byID[move.item.ProviderID]
+				if !exists {
+					allExact = false
+					continue
+				}
+				if stat.IsDir || stat.ParentID != move.targetParent || stat.Name != move.targetName || (move.item.Size > 0 && stat.Size != move.item.Size) {
+					allExact = false
+				}
+			}
+			if !allExact {
+				if callErr != nil {
+					return callErr
+				}
+				return cloudpkg.Error(cloudpkg.CodeMutationUnknown, true, errors.New("provider move batch result is incomplete"))
+			}
+			// Ignore an error only after every item is observed at its exact
+			// destination; this is the provider lost-ack recovery path.
+			completed += len(chunk)
+			if progress != nil {
+				if err := progress(completed, len(items)); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	for _, move := range sequential {
+		if move.stat.ParentID != move.targetParent {
+			if err := validateStructureMutation(boundary); err != nil {
+				return err
+			}
+			if err := mutations.Move(ctx, move.item.ProviderID, move.targetParent); err != nil {
+				return err
+			}
+		}
+		if move.stat.Name != move.targetName {
+			if err := validateStructureMutation(boundary); err != nil {
+				return err
+			}
+			if err := mutations.Rename(ctx, move.item.ProviderID, move.targetName); err != nil {
+				return err
+			}
+		}
+		listing, listErr := index.directory(move.targetParent, true)
+		stat, exists := listing.byID[move.item.ProviderID]
+		if listErr != nil || !exists || stat.IsDir || stat.ParentID != move.targetParent || stat.Name != move.targetName || (move.item.Size > 0 && stat.Size != move.item.Size) {
+			return cloudpkg.Error(cloudpkg.CodeMutationUnknown, true, errors.New("provider move result is incomplete"))
+		}
+		completed++
+		if progress != nil {
+			if err := progress(completed, len(items)); err != nil {
+				return err
+			}
+		}
+	}
+	if progress != nil && completed == len(items) && len(sequential) == 0 && len(batchGroups) == 0 {
+		if err := progress(completed, len(items)); err != nil {
+			return err
 		}
 	}
 	protected := make(map[string]struct{}, len(directoryCache)+1)
@@ -2422,6 +2741,38 @@ func (b pan115MediaLibraryStructureBackend) Apply(ctx context.Context, boundary 
 		protected[id] = struct{}{}
 	}
 	return cleanupEmptyProviderStructureDirectories(ctx, driver, mutations, rootID, oldParents, protected, boundary.beforeMutation)
+}
+
+func providerParentWithinRootCached(ctx context.Context, driver cloudpkg.Driver, parentID, rootID string, cache map[string]bool) (bool, error) {
+	if within, ok := cache[parentID]; ok {
+		return within, nil
+	}
+	within, err := providerParentWithinRoot(ctx, driver, parentID, rootID)
+	if err == nil {
+		cache[parentID] = within
+	}
+	return within, err
+}
+
+func providerChildrenByName(ctx context.Context, driver cloudpkg.Driver, parentID string) (map[string]string, error) {
+	children := make(map[string]string)
+	for offset := int64(0); ; {
+		page, err := driver.List(cloudpkg.WithReadClass(ctx, cloudpkg.ReadClassBackground), parentID, cloudpkg.PageRequest{Offset: offset, Limit: 200})
+		if err != nil {
+			return nil, err
+		}
+		for _, child := range page.Items {
+			key := strings.ToLower(child.Name)
+			if prior := children[key]; prior != "" && prior != child.ID {
+				return nil, errStructureConflict
+			}
+			children[key] = child.ID
+		}
+		if !page.HasMore || len(page.Items) == 0 {
+			return children, nil
+		}
+		offset += int64(len(page.Items))
+	}
 }
 
 func providerChildID(ctx context.Context, driver cloudpkg.Driver, parentID, name string) (string, error) {
@@ -2479,7 +2830,7 @@ func cleanupEmptyProviderStructureDirectories(ctx context.Context, driver cloudp
 				break
 			}
 			chainSeen[current] = struct{}{}
-			stat, err := driver.Stat(cloudpkg.WithReadClass(ctx, cloudpkg.ReadClassBackground), current)
+			stat, err := driver.Stat(ctx, current)
 			if err != nil || !stat.IsDir {
 				break
 			}
@@ -2510,7 +2861,7 @@ func cleanupEmptyProviderStructureDirectories(ctx context.Context, driver cloudp
 		if _, keep := protected[id]; keep || id == rootID {
 			continue
 		}
-		page, err := driver.List(cloudpkg.WithReadClass(ctx, cloudpkg.ReadClassBackground), id, cloudpkg.PageRequest{Limit: 1})
+		page, err := driver.List(ctx, id, cloudpkg.PageRequest{Limit: 1})
 		if err != nil {
 			return err
 		}

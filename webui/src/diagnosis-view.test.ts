@@ -54,6 +54,23 @@ describe('diagnosis dialog', () => {
     expect(JSON.parse(previewCall[1].body)).toEqual(expect.objectContaining({ include_automatic_repairs: true, selections: [] }))
     expect(wrapper.get('[aria-label="文件变更预览"]').text()).toContain('poster.jpg')
   })
+  it('reports a definite start rejection as not submitted', async () => {
+    const base = mocks.api.getMockImplementation()!
+    const automatic = { ...issue, code: 'path_mismatch', state: 'pending_repair', repairable: true, title: '影片', expected_path: '电影/影片.mkv' }
+    mocks.api.mockImplementation((path, options, ...args) => {
+      if (path.endsWith('/structure')) return Promise.resolve({ ...diagnostics(), repairable_count: 1 })
+      if (path.includes('/structure/issues?')) return Promise.resolve({ list: [automatic], total: 1, page: 1, page_size: 50, review_revision: 0, pending_total: 1, handled_total: 0 })
+      if (path.endsWith('/selection-preview')) return Promise.resolve({ revision: 'rev', confirmation_token: 'frozen', move_count: 1, recycle_count: 0, issue_count: 1, skipped_count: 0, items: { list: [], total: 1, page: 1, page_size: 50 } })
+      if (path.endsWith('/selection-repair')) return Promise.reject(new APIError(400, 'INVALID_REQUEST', '确认内容无效'))
+      return base(path, options, ...args)
+    })
+    vi.spyOn(window, 'confirm').mockReturnValue(true)
+    const wrapper = await open()
+    await button(wrapper, '预览').trigger('click'); await flushPromises()
+    await button(wrapper, '开始整理').trigger('click'); await flushPromises()
+    expect(wrapper.get('[role="alert"]').text()).toContain('开始整理未提交：确认内容无效')
+    expect(wrapper.text()).not.toContain('执行结果未确认')
+  })
   it('keeps an explicit frozen preview request alive across tab visibility changes', async () => {
     const base = mocks.api.getMockImplementation()!, pending = deferred<object>()
     mocks.api.mockImplementation((path, ...args) => path.endsWith('/selection-preview') ? pending.promise : base(path, ...args))

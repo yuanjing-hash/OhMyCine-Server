@@ -50,6 +50,9 @@ const (
 	structureRepairItemSucceeded = "succeeded"
 	structureRepairItemFailed    = "failed"
 	structureRepairItemBlocked   = "blocked"
+	// One preflight window may contain several provider mutation chunks. It is
+	// an internal memory/transaction bound, never a product item-count limit.
+	structureRepairProviderWindow = cloudpkg.MaxBatchMutationItems
 )
 
 type structureRepairExecution struct {
@@ -246,6 +249,58 @@ func (s *MediaLibraryStructureService) transitionStructureRepairItem(ctx context
 	})
 }
 
+// transitionStructureRepairItemsSucceeded checkpoints one verified provider
+// batch in one writer. Individual row guards still prevent stale/concurrent
+// transitions, while aggregate counters are adjusted once for the whole batch.
+func (s *MediaLibraryStructureService) transitionStructureRepairItemsSucceeded(ctx context.Context, repair models.MediaLibraryStructureRepair, claim *ClaimedJob, rows []models.MediaLibraryStructureRepairItem) error {
+	if len(rows) == 0 {
+		return nil
+	}
+	now := time.Now().UTC()
+	return s.structureRepairCheckpointTx(ctx, repair, claim, func(tx *gorm.DB) error {
+		repairUpdates := map[string]any{"updated_at": now}
+		processedDelta := 0
+		counterDelta := map[string]int{}
+		ordinalsByStatus := make(map[string][]int)
+		for _, row := range rows {
+			ordinalsByStatus[row.Status] = append(ordinalsByStatus[row.Status], row.Ordinal)
+			oldColumn := structureRepairCounterColumn(row.Status)
+			if oldColumn != "" && oldColumn != "succeeded_items" {
+				counterDelta[oldColumn]--
+			}
+			if oldColumn != "succeeded_items" {
+				counterDelta["succeeded_items"]++
+			}
+			if oldColumn == "" {
+				processedDelta++
+			}
+		}
+		for status, ordinals := range ordinalsByStatus {
+			for start := 0; start < len(ordinals); start += CatalogBatchRows {
+				part := ordinals[start:min(start+CatalogBatchRows, len(ordinals))]
+				changed := tx.Model(&models.MediaLibraryStructureRepairItem{}).
+					Where("repair_id = ? AND ordinal IN ? AND status = ?", repair.ID, part, status).
+					Updates(map[string]any{"status": structureRepairItemSucceeded, "attempt_count": gorm.Expr("attempt_count + 1"), "error_code": "", "error_message": "", "started_at": now, "finished_at": now, "updated_at": now})
+				if changed.Error != nil {
+					return changed.Error
+				}
+				if changed.RowsAffected != int64(len(part)) {
+					return errors.New("structure repair checkpoint batch changed concurrently")
+				}
+			}
+		}
+		for column, delta := range counterDelta {
+			if delta != 0 {
+				repairUpdates[column] = gorm.Expr(column+" + ?", delta)
+			}
+		}
+		if processedDelta != 0 {
+			repairUpdates["processed_items"] = gorm.Expr("processed_items + ?", processedDelta)
+		}
+		return tx.Model(&models.MediaLibraryStructureRepair{}).Where("id = ?", repair.ID).Updates(repairUpdates).Error
+	})
+}
+
 func (s *MediaLibraryStructureService) executeStructureRepairItems(ctx context.Context, runtime JobRuntime, repair models.MediaLibraryStructureRepair, plan StructurePlan, boundary StructureBoundary, backend MediaLibraryStructureBackend, claim *ClaimedJob) structureRepairExecution {
 	result := structureRepairExecution{Plan: plan}
 	result.Plan.Items = nil
@@ -302,6 +357,74 @@ func (s *MediaLibraryStructureService) executeStructureRepairItems(ctx context.C
 	}
 	for {
 		progressed := false
+		batchProgressed := false
+		// Only explicitly batch-capable backends receive more than one item.
+		// Dependencies are resolved before grouping; a failed/ambiguous batch
+		// falls back to the existing isolated path so one conflict cannot hide
+		// the outcome of unrelated operations.
+		if batch, ok := backend.(mediaLibraryStructureBatchBackend); ok && batch.SupportsStructureRepairBatch() {
+			for _, action := range []string{"recycle", "move"} {
+				readyRows := make([]models.MediaLibraryStructureRepairItem, 0)
+				for _, row := range rows {
+					if attempted[row.Ordinal] || row.Action != action || (row.DependencyOrdinal != nil && states[*row.DependencyOrdinal] != structureRepairItemSucceeded) {
+						continue
+					}
+					readyRows = append(readyRows, row)
+					if len(readyRows) >= structureRepairProviderWindow {
+						break
+					}
+				}
+				if len(readyRows) < 2 {
+					continue
+				}
+				var batchErr error
+				if action == "recycle" {
+					items := make([]StructureRecycleItem, 0, len(readyRows))
+					for _, row := range readyRows {
+						items = append(items, plan.RecycleItems[row.Ordinal])
+					}
+					batchErr = backend.Recycle(ctx, boundary, items, nil)
+				} else {
+					items := make([]StructurePlanItem, 0, len(readyRows))
+					for _, row := range readyRows {
+						items = append(items, plan.Items[row.Ordinal-len(plan.RecycleItems)])
+					}
+					batchErr = backend.Apply(ctx, boundary, items, nil)
+				}
+				if batchErr != nil {
+					if code, _, global, retryAt := structureRepairFailure(ctx, batchErr); global {
+						result.GlobalErr, result.GlobalCode, result.RetryAt = batchErr, code, retryAt
+						return result
+					}
+					continue
+				}
+				if err := validateStructureMutation(boundary); err != nil {
+					result.GlobalErr, result.GlobalCode = err, CodeMediaLibraryStructureBoundaryChanged
+					return result
+				}
+				if err := s.transitionStructureRepairItemsSucceeded(ctx, repair, claim, readyRows); err != nil {
+					result.GlobalErr, result.GlobalCode = err, CodeMediaLibraryStructureApplyFailed
+					return result
+				}
+				for _, row := range readyRows {
+					states[row.Ordinal] = structureRepairItemSucceeded
+					attempted[row.Ordinal] = true
+					if structureRepairCounterColumn(row.Status) == "" {
+						processed++
+					}
+				}
+				transitions += len(readyRows)
+				progressed = true
+				batchProgressed = true
+				if err := heartbeat(false); err != nil {
+					result.GlobalErr, result.GlobalCode = err, CodeMediaLibraryStructureBoundaryChanged
+					return result
+				}
+			}
+		}
+		if batchProgressed {
+			continue
+		}
 		for _, row := range rows {
 			if attempted[row.Ordinal] {
 				continue

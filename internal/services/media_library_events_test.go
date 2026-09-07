@@ -44,6 +44,36 @@ func TestProviderListenerRequeuesScopeAfterReconcileFailure(t *testing.T) {
 	}
 }
 
+func TestProviderEventReconcileDefersBeforeScanAllocationWhilePhysicalWriteEntered(t *testing.T) {
+	service, db, actor, storage, profile := mediaLibraryTestService(t)
+	library, err := service.Create(context.Background(), actor, testLibraryInput("event barrier", storage, profile, false), RequestContext{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&models.Storage{}).Where("id = ?", storage.ID).Update("type", models.StorageTypePan115).Error; err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	proof := models.CatalogPhysicalWrite{LibraryID: library.ID, OwnerKind: CatalogPhysicalRepair, OwnerID: "bulk-repair", Revision: 1, State: "entered", OwnerDigest: "test", EnteredAt: now, UpdatedAt: now}
+	if err := db.Create(&proof).Error; err != nil {
+		t.Fatal(err)
+	}
+	scope := providerChangeScope{EventCount: 4, DeliveryMaxID: 9, FullFallback: true, FallbackCode: "move_scope_unknown"}
+	if _, err := service.reconcile(withProviderChangeScope(context.Background(), scope), library.ID, "event"); !errors.Is(err, errMediaLibraryEventReconcileDeferred) {
+		t.Fatalf("entered physical write did not defer event scan: %v", err)
+	}
+	var runs int64
+	if err := db.Model(&models.MediaLibraryScanRun{}).Where("library_id = ?", library.ID).Count(&runs).Error; err != nil || runs != 0 {
+		t.Fatalf("deferred event allocated scan runs=%d err=%v", runs, err)
+	}
+	for _, jobType := range []string{JobTypeMediaLibraryRecognition, JobTypeMediaArtifact} {
+		var jobs int64
+		if err := db.Model(&models.Job{}).Where("job_type = ?", jobType).Count(&jobs).Error; err != nil || jobs != 0 {
+			t.Fatalf("deferred event allocated %s jobs=%d err=%v", jobType, jobs, err)
+		}
+	}
+}
+
 func TestProviderInboxAcknowledgesAfterDurableLibraryFanout(t *testing.T) {
 	service, db, actor, storage, profile := mediaLibraryTestService(t)
 	library, err := service.Create(context.Background(), actor, testLibraryInput("durable delivery", storage, profile, false), RequestContext{})

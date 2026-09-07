@@ -2,6 +2,7 @@ package services
 
 import (
 	"context"
+	"fmt"
 	"reflect"
 	"testing"
 
@@ -36,8 +37,14 @@ func TestStructureSelectionStatusPreservesOnlyCurrentDraftChoices(t *testing.T) 
 	if _, err := s.SelectionStatus(context.Background(), actor, library.ID+1, []string{two}); err == nil {
 		t.Fatal("missing library accepted")
 	}
-	if _, err := s.SelectionStatus(context.Background(), actor, library.ID, make([]string, maxStructureSelections+1)); err == nil {
-		t.Fatal("unbounded draft accepted")
+	large := make([]string, 5001)
+	large[0] = two
+	for index := 1; index < len(large); index++ {
+		large[index] = fmt.Sprintf("missing-%d", index)
+	}
+	largeStatus, err := s.SelectionStatus(context.Background(), actor, library.ID, large)
+	if err != nil || len(largeStatus.InvalidIssueTokens) != len(large)-1 {
+		t.Fatalf("large paged draft status invalid=%d err=%v", len(largeStatus.InvalidIssueTokens), err)
 	}
 	if _, err := s.SelectionStatus(context.Background(), actor, library.ID, []string{" "}); err == nil {
 		t.Fatal("invalid token accepted")

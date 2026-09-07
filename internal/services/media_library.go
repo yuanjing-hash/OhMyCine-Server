@@ -1931,6 +1931,21 @@ func (s *MediaLibraryService) reconcile(ctx context.Context, id uint, kind strin
 	if err := s.db.First(&storage, library.StorageID).Error; err != nil {
 		return models.MediaLibraryScanRun{}, err
 	}
+	// Provider life events remain in their durable delivery rows and in the
+	// listener accumulator while a catalog-owned external mutation is in
+	// flight. Defer before allocating a scan run/generation or enumerating the
+	// provider; otherwise a bulk repair feeds its own move events back into a
+	// stream of full scans and generation-bound follow-up jobs. Periodic 115
+	// reconciliation is held by the same boundary so it cannot race the repair.
+	if storage.Type == models.StorageTypePan115 && (kind == "event" || kind == "incremental" || kind == "catch_up") {
+		entered, err := catalogPhysicalWriteEntered(ctx, s.db, id)
+		if err != nil {
+			return models.MediaLibraryScanRun{}, err
+		}
+		if entered {
+			return models.MediaLibraryScanRun{}, errMediaLibraryEventReconcileDeferred
+		}
+	}
 	if err := s.db.First(&profile, library.ProfileID).Error; err != nil {
 		return models.MediaLibraryScanRun{}, err
 	}

@@ -12,6 +12,8 @@ import (
 
 const maxStructurePreviewBytes = 32 * 1024 * 1024
 
+const structurePreviewRowsMarker = "sql:v1"
+
 type MediaLibraryStructurePreviewItem struct {
 	Action       string `json:"action"`
 	Kind         string `json:"kind"`
@@ -69,6 +71,14 @@ func structurePreviewPage(items []MediaLibraryStructurePreviewItem, page, pageSi
 	return MediaLibraryStructurePreviewPage{List: items[start:end], Total: len(items), Page: page, PageSize: pageSize}
 }
 
+func structureDraftPreviewRows(draftID string, items []MediaLibraryStructurePreviewItem, createdAt time.Time) []models.MediaLibraryStructureRepairDraftPreviewItem {
+	rows := make([]models.MediaLibraryStructureRepairDraftPreviewItem, 0, len(items))
+	for ordinal, item := range items {
+		rows = append(rows, models.MediaLibraryStructureRepairDraftPreviewItem{DraftID: draftID, Ordinal: ordinal, Action: item.Action, Kind: item.Kind, CurrentPath: item.CurrentPath, ExpectedPath: item.ExpectedPath, CreatedAt: createdAt})
+	}
+	return rows
+}
+
 // SelectionPreviewItems reads a frozen display projection. It neither rebuilds
 // a plan nor consumes confirmation authority, and performs no provider work.
 func (s *MediaLibraryStructureService) SelectionPreviewItems(ctx context.Context, actor Actor, libraryID uint, token string, page, pageSize int) (MediaLibraryStructurePreviewPage, error) {
@@ -103,6 +113,24 @@ func (s *MediaLibraryStructureService) SelectionPreviewItems(ctx context.Context
 	}
 	if library.BaselineGeneration != draft.Generation || source.SourceRevision != draft.SourceRevision || diagnosis.JobID != draft.DiagnosisJobID || libraryRuleFingerprint(library) != draft.RuleFingerprint {
 		return MediaLibraryStructurePreviewPage{}, appError(CodeConflict, "媒体库来源、诊断或规则已变化，请重新预览", nil)
+	}
+	if draft.PreviewItemsJSON == structurePreviewRowsMarker {
+		result := MediaLibraryStructurePreviewPage{Page: page, PageSize: pageSize}
+		query := s.db.WithContext(ctx).Model(&models.MediaLibraryStructureRepairDraftPreviewItem{}).Where("draft_id = ?", draft.ID)
+		var total int64
+		if err := query.Count(&total).Error; err != nil {
+			return MediaLibraryStructurePreviewPage{}, err
+		}
+		result.Total = int(total)
+		var rows []models.MediaLibraryStructureRepairDraftPreviewItem
+		if err := query.Order("ordinal").Offset((page - 1) * pageSize).Limit(pageSize).Find(&rows).Error; err != nil {
+			return MediaLibraryStructurePreviewPage{}, err
+		}
+		result.List = make([]MediaLibraryStructurePreviewItem, 0, len(rows))
+		for _, row := range rows {
+			result.List = append(result.List, MediaLibraryStructurePreviewItem{Action: row.Action, Kind: row.Kind, CurrentPath: row.CurrentPath, ExpectedPath: row.ExpectedPath})
+		}
+		return result, nil
 	}
 	if draft.PreviewItemsJSON == "" || len(draft.PreviewItemsJSON) > maxStructurePreviewBytes {
 		return MediaLibraryStructurePreviewPage{}, appError(CodeConflict, "旧预览没有文件明细，请重新预览", nil)

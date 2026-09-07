@@ -874,6 +874,20 @@ type MediaLibraryStructureRepairDraft struct {
 	CreatedAt        time.Time  `gorm:"not null" json:"-"`
 }
 
+// MediaLibraryStructureRepairDraftPreviewItem is the paged, safe display
+// projection for one frozen repair draft. Keeping these rows relational avoids
+// imposing a whole-preview JSON size or item-count ceiling.
+type MediaLibraryStructureRepairDraftPreviewItem struct {
+	ID           uint      `gorm:"primaryKey" json:"-"`
+	DraftID      string    `gorm:"size:36;not null;uniqueIndex:idx_structure_draft_preview_ordinal,priority:1;index" json:"-"`
+	Ordinal      int       `gorm:"not null;uniqueIndex:idx_structure_draft_preview_ordinal,priority:2" json:"-"`
+	Action       string    `gorm:"size:16;not null" json:"action"`
+	Kind         string    `gorm:"size:16;not null" json:"kind"`
+	CurrentPath  string    `gorm:"size:2048;not null" json:"current_path"`
+	ExpectedPath string    `gorm:"size:2048;not null" json:"expected_path"`
+	CreatedAt    time.Time `gorm:"not null" json:"-"`
+}
+
 // MediaLibraryStructureRepair is the durable authority for one diagnostic or
 // repair run. PlanJSON and StateJSON contain private provider identities and
 // must never be returned by handlers or copied into audit metadata.

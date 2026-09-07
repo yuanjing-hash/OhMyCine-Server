@@ -20,15 +20,15 @@ import (
 )
 
 const (
-	StructureSelectionRepair              = "repair"
-	StructureSelectionKeepRecommended     = "keep_recommended"
-	StructureSelectionKeepMember          = "keep_member"
-	StructureSelectionKeepAllVersions     = "keep_all_versions"
-	StructureSelectionSkip                = "skip"
-	maxStructureSelections                = 5000
-	maxStructureAutomaticSelections       = 25000
-	maxStructurePreviewResponseSelections = maxStructureSelections
-	maxStructureSelectionBytes            = 32 * 1024 * 1024
+	StructureSelectionRepair          = "repair"
+	StructureSelectionKeepRecommended = "keep_recommended"
+	StructureSelectionKeepMember      = "keep_member"
+	StructureSelectionKeepAllVersions = "keep_all_versions"
+	StructureSelectionSkip            = "skip"
+	// This bounds only a redundant compatibility echo in the HTTP response. It
+	// is not an execution limit: the immutable draft and paged preview remain
+	// authoritative for selections of any size.
+	maxStructurePreviewResponseSelections = 5000
 	structureSelectionConfirmationExpiry  = 5 * time.Minute
 )
 
@@ -76,6 +76,10 @@ func (s *MediaLibraryStructureService) PreviewSelectionRepair(ctx context.Contex
 	if !actor.CanResource(authz.PermissionMediaLibrariesScan, models.AuthorizationResourceMediaLibrary, uintID(libraryID)) {
 		return MediaLibraryStructureSelectionPreview{}, appError(CodePermissionDenied, "无权修复媒体库结构", nil)
 	}
+	// Preserve the compact caller intent. The merged workspace may contain tens
+	// of thousands of rows and already has relational authority in SQLite; do
+	// not duplicate that expanded set into the frozen draft JSON.
+	requestedInput := input
 	var reviewSession models.MediaLibraryStructureReviewSession
 	var err error
 	input, reviewSession, err = s.mergeStructureReviewSelections(ctx, actor, libraryID, input)
@@ -98,25 +102,21 @@ func (s *MediaLibraryStructureService) PreviewSelectionRepair(ctx context.Contex
 	for _, item := range resolved {
 		selections = append(selections, item.selection)
 	}
-	selectionJSON, err := json.Marshal(MediaLibraryStructureSelectionInput{Revision: input.Revision, Selections: selections})
-	if err != nil || len(selectionJSON) > maxStructureSelectionBytes {
-		return MediaLibraryStructureSelectionPreview{}, appError(CodeInvalidRequest, "目录修复选择过多", err)
+	selectionJSON, err := json.Marshal(requestedInput)
+	if err != nil {
+		return MediaLibraryStructureSelectionPreview{}, appError(CodeInvalidRequest, "目录修复选择不可保存", err)
 	}
 	var autoState models.MediaLibraryStructureAutoState
 	if err := s.db.WithContext(ctx).Where("library_id = ?", libraryID).First(&autoState).Error; err != nil {
 		return MediaLibraryStructureSelectionPreview{}, err
 	}
 	expires := time.Now().UTC().Add(structureSelectionConfirmationExpiry)
-	draft := models.MediaLibraryStructureRepairDraft{ID: draftID, OwnerID: actor.User.ID, LibraryID: libraryID, DiagnosisJobID: diagnosis.JobID, ReviewSessionID: reviewSession.ID, ReviewRevision: input.ReviewRevision, SourceRevision: autoState.SourceRevision, Generation: plan.Generation, RuleFingerprint: plan.RuleFingerprint, PlanHash: planHash, SelectionsJSON: string(selectionJSON), ExpiresAt: expires, CreatedAt: time.Now().UTC()}
+	draft := models.MediaLibraryStructureRepairDraft{ID: draftID, OwnerID: actor.User.ID, LibraryID: libraryID, DiagnosisJobID: diagnosis.JobID, ReviewSessionID: reviewSession.ID, ReviewRevision: input.ReviewRevision, SourceRevision: autoState.SourceRevision, Generation: plan.Generation, RuleFingerprint: plan.RuleFingerprint, PlanHash: planHash, SelectionsJSON: string(selectionJSON), PreviewItemsJSON: structurePreviewRowsMarker, ExpiresAt: expires, CreatedAt: time.Now().UTC()}
 	previewItems, err := structurePreviewItems(plan, resolved)
 	if err != nil {
 		return MediaLibraryStructureSelectionPreview{}, err
 	}
-	previewJSON, err := json.Marshal(previewItems)
-	if err != nil || len(previewJSON) > maxStructurePreviewBytes {
-		return MediaLibraryStructureSelectionPreview{}, appError(CodeInvalidRequest, "目录修复预览过大，请分类型或减少选择后重试", err)
-	}
-	draft.PreviewItemsJSON = string(previewJSON)
+	previewRows := structureDraftPreviewRows(draft.ID, previewItems, draft.CreatedAt)
 	var admission *CatalogWriteAdmission
 	if s.catalogStore != nil {
 		admission = s.catalogStore.Admission()
@@ -134,7 +134,13 @@ func (s *MediaLibraryStructureService) PreviewSelectionRepair(ctx context.Contex
 				return err
 			}
 		}
-		return tx.Create(&draft).Error
+		if err := tx.Create(&draft).Error; err != nil {
+			return err
+		}
+		if len(previewRows) == 0 {
+			return nil
+		}
+		return tx.CreateInBatches(previewRows, 256).Error
 	}); err != nil {
 		return MediaLibraryStructureSelectionPreview{}, err
 	}
@@ -179,6 +185,10 @@ func (s *MediaLibraryStructureService) EnqueueSelectionRepair(ctx context.Contex
 	var input MediaLibraryStructureSelectionInput
 	if err := json.Unmarshal([]byte(draft.SelectionsJSON), &input); err != nil {
 		return models.MediaLibraryStructureRepair{}, appError(CodeInvalidRequest, "目录修复选择已失效", err)
+	}
+	input, _, err = s.mergeStructureReviewSelections(ctx, actor, libraryID, input)
+	if err != nil {
+		return models.MediaLibraryStructureRepair{}, err
 	}
 	plan, diagnosis, _, err := s.buildSelectionPlan(ctx, libraryID, input, draft.ID)
 	if err != nil {
@@ -231,8 +241,8 @@ func (s *MediaLibraryStructureService) validateSelectionRecycle(ctx context.Cont
 
 func (s *MediaLibraryStructureService) enqueueSelectionPlan(actor Actor, draft models.MediaLibraryStructureRepairDraft, plan StructurePlan, request RequestContext) (models.MediaLibraryStructureRepair, error) {
 	raw, err := json.Marshal(plan)
-	if err != nil || len(raw) > maxStructureSelectionBytes {
-		return models.MediaLibraryStructureRepair{}, appError(CodeMediaLibraryStructureUnavailable, "媒体库修复计划过大", err)
+	if err != nil {
+		return models.MediaLibraryStructureRepair{}, appError(CodeMediaLibraryStructureUnavailable, "媒体库修复计划不可保存", err)
 	}
 	var library models.MediaLibrary
 	if err := s.db.First(&library, draft.LibraryID).Error; err != nil {
@@ -292,9 +302,12 @@ func (s *MediaLibraryStructureService) enqueueSelectionPlan(actor Actor, draft m
 			for _, token := range tokens {
 				keys = append(keys, "issue:"+token)
 			}
-			updated := tx.Model(&models.MediaLibraryStructureReviewChoice{}).Where("session_id = ? AND subject_key IN ? AND state = ?", draft.ReviewSessionID, keys, "draft").Update("state", "submitted")
-			if updated.Error != nil {
-				return updated.Error
+			for start := 0; start < len(keys); start += CatalogBatchRows {
+				part := keys[start:min(start+CatalogBatchRows, len(keys))]
+				updated := tx.Model(&models.MediaLibraryStructureReviewChoice{}).Where("session_id = ? AND subject_key IN ? AND state = ?", draft.ReviewSessionID, part, "draft").Update("state", "submitted")
+				if updated.Error != nil {
+					return updated.Error
+				}
 			}
 			advanced := tx.Model(&models.MediaLibraryStructureReviewSession{}).
 				Where("id = ? AND revision = ?", draft.ReviewSessionID, draft.ReviewRevision).
@@ -313,6 +326,25 @@ func (s *MediaLibraryStructureService) enqueueSelectionPlan(actor Actor, draft m
 	}
 	repair.JobID = &job.ID
 	return repair, nil
+}
+
+func (s *MediaLibraryStructureService) loadCurrentStructureIssuesByTokens(ctx context.Context, libraryID uint, diagnosisJobID string, generation uint64, tokens []string) ([]models.MediaLibraryStructureIssue, error) {
+	issues := make([]models.MediaLibraryStructureIssue, 0, len(tokens))
+	for start := 0; start < len(tokens); start += CatalogBatchRows {
+		part := tokens[start:min(start+CatalogBatchRows, len(tokens))]
+		var rows []models.MediaLibraryStructureIssue
+		if err := s.db.WithContext(ctx).Where("library_id = ? AND diagnosis_job_id = ? AND generation = ? AND token IN ?", libraryID, diagnosisJobID, generation, part).Find(&rows).Error; err != nil {
+			return nil, err
+		}
+		issues = append(issues, rows...)
+	}
+	sort.Slice(issues, func(i, j int) bool {
+		if issues[i].Code != issues[j].Code {
+			return issues[i].Code < issues[j].Code
+		}
+		return issues[i].ID < issues[j].ID
+	})
+	return issues, nil
 }
 
 func (s *MediaLibraryStructureService) buildSelectionPlan(ctx context.Context, libraryID uint, input MediaLibraryStructureSelectionInput, draftID string) (StructurePlan, models.MediaLibraryStructureDiagnosis, []structureSelectionResolved, error) {
@@ -367,9 +399,7 @@ func (s *MediaLibraryStructureService) buildSelectionPlan(ctx context.Context, l
 			selectionByIssue[row.Token] = MediaLibraryStructureSelection{IssueToken: row.Token, Action: action, MemberToken: mapRecommendedMember(action, row.RecommendedMemberToken)}
 		}
 	}
-	selectionLimit := maxStructureSelections
 	if input.IncludeAutomaticRepairs {
-		selectionLimit = maxStructureAutomaticSelections
 		automatic := s.db.WithContext(ctx).
 			Where("library_id = ? AND diagnosis_job_id = ? AND generation = ? AND repairable = ?", libraryID, diagnosis.JobID, diagnosis.Generation, true)
 		if code := safeLabel(strings.TrimSpace(input.ReviewCode), 64); code != "" && code != "all" {
@@ -379,11 +409,8 @@ func (s *MediaLibraryStructureService) buildSelectionPlan(ctx context.Context, l
 			automatic = automatic.Where("NOT EXISTS (SELECT 1 FROM media_library_structure_review_choices rc WHERE rc.session_id = ? AND rc.subject_key = ('issue:' || media_library_structure_issues.token) AND rc.state = ?)", input.reviewSessionID, "submitted")
 		}
 		var rows []models.MediaLibraryStructureIssue
-		if err := automatic.Order("code,id").Limit(maxStructureAutomaticSelections + 1).Find(&rows).Error; err != nil {
+		if err := automatic.Order("code,id").Find(&rows).Error; err != nil {
 			return StructurePlan{}, diagnosis, nil, err
-		}
-		if len(rows) > maxStructureAutomaticSelections {
-			return StructurePlan{}, diagnosis, nil, appError(CodeInvalidRequest, "可自动整理项目超过单次安全上限，请按问题类型预览处理", nil)
 		}
 		for _, row := range rows {
 			if _, explicitlyHandled := selectionByIssue[row.Token]; explicitlyHandled {
@@ -395,19 +422,12 @@ func (s *MediaLibraryStructureService) buildSelectionPlan(ctx context.Context, l
 	if len(selectionByIssue) == 0 {
 		return StructurePlan{}, diagnosis, nil, appError(CodeInvalidRequest, "请选择要处理的问题", nil)
 	}
-	if len(selectionByIssue) > selectionLimit {
-		message := "本次处理选择过多，请分类型预览处理"
-		if input.IncludeAutomaticRepairs {
-			message = "可自动整理项目超过单次安全上限，请按问题类型预览处理"
-		}
-		return StructurePlan{}, diagnosis, nil, appError(CodeInvalidRequest, message, nil)
-	}
 	tokens := make([]string, 0, len(selectionByIssue))
 	for token := range selectionByIssue {
 		tokens = append(tokens, token)
 	}
-	var issues []models.MediaLibraryStructureIssue
-	if err := s.db.WithContext(ctx).Where("library_id = ? AND diagnosis_job_id = ? AND generation = ? AND token IN ?", libraryID, diagnosis.JobID, diagnosis.Generation, tokens).Order("code,id").Find(&issues).Error; err != nil {
+	issues, err := s.loadCurrentStructureIssuesByTokens(ctx, libraryID, diagnosis.JobID, diagnosis.Generation, tokens)
+	if err != nil {
 		return StructurePlan{}, diagnosis, nil, err
 	}
 	if len(issues) != len(tokens) {
@@ -474,9 +494,10 @@ func (s *MediaLibraryStructureService) validateStructureSelectionSafety(ctx cont
 }
 
 func (s *MediaLibraryStructureService) validateStructureSelectionSafetyTx(tx *gorm.DB, reader *CatalogReader, plan StructurePlan) error {
-	if len(plan.ResolvedIssues) > 0 {
+	for start := 0; start < len(plan.ResolvedIssues); start += CatalogBatchRows {
+		part := plan.ResolvedIssues[start:min(start+CatalogBatchRows, len(plan.ResolvedIssues))]
 		var issue models.MediaLibraryStructureIssue
-		result := tx.Where("library_id = ? AND diagnosis_job_id = ? AND token IN ? AND code IN ?", plan.LibraryID, plan.DiagnosisJobID, plan.ResolvedIssues, []string{"catalog_duplicate_conflict", "recognition_suspect_conflict"}).Limit(1).Find(&issue)
+		result := tx.Where("library_id = ? AND diagnosis_job_id = ? AND token IN ? AND code IN ?", plan.LibraryID, plan.DiagnosisJobID, part, []string{"catalog_duplicate_conflict", "recognition_suspect_conflict"}).Limit(1).Find(&issue)
 		if result.Error != nil {
 			return result.Error
 		}

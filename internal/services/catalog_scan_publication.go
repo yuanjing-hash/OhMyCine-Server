@@ -17,12 +17,13 @@ import (
 // collections or fan out targets in this transaction. A nil hook is a hard
 // rollout gate, never a successful scan with silently missing follow-up work.
 type CatalogScanPublication struct {
-	Candidate       *models.CatalogSnapshot
-	Head            models.CatalogHead
-	Run             models.MediaLibraryScanRun
-	MetadataChanged bool
-	NoContentChange bool
-	RecognitionOnly bool
+	Candidate          *models.CatalogSnapshot
+	Head               models.CatalogHead
+	Run                models.MediaLibraryScanRun
+	MetadataChanged    bool
+	NoContentChange    bool
+	PreserveGeneration bool
+	RecognitionOnly    bool
 }
 
 type CatalogScanCommit func(*gorm.DB, CatalogScanPublication) error
@@ -255,7 +256,12 @@ func (s *MediaLibraryService) finishCatalogScanTx(tx *gorm.DB, profile models.Me
 		run.Status, run.Phase, run.FinishedAt = "catalog_ready", "recognition_queued", nil
 	}
 	publication.Run = *run
-	if err := tx.Model(&models.MediaLibrary{}).Where("id=?", run.LibraryID).Updates(map[string]any{"dirty_generation": run.Generation, "baseline_generation": run.Generation, "last_scan_at": finished, "last_successful_scan_at": finished, "profile_revision": profile.Revision, "reclassification_due": false, "status_error_code": "", "next_retry_at": nil}).Error; err != nil {
+	libraryUpdates := map[string]any{"last_scan_at": finished, "last_successful_scan_at": finished, "profile_revision": profile.Revision, "reclassification_due": false, "status_error_code": "", "next_retry_at": nil}
+	if !publication.PreserveGeneration {
+		libraryUpdates["dirty_generation"] = run.Generation
+		libraryUpdates["baseline_generation"] = run.Generation
+	}
+	if err := tx.Model(&models.MediaLibrary{}).Where("id=?", run.LibraryID).Updates(libraryUpdates).Error; err != nil {
 		return err
 	}
 	if err := tx.Save(run).Error; err != nil {
@@ -282,7 +288,22 @@ func (s *MediaLibraryService) commitNoopCatalogScan(ctx context.Context, head mo
 		if err := s.validateCatalogScanRunTx(tx, head.LibraryID, *run); err != nil {
 			return err
 		}
-		return s.finishCatalogScanTx(tx, profile, run, CatalogScanPublication{Head: current, NoContentChange: true}, hook)
+		var library models.MediaLibrary
+		if err := tx.First(&library, head.LibraryID).Error; err != nil {
+			return err
+		}
+		// The allocated generation is provisional enumeration evidence. A true
+		// no-op keeps the published logical generation, so unchanged pending
+		// recognition can only replay the exact existing generation key and an
+		// artifact run cannot be fabricated for an empty delta.
+		run.Generation = library.BaselineGeneration
+		var storage models.Storage
+		if err := tx.First(&storage, library.StorageID).Error; err != nil {
+			return err
+		}
+		library.DirtyGeneration = library.BaselineGeneration
+		run.SourceFingerprint = mediaLibraryScanSourceFingerprint(library, storage, profile)
+		return s.finishCatalogScanTx(tx, profile, run, CatalogScanPublication{Head: current, NoContentChange: true, PreserveGeneration: true}, hook)
 	})
 }
 

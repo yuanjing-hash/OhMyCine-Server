@@ -59,7 +59,7 @@ func (s *MediaLibraryStructureService) runCatalogStructureRepair(ctx context.Con
 		if err != nil {
 			return fail(err)
 		}
-		defer quiesceCatalogPhysicalWrite(s.db, permit, s.log)
+		defer s.finishStructurePhysicalWrite(permit)
 		if err := s.finalizeCatalogStructureRepair(ctx, repair, plan, &state, claim, permit); err != nil {
 			return fail(err)
 		}
@@ -137,7 +137,7 @@ func (s *MediaLibraryStructureService) runCatalogStructureRepair(ctx context.Con
 	if err != nil {
 		return fail(err)
 	}
-	defer quiesceCatalogPhysicalWrite(s.db, permit, s.log)
+	defer s.finishStructurePhysicalWrite(permit)
 	if storage.Type != models.StorageTypeLocal && !physicalDone && state.Stage != "physical_running" && len(plan.Items) > 0 {
 		state.Stage = "directories_preparing"
 		if err := s.structureCatalogWriteTx(ctx, func(tx *gorm.DB) error {

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
@@ -54,8 +55,13 @@ func TestLocalStructureBackendMovesCompanionsAndRemovesEmptyOldDirectories(t *te
 }
 
 type structureCloudDriver struct {
-	items map[string]cloudpkg.Item
-	next  int
+	items            map[string]cloudpkg.Item
+	next             int
+	moveBatches      [][]string
+	recycleBatch     [][]string
+	listCalls        map[string]int
+	statCalls        int
+	nonPipelineReads int
 }
 
 func (d *structureCloudDriver) Provider() string { return cloudpkg.ProviderPan115 }
@@ -65,14 +71,25 @@ func (d *structureCloudDriver) Capabilities() cloudpkg.Capabilities {
 func (d *structureCloudDriver) Probe(context.Context) (cloudpkg.Account, error) {
 	return cloudpkg.Account{}, nil
 }
-func (d *structureCloudDriver) Stat(_ context.Context, id string) (cloudpkg.Item, error) {
+func (d *structureCloudDriver) Stat(ctx context.Context, id string) (cloudpkg.Item, error) {
+	d.statCalls++
+	if cloudpkg.ReadClassFromContext(ctx) != cloudpkg.ReadClassPipeline {
+		d.nonPipelineReads++
+	}
 	item, ok := d.items[id]
 	if !ok {
 		return cloudpkg.Item{}, os.ErrNotExist
 	}
 	return item, nil
 }
-func (d *structureCloudDriver) List(_ context.Context, parent string, _ cloudpkg.PageRequest) (cloudpkg.Page, error) {
+func (d *structureCloudDriver) List(ctx context.Context, parent string, _ cloudpkg.PageRequest) (cloudpkg.Page, error) {
+	if cloudpkg.ReadClassFromContext(ctx) != cloudpkg.ReadClassPipeline {
+		d.nonPipelineReads++
+	}
+	if d.listCalls == nil {
+		d.listCalls = make(map[string]int)
+	}
+	d.listCalls[parent]++
 	page := cloudpkg.Page{}
 	for _, item := range d.items {
 		if item.ParentID == parent {
@@ -107,6 +124,27 @@ func (d *structureCloudDriver) Recycle(_ context.Context, id string) error {
 	delete(d.items, id)
 	return nil
 }
+func (d *structureCloudDriver) MoveMany(ctx context.Context, ids []string, parent string) error {
+	d.moveBatches = append(d.moveBatches, append([]string(nil), ids...))
+	for _, id := range ids {
+		if err := d.Move(ctx, id, parent); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+func (*structureCloudDriver) CopyMany(context.Context, []string, string) error {
+	return errors.New("unused")
+}
+func (d *structureCloudDriver) RecycleMany(ctx context.Context, ids []string) error {
+	d.recycleBatch = append(d.recycleBatch, append([]string(nil), ids...))
+	for _, id := range ids {
+		if err := d.Recycle(ctx, id); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
 func TestPan115StructureBackendMovesByStableIdentityAndCleansEmptyDirectory(t *testing.T) {
 	driver := &structureCloudDriver{items: map[string]cloudpkg.Item{
@@ -126,6 +164,66 @@ func TestPan115StructureBackendMovesByStableIdentityAndCleansEmptyDirectory(t *t
 	}
 	if _, exists := driver.items["old"]; exists {
 		t.Fatal("empty old provider directory was not recycled")
+	}
+}
+
+func TestPan115StructureBackendBatchesSafeMovesAndListsTargetOnce(t *testing.T) {
+	driver := &structureCloudDriver{items: map[string]cloudpkg.Item{
+		"root":   {ID: "root", IsDir: true},
+		"old":    {ID: "old", ParentID: "root", Name: "old", IsDir: true},
+		"target": {ID: "target", ParentID: "root", Name: "target", IsDir: true},
+	}}
+	items := make([]StructurePlanItem, 0, 235)
+	for index := 0; index < 235; index++ {
+		id := fmt.Sprintf("video-%03d", index)
+		name := fmt.Sprintf("episode-%03d.mkv", index)
+		driver.items[id] = cloudpkg.Item{ID: id, ParentID: "old", Name: name, Size: 1}
+		items = append(items, StructurePlanItem{Kind: "video", ProviderID: id, SourceRelative: "old/" + name, TargetRelative: "target/" + name, Size: 1})
+	}
+	backend := pan115MediaLibraryStructureBackend{driver: func(uint) (cloudpkg.Driver, error) { return driver, nil }}
+	connectionID := uint(3)
+	boundary := StructureBoundary{Library: models.MediaLibrary{ProviderRootID: "root"}, Storage: models.Storage{ConnectionID: &connectionID, RootPath: "root"}, preparedParents: map[string]string{"": "root", ".": "root", "target": "target"}}
+	if err := backend.Apply(context.Background(), boundary, items, nil); err != nil {
+		t.Fatal(err)
+	}
+	batchSizes := make([]int, 0, len(driver.moveBatches))
+	for _, batch := range driver.moveBatches {
+		batchSizes = append(batchSizes, len(batch))
+	}
+	if !reflect.DeepEqual(batchSizes, []int{100, 100, 35}) {
+		t.Fatalf("move batch sizes=%v", batchSizes)
+	}
+	if driver.listCalls["target"] != 4 {
+		t.Fatalf("target listings=%d", driver.listCalls["target"])
+	}
+	if driver.statCalls > 3 {
+		t.Fatalf("batch preflight/reconciliation regressed to per-item Stat calls=%d", driver.statCalls)
+	}
+	if driver.nonPipelineReads != 0 {
+		t.Fatalf("structure repair used conservatively paced background reads=%d", driver.nonPipelineReads)
+	}
+}
+
+func TestPan115StructureBackendResumesMoveBeforeRenameWithoutPerItemStat(t *testing.T) {
+	driver := &structureCloudDriver{items: map[string]cloudpkg.Item{
+		"root":   {ID: "root", IsDir: true},
+		"old":    {ID: "old", ParentID: "root", Name: "old", IsDir: true},
+		"target": {ID: "target", ParentID: "root", Name: "target", IsDir: true},
+		// The move committed but the rename/checkpoint did not.
+		"video": {ID: "video", ParentID: "target", Name: "old-name.mkv", Size: 7},
+	}}
+	backend := pan115MediaLibraryStructureBackend{driver: func(uint) (cloudpkg.Driver, error) { return driver, nil }}
+	connectionID := uint(3)
+	boundary := StructureBoundary{Library: models.MediaLibrary{ProviderRootID: "root"}, Storage: models.Storage{ConnectionID: &connectionID, RootPath: "root"}, preparedParents: map[string]string{"": "root", ".": "root", "target": "target"}}
+	item := StructurePlanItem{Kind: "video", ProviderID: "video", SourceRelative: "old/old-name.mkv", TargetRelative: "target/new-name.mkv", Size: 7}
+	if err := backend.Apply(context.Background(), boundary, []StructurePlanItem{item}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if current := driver.items["video"]; current.ParentID != "target" || current.Name != "new-name.mkv" {
+		t.Fatalf("resumed item=%+v", current)
+	}
+	if driver.statCalls != 0 || driver.nonPipelineReads != 0 {
+		t.Fatalf("resume used stat=%d background=%d", driver.statCalls, driver.nonPipelineReads)
 	}
 }
 
@@ -150,6 +248,36 @@ func TestPan115StructureBackendRecyclesOnlyRevalidatedLibraryMember(t *testing.T
 	}
 	if _, exists := driver.items["other"]; !exists {
 		t.Fatal("out-of-bound provider item changed")
+	}
+}
+
+func TestPan115StructureBackendBatchesRecycleWithDirectoryProof(t *testing.T) {
+	driver := &structureCloudDriver{items: map[string]cloudpkg.Item{
+		"root":   {ID: "root", IsDir: true},
+		"folder": {ID: "folder", ParentID: "root", Name: "incoming", IsDir: true},
+	}}
+	items := make([]StructureRecycleItem, 0, 235)
+	for index := 0; index < 235; index++ {
+		id := fmt.Sprintf("recycle-%03d", index)
+		name := fmt.Sprintf("copy-%03d.mkv", index)
+		driver.items[id] = cloudpkg.Item{ID: id, ParentID: "folder", Name: name, Size: 2}
+		items = append(items, StructureRecycleItem{Kind: "video", ProviderID: id, SourceRelative: "incoming/" + name, Size: 2})
+	}
+	backend := pan115MediaLibraryStructureBackend{driver: func(uint) (cloudpkg.Driver, error) { return driver, nil }}
+	connectionID := uint(3)
+	boundary := StructureBoundary{Library: models.MediaLibrary{ProviderRootID: "root"}, Storage: models.Storage{ConnectionID: &connectionID, RootPath: "root"}}
+	if err := backend.Recycle(context.Background(), boundary, items, nil); err != nil {
+		t.Fatal(err)
+	}
+	batchSizes := make([]int, 0, len(driver.recycleBatch))
+	for _, batch := range driver.recycleBatch {
+		batchSizes = append(batchSizes, len(batch))
+	}
+	if !reflect.DeepEqual(batchSizes, []int{100, 100, 35}) {
+		t.Fatalf("recycle batch sizes=%v", batchSizes)
+	}
+	if driver.listCalls["folder"] != 4 || driver.statCalls != 0 || driver.nonPipelineReads != 0 {
+		t.Fatalf("recycle proof list=%d stat=%d background=%d", driver.listCalls["folder"], driver.statCalls, driver.nonPipelineReads)
 	}
 }
 

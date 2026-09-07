@@ -734,7 +734,11 @@ async function repairStructureSelections() {
     try {
       repair = await api<MediaLibraryStructureRepair>(`/api/v1/media-libraries/${id}/structure/selection-repair`, { method: 'POST', body: JSON.stringify({ confirmation_token: preview.confirmation_token }) })
     } catch (reason) {
-      if (ownsStructure(session, id)) { structureSelectionError.value = `执行结果未确认，请先核对后台任务：${message(reason)}`; structureSelectionPreview.value = null }
+      if (ownsStructure(session, id)) {
+        const definitelyRejected = reason instanceof APIError && reason.status >= 400 && reason.status < 500
+        structureSelectionError.value = definitelyRejected ? `开始整理未提交：${message(reason)}` : `执行结果未确认，请先核对后台任务：${message(reason)}`
+        structureSelectionPreview.value = null
+      }
       return
     }
     if (!ownsStructure(session, id)) return
