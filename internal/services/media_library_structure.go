@@ -1036,13 +1036,12 @@ func (s *MediaLibraryStructureService) enqueueRepairPlan(actor Actor, library mo
 	if workKey != "" {
 		scope = models.MediaLibraryStructureScopeWork
 	}
-	var active models.MediaLibraryStructureRepair
-	query := s.db.Where("library_id = ? AND scope = ? AND work_key = ? AND (phase IN ? OR (phase = 'failed' AND succeeded_items > 0 AND (failed_items > 0 OR blocked_items > 0)))", libraryID, scope, workKey, activeStructureRepairPhases).Order("created_at DESC").First(&active)
-	if query.Error == nil {
+	active, activeErr := findActiveStructureRepair(s.db, libraryID, scope, workKey)
+	if activeErr == nil {
 		return active, nil
 	}
-	if !errors.Is(query.Error, gorm.ErrRecordNotFound) {
-		return models.MediaLibraryStructureRepair{}, query.Error
+	if !errors.Is(activeErr, gorm.ErrRecordNotFound) {
+		return models.MediaLibraryStructureRepair{}, activeErr
 	}
 	raw, err := json.Marshal(plan)
 	if err != nil || len(raw) > 8*1024*1024 {

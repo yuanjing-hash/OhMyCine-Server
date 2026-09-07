@@ -57,6 +57,24 @@ beforeEach(() => {
 afterEach(() => { wrappers.splice(0).forEach(wrapper => wrapper.unmount()); vi.useRealTimers(); vi.unstubAllGlobals() })
 
 describe('task interaction lifecycle', () => {
+  it('shows a current wait reason separately in the row and drawer without hiding the last error', async () => {
+    const waiting = { ...job('waiting', 'queued'), wait_reason: { code: 'library_busy', message: '先前文件操作的结果仍待核验' }, last_error_message: '上次执行失败' }
+    mocks.list.mockResolvedValue(page([waiting]))
+    mocks.detail.mockResolvedValue(waiting)
+    const { wrapper } = await open('/automation/tasks?job_id=waiting')
+    expect(wrapper.get('tbody').text()).toContain('等待原因：先前文件操作的结果仍待核验')
+    expect(wrapper.get('tbody').text()).toContain('上次执行失败')
+    expect(wrapper.get('[role="dialog"]').text()).toContain('等待原因：先前文件操作的结果仍待核验')
+  })
+
+  it('does not display an obsolete wait reason on a terminal job', async () => {
+    const cancelled = { ...job('cancelled', 'cancelled'), wait_reason: { code: 'library_busy', message: 'obsolete wait' } }
+    mocks.list.mockResolvedValue(page([cancelled]))
+    mocks.detail.mockResolvedValue(cancelled)
+    const { wrapper } = await open('/automation/tasks?job_id=cancelled')
+    expect(wrapper.text()).not.toContain('obsolete wait')
+  })
+
   it('ignores stale errors and restores filters when returning from a different page', async () => {
     const { wrapper, router } = await open('/automation/tasks?status=running&page=3')
     const pending = deferred<ReturnType<typeof page>>()

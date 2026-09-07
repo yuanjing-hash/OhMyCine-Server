@@ -119,8 +119,18 @@ func (s *STRMManagementService) ReconcileSupersededCleanup(ctx context.Context, 
 	if s == nil || s.libraries == nil {
 		return ErrCatalogFence
 	}
-	unlock := s.lockCleanupBoundary(permit.evidence.LibraryID)
-	defer unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	// Maintenance must not queue behind a long scan: its context cannot cancel
+	// Mutex.Lock, and that would stall other libraries and Scheduler.Close.
+	// Keep the same boundary, but defer recovery with all evidence intact when
+	// another operation owns it. The existing worker/maintenance retries later.
+	lock := s.libraries.scanLock(permit.evidence.LibraryID)
+	if !lock.TryLock() {
+		return ErrCatalogFence
+	}
+	defer lock.Unlock()
 	if err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		proof, _, err := catalogArtifactPermitTx(tx, permit)
 		if err != nil {

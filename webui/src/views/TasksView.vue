@@ -382,6 +382,7 @@ onBeforeUnmount(() => { alive = false; listRequest.cancel(); detailRequest.cance
                 v-if="job.interrupt_pending"
                 class="block mt-1 semantic-warning-text"
               >控制请求处理中</small>
+              <small v-if="job.wait_reason && ['queued', 'retry_wait'].includes(job.status)" class="block mt-1 semantic-warning-text">等待原因：{{ job.wait_reason.message }}</small>
             </td>
             <td>
               {{ unknown(job.progress, "%")
@@ -470,6 +471,7 @@ onBeforeUnmount(() => { alive = false; listRequest.cancel(); detailRequest.cance
           </button>
         </header>
         <p v-if="detailLoading" class="p-4" role="status">正在读取任务详情…</p>
+        <p v-if="selected?.wait_reason && ['queued', 'retry_wait'].includes(selected.status)" class="semantic-warning m-4 p-4" role="status">等待原因：{{ selected.wait_reason.message }}</p>
         <p v-if="detailError" class="semantic-error m-4 p-4" role="alert">{{ detailError }} <button class="btn-secondary" @click="loadDetail(detailID)">重试</button></p>
         <section
           v-if="selected?.action_request"

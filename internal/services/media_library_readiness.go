@@ -30,6 +30,19 @@ const readinessRepairCurrentSQL = `NOT EXISTS (
 
 const readinessRepairFailedSQL = `(r.succeeded_items>0 AND (r.failed_items>0 OR r.blocked_items>0)) OR ` + readinessRepairCurrentSQL
 
+// A cancelled original admission never entered file execution. Do not let the
+// stale domain phase hold the library forever; a retry removes this exemption.
+// Missing receipts, partial results and unacknowledged leases remain blocking.
+const readinessRepairCancelledUnenteredSQL = `r.succeeded_items=0 AND EXISTS (
+	SELECT 1 FROM catalog_physical_writes cp JOIN jobs cj ON cj.id=cp.job_id
+	WHERE cp.library_id=l.id AND cp.owner_kind='repair' AND cp.owner_id=r.id
+	AND cp.job_id=r.job_id AND cp.state='admitted'
+	AND cj.job_type='media_library_repair' AND cj.status='cancelled'
+	AND cj.lease_token_hash='' AND cj.lease_expires_at IS NULL
+)`
+
+const readinessRepairActiveSQL = `r.phase IN ('queued','executing','reconciling') AND NOT (` + readinessRepairCancelledUnenteredSQL + `)`
+
 func libraryReadinessRows(db *gorm.DB, ids []uint) (map[uint]MediaLibraryReadiness, error) {
 	type row struct {
 		ID                 uint
@@ -50,7 +63,7 @@ func libraryReadinessRows(db *gorm.DB, ids []uint) (map[uint]MediaLibraryReadine
 		COALESCE(c.enabled,1) AS connection_enabled,
 		COALESCE(c.last_health_status = 'offline' AND c.last_health_error_code = 'pan115_auth_expired', 0) AS auth_expired,
 		EXISTS(SELECT 1 FROM media_library_structure_auto_states a WHERE a.library_id=l.id AND a.diagnosed_revision<a.source_revision) AS checking,
-		EXISTS(SELECT 1 FROM media_library_structure_repairs r WHERE r.library_id=l.id AND (r.phase IN ('queued','executing','reconciling') OR (r.phase='failed' AND (` + readinessRepairFailedSQL + `)))) AS repairing,
+		EXISTS(SELECT 1 FROM media_library_structure_repairs r WHERE r.library_id=l.id AND ((` + readinessRepairActiveSQL + `) OR (r.phase='failed' AND (` + readinessRepairFailedSQL + `)))) AS repairing,
 		EXISTS(SELECT 1 FROM media_library_structure_repairs r WHERE r.library_id=l.id AND r.phase = 'failed' AND (` + readinessRepairFailedSQL + `)) AS repair_failed,
 		EXISTS(SELECT 1 FROM catalog_physical_writes p WHERE p.library_id=l.id AND p.state IN ('entered','quiescent')) AS physical_pending`).
 		Joins("JOIN storages s ON s.id=l.storage_id").Joins("LEFT JOIN connections c ON c.id=s.connection_id")
@@ -105,7 +118,7 @@ func currentLibraryRepairOwner(db *gorm.DB, libraryID uint) (string, error) {
 	err := db.Table("media_library_structure_repairs AS r").
 		Select("r.id").
 		Joins("JOIN media_libraries AS l ON l.id=r.library_id").
-		Where("r.library_id=? AND (r.phase IN ? OR (r.phase='failed' AND ("+readinessRepairFailedSQL+")))", libraryID, activeStructureRepairPhases).
+		Where("r.library_id=? AND (("+readinessRepairActiveSQL+") OR (r.phase='failed' AND ("+readinessRepairFailedSQL+")))", libraryID).
 		Order("r.created_at,r.id").
 		Limit(1).
 		Scan(&row).Error

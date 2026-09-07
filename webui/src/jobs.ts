@@ -36,6 +36,7 @@ export interface Job {
   eta_seconds: number | null;
   last_error_code: string;
   last_error_message: string;
+  wait_reason?: { code: string; message: string };
   next_attempt_at: string | null;
   cancellation_requested: boolean;
   interrupt_pending: string;

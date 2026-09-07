@@ -30,6 +30,12 @@ type Worker interface {
 type InterruptibleWorker interface {
 	Interrupt(context.Context, ClaimedJob, string) error
 }
+
+// StoppedWorkRecovery observes durable stopped work without reviving its Job
+// or consuming execution slots. Each implementation must use bounded pages.
+type StoppedWorkRecovery interface {
+	RecoverStoppedWork(context.Context, uint64) (uint64, error)
+}
 type WorkerFunc func(context.Context, JobRuntime, ClaimedJob) WorkerResult
 
 func (f WorkerFunc) Run(ctx context.Context, runtime JobRuntime, job ClaimedJob) WorkerResult {
@@ -160,8 +166,36 @@ func (s *Scheduler) Start(parent context.Context) error {
 	s.cancel = cancel
 	s.wg.Add(1)
 	go s.loop(ctx)
+	for _, kind := range s.registry.Types() {
+		worker, _ := s.registry.Get(kind)
+		if recovery, ok := worker.(StoppedWorkRecovery); ok {
+			s.wg.Add(1)
+			go s.recoverStoppedLoop(ctx, recovery)
+		}
+	}
 	serverlog.OperationTaskQueue.Event(s.log.Info()).Strs("worker_types", s.registry.Types()).Msg(serverlog.OperationTaskQueue.Message("调度器已启动"))
 	return nil
+}
+
+func (s *Scheduler) recoverStoppedLoop(ctx context.Context, recovery StoppedWorkRecovery) {
+	defer s.wg.Done()
+	var after uint64
+	for {
+		batchCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		next, err := recovery.RecoverStoppedWork(batchCtx, after)
+		cancel()
+		if err != nil && ctx.Err() == nil {
+			s.log.Warn().Str("error_code", "cancelled_work_recovery_unavailable").Msg("已取消任务的文件核验暂不可用，将稍后重试")
+		}
+		after = next
+		timer := time.NewTimer(15 * time.Second)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+	}
 }
 func (s *Scheduler) Close() {
 	if s.cancel != nil {

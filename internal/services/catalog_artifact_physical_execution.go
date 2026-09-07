@@ -175,6 +175,10 @@ func artifactJobCancelled(job models.Job) bool {
 func (s *MediaArtifactService) settleStoppedArtifactExecution(permit CatalogPhysicalWritePermit, policy mediaArtifactPolicy, cancelled bool) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+	return s.settleStoppedArtifactExecutionContext(ctx, permit, policy, cancelled)
+}
+
+func (s *MediaArtifactService) settleStoppedArtifactExecutionContext(ctx context.Context, permit CatalogPhysicalWritePermit, policy mediaArtifactPolicy, cancelled bool) error {
 	// All generator calls are synchronous and have returned before this helper.
 	if err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error { return QuiesceCatalogPhysicalWriteTx(tx, permit) }); err != nil {
 		return err

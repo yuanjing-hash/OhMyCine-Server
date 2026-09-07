@@ -248,13 +248,12 @@ func (s *MediaLibraryStructureService) enqueueSelectionPlan(actor Actor, draft m
 	if err := s.db.First(&library, draft.LibraryID).Error; err != nil {
 		return models.MediaLibraryStructureRepair{}, mediaLibraryNotFound(err)
 	}
-	var active models.MediaLibraryStructureRepair
-	query := s.db.Where("library_id = ? AND scope = ? AND work_key = '' AND (phase IN ? OR (phase = 'failed' AND succeeded_items > 0 AND (failed_items > 0 OR blocked_items > 0)))", draft.LibraryID, models.MediaLibraryStructureScopeFull, activeStructureRepairPhases).Order("created_at DESC").First(&active)
-	if query.Error == nil {
+	_, activeErr := findActiveStructureRepair(s.db, draft.LibraryID, models.MediaLibraryStructureScopeFull, "")
+	if activeErr == nil {
 		return models.MediaLibraryStructureRepair{}, appError(CodeConflict, "已有媒体库结构修复任务正在执行", nil)
 	}
-	if !errors.Is(query.Error, gorm.ErrRecordNotFound) {
-		return models.MediaLibraryStructureRepair{}, query.Error
+	if !errors.Is(activeErr, gorm.ErrRecordNotFound) {
+		return models.MediaLibraryStructureRepair{}, activeErr
 	}
 	now := time.Now().UTC()
 	repair := models.MediaLibraryStructureRepair{ID: uuid.NewString(), OwnerID: actor.User.ID, LibraryID: draft.LibraryID, Scope: models.MediaLibraryStructureScopeFull, RuleFingerprint: plan.RuleFingerprint, Generation: plan.Generation, PlanJSON: string(raw), StateJSON: `{}`, Phase: "queued", IssueCount: len(plan.ResolvedIssues) + len(plan.SkippedIssues), TotalItems: len(plan.RecycleItems) + len(plan.Items), CreatedAt: now, UpdatedAt: now}

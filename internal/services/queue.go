@@ -308,6 +308,7 @@ type JobDTO struct {
 	ETASeconds            *int64            `json:"eta_seconds"`
 	LastErrorCode         string            `json:"last_error_code"`
 	LastErrorMessage      string            `json:"last_error_message"`
+	WaitReason            *JobWaitReasonDTO `json:"wait_reason,omitempty"`
 	NextAttemptAt         *time.Time        `json:"next_attempt_at"`
 	CancellationRequested bool              `json:"cancellation_requested"`
 	InterruptPending      string            `json:"interrupt_pending"`
@@ -403,6 +404,9 @@ func (s *QueueService) List(actor Actor, filter JobListFilter) (JobPage, error) 
 	for _, job := range jobs {
 		list = append(list, s.toDTO(job, nil))
 	}
+	if err := s.projectJobWaitReasons(actor, jobs, list); err != nil {
+		return JobPage{}, err
+	}
 	return JobPage{List: list, Total: total, Page: filter.Page, PageSize: filter.PageSize}, nil
 }
 
@@ -421,7 +425,11 @@ func (s *QueueService) Get(actor Actor, id string) (JobDTO, error) {
 	} else if err != gorm.ErrRecordNotFound {
 		return JobDTO{}, err
 	}
-	return s.toDTO(job, actionPtr), nil
+	dtos := []JobDTO{s.toDTO(job, actionPtr)}
+	if err := s.projectJobWaitReasons(actor, []models.Job{job}, dtos); err != nil {
+		return JobDTO{}, err
+	}
+	return dtos[0], nil
 }
 
 func (s *QueueService) Attempts(actor Actor, id string) ([]models.JobAttempt, error) {
