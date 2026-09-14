@@ -63,7 +63,10 @@ try {
         try {
             $publicKey = [Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPublicKey($certificate)
             try {
-                if ($publicKey.KeySize -lt 3072) { throw "Generated Node TLS key is only $($publicKey.KeySize) bits." }
+                # RSAOpenSsl exposes KeySize inconsistently through PowerShell's
+                # property adapter; exported public parameters work on every OS.
+                $keySizeBits = $publicKey.ExportParameters($false).Modulus.Length * 8
+                if ($keySizeBits -lt 3072) { throw "Generated Node TLS key is only $keySizeBits bits." }
             } finally { $publicKey.Dispose() }
             $san = ($certificate.Extensions | Where-Object { $_.Oid.Value -eq '2.5.29.17' }).Format($false)
             if (-not $san.Contains('localhost') -or -not $san.Contains('127.0.0.1') -or -not $san.Contains('192.0.2.44')) { throw "Generated Node TLS SAN is incomplete: $san" }

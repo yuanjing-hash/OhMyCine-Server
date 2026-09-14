@@ -140,7 +140,7 @@ function New-ReleasePublicKey {
         $pem = [Text.Encoding]::UTF8.GetString($pemBytes)
         $rsa = [Security.Cryptography.RSA]::Create()
         $rsa.ImportFromPem($pem)
-        if ($rsa.KeySize -lt 3072) { Fail 'embedded release public key is too small' }
+        if (($rsa.ExportParameters($false).Modulus.Length * 8) -lt 3072) { Fail 'embedded release public key is too small' }
         return $rsa
     } catch {
         Fail 'embedded release public key is invalid'
