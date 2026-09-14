@@ -277,12 +277,14 @@ func TestMediaLibraryTenEpisodeScanRepairsRegressedChangeRevision(t *testing.T) 
 		}
 	}
 
-	run, err := service.reconcile(context.Background(), created.ID, "event")
+	// This fixture enumerates the whole library to repair revision state; it
+	// does not represent a provider event with a bounded change scope.
+	run, err := service.Scan(context.Background(), actor, created.ID, "full")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if run.Status != "success" || run.Added != 10 || run.Matched != 1 || run.Generation != 1 {
-		t.Fatalf("event run=%+v", run)
+		t.Fatalf("full run=%+v", run)
 	}
 	var entryCount, recognitionCount int64
 	if err := db.Model(&models.MediaLibraryEntry{}).Where("library_id = ?", created.ID).Count(&entryCount).Error; err != nil {
