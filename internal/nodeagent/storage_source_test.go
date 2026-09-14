@@ -180,7 +180,7 @@ func TestStorageSourceRestartDoesNotResubmitAndResumesVerifiedChunks(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	defer func() { _ = store.Close() }()
 	config := Config{NodeID: "node-1", ListenAddress: "127.0.0.1:0", DataDirectory: root, ManagedRoot: managed, SealingPrivateKeyFile: filepath.Join(root, "node.seal.key"), MaxConcurrentOperations: 1, AllowInsecureDevelopment: true}
 	if err := EnsureSealingIdentity(config); err != nil {
 		t.Fatal(err)
@@ -354,7 +354,7 @@ func TestStorageSourceShareReconcilesBeforeAndAfterReceive(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer store.Close()
+			defer func() { _ = store.Close() }()
 			config := Config{NodeID: "node-1", ListenAddress: "127.0.0.1:0", DataDirectory: root, ManagedRoot: managed, SealingPrivateKeyFile: filepath.Join(root, "node.seal.key"), MaxConcurrentOperations: 1, AllowInsecureDevelopment: true}
 			if err := EnsureSealingIdentity(config); err != nil {
 				t.Fatal(err)
@@ -409,7 +409,7 @@ func TestStorageSourceCredentialRejectsSourceIdentityDrift(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	defer func() { _ = store.Close() }()
 	config := Config{NodeID: "node-1", ListenAddress: "127.0.0.1:0", DataDirectory: root, ManagedRoot: filepath.Join(root, "managed"), SealingPrivateKeyFile: filepath.Join(root, "node.seal.key"), MaxConcurrentOperations: 1, AllowInsecureDevelopment: true}
 	if err := EnsureSealingIdentity(config); err != nil {
 		t.Fatal(err)

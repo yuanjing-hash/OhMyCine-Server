@@ -1,6 +1,7 @@
 package services
 
 import (
+	"context"
 	"encoding/json"
 	"path/filepath"
 	"strings"
@@ -72,7 +73,7 @@ func TestTransferNodeEnrollmentTokenIsOneTimeEncryptedAndRedacted(t *testing.T) 
 	service, actor := transferNodeFixture(t)
 	now := time.Date(2026, 9, 10, 8, 0, 0, 0, time.UTC)
 	service.now = func() time.Time { return now }
-	node, token, err := service.Create(nil, actor, CreateTransferNodeInput{Name: "  公网节点 A  ", APIURL: "https://node.example.com:4433/", Platform: "linux", Architecture: "amd64"}, RequestContext{})
+	node, token, err := service.Create(context.Background(), actor, CreateTransferNodeInput{Name: "  公网节点 A  ", APIURL: "https://node.example.com:4433/", Platform: "linux", Architecture: "amd64"}, RequestContext{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -109,7 +110,7 @@ func TestTransferNodeEnrollmentTokenIsOneTimeEncryptedAndRedacted(t *testing.T) 
 
 func TestTransferNodeSettingsRequireOnlineNodeAndUseRevisionCAS(t *testing.T) {
 	service, actor := transferNodeFixture(t)
-	node, _, err := service.Create(nil, actor, CreateTransferNodeInput{Name: "Node A", APIURL: "https://node.example.com", Platform: "windows", Architecture: "amd64"}, RequestContext{})
+	node, _, err := service.Create(context.Background(), actor, CreateTransferNodeInput{Name: "Node A", APIURL: "https://node.example.com", Platform: "windows", Architecture: "amd64"}, RequestContext{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -137,7 +138,7 @@ func TestTransferNodeSettingsRequireOnlineNodeAndUseRevisionCAS(t *testing.T) {
 
 func TestTransferNodeMustBeRevokedAndUnreferencedBeforeDeletion(t *testing.T) {
 	service, actor := transferNodeFixture(t)
-	node, _, err := service.Create(nil, actor, CreateTransferNodeInput{Name: "Node A", APIURL: "https://node.example.com", Platform: "linux", Architecture: "arm64"}, RequestContext{})
+	node, _, err := service.Create(context.Background(), actor, CreateTransferNodeInput{Name: "Node A", APIURL: "https://node.example.com", Platform: "linux", Architecture: "arm64"}, RequestContext{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -159,7 +160,7 @@ func TestTransferNodeMustBeRevokedAndUnreferencedBeforeDeletion(t *testing.T) {
 func TestTransferNodePermissionsAreEnforcedInService(t *testing.T) {
 	service, actor := transferNodeFixture(t)
 	actor.Permissions = map[string]struct{}{}
-	if _, _, err := service.Create(nil, actor, CreateTransferNodeInput{Name: "Node A", APIURL: "https://node.example.com", Platform: "linux", Architecture: "amd64"}, RequestContext{}); ErrorCode(err) != CodePermissionDenied {
+	if _, _, err := service.Create(context.Background(), actor, CreateTransferNodeInput{Name: "Node A", APIURL: "https://node.example.com", Platform: "linux", Architecture: "amd64"}, RequestContext{}); ErrorCode(err) != CodePermissionDenied {
 		t.Fatalf("create permission err=%v", err)
 	}
 	if _, err := service.List(actor); ErrorCode(err) != CodePermissionDenied {

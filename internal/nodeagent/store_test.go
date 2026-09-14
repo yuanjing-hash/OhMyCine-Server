@@ -51,7 +51,7 @@ func TestNodeStoreMigrationsCreateFreshSchemaAndReopenIdempotently(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer reopened.Close()
+	defer func() { _ = reopened.Close() }()
 	gotVersions, gotAppliedAt := nodeMigrationLedger(t, reopened.db)
 	if !reflect.DeepEqual(gotVersions, wantVersions) || !reflect.DeepEqual(gotAppliedAt, appliedAt) {
 		t.Fatalf("reopen changed migration ledger: versions=%v applied_at=%v", gotVersions, gotAppliedAt)
@@ -88,7 +88,7 @@ func TestNodeStoreMigrationUpgradesV3ToV4WithoutChangingV3Data(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer upgraded.Close()
+	defer func() { _ = upgraded.Close() }()
 	versions, _ := nodeMigrationLedger(t, upgraded.db)
 	if !reflect.DeepEqual(versions, []int{1, 2, 3, 4, 5, 6, 7}) {
 		t.Fatalf("upgrade versions=%v", versions)
@@ -123,7 +123,7 @@ func TestNodeStoreFailedMigrationRollsBackSchemaAndDoesNotRecordVersion(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 	versions, _ := nodeMigrationLedger(t, db)
 	if !reflect.DeepEqual(versions, []int{1, 2, 3}) {
 		t.Fatalf("failed migration was recorded: versions=%v", versions)
@@ -164,7 +164,7 @@ func TestNodeStoreFailedV6MigrationRollsBackFirstColumn(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 	versions, _ := nodeMigrationLedger(t, db)
 	if !reflect.DeepEqual(versions, []int{1, 2, 3, 4, 5}) {
 		t.Fatalf("failed v6 migration was recorded: versions=%v", versions)
@@ -184,7 +184,7 @@ func nodeMigrationLedger(t *testing.T, db *sql.DB) ([]int, []time.Time) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var versions []int
 	var appliedAt []time.Time
 	for rows.Next() {
@@ -218,7 +218,7 @@ func TestStoreOperationIdempotencyAndConflict(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	defer func() { _ = store.Close() }()
 	now := time.Now().UTC().Truncate(time.Millisecond)
 	plan := nodeprotocol.OperationPlan{ProtocolVersion: 1, OperationKey: "op-1", TaskID: "task-1", NodeID: "node-1", Kind: "test", PlanRevision: 1, LeaseEpoch: 1, LeaseExpiresAt: now.Add(time.Minute), Payload: json.RawMessage(`{}`)}
 	digest, _ := plan.Digest()
@@ -240,7 +240,7 @@ func TestStoreLeaseDoesNotRegress(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	defer func() { _ = store.Close() }()
 	now := time.Now().UTC().Truncate(time.Millisecond)
 	plan := nodeprotocol.OperationPlan{ProtocolVersion: 1, OperationKey: "op-1", TaskID: "task-1", NodeID: "node-1", Kind: "test", PlanRevision: 1, LeaseEpoch: 2, LeaseExpiresAt: now.Add(time.Minute), Payload: json.RawMessage(`{}`)}
 	digest, _ := plan.Digest()

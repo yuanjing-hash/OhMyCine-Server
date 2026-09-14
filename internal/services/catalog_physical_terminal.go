@@ -55,6 +55,12 @@ func finalizeTerminalNoIOCatalogJobTx(tx *gorm.DB, jobID string) error {
 		return err
 	}
 	for _, proof := range admitted {
+		// Repair readiness distinguishes an unentered cancellation from a
+		// published physical result. Preserve its admission as no-I/O evidence;
+		// an explicit retry must still reactivate this exact owner.
+		if proof.OwnerKind == CatalogPhysicalRepair {
+			continue
+		}
 		if err := settleAdmittedCatalogPhysicalWriteTx(tx, proof); err != nil {
 			return err
 		}

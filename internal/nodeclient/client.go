@@ -265,7 +265,7 @@ func (c *Client) doWithHeaders(ctx context.Context, method, path string, input, 
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		var remote nodeprotocol.ErrorResponse
 		if decodeBoundedJSON(resp.Body, &remote) == nil && strings.TrimSpace(remote.Code) != "" {
@@ -297,7 +297,7 @@ func doJSON(ctx context.Context, client *http.Client, method, target, token stri
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return errors.New("node_enrollment_request_failed")
 	}

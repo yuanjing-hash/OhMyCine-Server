@@ -65,7 +65,7 @@ func (c *Client) ReadFileChunk(ctx context.Context, input ReadFileChunkRequest) 
 	if err != nil {
 		return nil, err
 	}
-	defer response.Body.Close()
+	defer func() { _ = response.Body.Close() }()
 	if response.StatusCode != http.StatusPartialContent {
 		return nil, decodeRemoteResponseError(response)
 	}
@@ -99,7 +99,7 @@ func (c *Client) fileExportJSON(ctx context.Context, path, taskID string, output
 	if err != nil {
 		return err
 	}
-	defer response.Body.Close()
+	defer func() { _ = response.Body.Close() }()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		return decodeRemoteResponseError(response)
 	}

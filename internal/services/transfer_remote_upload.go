@@ -271,11 +271,12 @@ func (w *TransferWorker) executeRemoteUploadBatch(ctx context.Context, runtime J
 			return err
 		}
 		phase := nodeprotocol.PhaseUploadingTarget
-		if response.Status == nodeprotocol.StorageActionWaitingCredentials {
+		switch response.Status {
+		case nodeprotocol.StorageActionWaitingCredentials:
 			phase = nodeprotocol.PhaseWaitingCredentials
-		} else if response.Status == nodeprotocol.StorageActionReconciliation {
+		case nodeprotocol.StorageActionReconciliation:
 			phase = nodeprotocol.PhaseVerifyingTarget
-		} else if response.Status == nodeprotocol.StorageActionCompleted {
+		case nodeprotocol.StorageActionCompleted:
 			phase = nodeprotocol.PhaseCompleted
 		}
 		status := nodeprotocol.OperationRunning

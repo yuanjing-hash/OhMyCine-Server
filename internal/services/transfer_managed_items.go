@@ -11,21 +11,6 @@ import (
 	"gorm.io/gorm/clause"
 )
 
-// captureLocalManagedItems persists ownership only for files whose completed
-// destination was durably recorded by the transfer worker. A truncated public
-// plan deliberately results in a conservative partial ownership manifest.
-func captureLocalManagedItems(tx *gorm.DB, task models.TransferTask, download models.DownloadTask, summary TransferPlanSummary) error {
-	for _, item := range summary.Items {
-		if item.Result != "completed" {
-			continue
-		}
-		if err := upsertManagedItem(tx, task, download, item.RelativePath, item.Kind, item.Size, "", ""); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 func captureCloudManagedItems(tx *gorm.DB, task models.TransferTask, download models.DownloadTask, targets []transferTargetItem, state cloudTransferState) error {
 	for _, target := range targets {
 		key := normalizedManifestPath(target.File.RelativePath)

@@ -549,7 +549,7 @@ func TestLocalWatcherDeliversPathAndRetriesFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	listener := localMediaLibraryListener{watcher: watcher, incremental: time.Hour}
-	defer listener.Close()
+	defer func() { _ = listener.Close() }()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	target := filepath.Join(root, "Show.S01E01.mkv")
@@ -579,7 +579,7 @@ func TestLocalWatcherUnresolvablePathDoesNotBlockValidFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	listener := localMediaLibraryListener{watcher: watcher, incremental: time.Hour}
-	defer listener.Close()
+	defer func() { _ = listener.Close() }()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	bad := filepath.Join(root, "a-unresolved.mkv")

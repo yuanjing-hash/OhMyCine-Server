@@ -21,12 +21,10 @@ func TestCatalogArtifactIncrementalV96UpgradeRecoveryAndRepeat(t *testing.T) {
 		t.Fatal(err)
 	}
 	owned := models.MediaArtifact{OpaqueID: "artifact-owned-manifest-v96", RunID: protected.ID, LibraryID: library.ID, SourceIdentity: "recognition:1", Kind: models.MediaArtifactKindNFO, TargetKind: models.MediaArtifactTargetLocalAdjacent, RelativePath: "/owned/tvshow.nfo", Managed: true, Active: true, Status: models.MediaArtifactStatusCompleted, CreatedAt: now, UpdatedAt: now}
-	if err := db.Create(&owned).Error; err != nil {
+	if err := db.Omit("source_fingerprint").Create(&owned).Error; err != nil {
 		t.Fatal(err)
 	}
-	if err := Migrate(db); err != nil {
-		t.Fatal(err)
-	}
+	applyMigrationsThrough(t, db, 96)
 	for _, column := range []string{"scope_mode", "scope_prepared", "scope_entry_after_id", "scope_asset_after_id", "scope_recognition_after_id"} {
 		if !db.Migrator().HasColumn("catalog_artifact_bindings", column) {
 			t.Fatalf("missing catalog_artifact_bindings.%s", column)

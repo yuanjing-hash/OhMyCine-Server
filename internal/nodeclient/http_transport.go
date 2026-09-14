@@ -33,7 +33,7 @@ func (t *signedTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		return nil, err
 	}
 	body, readErr := io.ReadAll(io.LimitReader(resp.Body, nodeprotocol.MaxHTTPResponseBytes+1))
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if readErr != nil {
 		return nil, readErr
 	}

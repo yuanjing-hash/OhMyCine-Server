@@ -250,9 +250,10 @@ func (a *API) PluginResourceCaptchaAsset(c *gin.Context) {
 	if err != nil {
 		code := hostapi.ErrorCode(err)
 		appCode, message := services.CodePluginAssetExpired, "资源站验证码已过期，请重新登录"
-		if code == "plugin_asset_range_invalid" {
+		switch code {
+		case "plugin_asset_range_invalid":
 			appCode, message = services.CodeInvalidRequest, "资源站验证码请求无效"
-		} else if code == "plugin_asset_reference_denied" {
+		case "plugin_asset_reference_denied":
 			appCode, message = services.CodePermissionDenied, "资源站验证码引用无效"
 		}
 		writeError(c, a.log, &services.AppError{Code: appCode, Message: message, Cause: err})

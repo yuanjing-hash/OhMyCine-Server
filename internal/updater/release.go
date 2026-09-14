@@ -56,7 +56,8 @@ func AssetNames(version, goos, goarch string) (PlatformAssets, error) {
 	if err != nil || parsed.String() != version {
 		return PlatformAssets{}, coded(CodeInvalidRelease, errors.New("release version is invalid"))
 	}
-	if !((goos == "windows" && goarch == "amd64") || (goos == "linux" && (goarch == "amd64" || goarch == "arm64"))) {
+	supported := goos == "windows" && goarch == "amd64" || goos == "linux" && (goarch == "amd64" || goarch == "arm64")
+	if !supported {
 		return PlatformAssets{}, coded(CodeUnsupportedPlatform, errors.New("self-update is not supported on this platform"))
 	}
 	platform := goos + "-x64"

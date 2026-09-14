@@ -54,8 +54,6 @@ func validateStructureMutation(boundary StructureBoundary) error {
 
 type StructureProgress func(processed, total int) error
 
-var activeStructureRepairPhases = []string{"queued", "executing", "reconciling"}
-
 type MediaLibraryStructureBackend interface {
 	StorageType() string
 	ValidateRecycle(context.Context, StructureBoundary) error
@@ -2767,38 +2765,6 @@ func (b pan115MediaLibraryStructureBackend) Apply(ctx context.Context, boundary 
 		protected[id] = struct{}{}
 	}
 	return cleanupEmptyProviderStructureDirectories(ctx, driver, mutations, rootID, oldParents, protected, boundary.beforeMutation)
-}
-
-func providerParentWithinRootCached(ctx context.Context, driver cloudpkg.Driver, parentID, rootID string, cache map[string]bool) (bool, error) {
-	if within, ok := cache[parentID]; ok {
-		return within, nil
-	}
-	within, err := providerParentWithinRoot(ctx, driver, parentID, rootID)
-	if err == nil {
-		cache[parentID] = within
-	}
-	return within, err
-}
-
-func providerChildrenByName(ctx context.Context, driver cloudpkg.Driver, parentID string) (map[string]string, error) {
-	children := make(map[string]string)
-	for offset := int64(0); ; {
-		page, err := driver.List(cloudpkg.WithReadClass(ctx, cloudpkg.ReadClassBackground), parentID, cloudpkg.PageRequest{Offset: offset, Limit: 200})
-		if err != nil {
-			return nil, err
-		}
-		for _, child := range page.Items {
-			key := strings.ToLower(child.Name)
-			if prior := children[key]; prior != "" && prior != child.ID {
-				return nil, errStructureConflict
-			}
-			children[key] = child.ID
-		}
-		if !page.HasMore || len(page.Items) == 0 {
-			return children, nil
-		}
-		offset += int64(len(page.Items))
-	}
 }
 
 func providerChildID(ctx context.Context, driver cloudpkg.Driver, parentID, name string) (string, error) {

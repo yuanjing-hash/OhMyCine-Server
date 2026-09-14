@@ -137,7 +137,7 @@ func hashExportFile(ctx context.Context, filename string, expectedSize int64) (s
 	if err != nil {
 		return "", nil, errors.New("node_managed_file_invalid")
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 	before, err := file.Stat()
 	if err != nil || !before.Mode().IsRegular() || before.Size() != expectedSize {
 		return "", nil, errors.New("node_managed_file_invalid")

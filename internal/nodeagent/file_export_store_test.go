@@ -17,7 +17,7 @@ func TestStoreFileExportIsPagedTaskBoundAndIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	defer func() { _ = store.Close() }()
 	now := time.Now().UTC().Truncate(time.Millisecond)
 	record := FileExportRecord{
 		Summary: nodeprotocol.FileExportSummary{OperationKey: "export:task-1", TaskID: "task-1", Name: "Movie", ManifestDigest: strings.Repeat("a", 64), TotalFiles: 1, TotalBytes: 3, ChunkSize: nodeprotocol.FileChunkSize, CreatedAt: now, ExpiresAt: now.Add(time.Hour)},

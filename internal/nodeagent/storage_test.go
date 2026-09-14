@@ -146,7 +146,7 @@ func TestStorageUploadRunsInBackgroundPersistsCheckpointAndReusesReceipt(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	defer func() { _ = store.Close() }()
 	agent, err := New(Config{NodeID: "node-1", ListenAddress: "127.0.0.1:0", DataDirectory: root, ManagedRoot: managed, SealingPrivateKeyFile: filepath.Join(root, "missing.key"), MaxConcurrentOperations: 1, AllowInsecureDevelopment: true}, store)
 	if err != nil {
 		t.Fatal(err)
@@ -215,7 +215,7 @@ func TestStorageUploadRunsInBackgroundPersistsCheckpointAndReusesReceipt(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resultHTTP.Body.Close()
+	defer func() { _ = resultHTTP.Body.Close() }()
 	if resultHTTP.StatusCode != http.StatusOK {
 		t.Fatalf("result query status=%d", resultHTTP.StatusCode)
 	}

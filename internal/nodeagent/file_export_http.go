@@ -92,7 +92,7 @@ func (a *Agent) fileExportRange(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "node_managed_file_changed", "远端文件已变化，需要重新核验清单")
 		return
 	}
-	defer handle.Close()
+	defer func() { _ = handle.Close() }()
 	if _, err := handle.Seek(start, io.SeekStart); err != nil {
 		writeError(w, http.StatusConflict, "node_managed_file_changed", "远端文件已变化，需要重新核验清单")
 		return

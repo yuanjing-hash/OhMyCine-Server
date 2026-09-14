@@ -189,7 +189,8 @@ func TestRemoteUploadResponsePersistsTerminalReceiptsAndSummary(t *testing.T) {
 
 func TestRemoteUploadOperationKeyIsStablePerBatch(t *testing.T) {
 	taskID := uuid.NewString()
-	if remoteUploadOperationKey(taskID, 0) != remoteUploadOperationKey(taskID, 0) || remoteUploadOperationKey(taskID, 0) == remoteUploadOperationKey(taskID, 1) {
+	firstKey := remoteUploadOperationKey(taskID, 0)
+	if firstKey != remoteUploadOperationKey(taskID, 0) || firstKey == remoteUploadOperationKey(taskID, 1) {
 		t.Fatal("remote upload operation key is not stable per batch")
 	}
 }

@@ -43,7 +43,6 @@ func TestStorageSourceClientLostAcknowledgementKeepsIdempotencyIdentity(t *testi
 		}
 	}))
 	defer server.Close()
-
 	client := testStorageSourceClient(t, server, operation, func(call int) nodeprotocol.CredentialGrantEnvelope {
 		return nodeprotocol.CredentialGrantEnvelope{GrantID: "grant-" + strconv.Itoa(call)}
 	})
@@ -99,7 +98,6 @@ func TestStorageSourceClientReissuesCredentialAfterExpiry(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-
 	client := testStorageSourceClient(t, server, operation, func(call int) nodeprotocol.CredentialGrantEnvelope {
 		return nodeprotocol.CredentialGrantEnvelope{GrantID: "rotated-grant-" + strconv.Itoa(call)}
 	})
@@ -134,7 +132,6 @@ func TestStorageSourceClientRenewsLeaseBeforeAction(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-
 	client := testStorageSourceClient(t, server, operation, nil)
 	if _, err := client.Get(context.Background(), operation.Plan.OperationKey); err != nil {
 		t.Fatal(err)
@@ -169,7 +166,6 @@ func TestStorageSourceClientReadsCompletedFileExport(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-
 	client := testStorageSourceClient(t, server, operation, nil)
 	manifest, err := client.Manifest(context.Background(), operation.Plan.OperationKey)
 	if err != nil {
@@ -200,7 +196,6 @@ func TestStorageSourceClientCancelAlsoCleansManagedSource(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-
 	client := testStorageSourceClient(t, server, operation, nil)
 	if err := client.Cancel(context.Background(), operation.Plan.OperationKey, false); err != nil {
 		t.Fatal(err)
@@ -234,7 +229,6 @@ func TestStorageSourceCleanupRetryDoesNotReplayMaterialization(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-
 	operation.Completed = true
 	client := testStorageSourceClient(t, server, operation, nil)
 	if err := client.CleanupManagedSource(context.Background()); err == nil {
@@ -260,7 +254,6 @@ func TestStorageSourceClientRejectsPlanAndHTTPSourceDrift(t *testing.T) {
 		http.NotFound(w, r)
 	}))
 	defer server.Close()
-
 	client := testStorageSourceClient(t, server, operation, func(int) nodeprotocol.CredentialGrantEnvelope {
 		grantCalls++
 		return nodeprotocol.CredentialGrantEnvelope{GrantID: "grant"}

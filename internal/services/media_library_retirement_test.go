@@ -333,7 +333,7 @@ func TestLibraryRetirementStopsAndRemovesExactLibraryTransferOnly(t *testing.T) 
 			t.Fatal(err)
 		}
 		status := models.JobStatusCompleted
-		var finished *time.Time = &now
+		finished := &now
 		job := models.Job{ID: prefix + "-transfer-job", OwnerID: &ownerID, CreatedByKind: "user", JobType: "transfer", Priority: 1, LanePosition: 1, Revision: 1, Status: status, DisplayName: prefix + " transfer", ResourceKey: "library:" + uintID(target.ID), PayloadJSON: `{"transfer_task_id":"` + prefix + `-transfer"}`, CheckpointJSON: `{}`, Generation: 1, FinishedAt: finished, CreatedAt: now, UpdatedAt: now}
 		if running {
 			job.Status, job.FinishedAt = models.JobStatusRunning, nil
@@ -361,6 +361,17 @@ func TestLibraryRetirementStopsAndRemovesExactLibraryTransferOnly(t *testing.T) 
 	}
 	job, transfer, proof := createPipeline("selected", library, true)
 	otherJob, otherTransfer, _ := createPipeline("other", other, false)
+	for _, task := range []models.TransferTask{transfer, otherTransfer} {
+		for i := 0; i < CatalogBatchRows+1; i++ {
+			fileToken := fmt.Sprintf("file-%d", i)
+			if err := s.db.Create(&models.RemoteTransferFile{TransferTaskID: task.ID, DownloadTaskID: task.DownloadTaskID, FileToken: fileToken, RelativePath: fileToken, CompletedBitmap: []byte{}, CreatedAt: now, UpdatedAt: now}).Error; err != nil {
+				t.Fatal(err)
+			}
+			if err := s.db.Create(&models.RemoteUploadFile{TransferTaskID: task.ID, DownloadTaskID: task.DownloadTaskID, Ordinal: i, SourceFileToken: fileToken, CreatedAt: now, UpdatedAt: now}).Error; err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
 	claim, row := claimRetirement(t, s, library, actor)
 	var frozen int64
 	if err := s.db.Model(&models.MediaLibraryRetirementJob{}).Where("retirement_id = ? AND job_id = ?", row.ID, job.ID).Count(&frozen).Error; err != nil || frozen != 1 {
@@ -403,9 +414,10 @@ func TestLibraryRetirementStopsAndRemovesExactLibraryTransferOnly(t *testing.T) 
 	}
 	for label, model := range map[string]any{"selected transfer": &models.TransferTask{}, "selected job": &models.Job{}, "selected proof": &models.CatalogPhysicalWrite{}} {
 		id := any(transfer.ID)
-		if label == "selected job" {
+		switch label {
+		case "selected job":
 			id = job.ID
-		} else if label == "selected proof" {
+		case "selected proof":
 			id = proof.ID
 		}
 		if err := s.db.First(model, "id = ?", id).Error; !errors.Is(err, gorm.ErrRecordNotFound) {
@@ -420,6 +432,18 @@ func TestLibraryRetirementStopsAndRemovesExactLibraryTransferOnly(t *testing.T) 
 	}
 	if err := s.db.First(&models.DownloadTask{}, "id = ?", "selected-download").Error; err != nil {
 		t.Fatalf("upstream download history removed: %v", err)
+	}
+	for _, model := range []any{&models.RemoteTransferFile{}, &models.RemoteUploadFile{}} {
+		for _, task := range []models.TransferTask{transfer, otherTransfer} {
+			var count int64
+			want := int64(0)
+			if task.ID == otherTransfer.ID {
+				want = CatalogBatchRows + 1
+			}
+			if err := s.db.Model(model).Where("transfer_task_id = ?", task.ID).Count(&count).Error; err != nil || count != want {
+				t.Fatalf("remote checkpoint retirement scope: model=%T task=%s count=%d want=%d err=%v", model, task.ID, count, want, err)
+			}
+		}
 	}
 }
 

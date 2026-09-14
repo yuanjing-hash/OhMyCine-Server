@@ -682,7 +682,7 @@ func (a *Agent) downloadStorageSourceFile(ctx context.Context, serverID string, 
 	}
 	chunks, err := a.store.StorageSourceChunks(ctx, input.OperationKey, file.Ordinal)
 	if err != nil {
-		handle.Close()
+		_ = handle.Close()
 		return err
 	}
 	buffer := make([]byte, nodeprotocol.FileChunkSize)
@@ -698,40 +698,40 @@ func (a *Agent) downloadStorageSourceFile(ctx context.Context, serverID string, 
 				}
 			}
 			if err := a.store.DeleteStorageSourceChunk(ctx, input.OperationKey, file.Ordinal, chunkIndex); err != nil {
-				handle.Close()
+				_ = handle.Close()
 				return err
 			}
 		}
 		read, err := driver.OpenRead(ctx, cloud.ReadRequest{FileID: file.ProviderFileID, Offset: offset})
 		if err != nil {
-			handle.Close()
+			_ = handle.Close()
 			return err
 		}
 		if read.TotalSize == nil || *read.TotalSize != file.Size || offset > 0 && !read.OffsetAccepted {
-			read.Body.Close()
-			handle.Close()
+			_ = read.Body.Close()
+			_ = handle.Close()
 			return errors.New(nodeprotocol.ErrorReconciliationNeeded)
 		}
 		payload := buffer[:size]
 		_, readErr := io.ReadFull(read.Body, payload)
 		closeErr := read.Body.Close()
 		if readErr != nil || closeErr != nil {
-			handle.Close()
+			_ = handle.Close()
 			return errors.New("node_source_read_incomplete")
 		}
 		if _, err := handle.WriteAt(payload, offset); err != nil || handle.Sync() != nil {
-			handle.Close()
+			_ = handle.Close()
 			return errors.New("node_source_staging_write_failed")
 		}
 		digest := sha256.Sum256(payload)
 		checkpoint := nodeprotocol.FileChunkDigest{Index: chunkIndex, Offset: offset, Size: size, SHA256: hex.EncodeToString(digest[:])}
 		if err := a.store.SaveStorageSourceChunk(ctx, input.OperationKey, file.Ordinal, checkpoint, a.now()); err != nil {
-			handle.Close()
+			_ = handle.Close()
 			return err
 		}
 	}
 	if err := handle.Sync(); err != nil {
-		handle.Close()
+		_ = handle.Close()
 		return err
 	}
 	if err := handle.Close(); err != nil {
@@ -870,7 +870,7 @@ func storageSourceFilesQuery(ctx context.Context, db storageSourceQueryer, opera
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	files := make([]StorageSourceFile, 0, limit)
 	for rows.Next() {
 		var file StorageSourceFile
@@ -887,7 +887,7 @@ func storageSourceChunksQuery(ctx context.Context, db storageSourceQueryer, oper
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	result := make(map[int]nodeprotocol.FileChunkDigest)
 	for rows.Next() {
 		var chunk nodeprotocol.FileChunkDigest
@@ -974,12 +974,12 @@ func openStorageSourcePartial(filename string, size int64) (*os.File, error) {
 	}
 	info, err := file.Stat()
 	if err != nil || !info.Mode().IsRegular() {
-		file.Close()
+		_ = file.Close()
 		return nil, errors.New("node_source_partial_invalid")
 	}
 	if info.Size() != size {
 		if err := file.Truncate(size); err != nil {
-			file.Close()
+			_ = file.Close()
 			return nil, err
 		}
 	}
@@ -991,7 +991,7 @@ func hashSourcePath(ctx context.Context, filename string, expectedSize int64) (s
 	if err != nil {
 		return "", "", err
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 	info, err := file.Stat()
 	if err != nil || !info.Mode().IsRegular() || info.Size() != expectedSize {
 		return "", "", errors.New("node_source_file_invalid")
@@ -1076,9 +1076,10 @@ func storageSourceErrorCode(err error) string {
 func writeStorageSourceError(w http.ResponseWriter, err error) {
 	code := storageSourceErrorCode(err)
 	status := http.StatusConflict
-	if code == nodeprotocol.ErrorCredentialExpired {
+	switch code {
+	case nodeprotocol.ErrorCredentialExpired:
 		status = http.StatusForbidden
-	} else if code == "node_source_unavailable" {
+	case "node_source_unavailable":
 		status = http.StatusBadGateway
 	}
 	writeError(w, status, code, fmt.Sprintf("节点无法接受来源存储操作：%s", storageSourceSafeMessage(code)))

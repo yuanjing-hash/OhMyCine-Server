@@ -31,7 +31,7 @@ func TestFileExportHTTPRequiresTaskBoundExactVerifiedRanges(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	defer func() { _ = store.Close() }()
 	now := time.Now().UTC().Truncate(time.Millisecond)
 	record, err := buildFileExport(context.Background(), managed, "server-1", "export:task-1", ManagedDownload{TaskID: "task-1", NodeLocalRoot: downloadRoot}, downloadpkg.Manifest{Complete: true, Files: []downloadpkg.File{{RelativePath: "movie.mkv", Size: 6}}}, now, now.Add(time.Hour))
 	if err != nil {
@@ -47,7 +47,6 @@ func TestFileExportHTTPRequiresTaskBoundExactVerifiedRanges(t *testing.T) {
 	agent.now = func() time.Time { return now }
 	server := httptest.NewServer(agent.Handler())
 	defer server.Close()
-
 	request := func(target, taskID, byteRange string) *http.Response {
 		req, requestErr := http.NewRequest(http.MethodGet, server.URL+target, nil)
 		if requestErr != nil {
@@ -69,7 +68,7 @@ func TestFileExportHTTPRequiresTaskBoundExactVerifiedRanges(t *testing.T) {
 
 	manifest := request("/node/v1/operations/export:task-1/manifest?page=1&page_size=10", "task-1", "")
 	manifestBody, _ := io.ReadAll(manifest.Body)
-	manifest.Body.Close()
+	_ = manifest.Body.Close()
 	if manifest.StatusCode != http.StatusOK || bytes.Contains(manifestBody, []byte(downloadRoot)) || bytes.Contains(manifestBody, []byte("node_path")) {
 		t.Fatalf("manifest status=%d body=%s", manifest.StatusCode, manifestBody)
 	}
@@ -84,23 +83,23 @@ func TestFileExportHTTPRequiresTaskBoundExactVerifiedRanges(t *testing.T) {
 	token := page.Files[0].FileToken
 
 	wrongTask := request("/node/v1/operations/export:task-1/manifest", "task-2", "")
-	wrongTask.Body.Close()
+	_ = wrongTask.Body.Close()
 	if wrongTask.StatusCode != http.StatusNotFound {
 		t.Fatalf("cross-task manifest status=%d", wrongTask.StatusCode)
 	}
 	missingRange := request("/node/v1/operations/export:task-1/files/"+token, "task-1", "")
-	missingRange.Body.Close()
+	_ = missingRange.Body.Close()
 	if missingRange.StatusCode != http.StatusRequestedRangeNotSatisfiable {
 		t.Fatalf("full-file read status=%d", missingRange.StatusCode)
 	}
 	partialChunk := request("/node/v1/operations/export:task-1/files/"+token, "task-1", "bytes=0-2")
-	partialChunk.Body.Close()
+	_ = partialChunk.Body.Close()
 	if partialChunk.StatusCode != http.StatusRequestedRangeNotSatisfiable {
 		t.Fatalf("non-chunk read status=%d", partialChunk.StatusCode)
 	}
 	valid := request("/node/v1/operations/export:task-1/files/"+token, "task-1", "bytes=0-5")
 	validBody, _ := io.ReadAll(valid.Body)
-	valid.Body.Close()
+	_ = valid.Body.Close()
 	if valid.StatusCode != http.StatusPartialContent || string(validBody) != "abcdef" || valid.Header.Get("Content-Range") != "bytes 0-5/6" || !strings.HasPrefix(valid.Header.Get("ETag"), `"sha256:`) {
 		t.Fatalf("range status=%d headers=%v body=%q", valid.StatusCode, valid.Header, validBody)
 	}
@@ -109,7 +108,7 @@ func TestFileExportHTTPRequiresTaskBoundExactVerifiedRanges(t *testing.T) {
 	}
 	tampered := request("/node/v1/operations/export:task-1/files/"+token, "task-1", "bytes=0-5")
 	tamperedBody, _ := io.ReadAll(tampered.Body)
-	tampered.Body.Close()
+	_ = tampered.Body.Close()
 	if tampered.StatusCode != http.StatusConflict || !bytes.Contains(tamperedBody, []byte("node_checksum_mismatch")) {
 		t.Fatalf("tampered range status=%d body=%s", tampered.StatusCode, tamperedBody)
 	}

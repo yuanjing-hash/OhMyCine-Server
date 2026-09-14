@@ -202,16 +202,6 @@ func (a *providerChangeAccumulator) merge(scope providerChangeScope) {
 	}
 }
 
-func (a *providerChangeAccumulator) markBlocked(code string) {
-	if a == nil {
-		return
-	}
-	a.mu.Lock()
-	a.eventCount++
-	a.markBlockedLocked(code)
-	a.mu.Unlock()
-}
-
 func (a *providerChangeAccumulator) markBlockedLocked(code string) {
 	a.blocked = true
 	if a.blockCode == "" {

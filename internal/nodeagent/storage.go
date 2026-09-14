@@ -296,7 +296,7 @@ func (a *Agent) uploadStorageFile(ctx context.Context, serverID string, input no
 	if err != nil {
 		return result, errors.New(nodeprotocol.ErrorChecksumMismatch)
 	}
-	defer handle.Close()
+	defer func() { _ = handle.Close() }()
 	sha1Digest, err := hashStorageSource(ctx, handle, filePlan.Size, filePlan.SHA256)
 	if err != nil {
 		return result, err
@@ -396,9 +396,10 @@ func (a *Agent) pauseStorageUpload(ctx context.Context, serverID string, input n
 	}
 	_ = a.store.UpdateActionReceipt(ctx, serverID, input.RequestID, response, a.now())
 	phase := nodeprotocol.PhaseUploadingTarget
-	if code == nodeprotocol.ErrorCredentialExpired {
+	switch code {
+	case nodeprotocol.ErrorCredentialExpired:
 		phase = nodeprotocol.PhaseWaitingCredentials
-	} else if code == nodeprotocol.ErrorReconciliationNeeded {
+	case nodeprotocol.ErrorReconciliationNeeded:
 		phase = nodeprotocol.PhaseVerifyingTarget
 	}
 	_ = a.store.UpdateOperationExecution(ctx, serverID, input.OperationKey, input.PlanDigest, nodeprotocol.OperationRunning, phase, code, nil, a.now())
@@ -567,9 +568,10 @@ func storageErrorCode(err error) string {
 func writeStorageError(w http.ResponseWriter, err error) {
 	code := storageErrorCode(err)
 	status := http.StatusConflict
-	if code == nodeprotocol.ErrorCredentialExpired {
+	switch code {
+	case nodeprotocol.ErrorCredentialExpired:
 		status = http.StatusForbidden
-	} else if code == "node_target_unavailable" {
+	case "node_target_unavailable":
 		status = http.StatusBadGateway
 	}
 	writeError(w, status, code, fmt.Sprintf("节点无法接受存储操作：%s", storageSafeMessage(code)))

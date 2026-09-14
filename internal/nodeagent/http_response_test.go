@@ -67,12 +67,12 @@ func TestHTTPReplayNonceSurvivesRestart(t *testing.T) {
 	if !agent.consumeHTTPNonce("nonce") || agent.consumeHTTPNonce("nonce") {
 		t.Fatal("nonce not one-use")
 	}
-	store.Close()
+	_ = store.Close()
 	reopened, err := OpenStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer reopened.Close()
+	defer func() { _ = reopened.Close() }()
 	agent.store = reopened
 	if agent.consumeHTTPNonce("nonce") {
 		t.Fatal("restart accepted replay")

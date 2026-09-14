@@ -158,7 +158,7 @@ func (s *Store) StorageSourceFiles(ctx context.Context, operationKey string, aft
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	files := make([]StorageSourceFile, 0, limit)
 	for rows.Next() {
 		var file StorageSourceFile
@@ -175,7 +175,7 @@ func (s *Store) StorageSourceChunks(ctx context.Context, operationKey string, or
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	result := make(map[int]nodeprotocol.FileChunkDigest)
 	for rows.Next() {
 		var chunk nodeprotocol.FileChunkDigest
@@ -268,7 +268,7 @@ func validSHA1(value string) bool {
 		return false
 	}
 	for _, r := range value {
-		if !(r >= '0' && r <= '9' || r >= 'a' && r <= 'f' || r >= 'A' && r <= 'F') {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') && (r < 'A' || r > 'F') {
 			return false
 		}
 	}

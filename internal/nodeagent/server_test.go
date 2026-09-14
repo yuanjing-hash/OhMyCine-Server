@@ -23,7 +23,7 @@ func TestAgentHealthAndOperationIdempotency(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	defer func() { _ = store.Close() }()
 	agent, err := New(Config{NodeID: "node-1", ListenAddress: "127.0.0.1:0", DataDirectory: dir, ManagedRoot: filepath.Join(dir, "managed"), MaxConcurrentOperations: 2, AllowInsecureDevelopment: true}, store)
 	if err != nil {
 		t.Fatal(err)
@@ -49,7 +49,7 @@ func TestAgentHealthAndOperationIdempotency(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		got.Body.Close()
+		_ = got.Body.Close()
 		if got.StatusCode != expected {
 			t.Fatalf("request %d status=%d expected=%d", index, got.StatusCode, expected)
 		}
@@ -62,7 +62,7 @@ func TestPairedAgentHealthRequiresThePinnedServerIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	defer func() { _ = store.Close() }()
 	now := time.Now().UTC()
 	serverCertificate := []byte("paired-server-certificate")
 	serverSum := sha256.Sum256(serverCertificate)

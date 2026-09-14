@@ -25,7 +25,7 @@ func TestArtifactRecoveryHistoryV97PreservesReferencesAndSeparatesLifetimes(t *t
 		{OpaqueID: "artifact-v97-a", RunID: "run-v97", LibraryID: library.ID, Kind: models.MediaArtifactKindSTRM, TargetKind: models.MediaArtifactTargetLocalProjection, RelativePath: "/a.strm", Managed: true, Active: true, Status: models.MediaArtifactStatusCompleted, CreatedAt: now, UpdatedAt: now},
 		{OpaqueID: "artifact-v97-b", RunID: "run-v97", LibraryID: library.ID, Kind: models.MediaArtifactKindNFO, TargetKind: models.MediaArtifactTargetLocalProjection, RelativePath: "/a.nfo", Managed: true, Active: true, Status: models.MediaArtifactStatusCompleted, CreatedAt: now, UpdatedAt: now},
 	}
-	if err := db.Create(&artifacts).Error; err != nil {
+	if err := db.Omit("source_fingerprint").Create(&artifacts).Error; err != nil {
 		t.Fatal(err)
 	}
 	physical := models.CatalogPhysicalWrite{LibraryID: library.ID, OwnerKind: "artifact", OwnerID: "run-v97", Revision: 1, State: "settled", JobID: job.ID, OwnerDigest: "owner", SourceFingerprint: "source", ConfigFingerprint: "config", EnteredAt: now, SettledAt: &now, UpdatedAt: now}
@@ -42,9 +42,7 @@ func TestArtifactRecoveryHistoryV97PreservesReferencesAndSeparatesLifetimes(t *t
 		t.Fatal(err)
 	}
 
-	if err := Migrate(db); err != nil {
-		t.Fatal(err)
-	}
+	applyMigrationsThrough(t, db, 97)
 	var run models.MediaArtifactRun
 	if err := db.First(&run, "id = ?", "run-v97").Error; err != nil {
 		t.Fatal(err)

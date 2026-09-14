@@ -24,7 +24,7 @@ func remoteDownloaderFixture(t *testing.T) (*TransferNodeService, Actor, *Downlo
 	actor.Permissions[authz.PermissionDownloadersCreate] = struct{}{}
 	actor.Permissions[authz.PermissionDownloadersRead] = struct{}{}
 	actor.Permissions[authz.PermissionDownloadersUpdate] = struct{}{}
-	node, _, err := nodes.Create(nil, actor, CreateTransferNodeInput{Name: "Edge", APIURL: "https://edge.example.com:4433", Platform: "linux", Architecture: "amd64"}, RequestContext{})
+	node, _, err := nodes.Create(context.Background(), actor, CreateTransferNodeInput{Name: "Edge", APIURL: "https://edge.example.com:4433", Platform: "linux", Architecture: "amd64"}, RequestContext{})
 	if err != nil {
 		t.Fatal(err)
 	}

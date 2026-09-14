@@ -92,7 +92,7 @@ func httpSigningMessage(r *http.Request, nodeFingerprint string) ([]byte, error)
 	if r.Body != nil {
 		var err error
 		body, err = io.ReadAll(io.LimitReader(r.Body, (4<<20)+1))
-		r.Body.Close()
+		_ = r.Body.Close()
 		if err != nil || len(body) > 4<<20 {
 			return nil, errors.New("node_request_body_invalid")
 		}

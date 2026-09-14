@@ -43,7 +43,6 @@ func TestTaskDownloaderClientMapsCategoryPathsAndBindsRequests(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-
 	localRoot := t.TempDir()
 	node := &Client{baseURL: server.URL, identity: Identity{ServerID: "server-1"}, http: server.Client()}
 	client, err := NewDownloaderClient(node, "downloader-1", "/qb-downloads", localRoot, "task-42", func(context.Context, string, string, string) (nodeprotocol.CredentialGrantEnvelope, error) {

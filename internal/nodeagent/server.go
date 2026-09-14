@@ -229,7 +229,7 @@ func validEnrollmentID(value string) bool {
 		return false
 	}
 	for _, r := range value {
-		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_' || r == '.' || r == ':') {
+		if (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') && (r < '0' || r > '9') && r != '-' && r != '_' && r != '.' && r != ':' {
 			return false
 		}
 	}
@@ -304,7 +304,7 @@ func (a *Agent) consumeHTTPNonce(nonce string) bool {
 	if err != nil {
 		return false
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	if _, err = tx.Exec(`DELETE FROM http_request_nonces WHERE expires_at <= ?`, now); err != nil {
 		return false
 	}

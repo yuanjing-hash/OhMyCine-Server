@@ -28,7 +28,6 @@ func TestDownloaderActionUsesSealedGrantWithoutPersistingPlaintext(t *testing.T)
 		}
 	}))
 	defer qbit.Close()
-
 	root := t.TempDir()
 	mount := filepath.Join(root, "downloads")
 	if err := os.MkdirAll(mount, 0o700); err != nil {
@@ -38,7 +37,7 @@ func TestDownloaderActionUsesSealedGrantWithoutPersistingPlaintext(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	defer func() { _ = store.Close() }()
 	agent, err := New(Config{NodeID: "node-1", ListenAddress: "127.0.0.1:0", DataDirectory: root, ManagedRoot: root, SealingPrivateKeyFile: filepath.Join(root, "missing.key"), MaxConcurrentOperations: 1, AllowInsecureDevelopment: true}, store)
 	if err != nil {
 		t.Fatal(err)
@@ -52,7 +51,6 @@ func TestDownloaderActionUsesSealedGrantWithoutPersistingPlaintext(t *testing.T)
 	}
 	server := httptest.NewServer(agent.Handler())
 	defer server.Close()
-
 	doNodeJSON(t, server.URL+"/node/v1/credential-grants/grant-1", http.MethodPut, envelope, http.StatusNoContent)
 	action := nodeprotocol.DownloaderActionRequest{RequestID: "request-1", TaskID: "task-1", OperationKey: "operation-1", DownloaderID: "downloader-1", Action: nodeprotocol.DownloaderActionTest, GrantID: "grant-1"}
 	response := doNodeJSON(t, server.URL+"/node/v1/downloader/actions", http.MethodPost, action, http.StatusOK)
@@ -91,7 +89,6 @@ func TestDownloaderCategoryActionValidatesMappingAndReusesReceipt(t *testing.T) 
 		}
 	}))
 	defer qbit.Close()
-
 	root := t.TempDir()
 	mount := filepath.Join(root, "downloads")
 	if err := os.MkdirAll(mount, 0o700); err != nil {
@@ -101,7 +98,7 @@ func TestDownloaderCategoryActionValidatesMappingAndReusesReceipt(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	defer func() { _ = store.Close() }()
 	agent, err := New(Config{NodeID: "node-1", ListenAddress: "127.0.0.1:0", DataDirectory: root, ManagedRoot: root, SealingPrivateKeyFile: filepath.Join(root, "missing.key"), MaxConcurrentOperations: 1, AllowInsecureDevelopment: true}, store)
 	if err != nil {
 		t.Fatal(err)
@@ -159,7 +156,7 @@ func doNodeJSON(t *testing.T, target, method string, input any, status int) []by
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer response.Body.Close()
+	defer func() { _ = response.Body.Close() }()
 	body, _ := io.ReadAll(response.Body)
 	if response.StatusCode != status {
 		t.Fatalf("status=%d body=%s", response.StatusCode, body)

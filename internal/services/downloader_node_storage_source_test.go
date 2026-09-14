@@ -127,7 +127,7 @@ func TestNodeStorageDownloaderRouteCannotChangeAfterAnyTask(t *testing.T) {
 	}
 
 	nodes := NewTransferNodeService(db, NewAuditService(db), connections.credentials)
-	node, _, err := nodes.Create(nil, actor, CreateTransferNodeInput{Name: "Storage node", APIURL: "https://node.example.test", Platform: "linux", Architecture: "amd64"}, RequestContext{})
+	node, _, err := nodes.Create(context.Background(), actor, CreateTransferNodeInput{Name: "Storage node", APIURL: "https://node.example.test", Platform: "linux", Architecture: "amd64"}, RequestContext{})
 	if err != nil {
 		t.Fatal(err)
 	}

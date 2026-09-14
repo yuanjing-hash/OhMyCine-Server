@@ -47,7 +47,7 @@ func TestProductionHTTPEnrollmentHealthAndFullChunk(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	defer func() { _ = store.Close() }()
 	agent, err := nodeagent.New(cfg, store)
 	if err != nil {
 		t.Fatal(err)
@@ -83,7 +83,7 @@ func TestProductionHTTPEnrollmentHealthAndFullChunk(t *testing.T) {
 		t.Fatal(err)
 	}
 	replayBody, _ := io.ReadAll(replay.Body)
-	replay.Body.Close()
+	_ = replay.Body.Close()
 	if replay.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("replay status=%d", replay.StatusCode)
 	}

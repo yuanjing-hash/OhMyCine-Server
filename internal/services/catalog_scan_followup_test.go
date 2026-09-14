@@ -485,3 +485,34 @@ func TestCatalogScanFollowupHealthyCompleteScanDoesNotCreateArtifactWork(t *test
 		t.Fatalf("healthy complete scan created artifact work: bindings=%d runs=%d jobs=%d", bindings, runs, jobs)
 	}
 }
+
+func TestCatalogScanFollowupExplicitFullAuditSurvivesUnchangedCatalog(t *testing.T) {
+	s, lib, _, _ := catalogFollowupFixture(t)
+	s.artifacts = NewMediaArtifactService(s.db, s.queue, nil, zerolog.Nop())
+	s.artifacts.SetCatalogSnapshotStore(s.catalogStore)
+	if err := s.db.Model(&lib).Update("metadata_artifacts_enabled", true).Error; err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	run := models.MediaLibraryScanRun{LibraryID: lib.ID, Generation: 1, Kind: "strm_full_manual", Status: "success", StartedAt: now, FinishedAt: &now}
+	if err := s.db.Create(&run).Error; err != nil {
+		t.Fatal(err)
+	}
+	var head models.CatalogHead
+	if err := s.db.First(&head, "library_id = ?", lib.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.Transaction(func(tx *gorm.DB) error {
+		return s.commitCatalogScanFollowupTx(tx, CatalogScanPublication{Head: head, Run: run, NoContentChange: true})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var binding models.CatalogArtifactBinding
+	if err := s.db.First(&binding, "library_id = ?", lib.ID).Error; err != nil || binding.Generation <= run.Generation {
+		t.Fatalf("explicit audit lost fresh binding: %+v err=%v", binding, err)
+	}
+	var followup models.CatalogScanFollowup
+	if err := s.db.First(&followup, "library_id = ?", lib.ID).Error; err != nil || !followup.ArtifactPending {
+		t.Fatalf("explicit audit intent missing: %+v err=%v", followup, err)
+	}
+}

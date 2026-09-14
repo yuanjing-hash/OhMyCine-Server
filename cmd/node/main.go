@@ -39,7 +39,7 @@ func run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	defer store.Close()
+	defer func() { _ = store.Close() }()
 	agent, err := nodeagent.New(cfg, store)
 	if err != nil {
 		return err

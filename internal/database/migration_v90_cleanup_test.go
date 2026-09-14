@@ -16,7 +16,7 @@ func TestCatalogArtifactCleanupV90PreservesHistoricalMarkersWithoutAttribution(t
 		t.Fatal(err)
 	}
 	artifact := models.MediaArtifact{OpaqueID: "cleanup-private", LibraryID: library.ID, RunID: run.ID, RelativePath: "movie.nfo", Managed: true, Status: models.MediaArtifactStatusCleanup}
-	if err := db.Create(&artifact).Error; err != nil {
+	if err := db.Omit("source_fingerprint").Create(&artifact).Error; err != nil {
 		t.Fatal(err)
 	}
 	if err := Migrate(db); err != nil {

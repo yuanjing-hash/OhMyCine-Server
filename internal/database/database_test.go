@@ -332,9 +332,7 @@ func TestArtifactAutoCleanupMigrationBackfillsHistoricalRuns(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := Migrate(db); err != nil {
-		t.Fatal(err)
-	}
+	applyMigrationsThrough(t, db, 29)
 	var runs []models.MediaArtifactRun
 	if err := db.Order("generation").Find(&runs).Error; err != nil {
 		t.Fatal(err)
@@ -466,14 +464,24 @@ const (
 	defaultTVFilenameTemplateForTest     = "{title} - S{season:02}E{episode:02}"
 )
 
+// Advance a historical fixture to the version whose contract is being tested.
+// Later migrations may intentionally retire those rows; asserting an earlier
+// backfill only after migrating to latest conflates independent lifecycles.
 func applyMigrationsThrough(t *testing.T, db *gorm.DB, maximum int) {
 	t.Helper()
-	if err := db.Exec(`CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at DATETIME NOT NULL)`).Error; err != nil {
+	if err := db.Exec(`CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at DATETIME NOT NULL)`).Error; err != nil {
 		t.Fatal(err)
 	}
 	for _, item := range schemaMigrations() {
 		if item.Version > maximum {
 			break
+		}
+		var applied int64
+		if err := db.Table("schema_migrations").Where("version = ?", item.Version).Count(&applied).Error; err != nil {
+			t.Fatal(err)
+		}
+		if applied != 0 {
+			continue
 		}
 		apply := func(connection *gorm.DB) error {
 			return connection.Transaction(func(tx *gorm.DB) error {

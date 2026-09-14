@@ -19,7 +19,7 @@ func EnsureTLSIdentity(cfg Config) error {
 	if certErr == nil && keyErr == nil && certInfo.Mode().IsRegular() && keyInfo.Mode().IsRegular() {
 		return nil
 	}
-	if !(errors.Is(certErr, os.ErrNotExist) && errors.Is(keyErr, os.ErrNotExist)) {
+	if !errors.Is(certErr, os.ErrNotExist) || !errors.Is(keyErr, os.ErrNotExist) {
 		return errors.New("node_tls_identity_incomplete")
 	}
 	if err := os.MkdirAll(filepath.Dir(cfg.TLSPrivateKeyFile), 0o700); err != nil {

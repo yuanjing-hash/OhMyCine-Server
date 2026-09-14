@@ -169,12 +169,12 @@ func TestMediaLibraryScanUsesSharedTMDBRecognitionAndPersistentCache(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	first, err := service.ScanNow(context.Background(), actor, created.ID)
+	first, err := service.Scan(context.Background(), actor, created.ID, "full")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if first.Kind != "incremental" {
-		t.Fatalf("routine ScanNow used %q, want incremental", first.Kind)
+	if first.Kind != "full" {
+		t.Fatalf("explicit scan used %q, want full", first.Kind)
 	}
 	if first.Matched != 1 || first.Unrecognized != 0 || first.CacheHits != 0 {
 		t.Fatalf("first run=%+v", first)
@@ -195,7 +195,7 @@ func TestMediaLibraryScanUsesSharedTMDBRecognitionAndPersistentCache(t *testing.
 		t.Fatalf("snapshot=%+v err=%v", snapshot, err)
 	}
 	requestCount := requests
-	second, err := service.ScanNow(context.Background(), actor, created.ID)
+	second, err := service.Scan(context.Background(), actor, created.ID, "full")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -339,7 +339,7 @@ func TestMediaLibraryPersistenceFailureLogsSafeStageAndRollsBack(t *testing.T) {
 	if err := db.Exec(`CREATE TRIGGER fail_media_entry_insert BEFORE INSERT ON media_library_entries BEGIN SELECT RAISE(ABORT, 'SECRET SQL path'); END`).Error; err != nil {
 		t.Fatal(err)
 	}
-	run, err := service.ScanNow(context.Background(), actor, created.ID)
+	run, err := service.Scan(context.Background(), actor, created.ID, "full")
 	if ErrorCode(err) != CodeMediaLibraryScanFailed || run.Status != "failed" {
 		t.Fatalf("run=%+v code=%q err=%v", run, ErrorCode(err), err)
 	}
@@ -412,7 +412,7 @@ func TestMediaLibraryRecognitionHonorsConfiguredConcurrencyAndRateGate(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	run, err := service.ScanNow(context.Background(), actor, created.ID)
+	run, err := service.Scan(context.Background(), actor, created.ID, "full")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -445,7 +445,7 @@ func TestSuccessfulMediaLibraryScanSchedulesCategoryArtworkAfterCommit(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	run, err := service.ScanNow(context.Background(), actor, created.ID)
+	run, err := service.Scan(context.Background(), actor, created.ID, "full")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -516,8 +516,8 @@ func TestMediaLibraryAutomaticallyBuildsBaselineThenListens(t *testing.T) {
 		t.Fatal(err)
 	}
 	library := waitForLibrary(t, db, created.ID, func(item models.MediaLibrary) bool { return item.Status == models.MediaLibraryStatusListening })
-	if library.BaselineGeneration < 2 || library.DirtyGeneration < 2 {
-		t.Fatalf("baseline/catch-up generations were not committed: %+v", library)
+	if library.BaselineGeneration != 1 || library.DirtyGeneration != 1 {
+		t.Fatalf("expected exactly one initial baseline generation: %+v", library)
 	}
 	entries, err := service.Entries(actor, created.ID, 20)
 	if err != nil || len(entries) != len(files) {
@@ -527,8 +527,8 @@ func TestMediaLibraryAutomaticallyBuildsBaselineThenListens(t *testing.T) {
 	if err := db.Model(&models.MediaLibraryScanRun{}).Where("library_id = ? AND status = ?", created.ID, "success").Order("id").Pluck("kind", &kinds).Error; err != nil {
 		t.Fatal(err)
 	}
-	if len(kinds) < 2 || kinds[0] != "initial" || kinds[1] != "catch_up" {
-		t.Fatalf("scan kinds=%v, want initial then catch_up", kinds)
+	if len(kinds) != 1 || kinds[0] != "initial" {
+		t.Fatalf("scan kinds=%v, want only initial; listener attachment cannot authorize unscoped catch-up", kinds)
 	}
 	payload, err := json.Marshal(created)
 	if err != nil {
@@ -788,8 +788,8 @@ func TestMediaLibrarySourceChangeClearsOldCatalogAndBuildsNewBaseline(t *testing
 	if err := db.Model(&models.MediaLibraryScanRun{}).Where("library_id = ? AND status = ?", created.ID, "success").Order("id").Pluck("kind", &kinds).Error; err != nil {
 		t.Fatal(err)
 	}
-	if len(kinds) < 2 || kinds[0] != "initial" || kinds[1] != "catch_up" {
-		t.Fatalf("new source scan kinds=%v, want initial then catch_up", kinds)
+	if len(kinds) != 1 || kinds[0] != "initial" {
+		t.Fatalf("new source scan kinds=%v, want only initial", kinds)
 	}
 }
 
@@ -1070,7 +1070,7 @@ func TestPan115MediaLibraryScanKeepsFileIdentityAcrossRename(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	first, err := service.ScanNow(context.Background(), actor, library.ID)
+	first, err := service.Scan(context.Background(), actor, library.ID, "full")
 	if err != nil || first.Added != 1 {
 		t.Fatalf("first=%+v err=%v", first, err)
 	}
@@ -1124,7 +1124,7 @@ func TestPan115MediaLibraryScanKeepsFileIdentityAcrossRename(t *testing.T) {
 	if err := db.First(&completedRun, first.ID).Error; err != nil || completedRun.Status != "success" || completedRun.Phase != "completed" || completedRun.RecognitionCompleted != 1 {
 		t.Fatalf("recognition did not complete scan run: run=%+v err=%v", completedRun, err)
 	}
-	unchanged, err := service.ScanNow(context.Background(), actor, library.ID)
+	unchanged, err := service.Scan(context.Background(), actor, library.ID, "full")
 	if err != nil || unchanged.Status != "success" || unchanged.Phase != "completed" || unchanged.RecognitionTotal != 0 || unchanged.CacheHits != 1 {
 		t.Fatalf("unchanged scan did not reuse recognition: run=%+v err=%v", unchanged, err)
 	}
@@ -1141,7 +1141,7 @@ func TestPan115MediaLibraryScanKeepsFileIdentityAcrossRename(t *testing.T) {
 		t.Fatalf("115 scan artifact job=%+v err=%v", firstArtifactJob, err)
 	}
 	driver.children["cloud-root"] = []cloud.Item{{ID: "video-id", ParentID: "cloud-root", Name: "After.2026.mkv", Size: 128, ModifiedAt: modified}}
-	second, err := service.ScanNow(context.Background(), actor, library.ID)
+	second, err := service.Scan(context.Background(), actor, library.ID, "full")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1195,7 +1195,7 @@ func TestPan115FastScanPublishes12171EntriesBeforeRecognition(t *testing.T) {
 		t.Fatal(err)
 	}
 	started := time.Now()
-	run, err := service.ScanNow(context.Background(), actor, library.ID)
+	run, err := service.Scan(context.Background(), actor, library.ID, "full")
 	elapsed := time.Since(started)
 	if err != nil || run.Status != "catalog_ready" || run.Added != len(items) || run.Persisted != len(items) {
 		t.Fatalf("run=%+v elapsed=%s err=%v", run, elapsed, err)

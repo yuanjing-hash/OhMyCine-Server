@@ -56,6 +56,8 @@ var libraryRetirementCleanup = []libraryRetirementCleanupStep{
 	{"schedule_runs", "schedule_id IN (SELECT id FROM schedule_definitions WHERE target_type='media_library' AND target_id=CAST(? AS TEXT))", "", false},
 	{"schedule_definitions", "target_type='media_library' AND target_id=CAST(? AS TEXT)", "", false},
 	{"media_managed_items", "library_id=?", "", false},
+	{"remote_transfer_files", "transfer_task_id IN (SELECT id FROM transfer_tasks WHERE library_id=?)", "", false},
+	{"remote_upload_files", "transfer_task_id IN (SELECT id FROM transfer_tasks WHERE library_id=?)", "", false},
 	// Transfer previews, reorganizations and managed items are already gone, so
 	// the target-library execution row can now be removed without touching its
 	// upstream Download or any source/provider files.

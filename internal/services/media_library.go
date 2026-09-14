@@ -1572,26 +1572,6 @@ func (s *MediaLibraryService) ackProviderChangeScope(ctx context.Context, librar
 	})
 }
 
-func (s *MediaLibraryService) ackPendingProviderChanges(ctx context.Context, libraryID, deliveryMaxID uint) error {
-	if libraryID == 0 || deliveryMaxID == 0 {
-		return nil
-	}
-	now := time.Now().UTC()
-	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		// Normally the shared inbox is already acknowledged by the time the
-		// debounced catalog commit finishes, so completed deliveries can be
-		// removed immediately. If it is not, retain a processed tombstone; the
-		// shared acknowledgement transaction removes it atomically later.
-		if err := tx.Where("library_id = ? AND id <= ? AND inbox_event_id IN (?)", libraryID, deliveryMaxID,
-			tx.Model(&models.ProviderEvent{}).Select("id").Where("processed_at IS NOT NULL")).Delete(&models.MediaLibraryProviderEvent{}).Error; err != nil {
-			return err
-		}
-		return tx.Model(&models.MediaLibraryProviderEvent{}).
-			Where("library_id = ? AND processed_at IS NULL AND id <= ?", libraryID, deliveryMaxID).
-			Updates(map[string]any{"processed_at": now, "updated_at": now}).Error
-	})
-}
-
 // scheduleDownloaderLifeEventRecheck coalesces event storms per Connection.
 // One provider event batch may contain many entries for the same transfer; a
 // bounded delayed sweep is sufficient to obtain the second stable snapshot.
@@ -2011,9 +1991,10 @@ func (s *MediaLibraryService) reconcile(ctx context.Context, id uint, kind strin
 		request := MediaLibraryScanRequest{Library: library, Storage: storage, VideoExtensions: extensions, AssetExtensions: assetExtensions, IgnorePatterns: ignores}
 		if hasProviderScope {
 			request.providerScope = &providerScope
-			if storage.Type == models.StorageTypePan115 {
+			switch storage.Type {
+			case models.StorageTypePan115:
 				request.knownProviderIDs, scanErr = s.knownPan115CatalogProviderIDs(scanCtx, id, providerScope)
-			} else if storage.Type == models.StorageTypeLocal {
+			case models.StorageTypeLocal:
 				request.knownLocalPaths, scanErr = s.knownLocalCatalogPaths(scanCtx, id, storage, library, providerScope.LocalPaths)
 			}
 		}

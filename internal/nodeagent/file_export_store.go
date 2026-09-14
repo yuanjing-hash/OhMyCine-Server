@@ -90,7 +90,7 @@ func (s *Store) FileExportManifest(ctx context.Context, serverID, operationKey s
 	if err != nil {
 		return nodeprotocol.FileExportManifestPage{}, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	files := make([]nodeprotocol.FileExportFile, 0, pageSize)
 	for rows.Next() {
 		var file nodeprotocol.FileExportFile
@@ -148,7 +148,7 @@ func (s *Store) FileExportChunks(ctx context.Context, serverID, operationKey, fi
 	if err != nil {
 		return nodeprotocol.FileChunkDigestPage{}, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	chunks := make([]nodeprotocol.FileChunkDigest, 0, pageSize)
 	for rows.Next() {
 		var chunk nodeprotocol.FileChunkDigest

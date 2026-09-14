@@ -267,6 +267,7 @@ func newTestClient(t *testing.T, cloudDrivers ...cloudpkg.Driver) *testClient {
 	}
 	api.SetRuntimeLogService(runtimeLogs)
 	queue := services.NewQueueService(db, audit)
+	libraries.SetQueueService(queue)
 	events := services.NewQueueEventHub()
 	queue.SetEventHub(events)
 	api.SetQueueService(queue)
@@ -2487,11 +2488,11 @@ func TestMediaLibraryAPICRUDRBACAndAutomaticInitialization(t *testing.T) {
 		t.Fatalf("referenced storage delete status=%d", status)
 	}
 	status, _ = owner.request(t, http.MethodDelete, "/api/v1/media-libraries/"+uintString(secondLibrary.ID), map[string]any{}, true)
-	if status != http.StatusOK {
+	if status != http.StatusAccepted {
 		t.Fatalf("delete second media library status=%d", status)
 	}
 	status, _ = owner.request(t, http.MethodDelete, "/api/v1/media-libraries/"+uintString(library.ID), map[string]any{}, true)
-	if status != http.StatusOK {
+	if status != http.StatusAccepted {
 		t.Fatalf("delete media library status=%d", status)
 	}
 }

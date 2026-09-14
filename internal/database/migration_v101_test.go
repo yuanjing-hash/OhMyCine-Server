@@ -46,6 +46,7 @@ func seedLegacyArtifactV101(t *testing.T, db *gorm.DB, library models.MediaLibra
 
 func TestLegacyArtifactNoIORecoveryV101FreshUpgradeAndRepeat(t *testing.T) {
 	db := structureMigrationDB(t, 100)
+	// v108 adds source_fingerprint; historical v100 inserts must omit it.
 	library := seedStructureMigrationLibrary(t, db, 100, "legacy-v101", "healthy", 0, 0)
 	_, safeRun, safePhysical := seedLegacyArtifactV101(t, db, library, "safe")
 	for index := 0; index < 3; index++ {
@@ -55,7 +56,7 @@ func TestLegacyArtifactNoIORecoveryV101FreshUpgradeAndRepeat(t *testing.T) {
 			RelativePath: fmt.Sprintf("/pending-%d.nfo", index), Managed: true, Active: true,
 			Status: models.MediaArtifactStatusQueued, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
 		}
-		if err := db.Create(&artifact).Error; err != nil {
+		if err := db.Omit("source_fingerprint").Create(&artifact).Error; err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -67,7 +68,7 @@ func TestLegacyArtifactNoIORecoveryV101FreshUpgradeAndRepeat(t *testing.T) {
 		RelativePath: "/written.nfo", ContentFingerprint: "published-fingerprint", Managed: true, Active: true,
 		Status: models.MediaArtifactStatusCompleted, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
 	}
-	if err := db.Create(&unsafeArtifact).Error; err != nil {
+	if err := db.Omit("source_fingerprint").Create(&unsafeArtifact).Error; err != nil {
 		t.Fatal(err)
 	}
 
@@ -95,7 +96,7 @@ func TestLegacyArtifactNoIORecoveryV101FreshUpgradeAndRepeat(t *testing.T) {
 		RelativePath: "/receipt-pending.nfo", Managed: true, Active: true,
 		Status: models.MediaArtifactStatusQueued, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
 	}
-	if err := db.Create(&unsafeReceiptArtifact).Error; err != nil {
+	if err := db.Omit("source_fingerprint").Create(&unsafeReceiptArtifact).Error; err != nil {
 		t.Fatal(err)
 	}
 	receipt := models.CatalogArtifactWriteReceipt{
@@ -117,7 +118,7 @@ func TestLegacyArtifactNoIORecoveryV101FreshUpgradeAndRepeat(t *testing.T) {
 		RelativePath: "/claim-pending.nfo", Managed: true, Active: true,
 		Status: models.MediaArtifactStatusQueued, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
 	}
-	if err := db.Create(&unsafeClaimArtifact).Error; err != nil {
+	if err := db.Omit("source_fingerprint").Create(&unsafeClaimArtifact).Error; err != nil {
 		t.Fatal(err)
 	}
 	claimRunID, claimPhysicalID := unsafeClaimRun.ID, unsafeClaimPhysical.ID
@@ -137,16 +138,12 @@ func TestLegacyArtifactNoIORecoveryV101FreshUpgradeAndRepeat(t *testing.T) {
 		t.Fatal(err)
 	}
 	otherArtifact := models.MediaArtifact{OpaqueID: "legacy-v101-other-artifact", RunID: otherRun.ID, LibraryID: other.ID, Kind: models.MediaArtifactKindSTRM, TargetKind: models.MediaArtifactTargetLocalProjection, RelativePath: "/keep.strm", ContentFingerprint: "keep", Managed: true, Active: true, Status: models.MediaArtifactStatusCompleted, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()}
-	if err := db.Create(&otherArtifact).Error; err != nil {
+	if err := db.Omit("source_fingerprint").Create(&otherArtifact).Error; err != nil {
 		t.Fatal(err)
 	}
 
-	if err := Migrate(db); err != nil {
-		t.Fatal(err)
-	}
-	if err := Migrate(db); err != nil {
-		t.Fatalf("repeat migration: %v", err)
-	}
+	applyMigrationsThrough(t, db, 101)
+	applyMigrationsThrough(t, db, 101)
 	var safe models.CatalogPhysicalWrite
 	if err := db.First(&safe, safePhysical.ID).Error; err != nil {
 		t.Fatal(err)

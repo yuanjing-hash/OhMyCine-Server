@@ -39,7 +39,7 @@ func TestStructureLocalScanPublishesAndDiagnosesOnlyOnce(t *testing.T) {
 	libraries := NewMediaLibraryService(s.db, s.audit, zerolog.Nop())
 	defer libraries.Close()
 	libraries.SetStructureService(s)
-	run, err := libraries.ScanNow(context.Background(), actor, lib.ID)
+	run, err := libraries.Scan(context.Background(), actor, lib.ID, "full")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,7 +56,7 @@ func TestStructureLocalScanPublishesAndDiagnosesOnlyOnce(t *testing.T) {
 	if err := s.queue.Complete(job.Job.ID, job.LeaseToken); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = libraries.ScanNow(context.Background(), actor, lib.ID); err != nil {
+	if _, err = libraries.Scan(context.Background(), actor, lib.ID, "full"); err != nil {
 		t.Fatal(err)
 	}
 	next, err := s.queue.Claim([]string{JobTypeMediaLibraryStructureDiagnosis})

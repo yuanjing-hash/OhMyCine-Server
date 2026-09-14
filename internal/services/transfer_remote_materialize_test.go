@@ -116,7 +116,7 @@ func TestRemoteNodeMaterializationRedownloadsCorruptCompletedChunk(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer partial.Close()
+	defer func() { _ = partial.Close() }()
 	if err := partial.Truncate(int64(len(content))); err != nil {
 		t.Fatal(err)
 	}

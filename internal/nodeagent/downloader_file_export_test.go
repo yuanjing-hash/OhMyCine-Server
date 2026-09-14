@@ -64,7 +64,6 @@ func TestCompletedQBittorrentManifestPublishesPersistentPagedExport(t *testing.T
 		}
 	}))
 	defer qbit.Close()
-
 	databasePath := filepath.Join(root, "node.db")
 	store, err := OpenStore(databasePath)
 	if err != nil {
@@ -163,7 +162,7 @@ func TestCompletedQBittorrentManifestPublishesPersistentPagedExport(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer reopened.Close()
+	defer func() { _ = reopened.Close() }()
 	restartedAgent, err := New(config, reopened)
 	if err != nil {
 		t.Fatal(err)
@@ -199,7 +198,7 @@ func TestFileExportHashFailureCanRetryWithoutPublishingPartialState(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	defer func() { _ = store.Close() }()
 	agent, err := New(Config{NodeID: "node-1", ListenAddress: "127.0.0.1:0", DataDirectory: root, ManagedRoot: managedRoot, MaxConcurrentOperations: 1, AllowInsecureDevelopment: true}, store)
 	if err != nil {
 		t.Fatal(err)
