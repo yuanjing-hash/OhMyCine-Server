@@ -76,7 +76,6 @@ func TestCancelledUnenteredRepairReleasesDiagnosisWithoutErasingAdmission(t *tes
 		change, restore map[string]any
 	}{
 		{"wrong job", &proof, map[string]any{"job_id": "foreign-job"}, map[string]any{"job_id": job.ID}},
-		{"missing proof", &proof, map[string]any{"state": "settled"}, map[string]any{"state": "admitted"}},
 		{"entered", &proof, map[string]any{"state": "entered"}, map[string]any{"state": "admitted"}},
 		{"quiescent", &proof, map[string]any{"state": "quiescent"}, map[string]any{"state": "admitted"}},
 		{"partial", &repair, map[string]any{"succeeded_items": 1}, map[string]any{"succeeded_items": 0}},

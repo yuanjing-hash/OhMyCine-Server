@@ -22,3 +22,11 @@ type MediaLibraryRetirement struct {
 	UpdatedAt         time.Time  `json:"-"`
 	CompletedAt       *time.Time `json:"-"`
 }
+
+// MediaLibraryRetirementJob is the frozen library-owned queue workset. It is
+// private and intentionally has no FK while retirement deletes its targets.
+type MediaLibraryRetirementJob struct {
+	RetirementID string    `gorm:"primaryKey" json:"-"`
+	JobID        string    `gorm:"primaryKey" json:"-"`
+	CreatedAt    time.Time `json:"-"`
+}

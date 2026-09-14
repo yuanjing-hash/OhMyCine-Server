@@ -99,7 +99,7 @@ func TestLegacyStructureRepairClearsOnlyCompletedPathIssues(t *testing.T) {
 				t.Fatalf("summary=%+v err=%v", diagnostics, err)
 			}
 			for _, issue := range page.List {
-				if issue.Code == "path_mismatch" && (mode == "full" || issue.CurrentPath == "incoming/冲突影片A.mkv") {
+				if (issue.Code == "naming_mismatch" || issue.Code == "location_mismatch") && (mode == "full" || issue.CurrentPath == "incoming/冲突影片A.mkv") {
 					t.Fatalf("completed path issue retained: %+v", issue)
 				}
 			}

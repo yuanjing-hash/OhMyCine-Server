@@ -69,8 +69,63 @@ func TestStructurePlannerTreatsSeasonScopedDoubleDotEpisodeAsRepairablePathMisma
 	}
 	issue := plan.Issues[0]
 	wantTarget := "电视剧/国产剧/知否知否应是绿肥红瘦 (2018)/Season 01/知否知否应是绿肥红瘦 - S01E02.mp4"
-	if issue.Code != "path_mismatch" || !issue.Repairable || issue.ExpectedPath != wantTarget || plan.Items[0].TargetRelative != wantTarget {
+	if issue.Code != "naming_mismatch" || plan.Classifications.NamingMismatch != 1 || !issue.Repairable || issue.ExpectedPath != wantTarget || plan.Items[0].TargetRelative != wantTarget {
 		t.Fatalf("issue=%+v item=%+v", issue, plan.Items[0])
+	}
+}
+
+func TestStructurePlannerSeparatesRecognizedNamingAndLocationMismatch(t *testing.T) {
+	tests := []struct {
+		name     string
+		source   string
+		target   string
+		template string
+		want     string
+	}{
+		{name: "movie title directory uses official Chinese numeral", source: "电影/动画电影/秒速5厘米 (2007)/banner.jpg", target: "电影/动画电影/秒速五厘米 (2007)/banner.jpg", template: "电影/{category}/{title} ({year})", want: "naming_mismatch"},
+		{name: "custom nested category depth remains stable", source: "媒体/电影/动画/秒速5厘米 (2007)/秒速5厘米.mkv", target: "媒体/电影/动画/秒速五厘米 (2007)/秒速五厘米 (2007).mkv", template: "媒体/电影/{category}/{title} ({year})", want: "naming_mismatch"},
+		{name: "category move wins over simultaneous rename", source: "媒体/电影/剧情/秒速5厘米 (2007)/秒速5厘米.mkv", target: "媒体/电影/动画/秒速五厘米 (2007)/秒速五厘米 (2007).mkv", template: "媒体/电影/{category}/{title} ({year})", want: "location_mismatch"},
+		{name: "category and title in one segment remains location", source: "媒体/剧情 - 秒速5厘米 (2007)/秒速5厘米.mkv", target: "媒体/动画 - 秒速五厘米 (2007)/秒速五厘米 (2007).mkv", template: "媒体/{category} - {title} ({year})", want: "location_mismatch"},
+		{name: "missing directory level is location", source: "电影/动画/秒速5厘米.mkv", target: "电影/动画/秒速五厘米 (2007)/秒速五厘米 (2007).mkv", template: "电影/{category}/{title} ({year})", want: "location_mismatch"},
+		{name: "tv series and season directory normalization", source: "电视剧/美剧/24小时/第1季/24小时 01.mkv", target: "电视剧/美剧/24小时 (2001)/Season 01/24小时 - S01E01.mkv", template: "电视剧/{category}/{title} ({year})/Season {season:02}", want: "naming_mismatch"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			indexes := structureTemplateNamingDirectoryIndexes(test.template)
+			if got := structurePathMismatchCode(test.source, test.target, indexes); got != test.want {
+				t.Fatalf("code=%q want=%q indexes=%v", got, test.want, indexes)
+			}
+		})
+	}
+}
+
+func TestStructurePlannerClassifiesVideoAndSidecarFromTheSameProfileLayout(t *testing.T) {
+	year, tmdbID := 2007, int64(1)
+	library := models.MediaLibrary{
+		ID: 1, BaselineGeneration: 1, ProfileRevision: 1,
+		MovieDirectoryTemplate: "电影/{category}/{title} ({year})",
+		MovieFilenameTemplate:  "{title} ({year})",
+	}
+	entry := models.MediaLibraryEntry{
+		RelativePath: "/电影/动画电影/秒速5厘米 (2007)/秒速5厘米 (2007).mkv",
+		ProviderID:   "video", MediaType: "movie", Title: "秒速五厘米", WorkKey: "movie:tmdb:1",
+		MatchStatus: mediaRecognitionStatusMatched, TMDBID: &tmdbID, ReleaseYear: &year, CategoryName: "动画电影",
+	}
+	asset := models.MediaLibrarySourceAsset{
+		RelativePath: "/电影/动画电影/秒速5厘米 (2007)/poster.jpg",
+		ProviderID:   "poster", Name: "poster.jpg", Active: true,
+	}
+	plan, err := (StructurePlanner{}).Build(library, []models.MediaLibraryEntry{entry}, []models.MediaLibrarySourceAsset{asset}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.AllIssues) != 2 || plan.Classifications.NamingMismatch != 2 || plan.Classifications.LocationMismatch != 0 {
+		t.Fatalf("classifications=%+v issues=%+v", plan.Classifications, plan.AllIssues)
+	}
+	for _, issue := range plan.AllIssues {
+		if issue.Code != "naming_mismatch" {
+			t.Fatalf("new diagnosis produced %q for %+v", issue.Code, issue)
+		}
 	}
 }
 
@@ -307,10 +362,10 @@ func TestStructurePlannerDoesNotTreatPendingRecognitionAsUnrecognized(t *testing
 
 func TestStructureIssueSamplesStayBoundedAndRepresentEveryPresentClass(t *testing.T) {
 	plan := StructurePlan{}
-	codes := []string{"missing_season_episode", "path_mismatch", "media_unrecognized", "invalid_path", "template_unavailable", "recognition_suspect_conflict", "catalog_duplicate_conflict", "duplicate_target", "sidecar_target_conflict"}
+	codes := []string{"missing_season_episode", "naming_mismatch", "location_mismatch", "media_unrecognized", "invalid_path", "template_unavailable", "recognition_suspect_conflict", "catalog_duplicate_conflict", "duplicate_target", "sidecar_target_conflict"}
 	for _, code := range codes {
 		for index := 0; index < 200; index++ {
-			plan.addIssue(StructureIssue{Code: code, Kind: "video", CurrentPath: fmt.Sprintf("%s/%03d.mkv", code, index), Repairable: code == "path_mismatch"})
+			plan.addIssue(StructureIssue{Code: code, Kind: "video", CurrentPath: fmt.Sprintf("%s/%03d.mkv", code, index), Repairable: code == "naming_mismatch" || code == "location_mismatch"})
 		}
 	}
 	if len(plan.Issues) != maxStructureIssueSamples {

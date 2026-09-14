@@ -74,7 +74,7 @@ const selectedRoute = computed(() => routeTargetByID(routePreview.value, downloa
 const selectedLibrary = computed(() => libraries.value.find(item => item.id === selectedRoute.value?.media_library_id) ?? null)
 const selectableSiteOptions = computed(() => siteOptions.value.filter(item => item.searchable))
 const activeChannel = ref<'all' | number>('all')
-const enabledSiteTypes = ref<Array<'pt' | 'bt'>>(['pt', 'bt'])
+const enabledSiteTypes = ref<Array<'pt' | 'bt' | 'bt_resource'>>(['pt', 'bt', 'bt_resource'])
 const resolutionFilter = ref('')
 const promotionFilter = ref('')
 const minimumSeeders = ref<number | undefined>()
@@ -521,7 +521,7 @@ onBeforeUnmount(() => {
         </nav>
 
         <form class="panel grid gap-3 md:grid-cols-2 xl:grid-cols-[auto_auto_11rem_11rem_9rem_10rem_9rem_auto] xl:items-end" @submit.prevent>
-          <fieldset class="flex gap-3"><legend class="label">站点类型</legend><label class="text-sm"><input v-model="enabledSiteTypes" type="checkbox" value="pt" /> PT</label><label class="text-sm"><input v-model="enabledSiteTypes" type="checkbox" value="bt" /> BT</label></fieldset>
+          <fieldset class="flex flex-wrap gap-3"><legend class="label">站点类型</legend><label class="text-sm"><input v-model="enabledSiteTypes" type="checkbox" value="pt" /> PT</label><label class="text-sm"><input v-model="enabledSiteTypes" type="checkbox" value="bt" /> 公共 BT</label><label class="text-sm"><input v-model="enabledSiteTypes" type="checkbox" value="bt_resource" /> 插件资源站</label></fieldset>
           <label><span class="label">分辨率</span><select v-model="resolutionFilter" class="input"><option value="">全部</option><option v-for="value in resolutionOptions" :key="value" :value="value">{{ value }}</option></select></label>
           <label><span class="label">优惠</span><select v-model="promotionFilter" class="input"><option value="">全部</option><option value="free">FREE</option><option value="2xfree">2X FREE</option><option value="2x">2X</option></select></label>
           <label><span class="label">最低做种</span><input v-model.number="minimumSeeders" class="input" type="number" min="0" placeholder="不限" /></label>

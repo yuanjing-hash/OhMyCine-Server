@@ -1,6 +1,9 @@
 package services
 
-import "gorm.io/gorm"
+import (
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
+	"gorm.io/gorm"
+)
 
 // Every entry is one independent transaction, not SQL chunks nested in a
 // library-sized writer. Predicates are compile-time identifiers only.
@@ -10,20 +13,6 @@ type libraryRetirementCleanupStep struct {
 }
 
 func (step libraryRetirementCleanupStep) run(tx *gorm.DB, libraryID uint) (int64, error) {
-	if step.table == "catalog_artifact_cleanup_claims" || step.table == "media_artifacts" {
-		// A cleanup claim is unresolved execution, including manual/null owners.
-		// Never discard it or let the artifact FK CASCADE conceal its existence.
-		var claim uint
-		if err := tx.Raw("SELECT artifact_id FROM catalog_artifact_cleanup_claims WHERE library_id=? LIMIT 1", libraryID).Scan(&claim).Error; err != nil {
-			return 0, err
-		}
-		if claim != 0 {
-			return 0, catalogPhysicalUnsettledError()
-		}
-		if step.table == "catalog_artifact_cleanup_claims" {
-			return 0, nil
-		}
-	}
 	sql := "DELETE FROM " + step.table
 	if step.update != "" {
 		sql = "UPDATE " + step.table + " SET " + step.update
@@ -50,10 +39,11 @@ var libraryRetirementCleanup = []libraryRetirementCleanupStep{
 	{"media_catalog_deletion_previews", "library_id=?", "", false},
 	{"media_library_scan_stagings", "library_id=?", "", false},
 	{"media_library_scan_runs", "library_id=?", "", false},
-	{"catalog_artifact_write_receipts", "library_id=? AND phase IN ('reconciled_before','reconciled_after') AND EXISTS (SELECT 1 FROM catalog_physical_writes p WHERE p.id=physical_write_id AND p.library_id=catalog_artifact_write_receipts.library_id AND p.owner_kind='artifact' AND p.owner_id=run_id AND p.state='settled')", "", false},
+	{"catalog_artifact_write_receipts", "library_id=?", "", false},
 	{"catalog_artifact_cleanup_claims", "library_id=?", "", false},
 	{"media_artifacts", "library_id=?", "", false},
 	{"media_artifact_runs", "library_id=?", "", false},
+	{"catalog_artifact_binding_items", "binding_id IN (SELECT id FROM catalog_artifact_bindings WHERE library_id=?)", "", false},
 	{"catalog_artifact_bindings", "library_id=?", "", false},
 	{"media_category_artworks", "library_id=?", "", false},
 	{"media_library_provider_events", "library_id=?", "", false},
@@ -66,6 +56,10 @@ var libraryRetirementCleanup = []libraryRetirementCleanupStep{
 	{"schedule_runs", "schedule_id IN (SELECT id FROM schedule_definitions WHERE target_type='media_library' AND target_id=CAST(? AS TEXT))", "", false},
 	{"schedule_definitions", "target_type='media_library' AND target_id=CAST(? AS TEXT)", "", false},
 	{"media_managed_items", "library_id=?", "", false},
+	// Transfer previews, reorganizations and managed items are already gone, so
+	// the target-library execution row can now be removed without touching its
+	// upstream Download or any source/provider files.
+	{"transfer_tasks", "library_id=?", "", false},
 	{"player_media_favorites", "library_id=?", "", false},
 	{"player_media_collection_items", "library_id=?", "", false},
 	{"media_acquisitions", "target_library_id=?", "target_library_id=NULL", false},
@@ -73,7 +67,29 @@ var libraryRetirementCleanup = []libraryRetirementCleanupStep{
 	{"media_library_source_assets", "library_id=?", "", true},
 	{"media_library_recognitions", "library_id=?", "", true},
 	{"catalog_identities", "library_id=?", "", true},
-	{"catalog_physical_writes", "library_id=? AND state IN ('admitted','settled')", "", true},
+	{"catalog_physical_writes", "library_id=?", "", true},
+}
+
+var libraryRetirementJobCleanupTables = []string{
+	"job_attempts",
+	"job_status_events",
+	"job_action_requests",
+	"notification_receipts",
+}
+
+func cleanupLibraryRetirementJobsTx(tx *gorm.DB, row models.MediaLibraryRetirement) (int64, error) {
+	for _, table := range libraryRetirementJobCleanupTables {
+		result := tx.Exec("DELETE FROM "+table+" WHERE rowid IN (SELECT d.rowid FROM "+table+" d JOIN media_library_retirement_jobs r ON r.job_id=d.job_id WHERE r.retirement_id=? ORDER BY d.rowid LIMIT ?)", row.ID, CatalogBatchRows)
+		if result.Error != nil || result.RowsAffected != 0 {
+			return result.RowsAffected, result.Error
+		}
+	}
+	result := tx.Exec("DELETE FROM jobs WHERE rowid IN (SELECT j.rowid FROM jobs j JOIN media_library_retirement_jobs r ON r.job_id=j.id WHERE r.retirement_id=? ORDER BY j.rowid LIMIT ?)", row.ID, CatalogBatchRows)
+	if result.Error != nil || result.RowsAffected != 0 {
+		return result.RowsAffected, result.Error
+	}
+	result = tx.Exec("DELETE FROM media_library_retirement_jobs WHERE rowid IN (SELECT rowid FROM media_library_retirement_jobs WHERE retirement_id=? ORDER BY rowid LIMIT ?)", row.ID, CatalogBatchRows)
+	return result.RowsAffected, result.Error
 }
 
 // Assert all reviewed CASCADE/SET NULL children are empty before the single
@@ -97,6 +113,13 @@ func assertLibraryRetirementEmptyTx(tx *gorm.DB, libraryID uint) error {
 		if found != 0 {
 			return ErrCatalogFence
 		}
+	}
+	var ownedJob int
+	if err := tx.Raw("SELECT 1 FROM media_library_retirement_jobs WHERE retirement_id=(SELECT id FROM media_library_retirements WHERE library_id=?) LIMIT 1", libraryID).Scan(&ownedJob).Error; err != nil {
+		return err
+	}
+	if ownedJob != 0 {
+		return ErrCatalogFence
 	}
 	return nil
 }

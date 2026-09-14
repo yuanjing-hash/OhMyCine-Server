@@ -6,10 +6,9 @@ import (
 	"time"
 
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
-	"gorm.io/gorm"
 )
 
-func TestLibraryRetirementArtifactReceiptsRequireReconciliationAndExactSettledOwner(t *testing.T) {
+func TestLibraryRetirementDiscardsArtifactReceiptsAfterQuiescence(t *testing.T) {
 	for _, phase := range []string{"prepared", "conflict", "reconciled_before", "reconciled_after"} {
 		t.Run(phase, func(t *testing.T) {
 			s, library, actor := retirementFixture(t)
@@ -25,15 +24,6 @@ func TestLibraryRetirementArtifactReceiptsRequireReconciliationAndExactSettledOw
 			receipt := models.CatalogArtifactWriteReceipt{LibraryID: library.ID, RunID: run.ID, PhysicalWriteID: proof.ID, PermitRevision: 1, Revision: 1, TargetKind: "nfo", RelativePath: "private.nfo", BeforeArtifactJSON: "{}", AfterArtifactJSON: "{}", Phase: phase, CreatedAt: now, UpdatedAt: now}
 			if err := s.db.Create(&receipt).Error; err != nil {
 				t.Fatal(err)
-			}
-			if phase == "prepared" || phase == "conflict" {
-				if _, err := s.DeleteRequest(context.Background(), actor, library.ID, RequestContext{}); err == nil {
-					t.Fatal("unresolved receipt ignored despite settled flag")
-				}
-				if err := s.db.First(&receipt, receipt.ID).Error; err != nil {
-					t.Fatal("unresolved receipt lost")
-				}
-				return
 			}
 			claim, row := claimRetirement(t, s, library, actor)
 			for i := 0; i < 80 && row.Phase != "completed"; i++ {
@@ -54,7 +44,7 @@ func TestLibraryRetirementArtifactReceiptsRequireReconciliationAndExactSettledOw
 	}
 }
 
-func TestLibraryRetirementNeverDiscardsArtifactCleanupClaims(t *testing.T) {
+func TestLibraryRetirementDiscardsArtifactCleanupClaimsAfterQuiescence(t *testing.T) {
 	for _, owner := range []string{"manual_null_owner", "settled_owner"} {
 		t.Run(owner, func(t *testing.T) {
 			s, library, actor := retirementFixture(t)
@@ -80,25 +70,20 @@ func TestLibraryRetirementNeverDiscardsArtifactCleanupClaims(t *testing.T) {
 			if err := s.db.Create(&claim).Error; err != nil {
 				t.Fatal(err)
 			}
-			if _, err := s.DeleteRequest(context.Background(), actor, library.ID, RequestContext{}); err == nil {
-				t.Fatal("unfinished cleanup claim was treated as old generated output")
-			}
-			for _, table := range []string{"catalog_artifact_cleanup_claims", "media_artifacts"} {
-				if err := s.db.Transaction(func(tx *gorm.DB) error {
-					_, err := (libraryRetirementCleanupStep{table: table, predicate: "library_id=?"}).run(tx, library.ID)
-					return err
-				}); err == nil {
-					t.Fatal("cleanup or artifact cascade discarded claim")
+			retirementClaim, row := claimRetirement(t, s, library, actor)
+			for i := 0; i < 100 && row.Phase != "completed"; i++ {
+				if _, _, err := NewMediaLibraryRetirementWorker(s).step(context.Background(), retirementClaim, &row); err != nil {
+					t.Fatal(err)
 				}
 			}
-			if err := s.db.First(&claim, "artifact_id=?", artifact.ID).Error; err != nil {
-				t.Fatal("claim lost")
+			if row.Phase != "completed" {
+				t.Fatalf("retirement did not finish: %s", row.Phase)
 			}
-			if err := s.db.First(&artifact, artifact.ID).Error; err != nil {
-				t.Fatal("artifact ownership lost")
-			}
-			if err := s.db.Transaction(func(tx *gorm.DB) error { return assertLibraryRetirementEmptyTx(tx, library.ID) }); err == nil {
-				t.Fatal("final empty missed cleanup claim")
+			for _, table := range []string{"catalog_artifact_cleanup_claims", "media_artifacts", "catalog_physical_writes"} {
+				var count int64
+				if err := s.db.Table(table).Where("library_id = ?", library.ID).Count(&count).Error; err != nil || count != 0 {
+					t.Fatalf("%s retained %d rows: %v", table, count, err)
+				}
 			}
 		})
 	}

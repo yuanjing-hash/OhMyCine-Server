@@ -390,7 +390,7 @@ func (s *UpdateService) deploymentManaged() (bool, string) {
 	if s.container != nil && s.container() {
 		return true, updateManagedContainer
 	}
-	if s.goarch != "amd64" || (s.goos != "windows" && s.goos != "linux") {
+	if !((s.goos == "windows" && s.goarch == "amd64") || (s.goos == "linux" && (s.goarch == "amd64" || s.goarch == "arm64"))) {
 		return true, updateManagedPlatform
 	}
 	info, err := os.Stat(s.executable)

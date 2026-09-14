@@ -40,3 +40,12 @@ func TestMediaLibraryStructureResponsesDoNotExposePrivatePlanIdentity(t *testing
 }
 
 func stringPointer(value string) *string { return &value }
+
+func TestMediaLibraryScanRequestDefaultsToIncremental(t *testing.T) {
+	if mode := requestedMediaLibraryScanMode(""); mode != "incremental" {
+		t.Fatalf("empty scan request defaulted to %q", mode)
+	}
+	if mode := requestedMediaLibraryScanMode("full"); mode != "full" {
+		t.Fatalf("explicit full request changed to %q", mode)
+	}
+}

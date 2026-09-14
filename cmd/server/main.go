@@ -179,7 +179,6 @@ func main() {
 	profiles := services.NewMediaClassificationProfileService(db, audit, nil)
 	libraries := services.NewMediaLibraryService(db, audit, logManager.Logger("media_library", "supervisor"))
 	libraries.SetCatalogSnapshotStore(catalogStore)
-	libraries.SetRetirementPhysicalGuard(services.AssertCatalogPhysicalDrainedTx)
 	libraries.SetConnectionService(connections)
 	profiles.SetReferences(libraries)
 	profiles.SetRevisionNotifier(libraries)
@@ -222,6 +221,8 @@ func main() {
 	}
 	downloaders := services.NewDownloaderService(db, audit, credentialStore, providerRegistry)
 	downloaders.SetConnectionService(connections)
+	transferNodes := services.NewTransferNodeService(db, audit, credentialStore)
+	downloaders.SetTransferNodeService(transferNodes)
 	downloadSettings := services.NewDownloadSettingsService(db, audit)
 	seedingSettings := services.NewSeedingSettingsService(db, audit)
 	metadataSettings := services.NewMetadataSettingsService(db, audit, credentialStore, tmdb.Credential{Kind: tmdb.CredentialKind(cfg.TMDBDeploymentCredentialKind), Value: cfg.TMDBDeploymentCredentialValue})
@@ -272,6 +273,7 @@ func main() {
 	pluginHostAPI := pluginhostapi.New(db, credentialStore, logManager.Logger("plugin", "host"))
 	pluginHost.SetCapabilityHost(pluginHostAPI)
 	pluginRepositories := services.NewPluginRepositoryService(db, audit, pluginrepository.NewGitHubClient(nil), logManager.Logger("plugin", "repository"), services.WithPluginRoot(cfg.PluginDirectory), services.WithPluginRuntimeHost(pluginHost), services.WithPluginCredentialStore(credentialStore))
+	sites.SetPluginResourceBridge(pluginRepositories)
 	libraryArtwork := services.NewLibraryArtworkService(
 		db, metadataSettings, pluginRepositories, pluginHostAPI, logManager.Logger("library_artwork", "generator"),
 		services.WithLibraryArtworkRoot(filepath.Join(filepath.Dir(cfg.DatabasePath), "cache", "artwork", "categories")),
@@ -373,6 +375,7 @@ func main() {
 	api.SetQueueService(queue)
 	api.SetQueueEventHub(queueEvents)
 	api.SetDownloaderService(downloaders)
+	api.SetTransferNodeService(transferNodes)
 	api.SetDownloadService(downloads)
 	api.SetTransferService(transfers)
 	api.SetMediaReorganizationService(reorganizations)

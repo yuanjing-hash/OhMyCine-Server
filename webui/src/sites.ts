@@ -1,5 +1,5 @@
 export interface SiteHealth {
-  status: 'unknown' | 'online' | 'offline'
+  status: 'unknown' | 'online' | 'offline' | 'healthy' | 'auth_required' | 'rate_limited' | 'unavailable'
   error_code: string
   username: string
   checked_at?: string
@@ -9,8 +9,8 @@ export interface SiteSummary {
   id: number
   name: string
   kind: string
-  site_type: 'pt' | 'bt'
-  credential_kind: 'cookie' | 'api_key' | 'none'
+  site_type: 'pt' | 'bt' | 'bt_resource'
+  credential_kind: 'cookie' | 'api_key' | 'none' | 'plugin'
   capabilities: SiteCapabilities
   base_url: string
   user_agent: string
@@ -33,7 +33,7 @@ export interface SiteSummary {
 export interface SearchSiteOption {
   id: number
   name: string
-  site_type: 'pt' | 'bt'
+  site_type: 'pt' | 'bt' | 'bt_resource'
   health_status: string
   searchable: boolean
   reason?: string
@@ -119,7 +119,7 @@ export interface PTSearchResult {
 export interface PTSearchGroup {
   site_id: number
   site_name: string
-  site_type: 'pt' | 'bt'
+  site_type: 'pt' | 'bt' | 'bt_resource'
   status: 'success' | 'error'
   error_code?: string
   page: number
@@ -179,7 +179,7 @@ export type TorrentResultSort = 'seeders' | 'published' | 'size'
 export type TorrentResultDirection = 'asc' | 'desc'
 export interface TorrentResultFilters {
   activeChannel: 'all' | number
-  enabledSiteTypes: ReadonlyArray<'pt' | 'bt'>
+  enabledSiteTypes: ReadonlyArray<'pt' | 'bt' | 'bt_resource'>
   resolution?: string
   promotion?: string
   minimumSeeders?: number

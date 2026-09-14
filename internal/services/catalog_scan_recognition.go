@@ -136,7 +136,7 @@ func (s *MediaLibraryService) completeCatalogRecognition(ctx context.Context, ru
 			return err
 		}
 		if remaining == 0 {
-			return s.finishCatalogRecognition(ctx, baseline.head, nil, "", sourceFingerprint, jobID, jobHash, &run, profile, true)
+			return s.finishCatalogRecognition(ctx, baseline.head, nil, "", sourceFingerprint, jobID, jobHash, &run, profile, true, CatalogArtifactChangeSet{})
 		}
 		if kind == "delta" {
 			compacted, err := s.catalogStore.Compact(ctx, CatalogCompactionInput{LibraryID: payload.LibraryID, JobID: &jobID, JobLeaseHash: jobHash})
@@ -173,7 +173,7 @@ func (s *MediaLibraryService) completeCatalogRecognition(ctx context.Context, ru
 		prepared := run
 		prepared.Added, prepared.Updated, prepared.Removed = 0, 0, 0
 		prepared.Matched, prepared.Unrecognized, prepared.CacheHits, prepared.RecognitionFailed = 0, 0, 0, 0
-		facts, _, err := s.prepareCatalogScanFacts(ctx, candidate, token, library, storage, profile, &prepared, medialibrary.Result{Partial: true, Files: files}, baseline, units, recognized, false)
+		facts, _, artifactChanges, err := s.prepareCatalogScanFacts(ctx, candidate, token, library, storage, profile, &prepared, medialibrary.Result{Partial: true, Files: files}, baseline, units, recognized, false)
 		if kind == "delta" && (err == nil || errors.Is(err, ErrCatalogBudget)) && (len(facts.Entries)+len(facts.Recognitions)+len(facts.SourceAssets) > CatalogMaxDeltaRows/2 || catalogBatchSize(facts) > CatalogMaxDeltaBytes/2) {
 			// Small file counts can still carry large metadata snapshots. Do not
 			// repeatedly compact/retry a delta that cannot fit the free budget.
@@ -216,7 +216,7 @@ func (s *MediaLibraryService) completeCatalogRecognition(ctx context.Context, ru
 					run.CacheHits++
 				}
 			}
-			err = s.finishCatalogRecognition(ctx, baseline.head, &candidate, token, sourceFingerprint, jobID, jobHash, &run, profile, false)
+			err = s.finishCatalogRecognition(ctx, baseline.head, &candidate, token, sourceFingerprint, jobID, jobHash, &run, profile, false, artifactChanges)
 		}
 		if err != nil {
 			abandonCatalogScan(s.catalogStore, candidate.ID, token)
@@ -253,7 +253,7 @@ func catalogRecognitionCounters(baseline catalogScanBaseline) (matched, unrecogn
 	return
 }
 
-func (s *MediaLibraryService) finishCatalogRecognition(ctx context.Context, head models.CatalogHead, candidate *models.CatalogSnapshot, token, sourceFingerprint, jobID, jobHash string, run *models.MediaLibraryScanRun, profile models.MediaClassificationProfile, finished bool) error {
+func (s *MediaLibraryService) finishCatalogRecognition(ctx context.Context, head models.CatalogHead, candidate *models.CatalogSnapshot, token, sourceFingerprint, jobID, jobHash string, run *models.MediaLibraryScanRun, profile models.MediaClassificationProfile, finished bool, artifactChanges CatalogArtifactChangeSet) error {
 	return s.catalogStore.writeCatalogBatch(ctx, func(tx *gorm.DB) error {
 		validate := func(tx *gorm.DB) error {
 			var currentHead models.CatalogHead
@@ -311,6 +311,6 @@ func (s *MediaLibraryService) finishCatalogRecognition(ctx context.Context, head
 		if err := tx.Save(run).Error; err != nil {
 			return err
 		}
-		return s.catalogScanCommit(tx, CatalogScanPublication{Candidate: candidate, Head: currentHead, Run: *run, MetadataChanged: candidate != nil, NoContentChange: candidate == nil, RecognitionOnly: true})
+		return s.catalogScanCommit(tx, CatalogScanPublication{Candidate: candidate, Head: currentHead, Run: *run, MetadataChanged: candidate != nil, NoContentChange: candidate == nil, RecognitionOnly: true, ArtifactChanges: artifactChanges})
 	})
 }

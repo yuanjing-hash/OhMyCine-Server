@@ -4,6 +4,7 @@ import QRCode from 'qrcode'
 import { api } from '@/api/client'
 import { Permissions } from '@/auth/generated-permissions'
 import PluginSettingsForm from '@/components/PluginSettingsForm.vue'
+import PluginResourceLogin from '@/components/PluginResourceLogin.vue'
 import SecretInput from '@/components/SecretInput.vue'
 import { credentialLoader } from '@/credentials'
 import {
@@ -37,6 +38,16 @@ import {
   permissionDetails,
   permissionLabel,
   pluginQRCodeAuthScope,
+  pluginResourceAuthPath,
+  pluginResourceHealthPath,
+  pluginResourceCapability,
+  pluginResourceEntryOptions,
+  buildPluginResourceLoginPayload,
+  buildPluginResourceCaptchaPayload,
+  buildPluginResourceCookiePayload,
+  type ResourceCaptchaPoint,
+  type ResourceHealthResponse,
+  type ResourceLoginResponse,
   normalizePluginInstallPreview,
   normalizeInstalledPluginSummary,
   pluginHasMarketplaceUpdate,
@@ -94,6 +105,10 @@ const connectionCredentialMode = ref<PluginCredentialMode>('none')
 const connectionCredentialScope = ref('')
 const connectionCredential = ref('')
 const connectionAuth = ref<Record<string, PluginQRCodeAuthState>>({})
+const resourceLoginResponses = ref<Record<string, ResourceLoginResponse | undefined>>({})
+const resourceHealthResponses = ref<Record<string, ResourceHealthResponse | undefined>>({})
+const resourceLoginErrors = ref<Record<string, string>>({})
+const resourceLoginBusyID = ref('')
 const authPollTimers = new Map<string, number>()
 let installDialogReturnFocus: HTMLElement | null = null
 
@@ -155,6 +170,81 @@ async function loadConnections(plugin: InstalledPluginSummary) {
   }
 }
 
+function isResourcePlugin(plugin: InstalledPluginSummary) {
+  return pluginResourceCapability(plugin)
+}
+
+function resourceEntryOptions(plugin: InstalledPluginSummary) {
+  return pluginResourceEntryOptions(plugin)
+}
+
+async function submitResourceLogin(plugin: InstalledPluginSummary, connection: PluginConnectionSummary, credentials: { username: string, password: string }) {
+  resourceLoginBusyID.value = connection.id
+  resourceLoginErrors.value = { ...resourceLoginErrors.value, [connection.id]: '' }
+  resourceLoginResponses.value = { ...resourceLoginResponses.value, [connection.id]: undefined }
+  try {
+    const response = await api<ResourceLoginResponse>(pluginResourceAuthPath(plugin.id, connection.id, 'login'), { method: 'POST', body: JSON.stringify(buildPluginResourceLoginPayload(credentials.username, credentials.password)) })
+    resourceLoginResponses.value = { ...resourceLoginResponses.value, [connection.id]: response }
+    if (response.state === 'authenticated') {
+      notify(response.accountName ? `资源站登录成功：${response.accountName}` : '资源站登录成功', 'success')
+      await loadConnections(plugin)
+    }
+  } catch (reason) {
+    resourceLoginErrors.value = { ...resourceLoginErrors.value, [connection.id]: message(reason) }
+  } finally {
+    resourceLoginBusyID.value = ''
+  }
+}
+
+async function checkResourceHealth(plugin: InstalledPluginSummary, connection: PluginConnectionSummary) {
+  resourceLoginBusyID.value = connection.id
+  resourceLoginErrors.value = { ...resourceLoginErrors.value, [connection.id]: '' }
+  try {
+    const response = await api<ResourceHealthResponse>(pluginResourceHealthPath(plugin.id, connection.id), { method: 'POST', body: '{}' })
+    resourceHealthResponses.value = { ...resourceHealthResponses.value, [connection.id]: response }
+    if (response.status === 'healthy') notify(response.accountName ? `入口与登录正常：${response.accountName}` : '入口与登录正常', 'success')
+    await loadConnections(plugin)
+  } catch (reason) {
+    resourceHealthResponses.value = { ...resourceHealthResponses.value, [connection.id]: undefined }
+    resourceLoginErrors.value = { ...resourceLoginErrors.value, [connection.id]: message(reason) }
+  } finally {
+    resourceLoginBusyID.value = ''
+  }
+}
+
+async function submitResourceCookie(plugin: InstalledPluginSummary, connection: PluginConnectionSummary, cookie: string) {
+  resourceLoginBusyID.value = connection.id
+  resourceLoginErrors.value = { ...resourceLoginErrors.value, [connection.id]: '' }
+  resourceLoginResponses.value = { ...resourceLoginResponses.value, [connection.id]: undefined }
+  try {
+    const response = await api<ResourceLoginResponse>(pluginResourceAuthPath(plugin.id, connection.id, 'cookie'), { method: 'POST', body: JSON.stringify(buildPluginResourceCookiePayload(cookie)) })
+    resourceLoginResponses.value = { ...resourceLoginResponses.value, [connection.id]: response }
+    notify('Cookie 已加密保存', 'success')
+    await loadConnections(plugin)
+  } catch (reason) {
+    resourceLoginErrors.value = { ...resourceLoginErrors.value, [connection.id]: message(reason) }
+  } finally {
+    resourceLoginBusyID.value = ''
+  }
+}
+
+async function submitResourceCaptcha(plugin: InstalledPluginSummary, connection: PluginConnectionSummary, challengeID: string, points: ResourceCaptchaPoint[]) {
+  resourceLoginBusyID.value = connection.id
+  resourceLoginErrors.value = { ...resourceLoginErrors.value, [connection.id]: '' }
+  try {
+    const response = await api<ResourceLoginResponse>(pluginResourceAuthPath(plugin.id, connection.id, 'captcha'), { method: 'POST', body: JSON.stringify(buildPluginResourceCaptchaPayload(challengeID, points)) })
+    resourceLoginResponses.value = { ...resourceLoginResponses.value, [connection.id]: response }
+    if (response.state === 'authenticated') {
+      notify(response.accountName ? `资源站登录成功：${response.accountName}` : '资源站登录成功', 'success')
+      await loadConnections(plugin)
+    }
+  } catch (reason) {
+    resourceLoginErrors.value = { ...resourceLoginErrors.value, [connection.id]: message(reason) }
+  } finally {
+    resourceLoginBusyID.value = ''
+  }
+}
+
 async function toggleConnectionPanel(plugin: InstalledPluginSummary) {
   if (expandedPluginID.value === plugin.id) {
     expandedPluginID.value = ''
@@ -162,10 +252,13 @@ async function toggleConnectionPanel(plugin: InstalledPluginSummary) {
   }
   expandedPluginID.value = plugin.id
   connectionName.value = `${plugin.name} 连接`
-  connectionConfig.value = { ...plugin.config_defaults }
-  connectionConfigText.value = JSON.stringify(plugin.config_defaults ?? {}, null, 2)
+  const resourceEntries = resourceEntryOptions(plugin)
+  const initialConfig = { ...plugin.config_defaults }
+  if (isResourcePlugin(plugin) && typeof initialConfig.entryOrigin !== 'string' && resourceEntries[0]) initialConfig.entryOrigin = resourceEntries[0]
+  connectionConfig.value = initialConfig
+  connectionConfigText.value = JSON.stringify(initialConfig, null, 2)
   const qrAuthScope = pluginQRCodeAuthScope(plugin)
-  connectionCredentialMode.value = qrAuthScope ? 'cookie' : 'none'
+  connectionCredentialMode.value = (qrAuthScope || isResourcePlugin(plugin)) ? 'cookie' : 'none'
   connectionCredentialScope.value = qrAuthScope ?? credentialScopes(plugin)[0] ?? ''
   connectionCredential.value = ''
   await loadConnections(plugin)
@@ -180,7 +273,9 @@ async function createConnection(plugin: InstalledPluginSummary) {
     const connection = await api<PluginConnectionSummary>(pluginConnectionsPath(plugin.id), { method: 'POST', body: JSON.stringify(payload) })
     connectionCredential.value = ''
     await loadConnections(plugin)
-    if (pluginQRCodeAuthScope(plugin)) {
+    if (isResourcePlugin(plugin)) {
+      notify('资源站连接已创建，请在连接卡片中完成登录', 'success')
+    } else if (pluginQRCodeAuthScope(plugin)) {
       notify(`插件连接已创建，请使用 ${plugin.name} 客户端扫码登录`, 'success')
       await startConnectionAuth(plugin, connection)
     } else {
@@ -298,8 +393,10 @@ async function pollConnectionAuth(plugin: InstalledPluginSummary, connection: Pl
 
 function connectionHealthLabel(connection: PluginConnectionSummary) {
   if (connection.health_status === 'healthy') return '连接正常'
-  if (connection.health_status === 'auth_pending') return '等待扫码'
-  if (connection.health_status === 'auth_expired') return '登录已过期'
+  if (connection.health_status === 'auth_pending') return connection.resource_type === 'bt_resource' ? '等待登录验证' : '等待扫码'
+  if (connection.health_status === 'auth_expired' || connection.health_status === 'auth_required') return '需要登录'
+  if (connection.health_status === 'rate_limited') return '站点限流中'
+  if (connection.health_status === 'unavailable') return '入口不可用'
   if (connection.health_status === 'error') return '连接异常'
   return connection.enabled ? '待检测' : '已停用'
 }
@@ -650,7 +747,7 @@ onMounted(() => { void loadAll() })
           <section v-if="expandedPluginID === plugin.id" class="semantic-inset mt-5 grid gap-4 p-4" :aria-label="`${plugin.name} 连接配置`">
             <div>
               <h3 class="m-0 text-base">连接与在线媒体库</h3>
-              <p class="text-subtle mb-0 mt-1 text-xs">一个插件可创建多个相互隔离的账号/匿名连接。普通配置可见，Cookie、Token 等凭据仅加密保存在 Server。</p>
+              <p class="text-subtle mb-0 mt-1 text-xs">一个插件可创建多个相互隔离的连接。普通配置可见，Cookie、Token 等凭据仅加密保存在 Server。</p>
             </div>
             <p v-if="connectionsLoadingID === plugin.id" class="text-subtle m-0 text-sm">正在读取连接…</p>
             <div v-else-if="(connectionsByPlugin[plugin.id] ?? []).length" class="grid gap-2">
@@ -658,11 +755,19 @@ onMounted(() => { void loadAll() })
                 <div class="flex flex-wrap items-center justify-between gap-3">
                   <div>
                     <strong class="text-sm">{{ connection.name }}</strong>
-                    <p class="text-subtle m-0 mt-1 text-xs">{{ connection.credential_configured ? `${connection.credential_mode} 凭据已安全配置` : '匿名连接' }}</p>
+                    <p class="text-subtle m-0 mt-1 text-xs">{{ connection.credential_configured ? `${connection.credential_mode} 凭据已安全配置` : (connection.resource_type === 'bt_resource' ? '尚未登录' : '匿名连接') }}</p>
                   </div>
                   <div class="flex flex-wrap gap-2"><span :class="connection.enabled ? 'status-chip status-chip--ready' : 'status-chip'">{{ connection.enabled ? '已启用' : '已停用' }}</span><span :class="connection.health_status === 'error' || connection.health_status === 'auth_expired' ? 'status-chip status-chip--warning' : 'status-chip'">{{ connectionHealthLabel(connection) }}</span></div>
                 </div>
                 <p v-if="connection.health_error_code" class="semantic-warning mt-3 p-2 text-xs">健康错误：<span class="font-mono">{{ connection.health_error_code }}</span></p>
+                <div v-if="isResourcePlugin(plugin)" class="semantic-inset mt-3 grid gap-2 p-3">
+                  <label class="label">固定镜像入口</label>
+                  <select v-if="resourceEntryOptions(plugin).length" class="input" :value="String(connection.config.entryOrigin ?? connection.entry_origin ?? '')" :disabled="editingConnectionID !== connection.id || connectionBusyID !== ''" @change="connectionEditConfig = { ...connectionEditConfig, entryOrigin: ($event.target as HTMLSelectElement).value }">
+                    <option v-for="origin in resourceEntryOptions(plugin)" :key="origin" :value="origin">{{ origin }}</option>
+                  </select>
+                  <p v-else class="semantic-warning m-0 p-2 text-xs">插件没有声明可用镜像入口，无法创建资源站连接。</p>
+                  <p class="text-subtle m-0 text-xs">入口切换后 Server 会清理旧凭据，必须重新登录；不会自动跨域切换。</p>
+                </div>
                 <PluginSettingsForm
                   v-if="plugin.settings_page && editingConnectionID === connection.id"
                   v-model="connectionEditConfig"
@@ -688,7 +793,21 @@ onMounted(() => { void loadAll() })
                   disabled
                   @start-auth="startConnectionAuth(plugin, connection)"
                 />
-                <div v-if="editingConnectionID === connection.id && connection.credential_mode !== 'none'" class="mt-3">
+                <PluginResourceLogin
+                  v-if="isResourcePlugin(plugin)"
+                  :plugin-id="plugin.id"
+                  :connection="connection"
+                  :can-manage="canManage"
+                  :response="resourceLoginResponses[connection.id]"
+                  :health-response="resourceHealthResponses[connection.id]"
+                  :error="resourceLoginErrors[connection.id]"
+                  :busy="resourceLoginBusyID === connection.id"
+                  @login="submitResourceLogin(plugin, connection, $event)"
+                  @cookie="submitResourceCookie(plugin, connection, $event)"
+                  @captcha="submitResourceCaptcha(plugin, connection, $event.challengeId, $event.points)"
+                  @health="checkResourceHealth(plugin, connection)"
+                />
+                <div v-if="editingConnectionID === connection.id && connection.credential_mode !== 'none' && !isResourcePlugin(plugin)" class="mt-3">
                   <label class="label">更换凭据（留空保留）</label>
                   <SecretInput
                     v-model="connectionEditCredential"
@@ -712,19 +831,29 @@ onMounted(() => { void loadAll() })
                 </div>
               </article>
             </div>
-            <p v-else class="text-subtle m-0 text-sm">尚未创建连接。无需登录即可使用的插件可直接创建匿名连接。</p>
+            <p v-else class="text-subtle m-0 text-sm">尚未创建连接。资源站连接创建后需要完成登录；其他无需认证的插件可创建匿名连接。</p>
 
             <form v-if="canManage" class="grid gap-3" @submit.prevent="createConnection(plugin)">
               <div><label class="label">连接名称</label><input v-model="connectionName" class="input" maxlength="128" required /></div>
+              <div v-if="isResourcePlugin(plugin)">
+                <label class="label">固定镜像入口</label>
+                <select v-if="resourceEntryOptions(plugin).length" v-model="connectionConfig.entryOrigin" class="input" required>
+                  <option v-for="origin in resourceEntryOptions(plugin)" :key="origin" :value="origin">{{ origin }}</option>
+                </select>
+                <p v-else class="semantic-error m-0 p-2 text-xs">插件没有声明可用镜像入口，不能创建资源站连接。</p>
+                <p class="text-subtle mb-0 mt-1 text-xs">每个连接固定一个镜像；切换镜像后需要重新登录。</p>
+                <p v-if="credentialScopes(plugin).length !== 1" class="semantic-error mb-0 mt-2 p-2 text-xs">资源站插件必须声明唯一的 Cookie 凭据范围，当前插件契约无效。</p>
+              </div>
               <PluginSettingsForm v-if="plugin.settings_page" v-model="connectionConfig" :page="plugin.settings_page" />
               <div v-else><label class="label">普通配置（JSON）</label><textarea v-model="connectionConfigText" class="input min-h-28 font-mono text-xs" spellcheck="false" /></div>
-              <p v-if="pluginQRCodeAuthScope(plugin)" class="semantic-inset m-0 p-3 text-sm">创建连接后会立即显示 {{ plugin.name }} 登录二维码，无需手动填写 Cookie。</p>
+              <p v-if="isResourcePlugin(plugin)" class="semantic-inset m-0 p-3 text-sm">先创建固定镜像连接，再在连接卡片中使用账号密码或 Cookie 登录；密码不会保存。</p>
+              <p v-else-if="pluginQRCodeAuthScope(plugin)" class="semantic-inset m-0 p-3 text-sm">创建连接后会立即显示 {{ plugin.name }} 登录二维码，无需手动填写 Cookie。</p>
               <div v-else class="grid gap-3 sm:grid-cols-2">
                 <div><label class="label">认证方式</label><select v-model="connectionCredentialMode" class="input"><option value="none">匿名 / 不使用凭据</option><option v-if="credentialScopes(plugin).length" value="cookie">Cookie</option><option v-if="credentialScopes(plugin).length" value="bearer">Bearer Token</option></select></div>
                 <div v-if="connectionCredentialMode !== 'none'"><label class="label">凭据范围</label><select v-model="connectionCredentialScope" class="input" required><option v-for="scope in credentialScopes(plugin)" :key="scope" :value="scope">{{ scope }}</option></select></div>
               </div>
-              <div v-if="!pluginQRCodeAuthScope(plugin) && connectionCredentialMode !== 'none'"><label class="label">凭据{{ connectionCredentialMode === 'cookie' ? '（可留空后扫码登录）' : '' }}</label><SecretInput v-model="connectionCredential" class="input min-h-20 font-mono text-xs" multiline :required="connectionCredentialMode === 'bearer'" autocomplete="off" spellcheck="false" /><p class="text-subtle mb-0 mt-1 text-xs">手动填写的凭据保存后不会再次回显明文，日志、普通 API 和 Player 都不会收到它。</p></div>
-              <button class="btn-primary" :disabled="connectionBusyID !== '' || !connectionName.trim()">{{ connectionBusyID === `new:${plugin.id}` ? '正在创建…' : pluginQRCodeAuthScope(plugin) ? '创建连接并扫码登录' : '创建连接' }}</button>
+              <div v-if="!isResourcePlugin(plugin) && !pluginQRCodeAuthScope(plugin) && connectionCredentialMode !== 'none'"><label class="label">凭据{{ connectionCredentialMode === 'cookie' ? '（可留空后扫码登录）' : '' }}</label><SecretInput v-model="connectionCredential" class="input min-h-20 font-mono text-xs" multiline :required="connectionCredentialMode === 'bearer'" autocomplete="off" spellcheck="false" /><p class="text-subtle mb-0 mt-1 text-xs">手动填写的凭据保存后不会再次回显明文，日志、普通 API 和 Player 都不会收到它。</p></div>
+              <button class="btn-primary" :disabled="connectionBusyID !== '' || !connectionName.trim() || (isResourcePlugin(plugin) && (resourceEntryOptions(plugin).length === 0 || credentialScopes(plugin).length !== 1))">{{ connectionBusyID === `new:${plugin.id}` ? '正在创建…' : pluginQRCodeAuthScope(plugin) ? '创建连接并扫码登录' : isResourcePlugin(plugin) ? '创建资源站连接' : '创建连接' }}</button>
             </form>
           </section>
         </article>

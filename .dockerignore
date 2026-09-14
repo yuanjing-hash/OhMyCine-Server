@@ -1,0 +1,15 @@
+.git
+.runtime
+data
+dist
+server.exe
+webui/node_modules
+webui/dist
+**/*.db*
+**/*.pem
+**/*.key
+**/.env*
+**/node_modules
+**/__pycache__
+*.exe
+build/container-assets

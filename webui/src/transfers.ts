@@ -37,6 +37,13 @@ export interface TransferSummary {
   profile_revision: number
   library_id: number
   library_name: string
+  execution_location: 'server' | 'node'
+  node_id?: string
+  node_name?: string
+  remote_phase?: string
+  remote_status?: string
+  remote_progress?: number | null
+  remote_error_code?: string
   route_kind: DownloadRouteKind
   transfer_mode: TransferMode
   conflict_policy: 'ask' | 'overwrite' | 'skip' | 'rename'
@@ -134,6 +141,29 @@ export function transferRouteLabel(routeKind: DownloadRouteKind): string {
     same_source_provider: '同源云端',
     cross_source: '跨数据源暂存',
   } as Record<string, string>)[routeKind] ?? '旧任务路线未知'
+}
+
+const remotePhaseLabels: Record<string, string> = {
+  accepted: '节点已接收计划',
+  submitting_download: '节点正在提交下载',
+  waiting_download: '节点等待下载完成',
+  verifying_remote_files: '节点核验下载文件',
+  waiting_server_plan: '节点等待 Server 规划',
+  pulling_source: '节点拉取来源文件',
+  uploading_target: '节点上传目标网盘',
+  verifying_target: '节点核验目标文件',
+  waiting_node: '等待节点恢复',
+  waiting_credentials: '等待更新临时凭据',
+  completed: '节点阶段完成',
+}
+
+export function transferExecutionLabel(item: TransferSummary): string {
+  return item.execution_location === 'node' ? `传输节点 · ${item.node_name || '节点不可用'}` : '主 Server'
+}
+
+export function remoteTransferPhaseLabel(item: TransferSummary): string {
+  if (item.execution_location !== 'node') return ''
+  return remotePhaseLabels[item.remote_phase || ''] || (item.remote_phase ? `节点阶段 · ${item.remote_phase}` : '节点等待调度')
 }
 
 export type TransferDeletionScope = 'record_only' | 'record_and_source' | 'record_and_library' | 'record_source_and_library'

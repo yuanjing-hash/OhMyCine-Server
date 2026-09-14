@@ -205,7 +205,7 @@ func TestLeaseRecoveryCountsOnlyConsecutiveLeaseExpiries(t *testing.T) {
 		if err != nil || claimed == nil {
 			t.Fatalf("retry claim %d = %+v err=%v", attempt+1, claimed, err)
 		}
-		if err := service.RetryLater(job.ID, claimed.LeaseToken, "downloader_unavailable", "provider offline", clock.now); err != nil {
+		if err := service.RetryLater(job.ID, claimed.LeaseToken, "pan115_auth_expired", "credential renewal required", clock.now); err != nil {
 			t.Fatal(err)
 		}
 		if err := service.PromoteDueRetries(); err != nil {

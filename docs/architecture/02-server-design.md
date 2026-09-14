@@ -20,7 +20,7 @@ OhMyCine Server 是一个**以媒体流水线为核心**的自托管后端，负
 
 多站搜索现在由 Server 生命周期级共享协调器执行受控并行，而不是逐站串行或为每次请求无限创建 goroutine。普通标题与 TMDB 多语言搜索共用每站独立超时、全局并发上限、站点限速、取消和稳定排序；SSE 按 `media/progress/site/done/error` 渐进输出完整计数快照和单站结果，单站失败不影响其它站点，JSON 降级接口复用同一最终投影。以 `owner + media_type + tmdb_id` 为身份的 Acquisition 聚合持久记录订阅、下载、整理、入库和失败阶段，并由 Download/Transfer/Follow 状态幂等推进；Player 与 Server Web 读取同一安全投影，冻结下载器、目标库和分类选项，重试不会采用新的默认值。
 
-可配置周期工作已收敛为统一五段 Cron 调度器：定义保存 IANA 时区、misfire、重叠、重试和最大运行时间，执行只向持久任务队列投递现有领域 Job。自动追更、媒体库全量扫描、CookieCloud、115 回收站、目录诊断/可选修复和 STRM 一致性检查使用统一定义；生活事件、文件/provider 监听补偿、下载器轮询、队列/上传心跳仍是常驻运行循环。系统迁移定义使用唯一非空 `managed_key`，启动只补缺失定义，不收编同目标手工计划，也不覆盖用户在计划任务页修改的 Cron；仅显式修改对应业务周期或启用状态时同步该 managed 定义。
+可配置周期工作已收敛为统一五段 Cron 调度器：定义保存 IANA 时区、misfire、重叠、重试和最大运行时间，执行只向持久任务队列投递现有领域 Job。自动追更、媒体库增量复核、CookieCloud、115 回收站、目录诊断/可选修复和 STRM 增量一致性检查使用统一定义；生活事件、文件/provider 监听补偿、下载器轮询、队列/上传心跳仍是常驻运行循环。媒体库只在首次启用或来源替换后自动执行一次完整基线；日常和周期任务使用增量入口，只有管理员明确点击“完整核对”才读取整棵目录树，而且产物阶段仍只执行实际差异。系统迁移定义使用唯一非空 `managed_key`，启动只补缺失定义，不收编同目标手工计划，也不覆盖用户在计划任务页修改的 Cron；仅显式修改对应业务周期或启用状态时同步该 managed 定义。
 
 自动分类入库采用 MoviePilot 的“媒体类型目录 → 类型内分类目录”层级原则，但保持 OhMyCine 自己的 Profile、任务快照和执行器实现：所有新任务先固定进入 `电影` 或 `电视剧`，再进入对应 Profile 分类、作品和季目录。本地、115 同源、跨数据源、插件下载与自动追更共享同一规范化模板；升级不会改写已排队任务的冻结模板或自动搬动已有文件。
 
@@ -451,7 +451,7 @@ STRM 管理有独立的管理页面，当前以媒体库 generation 和 manifest
 │  │ 剧集库   │ 5,678  │ 5,678  │ 0      │ 2小时前        │  │
 │  └──────────┴────────┴────────┴────────┴────────────────┘  │
 │                                                            │
-│  操作: [立即增量刷新] [全量重建] [失败重试] [清理预览]      │
+│  操作: [立即增量刷新] [完整核对] [失败重试] [清理预览]      │
 └────────────────────────────────────────────────────────────┘
 ```
 
@@ -499,7 +499,7 @@ func (g *Generator) IncrementalSync(ctx context.Context, remotePath string, last
     return nil
 }
 
-// FullSync 全量扫描 — 重新生成所有STRM
+// FullSync 完整核对 — 读取完整目录，但只写入实际差异
 func (g *Generator) FullSync(ctx context.Context, remotePath string) error {
     files, err := g.listMediaFiles(ctx, remotePath)
     if err != nil {
@@ -507,6 +507,9 @@ func (g *Generator) FullSync(ctx context.Context, remotePath string) error {
     }
 
     for _, file := range files {
+        if g.manifestIsHealthy(file) {
+            continue // 保留已有 bytes 与 mtime
+        }
         if err := g.generateOne(file); err != nil {
             log.Warn().Err(err).Str("file", file.Path).Msg("STRM生成失败")
             continue
@@ -1345,7 +1348,7 @@ POST   /api/v1/jobs/{transferJobID}/retry     # 仅重试失败的转移 Job
 # ====== STRM管理 ======
 GET    /api/v1/strm/status                   # STRM同步状态
 POST   /api/v1/strm/sync/incremental         # 立即增量同步
-POST   /api/v1/strm/sync/full                # 立即全量同步
+POST   /api/v1/strm/sync/full                # 手动完整核对，只执行实际差异
 POST   /api/v1/strm/clean                    # 清理无效STRM
 GET    /api/v1/strm/config                   # STRM定时任务配置
 PUT    /api/v1/strm/config                   # 更新STRM定时任务配置
@@ -1752,7 +1755,7 @@ MediaLibrary 的扫描器仍以只读索引为默认边界；目录写入必须�
 
 结构修复由 provider-neutral `StructurePlanner` 与严格 `MediaLibraryStructureBackend` registry 组成。本地和 115 backend 只负责在各自存储语义中执行同一不可变计划：视频、字幕、NFO 和图片作为关联资产一起移动；旧目录只有在仍位于媒体库根内且已经为空时才能删除。目标冲突作为一个问题保存全部来源成员，可选择唯一推荐来源、指定来源、全部保留为 `(2)/(3)…` 版本或本次跳过；没有唯一推荐时批量推荐自动跳过。选择只写草稿，预览与执行分离，确认令牌绑定用户、媒体库、诊断、来源版本、generation、规则和计划且短时单次有效。完成后只唤醒现有 LibrarySupervisor 重新扫描，不创建第二套 watcher。计划、provider identity、原始 work key 与 checkpoint 是服务内部状态，不进入浏览器 DTO。
 
-诊断摘要可继续保持有界，但操作真相是数据库中当前诊断的全部问题与全部冲突成员；`GET .../structure/issues` 提供 50/100/200 的 Server 分页、筛选与真实总数，不能从最多 100 条摘要样本反向恢复标题或选择范围。所有浏览器字段只使用安全相对摘要和库作用域 opaque token。冲突落选文件必须先进入可恢复回收区再移动保留项：本地移动到媒体库内 `.ohmycine-recycle/<draft>/...` 且扫描器永久忽略该目录；115 只调用 provider 原生 `Recycle`，并继续由连接上已有的定时回收站清空策略独立处理。没有可恢复能力时拒绝，任何路径都不得永久删除。执行前逐项复核根边界、稳定身份、名称、类型和大小；全部保留版本必须避开健康文件与既有 `(2)` 等目标。显式 `SxxEyy` 可与中文标题或发布文本直接相邻，同时仍拒绝嵌入 ASCII 单词内部的伪标记。
+诊断摘要可继续保持有界，但操作真相是数据库中当前诊断的全部问题与全部冲突成员；`GET .../structure/issues` 提供 50/100/200 的 Server 分页、筛选与真实总数，不能从最多 100 条摘要样本反向恢复标题或选择范围。已正确识别作品的路径差异按当前 Profile 模板拆成 `naming_mismatch`（只修改标题/年份/季集/版本控制的命名段及文件名）与 `location_mismatch`（层级或分类路由位置变化）；旧 `path_mismatch` 只读兼容到下一次重检。按分类跳过由服务端工作区覆盖当前诊断的全部分页结果，只记录本次意图，不移动文件或永久忽略。所有浏览器字段只使用安全相对摘要和库作用域 opaque token。冲突落选文件必须先进入可恢复回收区再移动保留项：本地移动到媒体库内 `.ohmycine-recycle/<draft>/...` 且扫描器永久忽略该目录；115 只调用 provider 原生 `Recycle`，并继续由连接上已有的定时回收站清空策略独立处理。没有可恢复能力时拒绝，任何路径都不得永久删除。执行前逐项复核根边界、稳定身份、名称、类型和大小；全部保留版本必须避开健康文件与既有 `(2)` 等目标。显式 `SxxEyy` 可与中文标题或发布文本直接相邻，同时仍拒绝嵌入 ASCII 单词内部的伪标记。
 
 同一有效 `recognition_id` 的未识别分集在当前诊断中合并成一个作品级问题，主列表只携带最多 8 个安全来源预览，完整来源通过问题 token 分页读取。每个当前诊断可为每个用户建立独立的 Server 持久处理工作区；`pending/handled` 由服务端跨完整分页计算，保存、修改、撤销和批量冲突选择都使用 review revision CAS。主动重新检测建立新 diagnosis job 后清理旧工作区，但已写入 catalog 的人工识别事实继续保留。工作区 revision 绑定冻结预览，任一选择变化都会令旧预览失效；修复任务一旦入队，对应选择标记为 submitted，不能从工作区反向撤销已提交的移动或回收操作。人工识别刷新投影时会删除被替换 issue token 上尚未提交的破坏性选择，恢复自动识别不会保留“已人工识别”投影。
 
@@ -1856,6 +1859,28 @@ services:
 
 ### 目录转换前的连接来源保护
 
+
 修改连接凭据/地址不能仅凭 Connection ID 相同就沿用旧媒体库。Server 比较规范化后的实际凭据；同值重存、改名与回收站配置不重建目录，启停连接只更新配置围栏。真正更换来源时，已采用分代目录的库会与连接保存一起切到空的新来源目录并发布移除通知，保留旧身份记录；尚未转换的旧库会返回 409，提示先新建连接再逐库修改来源，避免旧账号文件被错误解释为新账号文件。一次连接修改最多关联四个媒体库（包含旧格式库）；更多时需逐库迁移，转换中的库需先完成或恢复转换。
 
 旧扫描暂存的清理由已有后台维护循环接管：每轮最多检查 250 个扫描任务、删除 250 条超过七天的终态暂存，并在写入时重新验证状态。启动不再全量删除旧暂存；运行中与近期任务的恢复数据不受影响。此处清理不涉及媒体文件或用户回收站。
+
+## 21. 公网传输节点
+
+`ohmycine-node` 与 Server 同仓发布，但运行时是独立二进制、进程、配置、
+SQLite、日志和安全身份。Node 不是第二个 Server：媒体识别、分类、命名、冲突
+选择和最终路径都由主 Server 冻结，Node 只连接管理员已有的 qBittorrent 或按
+任务授权访问 115，并执行冻结操作。
+
+首版路线为 qB/PT→115、qB/PT→主 Server 本地库、115 A→115 B、115→主
+Server 本地库。一个下载任务只能绑定一个最终媒体库。远端 qB 做种源不能移动；
+网盘目标由 Node 直接上传，本地目标由 Server 主动通过 8 MiB Range 分块拉取，
+校验 SHA-256 后才进入现有本地 Transfer。
+
+下载器仍在 Server 的“下载器管理”中添加，运行位置可选主 Server 或 Node。
+存在任何下载任务后，Node、qB 路径映射、115 来源 Storage 和来源目录都不能
+修改，避免历史任务恢复时漂移；名称、启停和可续签凭据仍可维护。新 Provider
+进入正式下载/存储能力时，必须同时实现 Node 适配，或明确显示不支持 Node。
+
+Node 安装只安装 `ohmycine-node`，不安装 qBittorrent、防火墙或反向代理。正式
+Server 可生成 Linux bash 或 Windows PowerShell 完整命令；命令先校验 RSA-3072
+签名清单和 installer SHA-256，再执行对应平台安装器。开发构建不生成伪官方命令。

@@ -1,6 +1,7 @@
 ﻿<script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import JobRepairDetails from '@/components/JobRepairDetails.vue';
+import ClearHistoryButton from '@/components/ClearHistoryButton.vue';
 import { useRoute, useRouter } from 'vue-router';
 import { createLatestRequest } from '@/latest-request';
 import { useJobLiveRefresh } from '@/use-job-live-refresh';
@@ -17,6 +18,7 @@ import {
   respondAction,
   statusLabels,
   unknown,
+  progressPercent,
   type Job,
   type JobAttempt,
   type JobEvent,
@@ -252,7 +254,7 @@ onBeforeUnmount(() => { alive = false; listRequest.cancel(); detailRequest.cance
           不进入此队列。
         </p>
       </div>
-      <button class="btn-secondary" @click="refresh">刷新</button>
+      <div class="flex flex-wrap gap-2"><ClearHistoryButton v-if="canControl" scope="tasks" @cleared="load()" /><button class="btn-secondary" @click="refresh">刷新</button></div>
     </header>
     <div class="task-summary mt-6">
       <article
@@ -385,7 +387,7 @@ onBeforeUnmount(() => { alive = false; listRequest.cancel(); detailRequest.cance
               <small v-if="job.wait_reason && ['queued', 'retry_wait'].includes(job.status)" class="block mt-1 semantic-warning-text">等待原因：{{ job.wait_reason.message }}</small>
             </td>
             <td>
-              {{ unknown(job.progress, "%")
+              {{ progressPercent(job.progress)
               }}<small class="block text-subtle">{{ unknown(job.processed_items) }} /
                 {{ unknown(job.total_items) }}</small>
             </td>

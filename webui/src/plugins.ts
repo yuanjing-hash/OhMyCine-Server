@@ -149,6 +149,9 @@ export interface PluginConnectionSummary {
   credential_scope: string
   credential_mode: PluginCredentialMode
   credential_configured: boolean
+  resource_type?: string
+  entry_origin?: string
+  login_account_label?: string
   enabled: boolean
   health_status: 'unknown' | 'auth_pending' | 'auth_expired' | 'healthy' | 'error' | string
   health_error_code?: string
@@ -156,6 +159,26 @@ export interface PluginConnectionSummary {
   revision: number
   created_at: string
   updated_at: string
+}
+
+export interface ResourceCaptchaPoint { x: number; y: number }
+export interface ResourceCaptchaChallenge {
+  challengeId: string
+  imageAssetRef: string
+  width: number
+  height: number
+  prompt: string
+  maxPoints: number
+}
+export interface ResourceLoginResponse {
+  state: 'authenticated' | 'captcha_required' | 'failed'
+  accountName?: string
+  challenge?: ResourceCaptchaChallenge
+  errorCode?: string
+}
+export interface ResourceHealthResponse {
+  status: 'healthy' | 'auth_required' | 'unavailable' | 'rate_limited'
+  accountName?: string
 }
 
 export interface PluginAuthStartSummary {
@@ -218,6 +241,41 @@ export function pluginConnectionPath(pluginID: string, connectionID: string) {
 
 export function pluginConnectionAuthPath(pluginID: string, connectionID: string, operation: 'start' | 'poll') {
   return `${pluginConnectionPath(pluginID, connectionID)}/auth/${operation}`
+}
+
+export function pluginResourceAuthPath(pluginID: string, connectionID: string, operation: 'login' | 'captcha' | 'cookie') {
+  return `${pluginConnectionPath(pluginID, connectionID)}/resource/${operation}`
+}
+
+export function pluginResourceHealthPath(pluginID: string, connectionID: string) {
+  return `${pluginConnectionPath(pluginID, connectionID)}/resource/health`
+}
+
+/** Short-lived same-origin URL for a Host-owned captcha image. Never persist the raw image or token. */
+export function pluginResourceCaptchaAssetPath(pluginID: string, connectionID: string, assetRef: string) {
+  return `${pluginConnectionPath(pluginID, connectionID)}/resource/captcha/${encodeURIComponent(assetRef)}`
+}
+
+export function pluginResourceCapability(plugin: Pick<InstalledPluginSummary, 'capabilities'>) {
+  return plugin.capabilities.includes('resource.search') && plugin.capabilities.includes('resource.resolve')
+}
+
+export function pluginResourceEntryOptions(plugin: Pick<InstalledPluginSummary, 'config_schema'>) {
+  const schema = plugin.config_schema as { properties?: { entryOrigin?: { enum?: unknown[] } } } | undefined
+  const values = schema?.properties?.entryOrigin?.enum
+  return Array.isArray(values) ? values.filter((value): value is string => typeof value === 'string' && value.startsWith('https://')) : []
+}
+
+export function buildPluginResourceLoginPayload(username: string, password: string) {
+  return { username: username.trim(), password }
+}
+
+export function buildPluginResourceCookiePayload(cookie: string) {
+  return { cookie: cookie.trim() }
+}
+
+export function buildPluginResourceCaptchaPayload(challengeId: string, points: readonly ResourceCaptchaPoint[]) {
+  return { challengeId: challengeId.trim(), points: points.map(point => ({ x: Math.round(point.x), y: Math.round(point.y) })) }
 }
 
 export function pluginLogsPath(pluginID: string) {

@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/rs/zerolog"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/authz"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/classification"
@@ -29,10 +30,11 @@ import (
 )
 
 const (
-	ptResultTTL                    = 15 * time.Minute
-	maxPTResultClaims              = 5000
-	defaultSiteSearchConcurrency   = 4
-	CodeSiteResultIdentityMismatch = "site_result_identity_mismatch"
+	ptResultTTL                     = 15 * time.Minute
+	maxPTResultClaims               = 5000
+	pluginResourceClaimCleanupBatch = 512
+	defaultSiteSearchConcurrency    = 4
+	CodeSiteResultIdentityMismatch  = "site_result_identity_mismatch"
 )
 
 type SiteService struct {
@@ -47,6 +49,7 @@ type SiteService struct {
 	aiRecognition   *AIRecognitionSettingsService
 	renderedFetcher sitepkg.RenderedFetcher
 	searchSlots     chan struct{}
+	pluginResources PluginResourceBridge
 
 	limitMu sync.Mutex
 	limits  map[uint]*siteLimiter
@@ -65,6 +68,7 @@ type siteCredentialEnvelope struct {
 }
 type siteResultClaim struct {
 	ActorID, SiteID   uint
+	PluginClaimID     string
 	TorrentID, Title  string
 	Subtitle          string
 	MediaTypeHint     string
@@ -284,6 +288,10 @@ func (s *SiteService) SetRenderedFetcher(fetcher sitepkg.RenderedFetcher) {
 	s.renderedFetcher = fetcher
 }
 
+func (s *SiteService) SetPluginResourceBridge(bridge PluginResourceBridge) {
+	s.pluginResources = bridge
+}
+
 func (s *SiteService) List(actor Actor) ([]SiteSummary, error) {
 	if !actor.IsSystemAdmin() && !actor.HasPermission(authz.PermissionSitesRead) {
 		return nil, appError(CodePermissionDenied, "无权管理站点", nil)
@@ -480,6 +488,9 @@ func (s *SiteService) Update(ctx context.Context, actor Actor, id uint, input Si
 	if err := s.db.First(&record, id).Error; err != nil {
 		return SiteSummary{}, siteNotFound(err)
 	}
+	if record.SourceType == "plugin" {
+		return SiteSummary{}, appError(CodeSiteManagedByPlugin, "插件资源站请在插件连接页管理", nil)
+	}
 	if !actor.IsSystemAdmin() && !actor.CanResource(authz.PermissionSitesUpdate, models.AuthorizationResourceSite, uintID(record.ID)) {
 		return SiteSummary{}, appError(CodePermissionDenied, "无权编辑这个站点", nil)
 	}
@@ -634,6 +645,13 @@ func (s *SiteService) Test(ctx context.Context, actor Actor, id uint, request Re
 	if !actor.IsSystemAdmin() && !actor.HasPermission(authz.PermissionSitesTest) {
 		return SiteSummary{}, appError(CodePermissionDenied, "无权测试站点", nil)
 	}
+	var managed models.Site
+	if err := s.db.Select("id", "source_type").First(&managed, id).Error; err != nil {
+		return SiteSummary{}, siteNotFound(err)
+	}
+	if managed.SourceType == "plugin" {
+		return SiteSummary{}, appError(CodeSiteManagedByPlugin, "插件资源站请在插件连接页检测", nil)
+	}
 	record, config, adapter, err := s.runtimeConfig(id)
 	if err != nil {
 		return SiteSummary{}, err
@@ -670,6 +688,9 @@ func (s *SiteService) Delete(actor Actor, id uint, request RequestContext) error
 	var record models.Site
 	if err := s.db.First(&record, id).Error; err != nil {
 		return siteNotFound(err)
+	}
+	if record.SourceType == "plugin" {
+		return appError(CodeSiteManagedByPlugin, "插件资源站请在插件连接页删除", nil)
 	}
 	if !actor.IsSystemAdmin() && !actor.CanResource(authz.PermissionSitesDelete, models.AuthorizationResourceSite, uintID(record.ID)) {
 		return appError(CodePermissionDenied, "无权删除这个站点", nil)
@@ -760,6 +781,17 @@ func (s *SiteService) searchSiteRecords(actor Actor, siteID *uint, siteIDs []uin
 			}
 			continue
 		}
+		if record.SourceType == "plugin" && record.Kind == pluginResourceKind {
+			available, code, reason := s.pluginResourceSearchAvailability(record)
+			if !available {
+				if selected {
+					return nil, appError(code, reason, nil)
+				}
+				continue
+			}
+			filtered = append(filtered, record)
+			continue
+		}
 		definition, found := builtin.DefinitionForKey(record.Kind)
 		if !found || !definition.Search {
 			if selected {
@@ -785,6 +817,11 @@ func (s *SiteService) SearchOptions(actor Actor) ([]SiteSearchOption, error) {
 		if !actor.CanResource(authz.PermissionDiscoveryRead, models.AuthorizationResourceSite, uintID(record.ID)) {
 			continue
 		}
+		if record.SourceType == "plugin" && record.Kind == pluginResourceKind {
+			searchable, _, reason := s.pluginResourceSearchAvailability(record)
+			result = append(result, SiteSearchOption{ID: record.ID, Name: record.Name, SiteType: "bt_resource", HealthStatus: firstNonEmpty(record.LastHealthStatus, "unknown"), Searchable: searchable, Reason: reason})
+			continue
+		}
 		definition, found := builtin.DefinitionForKey(record.Kind)
 		if !found || !definition.Search {
 			continue
@@ -800,6 +837,29 @@ func (s *SiteService) SearchOptions(actor Actor) ([]SiteSearchOption, error) {
 		result = append(result, SiteSearchOption{ID: record.ID, Name: record.Name, SiteType: definition.SiteType, HealthStatus: firstNonEmpty(record.LastHealthStatus, "unknown"), Searchable: searchable, Reason: reason})
 	}
 	return result, nil
+}
+
+// pluginResourceSearchAvailability combines the derived Site projection with
+// the authoritative plugin lifecycle. A stale healthy Site row must never make
+// a disabled connection or an unavailable plugin searchable.
+func (s *SiteService) pluginResourceSearchAvailability(record models.Site) (bool, string, string) {
+	switch record.LastHealthStatus {
+	case "healthy":
+		// Continue with the authoritative lifecycle check below.
+	case "auth_required", "auth_pending":
+		return false, "resource_auth_required", "所选资源站尚未登录或登录已失效，请到插件连接页重新登录"
+	case "rate_limited":
+		return false, "resource_rate_limited", "所选资源站正在限流或安全验证中，请稍后重试"
+	default:
+		return false, "resource_entry_unavailable", "所选资源站入口不可用，请到插件连接页检查"
+	}
+	if s.pluginResources == nil {
+		return false, "resource_entry_unavailable", "所选资源站插件运行服务不可用"
+	}
+	if _, _, err := s.pluginResources.ResourceProvenance(record.PluginConnectionID); err != nil {
+		return false, "resource_entry_unavailable", "所选资源站插件已停用、卸载或连接不可用"
+	}
+	return true, "", ""
 }
 
 func (s *SiteService) SearchEach(ctx context.Context, actor Actor, input SiteSearchInput, emit func(SiteSearchGroup)) error {
@@ -896,6 +956,9 @@ func (s *SiteService) SearchEachProgress(ctx context.Context, actor Actor, input
 }
 
 func (s *SiteService) searchSite(ctx context.Context, actor Actor, record models.Site, input SiteSearchInput) SiteSearchGroup {
+	if record.SourceType == "plugin" && record.Kind == pluginResourceKind {
+		return s.searchPluginResource(ctx, actor, record, input)
+	}
 	definition, _ := builtin.DefinitionForKey(record.Kind)
 	group := SiteSearchGroup{SiteID: record.ID, SiteName: record.Name, SiteType: definition.SiteType, Status: "success", Page: input.Page, Items: []SiteSearchResult{}}
 	config, err := s.config(record)
@@ -935,6 +998,79 @@ func (s *SiteService) searchSite(ctx context.Context, actor Actor, record models
 	}
 	serverlog.OperationDiscoverySearch.Event(s.log.Info()).Uint("site_id", record.ID).Str("site_type", group.SiteType).Int("results", len(group.Items)).Int("skipped", group.Skipped).Msg(serverlog.OperationDiscoverySearch.Message("站点种子资源搜索完成"))
 	return group
+}
+
+func (s *SiteService) searchPluginResource(ctx context.Context, actor Actor, record models.Site, input SiteSearchInput) SiteSearchGroup {
+	group := SiteSearchGroup{SiteID: record.ID, SiteName: record.Name, SiteType: "bt_resource", Status: "success", Page: input.Page, Items: []SiteSearchResult{}}
+	if s.pluginResources == nil {
+		group.Status, group.ErrorCode = "error", "resource_entry_unavailable"
+		return group
+	}
+	// Expired claims can no longer authorize recognition or download. Reclaim a
+	// bounded batch while new claims are being produced so an always-on Server
+	// cannot grow this short-lived vault without limit.
+	_ = s.cleanupExpiredPluginResourceClaims(pluginResourceClaimCleanupBatch)
+	page, err := s.pluginResources.SearchResource(ctx, PluginResourceSearchInput{ConnectionID: record.PluginConnectionID, Query: input.Keyword, Kind: input.MediaType, Year: input.Year, Page: input.Page})
+	if err != nil {
+		group.Status, group.ErrorCode = "error", ErrorCode(err)
+		return group
+	}
+	pluginID, pluginVersion, provenanceErr := s.pluginResources.ResourceProvenance(record.PluginConnectionID)
+	if provenanceErr != nil {
+		group.Status, group.ErrorCode = "error", ErrorCode(provenanceErr)
+		return group
+	}
+	group.HasNext = page.HasNext
+	expires := s.now().Add(ptResultTTL)
+	for _, item := range page.Items {
+		token, tokenErr := s.issueClaim(siteResultClaim{ActorID: actor.User.ID, SiteID: record.ID, TorrentID: item.ID, Title: item.Title, MediaTypeHint: safeRecognitionMediaTypeHint(input.MediaType), ExpiresAt: expires})
+		if tokenErr != nil {
+			continue
+		}
+		claimID := uuid.NewString()
+		if err := s.db.Create(&models.PluginResourceClaim{ID: claimID, TokenHash: tokenDigest(token), OwnerID: actor.User.ID, SiteID: record.ID, PluginID: pluginID, PluginVersion: pluginVersion, PluginConnectionID: record.PluginConnectionID, ResourceID: item.ID, Title: item.Title, MediaTypeHint: safeRecognitionMediaTypeHint(input.MediaType), ExpiresAt: expires, CreatedAt: s.now()}).Error; err != nil {
+			s.vaultMu.Lock()
+			delete(s.vault, token)
+			s.vaultMu.Unlock()
+			continue
+		}
+		// Keep the existing in-memory claim for the current request path while
+		// persisting a restart-safe, actor-bound provider claim for later steps.
+		s.vaultMu.Lock()
+		if current, ok := s.vault[token]; ok {
+			current.PluginClaimID = claimID
+			s.vault[token] = current
+		}
+		s.vaultMu.Unlock()
+		var published *time.Time
+		if item.UpdatedAt != nil {
+			published = item.UpdatedAt
+		}
+		specifications := SiteRecognitionSpecifications{}
+		if parsed, parseErr := mediarecognition.Parse(mediarecognition.InputFacts{PackageName: item.Title, SourceKind: mediarecognition.SourceDownload, MediaTypeHint: mediarecognition.MediaType(safeRecognitionMediaTypeHint(input.MediaType))}); parseErr == nil {
+			specifications = siteRecognitionSpecifications(parsed.Specifications, parsed.ReleaseGroup)
+		}
+		group.Items = append(group.Items, SiteSearchResult{Token: token, Title: item.Title, SizeBytes: item.SizeBytes, Published: published, Seeders: &item.Seeders, Tags: append([]string(nil), item.Tags...), Specifications: specifications, ExpiresAt: expires})
+	}
+	return group
+}
+
+func (s *SiteService) cleanupExpiredPluginResourceClaims(limit int) error {
+	if limit < 1 {
+		return nil
+	}
+	if limit > pluginResourceClaimCleanupBatch {
+		limit = pluginResourceClaimCleanupBatch
+	}
+	var ids []string
+	if err := s.db.Model(&models.PluginResourceClaim{}).
+		Where("expires_at <= ?", s.now()).
+		Order("expires_at ASC").
+		Limit(limit).
+		Pluck("id", &ids).Error; err != nil || len(ids) == 0 {
+		return err
+	}
+	return s.db.Where("id IN ? AND expires_at <= ?", ids, s.now()).Delete(&models.PluginResourceClaim{}).Error
 }
 
 // RecognizeResult resolves only the actor-bound server-side title claim. It
@@ -1302,19 +1438,25 @@ func (s *SiteService) Download(ctx context.Context, actor Actor, input SiteDownl
 		return DownloadTaskSummary{}, appError(CodePermissionDenied, "无权向这个媒体库入库", nil)
 	}
 	var claimedSite models.Site
-	if err := s.db.Select("id", "kind", "enabled").First(&claimedSite, claim.SiteID).Error; err != nil {
+	if err := s.db.Select("id", "kind", "source_type", "plugin_connection_id", "enabled").First(&claimedSite, claim.SiteID).Error; err != nil {
 		return DownloadTaskSummary{}, siteNotFound(err)
 	}
 	if !actor.CanResource(authz.PermissionDiscoveryRead, models.AuthorizationResourceSite, uintID(claimedSite.ID)) {
 		return DownloadTaskSummary{}, appError(CodePermissionDenied, "无权使用这个站点的搜索结果", nil)
 	}
 	definition, definitionFound := builtin.DefinitionForKey(claimedSite.Kind)
-	if selectedDownloader.Type == models.DownloaderTypePan115Offline && (!definitionFound || definition.SiteType != builtin.SiteTypeBT) {
+	isPluginResource := claimedSite.SourceType == "plugin" && claimedSite.Kind == pluginResourceKind
+	if selectedDownloader.Type == models.DownloaderTypePan115Offline && !isPluginResource && (!definitionFound || definition.SiteType != builtin.SiteTypeBT) {
 		return DownloadTaskSummary{}, appError(CodeDownloadSourceInvalid, "只有已确认的公开 BT 资源可以提交到 115 离线下载", nil)
 	}
-	record, config, adapter, err := s.runtimeConfig(claim.SiteID)
-	if err != nil {
-		return DownloadTaskSummary{}, err
+	record := claimedSite
+	var config sitepkg.Config
+	var adapter sitepkg.Adapter
+	if !isPluginResource {
+		record, config, adapter, err = s.runtimeConfig(claim.SiteID)
+		if err != nil {
+			return DownloadTaskSummary{}, err
+		}
 	}
 	if !record.Enabled {
 		return DownloadTaskSummary{}, appError(CodeSiteUnavailable, "站点已停用", nil)
@@ -1323,7 +1465,29 @@ func (s *SiteService) Download(ctx context.Context, actor Actor, input SiteDownl
 		return DownloadTaskSummary{}, err
 	}
 	var source DownloadSourceInput
-	if resolver, ok := adapter.(sitepkg.SourceResolver); ok {
+	var pluginID, pluginVersion, pluginConnectionID string
+	if isPluginResource {
+		if s.pluginResources == nil || claim.PluginClaimID == "" {
+			return DownloadTaskSummary{}, appError("resource_entry_unavailable", "资源站暂时不可用", nil)
+		}
+		var resourceClaim models.PluginResourceClaim
+		if err := s.db.Where("id = ? AND owner_id = ? AND site_id = ? AND consumed_at IS NULL AND expires_at > ?", claim.PluginClaimID, actor.User.ID, record.ID, s.now()).First(&resourceClaim).Error; err != nil {
+			return DownloadTaskSummary{}, appError(CodeSiteResultExpired, "资源站搜索结果已过期，请重新搜索", nil)
+		}
+		pluginID, pluginVersion, err = s.pluginResources.ResourceProvenance(record.PluginConnectionID)
+		if err != nil {
+			return DownloadTaskSummary{}, err
+		}
+		if resourceClaim.PluginID != pluginID || resourceClaim.PluginVersion != pluginVersion || resourceClaim.PluginConnectionID != record.PluginConnectionID || resourceClaim.ResourceID != claim.TorrentID {
+			return DownloadTaskSummary{}, appError(CodeSiteResultExpired, "资源站插件或镜像已变化，请重新搜索", nil)
+		}
+		resolved, resolveErr := s.pluginResources.ResolveResource(ctx, PluginResourceResolveInput{ConnectionID: resourceClaim.PluginConnectionID, ResourceID: resourceClaim.ResourceID})
+		if resolveErr != nil {
+			return DownloadTaskSummary{}, resolveErr
+		}
+		source = DownloadSourceInput{Kind: downloadpkg.SourceURL, URL: resolved.Magnet}
+		pluginConnectionID = resourceClaim.PluginConnectionID
+	} else if resolver, ok := adapter.(sitepkg.SourceResolver); ok {
 		resolved, resolveErr := resolver.ResolveSource(ctx, config, claim.TorrentID)
 		if resolveErr != nil {
 			return DownloadTaskSummary{}, siteAdapterError(resolveErr, "无法解析下载来源")
@@ -1360,7 +1524,33 @@ func (s *SiteService) Download(ctx context.Context, actor Actor, input SiteDownl
 			return DownloadTaskSummary{}, err
 		}
 	}
-	result, err := s.downloads.Submit(ctx, actor, SubmitDownloadInput{DownloaderID: input.DownloaderID, MediaLibraryID: input.MediaLibraryID, ProfileID: input.ProfileID, DisplayName: claim.Title, Priority: input.Priority, Source: source, RecognitionOverride: recognitionOverride, FollowSubscriptionID: input.FollowSubscriptionID, FollowResourceFingerprint: input.FollowResourceFingerprint, ForceRecognitionOverride: input.FollowSubscriptionID != "", BeforePersist: input.BeforePersist}, request)
+	resourceClaimID := ""
+	if claim.PluginClaimID != "" {
+		resourceClaimID = claim.PluginClaimID
+	}
+	beforePersist := input.BeforePersist
+	if resourceClaimID != "" {
+		upstreamGuard := beforePersist
+		beforePersist = func(tx *gorm.DB) error {
+			if upstreamGuard != nil {
+				if err := upstreamGuard(tx); err != nil {
+					return err
+				}
+			}
+			now := s.now()
+			result := tx.Model(&models.PluginResourceClaim{}).
+				Where("id = ? AND owner_id = ? AND site_id = ? AND consumed_at IS NULL AND expires_at > ?", resourceClaimID, actor.User.ID, record.ID, now).
+				Update("consumed_at", now)
+			if result.Error != nil {
+				return result.Error
+			}
+			if result.RowsAffected != 1 {
+				return appError(CodeSiteResultExpired, "资源站搜索结果已过期，请重新搜索", nil)
+			}
+			return nil
+		}
+	}
+	result, err := s.downloads.Submit(ctx, actor, SubmitDownloadInput{DownloaderID: input.DownloaderID, MediaLibraryID: input.MediaLibraryID, ProfileID: input.ProfileID, DisplayName: claim.Title, Priority: input.Priority, Source: source, PluginID: pluginID, PluginVersion: pluginVersion, PluginConnectionID: pluginConnectionID, PluginResourceClaimID: resourceClaimID, RecognitionOverride: recognitionOverride, FollowSubscriptionID: input.FollowSubscriptionID, FollowResourceFingerprint: input.FollowResourceFingerprint, ForceRecognitionOverride: input.FollowSubscriptionID != "", BeforePersist: beforePersist}, request)
 	if err != nil {
 		return DownloadTaskSummary{}, err
 	}
@@ -1474,61 +1664,108 @@ func (s *SiteService) resolveClaim(token string, actorID uint) (siteResultClaim,
 		return siteResultClaim{}, appError(CodeSiteResultExpired, "种子资源搜索结果已过期，请重新搜索", nil)
 	}
 	s.vaultMu.Lock()
-	defer s.vaultMu.Unlock()
 	s.purgeClaimsLocked()
 	claim, ok := s.vault[token]
-	if !ok || claim.ActorID != actorID || !claim.ExpiresAt.After(s.now()) {
-		return siteResultClaim{}, appError(CodeSiteResultExpired, "种子资源搜索结果已过期，请重新搜索", nil)
+	s.vaultMu.Unlock()
+	if ok {
+		if claim.ActorID != actorID || !claim.ExpiresAt.After(s.now()) {
+			return siteResultClaim{}, appError(CodeSiteResultExpired, "种子资源搜索结果已过期，请重新搜索", nil)
+		}
+		return claim, nil
 	}
-	return claim, nil
+	if claim, found := s.loadPluginResourceClaim(token, actorID); found {
+		return claim, nil
+	}
+	return siteResultClaim{}, appError(CodeSiteResultExpired, "种子资源搜索结果已过期，请重新搜索", nil)
 }
 func (s *SiteService) resolveAvailableClaim(token string, actorID uint) (siteResultClaim, error) {
 	if len(token) != 43 {
 		return siteResultClaim{}, appError(CodeSiteResultExpired, "种子资源搜索结果已过期，请重新搜索", nil)
 	}
 	s.vaultMu.Lock()
-	defer s.vaultMu.Unlock()
 	s.purgeClaimsLocked()
 	claim, ok := s.vault[token]
-	if !ok || claim.ActorID != actorID || claim.InFlight || !claim.ExpiresAt.After(s.now()) {
-		return siteResultClaim{}, appError(CodeSiteResultExpired, "种子资源搜索结果已过期，请重新搜索", nil)
+	s.vaultMu.Unlock()
+	if ok {
+		if claim.ActorID != actorID || claim.InFlight || !claim.ExpiresAt.After(s.now()) {
+			return siteResultClaim{}, appError(CodeSiteResultExpired, "种子资源搜索结果已过期，请重新搜索", nil)
+		}
+		return claim, nil
 	}
-	return claim, nil
+	if claim, found := s.loadPluginResourceClaim(token, actorID); found {
+		return claim, nil
+	}
+	return siteResultClaim{}, appError(CodeSiteResultExpired, "种子资源搜索结果已过期，请重新搜索", nil)
 }
 func (s *SiteService) reserveClaim(token string, actorID uint) (siteResultClaim, error) {
 	if len(token) != 43 {
 		return siteResultClaim{}, appError(CodeSiteResultExpired, "种子资源搜索结果已过期，请重新搜索", nil)
 	}
 	s.vaultMu.Lock()
-	defer s.vaultMu.Unlock()
 	s.purgeClaimsLocked()
 	claim, ok := s.vault[token]
-	if !ok || claim.ActorID != actorID || claim.InFlight || !claim.ExpiresAt.After(s.now()) {
+	if ok {
+		if claim.ActorID != actorID || claim.InFlight || !claim.ExpiresAt.After(s.now()) {
+			s.vaultMu.Unlock()
+			return siteResultClaim{}, appError(CodeSiteResultExpired, "种子资源搜索结果已过期，请重新搜索", nil)
+		}
+		claim.InFlight = true
+		s.vault[token] = claim
+		s.vaultMu.Unlock()
+		return claim, nil
+	}
+	s.vaultMu.Unlock()
+
+	loaded, found := s.loadPluginResourceClaim(token, actorID)
+	if !found {
 		return siteResultClaim{}, appError(CodeSiteResultExpired, "种子资源搜索结果已过期，请重新搜索", nil)
 	}
-	claim.InFlight = true
-	s.vault[token] = claim
-	return claim, nil
+	s.vaultMu.Lock()
+	s.purgeClaimsLocked()
+	if current, exists := s.vault[token]; exists {
+		loaded = current
+	}
+	if loaded.ActorID != actorID || loaded.InFlight || !loaded.ExpiresAt.After(s.now()) {
+		s.vaultMu.Unlock()
+		return siteResultClaim{}, appError(CodeSiteResultExpired, "种子资源搜索结果已过期，请重新搜索", nil)
+	}
+	loaded.InFlight = true
+	s.vault[token] = loaded
+	s.vaultMu.Unlock()
+	return loaded, nil
 }
 func (s *SiteService) finishClaim(token string, completed bool) {
 	s.vaultMu.Lock()
-	defer s.vaultMu.Unlock()
 	claim, ok := s.vault[token]
 	if !ok {
+		s.vaultMu.Unlock()
 		return
 	}
 	if completed || !claim.ExpiresAt.After(s.now()) {
 		delete(s.vault, token)
+		s.vaultMu.Unlock()
 		return
 	}
 	claim.InFlight = false
 	s.vault[token] = claim
+	s.vaultMu.Unlock()
+}
+
+func (s *SiteService) loadPluginResourceClaim(token string, actorID uint) (siteResultClaim, bool) {
+	var row models.PluginResourceClaim
+	if err := s.db.Where("token_hash = ? AND owner_id = ? AND expires_at > ? AND consumed_at IS NULL", tokenDigest(token), actorID, s.now()).First(&row).Error; err != nil {
+		return siteResultClaim{}, false
+	}
+	return siteResultClaim{ActorID: row.OwnerID, SiteID: row.SiteID, PluginClaimID: row.ID, TorrentID: row.ResourceID, Title: row.Title, Subtitle: row.Subtitle, MediaTypeHint: row.MediaTypeHint, ExpiresAt: row.ExpiresAt}, true
 }
 func (s *SiteService) bindClaimRecognition(token string, actorID uint, tmdbID int64, mediaType, source, status string, locked bool) error {
 	s.vaultMu.Lock()
-	defer s.vaultMu.Unlock()
 	s.purgeClaimsLocked()
 	claim, ok := s.vault[token]
+	s.vaultMu.Unlock()
+	if !ok {
+		claim, ok = s.loadPluginResourceClaim(token, actorID)
+	}
 	if !ok || claim.ActorID != actorID || claim.InFlight || !claim.ExpiresAt.After(s.now()) {
 		return appError(CodeSiteResultExpired, "种子资源搜索结果已过期，请重新搜索", nil)
 	}
@@ -1538,7 +1775,9 @@ func (s *SiteService) bindClaimRecognition(token string, actorID uint, tmdbID in
 	claim.RecognitionSource = source
 	claim.RecognitionStatus = status
 	claim.RecognitionLocked = locked
+	s.vaultMu.Lock()
 	s.vault[token] = claim
+	s.vaultMu.Unlock()
 	return nil
 }
 func (s *SiteService) purgeClaimsLocked() {
@@ -1625,6 +1864,9 @@ func normalizeBrowserService(enabled bool, raw string) (string, error) {
 	return parsed.String(), nil
 }
 func (s *SiteService) siteSummary(record models.Site) SiteSummary {
+	if record.SourceType == "plugin" && record.Kind == pluginResourceKind {
+		return SiteSummary{ID: record.ID, Name: record.Name, Kind: record.Kind, SiteType: "bt_resource", CredentialKind: "plugin", Capabilities: SiteCapabilities{Search: true, Download: true}, BaseURL: record.BaseURL, Enabled: record.Enabled, Priority: record.Priority, TimeoutSeconds: record.TimeoutSeconds, RateLimitPerMinute: record.RateLimitPerMinute, Health: SiteHealthSummary{Status: record.LastHealthStatus, ErrorCode: record.LastHealthErrorCode, Username: record.LastHealthUsername, CheckedAt: record.LastHealthCheckedAt}, Revision: record.Revision, CreatedAt: record.CreatedAt, UpdatedAt: record.UpdatedAt}
+	}
 	definition, _ := builtin.DefinitionForKey(record.Kind)
 	var configured siteCredentialEnvelope
 	if record.CredentialCiphertext != "" {

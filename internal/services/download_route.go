@@ -15,6 +15,7 @@ import (
 	storagefs "github.com/yuanjing-hash/OhMyCine-Server/internal/storage"
 	cloudpkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud"
 	downloadpkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/downloader"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/nodeprotocol"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/site/builtin"
 )
 
@@ -26,18 +27,25 @@ type DownloadRoutePreviewInput struct {
 }
 
 type DownloadRouteTargetOption struct {
-	MediaLibraryID         uint   `json:"media_library_id"`
-	LibraryName            string `json:"library_name"`
-	StorageName            string `json:"storage_name"`
-	RouteKind              string `json:"route_kind"`
-	RouteLabel             string `json:"route_label"`
-	Enabled                bool   `json:"enabled"`
-	ReasonCode             string `json:"reason_code"`
-	ReasonMessage          string `json:"reason_message"`
-	RequiresManagedStaging bool   `json:"requires_managed_staging"`
-	ExpectedBytes          *int64 `json:"expected_bytes,omitempty"`
-	RequiredBytes          *int64 `json:"required_bytes,omitempty"`
-	AvailableBytes         *int64 `json:"available_bytes,omitempty"`
+	MediaLibraryID         uint    `json:"media_library_id"`
+	LibraryName            string  `json:"library_name"`
+	StorageName            string  `json:"storage_name"`
+	RouteKind              string  `json:"route_kind"`
+	RouteLabel             string  `json:"route_label"`
+	Enabled                bool    `json:"enabled"`
+	ReasonCode             string  `json:"reason_code"`
+	ReasonMessage          string  `json:"reason_message"`
+	RequiresManagedStaging bool    `json:"requires_managed_staging"`
+	ExpectedBytes          *int64  `json:"expected_bytes,omitempty"`
+	RequiredBytes          *int64  `json:"required_bytes,omitempty"`
+	AvailableBytes         *int64  `json:"available_bytes,omitempty"`
+	ExecutionLocation      string  `json:"execution_location"`
+	NodeID                 *string `json:"node_id,omitempty"`
+	NodeName               string  `json:"node_name,omitempty"`
+	RequiresNodeStaging    bool    `json:"requires_node_staging"`
+	RequiresServerStaging  bool    `json:"requires_server_staging"`
+	NodeAvailableBytes     *int64  `json:"node_available_bytes,omitempty"`
+	ServerAvailableBytes   *int64  `json:"server_available_bytes,omitempty"`
 }
 
 type DownloadRoutePreview struct {
@@ -88,7 +96,8 @@ func (s *DownloadService) PreviewRoutes(ctx context.Context, actor Actor, input 
 		if !actor.CanResource(authz.PermissionDownloadsCreate, models.AuthorizationResourceMediaLibrary, uintID(row.ID)) {
 			continue
 		}
-		option := DownloadRouteTargetOption{MediaLibraryID: row.ID, LibraryName: row.Name, StorageName: row.StorageName, ExpectedBytes: cloneOptionalInt64(input.ExpectedBytes)}
+		location := normalizeExecutionLocation(downloader.ExecutionLocation)
+		option := DownloadRouteTargetOption{MediaLibraryID: row.ID, LibraryName: row.Name, StorageName: row.StorageName, ExpectedBytes: cloneOptionalInt64(input.ExpectedBytes), ExecutionLocation: location, NodeID: downloader.NodeID, NodeName: downloader.NodeName}
 		target, _, err := s.previewDownloadTarget(ctx, downloader, row.MediaLibrary, input.SourceKind)
 		if err != nil {
 			option.ReasonCode = ErrorCode(err)
@@ -97,10 +106,21 @@ func (s *DownloadService) PreviewRoutes(ctx context.Context, actor Actor, input 
 			option.RouteKind = target.RouteKind
 			option.RouteLabel = transferRouteLabel(target.RouteKind)
 			option.RequiresManagedStaging = target.RouteKind == models.TransferRouteCrossSource
-			if option.RequiresManagedStaging {
+			option.RequiresServerStaging = option.RequiresManagedStaging && (location != models.NodeLocationRemote || target.StorageType == models.StorageTypeLocal)
+			option.RequiresNodeStaging = option.RequiresManagedStaging && location == models.NodeLocationRemote && downloader.Type == models.DownloaderTypePan115Offline
+			if option.RequiresServerStaging {
 				if spaceErr := s.applyManagedStagingPreview(ctx, downloader.Type, input.ExpectedBytes, &option); spaceErr != nil {
 					option.ReasonCode = ErrorCode(spaceErr)
 					option.ReasonMessage = safeErrorMessage(spaceErr, "Server 暂存空间不可用")
+					preview.Options = append(preview.Options, option)
+					continue
+				}
+				option.ServerAvailableBytes = cloneOptionalInt64(option.AvailableBytes)
+			}
+			if option.RequiresNodeStaging {
+				if spaceErr := s.applyNodeStagingPreview(downloader, input.ExpectedBytes, &option); spaceErr != nil {
+					option.ReasonCode = ErrorCode(spaceErr)
+					option.ReasonMessage = safeErrorMessage(spaceErr, "节点暂存空间不可用")
 					preview.Options = append(preview.Options, option)
 					continue
 				}
@@ -110,6 +130,46 @@ func (s *DownloadService) PreviewRoutes(ctx context.Context, actor Actor, input 
 		preview.Options = append(preview.Options, option)
 	}
 	return preview, nil
+}
+
+func (s *DownloadService) applyNodeStagingPreview(downloader models.Downloader, expected *int64, option *DownloadRouteTargetOption) error {
+	if option == nil || downloader.NodeID == nil || s.downloader == nil || s.downloader.transferNodes == nil {
+		return appError(nodeprotocol.ErrorNodeOffline, "传输节点不可用", nil)
+	}
+	var node models.TransferNode
+	if err := s.db.Select("id", "status", "free_bytes", "capabilities_json").First(&node, "id = ?", *downloader.NodeID).Error; err != nil || node.Status != models.NodeStatusOnline {
+		return appError(nodeprotocol.ErrorNodeOffline, "传输节点不可用", err)
+	}
+	var capabilities nodeprotocol.Capabilities
+	if json.Unmarshal([]byte(node.CapabilitiesJSON), &capabilities) != nil || !capabilities.ManagedFreeBytesKnown || node.FreeBytes == nil || *node.FreeBytes < 0 {
+		return appError("node_space_unknown", "无法确认节点暂存空间", nil)
+	}
+	available := *node.FreeBytes
+	option.NodeAvailableBytes = &available
+	if expected == nil {
+		return nil
+	}
+	required, err := requiredStagingBytes(*expected)
+	if err != nil || available < required {
+		return appError(nodeprotocol.ErrorSpaceInsufficient, "节点暂存空间不足", err)
+	}
+	option.RequiredBytes = &required
+	return nil
+}
+
+func requiredStagingBytes(expected int64) (int64, error) {
+	if expected < 0 {
+		return 0, errors.New("expected bytes is negative")
+	}
+	total := uint64(expected)
+	margin := total / 20
+	if margin < crossSourceMinimumFreeBytes {
+		margin = crossSourceMinimumFreeBytes
+	}
+	if total > math.MaxUint64-margin || total+margin > math.MaxInt64 {
+		return 0, errors.New("required bytes overflow")
+	}
+	return int64(total + margin), nil
 }
 
 func (s *DownloadService) applyManagedStagingPreview(ctx context.Context, providerType string, expected *int64, option *DownloadRouteTargetOption) error {
@@ -133,21 +193,12 @@ func (s *DownloadService) applyManagedStagingPreview(ctx context.Context, provid
 	if expected == nil {
 		return nil
 	}
-	total := uint64(*expected)
-	margin := total / 20
-	if margin < crossSourceMinimumFreeBytes {
-		margin = crossSourceMinimumFreeBytes
-	}
-	if total > math.MaxUint64-margin {
+	requiredInt, requiredErr := requiredStagingBytes(*expected)
+	if requiredErr != nil {
 		return appError("cross_source_space_insufficient", "Server 暂存空间不足", nil)
 	}
-	required := total + margin
-	requiredInt := int64(math.MaxInt64)
-	if required <= math.MaxInt64 {
-		requiredInt = int64(required)
-	}
 	option.RequiredBytes = &requiredInt
-	if available < required {
+	if availableInt < requiredInt {
 		return appError("cross_source_space_insufficient", "Server 暂存空间不足", nil)
 	}
 	return nil
@@ -274,7 +325,8 @@ func (s *DownloadService) buildDownloadTargetSnapshot(ctx context.Context, downl
 			return nil, models.MediaClassificationProfile{}, appError(CodeDownloaderStorageUnavailable, "下载器来源连接不可用", driverErr)
 		}
 		_, readable := sourceDriver.(cloudpkg.ReadDriver)
-		if routeKind == models.TransferRouteCrossSource && (!readable || !sourceDriver.Capabilities().TemporaryDirectURL) {
+		serverMaterializesSource := normalizeExecutionLocation(downloader.ExecutionLocation) != models.NodeLocationRemote
+		if routeKind == models.TransferRouteCrossSource && serverMaterializesSource && (!readable || !sourceDriver.Capabilities().TemporaryDirectURL) {
 			return nil, models.MediaClassificationProfile{}, appError(CodeTransferRouteUnsupported, "来源网盘不支持安全下载到 Server 暂存区", nil)
 		}
 		if sourceKind == downloadpkg.SourcePan115Share || sourceKind == downloadpkg.SourceProviderItem {
@@ -288,6 +340,36 @@ func (s *DownloadService) buildDownloadTargetSnapshot(ctx context.Context, downl
 					return nil, models.MediaClassificationProfile{}, appError(CodeMediaLibraryPathInvalid, "115 下载目录不可用", rootErr)
 				}
 			}
+		}
+	}
+	if normalizeExecutionLocation(downloader.ExecutionLocation) == models.NodeLocationRemote {
+		if downloader.NodeID == nil || s.downloader == nil || s.downloader.transferNodes == nil {
+			return nil, models.MediaClassificationProfile{}, appError(CodeDownloaderUnavailable, "下载器的传输节点绑定不完整", nil)
+		}
+		node, nodeErr := s.downloader.prepareNodeStorageDownloader(*downloader.NodeID)
+		if downloader.Type == models.DownloaderTypeQBittorrent {
+			_, node, nodeErr = s.downloader.transferNodes.nodeClient(*downloader.NodeID)
+		}
+		if nodeErr != nil {
+			return nil, models.MediaClassificationProfile{}, nodeErr
+		}
+		var nodeCapabilities nodeprotocol.Capabilities
+		if json.Unmarshal([]byte(node.CapabilitiesJSON), &nodeCapabilities) != nil || !nodeCapabilities.Has(nodeprotocol.CapabilityRangeExport) {
+			return nil, models.MediaClassificationProfile{}, appError(CodeTransferRouteUnsupported, "所选节点不支持受控文件导出", nil)
+		}
+		if downloader.Type == models.DownloaderTypeQBittorrent && !nodeCapabilities.Has(nodeprotocol.CapabilityQBittorrentControl) {
+			return nil, models.MediaClassificationProfile{}, appError(CodeDownloaderUnavailable, "所选节点不支持 qBittorrent", nil)
+		}
+		if downloader.Type == models.DownloaderTypePan115Offline && routeKind == models.TransferRouteSameSourceProvider {
+			return nil, models.MediaClassificationProfile{}, appError(CodeTransferRouteUnsupported, "同一 115 数据源请使用主 Server 原生云端整理，无需经过传输节点", nil)
+		}
+		if downloader.Type == models.DownloaderTypePan115Offline {
+			if sourceKind == downloadpkg.SourcePan115Share && !nodeCapabilities.Has(nodeprotocol.CapabilityPan115ShareReceive) {
+				return nil, models.MediaClassificationProfile{}, appError(CodeTransferRouteUnsupported, "所选节点不支持接收 115 分享", nil)
+			}
+		}
+		if targetStorage.Type == models.StorageTypePan115 && routeKind == models.TransferRouteCrossSource && !nodeCapabilities.Has(nodeprotocol.CapabilityPan115Upload) {
+			return nil, models.MediaClassificationProfile{}, appError(CodeTransferRouteUnsupported, "所选节点不支持上传到 115", nil)
 		}
 	}
 

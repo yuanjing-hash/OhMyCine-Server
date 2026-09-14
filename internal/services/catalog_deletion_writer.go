@@ -27,15 +27,16 @@ type catalogDeletionFence struct {
 }
 
 type catalogDeletionWrite struct {
-	Library   models.MediaLibrary
-	Storage   models.Storage
-	Head      models.CatalogHead
-	Fence     catalogDeletionFence
-	Entries   []models.MediaLibraryEntry
-	Assets    []models.MediaLibrarySourceAsset
-	WorkKey   string
-	Candidate models.CatalogSnapshot
-	Token     string
+	Library         models.MediaLibrary
+	Storage         models.Storage
+	Head            models.CatalogHead
+	Fence           catalogDeletionFence
+	Entries         []models.MediaLibraryEntry
+	Assets          []models.MediaLibrarySourceAsset
+	WorkKey         string
+	Candidate       models.CatalogSnapshot
+	Token           string
+	ArtifactChanges CatalogArtifactChangeSet
 }
 
 func catalogDeletionFenceTx(tx *gorm.DB, reader *CatalogReader, libraryID uint) (models.MediaLibrary, models.Storage, models.CatalogHead, catalogDeletionFence, error) {
@@ -201,6 +202,17 @@ func (s *MediaLibraryService) prepareCatalogDeletion(ctx context.Context, write 
 	if len(write.Entries)+len(write.Assets) == 0 {
 		return nil
 	}
+	changes := CatalogArtifactChangeSet{}
+	for _, entry := range write.Entries {
+		changes.Entries = append(changes.Entries, entry.ID)
+		if entry.RecognitionID != nil {
+			changes.Recognitions = append(changes.Recognitions, *entry.RecognitionID)
+		}
+	}
+	for _, asset := range write.Assets {
+		changes.SourceAssets = append(changes.SourceAssets, asset.ID)
+	}
+	write.ArtifactChanges = normalizeCatalogArtifactChanges(changes)
 	candidate, token, err := s.catalogStore.BeginCandidate(ctx, CatalogCandidateInput{LibraryID: write.Library.ID, Kind: "delta", ExpectedRevision: write.Head.Revision, SourceEpoch: write.Head.SourceEpoch, SourceFingerprint: write.Head.SourceFingerprint, ConfigFingerprint: write.Head.ConfigFingerprint, LeaseDuration: 2 * time.Minute})
 	if err != nil {
 		return err

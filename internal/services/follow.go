@@ -525,7 +525,7 @@ func (s *FollowService) Runs(actor Actor, id string) ([]FollowRunSummary, error)
 		return nil, err
 	}
 	var rows []models.FollowRun
-	if err := s.db.Where("subscription_id = ?", id).Order("created_at DESC").Limit(100).Find(&rows).Error; err != nil {
+	if err := s.db.Where("subscription_id = ? AND history_cleared_at IS NULL", id).Order("created_at DESC").Limit(100).Find(&rows).Error; err != nil {
 		return nil, err
 	}
 	result := make([]FollowRunSummary, 0, len(rows))

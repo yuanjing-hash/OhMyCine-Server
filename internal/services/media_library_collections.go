@@ -24,6 +24,17 @@ type tmdbCollectionMember struct {
 // the committed catalog view. Partial scans may prove additions but never
 // absence; only a complete scan is allowed to remove unseen TMDB-owned rows.
 func reconcileTMDBCollectionsTx(tx *gorm.DB, libraryID uint, partial bool, now time.Time) error {
+	return reconcileTMDBCollectionsScopeTx(tx, libraryID, partial, now, nil)
+}
+
+func reconcileTMDBBatchCollectionsTx(tx *gorm.DB, libraryID uint, paths []string, now time.Time) error {
+	if len(paths) == 0 {
+		return nil
+	}
+	return reconcileTMDBCollectionsScopeTx(tx, libraryID, true, now, paths)
+}
+
+func reconcileTMDBCollectionsScopeTx(tx *gorm.DB, libraryID uint, partial bool, now time.Time, paths []string) error {
 	reader, err := PinCatalogTx(tx, []uint{libraryID})
 	if err != nil {
 		return err
@@ -34,7 +45,21 @@ func reconcileTMDBCollectionsTx(tx *gorm.DB, libraryID uint, partial bool, now t
 		return ErrCatalogInvalid
 	}
 	var entries []models.MediaLibraryEntry
-	if err := tx.Where("library_id = ? AND media_type = ? AND match_status = ? AND recognition_id IS NOT NULL AND tmdb_id IS NOT NULL", libraryID, "movie", mediaRecognitionStatusMatched).Find(&entries).Error; err != nil {
+	entryQuery := func() *gorm.DB {
+		return tx.Where("library_id = ? AND media_type = ? AND match_status = ? AND recognition_id IS NOT NULL AND tmdb_id IS NOT NULL", libraryID, "movie", mediaRecognitionStatusMatched)
+	}
+	if paths != nil {
+		for start := 0; start < len(paths); start += 250 {
+			var rows []models.MediaLibraryEntry
+			if err := entryQuery().Where("relative_path IN ?", paths[start:min(start+250, len(paths))]).Find(&rows).Error; err != nil {
+				return err
+			}
+			entries = append(entries, rows...)
+		}
+		if len(entries) == 0 {
+			return nil
+		}
+	} else if err := entryQuery().Find(&entries).Error; err != nil {
 		return err
 	}
 	recognitionIDs := make([]uint, 0, len(entries))
@@ -87,11 +112,18 @@ func reconcileTMDBCollectionsTx(tx *gorm.DB, libraryID uint, partial bool, now t
 	}
 
 	var existingItems []models.PlayerMediaCollectionItem
-	if err := tx.Table("player_media_collection_items AS item").
+	itemsQuery := tx.Table("player_media_collection_items AS item").
 		Select("item.*").
 		Joins("JOIN player_media_collections AS collection ON collection.id = item.collection_id").
-		Where("item.library_id = ? AND item.origin = ? AND collection.source = ?", libraryID, models.PlayerMediaCollectionItemOriginTMDB, models.PlayerMediaCollectionSourceTMDB).
-		Scan(&existingItems).Error; err != nil {
+		Where("item.library_id = ? AND item.origin = ? AND collection.source = ?", libraryID, models.PlayerMediaCollectionItemOriginTMDB, models.PlayerMediaCollectionSourceTMDB)
+	if paths != nil {
+		works := make([]string, 0, len(entries))
+		for _, entry := range entries {
+			works = append(works, entry.WorkKey)
+		}
+		itemsQuery = itemsQuery.Where("item.work_key IN ?", works)
+	}
+	if err := itemsQuery.Scan(&existingItems).Error; err != nil {
 		return err
 	}
 	affected := make(map[string]struct{})

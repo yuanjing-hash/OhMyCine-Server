@@ -151,6 +151,9 @@ func TestStructureDiagnosisSamePayloadRequeueCannotBeOverwrittenByStaleWorker(t 
 	if err := queue.db.Model(&entry).Updates(map[string]any{"match_status": mediaRecognitionStatusUnrecognized, "recognition_error_code": "tmdb_no_match", "updated_at": time.Now().UTC()}).Error; err != nil {
 		t.Fatal(err)
 	}
+	if err := queue.db.Model(&models.MediaLibraryStructureDiagnosis{}).Where("library_id = ?", library.ID).Updates(map[string]any{"naming_mismatch_count": 9, "location_mismatch_count": 8}).Error; err != nil {
+		t.Fatal(err)
+	}
 	if err := service.EnqueueDiagnosis(context.Background(), library.ID, run.ID, 1, run.Kind); err != nil {
 		t.Fatal(err)
 	}
@@ -162,7 +165,7 @@ func TestStructureDiagnosisSamePayloadRequeueCannotBeOverwrittenByStaleWorker(t 
 	if err := queue.db.First(&diagnosis, "library_id = ?", library.ID).Error; err != nil {
 		t.Fatal(err)
 	}
-	if diagnosis.Status != models.MediaLibraryStructureQueued || diagnosis.ProcessedItems != 0 || diagnosis.FinishedAt != nil {
+	if diagnosis.Status != models.MediaLibraryStructureQueued || diagnosis.ProcessedItems != 0 || diagnosis.FinishedAt != nil || diagnosis.NamingMismatchCount != 0 || diagnosis.LocationMismatchCount != 0 {
 		t.Fatalf("stale worker overwrote latest projection: %+v", diagnosis)
 	}
 	if err := queue.Complete(claimed.Job.ID, claimed.LeaseToken); err != nil {

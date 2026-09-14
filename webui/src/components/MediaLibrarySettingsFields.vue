@@ -22,7 +22,7 @@ const cloud115 = computed(() => props.storageType === 'pan115')
       <p v-if="model.conflict_policy === 'overwrite'" class="semantic-error mb-0 mt-4 p-3 text-sm">{{ cloud115 ? '覆盖会先把媒体库中的同名目标送入 115 回收站，再放置新文件。' : '覆盖会直接替换媒体库中的同名目标文件。' }}</p>
     </section>
     <div class="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
-      <div><label class="label">周期全量间隔（小时）</label><input v-model.number="model.full_scan_interval_hours" class="input" type="number" min="1" max="720" :disabled="disabled" /></div>
+      <div><label class="label">周期增量复核间隔（小时）</label><input v-model.number="model.full_scan_interval_hours" class="input" type="number" min="1" max="720" :disabled="disabled" /></div>
       <div><label class="label">定时增量间隔（分钟）</label><input v-model.number="model.incremental_minutes" class="input" type="number" min="1" max="1440" :disabled="disabled" /></div>
       <div><label class="label">Provider 请求 / 秒</label><input v-model.number="model.provider_rate_per_second" class="input" type="number" min="1" max="1000" :disabled="disabled" /></div>
       <div><label class="label">Provider 并发</label><input v-model.number="model.provider_concurrency" class="input" type="number" min="1" max="32" :disabled="disabled" /></div>

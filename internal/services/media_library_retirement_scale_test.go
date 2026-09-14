@@ -2,11 +2,13 @@ package services
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
 
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
+	"gorm.io/gorm"
 )
 
 func TestLibraryRetirement100KBoundedWriters(t *testing.T) {
@@ -49,7 +51,7 @@ func TestLibraryRetirement100KBoundedWriters(t *testing.T) {
 	t.Logf("100k retirement accepted=%s total=%s longest writer=%s", accepted, time.Since(started), maxWriter)
 }
 
-func TestLibraryRetirementRealPhysicalGuardPreservesUnresolvedOwner(t *testing.T) {
+func TestLibraryRetirementWaitsForEnteredOwnerAndDiscardsQuiescentEvidence(t *testing.T) {
 	for _, state := range []string{"entered", "quiescent"} {
 		t.Run(state, func(t *testing.T) {
 			s, library, actor := retirementFixture(t)
@@ -57,19 +59,40 @@ func TestLibraryRetirementRealPhysicalGuardPreservesUnresolvedOwner(t *testing.T
 			if err := s.db.Create(&proof).Error; err != nil {
 				t.Fatal(err)
 			}
-			if _, err := s.DeleteRequest(context.Background(), actor, library.ID, RequestContext{}); err == nil {
-				t.Fatal("unresolved physical owner admitted")
+			claim, row := claimRetirement(t, s, library, actor)
+			worker := NewMediaLibraryRetirementWorker(s)
+			waiting := false
+			for i := 0; i < 8 && row.Phase != "completed"; i++ {
+				var err error
+				waiting, _, err = worker.step(context.Background(), claim, &row)
+				if err != nil {
+					t.Fatal(err)
+				}
 			}
-			var count int64
-			if err := s.db.Model(&models.MediaLibraryRetirement{}).Count(&count).Error; err != nil || count != 0 {
-				t.Fatal("retirement gate survived refusal")
+			if state == "entered" {
+				if !waiting || row.Phase != "draining" {
+					t.Fatalf("entered owner did not keep retirement waiting: phase=%s waiting=%v", row.Phase, waiting)
+				}
+				if err := s.db.First(&proof, proof.ID).Error; err != nil || proof.State != state {
+					t.Fatal("entered evidence was removed before external I/O exit")
+				}
+				// The credential is not retained as history. Once the actual caller
+				// has left its external-I/O boundary, retirement removes it together
+				// with every other selected-library execution record.
+				if err := s.db.Model(&models.CatalogPhysicalWrite{}).Where("id = ?", proof.ID).Updates(map[string]any{"state": "quiescent", "updated_at": time.Now().UTC()}).Error; err != nil {
+					t.Fatal(err)
+				}
 			}
-			var kept models.MediaLibrary
-			if err := s.db.First(&kept, library.ID).Error; err != nil || kept.Enabled != library.Enabled {
-				t.Fatal("library changed on refusal")
+			for i := 0; i < 100 && row.Phase != "completed"; i++ {
+				if _, _, err := worker.step(context.Background(), claim, &row); err != nil {
+					t.Fatal(err)
+				}
 			}
-			if err := s.db.First(&proof, proof.ID).Error; err != nil || proof.State != state {
-				t.Fatal("unresolved owner lost")
+			if row.Phase != "completed" {
+				t.Fatalf("quiescent retirement did not finish: %s", row.Phase)
+			}
+			if err := s.db.First(&proof, proof.ID).Error; !errors.Is(err, gorm.ErrRecordNotFound) {
+				t.Fatalf("quiescent evidence remained after deletion: %v", err)
 			}
 		})
 	}

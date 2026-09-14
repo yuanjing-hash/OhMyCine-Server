@@ -25,6 +25,14 @@ import {
   pluginLifecyclePath,
   pluginConnectionPath,
   pluginConnectionsPath,
+  pluginResourceAuthPath,
+  pluginResourceCaptchaAssetPath,
+  pluginResourceHealthPath,
+  pluginResourceCapability,
+  pluginResourceEntryOptions,
+  buildPluginResourceLoginPayload,
+  buildPluginResourceCookiePayload,
+  buildPluginResourceCaptchaPayload,
   pluginUninstallPath,
   pluginRepositoryRefreshPath,
   selectedMarketplaceSource,
@@ -77,6 +85,24 @@ describe('plugin connection contracts', () => {
     expect(pluginConnectionPath('org.example/video', connection.id)).toBe('/api/v1/plugins/org.example%2Fvideo/connections/connection%20id')
     expect(buildPluginConnectionTogglePayload(connection, false)).toEqual({ enabled: false, revision: 4 })
     expect(buildPluginConnectionDeletePayload(connection)).toEqual({ revision: 4 })
+  })
+
+  it('keeps resource login routes and captcha payloads bounded to opaque references', () => {
+    expect(pluginResourceAuthPath('org.example/site', 'connection id', 'login')).toBe('/api/v1/plugins/org.example%2Fsite/connections/connection%20id/resource/login')
+    expect(pluginResourceCaptchaAssetPath('org.example/site', 'connection id', 'asset/ref')).toBe('/api/v1/plugins/org.example%2Fsite/connections/connection%20id/resource/captcha/asset%2Fref')
+    expect(pluginResourceHealthPath('org.example/site', 'connection id')).toBe('/api/v1/plugins/org.example%2Fsite/connections/connection%20id/resource/health')
+    expect(buildPluginResourceLoginPayload(' user ', 'secret')).toEqual({ username: 'user', password: 'secret' })
+    expect(buildPluginResourceCookiePayload(' cookie ')).toEqual({ cookie: 'cookie' })
+    expect(buildPluginResourceCaptchaPayload(' challenge ', [{ x: 10.3, y: 4.8 }])).toEqual({ challengeId: 'challenge', points: [{ x: 10, y: 5 }] })
+  })
+
+  it('derives a fixed mirror selector from the plugin schema without accepting arbitrary URLs', () => {
+    const plugin = {
+      capabilities: ['resource.search', 'resource.resolve'],
+      config_schema: { properties: { entryOrigin: { enum: ['https://mirror.example/', 'http://unsafe.test/'] } } },
+    } as unknown as Pick<InstalledPluginSummary, 'capabilities' | 'config_schema'>
+    expect(pluginResourceCapability(plugin)).toBe(true)
+    expect(pluginResourceEntryOptions(plugin)).toEqual(['https://mirror.example/'])
   })
 
   it('preserves declarative settings defaults in create and revision-bound update payloads', () => {

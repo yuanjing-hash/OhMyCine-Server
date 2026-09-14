@@ -16,6 +16,7 @@ import (
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/mediarecognition"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
 	downloadpkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/downloader"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/nodeprotocol"
 	"gorm.io/gorm"
 )
 
@@ -123,6 +124,46 @@ func TestTransferOrganizationListDetailAndOwnership(t *testing.T) {
 		t.Fatalf("other detail error=%v", err)
 	}
 }
+
+func TestTransferOrganizationProjectsLatestRemoteNodeStage(t *testing.T) {
+	queue, actor, download, _, _ := transferFixture(t, models.MediaLibraryTransferCopy, models.MediaLibraryConflictOverwrite, false)
+	actor.Permissions[authz.PermissionTransfersReadAll] = struct{}{}
+	service := NewTransferService(queue.db, queue.audit, queue, zerolog.Nop())
+	manifest := downloadpkg.Manifest{Name: "Movie.2024", Complete: true, Files: []downloadpkg.File{{RelativePath: "Movie.2024.mkv", Size: minimumAutomaticTransferVideoBytes}}}
+	if err := service.Enqueue(download, manifest); err != nil {
+		t.Fatal(err)
+	}
+	var transfer models.TransferTask
+	if err := queue.db.Where("download_task_id = ?", download.ID).First(&transfer).Error; err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	nodeID := "projection-node"
+	if err := queue.db.Create(&models.TransferNode{ID: nodeID, OwnerID: actor.User.ID, Name: "异地节点", NameNormalized: "projection-node", APIURL: "https://node.example.test", Status: models.NodeStatusOnline, ProtocolMin: 1, ProtocolMax: 1, CapabilitiesJSON: `{}`, CreatedAt: now, UpdatedAt: now}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := queue.db.Model(&models.TransferTask{}).Where("id = ?", transfer.ID).Updates(map[string]any{"execution_location": models.NodeLocationRemote, "node_id": nodeID, "node_name": "异地节点"}).Error; err != nil {
+		t.Fatal(err)
+	}
+	old := now.Add(-time.Minute)
+	operations := []models.RemoteOperation{
+		{OperationKey: "projection-old", TaskID: download.ID, NodeID: nodeID, PlanDigest: strings.Repeat("a", 64), PlanRevision: 1, LeaseEpoch: 1, Phase: nodeprotocol.PhaseAccepted, Status: nodeprotocol.OperationPending, CreatedAt: old, UpdatedAt: old},
+		{OperationKey: "projection-new", TaskID: download.ID, NodeID: nodeID, PlanDigest: strings.Repeat("b", 64), PlanRevision: 1, LeaseEpoch: 2, Phase: nodeprotocol.PhaseUploadingTarget, Status: nodeprotocol.OperationRunning, Progress: float64Pointer(0.5), ErrorCode: nodeprotocol.ErrorTargetRateLimited, CreatedAt: now, UpdatedAt: now},
+	}
+	if err := queue.db.Create(&operations).Error; err != nil {
+		t.Fatal(err)
+	}
+	page, err := service.List(actor, TransferListFilter{Page: 1, PageSize: 20})
+	if err != nil || len(page.List) != 1 {
+		t.Fatalf("page=%+v err=%v", page, err)
+	}
+	item := page.List[0]
+	if item.ExecutionLocation != models.NodeLocationRemote || item.NodeID == nil || *item.NodeID != nodeID || item.NodeName != "异地节点" || item.RemotePhase != nodeprotocol.PhaseUploadingTarget || item.RemoteStatus != nodeprotocol.OperationRunning || item.RemoteProgress == nil || *item.RemoteProgress != 0.5 || item.RemoteErrorCode != nodeprotocol.ErrorTargetRateLimited {
+		t.Fatalf("remote projection=%+v", item)
+	}
+}
+
+func float64Pointer(value float64) *float64 { return &value }
 
 func TestTransferOrganizationRetryAndCancellationUseJobStatus(t *testing.T) {
 	queue, actor, download, _, _ := transferFixture(t, models.MediaLibraryTransferCopy, models.MediaLibraryConflictOverwrite, false)

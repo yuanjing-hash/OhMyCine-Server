@@ -46,6 +46,10 @@ type structureCatalogRepairState struct {
 	FailedItems              int                   `json:"failed_items,omitempty"`
 	BlockedItems             int                   `json:"blocked_items,omitempty"`
 	OriginalTotalItems       int                   `json:"original_total_items,omitempty"`
+	Cancelled                bool                  `json:"cancelled,omitempty"`
+	RetryCheckpointBefore    time.Time             `json:"retry_checkpoint_before,omitempty"`
+	// Only the exiting execution stack may supply cancellation authority.
+	cancelPermit *CatalogPhysicalWritePermit
 }
 
 func (state structureCatalogRepairState) binding() CatalogSnapshotBinding {
@@ -94,7 +98,7 @@ func (s *MediaLibraryStructureService) freezeCatalogStructureRepairTx(tx *gorm.D
 		return appError(CodeConflict, "目录索引已变化，请重新预览", ErrCatalogFence)
 	}
 	var active int64
-	if err := tx.Model(&models.MediaLibraryStructureRepair{}).Where("library_id = ? AND id <> ? AND (phase IN ? OR (phase = 'failed' AND succeeded_items > 0 AND (failed_items > 0 OR blocked_items > 0)))", repair.LibraryID, repair.ID, activeStructureRepairPhases).Limit(1).Count(&active).Error; err != nil {
+	if err := tx.Table("media_library_structure_repairs AS r").Joins("JOIN media_libraries AS l ON l.id=r.library_id").Where("r.library_id=? AND r.id<>? AND (("+readinessRepairActiveSQL+") OR (r.phase='failed' AND ("+readinessRepairFailedSQL+")))", repair.LibraryID, repair.ID).Limit(1).Count(&active).Error; err != nil {
 		return err
 	}
 	if active > 0 {
@@ -171,7 +175,14 @@ func (s *MediaLibraryStructureService) validateCatalogStructureExecutionTx(tx *g
 			return err
 		}
 	}
-	if claim != nil {
+	if state.cancelPermit != nil {
+		if !state.Cancelled {
+			return ErrCatalogFence
+		}
+		if err := validateCancelledStructurePermitTx(tx, *state.cancelPermit, repair); err != nil {
+			return err
+		}
+	} else if claim != nil {
 		if s.queue == nil || repair.JobID == nil || *repair.JobID != claim.Job.ID {
 			return ErrCatalogInvalid
 		}
@@ -370,7 +381,7 @@ func (s *MediaLibraryStructureService) prepareCatalogStructureCandidate(ctx cont
 		return prepared, nil
 	}
 	input := CatalogCandidateInput{LibraryID: repair.LibraryID, Kind: "delta", ExpectedRevision: prepared.Head.Revision, SourceEpoch: prepared.Head.SourceEpoch, SourceFingerprint: prepared.Head.SourceFingerprint, ConfigFingerprint: prepared.Head.ConfigFingerprint, LeaseDuration: 2 * time.Minute}
-	if claim != nil {
+	if claim != nil && state.cancelPermit == nil {
 		input.JobID = &claim.Job.ID
 		input.JobLeaseHash = leaseHash(claim.LeaseToken)
 	}

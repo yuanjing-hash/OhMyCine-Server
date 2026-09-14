@@ -22,7 +22,8 @@ export function structureIssueActions(issue: MediaLibraryStructureIssueSummary):
 }
 
 export function structureBulkConflictCodes(action: MediaLibraryStructureBulkSelection['action'], currentCode = ''): string[] {
-  const codes = action === 'keep_recommended' ? physicalConflictCodes : [...physicalConflictCodes, ...reviewConflictCodes]
+  if (action === 'skip' && currentCode && currentCode !== 'all' && currentCode !== 'missing_season_episode') return [currentCode]
+	const codes = action === 'keep_recommended' ? physicalConflictCodes : [...physicalConflictCodes, ...reviewConflictCodes]
   return currentCode ? codes.filter(code => code === currentCode) : [...codes]
 }
 

@@ -383,8 +383,12 @@ func (s *MediaLibraryStructureService) buildSelectionPlan(ctx context.Context, l
 		if len(codes) == 0 {
 			return StructurePlan{}, diagnosis, nil, appError(CodeInvalidRequest, "批量冲突操作必须指定问题类型", nil)
 		}
+		rowScope := s.db.WithContext(ctx).Where("library_id = ? AND diagnosis_job_id = ? AND generation = ? AND code IN ? AND code <> ?", libraryID, diagnosis.JobID, diagnosis.Generation, codes, "missing_season_episode")
+		if bulk.Action == StructureSelectionKeepRecommended {
+			rowScope = rowScope.Where("code IN ? AND conflict_source_count > 1", []string{"duplicate_target", "sidecar_target_conflict"})
+		}
 		var rows []models.MediaLibraryStructureIssue
-		if err := s.db.WithContext(ctx).Where("library_id = ? AND diagnosis_job_id = ? AND generation = ? AND conflict_source_count > 1 AND code IN ?", libraryID, diagnosis.JobID, diagnosis.Generation, codes).Order("code,id").Find(&rows).Error; err != nil {
+		if err := rowScope.Order("code,id").Find(&rows).Error; err != nil {
 			return StructurePlan{}, diagnosis, nil, err
 		}
 		for _, row := range rows {

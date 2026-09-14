@@ -49,7 +49,7 @@ func TestMigrationV57NormalizesFuturePolicyWithoutChangingFrozenTasks(t *testing
 		t.Fatal(err)
 	}
 	task := models.DownloadTask{ID: uuid.NewString(), OwnerID: owner.ID, JobID: job.ID, DownloaderName: "legacy", ProviderType: models.DownloaderTypeFake, SourceCiphertext: "encrypted", DisplayName: "legacy", Phase: models.DownloadTaskStatusQueued, MovieDirectoryTemplate: "{category}/{title}", TVDirectoryTemplate: "{category}/{title}/Season {season:02}", CreatedAt: now, UpdatedAt: now}
-	if err := db.Create(&task).Error; err != nil {
+	if err := db.Omit("ExecutionLocation", "NodeID", "NodeName", "ProtocolVersion", "RoutePlanRevision", "RoutePlanDigest", "PluginResourceClaimID").Create(&task).Error; err != nil {
 		t.Fatal(err)
 	}
 

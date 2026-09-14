@@ -14,7 +14,6 @@ func TestMediaLibraryRetirementHTTPAcceptedAndPolling(t *testing.T) {
 	c := newTestClient(t)
 	c.setup(t)
 	c.libraries.SetQueueService(c.queue)
-	c.libraries.SetRetirementPhysicalGuard(services.AssertCatalogPhysicalDrainedTx)
 	var profile models.MediaClassificationProfile
 	if err := c.db.Where("code=?", "default-v1").First(&profile).Error; err != nil {
 		t.Fatal(err)

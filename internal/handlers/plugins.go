@@ -6,6 +6,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/middleware"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/plugins/contract"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/services"
 )
 
@@ -373,6 +374,72 @@ func (a *API) PollPluginConnectionAuth(c *gin.Context) {
 		return
 	}
 	item, err := a.pluginRepositories.PollConnectionAuth(c.Request.Context(), actor, c.Param("plugin_id"), c.Param("connection_id"), payload.LoginSession)
+	if err != nil {
+		writeError(c, a.log, err)
+		return
+	}
+	success(c, http.StatusOK, item)
+}
+
+func (a *API) LoginPluginResource(c *gin.Context) {
+	actor, _ := middleware.ActorFrom(c)
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 32<<10)
+	var payload contract.ResourceLoginRequest
+	if err := strictJSON(c, &payload); err != nil {
+		writeError(c, a.log, invalid("资源站登录请求无效", err))
+		return
+	}
+	payload.ConnectionID = c.Param("connection_id")
+	item, err := a.pluginRepositories.LoginResource(c.Request.Context(), actor, c.Param("plugin_id"), payload)
+	if err != nil {
+		writeError(c, a.log, err)
+		return
+	}
+	success(c, http.StatusOK, item)
+}
+
+func (a *API) SubmitPluginResourceCaptcha(c *gin.Context) {
+	actor, _ := middleware.ActorFrom(c)
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 16<<10)
+	var payload contract.ResourceCaptchaRequest
+	if err := strictJSON(c, &payload); err != nil {
+		writeError(c, a.log, invalid("资源站验证码请求无效", err))
+		return
+	}
+	payload.ConnectionID = c.Param("connection_id")
+	item, err := a.pluginRepositories.SubmitResourceCaptcha(c.Request.Context(), actor, c.Param("plugin_id"), payload)
+	if err != nil {
+		writeError(c, a.log, err)
+		return
+	}
+	success(c, http.StatusOK, item)
+}
+
+func (a *API) SubmitPluginResourceCookie(c *gin.Context) {
+	actor, _ := middleware.ActorFrom(c)
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 40<<10)
+	var payload contract.ResourceCookieRequest
+	if err := strictJSON(c, &payload); err != nil {
+		writeError(c, a.log, invalid("资源站 Cookie 请求无效", err))
+		return
+	}
+	payload.ConnectionID = c.Param("connection_id")
+	item, err := a.pluginRepositories.SubmitResourceCookie(c.Request.Context(), actor, c.Param("plugin_id"), payload)
+	if err != nil {
+		writeError(c, a.log, err)
+		return
+	}
+	success(c, http.StatusOK, item)
+}
+
+func (a *API) CheckPluginResourceHealth(c *gin.Context) {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 1024)
+	var payload struct{}
+	if err := strictJSON(c, &payload); err != nil {
+		writeError(c, a.log, invalid("资源站健康检查请求无效", err))
+		return
+	}
+	item, err := a.pluginRepositories.ResourceHealth(c.Request.Context(), c.Param("plugin_id"), c.Param("connection_id"))
 	if err != nil {
 		writeError(c, a.log, err)
 		return

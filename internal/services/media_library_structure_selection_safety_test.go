@@ -36,9 +36,12 @@ func TestStructureSelectionReviewConflictsRequireIdentityOrIndexReview(t *testin
 					t.Fatalf("review guidance is missing: %v", err)
 				}
 			}
-			preview, err := service.PreviewSelectionRepair(context.Background(), actor, library.ID, MediaLibraryStructureSelectionInput{Revision: diagnostics.Revision, BulkActions: []MediaLibraryStructureBulkAction{{Codes: []string{code}, Action: StructureSelectionKeepRecommended}}})
+			if _, err := service.PreviewSelectionRepair(context.Background(), actor, library.ID, MediaLibraryStructureSelectionInput{Revision: diagnostics.Revision, BulkActions: []MediaLibraryStructureBulkAction{{Codes: []string{code}, Action: StructureSelectionKeepRecommended}}}); ErrorCode(err) != CodeInvalidRequest {
+				t.Fatalf("bulk recommendation accepted review-only conflict: %v", err)
+			}
+			preview, err := service.PreviewSelectionRepair(context.Background(), actor, library.ID, MediaLibraryStructureSelectionInput{Revision: diagnostics.Revision, BulkActions: []MediaLibraryStructureBulkAction{{Codes: []string{code}, Action: StructureSelectionSkip}}})
 			if err != nil || preview.SkippedCount != 1 || preview.MoveCount != 0 || preview.RecycleCount != 0 || len(preview.Selections) != 1 || preview.Selections[0].Action != StructureSelectionSkip {
-				t.Fatalf("bulk recommendation must skip review-only conflict: %+v err=%v", preview, err)
+				t.Fatalf("category bulk skip failed: %+v err=%v", preview, err)
 			}
 			preview, err = service.PreviewSelectionRepair(context.Background(), actor, library.ID, MediaLibraryStructureSelectionInput{Revision: diagnostics.Revision, Selections: []MediaLibraryStructureSelection{{IssueToken: issue.Token, Action: StructureSelectionSkip}}})
 			if err != nil || preview.SkippedCount != 1 {
@@ -105,7 +108,7 @@ func TestStructureSelectionDuplicateProviderFactsNeverRecycleRealFile(t *testing
 			t.Fatalf("same physical provider file accepted %s: %v", action, err)
 		}
 	}
-	preview, err := service.PreviewSelectionRepair(context.Background(), actor, library.ID, MediaLibraryStructureSelectionInput{Revision: diagnostics.Revision, BulkActions: []MediaLibraryStructureBulkAction{{Codes: []string{"catalog_duplicate_conflict"}, Action: StructureSelectionKeepRecommended}}})
+	preview, err := service.PreviewSelectionRepair(context.Background(), actor, library.ID, MediaLibraryStructureSelectionInput{Revision: diagnostics.Revision, BulkActions: []MediaLibraryStructureBulkAction{{Codes: []string{"catalog_duplicate_conflict"}, Action: StructureSelectionSkip}}})
 	if err != nil || preview.SkippedCount != 1 || preview.RecycleCount != 0 || preview.MoveCount != 0 {
 		t.Fatalf("duplicate facts bulk preview=%+v err=%v", preview, err)
 	}

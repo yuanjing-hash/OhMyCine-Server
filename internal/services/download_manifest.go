@@ -59,7 +59,9 @@ func selectDownloadPackageManifestWithMinimum(manifest downloadpkg.Manifest, med
 			eligible = append(eligible, mediarecognition.FileFact{RelativePath: normalizedManifestPath(file.RelativePath), Size: file.Size})
 		}
 		resolved := mediarecognition.ResolvePackageEpisodes(eligible, mediarecognition.MediaTypeTV)
-		if !resolved.Complete {
+		// Missing or unrecognized episodes must not block recognized files.
+		// Transfer still validates every file in this selected manifest.
+		if len(resolved.Files) == 0 {
 			return downloadpkg.Manifest{}, errPackageEpisodeUnrecognized
 		}
 		for _, fact := range resolved.Files {

@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud"
 )
@@ -69,12 +70,43 @@ type File struct {
 	ProviderItemID   string `json:"provider_item_id,omitempty"`
 	ProviderParentID string `json:"provider_parent_id,omitempty"`
 	SHA1             string `json:"sha1,omitempty"`
+	SHA256           string `json:"sha256,omitempty"`
+	RemoteFileToken  string `json:"remote_file_token,omitempty"`
 }
 
 type Manifest struct {
-	Name     string
-	Files    []File
-	Complete bool
+	Name                     string
+	Files                    []File
+	Complete                 bool
+	RemoteExportOperationKey string     `json:"remote_export_operation_key,omitempty"`
+	RemoteExportDigest       string     `json:"remote_export_digest,omitempty"`
+	RemoteExportExpiresAt    *time.Time `json:"remote_export_expires_at,omitempty"`
+}
+
+// RemoteFileChunk is one immutable content range advertised by a remote
+// downloader executor. The Server persists only completion bits for these
+// frozen indexes; it never invents ranges from a partial local file.
+type RemoteFileChunk struct {
+	Index  int
+	Offset int64
+	Size   int64
+	SHA256 string
+}
+
+// RemoteFileReader is an optional task-bound data-plane capability. It is
+// implemented by node-backed downloaders only. Manifest and File must be the
+// exact values returned by Manifest; implementations revalidate their opaque
+// identities before issuing any Range request.
+type RemoteFileReader interface {
+	RemoteFileChunks(context.Context, Manifest, File) ([]RemoteFileChunk, error)
+	ReadRemoteFileChunk(context.Context, Manifest, File, RemoteFileChunk) ([]byte, error)
+}
+
+// ManagedSourceCleaner removes only the task-owned temporary materialization
+// maintained by a remote executor. It never removes downloader data or a
+// provider-side source package.
+type ManagedSourceCleaner interface {
+	CleanupManagedSource(context.Context) error
 }
 
 type Category struct {

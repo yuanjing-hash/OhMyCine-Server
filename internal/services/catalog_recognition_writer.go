@@ -225,7 +225,11 @@ func (s *MediaLibraryService) persistVersionedRecognitionResults(source catalogR
 			if err := tx.Model(&models.MediaLibrary{}).Where("id = ?", source.Library.ID).Updates(map[string]any{"dirty_generation": generation, "updated_at": now}).Error; err != nil {
 				return err
 			}
-			if _, err := s.artifacts.BindCatalogGenerationTx(tx, source.Library.ID, generation); err != nil {
+			changes := CatalogArtifactChangeSet{Recognitions: make([]uint, 0, len(after))}
+			for _, record := range after {
+				changes.Recognitions = append(changes.Recognitions, record.ID)
+			}
+			if _, err := s.artifacts.BindCatalogGenerationChangesTx(tx, source.Library.ID, generation, changes); err != nil {
 				return err
 			}
 		}

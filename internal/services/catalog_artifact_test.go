@@ -5,14 +5,17 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/rs/zerolog"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/authz"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
+	cloudpkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/metadata/tmdb"
 	"gorm.io/gorm"
 )
@@ -51,6 +54,13 @@ func TestCatalogArtifactExactSnapshotSchedulesWithoutGenerationSweep(t *testing.
 	artifacts, store, library, binding, _, root := boundArtifactFixture(t)
 	if err := artifacts.ScheduleGeneration(library.ID, 7); err != nil {
 		t.Fatal(err)
+	}
+	var scheduledRun models.MediaArtifactRun
+	if err := store.writeDB.Where("library_id = ?", library.ID).First(&scheduledRun).Error; err != nil {
+		t.Fatal(err)
+	}
+	if scheduledRun.CatalogBindingID != binding.ID {
+		t.Fatalf("scheduled run lost catalog lifetime: run=%+v binding=%s", scheduledRun, binding.ID)
 	}
 	if err := artifacts.ScheduleGeneration(library.ID, 7); err != nil {
 		t.Fatal(err)
@@ -138,6 +148,338 @@ func TestCatalogArtifactNoopScanDirtyCounterDoesNotInvalidatePendingBinding(t *t
 	})
 	if err != nil {
 		t.Fatalf("no-op counter invalidated exact binding: %v", err)
+	}
+}
+
+func TestCatalogArtifactIncrementalBindingDoesNotRequireHistoricalPredecessor(t *testing.T) {
+	artifacts, store, library, predecessor, rec, _ := boundArtifactFixture(t)
+	if err := store.writeDB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Where("owner_kind = ? AND owner_id = ?", "artifact", predecessor.ID).Delete(&models.CatalogSnapshotReference{}).Error; err != nil {
+			return err
+		}
+		return tx.Delete(&models.CatalogArtifactBinding{}, "id = ?", predecessor.ID).Error
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var binding models.CatalogArtifactBinding
+	if err := store.writeDB.Transaction(func(tx *gorm.DB) error {
+		var err error
+		binding, err = artifacts.BindCatalogGenerationChangesTx(tx, library.ID, 8, CatalogArtifactChangeSet{Recognitions: []uint{rec.ID}})
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if binding.ScopeMode != catalogArtifactScopeIncremental {
+		t.Fatalf("established library without old binding expanded to %q", binding.ScopeMode)
+	}
+	var items []models.CatalogArtifactBindingItem
+	if err := store.writeDB.Where("binding_id = ?", binding.ID).Find(&items).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || items[0].EntityKind != "recognition" || items[0].EntityID != rec.ID {
+		t.Fatalf("incremental workset=%+v", items)
+	}
+}
+
+func TestCatalogArtifactHealthyFullAuditDoesNotRewriteFiles(t *testing.T) {
+	artifacts, store, library, _, _, root := boundArtifactFixture(t)
+	if err := artifacts.ScheduleGeneration(library.ID, 7); err != nil {
+		t.Fatal(err)
+	}
+	firstClaim, err := artifacts.queue.Claim([]string{JobTypeMediaArtifact})
+	if err != nil || firstClaim == nil {
+		t.Fatalf("first claim=%+v err=%v", firstClaim, err)
+	}
+	if result := NewMediaArtifactWorker(artifacts).Run(context.Background(), &providerWakeRuntime{}, *firstClaim); result.ErrorCode != "" {
+		t.Fatalf("first generation=%+v", result)
+	}
+	if err := artifacts.queue.Complete(firstClaim.Job.ID, firstClaim.LeaseToken); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(root, "Show", "tvshow.nfo")
+	before, err := os.Stat(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	scan := models.MediaLibraryScanRun{LibraryID: library.ID, Generation: 8, Kind: "full", Status: "success", StartedAt: now, FinishedAt: &now}
+	if err := store.writeDB.Create(&scan).Error; err != nil {
+		t.Fatal(err)
+	}
+	var binding models.CatalogArtifactBinding
+	if err := store.writeDB.Transaction(func(tx *gorm.DB) error {
+		var bindErr error
+		binding, bindErr = artifacts.BindCatalogGenerationTx(tx, library.ID, 8)
+		return bindErr
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := artifacts.ScheduleGeneration(library.ID, 8); err != nil {
+		t.Fatal(err)
+	}
+	claim, err := artifacts.queue.Claim([]string{JobTypeMediaArtifact})
+	if err != nil || claim == nil {
+		t.Fatalf("full audit claim=%+v err=%v", claim, err)
+	}
+	if result := NewMediaArtifactWorker(artifacts).Run(context.Background(), &providerWakeRuntime{}, *claim); result.ErrorCode != "" {
+		t.Fatalf("full audit=%+v", result)
+	}
+	var run models.MediaArtifactRun
+	if err := store.writeDB.First(&run, "library_id = ? AND generation = ?", library.ID, 8).Error; err != nil {
+		t.Fatal(err)
+	}
+	if run.ExpectedCount != 0 || run.WrittenCount != 0 || run.UpdatedCount != 0 || run.FailedCount != 0 {
+		t.Fatalf("healthy full audit produced work: %+v", run)
+	}
+	after, err := os.Stat(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !after.ModTime().Equal(before.ModTime()) {
+		t.Fatalf("healthy full audit rewrote file: before=%s after=%s", before.ModTime(), after.ModTime())
+	}
+	var active models.MediaArtifact
+	if err := store.writeDB.First(&active, "library_id = ? AND active = ?", library.ID, true).Error; err != nil || active.CatalogBindingID != binding.ID {
+		t.Fatalf("healthy manifest was not rebound: %+v err=%v", active, err)
+	}
+}
+
+func TestCatalogArtifactFullAuditRepairsCorruptManagedFile(t *testing.T) {
+	artifacts, store, library, _, _, root := boundArtifactFixture(t)
+	if err := artifacts.ScheduleGeneration(library.ID, 7); err != nil {
+		t.Fatal(err)
+	}
+	firstClaim, err := artifacts.queue.Claim([]string{JobTypeMediaArtifact})
+	if err != nil || firstClaim == nil {
+		t.Fatalf("first claim=%+v err=%v", firstClaim, err)
+	}
+	if result := NewMediaArtifactWorker(artifacts).Run(context.Background(), &providerWakeRuntime{}, *firstClaim); result.ErrorCode != "" {
+		t.Fatalf("first generation=%+v", result)
+	}
+	if err := artifacts.queue.Complete(firstClaim.Job.ID, firstClaim.LeaseToken); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(root, "Show", "tvshow.nfo")
+	original, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	corrupt := []byte("corrupt-managed-nfo")
+	if err := os.WriteFile(target, corrupt, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	scan := models.MediaLibraryScanRun{LibraryID: library.ID, Generation: 8, Kind: "strm_full_manual", Status: "success", StartedAt: now, FinishedAt: &now}
+	if err := store.writeDB.Create(&scan).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := store.writeDB.Transaction(func(tx *gorm.DB) error {
+		_, bindErr := artifacts.BindCatalogGenerationTx(tx, library.ID, 8)
+		return bindErr
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := artifacts.ScheduleGeneration(library.ID, 8); err != nil {
+		t.Fatal(err)
+	}
+	claim, err := artifacts.queue.Claim([]string{JobTypeMediaArtifact})
+	if err != nil || claim == nil {
+		t.Fatalf("full audit claim=%+v err=%v", claim, err)
+	}
+	if result := NewMediaArtifactWorker(artifacts).Run(context.Background(), &providerWakeRuntime{}, *claim); result.ErrorCode != "" {
+		t.Fatalf("full audit=%+v", result)
+	}
+	repaired, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(repaired) != string(original) || string(repaired) == string(corrupt) {
+		t.Fatalf("corrupt managed artifact was not repaired: %q", repaired)
+	}
+	var run models.MediaArtifactRun
+	if err := store.writeDB.First(&run, "library_id = ? AND generation = ?", library.ID, 8).Error; err != nil {
+		t.Fatal(err)
+	}
+	if run.ExpectedCount != 1 || run.UpdatedCount != 1 || run.FailedCount != 0 {
+		t.Fatalf("full repair counters=%+v", run)
+	}
+}
+
+func TestCatalogArtifactLocalExecutionIsBoundedAndSerialPerLane(t *testing.T) {
+	service := &MediaArtifactService{localSlots: make(chan struct{}, 8)}
+	keys := make([]string, 4)
+	for candidate := 0; ; candidate++ {
+		key := fmt.Sprintf("lane-%d", candidate)
+		hash := fnv.New32a()
+		_, _ = hash.Write([]byte(key))
+		lane := int(hash.Sum32() % 4)
+		if keys[lane] == "" {
+			keys[lane] = key
+		}
+		if keys[0] != "" && keys[1] != "" && keys[2] != "" && keys[3] != "" {
+			break
+		}
+	}
+	started := make(chan struct{}, 8)
+	release := make(chan struct{})
+	var active, maximum atomic.Int32
+	work := make([]catalogArtifactScopedWork, 0, 4)
+	for index, key := range keys {
+		itemID := uint(index + 1)
+		work = append(work, catalogArtifactScopedWork{item: models.CatalogArtifactBindingItem{EntityID: itemID}, key: key, execute: func(context.Context) (string, error) {
+			current := active.Add(1)
+			for previous := maximum.Load(); current > previous && !maximum.CompareAndSwap(previous, current); previous = maximum.Load() {
+			}
+			started <- struct{}{}
+			<-release
+			active.Add(-1)
+			return "skipped", nil
+		}})
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- service.executeCatalogArtifactWork(context.Background(), work, 4, func(catalogArtifactScopedResult) error { return nil })
+	}()
+	for range 4 {
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatal("independent local lanes did not run concurrently")
+		}
+	}
+	if maximum.Load() != 4 {
+		t.Fatalf("local concurrency=%d want=4", maximum.Load())
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+
+	var sameLaneActive, sameLaneMax atomic.Int32
+	sameLane := make([]catalogArtifactScopedWork, 8)
+	for index := range sameLane {
+		sameLane[index] = catalogArtifactScopedWork{item: models.CatalogArtifactBindingItem{EntityID: uint(index + 1)}, key: "same-target", execute: func(context.Context) (string, error) {
+			current := sameLaneActive.Add(1)
+			for previous := sameLaneMax.Load(); current > previous && !sameLaneMax.CompareAndSwap(previous, current); previous = sameLaneMax.Load() {
+			}
+			time.Sleep(time.Millisecond)
+			sameLaneActive.Add(-1)
+			return "skipped", nil
+		}}
+	}
+	if err := service.executeCatalogArtifactWork(context.Background(), sameLane, 4, func(catalogArtifactScopedResult) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if sameLaneMax.Load() != 1 {
+		t.Fatalf("same target executed concurrently: %d", sameLaneMax.Load())
+	}
+}
+
+func TestCatalogArtifactAuthenticationFailureStopsRemainingProviderWork(t *testing.T) {
+	service := &MediaArtifactService{localSlots: make(chan struct{}, 8)}
+	var calls atomic.Int32
+	work := make([]catalogArtifactScopedWork, 3)
+	for index := range work {
+		work[index] = catalogArtifactScopedWork{
+			item: models.CatalogArtifactBindingItem{EntityID: uint(index + 1)},
+			key:  fmt.Sprintf("asset:%d", index+1),
+			execute: func(context.Context) (string, error) {
+				calls.Add(1)
+				return "", cloudpkg.Error(cloudpkg.CodeAuthExpired, false, errors.New("expired"))
+			},
+		}
+	}
+	err := service.executeCatalogArtifactWork(context.Background(), work, 1, func(result catalogArtifactScopedResult) error {
+		if catalogArtifactFatalError(result.err) {
+			return result.err
+		}
+		return nil
+	})
+	if code, _ := cloudpkg.ErrorInfo(err); code != cloudpkg.CodeAuthExpired {
+		t.Fatalf("provider error=%v code=%q", err, code)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("authentication failure executed %d provider items, want 1", calls.Load())
+	}
+}
+
+func TestCatalogArtifactAuthenticationFailureKeepsExactItemPendingWithoutAttemptCost(t *testing.T) {
+	artifacts, store, library, binding, _, _ := boundArtifactFixture(t)
+	if err := artifacts.ScheduleGeneration(library.ID, 7); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := artifacts.queue.Claim([]string{JobTypeMediaArtifact})
+	if err != nil || claimed == nil {
+		t.Fatalf("claim=%+v err=%v", claimed, err)
+	}
+	var run models.MediaArtifactRun
+	if err := store.writeDB.First(&run, "library_id = ?", library.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	var policy mediaArtifactPolicy
+	if err := json.Unmarshal([]byte(run.PolicyJSON), &policy); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.writeDB.Model(&run).Update("status", models.MediaArtifactStatusRunning).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := store.writeDB.Model(&binding).Update("state", "running").Error; err != nil {
+		t.Fatal(err)
+	}
+	item := models.CatalogArtifactBindingItem{BindingID: binding.ID, EntityKind: "asset", EntityID: 999, Status: "pending"}
+	if err := store.writeDB.Create(&item).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := artifacts.startCatalogArtifactItems(context.Background(), policy, run, *claimed, []models.CatalogArtifactBindingItem{item}); err != nil {
+		t.Fatal(err)
+	}
+	authErr := cloudpkg.Error(cloudpkg.CodeAuthExpired, false, errors.New("expired cookie"))
+	result := catalogArtifactScopedResult{item: item, err: authErr, safePath: "Show/poster.jpg"}
+	if err := artifacts.finishCatalogArtifactItems(context.Background(), policy, run, *claimed, []catalogArtifactScopedResult{result}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.writeDB.First(&item, "binding_id = ? AND entity_kind = ? AND entity_id = ?", binding.ID, "asset", 999).Error; err != nil {
+		t.Fatal(err)
+	}
+	if item.Status != "pending" || item.Attempts != 0 || !item.Retryable || item.ErrorCode != cloudpkg.CodeAuthExpired || item.FinishedAt != nil {
+		t.Fatalf("credential wait item=%+v", item)
+	}
+}
+
+func TestCatalogArtifactFullAuditHealthChecksAreBoundedAndConcurrent(t *testing.T) {
+	service := &MediaArtifactService{localSlots: make(chan struct{}, 8)}
+	started := make(chan struct{}, 8)
+	release := make(chan struct{})
+	var active, maximum atomic.Int32
+	done := make(chan error, 1)
+	go func() {
+		results, err := service.inspectCatalogArtifactHealth(context.Background(), 8, func(index int) catalogArtifactInspection {
+			current := active.Add(1)
+			for previous := maximum.Load(); current > previous && !maximum.CompareAndSwap(previous, current); previous = maximum.Load() {
+			}
+			started <- struct{}{}
+			<-release
+			active.Add(-1)
+			return catalogArtifactInspection{healthy: true, artifactIDs: []uint{uint(index + 1)}}
+		})
+		if err == nil && len(results) != 8 {
+			err = fmt.Errorf("inspection results=%d want=8", len(results))
+		}
+		done <- err
+	}()
+	for range catalogArtifactLocalWorkers {
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatal("full audit hashing remained serial")
+		}
+	}
+	if maximum.Load() != catalogArtifactLocalWorkers {
+		t.Fatalf("full audit hashing concurrency=%d want=%d", maximum.Load(), catalogArtifactLocalWorkers)
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -426,6 +768,11 @@ func TestCatalogArtifactFinalizationUsesPersistedKeysetAndPartialDoesNotPrune(t 
 	for _, partial := range []bool{false, true} {
 		t.Run(fmt.Sprintf("partial=%t", partial), func(t *testing.T) {
 			artifacts, store, library, binding, _, _ := boundArtifactFixture(t)
+			if partial {
+				if err := store.writeDB.Model(&binding).Update("scope_mode", catalogArtifactScopeIncremental).Error; err != nil {
+					t.Fatal(err)
+				}
+			}
 			scan := models.MediaLibraryScanRun{LibraryID: library.ID, Generation: 7, Kind: "full", Status: "success", Partial: partial, StartedAt: time.Now().UTC()}
 			if err := store.writeDB.Create(&scan).Error; err != nil {
 				t.Fatal(err)

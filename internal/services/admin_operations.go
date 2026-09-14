@@ -160,7 +160,7 @@ func readableJobsQuery(db *gorm.DB, actor Actor) (*gorm.DB, error) {
 	if !actor.Can(authz.PermissionJobsReadAll) && !actor.Can(authz.PermissionJobsReadOwn) {
 		return nil, appError(CodePermissionDenied, "没有查看任务的权限", nil)
 	}
-	query := db.Model(&models.Job{})
+	query := db.Model(&models.Job{}).Where("history_cleared_at IS NULL")
 	if !actor.Can(authz.PermissionJobsReadAll) {
 		query = query.Where("owner_id = ?", actor.User.ID)
 	}

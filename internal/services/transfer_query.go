@@ -38,44 +38,51 @@ type TransferFilterOptions struct {
 }
 
 type TransferSummary struct {
-	ID               string     `json:"id"`
-	OwnerID          uint       `json:"owner_id"`
-	DownloadTaskID   string     `json:"download_task_id"`
-	JobID            string     `json:"job_id"`
-	DisplayName      string     `json:"display_name"`
-	DownloaderName   string     `json:"downloader_name"`
-	ProviderType     string     `json:"provider_type"`
-	ScrapeStatus     string     `json:"scrape_status"`
-	ScrapeTitle      string     `json:"scrape_title"`
-	ScrapeMediaType  string     `json:"scrape_media_type"`
-	ScrapeCategory   string     `json:"scrape_category"`
-	ScrapeTMDBID     *int64     `json:"scrape_tmdb_id"`
-	ScrapeYear       *int       `json:"scrape_year"`
-	ScrapeConfidence *float64   `json:"scrape_confidence"`
-	IdentitySource   string     `json:"identity_source"`
-	IdentityStatus   string     `json:"identity_status"`
-	IdentityLocked   bool       `json:"identity_locked"`
-	IdentityRevision uint64     `json:"identity_revision"`
-	ProfileID        uint       `json:"profile_id"`
-	ProfileRevision  uint64     `json:"profile_revision"`
-	LibraryID        uint       `json:"library_id"`
-	LibraryName      string     `json:"library_name"`
-	RouteKind        string     `json:"route_kind"`
-	TransferMode     string     `json:"transfer_mode"`
-	ConflictPolicy   string     `json:"conflict_policy"`
-	Phase            string     `json:"phase"`
-	JobStatus        string     `json:"job_status"`
-	RetryAt          *time.Time `json:"retry_at"`
-	ProcessedFiles   int        `json:"processed_files"`
-	TotalFiles       int        `json:"total_files"`
-	LastErrorCode    string     `json:"last_error_code"`
-	LastErrorMessage string     `json:"last_error_message"`
-	CleanupStatus    string     `json:"cleanup_status"`
-	CleanupRemoved   int        `json:"cleanup_removed"`
-	CleanupErrorCode string     `json:"cleanup_error_code"`
-	CreatedAt        time.Time  `json:"created_at"`
-	UpdatedAt        time.Time  `json:"updated_at"`
-	FinishedAt       *time.Time `json:"finished_at"`
+	ID                string     `json:"id"`
+	OwnerID           uint       `json:"owner_id"`
+	DownloadTaskID    string     `json:"download_task_id"`
+	JobID             string     `json:"job_id"`
+	DisplayName       string     `json:"display_name"`
+	DownloaderName    string     `json:"downloader_name"`
+	ProviderType      string     `json:"provider_type"`
+	ScrapeStatus      string     `json:"scrape_status"`
+	ScrapeTitle       string     `json:"scrape_title"`
+	ScrapeMediaType   string     `json:"scrape_media_type"`
+	ScrapeCategory    string     `json:"scrape_category"`
+	ScrapeTMDBID      *int64     `json:"scrape_tmdb_id"`
+	ScrapeYear        *int       `json:"scrape_year"`
+	ScrapeConfidence  *float64   `json:"scrape_confidence"`
+	IdentitySource    string     `json:"identity_source"`
+	IdentityStatus    string     `json:"identity_status"`
+	IdentityLocked    bool       `json:"identity_locked"`
+	IdentityRevision  uint64     `json:"identity_revision"`
+	ProfileID         uint       `json:"profile_id"`
+	ProfileRevision   uint64     `json:"profile_revision"`
+	LibraryID         uint       `json:"library_id"`
+	LibraryName       string     `json:"library_name"`
+	ExecutionLocation string     `json:"execution_location"`
+	NodeID            *string    `json:"node_id,omitempty"`
+	NodeName          string     `json:"node_name,omitempty"`
+	RemotePhase       string     `json:"remote_phase,omitempty"`
+	RemoteStatus      string     `json:"remote_status,omitempty"`
+	RemoteProgress    *float64   `json:"remote_progress,omitempty"`
+	RemoteErrorCode   string     `json:"remote_error_code,omitempty"`
+	RouteKind         string     `json:"route_kind"`
+	TransferMode      string     `json:"transfer_mode"`
+	ConflictPolicy    string     `json:"conflict_policy"`
+	Phase             string     `json:"phase"`
+	JobStatus         string     `json:"job_status"`
+	RetryAt           *time.Time `json:"retry_at"`
+	ProcessedFiles    int        `json:"processed_files"`
+	TotalFiles        int        `json:"total_files"`
+	LastErrorCode     string     `json:"last_error_code"`
+	LastErrorMessage  string     `json:"last_error_message"`
+	CleanupStatus     string     `json:"cleanup_status"`
+	CleanupRemoved    int        `json:"cleanup_removed"`
+	CleanupErrorCode  string     `json:"cleanup_error_code"`
+	CreatedAt         time.Time  `json:"created_at"`
+	UpdatedAt         time.Time  `json:"updated_at"`
+	FinishedAt        *time.Time `json:"finished_at"`
 }
 
 type TransferPage struct {
@@ -118,7 +125,12 @@ const transferProjectionColumns = `
 	download.scrape_category, download.scrape_tmdb_id, download.scrape_year,
 	download.scrape_confidence, download.identity_source, download.identity_status,
 	download.identity_locked, download.identity_revision, download.profile_id, download.profile_revision,
-	transfer.library_id, transfer.library_name, download.transfer_route_kind AS route_kind, download.transfer_mode,
+	transfer.library_id, transfer.library_name, transfer.execution_location, transfer.node_id, transfer.node_name,
+	COALESCE((SELECT remote.phase FROM remote_operations AS remote WHERE remote.task_id = download.id AND remote.node_id = transfer.node_id ORDER BY remote.updated_at DESC, remote.id DESC LIMIT 1), '') AS remote_phase,
+	COALESCE((SELECT remote.status FROM remote_operations AS remote WHERE remote.task_id = download.id AND remote.node_id = transfer.node_id ORDER BY remote.updated_at DESC, remote.id DESC LIMIT 1), '') AS remote_status,
+	(SELECT remote.progress FROM remote_operations AS remote WHERE remote.task_id = download.id AND remote.node_id = transfer.node_id ORDER BY remote.updated_at DESC, remote.id DESC LIMIT 1) AS remote_progress,
+	COALESCE((SELECT remote.error_code FROM remote_operations AS remote WHERE remote.task_id = download.id AND remote.node_id = transfer.node_id ORDER BY remote.updated_at DESC, remote.id DESC LIMIT 1), '') AS remote_error_code,
+	download.transfer_route_kind AS route_kind, download.transfer_mode,
 	download.conflict_policy, transfer.phase, jobs.status AS job_status, jobs.next_attempt_at AS retry_at,
 	transfer.processed_files, transfer.total_files,
 	transfer.last_error_code AS transfer_error_code,
@@ -135,6 +147,7 @@ func (s *TransferService) transferReadScope(actor Actor) (*gorm.DB, error) {
 		return nil, appError(CodePermissionDenied, "无权查看媒体整理任务", nil)
 	}
 	query := s.db.Table("transfer_tasks AS transfer").
+		Where("transfer.history_cleared_at IS NULL").
 		Joins("JOIN download_tasks AS download ON download.id = transfer.download_task_id").
 		Joins("JOIN jobs ON jobs.id = transfer.job_id")
 	if !actor.Can(authz.PermissionTransfersReadAll) {

@@ -168,8 +168,8 @@ func TestLibraryReadinessQueuedRetryBlocksEvenAfterPriorPhysicalSettlement(t *te
 		t.Fatal(err)
 	}
 	r, err = libraryReadiness(db, l.ID)
-	if err != nil || r.Ready || r.ReadinessStatus != "repair_failed" {
-		t.Fatalf("settled partial failure did not hold readiness: %+v %v", r, err)
+	if err != nil || !r.Ready {
+		t.Fatalf("settled partial result still blocked fresh work: %+v %v", r, err)
 	}
 }
 

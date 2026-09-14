@@ -26,6 +26,7 @@ type catalogArtifactPrivateMetadata struct {
 	TargetKind           string
 	RelativePath         string
 	ContentFingerprint   string
+	SourceFingerprint    string
 	ContentExpiresAt     *time.Time
 	ContentFormatVersion string
 	TargetProviderID     string
@@ -129,7 +130,7 @@ func PrepareCatalogArtifactWriteTx(tx *gorm.DB, permit CatalogPhysicalWritePermi
 	if b.ID == 0 || a.ID != b.ID || a.OpaqueID != b.OpaqueID || a.LibraryID != proof.LibraryID || b.LibraryID != proof.LibraryID || a.RunID != run.ID || a.TargetKind != b.TargetKind || a.RelativePath != b.RelativePath || a.Kind != b.Kind || a.TargetKind == "" || a.RelativePath == "" || input.RootIdentity == "" || len(input.RootIdentity) > 4096 || !a.Managed || a.ContentFingerprint != input.AfterFingerprint || len(input.AfterFingerprint) != 64 || input.BeforeSize < 0 || input.AfterSize < 0 || input.AfterSize > 32*1024*1024 || (input.BeforeExists && len(input.BeforeFingerprint) != 64) || (!input.BeforeExists && (input.BeforeFingerprint != "" || input.BeforeSize != 0)) {
 		return receipt, ErrCatalogInvalid
 	}
-	if input.BeforeExists && b.Status == models.MediaArtifactStatusCompleted && b.ContentFingerprint != input.BeforeFingerprint {
+	if input.BeforeExists && b.Status == models.MediaArtifactStatusCompleted && b.ContentFingerprint != input.BeforeFingerprint && !artifactFullAudit(policy) {
 		return receipt, catalogPhysicalUnsettledError()
 	}
 	beforeJSON, err := encodeCatalogArtifactMetadata(b)

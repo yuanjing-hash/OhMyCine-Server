@@ -119,7 +119,7 @@ func TestDefaultIngestLibrarySurvivesSafeUpdatesAndGuardsDestructiveChanges(t *t
 	if _, err := service.Update(context.Background(), actor, library.ID, disable, RequestContext{}); ErrorCode(err) != CodeConflict {
 		t.Fatalf("disabled default while listener active: %v", err)
 	}
-	if err := service.Delete(actor, library.ID, RequestContext{}); ErrorCode(err) != CodeConflict {
+	if _, err := service.DeleteRequest(context.Background(), actor, library.ID, RequestContext{}); ErrorCode(err) != CodeConflict {
 		t.Fatalf("deleted default while listener active: %v", err)
 	}
 	var preserved models.MediaLibrary

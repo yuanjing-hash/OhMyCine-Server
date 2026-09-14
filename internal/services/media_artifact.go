@@ -35,6 +35,12 @@ func mediaArtifactResourceKey(libraryID uint) string {
 }
 
 type mediaArtifactPolicy struct {
+	BatchSourceFingerprint string   `json:"batch_source_fingerprint,omitempty"`
+	ChangeRevisions        []uint64 `json:"change_revisions,omitempty"`
+	ScopeVersion           int      `json:"scope_version,omitempty"`
+	EntryIDs               []uint   `json:"entry_ids,omitempty"`
+	RecognitionIDs         []uint   `json:"recognition_ids,omitempty"`
+	SourceAssetIDs         []uint   `json:"source_asset_ids,omitempty"`
 	LibraryID              uint     `json:"library_id"`
 	Generation             uint64   `json:"generation"`
 	StorageID              uint     `json:"storage_id"`
@@ -52,6 +58,7 @@ type mediaArtifactPolicy struct {
 	CleanupEligible        bool     `json:"cleanup_eligible,omitempty"`
 	RefreshSerial          int64    `json:"refresh_serial,omitempty"`
 	CatalogBindingID       string   `json:"catalog_binding_id,omitempty"`
+	CatalogScopeMode       string   `json:"catalog_scope_mode,omitempty"`
 }
 
 type mediaArtifactJobPayload struct {
@@ -78,6 +85,7 @@ type MediaArtifactService struct {
 	changes      *MediaChangeService
 	log          zerolog.Logger
 	catalogStore *CatalogSnapshotStore
+	localSlots   chan struct{}
 }
 
 func (s *MediaArtifactService) SetCatalogSnapshotStore(store *CatalogSnapshotStore) {
@@ -85,7 +93,7 @@ func (s *MediaArtifactService) SetCatalogSnapshotStore(store *CatalogSnapshotSto
 }
 
 func NewMediaArtifactService(db *gorm.DB, queue *QueueService, signedProxy *SignedProxyService, log zerolog.Logger) *MediaArtifactService {
-	return &MediaArtifactService{db: db, queue: queue, signedProxy: signedProxy, log: log}
+	return &MediaArtifactService{db: db, queue: queue, signedProxy: signedProxy, log: log, localSlots: make(chan struct{}, 8)}
 }
 
 func (s *MediaArtifactService) SetMetadataSettingsService(metadata *MetadataSettingsService) {
@@ -175,14 +183,23 @@ func (s *MediaArtifactService) scheduleGeneration(libraryID uint, generation uin
 	if err := s.bindScheduledArtifactPolicy(&policy); err != nil {
 		return err
 	}
+	if err := s.freezeLegacyArtifactScope(&policy); err != nil {
+		return err
+	}
 	policyJSON, err := json.Marshal(policy)
 	if err != nil {
 		return err
 	}
 	now := time.Now().UTC()
-	run := models.MediaArtifactRun{ID: uuid.NewString(), LibraryID: library.ID, Generation: generation, PolicyJSON: string(policyJSON), Status: models.MediaArtifactStatusQueued, CleanupStatus: models.MediaArtifactCleanupPending, CreatedAt: now, UpdatedAt: now}
+	run := models.MediaArtifactRun{ID: uuid.NewString(), LibraryID: library.ID, Generation: generation, CatalogBindingID: policy.CatalogBindingID, PolicyJSON: string(policyJSON), Status: models.MediaArtifactStatusQueued, CleanupStatus: models.MediaArtifactCleanupPending, CreatedAt: now, UpdatedAt: now}
 	var existing models.MediaArtifactRun
-	lookupErr := s.db.Where("library_id = ? AND generation = ?", library.ID, generation).First(&existing).Error
+	lookup := s.db.Where("library_id = ? AND generation = ?", library.ID, generation)
+	if policy.CatalogBindingID != "" {
+		lookup = s.db.Where("library_id = ? AND catalog_binding_id = ?", library.ID, policy.CatalogBindingID)
+	} else {
+		lookup = legacyArtifactRunScopeQuery(lookup.Where("catalog_binding_id = ''"), policy)
+	}
+	lookupErr := lookup.First(&existing).Error
 	if lookupErr != nil && !errors.Is(lookupErr, gorm.ErrRecordNotFound) {
 		return lookupErr
 	}
@@ -198,7 +215,13 @@ func (s *MediaArtifactService) scheduleGeneration(libraryID uint, generation uin
 			return catalogPhysicalUnsettledError()
 		}
 		if existing.JobID != nil && artifactPoliciesEquivalent(existing.PolicyJSON, policy) && existing.Status != models.MediaArtifactStatusCompleted && !refresh {
-			return nil
+			var active int64
+			if err := s.db.Model(&models.Job{}).Where("id = ? AND status IN ?", *existing.JobID, activeJobStatuses()).Count(&active).Error; err != nil {
+				return err
+			}
+			if active > 0 {
+				return nil
+			}
 		}
 	}
 	_, err = s.queue.EnqueueLatestWith(EnqueueJobInput{System: true, JobType: JobTypeMediaArtifact, Priority: 100, DisplayName: fmt.Sprintf("媒体产物 · 媒体库 %d", library.ID), Provider: "media_library", ResourceKey: mediaArtifactResourceKey(library.ID), CoalescingKey: "run:" + run.ID, Payload: mediaArtifactJobPayload{ArtifactRunID: run.ID}}, func(tx *gorm.DB, job models.Job) error {
@@ -207,7 +230,13 @@ func (s *MediaArtifactService) scheduleGeneration(libraryID uint, generation uin
 		}
 		var current models.MediaArtifactRun
 		var admitted *models.CatalogPhysicalWrite
-		currentErr := tx.Where("library_id = ? AND generation = ?", library.ID, generation).First(&current).Error
+		currentQuery := tx.Where("library_id = ? AND generation = ?", library.ID, generation)
+		if policy.CatalogBindingID != "" {
+			currentQuery = tx.Where("library_id = ? AND catalog_binding_id = ?", library.ID, policy.CatalogBindingID)
+		} else {
+			currentQuery = legacyArtifactRunScopeQuery(currentQuery.Where("catalog_binding_id = ''"), policy)
+		}
+		currentErr := currentQuery.First(&current).Error
 		if currentErr == nil {
 			if lookupErr != nil || current.ID != existing.ID || current.PolicyJSON != existing.PolicyJSON || current.Status == models.MediaArtifactStatusRunning {
 				return catalogPhysicalUnsettledError()
@@ -259,7 +288,7 @@ func (s *MediaArtifactService) scheduleGeneration(libraryID uint, generation uin
 				if err := tx.Model(&existing).Update("job_id", job.ID).Error; err != nil {
 					return err
 				}
-				if refresh || (policy.CatalogBindingID != "" && existing.PolicyJSON != string(policyJSON)) {
+				if refresh || existing.PolicyJSON != string(policyJSON) {
 					updates := map[string]any{"policy_json": string(policyJSON), "updated_at": now}
 					if existing.Status != models.MediaArtifactStatusRunning {
 						updates["status"] = models.MediaArtifactStatusQueued
@@ -281,7 +310,7 @@ func (s *MediaArtifactService) scheduleGeneration(libraryID uint, generation uin
 					if err := tx.Model(&existing).Updates(updates).Error; err != nil {
 						return err
 					}
-					return tx.Model(&models.MediaLibrary{}).Where("id = ?", library.ID).Updates(map[string]any{"artifact_generation": generation, "artifact_status": models.MediaArtifactStatusQueued, "artifact_error": "", "artifact_updated_at": now}).Error
+					return artifactScheduledLibraryQuery(tx, policy).Updates(map[string]any{"artifact_generation": generation, "artifact_status": models.MediaArtifactStatusQueued, "artifact_error": "", "artifact_updated_at": now}).Error
 				}
 				return nil
 			}
@@ -291,10 +320,12 @@ func (s *MediaArtifactService) scheduleGeneration(libraryID uint, generation uin
 			return update(tx)
 		}
 		run.JobID = &job.ID
-		if err := RegisterCatalogPhysicalOwnerTx(tx, CatalogPhysicalWriteInput{LibraryID: library.ID, OwnerKind: CatalogPhysicalArtifact, OwnerID: run.ID}, func(tx *gorm.DB) error { return tx.Create(&run).Error }); err != nil {
+		if err := RegisterCatalogPhysicalOwnerTx(tx, CatalogPhysicalWriteInput{LibraryID: library.ID, OwnerKind: CatalogPhysicalArtifact, OwnerID: run.ID}, func(tx *gorm.DB) error {
+			return tx.Create(&run).Error
+		}); err != nil {
 			return err
 		}
-		return tx.Model(&models.MediaLibrary{}).Where("id = ?", library.ID).Updates(map[string]any{"artifact_generation": generation, "artifact_status": models.MediaArtifactStatusQueued, "artifact_error": "", "artifact_updated_at": now}).Error
+		return artifactScheduledLibraryQuery(tx, policy).Updates(map[string]any{"artifact_generation": generation, "artifact_status": models.MediaArtifactStatusQueued, "artifact_error": "", "artifact_updated_at": now}).Error
 	})
 	return err
 }
@@ -405,7 +436,7 @@ func (w *MediaArtifactWorker) Run(ctx context.Context, runtime JobRuntime, job C
 		if result.Error != nil {
 			return result.Error
 		}
-		if result.RowsAffected != 1 {
+		if result.RowsAffected != 1 && policy.ScopeVersion != 1 {
 			return errors.New("artifact generation changed before start")
 		}
 		return nil
@@ -467,6 +498,9 @@ func (s *MediaArtifactService) loadRun(runID string) (models.MediaArtifactRun, m
 	if err := json.Unmarshal([]byte(run.PolicyJSON), &policy); err != nil || policy.LibraryID != run.LibraryID || policy.Generation != run.Generation || (!policy.STRMEnabled && !policy.Metadata) || (policy.TargetKind != models.MediaArtifactTargetLocalAdjacent && policy.TargetKind != models.MediaArtifactTargetLocalProjection) {
 		return models.MediaArtifactRun{}, mediaArtifactPolicy{}, errors.New("artifact policy is invalid")
 	}
+	if artifactRequiresBoundedScope(policy) && policy.CatalogBindingID == "" && policy.ScopeVersion != 1 {
+		return models.MediaArtifactRun{}, mediaArtifactPolicy{}, errors.New("artifact batch scope is missing; obsolete task must be deleted")
+	}
 	return run, policy, nil
 }
 
@@ -477,11 +511,17 @@ func (s *MediaArtifactService) generateArtifacts(ctx context.Context, runtime Jo
 		return WorkerResult{ErrorCode: "artifact_projection_unavailable", ErrorMessage: "媒体产物目录不可用"}
 	}
 	var existingArtifacts []models.MediaArtifact
-	if err := s.db.Where("library_id = ? AND target_kind = ?", run.LibraryID, policy.TargetKind).Find(&existingArtifacts).Error; err != nil {
+	if err := func() error {
+		if policy.ScopeVersion == 1 {
+			return nil
+		}
+		return s.db.Where("library_id = ? AND target_kind = ?", run.LibraryID, policy.TargetKind).Find(&existingArtifacts).Error
+	}(); err != nil {
 		_ = s.failRun(run.ID, "artifact_manifest_unavailable")
 		return WorkerResult{ErrorCode: "artifact_manifest_unavailable", ErrorMessage: "媒体产物清单不可用"}
 	}
 	manifest := newArtifactManifestIndex(len(existingArtifacts))
+	manifest.lazy = policy.ScopeVersion == 1
 	manifest.physical = &artifactPhysicalExecution{ctx: ctx, permit: permit, policy: policy}
 	manifest.reserve = func(artifact *models.MediaArtifact) error {
 		return s.catalogArtifactWriteTx(ctx, func(tx *gorm.DB) error {
@@ -521,7 +561,11 @@ func (s *MediaArtifactService) generateArtifacts(ctx context.Context, runtime Jo
 		manifest.rows[artifactManifestKey(artifact.TargetKind, artifact.RelativePath)] = artifact
 	}
 	var entries []models.MediaLibraryEntry
-	if err := s.db.Where("library_id = ?", run.LibraryID).Order("relative_path").Find(&entries).Error; err != nil {
+	entryQuery := s.db.Where("library_id = ?", run.LibraryID)
+	if policy.ScopeVersion == 1 {
+		entryQuery = entryQuery.Where("id IN ?", policy.EntryIDs)
+	}
+	if err := entryQuery.Order("relative_path").Find(&entries).Error; err != nil {
 		_ = s.failRun(run.ID, "artifact_source_unavailable")
 		return WorkerResult{ErrorCode: "artifact_source_unavailable", ErrorMessage: "媒体源清单不可用"}
 	}
@@ -547,7 +591,9 @@ func (s *MediaArtifactService) generateArtifacts(ctx context.Context, runtime Jo
 	var recognitions []models.MediaLibraryRecognition
 	if policy.Metadata {
 		recognitionQuery := s.db.Where("library_id = ? AND status = ?", run.LibraryID, mediaRecognitionStatusMatched)
-		if !policy.ScanPartial {
+		if policy.ScopeVersion == 1 {
+			recognitionQuery = recognitionQuery.Where("id IN ?", policy.RecognitionIDs)
+		} else if !policy.ScanPartial {
 			recognitionQuery = recognitionQuery.Where("last_generation = ?", run.Generation)
 		}
 		if err := recognitionQuery.Order("id").Find(&recognitions).Error; err != nil {
@@ -558,13 +604,18 @@ func (s *MediaArtifactService) generateArtifacts(ctx context.Context, runtime Jo
 	var sourceAssets []models.MediaLibrarySourceAsset
 	if policy.STRMEnabled && policy.StorageType != models.StorageTypeLocal {
 		assetQuery := s.db.Where("library_id = ? AND active = ?", run.LibraryID, true)
-		if !policy.ScanPartial {
+		if policy.ScopeVersion == 1 {
+			assetQuery = assetQuery.Where("id IN ?", policy.SourceAssetIDs)
+		} else if !policy.ScanPartial {
 			assetQuery = assetQuery.Where("generation = ?", run.Generation)
 		}
 		if err := assetQuery.Order("relative_path").Find(&sourceAssets).Error; err != nil {
 			_ = s.failRun(run.ID, "artifact_source_assets_unavailable")
 			return WorkerResult{ErrorCode: "artifact_source_assets_unavailable", ErrorMessage: "源伴随文件清单不可用"}
 		}
+	}
+	if artifactFullAudit(policy) {
+		entries, recognitions, sourceAssets = s.filterLegacyFullArtifactWork(root, run, policy, entries, recognitions, sourceAssets, entriesByRecognition, manifest, activeVerifier)
 	}
 	videoCount := 0
 	if policy.STRMEnabled {
@@ -695,12 +746,14 @@ func (s *MediaArtifactService) generateArtifacts(ctx context.Context, runtime Jo
 			if err := tx.First(&current, run.LibraryID).Error; err != nil {
 				return err
 			}
-			if current.ArtifactGeneration != run.Generation || !artifactPolicyMatchesLibrary(policy, current) {
+			if !artifactPolicyMatchesLibrary(policy, current) {
 				superseded = true
 				return tx.Model(&models.MediaArtifactRun{}).Where("id = ?", run.ID).Updates(map[string]any{"status": models.MediaArtifactStatusSuperseded, "expected_count": run.ExpectedCount, "written_count": run.WrittenCount, "updated_count": run.UpdatedCount, "skipped_count": run.SkippedCount, "failed_count": run.FailedCount, "error_code": "", "cleanup_status": models.MediaArtifactCleanupSkipped, "cleanup_at": finished, "finished_at": finished, "updated_at": finished}).Error
 			}
-			if err := tx.Model(&models.MediaArtifact{}).Where("library_id = ? AND target_kind = ? AND run_id <> ? AND active = ?", run.LibraryID, policy.TargetKind, run.ID, true).Updates(map[string]any{"active": false, "updated_at": finished}).Error; err != nil {
-				return err
+			if policy.ScopeVersion != 1 {
+				if err := tx.Model(&models.MediaArtifact{}).Where("library_id = ? AND target_kind = ? AND run_id <> ? AND active = ?", run.LibraryID, policy.TargetKind, run.ID, true).Updates(map[string]any{"active": false, "updated_at": finished}).Error; err != nil {
+					return err
+				}
 			}
 			if err := tx.Model(&models.MediaArtifactRun{}).Where("id = ?", run.ID).Updates(map[string]any{"status": status, "expected_count": run.ExpectedCount, "written_count": run.WrittenCount, "updated_count": run.UpdatedCount, "skipped_count": run.SkippedCount, "failed_count": run.FailedCount, "error_code": code, "cleanup_status": models.MediaArtifactCleanupPending, "cleanup_error_code": "", "cleanup_at": nil, "finished_at": finished, "updated_at": finished}).Error; err != nil {
 				return err
@@ -709,7 +762,7 @@ func (s *MediaArtifactService) generateArtifacts(ctx context.Context, runtime Jo
 			if result.Error != nil {
 				return result.Error
 			}
-			if result.RowsAffected != 1 {
+			if result.RowsAffected != 1 && policy.ScopeVersion != 1 {
 				return errors.New("artifact generation changed during completion")
 			}
 			return nil
@@ -756,7 +809,7 @@ func (s *MediaArtifactService) finishArtifactGeneration(ctx context.Context, cla
 	}); err != nil {
 		return WorkerResult{ErrorCode: "artifact_write_settlement_failed", ErrorMessage: "媒体产物文件操作完成确认失败，保留恢复记录"}
 	}
-	if policy.ScanPartial {
+	if policy.ScanPartial && policy.ScopeVersion != 1 {
 		return WorkerResult{}
 	}
 	return s.publishGenerationReady(run.LibraryID, run.Generation, policy)
@@ -776,7 +829,7 @@ func (s *MediaArtifactService) publishGenerationReady(libraryID uint, generation
 	if s.changes == nil {
 		return WorkerResult{}
 	}
-	if policy.ScanPartial {
+	if policy.ScanPartial && policy.ScopeVersion != 1 {
 		return WorkerResult{}
 	}
 	var readied []models.MediaLibraryChange
@@ -785,7 +838,15 @@ func (s *MediaArtifactService) publishGenerationReady(libraryID uint, generation
 		if err := tx.First(&library, libraryID).Error; err != nil {
 			return err
 		}
-		if library.ArtifactGeneration != generation || library.ArtifactAppliedGeneration != generation || library.ArtifactStatus != models.MediaArtifactStatusCompleted {
+		if policy.ScopeVersion == 1 {
+			var completed models.MediaArtifactRun
+			if err := legacyArtifactRunScopeQuery(tx.Where("library_id = ? AND generation = ? AND status = ?", libraryID, generation, models.MediaArtifactStatusCompleted), policy).First(&completed).Error; err != nil {
+				return err
+			}
+			if !artifactPolicyMatchesLibrary(policy, library) {
+				return ErrCatalogFence
+			}
+		} else if library.ArtifactGeneration != generation || library.ArtifactAppliedGeneration != generation || library.ArtifactStatus != models.MediaArtifactStatusCompleted {
 			return ErrCatalogFence
 		}
 		if policy.CatalogBindingID != "" {
@@ -801,7 +862,11 @@ func (s *MediaArtifactService) publishGenerationReady(libraryID uint, generation
 			}
 		}
 		var err error
-		readied, err = s.changes.MarkGenerationReadyTx(tx, libraryID, generation)
+		if policy.ScopeVersion == 1 {
+			readied, err = s.markBatchChangesReadyTx(tx, policy)
+		} else {
+			readied, err = s.changes.MarkGenerationReadyTx(tx, libraryID, generation)
+		}
 		return err
 	}); err != nil {
 		if errors.Is(err, ErrCatalogFence) {
@@ -816,7 +881,7 @@ func (s *MediaArtifactService) publishGenerationReady(libraryID uint, generation
 }
 
 func artifactPolicyMatchesLibrary(policy mediaArtifactPolicy, library models.MediaLibrary) bool {
-	if library.StorageID != policy.StorageID || library.ArtifactGeneration != policy.Generation {
+	if library.StorageID != policy.StorageID || (policy.ScopeVersion != 1 && library.ArtifactGeneration != policy.Generation) {
 		return false
 	}
 	switch policy.TargetKind {
@@ -858,6 +923,15 @@ func (s *MediaArtifactService) artifactPolicySuperseded(policy mediaArtifactPoli
 	var current models.MediaLibrary
 	if err := s.db.First(&current, policy.LibraryID).Error; err != nil {
 		return false, err
+	}
+	if policy.ScopeVersion == 1 {
+		fingerprint, err := artifactBatchSourceFingerprint(s.db, current)
+		if err != nil {
+			return false, err
+		}
+		if fingerprint != policy.BatchSourceFingerprint {
+			return true, nil
+		}
 	}
 	return !artifactPolicyMatchesLibrary(policy, current), nil
 }
@@ -968,7 +1042,7 @@ func (s *MediaArtifactService) writeSourceAsset(ctx context.Context, root string
 	if relative == "." || relative == ".." || strings.HasPrefix(relative, "../") || !strings.EqualFold(filepath.Ext(relative), extension) {
 		return "", errors.New("source asset path is invalid")
 	}
-	return s.writeLocalArtifact(root, run, localArtifactSpec{SourceIdentity: fmt.Sprintf("asset:%d", asset.ID), ProviderItemID: asset.ProviderID, Kind: kind, TargetKind: models.MediaArtifactTargetLocalProjection, RelativePath: "/" + relative, Manifest: manifest, Content: func(models.MediaArtifact) ([]byte, error) { return body, nil }})
+	return s.writeLocalArtifact(root, run, localArtifactSpec{SourceFingerprint: artifactAssetSourceFingerprint(asset), SourceIdentity: fmt.Sprintf("asset:%d", asset.ID), ProviderItemID: asset.ProviderID, Kind: kind, TargetKind: models.MediaArtifactTargetLocalProjection, RelativePath: "/" + relative, Manifest: manifest, Content: func(models.MediaArtifact) ([]byte, error) { return body, nil }})
 }
 
 func (s *MediaArtifactService) writeNFO(ctx context.Context, root string, run models.MediaArtifactRun, targetKind string, recognition models.MediaLibraryRecognition, entries []models.MediaLibraryEntry, manifest *artifactManifestIndex) (string, error) {
@@ -1169,14 +1243,15 @@ type localArtifactRender struct {
 }
 
 type localArtifactSpec struct {
-	SourceIdentity string
-	ProviderItemID string
-	Kind           string
-	TargetKind     string
-	RelativePath   string
-	Manifest       *artifactManifestIndex
-	Content        func(models.MediaArtifact) ([]byte, error)
-	Render         func(models.MediaArtifact, string) (localArtifactRender, error)
+	SourceFingerprint string
+	SourceIdentity    string
+	ProviderItemID    string
+	Kind              string
+	TargetKind        string
+	RelativePath      string
+	Manifest          *artifactManifestIndex
+	Content           func(models.MediaArtifact) ([]byte, error)
+	Render            func(models.MediaArtifact, string) (localArtifactRender, error)
 }
 
 func (s *MediaArtifactService) writeLocalArtifact(root string, run models.MediaArtifactRun, spec localArtifactSpec) (string, error) {
@@ -1219,6 +1294,7 @@ func (s *MediaArtifactService) writeLocalArtifact(root string, run models.MediaA
 		return "", errors.New("managed artifact cleanup is in progress")
 	}
 	beforeArtifact := artifact
+	artifact.SourceFingerprint = spec.SourceFingerprint
 	artifact.RunID, artifact.SourceIdentity, artifact.ProviderItemID, artifact.Kind, artifact.Active = run.ID, spec.SourceIdentity, spec.ProviderItemID, spec.Kind, true
 	if spec.Manifest != nil {
 		artifact.CatalogBindingID = spec.Manifest.catalogBindingID
@@ -1250,7 +1326,14 @@ func (s *MediaArtifactService) writeLocalArtifact(root string, run models.MediaA
 	}
 	fingerprintHex := hex.EncodeToString(fingerprint[:])
 	artifact.ContentExpiresAt, artifact.ContentFormatVersion = render.ContentExpiresAt, render.ContentFormatVersion
-	if exists && (render.PreserveExisting || artifact.ContentFingerprint == fingerprintHex) {
+	// A manifest fingerprint alone is not proof that the managed file is still
+	// healthy. Full reconciliation deliberately reaches this writer after it
+	// detects damaged bytes; short-circuiting on the database value would leave
+	// the corruption in place forever. PreserveExisting is already backed by the
+	// renderer's format/signature inspection (STRM), while ordinary content must
+	// still match the on-disk digest.
+	contentAlreadyPresent := render.PreserveExisting || (artifact.ContentFingerprint == fingerprintHex && artifactFileMatches(root, artifact))
+	if exists && contentAlreadyPresent {
 		if info, err := os.Stat(target); err == nil && !info.IsDir() {
 			artifact.ContentFingerprint = fingerprintHex
 			artifact.Status, artifact.ErrorCode, artifact.UpdatedAt = models.MediaArtifactStatusCompleted, "", time.Now().UTC()

@@ -25,6 +25,18 @@ class VersionTests(unittest.TestCase):
 
 
 class WorkflowTests(unittest.TestCase):
+    def test_detects_missing_server_arm64_checksum_or_upload(self) -> None:
+        source = guard.DEFAULT_WORKFLOW.read_text(encoding="utf-8")
+        for value in (
+            'sha256sum "$windows_asset" "$linux_asset" "$linux_arm64_asset"',
+            '"$LINUX_ARM64_ASSET"',
+            'CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -tags webui',
+        ):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "workflow.yml"
+                path.write_text(source.replace(value, ""), encoding="utf-8")
+                self.assertIn("server arm64 archive is built and published", guard.verify_workflow(path))
+
     def test_repository_workflow_obeys_server_only_contract(self) -> None:
         self.assertEqual(guard.verify_workflow(), [])
 
@@ -61,6 +73,25 @@ class WorkflowTests(unittest.TestCase):
             path = Path(directory) / "workflow.yml"
             path.write_text(source, encoding="utf-8")
             self.assertIn("standalone timezone database is enforced", guard.verify_workflow(path))
+
+    def test_detects_unsigned_or_incomplete_node_release(self) -> None:
+        source = guard.DEFAULT_WORKFLOW.read_text(encoding="utf-8")
+        source = source.replace(
+            "${{ secrets.OHMYCINE_NODE_MANIFEST_SIGNING_PRIVATE_KEY }}",
+            "",
+        )
+        source = source.replace(
+            'openssl dgst -sha256 -verify "$public_key"',
+            "true # signature verification removed",
+        )
+        source = source.replace("linux-arm64.tar.gz", "linux-amd64.tar.gz")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "workflow.yml"
+            path.write_text(source, encoding="utf-8")
+            failures = guard.verify_workflow(path)
+            self.assertIn("node signing secret is injected only for trust derivation and signing", failures)
+            self.assertIn("node manifest signature is verified before upload", failures)
+            self.assertIn("node platform archives are built", failures)
 
     def test_detects_missing_linker_build_identity(self) -> None:
         source = guard.DEFAULT_WORKFLOW.read_text(encoding="utf-8")

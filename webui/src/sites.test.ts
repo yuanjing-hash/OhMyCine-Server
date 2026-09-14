@@ -156,6 +156,11 @@ describe('PT discovery contracts', () => {
     expect(exploreView).toContain('lockedSiteID')
     expect(exploreView).toContain('当前处于单站搜索模式')
     expect(exploreView).toContain('void searchJSON(lockedSiteID.value)')
+		expect(sitesView).toContain("site.site_type === 'bt_resource'")
+		expect(sitesView).toContain('前往插件连接管理')
+		expect(sitesView).toContain('<template v-else>')
+		expect(exploreView).toContain('value="bt_resource"')
+		expect(exploreView).toContain('插件资源站')
   })
 
   it('presents shared recognition specifications without accepting a raw title or torrent URL', () => {

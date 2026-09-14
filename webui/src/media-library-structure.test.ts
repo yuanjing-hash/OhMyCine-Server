@@ -59,6 +59,9 @@ describe('cross-page conflict drafts', () => {
     expect(structureBulkConflictCodes('keep_recommended', 'path_mismatch')).toEqual([])
     expect(structureBulkConflictCodes('keep_recommended', 'duplicate_target')).toEqual(['duplicate_target'])
     expect(structureBulkConflictCodes('skip', 'catalog_duplicate_conflict')).toEqual(['catalog_duplicate_conflict'])
+    expect(structureBulkConflictCodes('skip', 'naming_mismatch')).toEqual(['naming_mismatch'])
+    expect(structureBulkConflictCodes('skip', 'location_mismatch')).toEqual(['location_mismatch'])
+    expect(structureBulkConflictCodes('skip', 'missing_season_episode')).toEqual([])
   })
 })
 

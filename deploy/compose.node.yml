@@ -1,0 +1,15 @@
+services:
+  node:
+    image: ghcr.io/yuanjing-hash/ohmycine-node:${OMC_IMAGE_TAG:-beta}
+    restart: unless-stopped
+    ports:
+      - "4433:4433"
+    environment:
+      OMC_NODE_ID: ${OMC_NODE_ID:?Set a unique node ID}
+      OMC_NODE_ENROLLMENT_TOKEN: ${OMC_NODE_ENROLLMENT_TOKEN:?Set a random enrollment token}
+      OMC_NODE_TRANSPORT: ${OMC_NODE_TRANSPORT:-https}
+    volumes:
+      - node-state:/var/lib/ohmycine-node
+    stop_grace_period: 60s
+volumes:
+  node-state:

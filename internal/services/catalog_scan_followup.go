@@ -36,8 +36,15 @@ func (s *MediaLibraryService) commitCatalogScanFollowupTx(tx *gorm.DB, p Catalog
 		return err
 	}
 	requiresArtifacts := mediaLibraryRequiresArtifacts(storage.Type, library, s.artifacts != nil)
-	generate := requiresArtifacts && mediaLibraryArtifactGenerationRequired(p.Run.Kind, p.Run, p.MetadataChanged)
-	if p.NoContentChange {
+	// Initial and explicit STRM full scans establish policy; scheduled provider
+	// full scans also perform a bidirectional health audit, while the binder
+	// itself skips unchanged cloud entries and only repairs local drift.
+	fullArtifactReconcile := !p.RecognitionOnly && (p.Run.Kind == "initial" || p.Run.Kind == "full" || p.Run.Kind == "strm_full_manual")
+	generate := requiresArtifacts && (fullArtifactReconcile || mediaLibraryArtifactGenerationRequired(p.Run.Kind, p.Run, p.MetadataChanged))
+	if p.ArtifactChanges.Empty() && !fullArtifactReconcile {
+		generate = false
+	}
+	if p.NoContentChange && !fullArtifactReconcile {
 		generate = false
 	}
 	// A metadata worker's final no-op must not create another binding for a
@@ -46,9 +53,22 @@ func (s *MediaLibraryService) commitCatalogScanFollowupTx(tx *gorm.DB, p Catalog
 		generate = false
 	}
 	artifactGeneration := max(p.Run.Generation, max(library.DirtyGeneration, library.ArtifactGeneration))
-	if generate {
-		if _, err := s.artifacts.BindCatalogGenerationTx(tx, library.ID, artifactGeneration); err != nil {
+	if generate && p.Run.Kind == "strm_full_manual" && p.NoContentChange {
+		artifactGeneration++
+		if err := tx.Model(&models.MediaLibrary{}).Where("id = ?", library.ID).Update("dirty_generation", artifactGeneration).Error; err != nil {
 			return err
+		}
+		library.DirtyGeneration = artifactGeneration
+	}
+	if generate {
+		var bindErr error
+		if fullArtifactReconcile {
+			_, bindErr = s.artifacts.BindCatalogGenerationTx(tx, library.ID, artifactGeneration)
+		} else {
+			_, bindErr = s.artifacts.BindCatalogGenerationChangesTx(tx, library.ID, artifactGeneration, p.ArtifactChanges)
+		}
+		if bindErr != nil {
+			return bindErr
 		}
 	}
 	if !p.NoContentChange {

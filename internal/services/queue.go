@@ -156,7 +156,7 @@ func (s *QueueService) enqueueWith(input EnqueueJobInput, after func(*gorm.DB, m
 				job.Generation++
 				job.Revision++
 				job.UpdatedAt = now
-				updates := map[string]any{"generation": job.Generation, "revision": job.Revision, "updated_at": now}
+				updates := map[string]any{"generation": job.Generation, "revision": job.Revision, "history_cleared_at": nil, "updated_at": now}
 				if updateCoalesced {
 					job.PayloadJSON = string(payload)
 					updates["payload_json"] = job.PayloadJSON
@@ -412,7 +412,7 @@ func (s *QueueService) List(actor Actor, filter JobListFilter) (JobPage, error) 
 
 func (s *QueueService) Get(actor Actor, id string) (JobDTO, error) {
 	var job models.Job
-	if err := s.db.First(&job, "id = ?", id).Error; err != nil {
+	if err := s.db.First(&job, "id = ? AND history_cleared_at IS NULL", id).Error; err != nil {
 		return JobDTO{}, queueNotFound(err)
 	}
 	if !s.canRead(actor, job.OwnerID) {
@@ -434,7 +434,7 @@ func (s *QueueService) Get(actor Actor, id string) (JobDTO, error) {
 
 func (s *QueueService) Attempts(actor Actor, id string) ([]models.JobAttempt, error) {
 	var job models.Job
-	if err := s.db.First(&job, "id = ?", id).Error; err != nil {
+	if err := s.db.First(&job, "id = ? AND history_cleared_at IS NULL", id).Error; err != nil {
 		return nil, queueNotFound(err)
 	}
 	if !s.canRead(actor, job.OwnerID) {
@@ -449,7 +449,7 @@ func (s *QueueService) Attempts(actor Actor, id string) ([]models.JobAttempt, er
 
 func (s *QueueService) Timeline(actor Actor, id string) ([]models.JobStatusEvent, error) {
 	var job models.Job
-	if err := s.db.First(&job, "id = ?", id).Error; err != nil {
+	if err := s.db.First(&job, "id = ? AND history_cleared_at IS NULL", id).Error; err != nil {
 		return nil, queueNotFound(err)
 	}
 	if !s.canRead(actor, job.OwnerID) {
@@ -656,14 +656,24 @@ func (s *QueueService) Control(actor Actor, id, action string, request RequestCo
 			updates["finished_at"] = nil
 			updates["last_error_code"] = ""
 			updates["last_error_message"] = ""
+			updates["failure_retry_count"] = 0
+			updates["history_cleared_at"] = nil
 		default:
 			return appError(CodeInvalidRequest, "未知任务操作", nil)
 		}
 		if err := tx.Model(&job).Updates(updates).Error; err != nil {
 			return err
 		}
+		if err := finalizeTerminalNoIOCatalogJobTx(tx, job.ID); err != nil {
+			return err
+		}
 		if action == "retry" && s.retryAccepted != nil {
 			if err := s.retryAccepted(tx, job, now); err != nil {
+				return err
+			}
+		}
+		if action == "retry" {
+			if err := restoreManagementHistoryForJobTx(tx, job.ID); err != nil {
 				return err
 			}
 		}
@@ -1245,13 +1255,37 @@ func (s *QueueService) finishLease(id, token, status, code, message string, next
 		if status == models.JobStatusRetryWait {
 			finished = nil
 		}
+		failureRetryCount := job.FailureRetryCount
+		if status == models.JobStatusRetryWait && retryWaitConsumesFailureBudget(code) {
+			var policy models.QueuePolicy
+			if err := tx.First(&policy, "job_type = ?", job.JobType).Error; err != nil {
+				return err
+			}
+			failureRetryCount++
+			maxAttempts := policy.MaxAttempts
+			if maxAttempts < 1 {
+				maxAttempts = 1
+			}
+			if failureRetryCount >= maxAttempts {
+				finalStatus = models.JobStatusFailed
+				finished = now
+				next = nil
+			}
+		}
 		if status == models.JobStatusCompleted && job.Generation > job.StartedGeneration {
 			finalStatus = models.JobStatusQueued
 			finished = nil
+			failureRetryCount = 0
 		}
-		updates := map[string]any{"status": finalStatus, "revision": job.Revision + 1, "last_error_code": code, "last_error_message": message, "next_attempt_at": next, "finished_at": finished, "updated_at": now}
+		updates := map[string]any{"status": finalStatus, "revision": job.Revision + 1, "failure_retry_count": failureRetryCount, "last_error_code": code, "last_error_message": message, "next_attempt_at": next, "finished_at": finished, "updated_at": now}
+		if finalStatus == models.JobStatusQueued {
+			updates["history_cleared_at"] = nil
+		}
 		releaseLease(updates)
 		if err := tx.Model(&job).Updates(updates).Error; err != nil {
+			return err
+		}
+		if err := finalizeTerminalNoIOCatalogJobTx(tx, job.ID); err != nil {
 			return err
 		}
 		if err := recordJobEvent(tx, id, "worker.finished", models.JobStatusRunning, finalStatus, nil, code, now); err != nil {
@@ -1269,6 +1303,18 @@ func (s *QueueService) finishLease(id, token, status, code, message string, next
 	return err
 }
 
+// Credential/readiness waits are blocked on user or external state rather than
+// repeated execution failure. They remain visible and resumable without using
+// the ordinary bounded failure budget. Empty-code retry_at is scheduled work.
+func retryWaitConsumesFailureBudget(code string) bool {
+	switch strings.TrimSpace(code) {
+	case "", "pan115_auth_expired", "pan115_cookie_invalid", "credentials_required", "media_library_not_ready":
+		return false
+	default:
+		return true
+	}
+}
+
 func (s *QueueService) acknowledgeInterruptTx(tx *gorm.DB, job models.Job, now time.Time) error {
 	updates := map[string]any{"status": job.InterruptStatus, "interrupt_status": "", "cancellation_asked": false, "revision": job.Revision + 1, "checkpoint_json": clearProviderControlOrigin(job.CheckpointJSON), "last_error_code": "", "last_error_message": "", "updated_at": now}
 	if job.InterruptStatus == models.JobStatusCancelled {
@@ -1276,6 +1322,9 @@ func (s *QueueService) acknowledgeInterruptTx(tx *gorm.DB, job models.Job, now t
 	}
 	releaseLease(updates)
 	if err := tx.Model(&job).Updates(updates).Error; err != nil {
+		return err
+	}
+	if err := finalizeTerminalNoIOCatalogJobTx(tx, job.ID); err != nil {
 		return err
 	}
 	if err := recordJobEvent(tx, job.ID, "worker.interrupted", models.JobStatusRunning, job.InterruptStatus, nil, "", now); err != nil {

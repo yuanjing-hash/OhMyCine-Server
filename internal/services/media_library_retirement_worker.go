@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"strings"
 	"time"
 
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
@@ -46,7 +45,7 @@ func (w *MediaLibraryRetirementWorker) Run(ctx context.Context, runtime JobRunti
 				}
 				return tx.Model(&models.MediaLibraryRetirement{}).Where("id=? AND phase<>?", row.ID, "completed").Updates(map[string]any{"last_error_code": "library_retirement_needs_attention", "updated_at": time.Now().UTC()}).Error
 			})
-			return WorkerResult{ErrorCode: "library_retirement_needs_attention", ErrorMessage: "媒体库索引移除暂停；文件和历史均保留，请检查任务后重试"}
+			return WorkerResult{ErrorCode: "library_retirement_needs_attention", ErrorMessage: "媒体库移除出现内部错误；文件未改动，当前进度和安全证据已保留"}
 		}
 		if done {
 			return WorkerResult{}
@@ -57,13 +56,11 @@ func (w *MediaLibraryRetirementWorker) Run(ctx context.Context, runtime JobRunti
 			}
 		}
 		if waiting {
-			timer := time.NewTimer(100 * time.Millisecond)
-			select {
-			case <-ctx.Done():
-				timer.Stop()
-				return WorkerResult{}
-			case <-timer.C:
-			}
+			// Waiting for another worker to leave its real external-I/O boundary is
+			// normal retirement progress. Yield the queue lease instead of occupying
+			// a worker or spending the bounded failure budget.
+			next := time.Now().UTC().Add(2 * time.Second)
+			return WorkerResult{RetryAt: &next}
 		}
 	}
 	return WorkerResult{}
@@ -90,14 +87,8 @@ func (w *MediaLibraryRetirementWorker) step(ctx context.Context, claim ClaimedJo
 		if library.Enabled {
 			return ErrCatalogFence
 		}
-		if row.Phase != "finalizing" {
-			var head models.CatalogHead
-			if err := tx.First(&head, "library_id=?", row.LibraryID).Error; err != nil {
-				return err
-			}
-			if head.SourceEpoch != row.SourceEpoch || head.SourceFingerprint != row.SourceFingerprint || head.ConfigFingerprint != row.ConfigFingerprint {
-				return ErrCatalogFence
-			}
+		if err := verifyLibraryRetirementHeadTx(tx, *row); err != nil {
+			return err
 		}
 		switch row.Phase {
 		case "queued":
@@ -125,7 +116,7 @@ func (w *MediaLibraryRetirementWorker) step(ctx context.Context, claim ClaimedJo
 			if err != nil {
 				return err
 			}
-			waiting = !complete && interrupt != ""
+			waiting = !complete
 			if complete {
 				row.Phase = "owners"
 			}
@@ -172,7 +163,14 @@ func (w *MediaLibraryRetirementWorker) step(ctx context.Context, claim ClaimedJo
 			}
 		case "derived", "anchors":
 			if row.Cursor >= len(libraryRetirementCleanup) {
-				row.Phase = "finalizing"
+				changed, err := cleanupLibraryRetirementJobsTx(tx, *row)
+				if err != nil {
+					return err
+				}
+				row.ProcessedRows += changed
+				if changed == 0 {
+					row.Phase = "finalizing"
+				}
 				break
 			}
 			item := libraryRetirementCleanup[row.Cursor]
@@ -201,7 +199,7 @@ func (w *MediaLibraryRetirementWorker) step(ctx context.Context, claim ClaimedJo
 			row.Phase = "completed"
 			row.CompletedAt = &now
 			done = true
-			if err := s.audit.Record(tx, nil, "media_library.retirement.complete", "media_library", uintID(row.LibraryID), "success", map[string]any{"job_id": row.JobID, "files_preserved": true, "history_preserved": true}, RequestContext{}); err != nil {
+			if err := s.audit.Record(tx, nil, "media_library.retirement.complete", "media_library", uintID(row.LibraryID), "success", map[string]any{"job_id": row.JobID, "files_preserved": true, "library_history_removed": true}, RequestContext{}); err != nil {
 				return err
 			}
 		default:
@@ -217,30 +215,60 @@ func (w *MediaLibraryRetirementWorker) step(ctx context.Context, claim ClaimedJo
 	} else {
 		err = s.db.WithContext(ctx).Transaction(write)
 	}
-	if err == nil && interrupt != "" && s.queue.interrupt != nil {
-		s.queue.interrupt(interrupt, "cancel")
+	if err == nil && interrupt != "" {
+		s.queue.interruptLocally([]string{interrupt})
 	}
 	return
 }
 
-// Only library-owned maintenance jobs are cancelled. Download / Transfer /
-// seeding histories and their providers are never controlled by retirement.
+// Zero source fences identify a retirement accepted before the library has
+// published its first baseline. It must stay headless for the entire cleanup; a newly appearing head
+// is a producer race and is never silently removed. Snapshot-backed retirements
+// keep their original exact head fence through finalization.
+func verifyLibraryRetirementHeadTx(tx *gorm.DB, row models.MediaLibraryRetirement) error {
+	var head models.CatalogHead
+	err := tx.First(&head, "library_id=?", row.LibraryID).Error
+	headless := row.SourceEpoch == 0 && row.SourceFingerprint == "" && row.ConfigFingerprint == ""
+	if headless {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		return ErrCatalogFence
+	}
+	if err != nil {
+		return err
+	}
+	if head.SourceEpoch != row.SourceEpoch || head.SourceFingerprint != row.SourceFingerprint || head.ConfigFingerprint != row.ConfigFingerprint {
+		return ErrCatalogFence
+	}
+	return nil
+}
+
+// Freeze only work with exact selected-library ownership. A Transfer is owned
+// by its one immutable target library and must be stopped and removed with that
+// library. Download and seeding work remain separate provider/source facts.
 func retirementLibraryJobs(tx *gorm.DB, libraryID uint) *gorm.DB {
-	return tx.Model(&models.Job{}).Where("job_type<>?", JobTypeMediaLibraryRetirement).Where(`resource_key IN ? OR id IN (SELECT job_id FROM media_artifact_runs WHERE library_id=?) OR id IN (SELECT job_id FROM catalog_snapshots WHERE library_id=?) OR id IN (SELECT job_id FROM media_library_structure_diagnoses WHERE library_id=?) OR id IN (SELECT job_id FROM media_library_structure_repairs WHERE library_id=?) OR id IN (SELECT job_id FROM media_reorganization_tasks WHERE library_id=?) OR id IN (SELECT job_id FROM media_server_refresh_runs WHERE target_id IN (SELECT id FROM media_server_refresh_targets WHERE library_id=?)) OR id IN (SELECT job_id FROM schedule_runs WHERE schedule_id IN (SELECT id FROM schedule_definitions WHERE target_type='media_library' AND target_id=CAST(? AS TEXT)))`, []string{mediaArtifactResourceKey(libraryID), strmReconcileResourceKey(libraryID), "structure-diagnosis-library:" + uintID(libraryID)}, libraryID, libraryID, libraryID, libraryID, libraryID, libraryID, libraryID)
+	return tx.Model(&models.Job{}).Where("job_type<>?", JobTypeMediaLibraryRetirement).Where(`resource_key IN ? OR id IN (SELECT job_id FROM catalog_physical_writes WHERE library_id=? AND job_id<>'') OR id IN (SELECT job_id FROM transfer_tasks WHERE library_id=?) OR id IN (SELECT job_id FROM media_artifact_runs WHERE library_id=?) OR id IN (SELECT job_id FROM catalog_snapshots WHERE library_id=?) OR id IN (SELECT job_id FROM media_library_structure_diagnoses WHERE library_id=?) OR id IN (SELECT job_id FROM media_library_structure_repairs WHERE library_id=?) OR id IN (SELECT job_id FROM media_reorganization_tasks WHERE library_id=?) OR id IN (SELECT job_id FROM media_server_refresh_runs WHERE target_id IN (SELECT id FROM media_server_refresh_targets WHERE library_id=?)) OR id IN (SELECT job_id FROM schedule_runs WHERE schedule_id IN (SELECT id FROM schedule_definitions WHERE target_type='media_library' AND target_id=CAST(? AS TEXT)))`, []string{mediaArtifactResourceKey(libraryID), strmReconcileResourceKey(libraryID), "structure-diagnosis-library:" + uintID(libraryID)}, libraryID, libraryID, libraryID, libraryID, libraryID, libraryID, libraryID, libraryID, libraryID)
 }
 func drainLibraryRetirementJobTx(tx *gorm.DB, row models.MediaLibraryRetirement) (bool, string, error) {
 	var job models.Job
-	err := retirementLibraryJobs(tx, row.LibraryID).Where("status IN ? OR lease_token_hash<>'' OR interrupt_status<>''", activeJobStatuses()).Order("id").First(&job).Error
+	err := tx.Table("jobs j").Select("j.*").
+		Joins("JOIN media_library_retirement_jobs r ON r.job_id=j.id").
+		Where("r.retirement_id=?", row.ID).
+		Where("j.status NOT IN ? OR j.finished_at IS NULL OR j.lease_token_hash<>'' OR j.lease_expires_at IS NOT NULL OR j.interrupt_status<>''", historyTerminalStatuses()).
+		Order("j.id").First(&job).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
-		return true, "", nil
+		var entered int
+		if err := tx.Raw("SELECT 1 FROM catalog_physical_writes WHERE library_id=? AND state='entered' LIMIT 1", row.LibraryID).Scan(&entered).Error; err != nil {
+			return false, "", err
+		}
+		return entered == 0, "", nil
 	}
 	if err != nil {
 		return false, "", err
-	}
-	switch job.JobType {
-	case JobTypeMediaLibraryRecognition, JobTypeMediaLibraryStructureDiagnosis, JobTypeMediaArtifact, JobTypeMediaReorganization, JobTypeMediaLibraryRepair, "strm_reconcile", "catalog_conversion", "catalog_compaction", JobTypeMediaServerRefresh, "unified_schedule":
-	default:
-		return false, "", appError(CodeConflict, "仍有需要恢复的媒体写入任务，请先处理任务", nil)
 	}
 	now := time.Now().UTC()
 	if job.Status == models.JobStatusRunning {
@@ -252,10 +280,15 @@ func drainLibraryRetirementJobTx(tx *gorm.DB, row models.MediaLibraryRetirement)
 		}
 		return false, job.ID, nil
 	}
-	if job.LeaseTokenHash != "" || job.InterruptStatus != "" {
-		return false, "", ErrCatalogFence
+	if job.LeaseTokenHash != "" {
+		return false, job.ID, nil
 	}
-	if err := tx.Model(&job).Updates(map[string]any{"status": models.JobStatusCancelled, "cancellation_asked": true, "finished_at": now, "revision": job.Revision + 1, "updated_at": now}).Error; err != nil {
+	if err := tx.Model(&job).Updates(map[string]any{
+		"status": models.JobStatusCancelled, "cancellation_asked": true,
+		"interrupt_status": "", "next_attempt_at": nil, "lease_expires_at": nil,
+		"heartbeat_at": nil, "finished_at": now, "revision": job.Revision + 1,
+		"updated_at": now,
+	}).Error; err != nil {
 		return false, "", err
 	}
 	return false, "", recordJobEvent(tx, job.ID, "library.retirement", job.Status, models.JobStatusCancelled, nil, "", now)
@@ -272,8 +305,10 @@ func requireRetiredJobTx(tx *gorm.DB, jobID string) error {
 	return nil
 }
 
-// One exact, verified reference per short transaction. Unknown owner types or
-// missing receipts fail closed; age alone never licenses reference deletion.
+// One reference per short transaction. Draining has already proved that every
+// frozen library-owned Job is terminal and that no external call remains in
+// entered state. Retirement intentionally discards this library's recovery
+// graph, so references do not need an owner-kind-specific recovery path.
 func releaseLibraryRetirementOwnerTx(tx *gorm.DB, row models.MediaLibraryRetirement) (bool, error) {
 	var ref models.CatalogSnapshotReference
 	err := tx.Table("catalog_snapshot_references r").Select("r.*").Joins("JOIN catalog_snapshots s ON s.id=r.snapshot_id").Where("s.library_id=?", row.LibraryID).Order("r.snapshot_id,r.owner_kind,r.owner_id").Take(&ref).Error
@@ -283,82 +318,5 @@ func releaseLibraryRetirementOwnerTx(tx *gorm.DB, row models.MediaLibraryRetirem
 	if err != nil {
 		return false, err
 	}
-	switch ref.OwnerKind {
-	case "artifact":
-		var binding models.CatalogArtifactBinding
-		if err := tx.First(&binding, "id=? AND library_id=?", ref.OwnerID, row.LibraryID).Error; err != nil {
-			return false, err
-		}
-		if err := tx.Model(&binding).Update("state", "superseded").Error; err != nil {
-			return false, err
-		}
-	case "reorganization":
-		var task models.MediaReorganizationTask
-		if err := tx.First(&task, "id=? AND library_id=?", ref.OwnerID, row.LibraryID).Error; err != nil {
-			return false, err
-		}
-		if err := requireRetiredJobTx(tx, task.JobID); err != nil {
-			return false, err
-		}
-		if task.Phase != "completed" {
-			if err := requireUnenteredRetirementOwnerTx(tx, row.LibraryID, CatalogPhysicalReorganization, task.ID); err != nil {
-				return false, err
-			}
-		}
-	case "repair":
-		var task models.MediaLibraryStructureRepair
-		if err := tx.First(&task, "id=? AND library_id=?", ref.OwnerID, row.LibraryID).Error; err != nil {
-			return false, err
-		}
-		if task.JobID != nil {
-			if err := requireRetiredJobTx(tx, *task.JobID); err != nil {
-				return false, err
-			}
-		}
-		if task.Phase != "completed" {
-			if err := requireUnenteredRetirementOwnerTx(tx, row.LibraryID, CatalogPhysicalRepair, task.ID); err != nil {
-				return false, err
-			}
-		}
-	case "compaction":
-		id, _, ok := strings.Cut(ref.OwnerID, ":")
-		if !ok {
-			return false, ErrCatalogInvalid
-		}
-		var candidate models.CatalogSnapshot
-		if err := tx.First(&candidate, "id=? AND library_id=?", id, row.LibraryID).Error; err != nil {
-			return false, err
-		}
-		if candidate.JobID != nil {
-			if err := requireRetiredJobTx(tx, *candidate.JobID); err != nil {
-				return false, err
-			}
-		}
-		if candidate.State != "published" && candidate.State != "abandoned" {
-			if err := tx.Model(&candidate).Update("state", "abandoned").Error; err != nil {
-				return false, err
-			}
-		}
-	case "diagnosis":
-		// Current production diagnoses do not retain refs. If an older build did,
-		// require its explicit same-library job receipt; never guess an owner.
-		var owner models.MediaLibraryStructureDiagnosis
-		if err := tx.First(&owner, "job_id=? AND library_id=?", ref.OwnerID, row.LibraryID).Error; err != nil {
-			return false, err
-		}
-		if err := requireRetiredJobTx(tx, owner.JobID); err != nil {
-			return false, err
-		}
-	default:
-		return false, ErrCatalogFence
-	}
 	return false, ReleaseCatalogReferenceTx(tx, ref.SnapshotID, ref.OwnerKind, ref.OwnerID)
-}
-
-func requireUnenteredRetirementOwnerTx(tx *gorm.DB, libraryID uint, kind, id string) error {
-	var proof models.CatalogPhysicalWrite
-	if err := tx.Where("library_id=? AND owner_kind=? AND owner_id=? AND state='admitted'", libraryID, kind, id).First(&proof).Error; err != nil {
-		return ErrCatalogFence
-	}
-	return nil
 }

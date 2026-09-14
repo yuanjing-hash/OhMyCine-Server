@@ -710,3 +710,18 @@ ports:
 | 插件系统使用 Go plugin 还是 WASM | 正式默认使用 WASM；PT 适配器内建，非 PT 站点通过 Server GitHub 插件仓库分发 |
 | Server 是否支持公开公网访问 | 支持，但文档强制建议 HTTPS + 反向代理 |
 | 配置完整同步是否默认开启 | 不默认开启，必须用户确认 |
+
+## 19. 公网传输 Node 安全边界
+
+- Node API 必须是公网可达 HTTPS，由主 Server 主动连接；配对后使用固定双端身份，
+  不开放任意命令、任意 URL 或任意路径读取。
+- Cookie、下载器密码和来源 URI 只存在于 Node 公钥密封、绑定
+  `node + task + operation + resource + expiry` 的短期授权中。Node 不能枚举 Server
+  凭据库，普通数据库投影、任务 DTO、日志和审计不得出现明文。
+- Operation key 与 plan digest 保证丢 ACK/重投不产生第二次离线下载或上传；Node、
+  下载器、来源、目标和一个最终媒体库从任务创建起冻结。
+- Range 导出使用不透明文件 token、固定 8 MiB 分块和 SHA-256。完成 checkpoint
+  仍需验证本地普通文件；缺失则重新拉取，内容变化则失败关闭。
+- 正式安装链由至少 RSA-3072 的离线私钥签 manifest，Server 和安装器只携带公钥。
+  Release 工作流分别在构建前派生信任根、签名时重新派生并比较；私钥不会通过
+  `$GITHUB_ENV`、构建参数或发布资产传播。开发构建没有信任根时不提供完整命令。

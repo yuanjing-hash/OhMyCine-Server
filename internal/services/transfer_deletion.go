@@ -985,7 +985,7 @@ func (s *TransferService) finalizeTransferDeletion(ctx context.Context, actor Ac
 				if err := tx.Model(&models.MediaLibrary{}).Where("id=?", b.library.ID).Update("dirty_generation", artifactGeneration).Error; err != nil {
 					return err
 				}
-				if _, err := s.artifacts.BindCatalogGenerationTx(tx, b.library.ID, artifactGeneration); err != nil {
+				if _, err := s.artifacts.BindCatalogGenerationChangesTx(tx, b.library.ID, artifactGeneration, b.catalog.ArtifactChanges); err != nil {
 					return err
 				}
 			}

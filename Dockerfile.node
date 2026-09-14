@@ -1,0 +1,32 @@
+# syntax=docker/dockerfile:1.7
+FROM --platform=$BUILDPLATFORM golang:1.23-bookworm AS build
+ARG TARGETOS
+ARG TARGETARCH
+ARG VERSION=dev
+ARG COMMIT=unknown
+ARG NODE_RELEASE_PUBLIC_KEY_B64=
+WORKDIR /src
+COPY go.mod go.sum ./
+COPY webui/go.mod webui/go.sum ./webui/
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldflags "-s -w -X=github.com/yuanjing-hash/OhMyCine-Server/internal/buildinfo.Version=${VERSION} -X=github.com/yuanjing-hash/OhMyCine-Server/internal/buildinfo.Commit=${COMMIT} -X=github.com/yuanjing-hash/OhMyCine-Server/internal/buildinfo.NodeReleasePublicKeyBase64=${NODE_RELEASE_PUBLIC_KEY_B64}" -o /out/ohmycine-node ./cmd/node
+
+FROM debian:bookworm-slim AS runtime
+COPY LICENSE /usr/share/doc/ohmycine-node/LICENSE
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates tzdata \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /var/lib/ohmycine-node/managed \
+    && chown -R 65532:65532 /var/lib/ohmycine-node
+ENV OMC_NODE_LISTEN=0.0.0.0:4433 OMC_NODE_DATA_DIR=/var/lib/ohmycine-node OMC_NODE_MANAGED_ROOT=/var/lib/ohmycine-node/managed
+VOLUME ["/var/lib/ohmycine-node"]
+EXPOSE 4433
+USER 65532:65532
+ENTRYPOINT ["/usr/local/bin/ohmycine-node"]
+
+FROM runtime AS release
+ARG TARGETARCH
+COPY --chmod=755 build/container-release/${TARGETARCH}/ohmycine-node /usr/local/bin/ohmycine-node
+
+FROM runtime AS local
+COPY --from=build /out/ohmycine-node /usr/local/bin/ohmycine-node

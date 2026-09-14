@@ -367,7 +367,7 @@ func TestCatalogScanFollowupArtifactUsesLatestLogicalGenerationAndDoesNotReviveC
 		t.Fatal(err)
 	}
 	if err := s.db.Transaction(func(tx *gorm.DB) error {
-		return s.commitCatalogScanFollowupTx(tx, CatalogScanPublication{Head: head, Run: run, MetadataChanged: true, RecognitionOnly: true})
+		return s.commitCatalogScanFollowupTx(tx, CatalogScanPublication{Head: head, Run: run, MetadataChanged: true, RecognitionOnly: true, ArtifactChanges: CatalogArtifactChangeSet{Recognitions: []uint{1}}})
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -404,5 +404,84 @@ func TestCatalogScanFollowupArtifactUsesLatestLogicalGenerationAndDoesNotReviveC
 	}
 	if after.Status != models.JobStatusCancelled || after.Generation != job.Generation {
 		t.Fatal("receipt replay revived artifact job")
+	}
+}
+
+func TestCatalogScanFollowupEmptyIncrementalChangeDoesNotCreateArtifactWork(t *testing.T) {
+	s, lib, _, _ := catalogFollowupFixture(t)
+	s.artifacts = NewMediaArtifactService(s.db, s.queue, nil, zerolog.Nop())
+	s.artifacts.SetCatalogSnapshotStore(s.catalogStore)
+	if err := s.db.Model(&lib).Update("metadata_artifacts_enabled", true).Error; err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	run := models.MediaLibraryScanRun{LibraryID: lib.ID, Generation: 1, Kind: "incremental", Status: "success", StartedAt: now, FinishedAt: &now}
+	if err := s.db.Create(&run).Error; err != nil {
+		t.Fatal(err)
+	}
+	var head models.CatalogHead
+	if err := s.db.First(&head, "library_id = ?", lib.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.Transaction(func(tx *gorm.DB) error {
+		return s.commitCatalogScanFollowupTx(tx, CatalogScanPublication{Head: head, Run: run, MetadataChanged: true})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var bindings, runs, jobs int64
+	if err := s.db.Model(&models.CatalogArtifactBinding{}).Count(&bindings).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.Model(&models.MediaArtifactRun{}).Count(&runs).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.Model(&models.Job{}).Where("job_type = ?", JobTypeMediaArtifact).Count(&jobs).Error; err != nil {
+		t.Fatal(err)
+	}
+	if bindings != 0 || runs != 0 || jobs != 0 {
+		t.Fatalf("empty incremental diff created artifact work: bindings=%d runs=%d jobs=%d", bindings, runs, jobs)
+	}
+	var followup models.CatalogScanFollowup
+	if err := s.db.First(&followup, "library_id = ?", lib.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if followup.ArtifactPending {
+		t.Fatalf("empty incremental diff retained artifact intent: %+v", followup)
+	}
+}
+
+func TestCatalogScanFollowupHealthyCompleteScanDoesNotCreateArtifactWork(t *testing.T) {
+	s, lib, _, _ := catalogFollowupFixture(t)
+	s.artifacts = NewMediaArtifactService(s.db, s.queue, nil, zerolog.Nop())
+	s.artifacts.SetCatalogSnapshotStore(s.catalogStore)
+	if err := s.db.Model(&lib).Update("metadata_artifacts_enabled", true).Error; err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	run := models.MediaLibraryScanRun{LibraryID: lib.ID, Generation: 1, Kind: "full", Status: "success", StartedAt: now, FinishedAt: &now}
+	if err := s.db.Create(&run).Error; err != nil {
+		t.Fatal(err)
+	}
+	var head models.CatalogHead
+	if err := s.db.First(&head, "library_id = ?", lib.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.Transaction(func(tx *gorm.DB) error {
+		return s.commitCatalogScanFollowupTx(tx, CatalogScanPublication{Head: head, Run: run, NoContentChange: true})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var bindings, runs, jobs int64
+	if err := s.db.Model(&models.CatalogArtifactBinding{}).Count(&bindings).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.Model(&models.MediaArtifactRun{}).Count(&runs).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.Model(&models.Job{}).Where("job_type = ?", JobTypeMediaArtifact).Count(&jobs).Error; err != nil {
+		t.Fatal(err)
+	}
+	if bindings != 0 || runs != 0 || jobs != 0 {
+		t.Fatalf("healthy complete scan created artifact work: bindings=%d runs=%d jobs=%d", bindings, runs, jobs)
 	}
 }

@@ -79,7 +79,7 @@ func libraryWaitReason(status string) *JobWaitReasonDTO {
 	case "credentials_required":
 		message = "连接凭据已失效，请在连接设置中更新凭据后继续"
 	case "busy":
-		message = "先前文件操作的结果仍待核验，正在等待安全恢复；不是等待运行名额"
+		message = "媒体库正在执行文件操作或自动核验其结果；无需手动确认，完成后任务会自动继续"
 	case "repairing":
 		message = "媒体库整理尚未完成，等待原整理任务完成或核验恢复"
 	case "repair_failed":

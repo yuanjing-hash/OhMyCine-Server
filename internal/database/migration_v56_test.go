@@ -48,7 +48,7 @@ func TestMigrationV56AddsRouteSnapshotsAndFreezesOneDefaultIngestLibrary(t *test
 		t.Fatal(err)
 	}
 	downloader := models.Downloader{ID: uuid.NewString(), OwnerID: owner.ID, Name: "115", NameNormalized: "v56-downloader-" + uuid.NewString(), Type: models.DownloaderTypePan115Offline, StorageID: &storage.ID, ProviderDirectoryID: "downloads", AutoListenLifeEvents: true, Enabled: true, CapabilitiesJSON: `{}`, CreatedAt: now, UpdatedAt: now}
-	if err := db.Create(&downloader).Error; err != nil {
+	if err := db.Omit("ExecutionLocation", "NodeID", "NodeName").Create(&downloader).Error; err != nil {
 		t.Fatal(err)
 	}
 	connectionB := models.Connection{Name: "115 B", NameNormalized: "v56-115-b-" + uuid.NewString(), Provider: models.ConnectionProviderPan115, CredentialCiphertext: "encrypted", Enabled: true, Revision: 1, CreatedAt: now, UpdatedAt: now}
@@ -75,7 +75,7 @@ func TestMigrationV56AddsRouteSnapshotsAndFreezesOneDefaultIngestLibrary(t *test
 		{ID: "v56-same", OwnerID: ownerID, JobID: legacyJobs[0].ID, DownloaderID: &downloader.ID, DownloaderName: downloader.Name, ProviderType: models.DownloaderTypePan115Offline, SourceCiphertext: "encrypted", StagingStorageID: &storage.ID, TargetLibraryID: &libraryA.ID, TargetStorageID: &storage.ID, TargetStorageType: models.StorageTypePan115, TargetConnectionID: &connection.ID, DisplayName: "same", Phase: models.DownloadTaskStatusQueued, CreatedAt: now, UpdatedAt: now},
 		{ID: "v56-cross", OwnerID: ownerID, JobID: legacyJobs[1].ID, DownloaderID: &downloader.ID, DownloaderName: downloader.Name, ProviderType: models.DownloaderTypePan115Offline, SourceCiphertext: "encrypted", StagingStorageID: &storage.ID, TargetLibraryID: &libraryBConnection.ID, TargetStorageID: &storageB.ID, TargetStorageType: models.StorageTypePan115, TargetConnectionID: &connectionB.ID, DisplayName: "cross", Phase: models.DownloadTaskStatusQueued, CreatedAt: now, UpdatedAt: now},
 	}
-	if err := db.Omit("SourceDataSourceJSON", "TargetDataSourceJSON", "TransferRouteKind", "TransferRouteVersion").Create(&legacyTasks).Error; err != nil {
+	if err := db.Omit("SourceDataSourceJSON", "TargetDataSourceJSON", "TransferRouteKind", "TransferRouteVersion", "ExecutionLocation", "NodeID", "NodeName", "ProtocolVersion", "RoutePlanRevision", "RoutePlanDigest", "PluginResourceClaimID").Create(&legacyTasks).Error; err != nil {
 		t.Fatal(err)
 	}
 

@@ -156,6 +156,12 @@ func (s *SeedingService) SetStagingCleanup(cleanup func(context.Context, string,
 // removed without asking the provider to delete data. Copy/symlink continue
 // through durable seeding management.
 func (s *SeedingService) AfterTransfer(ctx context.Context, download models.DownloadTask) error {
+	if normalizeExecutionLocation(download.ExecutionLocation) == models.NodeLocationRemote {
+		// Node downloads are copied over the data plane even when the final local
+		// organization mode is move. The original bytes still back qB seeding and
+		// must remain on the Node until the ordinary seeding policy finishes.
+		return s.Enqueue(download)
+	}
 	if download.TransferMode != models.MediaLibraryTransferMove {
 		return s.Enqueue(download)
 	}
@@ -176,7 +182,7 @@ func (s *SeedingService) AfterTransfer(ctx context.Context, download models.Down
 	if !supported {
 		return nil
 	}
-	_, client, err := s.downloaders.client(*download.DownloaderID)
+	client, err := s.downloaders.clientForDownloadTask(ctx, download)
 	if err != nil {
 		return err
 	}
@@ -190,7 +196,8 @@ func (s *SeedingService) AfterTransfer(ctx context.Context, download models.Down
 // provider deletion is allowed only when the immutable transfer manifests prove
 // that no unselected video or unmatched subtitle needs conservative retention.
 func (s *SeedingService) Enqueue(download models.DownloadTask) error {
-	if download.TransferMode != models.MediaLibraryTransferCopy && download.TransferMode != models.MediaLibraryTransferSymlink {
+	remote := normalizeExecutionLocation(download.ExecutionLocation) == models.NodeLocationRemote
+	if !remote && download.TransferMode != models.MediaLibraryTransferCopy && download.TransferMode != models.MediaLibraryTransferSymlink {
 		return nil
 	}
 	if download.DownloaderID == nil || download.ProviderTaskID == "" {
@@ -213,8 +220,8 @@ func (s *SeedingService) Enqueue(download models.DownloadTask) error {
 		return err
 	}
 	now, id := time.Now().UTC(), uuid.NewString()
-	deleteData := download.TransferMode == models.MediaLibraryTransferCopy && s.transferAllowsWholePackageCleanup(download.ID)
-	record := models.SeedingTask{ID: id, OwnerID: download.OwnerID, DownloadTaskID: download.ID, DownloaderID: download.DownloaderID, DownloaderName: download.DownloaderName, ProviderType: download.ProviderType, ProviderTaskID: download.ProviderTaskID, TransferMode: download.TransferMode, DeleteData: deleteData, CleanupEnabled: download.SeedingCleanupEnabled, MinimumSeedMinutes: download.SeedingMinimumMinutes, MinimumRatio: download.SeedingMinimumRatio, CompletionMode: download.SeedingCompletionMode, Phase: models.SeedingTaskStatusQueued, CreatedAt: now, UpdatedAt: now}
+	deleteData := (remote || download.TransferMode == models.MediaLibraryTransferCopy) && s.transferAllowsWholePackageCleanup(download.ID)
+	record := models.SeedingTask{ID: id, OwnerID: download.OwnerID, DownloadTaskID: download.ID, ExecutionLocation: normalizeExecutionLocation(download.ExecutionLocation), NodeID: download.NodeID, NodeName: download.NodeName, DownloaderID: download.DownloaderID, DownloaderName: download.DownloaderName, ProviderType: download.ProviderType, ProviderTaskID: download.ProviderTaskID, TransferMode: download.TransferMode, DeleteData: deleteData, CleanupEnabled: download.SeedingCleanupEnabled, MinimumSeedMinutes: download.SeedingMinimumMinutes, MinimumRatio: download.SeedingMinimumRatio, CompletionMode: download.SeedingCompletionMode, Phase: models.SeedingTaskStatusQueued, CreatedAt: now, UpdatedAt: now}
 	_, err = s.queue.EnqueueWith(EnqueueJobInput{OwnerID: download.OwnerID, JobType: "seeding", DisplayName: "做种：" + download.DisplayName, Provider: download.ProviderType, ResourceKey: "downloader:" + *download.DownloaderID, Payload: seedingJobPayload{SeedingTaskID: id}}, func(tx *gorm.DB, job models.Job) error {
 		record.JobID = job.ID
 		return tx.Create(&record).Error
@@ -259,7 +266,7 @@ func (s *SeedingService) List(actor Actor, limit int) ([]SeedingTaskSummary, err
 	if limit > 200 {
 		limit = 200
 	}
-	query := s.db.Order("created_at DESC, id DESC").Limit(limit)
+	query := s.db.Where("history_cleared_at IS NULL").Order("created_at DESC, id DESC").Limit(limit)
 	if !actor.Can(authz.PermissionDownloadsReadAll) {
 		query = query.Where("owner_id = ?", actor.User.ID)
 	}
@@ -340,7 +347,11 @@ func (s *SeedingService) cleanupProvider(ctx context.Context, task *models.Seedi
 	if task.DownloaderID == nil {
 		return appError(CodeDownloaderUnavailable, "原下载器配置已不存在", nil)
 	}
-	_, client, err := s.downloaders.client(*task.DownloaderID)
+	var download models.DownloadTask
+	if err := s.db.First(&download, "id = ?", task.DownloadTaskID).Error; err != nil {
+		return err
+	}
+	client, err := s.downloaders.clientForDownloadTask(ctx, download)
 	if err != nil {
 		return err
 	}
@@ -430,7 +441,11 @@ func (w *SeedingWorker) Run(ctx context.Context, _ JobRuntime, job ClaimedJob) W
 	if task.DownloaderID == nil {
 		return w.fail(task, "seeding_downloader_missing", "原下载器配置已不存在")
 	}
-	_, client, err := w.service.downloaders.client(*task.DownloaderID)
+	var download models.DownloadTask
+	if err := w.service.db.First(&download, "id = ?", task.DownloadTaskID).Error; err != nil {
+		return w.fail(task, "seeding_download_missing", "原下载任务不存在")
+	}
+	client, err := w.service.downloaders.clientForDownloadTask(ctx, download)
 	if err != nil {
 		return w.retry(task, "seeding_downloader_unavailable", "暂时无法连接下载器")
 	}

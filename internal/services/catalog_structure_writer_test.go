@@ -178,7 +178,7 @@ func TestCatalogStructureRepairResumesBookkeepingWithoutFilesOrEarlyReady(t *tes
 	}
 }
 
-func TestCatalogStructureRepairPublishesOnlyAfterAllCheckpointItemsSucceed(t *testing.T) {
+func TestCatalogStructureRepairPublishesVerifiedSubsetAndFreshPlan(t *testing.T) {
 	s, repair, plan, entries, _ := catalogStructureRepairFixture(t)
 	plan.Items = []StructurePlanItem{
 		{Kind: "video", SourceRelative: entries[0].RelativePath, TargetRelative: "Show/Season 02/Show.S02E01.mkv", ProviderID: entries[0].ProviderID},
@@ -196,22 +196,46 @@ func TestCatalogStructureRepairPublishesOnlyAfterAllCheckpointItemsSucceed(t *te
 	if err := s.db.First(&before, "library_id = ?", repair.LibraryID).Error; err != nil {
 		t.Fatal(err)
 	}
-	backend := &checkpointStructureBackend{fail: map[string]bool{entries[1].RelativePath: true}}
+	backend := &catalogStructureResultBackend{fail: entries[1].RelativePath}
 	s.backends.Register(backend)
 	if result := s.runRepair(context.Background(), fastScanTestRuntime{}, repair.ID); result.ErrorCode != CodeMediaLibraryStructureApplyFailed || result.RetryAt != nil {
 		t.Fatalf("partial result=%+v", result)
 	}
 	var partial models.CatalogHead
-	if err := s.db.First(&partial, "library_id = ?", repair.LibraryID).Error; err != nil || partial.Revision != before.Revision {
+	if err := s.db.First(&partial, "library_id = ?", repair.LibraryID).Error; err != nil || partial.Revision <= before.Revision {
 		t.Fatalf("partial repair published catalog: before=%+v after=%+v err=%v", before, partial, err)
 	}
-	backend.fail = map[string]bool{}
+	assertPhysicalOwnerState(t, s.db, CatalogPhysicalRepair, repair.ID, "settled")
+	var rows []models.CatalogEntryFact
+	if err := s.catalogStore.Read(context.Background(), []uint{repair.LibraryID}, func(r *CatalogReader) error { return r.RawEntryFacts().Order("id").Find(&rows).Error }); err != nil {
+		t.Fatal(err)
+	}
+	if rows[0].RelativePath != "/"+plan.Items[0].TargetRelative || rows[1].RelativePath != entries[1].RelativePath {
+		t.Fatalf("partial facts=%+v", rows)
+	}
 	backend.calls = nil
+	facts, err := s.loadStructureCatalog(context.Background(), repair.LibraryID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan.catalogFence = facts.LogicalFence
+	plan.Items = plan.Items[1:]
+	raw, _ = json.Marshal(plan)
+	repair.ID, repair.PlanJSON, repair.StateJSON, repair.Phase, repair.TotalItems = uuid.NewString(), string(raw), "{}", "executing", 1
+	if err := s.structureCatalogWriteTx(context.Background(), func(tx *gorm.DB) error {
+		if err := s.freezeCatalogStructureRepairTx(tx, &repair, plan); err != nil {
+			return err
+		}
+		return tx.Create(&repair).Error
+	}); err != nil {
+		t.Fatal(err)
+	}
+	backend.fail = ""
 	if result := s.runRepair(context.Background(), fastScanTestRuntime{}, repair.ID); result.ErrorCode != "" {
-		t.Fatalf("retry result=%+v", result)
+		t.Fatalf("fresh result=%+v", result)
 	}
 	if !reflect.DeepEqual(backend.calls, []string{entries[1].RelativePath}) {
-		t.Fatalf("retry replayed a successful physical item: %v", backend.calls)
+		t.Fatalf("replayed success=%v", backend.calls)
 	}
 	var completed models.CatalogHead
 	if err := s.db.First(&completed, "library_id = ?", repair.LibraryID).Error; err != nil || completed.Revision <= before.Revision {

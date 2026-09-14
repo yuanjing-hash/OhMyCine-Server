@@ -76,7 +76,11 @@ func (s *MediaArtifactService) prepareArtifactPhysicalWrite(root string, before,
 	if err != nil {
 		return receipt, err
 	}
-	if observed.Exists && before.Status == models.MediaArtifactStatusCompleted && before.ContentFingerprint != "" && observed.Fingerprint != before.ContentFingerprint {
+	// Incremental work must fail closed if bytes changed outside the managed
+	// writer. A full scope exists specifically to audit and repair a damaged
+	// managed projection, so its receipt records the actually observed bytes as
+	// the rollback side while retaining the current manifest metadata.
+	if observed.Exists && before.Status == models.MediaArtifactStatusCompleted && before.ContentFingerprint != "" && observed.Fingerprint != before.ContentFingerprint && !artifactFullAudit(execution.policy) {
 		return receipt, ErrCatalogFence
 	}
 	hash := sha256.Sum256(content)

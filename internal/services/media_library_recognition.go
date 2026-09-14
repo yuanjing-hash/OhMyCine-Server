@@ -185,6 +185,18 @@ func (s *MediaLibraryService) recognizeLibraryUnitsWithExisting(ctx context.Cont
 			results[index] = mediaLibraryRecognizedUnit{Unit: unit, Result: result, Manual: true}
 			return nil
 		}
+		if verified, ok := transferBatchRecognition(workerCtx, unit); ok {
+			// A new episode must not replace already fetched show artwork and
+			// details with the compact download identity snapshot.
+			if record, exists := bySource[unit.SourceKey]; exists && sameOptional(record.TMDBID, verified.Result.TMDBID) && record.MediaType == verified.Result.MediaType {
+				if stored, decodeErr := recognitionResultFromStored(record, rules); decodeErr == nil {
+					verified.Result.Snapshot = stored.Snapshot
+					verified.Result.Metadata = stored.Metadata
+				}
+			}
+			results[index] = verified
+			return nil
+		}
 		cacheKey := mediaLibraryRecognitionCacheKey(unit, profile, library)
 		if cached, ok := s.loadRecognitionCache(workerCtx, cacheKey); ok {
 			results[index] = mediaLibraryRecognizedUnit{Unit: unit, Result: cached, CacheHit: true}

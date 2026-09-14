@@ -1,7 +1,7 @@
 import type { DownloadTaskSummary } from '@/types/api'
 
 export type DownloadSourceMode = 'url' | 'torrent' | 'share'
-export type DownloadManagementSection = 'active' | 'history' | 'create' | 'seeding' | 'downloaders'
+export type DownloadManagementSection = 'active' | 'history' | 'create' | 'seeding' | 'downloaders' | 'nodes'
 export interface DownloaderTaskStats { active: number; total: number; downloadSpeed: number | null; uploadSpeed: number | null; averageProgress: number | null }
 export interface DownloadRetryPresentationState { errorFingerprint: string; taskUpdatedAt: string; observedActive: boolean }
 export type DownloadRetryPresentations = Record<string, DownloadRetryPresentationState>
@@ -25,6 +25,15 @@ export function parseDownloadSourceLines(value: string, limit = 50): ParsedDownl
     sources.push(source)
   }
   return { sources, duplicateCount }
+}
+
+export function nodePan115UnsupportedSource(value: string): string {
+  for (const raw of value.split(/\r?\n/)) {
+    const source = raw.trim()
+    if (!source) continue
+    if (/^https?:\/\//i.test(source)) return source
+  }
+  return ''
 }
 
 export function formatBytes(value: number | null, suffix = ''): string {

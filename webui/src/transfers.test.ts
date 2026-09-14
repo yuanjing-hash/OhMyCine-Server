@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { canDeleteTransferRecord, formatTransferProgress, shouldRefreshTransferEvent, transferDeletionLabels, transferIdentityLabel, transferPhaseDescription, transferRouteLabel, transferStatusClass, transferStatusLabel, type TransferSummary } from '@/transfers'
+import { canDeleteTransferRecord, formatTransferProgress, remoteTransferPhaseLabel, shouldRefreshTransferEvent, transferDeletionLabels, transferExecutionLabel, transferIdentityLabel, transferPhaseDescription, transferRouteLabel, transferStatusClass, transferStatusLabel, type TransferSummary } from '@/transfers'
 
 const summary = { phase: 'planning', job_status: 'running', processed_files: 0, total_files: 2 } as TransferSummary
 
@@ -39,6 +39,14 @@ describe('media organization presentation', () => {
     expect(transferRouteLabel('same_source_provider')).toBe('同源云端')
     expect(transferRouteLabel('cross_source')).toBe('跨数据源暂存')
     expect(transferRouteLabel('')).toBe('旧任务路线未知')
+  })
+
+  it('shows the frozen Node and its latest remote stage', () => {
+    const remote = { ...summary, execution_location: 'node', node_name: '香港节点', remote_phase: 'uploading_target' } as TransferSummary
+    expect(transferExecutionLabel(remote)).toBe('传输节点 · 香港节点')
+    expect(remoteTransferPhaseLabel(remote)).toBe('节点上传目标网盘')
+    expect(remoteTransferPhaseLabel({ ...remote, remote_phase: '' })).toBe('节点等待调度')
+    expect(transferExecutionLabel({ ...summary, execution_location: 'server' } as TransferSummary)).toBe('主 Server')
   })
 
   it('refreshes only transfer or visible job events', () => {

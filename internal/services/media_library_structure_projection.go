@@ -78,12 +78,20 @@ func refreshStructureSummaryTx(tx *gorm.DB, libraryID uint, now time.Time) error
 		switch group.Code {
 		case "media_unrecognized":
 			classes.Unrecognized += group.Total
+		case "naming_mismatch":
+			classes.NamingMismatch += group.Total
+		case "location_mismatch":
+			classes.LocationMismatch += group.Total
 		case "invalid_path":
 			classes.InvalidPath += group.Total
 		case "template_unavailable":
 			classes.TemplateError += group.Total
-		case "duplicate_target", "recognition_suspect_conflict", "catalog_duplicate_conflict":
+		case "duplicate_target":
 			classes.DuplicateTarget += group.Total
+		case "recognition_suspect_conflict":
+			classes.RecognitionSuspectConflict += group.Total
+		case "catalog_duplicate_conflict":
+			classes.CatalogDuplicateConflict += group.Total
 		case "sidecar_target_conflict":
 			classes.SidecarConflict += group.Total
 		}
@@ -125,8 +133,10 @@ func refreshStructureSummaryTx(tx *gorm.DB, libraryID uint, now time.Time) error
 	if err := tx.Model(&models.MediaLibraryStructureDiagnosis{}).Where("library_id = ?", libraryID).Updates(map[string]any{
 		"status": status, "issue_count": total, "repairable_count": repairable,
 		"unrecognized_count": classes.Unrecognized, "missing_episode_count": 0,
+		"naming_mismatch_count": classes.NamingMismatch, "location_mismatch_count": classes.LocationMismatch,
 		"invalid_path_count": classes.InvalidPath, "template_error_count": classes.TemplateError,
 		"duplicate_target_count": classes.DuplicateTarget, "sidecar_conflict_count": classes.SidecarConflict,
+		"recognition_suspect_conflict_count": classes.RecognitionSuspectConflict, "catalog_duplicate_conflict_count": classes.CatalogDuplicateConflict,
 		"issues_json": string(raw), "last_error_code": "", "updated_at": now,
 	}).Error; err != nil {
 		return err

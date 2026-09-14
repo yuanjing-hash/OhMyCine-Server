@@ -24,15 +24,17 @@ type CatalogScanPublication struct {
 	NoContentChange    bool
 	PreserveGeneration bool
 	RecognitionOnly    bool
+	ArtifactChanges    CatalogArtifactChangeSet
 }
 
 type CatalogScanCommit func(*gorm.DB, CatalogScanPublication) error
 
 type catalogScanBaseline struct {
-	head         models.CatalogHead
-	entries      []models.MediaLibraryEntry
-	recognitions []models.MediaLibraryRecognition
-	assets       []models.MediaLibrarySourceAsset
+	head                  models.CatalogHead
+	entries               []models.MediaLibraryEntry
+	recognitions          []models.MediaLibraryRecognition
+	assets                []models.MediaLibrarySourceAsset
+	protectedRecognitions map[uint]bool
 }
 
 func (s *MediaLibraryService) catalogScanVersioned(ctx context.Context, libraryID uint) (bool, error) {
@@ -182,7 +184,7 @@ func catalogScanEntry(file medialibrary.File, record *models.MediaLibraryRecogni
 	return entry
 }
 
-func (s *MediaLibraryService) commitCatalogScan(ctx context.Context, candidate models.CatalogSnapshot, token string, library models.MediaLibrary, profile models.MediaClassificationProfile, run *models.MediaLibraryScanRun, metadataChanged bool, hook CatalogScanCommit) error {
+func (s *MediaLibraryService) commitCatalogScan(ctx context.Context, candidate models.CatalogSnapshot, token string, library models.MediaLibrary, profile models.MediaClassificationProfile, run *models.MediaLibraryScanRun, metadataChanged bool, artifactChanges CatalogArtifactChangeSet, hook CatalogScanCommit) error {
 	if hook == nil {
 		return ErrCatalogInvalid
 	}
@@ -200,7 +202,7 @@ func (s *MediaLibraryService) commitCatalogScan(ctx context.Context, candidate m
 			return err
 		}
 		candidate.State, candidate.PublishedRevision = "published", revision
-		return s.finishCatalogScanTx(tx, profile, run, CatalogScanPublication{Candidate: &candidate, Head: head, MetadataChanged: metadataChanged}, hook)
+		return s.finishCatalogScanTx(tx, profile, run, CatalogScanPublication{Candidate: &candidate, Head: head, MetadataChanged: metadataChanged, ArtifactChanges: artifactChanges}, hook)
 	})
 }
 
@@ -345,7 +347,13 @@ func (s *MediaLibraryService) publishCatalogScan(ctx context.Context, library mo
 		}); err != nil {
 			return run, err
 		}
-		baseline, err := s.loadCatalogScanBaseline(ctx, library.ID)
+		var baseline catalogScanBaseline
+		var err error
+		if input.Partial {
+			baseline, err = s.loadCatalogBatchBaseline(ctx, library.ID, input)
+		} else {
+			baseline, err = s.loadCatalogScanBaseline(ctx, library.ID)
+		}
 		if err != nil {
 			return run, err
 		}
@@ -353,12 +361,7 @@ func (s *MediaLibraryService) publishCatalogScan(ctx context.Context, library mo
 			return run, err
 		}
 		result := input
-		if result.Scoped {
-			result, err = mergeScopedPan115CatalogFacts(input, baseline.entries, baseline.assets)
-			if err != nil {
-				return run, err
-			}
-		}
+		result = catalogBatchPathReplacements(result, baseline)
 		units := stabilizeRecognitionUnits(medialibrary.GroupRecognitionUnits(result.Files), baseline.entries, baseline.recognitions)
 		var recognized []mediaLibraryRecognizedUnit
 		if !fast {
@@ -386,7 +389,7 @@ func (s *MediaLibraryService) publishCatalogScan(ctx context.Context, library mo
 		preparedRun.RecognitionTotal = 0
 		preparedRun.Discovered, preparedRun.Enumerated, preparedRun.Processed = len(result.Files), max(input.Enumerated, len(input.Files)+len(input.Assets)+input.Deduplicated), len(result.Files)+len(result.Assets)
 		preparedRun.Deduplicated, preparedRun.Partial = input.Deduplicated, result.Partial
-		facts, metadataChanged, err := s.prepareCatalogScanFacts(ctx, candidate, token, library, storage, profile, &preparedRun, result, baseline, units, recognized, fast)
+		facts, metadataChanged, artifactChanges, err := s.prepareCatalogScanFacts(ctx, candidate, token, library, storage, profile, &preparedRun, result, baseline, units, recognized, fast)
 		if err == nil && kind == "delta" && preparedRun.Persisted == 0 {
 			abandonCatalogScan(s.catalogStore, candidate.ID, token)
 			err = s.commitNoopCatalogScan(ctx, baseline.head, profile, &preparedRun, hook)
@@ -406,7 +409,7 @@ func (s *MediaLibraryService) publishCatalogScan(ctx context.Context, library mo
 		}
 		if err == nil {
 			operation.Event(s.log.Info()).Uint("library_id", library.ID).Uint("scan_run_id", run.ID).Str("phase", "publishing").Int("persisted", preparedRun.Persisted).Msg(operation.Message("目录候选验证完成，准备短事务切换"))
-			err = s.commitCatalogScan(ctx, candidate, token, library, profile, &preparedRun, metadataChanged, hook)
+			err = s.commitCatalogScan(ctx, candidate, token, library, profile, &preparedRun, metadataChanged, artifactChanges, hook)
 		}
 		if err == nil {
 			operation.Event(s.log.Info()).Uint("library_id", library.ID).Uint("scan_run_id", run.ID).Str("phase", preparedRun.Phase).Int("added", preparedRun.Added).Int("updated", preparedRun.Updated).Int("removed", preparedRun.Removed).Int("recognition_total", preparedRun.RecognitionTotal).Msg(operation.Message("新目录已原子发布，后续工作由持久记录接续"))
@@ -427,8 +430,9 @@ func (s *MediaLibraryService) catalogScanProgress(ctx context.Context, runID uin
 	})
 }
 
-func (s *MediaLibraryService) prepareCatalogScanFacts(ctx context.Context, candidate models.CatalogSnapshot, token string, library models.MediaLibrary, storage models.Storage, profile models.MediaClassificationProfile, run *models.MediaLibraryScanRun, result medialibrary.Result, baseline catalogScanBaseline, units []medialibrary.RecognitionUnit, recognized []mediaLibraryRecognizedUnit, fast bool) (CatalogFactBatch, bool, error) {
+func (s *MediaLibraryService) prepareCatalogScanFacts(ctx context.Context, candidate models.CatalogSnapshot, token string, library models.MediaLibrary, storage models.Storage, profile models.MediaClassificationProfile, run *models.MediaLibraryScanRun, result medialibrary.Result, baseline catalogScanBaseline, units []medialibrary.RecognitionUnit, recognized []mediaLibraryRecognizedUnit, fast bool) (CatalogFactBatch, bool, CatalogArtifactChangeSet, error) {
 	facts := CatalogFactBatch{}
+	artifactChanges := CatalogArtifactChangeSet{}
 	now := time.Now().UTC()
 	metadataChanged := false
 	bySource := make(map[string]models.MediaLibraryRecognition, len(baseline.recognitions))
@@ -470,14 +474,14 @@ func (s *MediaLibraryService) prepareCatalogScanFacts(ctx context.Context, candi
 		}
 		ids, err := s.resolveCatalogScanIDs(ctx, candidate, token, requests)
 		if err != nil {
-			return facts, false, err
+			return facts, false, artifactChanges, err
 		}
 		for index, item := range recognized {
 			record := bySource[item.Unit.SourceKey]
 			item.Result = preservePlayerEpisodeMetadata(item.Result, record.MetadataJSON, library.MetadataLanguage)
 			metadata, err := marshalRecognitionMetadata(item.Result)
 			if err != nil {
-				return facts, false, err
+				return facts, false, artifactChanges, err
 			}
 			if record.ID != 0 && mediaRecognitionProjectionChanged(record, item.Result, metadata, item.Manual) {
 				metadataChanged = true
@@ -518,12 +522,17 @@ func (s *MediaLibraryService) prepareCatalogScanFacts(ctx context.Context, candi
 	}
 	entryRows := make([]models.MediaLibraryEntry, 0, len(result.Files))
 	entryRecords := make([]*models.MediaLibraryRecognition, 0, len(result.Files))
+	entryChanged := make([]bool, 0, len(result.Files))
+	entryBeforeRecognition := make([]*uint, 0, len(result.Files))
 	requests := make([]CatalogIdentityRequest, 0, len(result.Files))
 	seenEntries := make(map[uint]bool)
 	survivingRecognitions := make(map[uint]bool)
+	for id := range baseline.protectedRecognitions {
+		survivingRecognitions[id] = true
+	}
 	for _, file := range result.Files {
 		if err := ctx.Err(); err != nil {
-			return facts, false, err
+			return facts, false, artifactChanges, err
 		}
 		old, exists := byPath[file.RelativePath]
 		// A stable remote provider identity outranks a recycled path. Otherwise
@@ -578,15 +587,30 @@ func (s *MediaLibraryService) prepareCatalogScanFacts(ctx context.Context, candi
 		}
 		entryRows = append(entryRows, entry)
 		entryRecords = append(entryRecords, record)
+		// STRM bytes follow the stable Entry identity, but an opaque provider
+		// rebind still has to update the managed manifest. Recognition identity
+		// changes also retire/rebind the exact old/new metadata families. Pure
+		// size/mtime changes intentionally remain outside the artifact workset.
+		entryChanged = append(entryChanged, !exists || old.RelativePath != entry.RelativePath || old.ProviderID != entry.ProviderID || !sameOptional(old.RecognitionID, entry.RecognitionID))
+		entryBeforeRecognition = append(entryBeforeRecognition, cloneUint(old.RecognitionID))
 		requests = append(requests, CatalogIdentityRequest{Kind: "entry", SourceKey: file.RelativePath, ExistingID: old.ID, ProviderID: file.ProviderID})
 	}
 	ids, err := s.resolveCatalogScanIDs(ctx, candidate, token, requests)
 	if err != nil {
-		return facts, false, err
+		return facts, false, artifactChanges, err
 	}
 	for i, entry := range entryRows {
 		entry.ID = ids[i]
 		facts.Entries = append(facts.Entries, CatalogEntryFromLegacy(entry, entryRecords[i]))
+		if entryChanged[i] {
+			artifactChanges.Entries = append(artifactChanges.Entries, entry.ID)
+			if entryBeforeRecognition[i] != nil {
+				artifactChanges.Recognitions = append(artifactChanges.Recognitions, *entryBeforeRecognition[i])
+			}
+			if entry.RecognitionID != nil {
+				artifactChanges.Recognitions = append(artifactChanges.Recognitions, *entry.RecognitionID)
+			}
+		}
 	}
 	for _, old := range baseline.entries {
 		if seenEntries[old.ID] {
@@ -599,6 +623,10 @@ func (s *MediaLibraryService) prepareCatalogScanFacts(ctx context.Context, candi
 				fact := models.CatalogEntryFact{MediaLibraryEntry: old, Tombstone: true}
 				facts.Entries = append(facts.Entries, fact)
 			}
+			artifactChanges.Entries = append(artifactChanges.Entries, old.ID)
+			if old.RecognitionID != nil {
+				artifactChanges.Recognitions = append(artifactChanges.Recognitions, *old.RecognitionID)
+			}
 		} else if old.RecognitionID != nil {
 			survivingRecognitions[*old.RecognitionID] = true
 		}
@@ -608,33 +636,41 @@ func (s *MediaLibraryService) prepareCatalogScanFacts(ctx context.Context, candi
 			continue
 		}
 		before := oldRecognitions[record.ID]
+		changed := before.ID == 0 || mediaLibraryRecognitionArtifactChanged(before, record)
 		before.LastGeneration, before.UpdatedAt = record.LastGeneration, record.UpdatedAt
 		if candidate.Kind == "base" || !reflect.DeepEqual(before, record) {
 			facts.Recognitions = append(facts.Recognitions, CatalogRecognitionFromLegacy(record))
 		}
+		if changed {
+			artifactChanges.Recognitions = append(artifactChanges.Recognitions, record.ID)
+		}
 	}
-	if candidate.Kind == "delta" && result.Scoped {
+	if (candidate.Kind == "base" && !result.Partial) || result.Scoped {
 		for _, record := range baseline.recognitions {
 			if !survivingRecognitions[record.ID] {
-				fact := CatalogRecognitionFromLegacy(record)
-				fact.Tombstone = true
-				facts.Recognitions = append(facts.Recognitions, fact)
+				if candidate.Kind == "delta" {
+					fact := CatalogRecognitionFromLegacy(record)
+					fact.Tombstone = true
+					facts.Recognitions = append(facts.Recognitions, fact)
+				}
+				artifactChanges.Recognitions = append(artifactChanges.Recognitions, record.ID)
 			}
 		}
 	}
-	assetFacts, err := s.prepareCatalogScanAssets(ctx, candidate, token, library, storage, run, result, baseline.assets, deleted, now)
+	assetFacts, assetChanges, err := s.prepareCatalogScanAssets(ctx, candidate, token, library, storage, run, result, baseline.assets, deleted, now)
 	if err != nil {
-		return facts, false, err
+		return facts, false, artifactChanges, err
 	}
 	facts.SourceAssets = assetFacts
+	artifactChanges.SourceAssets = append(artifactChanges.SourceAssets, assetChanges...)
 	run.Persisted = len(facts.Entries) + len(facts.Recognitions) + len(facts.SourceAssets)
 	if candidate.Kind == "delta" && (run.Persisted > CatalogMaxDeltaRows || catalogBatchSize(facts) > CatalogMaxDeltaBytes) {
-		return facts, false, ErrCatalogBudget
+		return facts, false, artifactChanges, ErrCatalogBudget
 	}
-	return facts, metadataChanged, nil
+	return facts, metadataChanged, normalizeCatalogArtifactChanges(artifactChanges), nil
 }
 
-func (s *MediaLibraryService) prepareCatalogScanAssets(ctx context.Context, candidate models.CatalogSnapshot, token string, library models.MediaLibrary, storage models.Storage, run *models.MediaLibraryScanRun, result medialibrary.Result, existing []models.MediaLibrarySourceAsset, deleted map[string]bool, now time.Time) ([]models.CatalogSourceAssetFact, error) {
+func (s *MediaLibraryService) prepareCatalogScanAssets(ctx context.Context, candidate models.CatalogSnapshot, token string, library models.MediaLibrary, storage models.Storage, run *models.MediaLibraryScanRun, result medialibrary.Result, existing []models.MediaLibrarySourceAsset, deleted map[string]bool, now time.Time) ([]models.CatalogSourceAssetFact, []uint, error) {
 	byPath, byProvider := make(map[string]models.MediaLibrarySourceAsset), make(map[string]models.MediaLibrarySourceAsset)
 	for _, asset := range existing {
 		byPath[asset.RelativePath] = asset
@@ -643,6 +679,7 @@ func (s *MediaLibraryService) prepareCatalogScanAssets(ctx context.Context, cand
 		}
 	}
 	rows := make([]models.MediaLibrarySourceAsset, 0, len(result.Assets))
+	changedRows := make([]bool, 0, len(result.Assets))
 	requests := make([]CatalogIdentityRequest, 0, len(result.Assets))
 	seen := make(map[uint]bool)
 	for _, source := range result.Assets {
@@ -670,23 +707,49 @@ func (s *MediaLibraryService) prepareCatalogScanAssets(ctx context.Context, cand
 			continue
 		}
 		rows = append(rows, asset)
+		changedRows = append(changedRows, !exists || !reflect.DeepEqual(before, asset))
 		requests = append(requests, CatalogIdentityRequest{Kind: "asset", SourceKey: asset.RelativePath, ExistingID: old.ID, ProviderID: source.ProviderID})
 	}
 	ids, err := s.resolveCatalogScanIDs(ctx, candidate, token, requests)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	facts := make([]models.CatalogSourceAssetFact, 0, len(rows))
+	changes := make([]uint, 0, len(rows))
 	for i, row := range rows {
 		row.ID = ids[i]
 		facts = append(facts, models.CatalogSourceAssetFact{MediaLibrarySourceAsset: row})
+		if changedRows[i] {
+			changes = append(changes, row.ID)
+		}
 	}
 	if candidate.Kind == "delta" {
 		for _, old := range existing {
 			if !seen[old.ID] && deleted[old.ProviderID] {
 				facts = append(facts, models.CatalogSourceAssetFact{MediaLibrarySourceAsset: old, Tombstone: true})
+				changes = append(changes, old.ID)
+			}
+		}
+	} else if !result.Partial {
+		for _, old := range existing {
+			if !seen[old.ID] {
+				changes = append(changes, old.ID)
 			}
 		}
 	}
-	return facts, nil
+	return facts, changes, nil
+}
+
+func cloneUint(value *uint) *uint {
+	if value == nil {
+		return nil
+	}
+	copy := *value
+	return &copy
+}
+
+func mediaLibraryRecognitionArtifactChanged(before, after models.MediaLibraryRecognition) bool {
+	return before.Status != after.Status || before.MediaType != after.MediaType || before.Title != after.Title ||
+		!sameOptional(before.ReleaseYear, after.ReleaseYear) || !sameOptional(before.TMDBID, after.TMDBID) ||
+		before.MetadataJSON != after.MetadataJSON
 }

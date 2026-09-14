@@ -3,8 +3,8 @@ import { enabledRouteTargets, formatRouteBytes, routeTargetByID, type DownloadRo
 
 const preview: DownloadRoutePreview = {
   downloader_id: 'qbit', source_kind: 'torrent', options: [
-    { media_library_id: 1, library_name: '本地', storage_name: 'NAS', route_kind: 'same_source_local', route_label: '本地整理', enabled: true, reason_code: '', reason_message: '', requires_managed_staging: false, expected_bytes: null, required_bytes: null, available_bytes: null },
-    { media_library_id: 2, library_name: '115', storage_name: '115', route_kind: 'cross_source', route_label: '跨数据源', enabled: false, reason_code: 'staging_space_insufficient', reason_message: '暂存空间不足', requires_managed_staging: true, expected_bytes: 1024, required_bytes: 2048, available_bytes: 1024 },
+    { media_library_id: 1, library_name: '本地', storage_name: 'NAS', route_kind: 'same_source_local', route_label: '本地整理', enabled: true, reason_code: '', reason_message: '', requires_managed_staging: false, execution_location: 'server', requires_node_staging: false, requires_server_staging: false, expected_bytes: null, required_bytes: null, available_bytes: null },
+    { media_library_id: 2, library_name: '115', storage_name: '115', route_kind: 'cross_source', route_label: '跨数据源', enabled: false, reason_code: 'staging_space_insufficient', reason_message: '暂存空间不足', requires_managed_staging: true, execution_location: 'server', requires_node_staging: false, requires_server_staging: true, expected_bytes: 1024, required_bytes: 2048, available_bytes: 1024 },
   ],
 }
 

@@ -46,6 +46,35 @@ type stubResolverAdapter struct {
 	resolveErr error
 }
 
+type stubPluginResourceBridge struct {
+	pluginID      string
+	version       string
+	magnet        string
+	connectionID  string
+	resourceID    string
+	provenanceErr error
+	searchCalls   int
+}
+
+func (b *stubPluginResourceBridge) SearchResource(context.Context, PluginResourceSearchInput) (PluginResourceSearchPage, error) {
+	b.searchCalls++
+	return PluginResourceSearchPage{}, nil
+}
+
+func (b *stubPluginResourceBridge) ResolveResource(_ context.Context, input PluginResourceResolveInput) (PluginResourceResolveResult, error) {
+	b.connectionID = input.ConnectionID
+	b.resourceID = input.ResourceID
+	return PluginResourceResolveResult{Magnet: b.magnet}, nil
+}
+
+func (b *stubPluginResourceBridge) ResourceProvenance(connectionID string) (string, string, error) {
+	b.connectionID = connectionID
+	if b.provenanceErr != nil {
+		return "", "", b.provenanceErr
+	}
+	return b.pluginID, b.version, nil
+}
+
 func (a *stubResolverAdapter) ResolveSource(_ context.Context, _ sitepkg.Config, identity string) (sitepkg.Source, error) {
 	if identity != "42" {
 		return sitepkg.Source{}, sitepkg.ErrNotFound
@@ -235,6 +264,76 @@ func TestSiteSearchOptionsExposeOnlySafeDiscoveryFields(t *testing.T) {
 	delete(foreign.Permissions, authz.PermissionDiscoveryRead)
 	if _, err := service.SearchOptions(foreign); ErrorCode(err) != CodePermissionDenied {
 		t.Fatalf("unauthorized options err=%v", err)
+	}
+}
+
+func TestPluginResourceSearchRequiresHealthyCurrentLifecycle(t *testing.T) {
+	service, _, actor, _, _, _ := siteFixture(t)
+	bridge := &stubPluginResourceBridge{pluginID: "org.ohmycine.lifecycle", version: "1.0.0", provenanceErr: errors.New("runtime unavailable")}
+	service.SetPluginResourceBridge(bridge)
+	now := service.now()
+	site := models.Site{
+		Name: "Plugin resource", NameNormalized: "plugin-resource-lifecycle", Kind: pluginResourceKind,
+		SourceType: "plugin", PluginID: bridge.pluginID, PluginConnectionID: "resource-connection",
+		BaseURL: "https://resource.example.test", Enabled: true, Priority: 100, TimeoutSeconds: 15,
+		RateLimitPerMinute: 30, LastHealthStatus: "healthy", Revision: 1, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := service.db.Create(&site).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	options, err := service.SearchOptions(actor)
+	if err != nil || len(options) != 1 || options[0].Searchable || !strings.Contains(options[0].Reason, "插件已停用") {
+		t.Fatalf("options=%+v err=%v", options, err)
+	}
+	if _, err := service.Search(context.Background(), actor, SiteSearchInput{Keyword: "test", SiteID: &site.ID, Page: 1}); ErrorCode(err) != "resource_entry_unavailable" {
+		t.Fatalf("selected unavailable plugin error=%v code=%s", err, ErrorCode(err))
+	}
+	groups, err := service.Search(context.Background(), actor, SiteSearchInput{Keyword: "test", Page: 1})
+	if err != nil || len(groups) != 0 || bridge.searchCalls != 0 {
+		t.Fatalf("aggregate groups=%+v calls=%d err=%v", groups, bridge.searchCalls, err)
+	}
+
+	bridge.provenanceErr = nil
+	if err := service.db.Model(&models.Site{}).Where("id = ?", site.ID).Update("last_health_status", "auth_required").Error; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Search(context.Background(), actor, SiteSearchInput{Keyword: "test", SiteID: &site.ID, Page: 1}); ErrorCode(err) != "resource_auth_required" {
+		t.Fatalf("selected unauthenticated plugin error=%v code=%s", err, ErrorCode(err))
+	}
+	if err := service.db.Model(&models.Site{}).Where("id = ?", site.ID).Update("last_health_status", "healthy").Error; err != nil {
+		t.Fatal(err)
+	}
+	groups, err = service.Search(context.Background(), actor, SiteSearchInput{Keyword: "test", SiteID: &site.ID, Page: 1})
+	if err != nil || len(groups) != 1 || groups[0].Status != "success" || bridge.searchCalls != 1 {
+		t.Fatalf("healthy groups=%+v calls=%d err=%v", groups, bridge.searchCalls, err)
+	}
+}
+
+func TestPluginManagedSiteRejectsGenericMutations(t *testing.T) {
+	service, _, actor, _, _, _ := siteFixture(t)
+	now := service.now()
+	site := models.Site{
+		Name: "Plugin resource", NameNormalized: "plugin-resource-managed", Kind: pluginResourceKind,
+		SourceType: "plugin", PluginID: "org.ohmycine.managed", PluginConnectionID: "managed-connection",
+		BaseURL: "https://resource.example.test", Enabled: true, Priority: 100, TimeoutSeconds: 15,
+		RateLimitPerMinute: 30, LastHealthStatus: "healthy", Revision: 1, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := service.db.Create(&site).Error; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Update(context.Background(), actor, site.ID, SiteUpdateInput{Revision: 1}, RequestContext{}); ErrorCode(err) != CodeSiteManagedByPlugin {
+		t.Fatalf("update error=%v code=%s", err, ErrorCode(err))
+	}
+	if _, err := service.Test(context.Background(), actor, site.ID, RequestContext{}); ErrorCode(err) != CodeSiteManagedByPlugin {
+		t.Fatalf("test error=%v code=%s", err, ErrorCode(err))
+	}
+	if err := service.Delete(actor, site.ID, RequestContext{}); ErrorCode(err) != CodeSiteManagedByPlugin {
+		t.Fatalf("delete error=%v code=%s", err, ErrorCode(err))
+	}
+	var count int64
+	if err := service.db.Model(&models.Site{}).Where("id = ?", site.ID).Count(&count).Error; err != nil || count != 1 {
+		t.Fatalf("managed site count=%d err=%v", count, err)
 	}
 }
 func (a *stubSiteAdapter) Download(_ context.Context, _ sitepkg.Config, torrentID string) ([]byte, string, error) {
@@ -932,6 +1031,72 @@ func TestBTResolverUsesExistingDownloadPipelineWithoutPublicSourceLeak(t *testin
 	adapter.resolved = sitepkg.Source{Magnet: magnet, Torrent: []byte("d4:infod4:name7:samuraiee"), Filename: "both.torrent"}
 	if _, err := service.Download(context.Background(), actor, SiteDownloadInput{ResultToken: groups[0].Items[0].Token, DownloaderID: downloader.ID}, RequestContext{}); ErrorCode(err) != CodeSiteResponseInvalid {
 		t.Fatalf("ambiguous resolver source err=%v", err)
+	}
+}
+
+func TestPluginResourceDownloadLoadsBridgeIdentityAndPersistsSourceSnapshot(t *testing.T) {
+	service, _, actor, _, _, downloaders := siteFixture(t)
+	const (
+		connectionID = "11111111-1111-4111-8111-111111111111"
+		claimID      = "22222222-2222-4222-8222-222222222222"
+		resourceID   = "fixture-resource"
+		magnet       = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567"
+	)
+	bridge := &stubPluginResourceBridge{pluginID: "org.ohmycine.fixture", version: "1.2.3", magnet: magnet}
+	service.SetPluginResourceBridge(bridge)
+	now := service.now()
+	packageRecord := models.PluginPackage{PluginID: bridge.pluginID, Version: bridge.version, RepositoryOwner: "fixture", RepositoryRepo: "plugins", RegistryCommit: strings.Repeat("a", 40), RegistryEntryJSON: `{}`, ManifestURL: "https://example.test/manifest.json", PackageURL: "https://example.test/plugin.omcp", PackageSHA256: strings.Repeat("b", 64), ExtractedTreeSHA256: strings.Repeat("c", 64), ManifestJSON: `{}`, PackagePath: t.TempDir(), VerifiedAt: now, CreatedAt: now}
+	if err := service.db.Create(&packageRecord).Error; err != nil {
+		t.Fatal(err)
+	}
+	installation := models.PluginInstallation{PluginID: bridge.pluginID, ActivePackageID: packageRecord.ID, Status: models.PluginInstallationEnabled, Revision: 1, InstalledAt: now, UpdatedAt: now}
+	if err := service.db.Create(&installation).Error; err != nil {
+		t.Fatal(err)
+	}
+	connection := models.PluginConnection{ID: connectionID, PluginID: bridge.pluginID, Name: "Fixture resource connection", ConfigJSON: `{}`, CredentialMode: models.PluginCredentialModeCookie, ResourceType: "bt_resource", EntryOrigin: "https://resource.example.test", Enabled: true, Revision: 1, CreatedAt: now, UpdatedAt: now}
+	if err := service.db.Create(&connection).Error; err != nil {
+		t.Fatal(err)
+	}
+	site := models.Site{Name: "Fixture resource site", NameNormalized: "fixture-resource-site", Kind: pluginResourceKind, SourceType: "plugin", PluginID: bridge.pluginID, PluginConnectionID: connectionID, BaseURL: "https://resource.example.test", Enabled: true, Priority: 100, TimeoutSeconds: 12, RateLimitPerMinute: 120, CreatedAt: now, UpdatedAt: now}
+	if err := service.db.Create(&site).Error; err != nil {
+		t.Fatal(err)
+	}
+	token, err := service.issueClaim(siteResultClaim{ActorID: actor.User.ID, SiteID: site.ID, PluginClaimID: claimID, TorrentID: resourceID, Title: "Fixture.Resource.2026", ExpiresAt: now.Add(time.Minute)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resourceClaim := models.PluginResourceClaim{ID: claimID, TokenHash: tokenDigest(token), OwnerID: actor.User.ID, SiteID: site.ID, PluginID: bridge.pluginID, PluginVersion: bridge.version, PluginConnectionID: connectionID, ResourceID: resourceID, Title: "Fixture.Resource.2026", ExpiresAt: now.Add(time.Minute), CreatedAt: now}
+	if err := service.db.Create(&resourceClaim).Error; err != nil {
+		t.Fatal(err)
+	}
+	downloader, err := downloaders.Create(actor, DownloaderInput{Name: "Plugin BT qBit", Type: models.DownloaderTypeQBittorrent, BaseURL: "http://qbit.example.test", Enabled: true}, RequestContext{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := service.Download(context.Background(), actor, SiteDownloadInput{ResultToken: token, DownloaderID: downloader.ID, Priority: 10}, RequestContext{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bridge.connectionID != connectionID || bridge.resourceID != resourceID {
+		t.Fatalf("plugin bridge received connection=%q resource=%q", bridge.connectionID, bridge.resourceID)
+	}
+	var task models.DownloadTask
+	if err := service.db.First(&task, "id = ?", result.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if task.PluginID != bridge.pluginID || task.PluginVersion != bridge.version || task.PluginConnectionID != connectionID || task.PluginResourceClaimID != claimID {
+		t.Fatalf("plugin source snapshot was not preserved: %+v", task)
+	}
+	plaintext, err := service.downloads.credentials.Decrypt(downloadSourcePurpose(task.ID), task.SourceCiphertext)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var source downloadSourceEnvelope
+	if err := json.Unmarshal([]byte(plaintext), &source); err != nil || source.Kind != downloadpkg.SourceURL || source.URL != magnet {
+		t.Fatalf("unexpected encrypted source=%+v err=%v", source, err)
+	}
+	if err := service.db.First(&resourceClaim, "id = ?", claimID).Error; err != nil || resourceClaim.ConsumedAt == nil {
+		t.Fatalf("resource claim was not consumed atomically: %+v err=%v", resourceClaim, err)
 	}
 }
 

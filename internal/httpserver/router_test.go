@@ -113,6 +113,36 @@ func TestStructureReviewRoutesRequireSessionCSRFAndNoStore(t *testing.T) {
 	}
 }
 
+func TestManagementHistoryRoutesRequireSessionCSRFAndNoStore(t *testing.T) {
+	client := newTestClient(t)
+	paths := []string{
+		"/api/v1/management-history/purge/preview",
+		"/api/v1/management-history/purge",
+	}
+	for _, path := range paths {
+		request := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{"scope":"tasks"}`))
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("Origin", "http://localhost:3000")
+		response := httptest.NewRecorder()
+		client.router.ServeHTTP(response, request)
+		if response.Code != http.StatusUnauthorized || response.Header().Get("Cache-Control") != "no-store" {
+			t.Fatalf("unauthenticated management history path=%s status=%d cache=%q", path, response.Code, response.Header().Get("Cache-Control"))
+		}
+	}
+
+	client.setup(t)
+	for _, path := range paths {
+		status, _ := client.request(t, http.MethodPost, path, map[string]any{"scope": "tasks"}, false)
+		if status != http.StatusForbidden || client.lastHeader.Get("Cache-Control") != "no-store" {
+			t.Fatalf("management history without csrf path=%s status=%d cache=%q", path, status, client.lastHeader.Get("Cache-Control"))
+		}
+	}
+	status, _ := client.request(t, http.MethodPost, paths[0], map[string]any{"scope": "tasks"}, true)
+	if status != http.StatusOK || client.lastHeader.Get("Cache-Control") != "no-store" {
+		t.Fatalf("authorized management history preview status=%d cache=%q", status, client.lastHeader.Get("Cache-Control"))
+	}
+}
+
 func TestBuiltInLibraryArtworkIsPublicInertRaster(t *testing.T) {
 	client := newTestClient(t)
 	request := httptest.NewRequest(http.MethodGet, "/api/v1/assets/library-covers/library-local.png", nil)
@@ -291,6 +321,7 @@ func newTestClient(t *testing.T, cloudDrivers ...cloudpkg.Driver) *testClient {
 		t.Fatal(err)
 	}
 	downloaders := services.NewDownloaderService(db, audit, credentialStore, providerRegistry)
+	api.SetTransferNodeService(services.NewTransferNodeService(db, audit, credentialStore))
 	downloadSettings := services.NewDownloadSettingsService(db, audit)
 	seedingSettings := services.NewSeedingSettingsService(db, audit)
 	metadataSettings := services.NewMetadataSettingsService(db, audit, credentialStore)
@@ -330,6 +361,45 @@ func newTestClient(t *testing.T, cloudDrivers ...cloudpkg.Driver) *testClient {
 	api.SetSeedingService(seeding)
 	api.SetPluginRepositoryService(services.NewPluginRepositoryService(db, audit, nil, log))
 	return &testClient{router: New(cfg, api, auth, log), queue: queue, queueEvents: events, db: db, connections: connections, signedProxy: signedProxy, embyGateway: embyGateway, changes: changes, sites: sites, libraries: libraries, history: playerHistory}
+}
+
+func TestTransferNodeRoutesAreNoStoreAndKeepEnrollmentSecretsOutOfLists(t *testing.T) {
+	client := newTestClient(t)
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/transfer-nodes", nil)
+	response := httptest.NewRecorder()
+	client.router.ServeHTTP(response, request)
+	if response.Code != http.StatusUnauthorized || response.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("anonymous node list status=%d cache=%q", response.Code, response.Header().Get("Cache-Control"))
+	}
+
+	client.setup(t)
+	status, createdBody := client.request(t, http.MethodPost, "/api/v1/transfer-nodes", map[string]any{
+		"name": "Public node", "api_url": "https://node.example.com:4433", "platform": "linux", "architecture": "amd64",
+	}, true)
+	if status != http.StatusCreated || client.lastHeader.Get("Cache-Control") != "no-store" {
+		t.Fatalf("create node status=%d cache=%q body=%s", status, client.lastHeader.Get("Cache-Control"), createdBody.Data)
+	}
+	var created struct {
+		Node struct {
+			ID string `json:"id"`
+		} `json:"node"`
+		EnrollmentToken string `json:"enrollment_token"`
+	}
+	if err := json.Unmarshal(createdBody.Data, &created); err != nil || created.Node.ID == "" || created.EnrollmentToken == "" {
+		t.Fatalf("created node response=%s err=%v", createdBody.Data, err)
+	}
+	status, listed := client.request(t, http.MethodGet, "/api/v1/transfer-nodes", nil, false)
+	if status != http.StatusOK || bytes.Contains(listed.Data, []byte(created.EnrollmentToken)) || bytes.Contains(listed.Data, []byte("token_hash")) || bytes.Contains(listed.Data, []byte("token_ciphertext")) {
+		t.Fatalf("node list status=%d leaked enrollment material: %s", status, listed.Data)
+	}
+	status, _ = client.request(t, http.MethodPost, "/api/v1/transfer-nodes/"+created.Node.ID+"/revoke", map[string]any{}, true)
+	if status != http.StatusOK {
+		t.Fatalf("revoke node status=%d", status)
+	}
+	status, _ = client.request(t, http.MethodDelete, "/api/v1/transfer-nodes/"+created.Node.ID, map[string]any{}, true)
+	if status != http.StatusOK {
+		t.Fatalf("delete node status=%d", status)
+	}
 }
 
 func TestPlayerAcquisitionListRequiresDeviceAuthScopesOwnerAndValidatesInput(t *testing.T) {

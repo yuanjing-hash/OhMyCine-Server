@@ -17,6 +17,105 @@ import (
 	"gorm.io/gorm"
 )
 
+func TestDeleteRequestAcceptsHistoricalBlockerWithoutStartingFollowupWork(t *testing.T) {
+	s, library, actor := createCatalogTestLibrary(t)
+	s.SetQueueService(NewQueueService(s.db, s.audit))
+	if err := s.db.Model(&models.MediaLibrary{}).Where("id = ?", library.ID).Update("enabled", true).Error; err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	blocker := models.MediaArtifactRun{ID: "legacy-delete-blocker", LibraryID: library.ID, Generation: 1, PolicyJSON: `{}`, Status: models.MediaArtifactStatusFailed, CleanupStatus: models.MediaArtifactCleanupPending, CreatedAt: now, UpdatedAt: now}
+	if err := s.db.Create(&blocker).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { <-ctx.Done(); close(done) }()
+	s.mu.Lock()
+	s.supervisors[library.ID] = supervisorHandle{cancel: cancel, done: done, wake: make(chan struct{}, 1), pending: newProviderChangeAccumulator()}
+	s.mu.Unlock()
+	defer func() {
+		cancel()
+		<-done
+	}()
+
+	result, err := s.DeleteRequest(context.Background(), actor, library.ID, RequestContext{})
+	if err != nil || result.Deleted || result.JobID == "" {
+		t.Fatalf("durable retirement was not accepted: result=%+v err=%v", result, err)
+	}
+	select {
+	case <-ctx.Done():
+		t.Fatal("predictable delete conflict stopped the supervisor")
+	default:
+	}
+	var jobs int64
+	if err := s.db.Model(&models.Job{}).Where("job_type <> ?", JobTypeMediaLibraryRetirement).Count(&jobs).Error; err != nil || jobs != 0 {
+		t.Fatalf("delete acceptance created follow-up work: count=%d err=%v", jobs, err)
+	}
+}
+
+func TestHeadlessLibraryWithLargeHistoryUsesBoundedRetirement(t *testing.T) {
+	s, library, actor := createCatalogTestLibrary(t)
+	queue := NewQueueService(s.db, s.audit)
+	s.SetQueueService(queue)
+	now := time.Now().UTC()
+	if err := s.db.Model(&models.MediaLibrary{}).Where("id = ?", library.ID).Updates(map[string]any{
+		"artifact_generation": 3, "artifact_applied_generation": 3, "artifact_status": models.MediaArtifactStatusCompleted,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	runs := make([]models.MediaArtifactRun, 0, CatalogBatchRows+7)
+	for i := 0; i < CatalogBatchRows+7; i++ {
+		runs = append(runs, models.MediaArtifactRun{
+			ID: fmt.Sprintf("headless-history-%03d", i), LibraryID: library.ID, Generation: 2,
+			PolicyJSON: `{}`, Status: models.MediaArtifactStatusSuperseded, ErrorCode: "old_reason",
+			CleanupStatus: models.MediaArtifactCleanupSkipped, FinishedAt: &now,
+			ExpectedCount: 10, ProcessedCount: 10, SucceededCount: 10, UpdatedCount: 10,
+			CreatedAt: now, UpdatedAt: now,
+		})
+	}
+	if err := s.db.CreateInBatches(&runs, 100).Error; err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.DeleteRequest(context.Background(), actor, library.ID, RequestContext{})
+	if err != nil || result.Deleted || result.Status != "deleting" || result.JobID == "" {
+		t.Fatalf("headless bounded retirement result=%+v err=%v", result, err)
+	}
+	again, err := s.DeleteRequest(context.Background(), actor, library.ID, RequestContext{})
+	if err != nil || again != result {
+		t.Fatalf("headless retirement was not idempotent: %+v err=%v", again, err)
+	}
+	claim, err := queue.Claim([]string{JobTypeMediaLibraryRetirement})
+	if err != nil || claim == nil {
+		t.Fatalf("claim headless retirement: %v", err)
+	}
+	var row models.MediaLibraryRetirement
+	if err := s.db.Where("job_id = ?", claim.Job.ID).First(&row).Error; err != nil {
+		t.Fatal(err)
+	}
+	if row.SourceEpoch != 0 || row.SourceFingerprint != "" || row.ConfigFingerprint != "" {
+		t.Fatalf("headless retirement invented a catalog fence: %+v", row)
+	}
+	worker := NewMediaLibraryRetirementWorker(s)
+	for step := 0; step < 200 && row.Phase != "completed"; step++ {
+		waiting, _, stepErr := worker.step(context.Background(), *claim, &row)
+		if stepErr != nil || waiting {
+			t.Fatalf("headless step=%d phase=%s waiting=%v err=%v", step, row.Phase, waiting, stepErr)
+		}
+	}
+	if row.Phase != "completed" {
+		t.Fatalf("headless retirement did not complete: phase=%s", row.Phase)
+	}
+	var remaining int64
+	if err := s.db.Model(&models.MediaArtifactRun{}).Where("library_id = ?", library.ID).Count(&remaining).Error; err != nil || remaining != 0 {
+		t.Fatalf("headless history remaining=%d err=%v", remaining, err)
+	}
+	if err := s.db.First(&models.MediaLibrary{}, library.ID).Error; !errors.Is(err, gorm.ErrRecordNotFound) {
+		t.Fatalf("headless library still exists: %v", err)
+	}
+}
+
 func retirementFixture(t *testing.T) (*MediaLibraryService, models.MediaLibrary, Actor) {
 	t.Helper()
 	store, library, recognition, entries := catalogFixture(t)
@@ -24,7 +123,6 @@ func retirementFixture(t *testing.T) (*MediaLibraryService, models.MediaLibrary,
 	s := NewMediaLibraryService(store.writeDB, NewAuditService(store.writeDB), zerolog.Nop())
 	s.SetCatalogSnapshotStore(store)
 	s.SetQueueService(NewQueueService(store.writeDB, s.audit))
-	s.SetRetirementPhysicalGuard(AssertCatalogPhysicalDrainedTx)
 	var user models.User
 	if err := s.db.Where("username=?", "library-test").First(&user).Error; err != nil {
 		t.Fatal(err)
@@ -96,9 +194,6 @@ func TestLibraryRetirementPreservesFilesHistoryAndOtherLibraryAcrossRestart(t *t
 		}
 	}
 	claim, row := claimRetirement(t, s, library, actor)
-	if err := s.Delete(actor, library.ID, RequestContext{}); err == nil {
-		t.Fatal("legacy Delete must not claim retired library deleted")
-	}
 	detail, err := s.Get(actor, library.ID)
 	if err != nil || detail.Retirement == nil || detail.Enabled {
 		t.Fatalf("deleting detail: %+v %v", detail, err)
@@ -149,45 +244,186 @@ func TestLibraryRetirementPreservesFilesHistoryAndOtherLibraryAcrossRestart(t *t
 	}
 }
 
-func TestLibraryRetirementRefusalRollsBackEnabledHeadAndQueue(t *testing.T) {
+func TestLibraryRetirementAcceptanceCreatesGateBeforePhysicalDrain(t *testing.T) {
 	s, library, actor := retirementFixture(t)
 	if err := s.db.Model(&library).Update("enabled", true).Error; err != nil {
 		t.Fatal(err)
 	}
 	var before models.CatalogHead
 	s.db.First(&before, "library_id=?", library.ID)
-	s.SetRetirementPhysicalGuard(func(*gorm.DB, uint) error { return appError(CodeConflict, "unfinished physical owner", nil) })
-	_, err := s.DeleteRequest(context.Background(), actor, library.ID, RequestContext{})
-	if err == nil {
-		t.Fatal("unsafe owner admitted")
+	result, err := s.DeleteRequest(context.Background(), actor, library.ID, RequestContext{})
+	if err != nil || result.JobID == "" || result.Deleted {
+		t.Fatalf("retirement was not accepted: result=%+v err=%v", result, err)
 	}
 	var after models.MediaLibrary
 	s.db.First(&after, library.ID)
-	if !after.Enabled {
-		t.Fatal("refusal disabled original owner")
+	if after.Enabled {
+		t.Fatal("retirement gate did not disable producers")
 	}
 	var head models.CatalogHead
 	s.db.First(&head, "library_id=?", library.ID)
 	if head != before {
-		t.Fatal("refusal changed head")
+		t.Fatal("acceptance changed head")
 	}
 	var n int64
 	s.db.Model(&models.MediaLibraryRetirement{}).Count(&n)
-	if n != 0 {
-		t.Fatal("gate survived rollback")
+	if n != 1 {
+		t.Fatalf("retirement receipt count=%d", n)
 	}
 	s.db.Model(&models.Job{}).Where("job_type=?", JobTypeMediaLibraryRetirement).Count(&n)
-	if n != 0 {
-		t.Fatal("job survived rollback")
+	if n != 1 {
+		t.Fatalf("retirement job count=%d", n)
 	}
 }
 
-func TestLibraryRetirementLegacySynchronousAndUnknownReferenceRefused(t *testing.T) {
-	legacy, library, actor := createCatalogTestLibrary(t)
-	result, err := legacy.DeleteRequest(context.Background(), actor, library.ID, RequestContext{})
-	if err != nil || !result.Deleted || result.JobID != "" {
-		t.Fatalf("legacy %+v %v", result, err)
+func TestLibraryRetirementCanClaimWhileLibraryWorkerOwnsOrdinaryResource(t *testing.T) {
+	s, library, actor := retirementFixture(t)
+	now := time.Now().UTC()
+	expires := now.Add(time.Minute)
+	ownerID := actor.User.ID
+	blocking := models.Job{
+		ID: "running-library-worker", OwnerID: &ownerID, CreatedByKind: "user",
+		JobType: JobTypeMediaArtifact, Priority: 100, LanePosition: 1, Revision: 1,
+		Status: models.JobStatusRunning, DisplayName: "running library worker",
+		ResourceKey: mediaArtifactResourceKey(library.ID), PayloadJSON: `{}`, CheckpointJSON: `{}`,
+		Generation: 1, StartedGeneration: 1, LeaseTokenHash: "active-lease", LeaseExpiresAt: &expires,
+		HeartbeatAt: &now, AttemptCount: 1, CreatedAt: now, UpdatedAt: now, StartedAt: &now,
 	}
+	if err := s.db.Create(&blocking).Error; err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.DeleteRequest(context.Background(), actor, library.ID, RequestContext{})
+	if err != nil || result.JobID == "" {
+		t.Fatalf("accept result=%+v err=%v", result, err)
+	}
+	var retirementJob models.Job
+	if err := s.db.First(&retirementJob, "id = ?", result.JobID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if retirementJob.ResourceKey != mediaLibraryRetirementResourceKey(library.ID) || retirementJob.ResourceKey == blocking.ResourceKey {
+		t.Fatalf("retirement resource cannot preempt library worker: retirement=%q worker=%q", retirementJob.ResourceKey, blocking.ResourceKey)
+	}
+	claim, err := s.queue.Claim([]string{JobTypeMediaLibraryRetirement})
+	if err != nil || claim == nil || claim.Job.ID != result.JobID {
+		t.Fatalf("retirement was blocked behind worker: claim=%+v err=%v", claim, err)
+	}
+}
+
+func TestLibraryRetirementStopsAndRemovesExactLibraryTransferOnly(t *testing.T) {
+	s, library, actor := retirementFixture(t)
+	other := library
+	other.ID = 0
+	other.Name = "Other transfer library"
+	other.NameNormalized = "other transfer library"
+	other.RelativeRoot = "/other-transfer"
+	if err := s.db.Create(&other).Error; err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	expires := now.Add(time.Minute)
+	ownerID := actor.User.ID
+	createPipeline := func(prefix string, target models.MediaLibrary, running bool) (models.Job, models.TransferTask, models.CatalogPhysicalWrite) {
+		downloadJob := models.Job{ID: prefix + "-download-job", OwnerID: &ownerID, CreatedByKind: "user", JobType: "download", Priority: 1, LanePosition: 1, Revision: 1, Status: models.JobStatusCompleted, DisplayName: prefix + " download", PayloadJSON: `{}`, CheckpointJSON: `{}`, Generation: 1, FinishedAt: &now, CreatedAt: now, UpdatedAt: now}
+		if err := s.db.Create(&downloadJob).Error; err != nil {
+			t.Fatal(err)
+		}
+		targetID := target.ID
+		download := models.DownloadTask{ID: prefix + "-download", OwnerID: ownerID, JobID: downloadJob.ID, DownloaderName: "test", ProviderType: models.DownloaderTypeFake, SourceCiphertext: "test", DisplayName: prefix, Phase: models.DownloadTaskStatusCompleted, TargetLibraryID: &targetID, TargetLibraryName: target.Name, CreatedAt: now, UpdatedAt: now, FinishedAt: &now}
+		if err := s.db.Create(&download).Error; err != nil {
+			t.Fatal(err)
+		}
+		status := models.JobStatusCompleted
+		var finished *time.Time = &now
+		job := models.Job{ID: prefix + "-transfer-job", OwnerID: &ownerID, CreatedByKind: "user", JobType: "transfer", Priority: 1, LanePosition: 1, Revision: 1, Status: status, DisplayName: prefix + " transfer", ResourceKey: "library:" + uintID(target.ID), PayloadJSON: `{"transfer_task_id":"` + prefix + `-transfer"}`, CheckpointJSON: `{}`, Generation: 1, FinishedAt: finished, CreatedAt: now, UpdatedAt: now}
+		if running {
+			job.Status, job.FinishedAt = models.JobStatusRunning, nil
+			job.StartedGeneration, job.LeaseTokenHash, job.LeaseExpiresAt, job.HeartbeatAt, job.StartedAt, job.AttemptCount = 1, "transfer-lease", &expires, &now, &now, 1
+		}
+		if err := s.db.Create(&job).Error; err != nil {
+			t.Fatal(err)
+		}
+		transfer := models.TransferTask{ID: prefix + "-transfer", OwnerID: ownerID, JobID: job.ID, DownloadTaskID: download.ID, LibraryID: target.ID, LibraryName: target.Name, ManifestJSON: `{}`, SourceManifestJSON: `{}`, SourceDataSourceJSON: `{}`, TargetDataSourceJSON: `{}`, Phase: models.TransferTaskStatusCompleted, CleanupStatus: models.TransferCleanupCompleted, CreatedAt: now, UpdatedAt: now, FinishedAt: &now}
+		if running {
+			transfer.Phase, transfer.CleanupStatus, transfer.FinishedAt = models.TransferTaskStatusTransferring, models.TransferCleanupPending, nil
+		}
+		if err := s.db.Create(&transfer).Error; err != nil {
+			t.Fatal(err)
+		}
+		state := "settled"
+		if running {
+			state = "entered"
+		}
+		proof := models.CatalogPhysicalWrite{LibraryID: target.ID, OwnerKind: CatalogPhysicalTransfer, OwnerID: transfer.ID, State: state, Revision: 1, OwnerDigest: prefix, JobID: job.ID, JobLeaseHash: job.LeaseTokenHash, EnteredAt: now, UpdatedAt: now}
+		if err := s.db.Create(&proof).Error; err != nil {
+			t.Fatal(err)
+		}
+		return job, transfer, proof
+	}
+	job, transfer, proof := createPipeline("selected", library, true)
+	otherJob, otherTransfer, _ := createPipeline("other", other, false)
+	claim, row := claimRetirement(t, s, library, actor)
+	var frozen int64
+	if err := s.db.Model(&models.MediaLibraryRetirementJob{}).Where("retirement_id = ? AND job_id = ?", row.ID, job.ID).Count(&frozen).Error; err != nil || frozen != 1 {
+		t.Fatalf("selected-library transfer was not frozen: count=%d err=%v", frozen, err)
+	}
+	worker := NewMediaLibraryRetirementWorker(s)
+	waiting := false
+	for i := 0; i < 10 && !waiting; i++ {
+		var err error
+		waiting, _, err = worker.step(context.Background(), claim, &row)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !waiting {
+		var got models.Job
+		_ = s.db.First(&got, "id = ?", job.ID).Error
+		t.Fatalf("running transfer was not interrupted: phase=%s job=%+v", row.Phase, got)
+	}
+	var interrupted models.Job
+	if err := s.db.First(&interrupted, "id = ?", job.ID).Error; err != nil || !interrupted.CancellationAsked || interrupted.InterruptStatus != models.JobStatusCancelled {
+		t.Fatalf("transfer interrupt not persisted: job=%+v err=%v", interrupted, err)
+	}
+	if err := s.db.First(&proof, proof.ID).Error; err != nil || proof.State != "entered" {
+		t.Fatalf("entered evidence removed before exit: proof=%+v err=%v", proof, err)
+	}
+	if err := s.db.Model(&models.CatalogPhysicalWrite{}).Where("id = ?", proof.ID).Updates(map[string]any{"state": "quiescent", "updated_at": time.Now().UTC()}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.Model(&models.Job{}).Where("id = ?", job.ID).Updates(map[string]any{"status": models.JobStatusCancelled, "interrupt_status": "", "lease_token_hash": "", "lease_expires_at": nil, "heartbeat_at": nil, "finished_at": time.Now().UTC()}).Error; err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 160 && row.Phase != "completed"; i++ {
+		if _, _, err := worker.step(context.Background(), claim, &row); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if row.Phase != "completed" {
+		t.Fatalf("retirement did not complete: %s", row.Phase)
+	}
+	for label, model := range map[string]any{"selected transfer": &models.TransferTask{}, "selected job": &models.Job{}, "selected proof": &models.CatalogPhysicalWrite{}} {
+		id := any(transfer.ID)
+		if label == "selected job" {
+			id = job.ID
+		} else if label == "selected proof" {
+			id = proof.ID
+		}
+		if err := s.db.First(model, "id = ?", id).Error; !errors.Is(err, gorm.ErrRecordNotFound) {
+			t.Fatalf("%s survived: %v", label, err)
+		}
+	}
+	if err := s.db.First(&models.TransferTask{}, "id = ?", otherTransfer.ID).Error; err != nil {
+		t.Fatalf("other-library transfer removed: %v", err)
+	}
+	if err := s.db.First(&models.Job{}, "id = ?", otherJob.ID).Error; err != nil {
+		t.Fatalf("other-library transfer job removed: %v", err)
+	}
+	if err := s.db.First(&models.DownloadTask{}, "id = ?", "selected-download").Error; err != nil {
+		t.Fatalf("upstream download history removed: %v", err)
+	}
+}
+
+func TestLibraryRetirementDiscardsUnknownLibraryReferenceAfterDrain(t *testing.T) {
 	s, library, actor := retirementFixture(t)
 	var layer models.CatalogHeadLayer
 	s.db.First(&layer, "library_id=?", library.ID)
@@ -196,19 +432,18 @@ func TestLibraryRetirementLegacySynchronousAndUnknownReferenceRefused(t *testing
 	}
 	claim, row := claimRetirement(t, s, library, actor)
 	w := NewMediaLibraryRetirementWorker(s)
-	for i := 0; i < 4; i++ {
-		_, _, err = w.step(context.Background(), claim, &row)
-		if err != nil {
-			break
+	for i := 0; i < 100 && row.Phase != "completed"; i++ {
+		if _, _, err := w.step(context.Background(), claim, &row); err != nil {
+			t.Fatal(err)
 		}
 	}
-	if err == nil {
-		t.Fatal("unproven ref removed")
+	if row.Phase != "completed" {
+		t.Fatalf("retirement did not complete: %s", row.Phase)
 	}
 	var n int64
 	s.db.Model(&models.CatalogSnapshotReference{}).Where("owner_id=?", "unknown-owner").Count(&n)
-	if n != 1 {
-		t.Fatal("unproven ref lost")
+	if n != 0 {
+		t.Fatal("retired library reference survived")
 	}
 	raw, _ := json.Marshal(retirementSummary(row))
 	for _, private := range []string{"source_epoch", "fingerprint", "cursor", "owner"} {
@@ -315,6 +550,12 @@ func TestLibraryRetirementCancelsOnlyProvenUnenteredRepairAndBlocksNewAdmission(
 	if err != nil {
 		t.Fatal(err)
 	}
+	// A stale expiry without a lease hash is not an active worker and must not
+	// keep retirement in an endless draining loop.
+	staleExpiry := time.Now().UTC().Add(-time.Minute)
+	if err := s.db.Model(&models.Job{}).Where("id = ?", job.ID).Update("lease_expires_at", staleExpiry).Error; err != nil {
+		t.Fatal(err)
+	}
 	claim, row := claimRetirement(t, s, library, actor)
 	if err := s.db.Transaction(func(tx *gorm.DB) error { return AssertCatalogPhysicalAdmissionTx(tx, library.ID) }); err == nil {
 		t.Fatal("new physical admission survived retirement gate")
@@ -328,8 +569,10 @@ func TestLibraryRetirementCancelsOnlyProvenUnenteredRepairAndBlocksNewAdmission(
 	if row.Phase != "completed" {
 		t.Fatal("retirement did not converge")
 	}
-	var kept models.Job
-	if err := s.db.First(&kept, "id=?", job.ID).Error; err != nil || kept.Status != models.JobStatusCancelled || kept.LeaseTokenHash != "" {
-		t.Fatalf("safe queued job not cancelled or history lost %+v %v", kept, err)
+	if err := s.db.First(&models.Job{}, "id=?", job.ID).Error; !errors.Is(err, gorm.ErrRecordNotFound) {
+		t.Fatalf("retired library job history survived: %v", err)
+	}
+	if err := s.db.First(&models.MediaLibraryStructureRepair{}, "id=?", "retirement-safe-repair").Error; !errors.Is(err, gorm.ErrRecordNotFound) {
+		t.Fatalf("retired library repair history survived: %v", err)
 	}
 }

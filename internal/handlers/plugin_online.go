@@ -18,6 +18,10 @@ type pluginAssetGateway interface {
 	OpenAsset(context.Context, string, string, string) (*hostapi.AssetStream, error)
 }
 
+type pluginConnectionAssetGateway interface {
+	OpenAssetForPluginConnection(context.Context, string, string, string, string, string) (*hostapi.AssetStream, error)
+}
+
 func (a *API) PlayerOnlineLibraries(c *gin.Context) {
 	actor, _ := middleware.ActorFrom(c)
 	items, err := a.pluginRepositories.OnlineLibraries(actor)
@@ -210,6 +214,46 @@ func (a *API) PlayerOnlineAsset(c *gin.Context) {
 			appCode, message = services.CodePluginAssetExpired, "在线媒体资源已过期，请重新开始播放"
 		case "plugin_asset_range_invalid":
 			appCode, message = services.CodeInvalidRequest, "在线媒体资源 Range 请求无效"
+		}
+		writeError(c, a.log, &services.AppError{Code: appCode, Message: message, Cause: err})
+		return
+	}
+	defer func() { _ = stream.Body.Close() }()
+	for name, values := range stream.Header {
+		for _, value := range values {
+			c.Writer.Header().Add(name, value)
+		}
+	}
+	c.Header("Cache-Control", "no-store")
+	c.Status(stream.StatusCode)
+	if c.Request.Method == http.MethodHead || stream.StatusCode == http.StatusRequestedRangeNotSatisfiable {
+		return
+	}
+	_, _ = io.Copy(c.Writer, stream.Body)
+}
+
+// PluginResourceCaptchaAsset serves a short-lived, opaque captcha image that
+// was registered by the exact plugin connection. The image body never enters
+// the JSON login response or browser storage.
+func (a *API) PluginResourceCaptchaAsset(c *gin.Context) {
+	actor, _ := middleware.ActorFrom(c)
+	if !actor.Can(authz.PermissionPluginsInstall) {
+		writeError(c, a.log, &services.AppError{Code: services.CodePermissionDenied, Message: "无权读取资源站验证码"})
+		return
+	}
+	gateway, ok := a.pluginAssets.(pluginConnectionAssetGateway)
+	if !ok {
+		writeError(c, a.log, &services.AppError{Code: services.CodePluginRuntimeUnavailable, Message: "资源站验证码服务不可用"})
+		return
+	}
+	stream, err := gateway.OpenAssetForPluginConnection(c.Request.Context(), c.Param("plugin_id"), c.Param("connection_id"), c.Param("asset_ref"), c.Request.Method, c.GetHeader("Range"))
+	if err != nil {
+		code := hostapi.ErrorCode(err)
+		appCode, message := services.CodePluginAssetExpired, "资源站验证码已过期，请重新登录"
+		if code == "plugin_asset_range_invalid" {
+			appCode, message = services.CodeInvalidRequest, "资源站验证码请求无效"
+		} else if code == "plugin_asset_reference_denied" {
+			appCode, message = services.CodePermissionDenied, "资源站验证码引用无效"
 		}
 		writeError(c, a.log, &services.AppError{Code: appCode, Message: message, Cause: err})
 		return

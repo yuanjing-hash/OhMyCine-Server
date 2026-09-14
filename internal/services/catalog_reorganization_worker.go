@@ -356,6 +356,11 @@ func (w *MediaReorganizationWorker) finalizeCatalogReorganization(ctx context.Co
 			if err := tx.Model(&models.MediaLibrary{}).Where("id=?", library.ID).Updates(map[string]any{"dirty_generation": generation, "updated_at": now}).Error; err != nil {
 				return err
 			}
+			if mediaLibraryRequiresArtifacts(storage.Type, library, libraries.artifacts != nil) {
+				if _, err := libraries.artifacts.BindCatalogGenerationChangesTx(tx, library.ID, generation, p.ArtifactChanges); err != nil {
+					return err
+				}
+			}
 			if libraries.changes != nil {
 				var err error
 				_, err = libraries.changes.RecordTx(tx, library.ID, generation, models.MediaLibraryChangeMetadata, false)

@@ -129,6 +129,7 @@ const (
 	CodeSiteRateLimited                       = "site_rate_limited"
 	CodeSiteResponseInvalid                   = "site_response_invalid"
 	CodeSiteResultExpired                     = "site_result_expired"
+	CodeSiteManagedByPlugin                   = "site_managed_by_plugin"
 	CodeCookieCloudInvalid                    = "cookiecloud_invalid"
 	CodeCookieCloudDisabled                   = "cookiecloud_disabled"
 	CodeCookieCloudAuthentication             = "cookiecloud_authentication_failed"

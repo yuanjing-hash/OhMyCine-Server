@@ -15,6 +15,13 @@ export interface DownloadRouteTargetOption {
   expected_bytes?: number | null
   required_bytes?: number | null
   available_bytes?: number | null
+  execution_location: 'server' | 'node'
+  node_id?: string
+  node_name?: string
+  requires_node_staging: boolean
+  requires_server_staging: boolean
+  node_available_bytes?: number | null
+  server_available_bytes?: number | null
 }
 
 export interface DownloadRoutePreview {

@@ -1,7 +1,9 @@
 name: Server Beta Release
-run-name: Server Beta ${{ inputs.version }}
+run-name: Server Release ${{ inputs.version || github.ref_name }}
 
 on:
+  push:
+    tags: ['server-v*']
   workflow_dispatch:
     inputs:
       version:
@@ -18,6 +20,8 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
       tag_name: ${{ steps.version.outputs.tag_name }}
+      channel: ${{ steps.version.outputs.channel }}
+      commit: ${{ steps.version.outputs.commit }}
 
     steps:
       - name: Checkout requested develop commit
@@ -29,33 +33,27 @@ jobs:
         id: version
         env:
           WORKFLOW_INPUT_VERSION: ${{ inputs.version }}
-        run: python3 .github/scripts/server_beta_release_guard.py resolve-version "$WORKFLOW_INPUT_VERSION" >> "$GITHUB_OUTPUT"
+        run: python3 .github/scripts/server_release_source.py >> "$GITHUB_OUTPUT"
 
       - name: Verify Server-only release workflow contract
         run: |
           python3 .github/scripts/server_beta_release_guard.py check-workflow
           python3 .github/scripts/test_server_beta_release_guard.py
+          python3 .github/scripts/test_docker_release_guard.py
+          python3 .github/scripts/test_server_release_source.py
+          bash -n .github/scripts/docker_smoke.sh
+          bash -n scripts/install-node.sh
+          pwsh -NoLogo -NoProfile -File scripts/test-install-node.ps1
 
       - name: Validate source, tag and release state
         env:
           GH_TOKEN: ${{ github.token }}
           TAG_NAME: ${{ steps.version.outputs.tag_name }}
           VERSION: ${{ steps.version.outputs.version }}
+          CHANNEL: ${{ steps.version.outputs.channel }}
         shell: bash
         run: |
           set -euo pipefail
-
-          if [[ "$GITHUB_REF" != "refs/heads/develop" ]]; then
-            echo "::error::Server Beta Release must be dispatched from develop."
-            exit 1
-          fi
-
-          git fetch --force --prune origin develop
-          remote_develop="$(git rev-parse refs/remotes/origin/develop)"
-          if [[ "$GITHUB_SHA" != "$remote_develop" ]]; then
-            echo "::error::Server beta source must equal the latest origin/develop commit."
-            exit 1
-          fi
 
           if git ls-remote --exit-code --tags origin "refs/tags/${TAG_NAME}" >/dev/null 2>&1; then
             git fetch --force origin "+refs/tags/${TAG_NAME}:refs/tags/${TAG_NAME}"
@@ -67,10 +65,12 @@ jobs:
           fi
 
           release_title="OhMyCine Server v${VERSION} Beta"
+          prerelease=true
+          if [[ "$CHANNEL" == stable ]]; then release_title="OhMyCine Server v${VERSION}"; prerelease=false; fi
           if release_json="$(gh release view "$TAG_NAME" --json tagName,name,isPrerelease,isDraft 2>/dev/null)"; then
             if [[ "$(jq -r '.tagName' <<<"$release_json")" != "$TAG_NAME" ]] ||
                [[ "$(jq -r '.name' <<<"$release_json")" != "$release_title" ]] ||
-               [[ "$(jq -r '.isPrerelease' <<<"$release_json")" != "true" ]] ||
+               [[ "$(jq -r '.isPrerelease' <<<"$release_json")" != "$prerelease" ]] ||
                [[ "$(jq -r '.isDraft' <<<"$release_json")" != "false" ]]; then
               echo "::error::Existing Server release must have the exact Server tag/title and be a published prerelease."
               exit 1
@@ -89,6 +89,7 @@ jobs:
     env:
       VERSION: ${{ needs.resolve.outputs.version }}
       TAG_NAME: ${{ needs.resolve.outputs.tag_name }}
+      CHANNEL: ${{ needs.resolve.outputs.channel }}
 
     steps:
       - name: Checkout selected develop commit
@@ -137,6 +138,31 @@ jobs:
         with:
           version: v2.4.0
 
+      - name: Derive Node release trust root
+        env:
+          OHMYCINE_NODE_MANIFEST_SIGNING_PRIVATE_KEY: ${{ secrets.OHMYCINE_NODE_MANIFEST_SIGNING_PRIVATE_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${OHMYCINE_NODE_MANIFEST_SIGNING_PRIVATE_KEY:-}" ]]; then
+            echo "::error::OHMYCINE_NODE_MANIFEST_SIGNING_PRIVATE_KEY is required; unsigned Node assets are forbidden."
+            exit 1
+          fi
+          trust_root="$(mktemp -d)"
+          trap 'rm -rf -- "$trust_root"' EXIT
+          signing_key="${trust_root}/node-manifest-private.pem"
+          public_key="${trust_root}/node-manifest-public.pem"
+          umask 077
+          printf '%s\n' "$OHMYCINE_NODE_MANIFEST_SIGNING_PRIVATE_KEY" > "$signing_key"
+          unset OHMYCINE_NODE_MANIFEST_SIGNING_PRIVATE_KEY
+          key_bits="$( { openssl rsa -in "$signing_key" -passin pass: -text -noout 2>/dev/null | sed -n 's/Private-Key: (\([0-9][0-9]*\) bit.*/\1/p' | head -n 1; } || true )"
+          if [[ -z "$key_bits" ]] || (( key_bits < 3072 )); then
+            echo "::error::Node manifest signing Secret must contain an RSA private key of at least 3072 bits."
+            exit 1
+          fi
+          openssl rsa -in "$signing_key" -passin pass: -pubout -out "$public_key" 2>/dev/null
+          echo "NODE_RELEASE_PUBLIC_KEY_B64=$(base64 -w 0 "$public_key")" >> "$GITHUB_ENV"
+
       - name: Build and package embedded-WebUI Server archives
         env:
           OHMYCINE_TMDB_READ_ACCESS_TOKEN: ${{ secrets.OHMYCINE_TMDB_READ_ACCESS_TOKEN }}
@@ -152,34 +178,159 @@ jobs:
             echo "::error::OHMYCINE_TMDB_READ_ACCESS_TOKEN contains unsupported characters."
             exit 1
           fi
-
           tmdb_ldflags="-X=github.com/yuanjing-hash/OhMyCine-Server/pkg/metadata/tmdb.BuiltinReadAccessToken=${OHMYCINE_TMDB_READ_ACCESS_TOKEN}"
-          build_ldflags="-X=github.com/yuanjing-hash/OhMyCine-Server/internal/buildinfo.Version=${VERSION} -X=github.com/yuanjing-hash/OhMyCine-Server/internal/buildinfo.Commit=${GITHUB_SHA}"
+          if [[ -z "${NODE_RELEASE_PUBLIC_KEY_B64:-}" ]]; then
+            echo "::error::Node release public trust root is unavailable."
+            exit 1
+          fi
+          build_ldflags="-X=github.com/yuanjing-hash/OhMyCine-Server/internal/buildinfo.Version=${VERSION} -X=github.com/yuanjing-hash/OhMyCine-Server/internal/buildinfo.Commit=${GITHUB_SHA} -X=github.com/yuanjing-hash/OhMyCine-Server/internal/buildinfo.NodeReleasePublicKeyBase64=${NODE_RELEASE_PUBLIC_KEY_B64}"
           release_root="dist/server-beta/${TAG_NAME}"
           windows_dir="${release_root}/OhMyCine-Server-v${VERSION}-windows-x64"
           linux_dir="${release_root}/OhMyCine-Server-v${VERSION}-linux-x64"
-          mkdir -p "$windows_dir" "$linux_dir"
+          linux_arm64_dir="${release_root}/OhMyCine-Server-v${VERSION}-linux-arm64"
+          node_windows_dir="${release_root}/OhMyCine-Node-v${VERSION}-windows-amd64"
+          node_linux_amd64_dir="${release_root}/OhMyCine-Node-v${VERSION}-linux-amd64"
+          node_linux_arm64_dir="${release_root}/OhMyCine-Node-v${VERSION}-linux-arm64"
+          mkdir -p "$windows_dir" "$linux_dir" "$linux_arm64_dir" "$node_windows_dir" "$node_linux_amd64_dir" "$node_linux_arm64_dir"
 
           CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -tags webui -trimpath -ldflags "${tmdb_ldflags} ${build_ldflags} -s -w" -o "${windows_dir}/ohmycine-server.exe" ./cmd/server
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -tags webui -trimpath -ldflags "${tmdb_ldflags} ${build_ldflags} -s -w" -o "${linux_dir}/ohmycine-server" ./cmd/server
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -tags webui -trimpath -ldflags "${tmdb_ldflags} ${build_ldflags} -s -w" -o "${linux_arm64_dir}/ohmycine-server" ./cmd/server
+          if go list -deps ./cmd/node | grep -Eq '(^|/)(webui|pkg/metadata/tmdb)$'; then
+            echo "::error::Node dependency graph contains Server WebUI or TMDB packages."
+            exit 1
+          fi
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "${build_ldflags} -s -w" -o "${node_windows_dir}/ohmycine-node.exe" ./cmd/node
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "${build_ldflags} -s -w" -o "${node_linux_amd64_dir}/ohmycine-node" ./cmd/node
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags "${build_ldflags} -s -w" -o "${node_linux_arm64_dir}/ohmycine-node" ./cmd/node
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          secret = os.environ["OHMYCINE_TMDB_READ_ACCESS_TOKEN"].encode()
+          root = Path(os.environ["release_root"]) if "release_root" in os.environ else Path("dist/server-beta") / os.environ["TAG_NAME"]
+          for binary in root.glob("OhMyCine-Node-v*/ohmycine-node*"):
+              if secret in binary.read_bytes():
+                  raise SystemExit(f"::error::Node binary unexpectedly contains the Server TMDB credential: {binary.name}")
+          PY
           cp README.md "${windows_dir}/README.md"
           cp README.md "${linux_dir}/README.md"
           cp LICENSE "${windows_dir}/LICENSE"
           cp LICENSE "${linux_dir}/LICENSE"
+          cp README.md LICENSE "$linux_arm64_dir/"
+          for node_dir in "$node_windows_dir" "$node_linux_amd64_dir" "$node_linux_arm64_dir"; do
+            cp LICENSE "${node_dir}/LICENSE"
+          done
 
           windows_asset="OhMyCine-Server-v${VERSION}-windows-x64.zip"
           linux_asset="OhMyCine-Server-v${VERSION}-linux-x64.tar.gz"
+          linux_arm64_asset="OhMyCine-Server-v${VERSION}-linux-arm64.tar.gz"
           checksums_asset="OhMyCine-Server-v${VERSION}-SHA256SUMS.txt"
+          node_windows_asset="OhMyCine-Node-v${VERSION}-windows-amd64.zip"
+          node_linux_amd64_asset="OhMyCine-Node-v${VERSION}-linux-amd64.tar.gz"
+          node_linux_arm64_asset="OhMyCine-Node-v${VERSION}-linux-arm64.tar.gz"
           (
             cd "$release_root"
             zip -qr "$windows_asset" "$(basename "$windows_dir")"
             tar -czf "$linux_asset" "$(basename "$linux_dir")"
-            sha256sum "$windows_asset" "$linux_asset" > "$checksums_asset"
+            tar -czf "$linux_arm64_asset" "$(basename "$linux_arm64_dir")"
+            sha256sum "$windows_asset" "$linux_asset" "$linux_arm64_asset" > "$checksums_asset"
+            zip -qr "$node_windows_asset" "$(basename "$node_windows_dir")"
+            tar -czf "$node_linux_amd64_asset" "$(basename "$node_linux_amd64_dir")"
+            tar -czf "$node_linux_arm64_asset" "$(basename "$node_linux_arm64_dir")"
+            [[ "$(unzip -Z1 "$node_windows_asset" | grep -Ec '/(ohmycine-node\.exe|LICENSE)$')" == '2' ]]
+            [[ "$(tar -tzf "$node_linux_amd64_asset" | grep -Ec '/(ohmycine-node|LICENSE)$')" == '2' ]]
+            [[ "$(tar -tzf "$node_linux_arm64_asset" | grep -Ec '/(ohmycine-node|LICENSE)$')" == '2' ]]
+            if unzip -Z1 "$node_windows_asset" | grep -Eiq 'webui|tmdb' || tar -tzf "$node_linux_amd64_asset" | grep -Eiq 'webui|tmdb' || tar -tzf "$node_linux_arm64_asset" | grep -Eiq 'webui|tmdb'; then
+              echo "::error::Node archive contains Server-only WebUI or TMDB files."
+              exit 1
+            fi
           )
 
           echo "WINDOWS_ASSET=${release_root}/${windows_asset}" >> "$GITHUB_ENV"
           echo "LINUX_ASSET=${release_root}/${linux_asset}" >> "$GITHUB_ENV"
+          echo "LINUX_ARM64_ASSET=${release_root}/${linux_arm64_asset}" >> "$GITHUB_ENV"
           echo "CHECKSUMS_ASSET=${release_root}/${checksums_asset}" >> "$GITHUB_ENV"
+          echo "RELEASE_ROOT=${release_root}" >> "$GITHUB_ENV"
+          echo "NODE_WINDOWS_ASSET=${release_root}/${node_windows_asset}" >> "$GITHUB_ENV"
+          echo "NODE_LINUX_AMD64_ASSET=${release_root}/${node_linux_amd64_asset}" >> "$GITHUB_ENV"
+          echo "NODE_LINUX_ARM64_ASSET=${release_root}/${node_linux_arm64_asset}" >> "$GITHUB_ENV"
+
+      - name: Sign Node manifest and render versioned installers
+        env:
+          OHMYCINE_NODE_MANIFEST_SIGNING_PRIVATE_KEY: ${{ secrets.OHMYCINE_NODE_MANIFEST_SIGNING_PRIVATE_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${OHMYCINE_NODE_MANIFEST_SIGNING_PRIVATE_KEY:-}" ]]; then
+            echo "::error::OHMYCINE_NODE_MANIFEST_SIGNING_PRIVATE_KEY is required; unsigned Node assets are forbidden."
+            exit 1
+          fi
+          node_windows_asset="$(basename "$NODE_WINDOWS_ASSET")"
+          node_linux_amd64_asset="$(basename "$NODE_LINUX_AMD64_ASSET")"
+          node_linux_arm64_asset="$(basename "$NODE_LINUX_ARM64_ASSET")"
+          node_manifest="OhMyCine-Node-v${VERSION}-SHA256SUMS.txt"
+          node_signature="${node_manifest}.sig"
+          node_installer_sh="install-ohmycine-node-v${VERSION}.sh"
+          node_installer_ps1="install-ohmycine-node-v${VERSION}.ps1"
+          signing_root="$(mktemp -d)"
+          trap 'rm -rf -- "$signing_root"' EXIT
+          signing_key="${signing_root}/node-manifest-private.pem"
+          public_key="${signing_root}/node-manifest-public.pem"
+          umask 077
+          printf '%s\n' "$OHMYCINE_NODE_MANIFEST_SIGNING_PRIVATE_KEY" > "$signing_key"
+          unset OHMYCINE_NODE_MANIFEST_SIGNING_PRIVATE_KEY
+          key_bits="$( { openssl rsa -in "$signing_key" -passin pass: -text -noout 2>/dev/null | sed -n 's/Private-Key: (\([0-9][0-9]*\) bit.*/\1/p' | head -n 1; } || true )"
+          if [[ -z "$key_bits" ]] || (( key_bits < 3072 )); then
+            echo "::error::Node manifest signing Secret must contain an RSA private key of at least 3072 bits."
+            exit 1
+          fi
+          openssl rsa -in "$signing_key" -passin pass: -pubout -out "$public_key" 2>/dev/null
+          public_key_b64="$(base64 -w 0 "$public_key")"
+          if [[ "$public_key_b64" != "$NODE_RELEASE_PUBLIC_KEY_B64" ]]; then
+            echo "::error::Node signing key changed between Server build and release signing."
+            exit 1
+          fi
+          export public_key_b64 VERSION node_installer_sh node_installer_ps1
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          root = Path(os.environ["RELEASE_ROOT"])
+          replacements = {
+              "__OHMYCINE_NODE_RELEASE_PUBLIC_KEY_BASE64__": os.environ["public_key_b64"],
+              "__OHMYCINE_NODE_RELEASE_VERSION__": os.environ["VERSION"],
+          }
+          for source_name, output_name in (
+              ("scripts/install-node.sh", os.environ["node_installer_sh"]),
+              ("scripts/install-node.ps1", os.environ["node_installer_ps1"]),
+          ):
+              text = Path(source_name).read_text(encoding="utf-8")
+              for marker, value in replacements.items():
+                  if text.count(marker) < 1:
+                      raise SystemExit(f"::error::Missing installer marker {marker} in {source_name}")
+                  text = text.replace(marker, value)
+              if "__OHMYCINE_NODE_RELEASE_" in text:
+                  raise SystemExit(f"::error::Unrendered installer marker in {source_name}")
+              target = root / output_name
+              target.write_text(text, encoding="utf-8", newline="\n")
+              target.chmod(0o755 if target.suffix == ".sh" else 0o644)
+          PY
+          (
+            cd "$RELEASE_ROOT"
+            sha256sum "$node_windows_asset" "$node_linux_amd64_asset" "$node_linux_arm64_asset" "$node_installer_sh" "$node_installer_ps1" > "$node_manifest"
+            openssl dgst -sha256 -sign "$signing_key" -passin pass: -out "$node_signature" "$node_manifest"
+            openssl dgst -sha256 -verify "$public_key" -signature "$node_signature" "$node_manifest"
+            bash "$node_installer_sh" --version "$VERSION" --verify-only --manifest "$node_manifest" --signature "$node_signature" --archive "$node_linux_amd64_asset" --asset-name "$node_linux_amd64_asset"
+            pwsh -NoLogo -NoProfile -File "$node_installer_ps1" -Version "$VERSION" -VerifyOnly -ManifestPath "$PWD/$node_manifest" -SignaturePath "$PWD/$node_signature" -ArchivePath "$PWD/$node_windows_asset" -AssetName "$node_windows_asset"
+          )
+          rm -f -- "$signing_key"
+
+          echo "NODE_MANIFEST_ASSET=${RELEASE_ROOT}/${node_manifest}" >> "$GITHUB_ENV"
+          echo "NODE_SIGNATURE_ASSET=${RELEASE_ROOT}/${node_signature}" >> "$GITHUB_ENV"
+          echo "NODE_INSTALLER_SH=${RELEASE_ROOT}/${node_installer_sh}" >> "$GITHUB_ENV"
+          echo "NODE_INSTALLER_PS1=${RELEASE_ROOT}/${node_installer_ps1}" >> "$GITHUB_ENV"
 
       - name: Revalidate latest develop and publish Server-only prerelease
         env:
@@ -188,19 +339,9 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [[ "$GITHUB_REF" != "refs/heads/develop" ]]; then
-            echo "::error::Server Beta Release must still be running from develop."
-            exit 1
-          fi
-
-          # Re-fetch immediately before the first remote mutation so a stale
-          # queued build cannot publish after develop has advanced.
-          git fetch --force --prune origin develop
-          remote_develop="$(git rev-parse refs/remotes/origin/develop)"
-          if [[ "$GITHUB_SHA" != "$remote_develop" ]]; then
-            echo "::error::origin/develop advanced while Server assets were building; dispatch again from the new tip."
-            exit 1
-          fi
+          # Repeat source validation before any remote mutation.
+          WORKFLOW_INPUT_VERSION="$VERSION" python3 .github/scripts/server_release_source.py > "$RUNNER_TEMP/release-source"
+          grep -Fxq "channel=$CHANNEL" "$RUNNER_TEMP/release-source"
 
           tag_exists=false
           if git ls-remote --exit-code --tags origin "refs/tags/${TAG_NAME}" >/dev/null 2>&1; then
@@ -215,11 +356,13 @@ jobs:
 
           release_exists=false
           release_title="OhMyCine Server v${VERSION} Beta"
+          prerelease=true
+          if [[ "$CHANNEL" == stable ]]; then release_title="OhMyCine Server v${VERSION}"; prerelease=false; fi
           if release_json="$(gh release view "$TAG_NAME" --json tagName,name,isPrerelease,isDraft 2>/dev/null)"; then
             release_exists=true
             if [[ "$(jq -r '.tagName' <<<"$release_json")" != "$TAG_NAME" ]] ||
                [[ "$(jq -r '.name' <<<"$release_json")" != "$release_title" ]] ||
-               [[ "$(jq -r '.isPrerelease' <<<"$release_json")" != "true" ]] ||
+               [[ "$(jq -r '.isPrerelease' <<<"$release_json")" != "$prerelease" ]] ||
                [[ "$(jq -r '.isDraft' <<<"$release_json")" != "false" ]]; then
               echo "::error::Existing Server release must have the exact Server tag/title and be a published prerelease."
               exit 1
@@ -230,10 +373,10 @@ jobs:
             create_args=(
               "$TAG_NAME"
               --title "$release_title"
-              --notes "OhMyCine Server v${VERSION} Beta. Server-only archives include the embedded Web management UI."
-              --prerelease
+              --notes "OhMyCine Server v${VERSION} Beta. Server archives include the embedded Web management UI; separately signed Node assets cover Linux amd64/arm64 and Windows amd64."
               --latest=false
             )
+            if [[ "$prerelease" == true ]]; then create_args+=(--prerelease); fi
             if [[ "$tag_exists" == "true" ]]; then
               create_args+=(--verify-tag)
             else
@@ -251,10 +394,24 @@ jobs:
           release_json="$(gh release view "$TAG_NAME" --json tagName,name,isPrerelease,isDraft)"
           if [[ "$(jq -r '.tagName' <<<"$release_json")" != "$TAG_NAME" ]] ||
              [[ "$(jq -r '.name' <<<"$release_json")" != "$release_title" ]] ||
-             [[ "$(jq -r '.isPrerelease' <<<"$release_json")" != "true" ]] ||
+             [[ "$(jq -r '.isPrerelease' <<<"$release_json")" != "$prerelease" ]] ||
              [[ "$(jq -r '.isDraft' <<<"$release_json")" != "false" ]]; then
             echo "::error::Server prerelease verification failed."
             exit 1
           fi
 
-          gh release upload "$TAG_NAME" "$WINDOWS_ASSET" "$LINUX_ASSET" "$CHECKSUMS_ASSET" --clobber
+          gh release upload "$TAG_NAME" "$WINDOWS_ASSET" "$LINUX_ASSET" "$LINUX_ARM64_ASSET" "$CHECKSUMS_ASSET" "$NODE_WINDOWS_ASSET" "$NODE_LINUX_AMD64_ASSET" "$NODE_LINUX_ARM64_ASSET" "$NODE_MANIFEST_ASSET" "$NODE_SIGNATURE_ASSET" "$NODE_INSTALLER_SH" "$NODE_INSTALLER_PS1" --clobber
+
+  docker:
+    name: Publish multi-architecture Docker images
+    needs: [resolve, release]
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/docker-publish.yml
+    with:
+      version: ${{ needs.resolve.outputs.version }}
+      commit: ${{ needs.resolve.outputs.commit }}
+    secrets:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}

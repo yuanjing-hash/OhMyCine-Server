@@ -173,6 +173,9 @@ func TestMediaLibraryScanUsesSharedTMDBRecognitionAndPersistentCache(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
+	if first.Kind != "incremental" {
+		t.Fatalf("routine ScanNow used %q, want incremental", first.Kind)
+	}
 	if first.Matched != 1 || first.Unrecognized != 0 || first.CacheHits != 0 {
 		t.Fatalf("first run=%+v", first)
 	}

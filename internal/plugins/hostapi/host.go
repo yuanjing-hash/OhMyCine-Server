@@ -11,6 +11,7 @@ import (
 	"mime"
 	"net"
 	"net/http"
+	"net/http/cookiejar"
 	"net/url"
 	"regexp"
 	"sort"
@@ -274,7 +275,7 @@ func (host *Host) registerAsset(ctx context.Context, pluginID string, authorizat
 	var err error
 	if inline {
 		body, err = base64.StdEncoding.DecodeString(input.BodyBase64)
-		if err != nil || len(body) == 0 || len(body) > maxAssetRequestBytes || (input.ContentType != "application/json" && input.ContentType != "text/vtt; charset=utf-8") || len(input.Headers) != 0 {
+		if err != nil || len(body) == 0 || len(body) > maxAssetRequestBytes || !allowedInlineAssetContentType(input.ContentType) || len(input.Headers) != 0 {
 			return nil, invalid("plugin_asset_body_invalid", err)
 		}
 		if input.ContentType == "application/json" && !json.Valid(body) {
@@ -328,6 +329,15 @@ func (host *Host) registerAsset(ctx context.Context, pluginID string, authorizat
 	host.assets[reference] = asset
 	host.assetsMu.Unlock()
 	return map[string]any{"ref": reference, "expiresAt": asset.ExpiresAt.Format(time.RFC3339Nano)}, nil
+}
+
+func allowedInlineAssetContentType(value string) bool {
+	switch value {
+	case "application/json", "text/vtt; charset=utf-8", "image/png", "image/jpeg", "image/webp":
+		return true
+	default:
+		return false
+	}
 }
 
 // ResolveAsset is a low-level in-process lookup retained for runtime tests.
@@ -613,6 +623,18 @@ func (host *Host) http(ctx context.Context, pluginID string, authorization plugi
 		}
 	}
 	client := host.clientForPermissions(permissions, false)
+	var captureJar http.CookieJar
+	if input.CaptureCredentialScope != "" {
+		// A private per-call jar preserves same-origin Set-Cookie values across a
+		// login redirect without exposing them to guest memory or another plugin
+		// invocation. Redirect targets are still checked by clientForPermissions.
+		jar, jarErr := cookiejar.New(nil)
+		if jarErr != nil {
+			return httpResponse{}, invalid("plugin_credential_capture_unavailable", jarErr)
+		}
+		client.Jar = jar
+		captureJar = jar
+	}
 	response, err := client.Do(request)
 	if err != nil {
 		if response != nil && response.Body != nil {
@@ -635,7 +657,11 @@ func (host *Host) http(ctx context.Context, pluginID string, authorization plugi
 	}
 	result := httpResponse{Status: response.StatusCode, Headers: safeResponseHeaders(response.Header), BodyBase64: base64.StdEncoding.EncodeToString(responseBody)}
 	if input.CaptureCredentialScope != "" {
-		reference, expiresAt, captureErr := host.captureCredential(pluginID, input.ConnectionID, input.CaptureCredentialScope, authorization, target, response)
+		redirectCookies := []*http.Cookie(nil)
+		if captureJar != nil {
+			redirectCookies = captureJar.Cookies(target)
+		}
+		reference, expiresAt, captureErr := host.captureCredential(pluginID, input.ConnectionID, input.CaptureCredentialScope, authorization, target, response, redirectCookies)
 		if captureErr != nil {
 			return httpResponse{}, captureErr
 		}
@@ -647,15 +673,27 @@ func (host *Host) http(ctx context.Context, pluginID string, authorization plugi
 	return result, nil
 }
 
-func (host *Host) captureCredential(pluginID, connectionID, scope string, authorization pluginAuthorization, initial *url.URL, response *http.Response) (string, time.Time, error) {
+func (host *Host) captureCredential(pluginID, connectionID, scope string, authorization pluginAuthorization, initial *url.URL, response *http.Response, redirectCookies []*http.Cookie) (string, time.Time, error) {
 	if response.Request == nil || response.Request.URL == nil || !sameHTTPSOrigin(initial, response.Request.URL) {
 		// A successful cross-origin redirect may still be useful to the plugin,
 		// but it can never be a credential-capture boundary.
 		return "", time.Time{}, nil
 	}
-	cookies, err := validateCapturedCookies(response.Request.URL, response.Cookies())
+	redirectCaptured, err := validateCapturedCookies(response.Request.URL, redirectCookies)
 	if err != nil {
 		return "", time.Time{}, err
+	}
+	responseCaptured, err := validateCapturedCookies(response.Request.URL, response.Cookies())
+	if err != nil {
+		return "", time.Time{}, err
+	}
+	// The private Jar also contains the final response cookies. Merge the two
+	// independently validated views by name so ordinary Set-Cookie responses do
+	// not look like an attacker-supplied duplicate. The final response wins,
+	// which preserves explicit cookie deletion and replacement semantics.
+	cookies := mergeCredentialCaptureCookies(redirectCaptured, responseCaptured)
+	if len(cookies) > 128 {
+		return "", time.Time{}, denied("plugin_credential_capture_invalid", nil)
 	}
 	if len(cookies) == 0 {
 		return "", time.Time{}, nil
@@ -680,6 +718,26 @@ func (host *Host) captureCredential(pluginID, connectionID, scope string, author
 	}
 	host.captures[reference] = capture
 	return reference, expiresAt, nil
+}
+
+func mergeCredentialCaptureCookies(base, final []capturedCookie) []capturedCookie {
+	byName := make(map[string]capturedCookie, len(base)+len(final))
+	for _, cookie := range base {
+		byName[cookie.Name] = cookie
+	}
+	for _, cookie := range final {
+		byName[cookie.Name] = cookie
+	}
+	names := make([]string, 0, len(byName))
+	for name := range byName {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	result := make([]capturedCookie, 0, len(names))
+	for _, name := range names {
+		result = append(result, byName[name])
+	}
+	return result
 }
 
 func (host *Host) commitCredential(pluginID string, authorization pluginAuthorization, payload []byte) (map[string]any, error) {
@@ -722,7 +780,7 @@ func (host *Host) commitCredential(pluginID string, authorization pluginAuthoriz
 	}
 	result := host.db.Model(&models.PluginConnection{}).
 		Where("id = ? AND plugin_id = ? AND enabled = ? AND revision = ? AND credential_scope = ? AND credential_mode = ?", connection.ID, pluginID, true, connection.Revision, input.Scope, models.PluginCredentialModeCookie).
-		Updates(map[string]any{"credential_ciphertext": ciphertext, "revision": connection.Revision + 1, "updated_at": now})
+		Updates(map[string]any{"credential_ciphertext": ciphertext, "credential_version": connection.CredentialVersion + 1, "revision": connection.Revision + 1, "updated_at": now})
 	if result.Error != nil {
 		return nil, invalid("plugin_credential_store_unavailable", result.Error)
 	}

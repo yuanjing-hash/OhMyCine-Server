@@ -47,7 +47,7 @@ func (s *MediaLibraryStructureService) finalizeCatalogStructureRepair(ctx contex
 				}
 				return persistCatalogStructureStateTx(tx, repair.ID, next, nil)
 			}
-			if !plan.SelectionBound && next.AfterMoves < len(plan.Items) {
+			if (!plan.SelectionBound || next.FailedItems+next.BlockedItems > 0 || next.Cancelled) && next.AfterMoves < len(plan.Items) {
 				for checked := 0; checked < CatalogBatchRows && next.AfterMoves < len(plan.Items); checked++ {
 					item := plan.Items[next.AfterMoves]
 					complete, err := deleteCatalogStructureIssueBatchTx(tx, repair.LibraryID, next.DiagnosisJobID, next.DiagnosisGeneration, "", &item)
@@ -97,9 +97,6 @@ func (s *MediaLibraryStructureService) finalizeCatalogStructureRepair(ctx contex
 					if s.artifacts == nil {
 						return ErrCatalogInvalid
 					}
-					if _, err := s.artifacts.BindCatalogGenerationTx(tx, library.ID, next.ArtifactGeneration); err != nil {
-						return err
-					}
 				} else {
 					var err error
 					readied, err = s.changes.MarkGenerationReadyTx(tx, library.ID, next.ArtifactGeneration)
@@ -112,13 +109,40 @@ func (s *MediaLibraryStructureService) finalizeCatalogStructureRepair(ctx contex
 				return err
 			}
 			next.Stage = "completed"
-			if err := persistCatalogStructureStateTx(tx, repair.ID, next, map[string]any{"phase": "completed", "processed_items": len(plan.Items) + len(plan.RecycleItems), "finished_at": finished, "last_error_code": ""}); err != nil {
+			var succeeded int64
+			if err := tx.Model(&models.MediaLibraryStructureRepairItem{}).Where("repair_id=? AND status=?", repair.ID, structureRepairItemSucceeded).Count(&succeeded).Error; err != nil {
 				return err
 			}
-			if err := SettleCatalogPhysicalWriteTx(tx, permit, claim); err != nil {
+			if err := persistCatalogStructureStateTx(tx, repair.ID, next, map[string]any{"phase": "completed", "processed_items": succeeded + int64(next.FailedItems+next.BlockedItems), "succeeded_items": succeeded, "failed_items": next.FailedItems, "blocked_items": next.BlockedItems, "current_action": "", "current_item": "", "current_batch_size": 0, "finished_at": finished, "last_error_code": ""}); err != nil {
 				return err
 			}
-			if err := s.audit.Record(tx, &repair.OwnerID, "media_library.structure_repair.complete", "media_library", uintID(repair.LibraryID), "success", map[string]any{"scope": repair.Scope, "move_count": len(plan.Items), "recycle_count": len(plan.RecycleItems)}, RequestContext{}); err != nil {
+			if next.cancelPermit != nil {
+				if err := validateCancelledStructurePermitTx(tx, permit, repair); err != nil {
+					return err
+				}
+				settled := tx.Model(&models.CatalogPhysicalWrite{}).Where("id=? AND revision=? AND state='quiescent'", permit.evidence.ID, permit.evidence.Revision).Updates(map[string]any{"state": "settled", "settled_at": finished, "updated_at": finished})
+				if settled.Error != nil {
+					return settled.Error
+				}
+				if settled.RowsAffected != 1 {
+					return ErrCatalogFence
+				}
+			} else if err := SettleCatalogPhysicalWriteTx(tx, permit, claim); err != nil {
+				return err
+			}
+			outcome := "success"
+			if next.FailedItems+next.BlockedItems > 0 || next.Cancelled {
+				outcome = "partial"
+				next.Stage = "partial_finalized"
+				code := CodeMediaLibraryStructureApplyFailed
+				if next.Cancelled {
+					next.Stage, code, outcome = "cancelled_finalized", "structure_cancelled", "cancelled"
+				}
+				if err := persistCatalogStructureStateTx(tx, repair.ID, next, map[string]any{"phase": "failed", "processed_items": next.OriginalTotalItems, "last_error_code": code}); err != nil {
+					return err
+				}
+			}
+			if err := s.audit.Record(tx, &repair.OwnerID, "media_library.structure_repair.complete", "media_library", uintID(repair.LibraryID), outcome, map[string]any{"scope": repair.Scope, "move_count": len(plan.Items), "recycle_count": len(plan.RecycleItems)}, RequestContext{}); err != nil {
 				return err
 			}
 			done = true

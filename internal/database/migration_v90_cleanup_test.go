@@ -12,7 +12,7 @@ func TestCatalogArtifactCleanupV90PreservesHistoricalMarkersWithoutAttribution(t
 	db := structureMigrationDB(t, 89)
 	library := seedStructureMigrationLibrary(t, db, 89, "cleanup-owner", "healthy", 0, 0)
 	run := models.MediaArtifactRun{ID: "legacy-generator", LibraryID: library.ID, Generation: 1, PolicyJSON: "{}", Status: models.MediaArtifactStatusCompleted}
-	if err := db.Create(&run).Error; err != nil {
+	if err := db.Omit("catalog_binding_id").Create(&run).Error; err != nil {
 		t.Fatal(err)
 	}
 	artifact := models.MediaArtifact{OpaqueID: "cleanup-private", LibraryID: library.ID, RunID: run.ID, RelativePath: "movie.nfo", Managed: true, Status: models.MediaArtifactStatusCleanup}

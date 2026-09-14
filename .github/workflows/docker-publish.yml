@@ -1,0 +1,164 @@
+name: Publish Docker images
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Published Server release tag (server-vX.Y.Z)
+        required: true
+        type: string
+  workflow_call:
+    inputs:
+      version: { required: true, type: string }
+      commit: { required: true, type: string }
+    secrets:
+      DOCKERHUB_USERNAME: { required: true }
+      DOCKERHUB_TOKEN: { required: true }
+permissions:
+  contents: read
+  packages: write
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: server-docker-publish
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Resolve published Server release and source branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUEST_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+          CALL_VERSION: ${{ inputs.version }}
+          CALL_COMMIT: ${{ inputs.commit }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="$REQUEST_TAG"
+          if [[ -n "$CALL_VERSION" ]]; then tag="server-v${CALL_VERSION}"; fi
+          [[ "$tag" =~ ^server-v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+          gh release view "$tag" --json tagName,isPrerelease,isDraft > "$RUNNER_TEMP/docker-release.json"
+          [[ "$(jq -r '.isDraft' "$RUNNER_TEMP/docker-release.json")" == false ]]
+          [[ "$(jq -r '.tagName' "$RUNNER_TEMP/docker-release.json")" == "$tag" ]]
+          channel=stable
+          branch=main
+          if [[ "$(jq -r '.isPrerelease' "$RUNNER_TEMP/docker-release.json")" == true ]]; then channel=beta; branch=develop; fi
+          git fetch origin "refs/tags/${tag}:refs/tags/${tag}" "+refs/heads/${branch}:refs/remotes/origin/${branch}"
+          commit="$(git rev-parse "refs/tags/${tag}^{commit}")"
+          git merge-base --is-ancestor "$commit" "refs/remotes/origin/${branch}"
+          if [[ -n "$CALL_VERSION" ]]; then
+            [[ "$CALL_COMMIT" =~ ^[0-9a-f]{40}$ && "$commit" == "$CALL_COMMIT" ]]
+          fi
+          git checkout --detach "$commit"
+          echo "VERSION=${tag#server-v}" >> "$GITHUB_ENV"
+          echo "RELEASE_CHANNEL=$channel" >> "$GITHUB_ENV"
+          echo "IMAGE_OWNER=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_ENV"
+      - name: Validate Docker Hub configuration
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          namespace="${DOCKERHUB_USERNAME,,}"
+          if [[ ! "$namespace" =~ ^[a-z0-9][a-z0-9_-]{0,127}$ ]] || [[ -z "$DOCKERHUB_TOKEN" ]]; then
+            echo '::error::Configure a valid DOCKERHUB_USERNAME and a nonempty DOCKERHUB_TOKEN in Actions Secrets.'
+            exit 1
+          fi
+          echo "DOCKERHUB_NAMESPACE=$namespace" >> "$GITHUB_ENV"
+      - name: Fetch verified Release binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+          tag="server-v${VERSION}"
+          mkdir -p build/container-assets build/container-release/{amd64,arm64}
+          gh release download "$tag" --dir build/container-assets \
+            --pattern "OhMyCine-Server-v${VERSION}-*" \
+            --pattern "OhMyCine-Node-v${VERSION}-*" \
+            --pattern "install-ohmycine-node-v${VERSION}.*"
+          (cd build/container-assets && sha256sum -c "OhMyCine-Server-v${VERSION}-SHA256SUMS.txt" && sha256sum -c "OhMyCine-Node-v${VERSION}-SHA256SUMS.txt")
+          for arch in amd64 arm64; do
+            server_arch="$arch"
+            if [[ "$arch" == amd64 ]]; then server_arch=x64; fi
+            tar -xzf "build/container-assets/OhMyCine-Server-v${VERSION}-linux-${server_arch}.tar.gz" \
+              -C "build/container-release/${arch}" --strip-components=1 "OhMyCine-Server-v${VERSION}-linux-${server_arch}/ohmycine-server"
+            tar -xzf "build/container-assets/OhMyCine-Node-v${VERSION}-linux-${arch}.tar.gz" \
+              -C "build/container-release/${arch}" --strip-components=1 "OhMyCine-Node-v${VERSION}-linux-${arch}/ohmycine-node"
+          done
+          echo "IMAGE_OWNER=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_ENV"
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: |
+            ghcr.io/${{ env.IMAGE_OWNER }}/ohmycine-server
+            docker.io/${{ env.DOCKERHUB_NAMESPACE }}/ohmycine-server
+          tags: |
+            type=raw,value=v${{ env.VERSION }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          target: release
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+      - uses: docker/metadata-action@v5
+        id: node-meta
+        with:
+          images: |
+            ghcr.io/${{ env.IMAGE_OWNER }}/ohmycine-node
+            docker.io/${{ env.DOCKERHUB_NAMESPACE }}/ohmycine-node
+          tags: |
+            type=raw,value=v${{ env.VERSION }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.node
+          target: release
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.node-meta.outputs.tags }}
+          labels: ${{ steps.node-meta.outputs.labels }}
+      - name: Smoke test both architectures with isolated state
+        env:
+          IMAGE_REGISTRIES: ghcr.io/${{ env.IMAGE_OWNER }},docker.io/${{ env.DOCKERHUB_NAMESPACE }}
+        run: bash .github/scripts/docker_smoke.sh
+      - name: Promote only the newest published channel release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE_REGISTRIES: ghcr.io/${{ env.IMAGE_OWNER }},docker.io/${{ env.DOCKERHUB_NAMESPACE }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/releases" > "$RUNNER_TEMP/server-releases.json"
+          if [[ "$(python3 .github/scripts/docker_release_guard.py "$VERSION" "$RELEASE_CHANNEL" < "$RUNNER_TEMP/server-releases.json")" == true ]]; then
+            aliases=(beta)
+            if [[ "$RELEASE_CHANNEL" == stable ]]; then aliases=(stable latest); fi
+            IFS=',' read -ra registries <<< "$IMAGE_REGISTRIES"
+            for registry in "${registries[@]}"; do
+              for component in server node; do
+                image="${registry}/ohmycine-${component}"
+                for alias in "${aliases[@]}"; do
+                  docker buildx imagetools create --tag "${image}:${alias}" "${image}:v${VERSION}"
+                done
+              done
+            done
+          else
+            echo 'A newer release exists in this channel; versioned images remain available without moving channel tags backwards.'
+          fi

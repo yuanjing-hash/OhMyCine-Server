@@ -3,13 +3,71 @@ package services
 import (
 	"context"
 	"encoding/json"
+	"strconv"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/rs/zerolog"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/authz"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
 )
+
+func TestUnifiedScheduleMediaLibraryPerformsExplicitFullComparison(t *testing.T) {
+	libraries, db, actor, storage, profile := mediaLibraryTestService(t)
+	var administrator models.Role
+	if err := db.Where("code = ?", authz.RoleAdministrator).First(&administrator).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Create(&models.UserRole{UserID: actor.User.ID, RoleID: administrator.ID, CreatedAt: time.Now().UTC()}).Error; err != nil {
+		t.Fatal(err)
+	}
+	library, err := libraries.Create(context.Background(), actor, testLibraryInput("scheduled full", storage, profile, false), RequestContext{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := NewUnifiedScheduleService(db, nil, NewAuthorizationService(db), libraries, nil, nil, nil, nil, zerolog.Nop())
+	now := time.Now().UTC()
+	definition := createDueSchedule(t, service, actor, now, "run_once", "skip")
+	definition.ActionType, definition.TargetType, definition.TargetID = "media_library_scan", "media_library", strconv.FormatUint(uint64(library.ID), 10)
+	if err := db.Save(&definition).Error; err != nil {
+		t.Fatal(err)
+	}
+	run := models.ScheduleRun{ID: uuid.NewString(), ScheduleID: definition.ID, ScheduledAt: now, Status: "queued", CreatedAt: now, UpdatedAt: now}
+	if err := db.Create(&run).Error; err != nil {
+		t.Fatal(err)
+	}
+	payload, _ := json.Marshal(scheduleJobPayload{RunID: run.ID, DefinitionID: definition.ID, Revision: definition.Revision})
+	result := service.run(context.Background(), nil, ClaimedJob{Job: models.Job{PayloadJSON: string(payload), AttemptCount: 1}})
+	if result.ErrorCode != "" || result.RetryAt != nil {
+		t.Fatalf("scheduled full failed: %+v", result)
+	}
+	var scan models.MediaLibraryScanRun
+	if err := db.Where("library_id = ?", library.ID).Order("id DESC").First(&scan).Error; err != nil {
+		t.Fatal(err)
+	}
+	if scan.Kind != "full" || scan.Partial || scan.Status != "success" {
+		t.Fatalf("scheduled scan=%+v", scan)
+	}
+}
+
+func TestManagedLibraryScheduleRefreshesOldLabelWithoutChangingCron(t *testing.T) {
+	service, _, actor, now := scheduleFixture(t)
+	if err := syncManagedSchedule(service.db, actor.User.ID, "媒体库增量复核 · A · 7", "media_library_scan", "media_library", "7", "15 4 * * 2", "UTC", true, true, now); err != nil {
+		t.Fatal(err)
+	}
+	key := managedScheduleKey("media_library_scan", "media_library", "7")
+	if err := syncManagedSchedule(service.db, actor.User.ID, "媒体库全量核对（仅处理云端差异） · A · 7", "media_library_scan", "media_library", "7", "0 3 * * *", "Asia/Shanghai", true, false, now); err != nil {
+		t.Fatal(err)
+	}
+	var row models.ScheduleDefinition
+	if err := service.db.First(&row, "managed_key = ?", key).Error; err != nil {
+		t.Fatal(err)
+	}
+	if row.Name != "媒体库全量核对（仅处理云端差异） · A · 7" || row.CronExpression != "15 4 * * 2" || row.Timezone != "UTC" || row.Revision != 1 {
+		t.Fatalf("startup refresh changed execution policy: %+v", row)
+	}
+}
 
 func scheduleFixture(t *testing.T) (*UnifiedScheduleService, *QueueService, Actor, time.Time) {
 	t.Helper()
@@ -136,14 +194,14 @@ func TestManagedScheduleDoesNotAdoptOrOverwriteManualDefinition(t *testing.T) {
 
 func TestLegacySyncPreservesEditedManagedCronUntilBusinessSettingChanges(t *testing.T) {
 	service, _, actor, now := scheduleFixture(t)
-	if err := syncManagedSchedule(service.db, actor.User.ID, "媒体库全量扫描 · A · 7", "media_library_scan", "media_library", "7", "0 3 * * *", "Asia/Shanghai", true, true, now); err != nil {
+	if err := syncManagedSchedule(service.db, actor.User.ID, "媒体库增量复核 · A · 7", "media_library_scan", "media_library", "7", "0 3 * * *", "Asia/Shanghai", true, true, now); err != nil {
 		t.Fatal(err)
 	}
 	key := managedScheduleKey("media_library_scan", "media_library", "7")
 	if err := service.db.Model(&models.ScheduleDefinition{}).Where("managed_key = ?", key).Updates(map[string]any{"cron_expression": "15 4 * * 2", "timezone": "UTC", "overlap_policy": "queue"}).Error; err != nil {
 		t.Fatal(err)
 	}
-	if err := syncManagedSchedule(service.db, actor.User.ID, "媒体库全量扫描 · A · 7", "media_library_scan", "media_library", "7", "0 */6 * * *", "Asia/Shanghai", true, false, now.Add(time.Hour)); err != nil {
+	if err := syncManagedSchedule(service.db, actor.User.ID, "媒体库增量复核 · A · 7", "media_library_scan", "media_library", "7", "0 */6 * * *", "Asia/Shanghai", true, false, now.Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 	var preserved models.ScheduleDefinition
@@ -153,7 +211,7 @@ func TestLegacySyncPreservesEditedManagedCronUntilBusinessSettingChanges(t *test
 	if preserved.CronExpression != "15 4 * * 2" || preserved.Timezone != "UTC" || preserved.OverlapPolicy != "queue" {
 		t.Fatalf("startup sync overwrote user schedule: %+v", preserved)
 	}
-	if err := syncManagedSchedule(service.db, actor.User.ID, "媒体库全量扫描 · A · 7", "media_library_scan", "media_library", "7", "0 */6 * * *", "Asia/Shanghai", false, true, now.Add(2*time.Hour)); err != nil {
+	if err := syncManagedSchedule(service.db, actor.User.ID, "媒体库增量复核 · A · 7", "media_library_scan", "media_library", "7", "0 */6 * * *", "Asia/Shanghai", false, true, now.Add(2*time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 	var updated models.ScheduleDefinition

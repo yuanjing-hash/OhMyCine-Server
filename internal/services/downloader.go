@@ -20,15 +20,20 @@ import (
 )
 
 type DownloaderService struct {
-	db          *gorm.DB
-	audit       *AuditService
-	credentials *credential.Store
-	registry    *downloadpkg.Registry
-	connections *ConnectionService
+	db            *gorm.DB
+	audit         *AuditService
+	credentials   *credential.Store
+	registry      *downloadpkg.Registry
+	connections   *ConnectionService
+	transferNodes *TransferNodeService
 }
 
 func (s *DownloaderService) SetConnectionService(connections *ConnectionService) {
 	s.connections = connections
+}
+
+func (s *DownloaderService) SetTransferNodeService(nodes *TransferNodeService) {
+	s.transferNodes = nodes
 }
 
 func NewDownloaderService(db *gorm.DB, audit *AuditService, credentials *credential.Store, registry *downloadpkg.Registry) *DownloaderService {
@@ -45,6 +50,10 @@ type DownloaderInput struct {
 	StorageID              *uint
 	ProviderDirectoryToken string
 	AutoListenLifeEvents   bool
+	ExecutionLocation      string
+	NodeID                 string
+	DownloaderSaveRoot     string
+	NodeMountRoot          string
 }
 
 type UpdateDownloaderInput struct {
@@ -58,6 +67,10 @@ type UpdateDownloaderInput struct {
 	StorageID              *uint
 	ProviderDirectoryToken *string
 	AutoListenLifeEvents   *bool
+	ExecutionLocation      *string
+	NodeID                 *string
+	DownloaderSaveRoot     *string
+	NodeMountRoot          *string
 }
 
 type DownloaderHealth struct {
@@ -85,6 +98,11 @@ type DownloaderSummary struct {
 	AutoListenLifeEvents        bool                     `json:"auto_listen_life_events"`
 	LifeEventDefaultLibraryID   *uint                    `json:"life_event_default_library_id"`
 	LifeEventDefaultLibraryName string                   `json:"life_event_default_library_name"`
+	ExecutionLocation           string                   `json:"execution_location"`
+	NodeID                      *string                  `json:"node_id,omitempty"`
+	NodeName                    string                   `json:"node_name,omitempty"`
+	DownloaderSaveRoot          string                   `json:"downloader_save_root,omitempty"`
+	NodeMountRoot               string                   `json:"node_mount_root,omitempty"`
 }
 
 func (s *DownloaderService) List(actor Actor) ([]DownloaderSummary, error) {
@@ -122,9 +140,38 @@ func (s *DownloaderService) CreateContext(ctx context.Context, actor Actor, inpu
 	if !ok {
 		return DownloaderSummary{}, appError(CodeDownloaderTypeUnsupported, "当前 Server 不支持该下载器类型", nil)
 	}
-	baseURL, storage, err := s.validateDownloaderConfig(providerType, input.BaseURL, input.Username, input.Password, input.StorageID)
-	if err != nil {
-		return DownloaderSummary{}, err
+	executionLocation := normalizeExecutionLocation(input.ExecutionLocation)
+	var binding *models.NodeDownloaderBinding
+	var executionNode *models.TransferNode
+	baseURL := ""
+	var storage *uint
+	if executionLocation == models.NodeLocationRemote {
+		if s.transferNodes == nil {
+			return DownloaderSummary{}, appError(CodeDownloaderUnavailable, "传输节点服务不可用", nil)
+		}
+		switch providerType {
+		case models.DownloaderTypeQBittorrent:
+		case models.DownloaderTypePan115Offline:
+			if input.AutoListenLifeEvents {
+				return DownloaderSummary{}, appError(CodeInvalidRequest, "节点 115 下载器暂不承接生活事件自动摄取", nil)
+			}
+			_, storage, err = s.validateDownloaderConfig(providerType, "", "", "", input.StorageID)
+			if err != nil {
+				return DownloaderSummary{}, err
+			}
+			node, nodeErr := s.prepareNodeStorageDownloader(input.NodeID)
+			if nodeErr != nil {
+				return DownloaderSummary{}, nodeErr
+			}
+			executionNode = &node
+		default:
+			return DownloaderSummary{}, appError(CodeInvalidRequest, "当前传输节点不支持该下载器类型", nil)
+		}
+	} else {
+		baseURL, storage, err = s.validateDownloaderConfig(providerType, input.BaseURL, input.Username, input.Password, input.StorageID)
+		if err != nil {
+			return DownloaderSummary{}, err
+		}
 	}
 	providerDirectoryID, providerDirectoryPath := "", ""
 	if providerType == models.DownloaderTypePan115Offline {
@@ -144,22 +191,46 @@ func (s *DownloaderService) CreateContext(ctx context.Context, actor Actor, inpu
 		}
 	}
 	id := uuid.NewString()
-	username, err := s.credentials.Encrypt(downloaderPurpose(id, "username"), input.Username)
+	usernameValue, passwordValue := input.Username, input.Password
+	if executionLocation == models.NodeLocationRemote && providerType == models.DownloaderTypeQBittorrent {
+		usernameValue, passwordValue = "", ""
+		prepared, prepareErr := s.prepareNodeBinding(id, input.NodeID, input.BaseURL, input.Username, input.Password, input.DownloaderSaveRoot, input.NodeMountRoot)
+		if prepareErr != nil {
+			return DownloaderSummary{}, prepareErr
+		}
+		binding = &prepared
+	}
+	username, err := s.credentials.Encrypt(downloaderPurpose(id, "username"), usernameValue)
 	if err != nil {
 		return DownloaderSummary{}, err
 	}
-	password, err := s.credentials.Encrypt(downloaderPurpose(id, "password"), input.Password)
+	password, err := s.credentials.Encrypt(downloaderPurpose(id, "password"), passwordValue)
 	if err != nil {
 		return DownloaderSummary{}, err
 	}
 	capabilitiesJSON, _ := json.Marshal(capabilities)
 	now := time.Now().UTC()
-	record := models.Downloader{ID: id, OwnerID: actor.User.ID, Name: name, NameNormalized: normalized, Type: providerType, BaseURL: baseURL, UsernameCiphertext: username, PasswordCiphertext: password, StorageID: storage, ProviderDirectoryID: providerDirectoryID, ProviderDirectoryPath: providerDirectoryPath, AutoListenLifeEvents: autoListen, Enabled: input.Enabled, CapabilitiesJSON: string(capabilitiesJSON), LastHealthStatus: "unknown", CreatedAt: now, UpdatedAt: now}
+	record := models.Downloader{ID: id, OwnerID: actor.User.ID, Name: name, NameNormalized: normalized, Type: providerType, ExecutionLocation: executionLocation, BaseURL: baseURL, UsernameCiphertext: username, PasswordCiphertext: password, StorageID: storage, ProviderDirectoryID: providerDirectoryID, ProviderDirectoryPath: providerDirectoryPath, AutoListenLifeEvents: autoListen, Enabled: input.Enabled, CapabilitiesJSON: string(capabilitiesJSON), LastHealthStatus: "unknown", CreatedAt: now, UpdatedAt: now}
+	if binding != nil {
+		record.NodeID = &binding.NodeID
+		var node models.TransferNode
+		if s.db.Select("name").First(&node, "id = ?", binding.NodeID).Error == nil {
+			record.NodeName = node.Name
+		}
+	} else if executionNode != nil {
+		record.NodeID = &executionNode.ID
+		record.NodeName = executionNode.Name
+	}
 	err = s.db.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Create(&record).Error; err != nil {
 			return err
 		}
-		return s.audit.Record(tx, &actor.User.ID, "downloader.create", "downloader", record.ID, "success", map[string]any{"type": record.Type, "enabled": record.Enabled}, request)
+		if binding != nil {
+			if err := tx.Create(binding).Error; err != nil {
+				return err
+			}
+		}
+		return s.audit.Record(tx, &actor.User.ID, "downloader.create", "downloader", record.ID, "success", map[string]any{"type": record.Type, "enabled": record.Enabled, "execution_location": record.ExecutionLocation, "node_id": record.NodeID}, request)
 	})
 	if err != nil {
 		if conflict := downloaderConstraintError(err); conflict != nil {
@@ -188,6 +259,9 @@ func (s *DownloaderService) UpdateContext(ctx context.Context, actor Actor, id s
 	if !actor.CanResource(authz.PermissionDownloadersUpdate, models.AuthorizationResourceDownloader, record.ID) {
 		return DownloaderSummary{}, appError(CodePermissionDenied, "无权编辑这个下载器", nil)
 	}
+	if input.ExecutionLocation != nil && normalizeExecutionLocation(*input.ExecutionLocation) != normalizeExecutionLocation(record.ExecutionLocation) {
+		return DownloaderSummary{}, appError(CodeConflict, "已有下载器不能直接迁移运行位置；请新建配置，避免现有任务漂移", nil)
+	}
 	if input.Name != nil {
 		name, normalized, err := normalizeDownloaderName(*input.Name)
 		if err != nil {
@@ -200,6 +274,9 @@ func (s *DownloaderService) UpdateContext(ctx context.Context, actor Actor, id s
 	}
 	if input.Enabled != nil {
 		record.Enabled = *input.Enabled
+	}
+	if normalizeExecutionLocation(record.ExecutionLocation) == models.NodeLocationRemote {
+		return s.updateNodeDownloader(ctx, actor, record, input, request)
 	}
 	if input.AutoListenLifeEvents != nil {
 		record.AutoListenLifeEvents = record.Type == models.DownloaderTypePan115Offline && *input.AutoListenLifeEvents
@@ -360,6 +437,15 @@ func (s *DownloaderService) client(id string) (models.Downloader, downloadpkg.Cl
 }
 
 func (s *DownloaderService) clientFor(record models.Downloader) (downloadpkg.Client, error) {
+	if record.ExecutionLocation == models.NodeLocationRemote {
+		if record.Type == models.DownloaderTypePan115Offline {
+			return s.nodeStorageProbeClient(record)
+		}
+		if record.Type != models.DownloaderTypeQBittorrent {
+			return nil, appError(CodeDownloaderUnavailable, "当前节点路线不支持该下载器", nil)
+		}
+		return s.nodeDownloaderClient(record, "", "")
+	}
 	config := downloadpkg.Config{BaseURL: record.BaseURL}
 	if record.Type == models.DownloaderTypePan115Offline {
 		if record.StorageID == nil || s.connections == nil {
@@ -565,7 +651,18 @@ func (s *DownloaderService) summary(record models.Downloader) DownloaderSummary 
 			}
 		}
 	}
-	return DownloaderSummary{ID: record.ID, Name: record.Name, Type: record.Type, BaseURL: record.BaseURL, Enabled: record.Enabled, UsernameConfigured: record.UsernameCiphertext != "", PasswordConfigured: record.PasswordCiphertext != "", Capabilities: capabilities, Health: DownloaderHealth{Status: record.LastHealthStatus, Version: record.LastHealthVersion, ErrorCode: record.LastHealthErrorCode, LastChecked: record.LastHealthCheckedAt}, CreatedAt: record.CreatedAt, UpdatedAt: record.UpdatedAt, StorageID: record.StorageID, StorageName: name, ProviderDirectoryPath: record.ProviderDirectoryPath, AutoListenLifeEvents: record.AutoListenLifeEvents, LifeEventDefaultLibraryID: defaultLibraryID, LifeEventDefaultLibraryName: defaultLibraryName}
+	baseURL := record.BaseURL
+	usernameConfigured := record.UsernameCiphertext != ""
+	passwordConfigured := record.PasswordCiphertext != ""
+	downloaderSaveRoot, nodeMountRoot := "", ""
+	if binding, ok := s.nodeBindingSummary(record); ok {
+		baseURL = binding.BaseURL
+		usernameConfigured = binding.UsernameCiphertext != ""
+		passwordConfigured = binding.PasswordCiphertext != ""
+		downloaderSaveRoot, nodeMountRoot = binding.DownloaderSaveRoot, binding.NodeMountRoot
+	}
+	location := normalizeExecutionLocation(record.ExecutionLocation)
+	return DownloaderSummary{ID: record.ID, Name: record.Name, Type: record.Type, BaseURL: baseURL, Enabled: record.Enabled, UsernameConfigured: usernameConfigured, PasswordConfigured: passwordConfigured, Capabilities: capabilities, Health: DownloaderHealth{Status: record.LastHealthStatus, Version: record.LastHealthVersion, ErrorCode: record.LastHealthErrorCode, LastChecked: record.LastHealthCheckedAt}, CreatedAt: record.CreatedAt, UpdatedAt: record.UpdatedAt, StorageID: record.StorageID, StorageName: name, ProviderDirectoryPath: record.ProviderDirectoryPath, AutoListenLifeEvents: record.AutoListenLifeEvents, LifeEventDefaultLibraryID: defaultLibraryID, LifeEventDefaultLibraryName: defaultLibraryName, ExecutionLocation: location, NodeID: record.NodeID, NodeName: record.NodeName, DownloaderSaveRoot: downloaderSaveRoot, NodeMountRoot: nodeMountRoot}
 }
 
 func downloaderTestMessage(providerType, code string) string {

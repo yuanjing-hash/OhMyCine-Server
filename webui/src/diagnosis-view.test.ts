@@ -30,12 +30,58 @@ beforeEach(() => {
 })
 afterEach(() => { wrappers.splice(0).forEach(wrapper => wrapper.unmount()); vi.restoreAllMocks(); vi.useRealTimers() })
 describe('diagnosis dialog', () => {
+  it.each([
+    ['recognition_suspect_conflict', '识别冲突', '核对并修正识别'],
+    ['catalog_duplicate_conflict', '目录事实重复', '完整扫描'],
+  ])('filters the exact %s category without exposing physical retention', async (code, label, action) => {
+    const base = mocks.api.getMockImplementation()!
+    const conflict = { ...issue, code, kind: 'conflict', state: 'pending', title: '需要核对的作品', conflict_source_count: 2 }
+    mocks.api.mockImplementation((path, ...args) => {
+      if (path.endsWith('/structure')) return Promise.resolve({ ...diagnostics(), issue_count: 20, classifications: { unrecognized: 0, duplicate_target: 0, [code]: 20 } })
+      if (path.includes('/structure/issues?')) {
+        const selected = new URLSearchParams(path.split('?')[1]).get('code')
+        return Promise.resolve({ list: !selected || selected === code ? [conflict] : [], total: !selected || selected === code ? 20 : 0, page: 1, page_size: 50, review_revision: 0, pending_total: 20, handled_total: 0 })
+      }
+      return base(path, ...args)
+    })
+    const wrapper = await open()
+    expect(wrapper.findAll('button').some(item => item.text().startsWith('视频目标冲突'))).toBe(false)
+    await button(wrapper, `${label} 20`).trigger('click'); await flushPromises()
+    expect(mocks.api.mock.calls.some(([path]) => path.includes(`code=${code}`))).toBe(true)
+    const dialog = wrapper.get('[role="dialog"]')
+    expect(dialog.text()).toContain('需要核对的作品')
+    expect(dialog.text()).toContain(action)
+    expect(dialog.findAll('button').some(item => item.text() === '保留全部文件（自动区分重名）')).toBe(false)
+    expect(dialog.findAll('button').some(item => item.text() === '本次跳过')).toBe(true)
+  })
   it('filters unrecognized issues inside the dialog', async () => {
     const wrapper = await open()
     await wrapper.findAll('button').find(item => item.text().startsWith('识别失败或无匹配'))!.trigger('click')
     await flushPromises()
     expect(wrapper.find('[role="dialog"]').exists()).toBe(true)
     expect(mocks.api.mock.calls.some(([path]) => path.includes('code=media_unrecognized'))).toBe(true)
+  })
+  it('filters refined naming issues and skips the whole server-side category across pages', async () => {
+    const base = mocks.api.getMockImplementation()!
+    const naming = { ...issue, code: 'naming_mismatch', state: 'pending_repair', repairable: true, title: '秒速五厘米', current_path: '电影/动画电影/秒速5厘米 (2007)/banner.jpg', expected_path: '电影/动画电影/秒速五厘米 (2007)/banner.jpg', recognition_token: undefined }
+    mocks.api.mockImplementation((path, options, ...args) => {
+      if (path.endsWith('/structure')) return Promise.resolve({ ...diagnostics(), issue_count: 225, repairable_count: 225, classifications: { unrecognized: 0, duplicate_target: 0, naming_mismatch: 225, location_mismatch: 0 } })
+      if (path.includes('/structure/issues?')) {
+        const params = new URLSearchParams(path.split('?')[1])
+        return Promise.resolve({ list: params.get('review_state') === 'pending' ? [naming] : [], total: params.get('review_state') === 'pending' ? 225 : 0, page: 1, page_size: 50, review_revision: 0, pending_total: 225, handled_total: 0 })
+      }
+      if (path.endsWith('/structure/review/bulk') && options?.method === 'POST') {
+        expect(JSON.parse(options.body)).toEqual({ diagnosis_revision: 'rev', review_revision: 0, codes: ['naming_mismatch'], action: 'skip' })
+        return Promise.resolve({ review_revision: 1, updated: 225 })
+      }
+      return base(path, options, ...args)
+    })
+    const wrapper = await open()
+    await button(wrapper, '命名不规范 225').trigger('click'); await flushPromises()
+    expect(mocks.api.mock.calls.some(([path]) => path.includes('code=naming_mismatch'))).toBe(true)
+    await button(wrapper, '本类全部跳过').trigger('click'); await flushPromises()
+    expect(mocks.api.mock.calls.some(([path]) => path.endsWith('/structure/review/bulk'))).toBe(true)
+    expect(wrapper.get('[role="dialog"]').text()).toContain('已将 225 个本类问题保存为本次跳过')
   })
   it('automatically previews deterministic video and sidecar repairs without per-row selection', async () => {
     const base = mocks.api.getMockImplementation()!

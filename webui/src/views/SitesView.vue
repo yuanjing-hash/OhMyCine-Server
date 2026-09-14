@@ -175,6 +175,7 @@ async function resolveBT() {
 }
 
 function openEdit(site: SiteSummary) {
+  if (site.site_type === 'bt_resource') return
   btResolution.value = null
   editing.value = site
   form.value = {
@@ -237,8 +238,21 @@ async function save() {
 }
 
 function searchSite(site: SiteSummary) {
-  if (!site.enabled || site.health.status === 'offline' || !site.capabilities.search) return
+  if (siteSearchDisabled(site)) return
   void router.push({ name: 'explore', query: { site_id: String(site.id) } })
+}
+
+function siteSearchDisabled(site: SiteSummary) {
+  return !site.enabled || !site.capabilities.search || site.health.status === 'offline'
+    || (site.site_type === 'bt_resource' && site.health.status !== 'healthy')
+}
+
+function siteSearchHint(site: SiteSummary) {
+  if (!site.enabled) return '启用站点后才能搜索'
+  if (!site.capabilities.search) return '该适配器不支持搜索'
+  if (site.site_type === 'bt_resource' && site.health.status !== 'healthy') return '请先到插件连接页完成登录和检测'
+  if (site.health.status === 'offline') return '请先修复连接并重新测试'
+  return '只搜索此站点'
 }
 
 async function openCookieCloud() {
@@ -336,8 +350,10 @@ async function deleteSite(site: SiteSummary) {
 }
 
 function healthLabel(site: SiteSummary) {
-  if (site.health.status === 'online') return site.health.username ? `在线 · ${site.health.username}` : '在线'
-  if (site.health.status === 'offline') return '连接异常'
+  if (site.health.status === 'online' || site.health.status === 'healthy') return site.health.username ? `在线 · ${site.health.username}` : '在线'
+  if (site.health.status === 'auth_required') return '需要登录'
+  if (site.health.status === 'rate_limited') return '站点限流中'
+  if (site.health.status === 'offline' || site.health.status === 'unavailable') return '连接异常'
   return '尚未检测'
 }
 
@@ -388,17 +404,20 @@ onMounted(loadSites)
         </header>
         <dl class="mt-5 grid grid-cols-2 gap-3 text-sm">
           <div><dt class="text-subtle text-xs">连接状态</dt><dd class="m-0 mt-1">{{ healthLabel(site) }}</dd></div>
-          <div><dt class="text-subtle text-xs">凭据</dt><dd class="m-0 mt-1">{{ site.credential_kind === 'none' ? '无需凭据' : site.credential_configured ? '已安全配置' : '未配置' }}</dd></div>
+          <div><dt class="text-subtle text-xs">凭据</dt><dd class="m-0 mt-1">{{ site.credential_kind === 'plugin' ? '由插件连接管理' : site.credential_kind === 'none' ? '无需凭据' : site.credential_configured ? '已安全配置' : '未配置' }}</dd></div>
           <div><dt class="text-subtle text-xs">请求策略</dt><dd class="m-0 mt-1">{{ site.rate_limit_per_minute }} 次/分钟</dd></div>
-          <div><dt class="text-subtle text-xs">连接方式</dt><dd class="m-0 mt-1">{{ site.kind === 'torznab' ? 'Torznab API' : site.browser_emulation ? '浏览器仿真' : '原生适配' }}</dd></div>
+          <div><dt class="text-subtle text-xs">连接方式</dt><dd class="m-0 mt-1">{{ site.site_type === 'bt_resource' ? 'WASM 插件' : site.kind === 'torznab' ? 'Torznab API' : site.browser_emulation ? '浏览器仿真' : '原生适配' }}</dd></div>
         </dl>
         <p v-if="site.health.error_code" class="semantic-warning mt-4 p-3 text-xs">最近检测：<span class="font-mono">{{ site.health.error_code }}</span>。更新候选凭据失败时原配置会保留。</p>
         <div class="mt-auto flex flex-wrap gap-2 pt-5">
-          <button class="btn-primary" :disabled="busyID !== null || !site.enabled || site.health.status === 'offline' || !site.capabilities.search" :title="!site.enabled ? '启用站点后才能搜索' : site.health.status === 'offline' ? '请先修复连接并重新测试' : !site.capabilities.search ? '该适配器不支持搜索' : '只搜索此站点'" @click="searchSite(site)">搜索</button>
-          <button class="btn-secondary" :disabled="busyID !== null" @click="testSite(site)">{{ busyID === site.id ? '检测中…' : '测试连接' }}</button>
-          <button class="btn-secondary" :disabled="busyID !== null" @click="openEdit(site)">编辑</button>
-          <button class="btn-secondary" :disabled="busyID !== null" @click="toggleSite(site)">{{ site.enabled ? '停用' : '启用' }}</button>
-          <button class="btn-danger" :disabled="busyID !== null" @click="deleteSite(site)">删除</button>
+          <button class="btn-primary" :disabled="busyID !== null || siteSearchDisabled(site)" :title="siteSearchHint(site)" @click="searchSite(site)">搜索</button>
+          <RouterLink v-if="site.site_type === 'bt_resource'" class="btn-secondary" :to="{ name: 'plugins' }">前往插件连接管理</RouterLink>
+          <template v-else>
+            <button class="btn-secondary" :disabled="busyID !== null" @click="testSite(site)">{{ busyID === site.id ? '检测中…' : '测试连接' }}</button>
+            <button class="btn-secondary" :disabled="busyID !== null" @click="openEdit(site)">编辑</button>
+            <button class="btn-secondary" :disabled="busyID !== null" @click="toggleSite(site)">{{ site.enabled ? '停用' : '启用' }}</button>
+            <button class="btn-danger" :disabled="busyID !== null" @click="deleteSite(site)">删除</button>
+          </template>
         </div>
       </article>
     </div>

@@ -56,10 +56,13 @@ func AssetNames(version, goos, goarch string) (PlatformAssets, error) {
 	if err != nil || parsed.String() != version {
 		return PlatformAssets{}, coded(CodeInvalidRelease, errors.New("release version is invalid"))
 	}
-	if goarch != "amd64" || (goos != "windows" && goos != "linux") {
+	if !((goos == "windows" && goarch == "amd64") || (goos == "linux" && (goarch == "amd64" || goarch == "arm64"))) {
 		return PlatformAssets{}, coded(CodeUnsupportedPlatform, errors.New("self-update is not supported on this platform"))
 	}
 	platform := goos + "-x64"
+	if goarch == "arm64" {
+		platform = goos + "-arm64"
+	}
 	top := fmt.Sprintf("OhMyCine-Server-v%s-%s", version, platform)
 	assets := PlatformAssets{
 		Checksum: fmt.Sprintf("OhMyCine-Server-v%s-SHA256SUMS.txt", version),

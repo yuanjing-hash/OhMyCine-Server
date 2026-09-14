@@ -79,12 +79,16 @@ func (s *MediaLibraryStructureService) SaveStructureReviewBulk(ctx context.Conte
 		if err := tx.Where("library_id = ?", libraryID).First(&diagnosis).Error; err != nil {
 			return appError(CodeConflict, "目录诊断结果不存在，请重新检测", err)
 		}
+		rowScope := tx.Where("library_id = ? AND diagnosis_job_id = ? AND generation = ? AND code IN ? AND code <> ?", libraryID, diagnosis.JobID, diagnosis.Generation, codes, "missing_season_episode")
+		if input.Action == StructureSelectionKeepRecommended {
+			rowScope = rowScope.Where("code IN ? AND conflict_source_count > 1", []string{"duplicate_target", "sidecar_target_conflict"})
+		}
 		var rows []models.MediaLibraryStructureIssue
-		if err := tx.Where("library_id = ? AND diagnosis_job_id = ? AND generation = ? AND code IN ? AND conflict_source_count > 1", libraryID, diagnosis.JobID, diagnosis.Generation, codes).Order("id").Find(&rows).Error; err != nil {
+		if err := rowScope.Order("id").Find(&rows).Error; err != nil {
 			return err
 		}
 		if len(rows) == 0 {
-			return appError(CodeInvalidRequest, "当前筛选没有可批量处理的冲突", nil)
+			return appError(CodeInvalidRequest, "当前筛选没有可批量处理的问题", nil)
 		}
 		now := time.Now().UTC()
 		var session models.MediaLibraryStructureReviewSession
@@ -104,8 +108,14 @@ func (s *MediaLibraryStructureService) SaveStructureReviewBulk(ctx context.Conte
 			return appError(CodeConflict, "处理工作区已被其他页面修改，请刷新后重试", nil)
 		}
 		var submitted int64
+		submittedJoin := "JOIN media_library_structure_issues i ON i.token = media_library_structure_review_choices.issue_token AND i.library_id = ? AND i.diagnosis_job_id = ? AND i.generation = ? AND i.code IN ? AND i.code <> ?"
+		submittedArgs := []any{libraryID, diagnosis.JobID, diagnosis.Generation, codes, "missing_season_episode"}
+		if input.Action == StructureSelectionKeepRecommended {
+			submittedJoin += " AND i.code IN ? AND i.conflict_source_count > 1"
+			submittedArgs = append(submittedArgs, []string{"duplicate_target", "sidecar_target_conflict"})
+		}
 		if err := tx.Model(&models.MediaLibraryStructureReviewChoice{}).
-			Joins("JOIN media_library_structure_issues i ON i.token = media_library_structure_review_choices.issue_token AND i.library_id = ? AND i.diagnosis_job_id = ? AND i.generation = ? AND i.code IN ? AND i.conflict_source_count > 1", libraryID, diagnosis.JobID, diagnosis.Generation, codes).
+			Joins(submittedJoin, submittedArgs...).
 			Where("media_library_structure_review_choices.session_id = ? AND media_library_structure_review_choices.subject_kind = ? AND media_library_structure_review_choices.state = ?", session.ID, "issue", "submitted").
 			Count(&submitted).Error; err != nil {
 			return err

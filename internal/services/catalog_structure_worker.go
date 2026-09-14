@@ -18,6 +18,36 @@ func (s *MediaLibraryStructureService) runCatalogStructureRepair(ctx context.Con
 		return WorkerResult{ErrorCode: CodeMediaLibraryStructureBoundaryChanged, ErrorMessage: "目录修复缺少当前索引确认，请重新预览"}
 	}
 	plan.catalogFence = &state.Fence
+	fullPlan := plan
+	partialResult := func() WorkerResult {
+		return WorkerResult{ErrorCode: CodeMediaLibraryStructureApplyFailed, ErrorMessage: "已保存成功项；请重新诊断并预览剩余文件"}
+	}
+	if state.Stage == "cancelled_finalized" {
+		return partialResult()
+	}
+	if state.Stage == "partial_finalized" {
+		if err := s.rebindPartialStructureRetry(ctx, repair, &state, claim); err != nil {
+			return WorkerResult{ErrorCode: CodeMediaLibraryStructureBoundaryChanged, ErrorMessage: "媒体内容已变化，请重新诊断并预览剩余文件"}
+		}
+		plan.catalogFence = &state.Fence
+	}
+	if (state.FailedItems+state.BlockedItems > 0 || state.Cancelled || !state.RetryCheckpointBefore.IsZero()) && (state.Stage == "physical_completed" || state.Stage == "catalog_published" || state.Stage == "reconciling") {
+		var err error
+		plan, err = s.catalogStructureSucceededPlan(ctx, repair, plan, state.RetryCheckpointBefore)
+		if err != nil {
+			return WorkerResult{ErrorCode: CodeMediaLibraryStructureBoundaryChanged, ErrorMessage: "整理结果检查点不完整"}
+		}
+		if state.FailedItems+state.BlockedItems == 0 && !state.Cancelled {
+			plan.ResolvedIssues = fullPlan.ResolvedIssues
+		}
+	}
+	if !state.RetryCheckpointBefore.IsZero() && state.Stage != "physical_completed" && state.Stage != "catalog_published" && state.Stage != "reconciling" {
+		var err error
+		plan, err = s.catalogStructureRemainingPlan(ctx, repair, fullPlan, state.RetryCheckpointBefore)
+		if err != nil {
+			return WorkerResult{ErrorCode: CodeMediaLibraryStructureBoundaryChanged, ErrorMessage: "整理检查点已变化"}
+		}
+	}
 	physicalDone := state.Stage == "physical_completed"
 	fail := func(err error) WorkerResult {
 		cloudCode, _ := cloudpkg.ErrorInfo(err)
@@ -65,8 +95,12 @@ func (s *MediaLibraryStructureService) runCatalogStructureRepair(ctx context.Con
 			return fail(err)
 		}
 		defer s.finishStructurePhysicalWrite(permit)
+		defer s.finishCancelledCatalogStructureRepair(permit, repair, fullPlan, StructureBoundary{}, nil)
 		if err := s.finalizeCatalogStructureRepair(ctx, repair, plan, &state, claim, permit); err != nil {
 			return fail(err)
+		}
+		if state.FailedItems+state.BlockedItems > 0 {
+			return partialResult()
 		}
 		return WorkerResult{}
 	}
@@ -143,6 +177,7 @@ func (s *MediaLibraryStructureService) runCatalogStructureRepair(ctx context.Con
 		return fail(err)
 	}
 	defer s.finishStructurePhysicalWrite(permit)
+	defer s.finishCancelledCatalogStructureRepair(permit, repair, fullPlan, boundary, backend)
 	if storage.Type != models.StorageTypeLocal && !physicalDone && state.Stage != "physical_running" && len(plan.Items) > 0 {
 		state.Stage = "directories_preparing"
 		if err := s.structureCatalogWriteTx(ctx, func(tx *gorm.DB) error {
@@ -191,7 +226,7 @@ func (s *MediaLibraryStructureService) runCatalogStructureRepair(ctx context.Con
 		}); err != nil {
 			return fail(err)
 		}
-		execution := s.executeStructureRepairItems(ctx, runtime, repair, plan, boundary, backend, claim)
+		execution := s.executeStructureRepairItems(ctx, runtime, repair, fullPlan, boundary, backend, claim)
 		if execution.GlobalErr != nil {
 			if execution.RetryAt != nil {
 				_ = s.structureRepairCheckpointTx(ctx, repair, claim, func(tx *gorm.DB) error {
@@ -201,26 +236,28 @@ func (s *MediaLibraryStructureService) runCatalogStructureRepair(ctx context.Con
 			}
 			return fail(execution.GlobalErr)
 		}
-		originalTotal := len(plan.Items) + len(plan.RecycleItems)
+		originalTotal := len(fullPlan.Items) + len(fullPlan.RecycleItems)
 		state.FailedItems, state.BlockedItems, state.OriginalTotalItems = execution.Failed, execution.Blocked, originalTotal
 		if execution.Failed+execution.Blocked > 0 {
-			// Keep the old bound Catalog visible and retain its binding while the
-			// physical filesystem is only partially converged. A retry reuses the
-			// exact frozen plan, skips succeeded checkpoints, and publishes once
-			// every operation has succeeded. This never publishes invented paths.
-			s.abandonCatalogStructureCandidate(&prepared)
-			state.Stage = "physical_partial"
-			if err := s.structureCatalogWriteTx(ctx, func(tx *gorm.DB) error {
-				if err := s.validateCatalogStructureExecutionTx(tx, repair, state, claim, true); err != nil {
-					return err
-				}
-				return persistCatalogStructureStateTx(tx, repair.ID, state, map[string]any{"phase": "failed", "last_error_code": CodeMediaLibraryStructureApplyFailed})
-			}); err != nil {
+			if err := s.verifyStructureUnchangedFailures(ctx, repair, fullPlan, boundary, backend); err != nil {
 				return fail(err)
 			}
-			return WorkerResult{ErrorCode: CodeMediaLibraryStructureApplyFailed, ErrorMessage: "目录整理已部分完成；失败项已隔离，重试只会处理剩余项"}
 		}
 		plan = execution.Plan
+		if !state.RetryCheckpointBefore.IsZero() {
+			plan, err = s.catalogStructureSucceededPlan(ctx, repair, fullPlan, state.RetryCheckpointBefore)
+			if err != nil {
+				return fail(err)
+			}
+			if execution.Failed+execution.Blocked == 0 {
+				plan.ResolvedIssues = fullPlan.ResolvedIssues
+			}
+		}
+		if state.FailedItems+state.BlockedItems > 0 {
+			// Keep conflict groups until every member converges. Finalization
+			// resolves only exact successful single-source moves in this case.
+			plan.ResolvedIssues = nil
+		}
 		// Candidates prepared before physical work budget the full authorized
 		// plan only. Rebuild from checked successes before publication.
 		s.abandonCatalogStructureCandidate(&prepared)
@@ -248,6 +285,9 @@ func (s *MediaLibraryStructureService) runCatalogStructureRepair(ctx context.Con
 	if err := s.finalizeCatalogStructureRepair(ctx, repair, plan, &state, claim, permit); err != nil {
 		return fail(err)
 	}
+	if state.FailedItems+state.BlockedItems > 0 {
+		return partialResult()
+	}
 	return WorkerResult{}
 }
 
@@ -271,6 +311,15 @@ func (s *MediaLibraryStructureService) publishCatalogStructureRepair(ctx context
 				generation := max(max(library.DirtyGeneration, library.ArtifactGeneration), library.BaselineGeneration) + 1
 				if err := tx.Model(&library).Update("dirty_generation", generation).Error; err != nil {
 					return err
+				}
+				var storage models.Storage
+				if err := tx.First(&storage, library.StorageID).Error; err != nil {
+					return err
+				}
+				if mediaLibraryRequiresArtifacts(storage.Type, library, s.artifacts != nil) {
+					if _, err := s.artifacts.BindCatalogGenerationFactsTx(tx, library.ID, generation, prepared.Facts); err != nil {
+						return err
+					}
 				}
 				kind := models.MediaLibraryChangeCatalog
 				if len(plan.Items) == 0 {

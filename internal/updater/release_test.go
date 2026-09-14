@@ -26,6 +26,25 @@ func TestSelectLatestHonorsChannels(t *testing.T) {
 	}
 }
 
+func TestLinuxARM64SelectsItsOwnArchive(t *testing.T) {
+	names, err := AssetNames("1.2.3", "linux", "arm64")
+	if err != nil || names.Archive != "OhMyCine-Server-v1.2.3-linux-arm64.tar.gz" || names.Binary != "ohmycine-server" {
+		t.Fatalf("unexpected ARM64 assets: %+v, %v", names, err)
+	}
+	release := fixtureRelease("1.2.3", true, false)
+	if _, err := ValidateRelease(release, "linux", "arm64"); ErrorCode(err) != CodeInvalidRelease {
+		t.Fatalf("must not select another platform's archive: %v", err)
+	}
+	release.Assets = append(release.Assets, Asset{Name: names.Archive, Size: 1024})
+	selected, err := ValidateRelease(release, "linux", "arm64")
+	if err != nil || selected.Archive.Name != names.Archive || selected.PlatformName != "linux/arm64" {
+		t.Fatalf("unexpected ARM64 selection: %+v, %v", selected, err)
+	}
+	if _, err := AssetNames("1.2.3", "windows", "arm64"); ErrorCode(err) != CodeUnsupportedPlatform {
+		t.Fatalf("Windows ARM64 has no release archive: %v", err)
+	}
+}
+
 func TestReleaseValidationRejectsMalformedIdentityAndAssets(t *testing.T) {
 	base := fixtureRelease("1.2.3", false, false)
 	tests := []struct {

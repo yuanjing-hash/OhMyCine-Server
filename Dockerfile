@@ -1,0 +1,44 @@
+# syntax=docker/dockerfile:1.7
+FROM --platform=$BUILDPLATFORM node:22-bookworm-slim AS webui
+WORKDIR /src/webui
+COPY webui/package*.json ./
+RUN npm ci
+COPY webui/ ./
+COPY internal/authz/catalog.json /src/internal/authz/catalog.json
+RUN npm run build
+
+FROM --platform=$BUILDPLATFORM golang:1.23-bookworm AS build
+ARG TARGETOS
+ARG TARGETARCH
+ARG VERSION=dev
+ARG COMMIT=unknown
+ARG NODE_RELEASE_PUBLIC_KEY_B64=
+WORKDIR /src
+COPY go.mod go.sum ./
+COPY webui/go.mod webui/go.sum ./webui/
+RUN go mod download
+COPY --from=webui /src/webui/dist ./webui/dist
+COPY . .
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -tags webui -trimpath \
+  -ldflags "-s -w -X=github.com/yuanjing-hash/OhMyCine-Server/internal/buildinfo.Version=${VERSION} -X=github.com/yuanjing-hash/OhMyCine-Server/internal/buildinfo.Commit=${COMMIT} -X=github.com/yuanjing-hash/OhMyCine-Server/internal/buildinfo.NodeReleasePublicKeyBase64=${NODE_RELEASE_PUBLIC_KEY_B64}" \
+  -o /out/ohmycine-server ./cmd/server
+
+FROM debian:bookworm-slim AS runtime
+COPY LICENSE /usr/share/doc/ohmycine/LICENSE
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates tzdata ffmpeg \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /var/lib/ohmycine/data /var/lib/ohmycine/logs /var/lib/ohmycine/plugins \
+    && chown -R 65532:65532 /var/lib/ohmycine
+ENV OMC_ENV=production OMC_SERVER_HOST=0.0.0.0 OMC_SERVER_PORT=3000 OMC_DATABASE_PATH=/var/lib/ohmycine/data/ohmycine.db OMC_LOG_DIR=/var/lib/ohmycine/logs OMC_PLUGIN_DIR=/var/lib/ohmycine/plugins
+VOLUME ["/var/lib/ohmycine"]
+EXPOSE 3000
+USER 65532:65532
+ENTRYPOINT ["/usr/local/bin/ohmycine-server"]
+
+# CI uses the exact verified Release binaries, preserving TMDB and Node trust roots.
+FROM runtime AS release
+ARG TARGETARCH
+COPY --chmod=755 build/container-release/${TARGETARCH}/ohmycine-server /usr/local/bin/ohmycine-server
+
+FROM runtime AS local
+COPY --from=build /out/ohmycine-server /usr/local/bin/ohmycine-server

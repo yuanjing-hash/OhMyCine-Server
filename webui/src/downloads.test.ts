@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
-import { beginDownloadRetry, canCancelDownloadPipeline, downloadErrorMessage, downloadProviderStatusLabel, downloadStatusClass, downloadStatusLabel, formatBytes, formatETA, formatProgress, isDownloadHistoryTask, parseDownloadSourceLines, reconcileDownloadRetries, summarizeDownloaderTasks, torrentToBase64 } from '@/downloads'
+import { beginDownloadRetry, canCancelDownloadPipeline, downloadErrorMessage, downloadProviderStatusLabel, downloadStatusClass, downloadStatusLabel, formatBytes, formatETA, formatProgress, isDownloadHistoryTask, nodePan115UnsupportedSource, parseDownloadSourceLines, reconcileDownloadRetries, summarizeDownloaderTasks, torrentToBase64 } from '@/downloads'
 import type { DownloadTaskSummary } from '@/types/api'
 
 const task = { job_status: 'queued' } as DownloadTaskSummary
@@ -24,6 +24,16 @@ describe('download presentation', () => {
       duplicateCount: 1,
     })
     expect(() => parseDownloadSourceLines('a\nb\nc', 2)).toThrow('一次最多提交 2 个链接')
+  })
+  it('detects ordinary HTTP sources before a Node-bound 115 task is submitted', () => {
+    expect(nodePan115UnsupportedSource('magnet:?xt=urn:btih:abc\nMAGNET:?xt=urn:btih:def')).toBe('')
+    expect(nodePan115UnsupportedSource('magnet:?xt=urn:btih:abc\nhttps://example.test/file')).toBe('https://example.test/file')
+    expect(nodePan115UnsupportedSource('  HTTP://example.test/file  ')).toBe('HTTP://example.test/file')
+
+    const source = readFileSync(new URL('./views/DownloadsView.vue', import.meta.url), 'utf8')
+    expect(source).toContain('unsupportedNodePan115Source')
+    expect(source).toContain('传输节点首版只支持 115 磁力离线和 115 分享')
+    expect(source).toContain('!!unsupportedNodePan115Source')
   })
   it('shows the safe preclassification stage while a worker is active', () => {
     expect(downloadStatusLabel({ job_status: 'running', phase: 'metadata' } as DownloadTaskSummary)).toBe('获取 metadata')
@@ -107,6 +117,26 @@ describe('download presentation', () => {
     expect(source).toContain(':disabled="!editLifeEventDefault"')
     expect(source).not.toContain('按媒体库顺序自动选择')
     expect(source).not.toContain('compatibleDownloadLibraries')
+  })
+
+  it('can clear terminal seeding records from the dedicated management tab', () => {
+    const source = readFileSync(new URL('./views/DownloadsView.vue', import.meta.url), 'utf8')
+    expect(source).toContain('const canClearSeedingHistory')
+    expect(source).toContain('scope="seeding"')
+    expect(source).toContain('label="清除已结束记录"')
+  })
+
+  it('shows the frozen execution location when choosing and reviewing a downloader', () => {
+    const source = readFileSync(new URL('./views/DownloadsView.vue', import.meta.url), 'utf8')
+
+    expect(source).toContain('function downloaderLocation')
+    expect(source).toContain('实际执行位置：{{ downloaderLocation(selectedDownloader) }}')
+    expect(source).toContain('任务创建后不会自动换节点或回退主 Server')
+    expect(source).toContain("item.execution_location === 'node'")
+    expect(source).toContain('qB 保存根 {{ item.downloader_save_root }} → 节点挂载根 {{ item.node_mount_root }}')
+    expect(source).toContain('下载器已有任务时，Server 会拒绝更换执行节点')
+    expect(source).toContain('v-model="editForm.downloaderSaveRoot"')
+    expect(source).toContain('v-model="editForm.nodeMountRoot"')
   })
 })
 

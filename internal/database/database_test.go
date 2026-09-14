@@ -1005,7 +1005,7 @@ func TestUnifiedDownloadStagingMigrationAdoptsAndDetachesLegacyDownloaderStorage
 		t.Fatal(err)
 	}
 	downloader := models.Downloader{ID: "legacy-qbit", Name: "Legacy", NameNormalized: "legacy", Type: models.DownloaderTypeQBittorrent, BaseURL: "http://127.0.0.1:8080", StorageID: &storage.ID, CapabilitiesJSON: `{}`, LastHealthStatus: "unknown", CreatedAt: now, UpdatedAt: now}
-	if err := db.Omit("ProviderDirectoryID", "ProviderDirectoryPath", "OwnerID", "AutoListenLifeEvents").Create(&downloader).Error; err != nil {
+	if err := db.Omit("ProviderDirectoryID", "ProviderDirectoryPath", "OwnerID", "AutoListenLifeEvents", "ExecutionLocation", "NodeID", "NodeName").Create(&downloader).Error; err != nil {
 		t.Fatal(err)
 	}
 	if err := migrateUnifiedDownloadStaging(db); err != nil {

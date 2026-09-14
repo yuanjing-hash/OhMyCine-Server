@@ -25,12 +25,13 @@ func (w *TransferWorker) finishCompletedTransfer(ctx context.Context, task model
 	if err := w.service.db.First(&download, "id = ?", task.DownloadTaskID).Error; err != nil {
 		return WorkerResult{ErrorCode: "transfer_download_missing", ErrorMessage: "原下载任务不存在"}
 	}
-	// A successful transfer is authoritative knowledge that the target library
-	// changed. Signal it before any follow/seeding/cleanup bookkeeping so a
-	// retryable post-transfer failure cannot delay catalog, STRM, or Player
-	// updates. Duplicate retries are coalesced by the library listener.
+	// The persisted successful targets are the only authorized catalog scope.
+	// Failure retries this batch; it must never wake an unscoped library scan.
 	if w.service.libraryReconciler != nil {
-		w.service.libraryReconciler.RequestReconcile(task.LibraryID)
+		if err := w.service.libraryReconciler.ReconcileTransferBatch(ctx, task.ID); err != nil {
+			next := time.Now().UTC().Add(time.Minute)
+			return WorkerResult{RetryAt: &next, ErrorCode: "transfer_batch_publish_failed", ErrorMessage: "入库文件目录更新失败，将仅重试本批次"}
+		}
 	}
 	if err := w.service.db.Transaction(func(tx *gorm.DB) error {
 		if err := ensureDownloadPipelineActive(tx, task.DownloadTaskID); err != nil {
@@ -53,6 +54,30 @@ func (w *TransferWorker) finishCompletedTransfer(ctx context.Context, task model
 			next := time.Now().UTC().Add(time.Minute)
 			return WorkerResult{RetryAt: &next, ErrorCode: "post_transfer_provider_failed", ErrorMessage: "下载器收尾失败，将自动重试"}
 		}
+	}
+	if download.ProviderType == models.DownloaderTypePan115Offline && normalizeExecutionLocation(download.ExecutionLocation) == models.NodeLocationRemote {
+		client, err := w.service.downloader.clientForDownloadTask(ctx, download)
+		if err != nil {
+			next := time.Now().UTC().Add(time.Minute)
+			return WorkerResult{RetryAt: &next, ErrorCode: "node_source_cleanup_failed", ErrorMessage: "入库已完成，传输节点临时文件清理将自动重试"}
+		}
+		cleaner, ok := client.(downloadpkg.ManagedSourceCleaner)
+		if !ok || cleaner.CleanupManagedSource(ctx) != nil {
+			next := time.Now().UTC().Add(time.Minute)
+			return WorkerResult{RetryAt: &next, ErrorCode: "node_source_cleanup_failed", ErrorMessage: "入库已完成，传输节点临时文件清理将自动重试"}
+		}
+	}
+	if download.ProviderType == models.DownloaderTypeQBittorrent && normalizeExecutionLocation(download.ExecutionLocation) == models.NodeLocationRemote {
+		if err := cleanupCrossSourceManagedRoot(task, download); err != nil {
+			next := time.Now().UTC().Add(time.Minute)
+			return WorkerResult{RetryAt: &next, ErrorCode: "node_staging_cleanup_failed", ErrorMessage: "入库已完成，主 Server 接收暂存清理将自动重试"}
+		}
+		if err := w.service.db.Where("transfer_task_id = ?", task.ID).Delete(&models.RemoteTransferFile{}).Error; err != nil {
+			next := time.Now().UTC().Add(time.Minute)
+			return WorkerResult{RetryAt: &next, ErrorCode: "node_staging_checkpoint_cleanup_failed", ErrorMessage: "入库已完成，断点记录清理将自动重试"}
+		}
+		_ = w.service.db.Model(&models.TransferTask{}).Where("id = ?", task.ID).Updates(map[string]any{"cleanup_status": models.TransferCleanupCompleted, "cleanup_error_code": "", "updated_at": time.Now().UTC()}).Error
+		return WorkerResult{}
 	}
 	if download.ProviderType == models.DownloaderTypePluginHTTP {
 		if download.TransferMode == models.MediaLibraryTransferSymlink {

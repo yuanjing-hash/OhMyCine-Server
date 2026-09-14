@@ -395,7 +395,7 @@ func (s *MediaLibraryService) ConfirmCatalogDeletion(ctx context.Context, actor 
 		}
 		generation = updated.ArtifactGeneration
 		if requiresArtifacts && write.Head.Mode == "versioned" {
-			if _, err := s.artifacts.BindCatalogGenerationTx(tx, libraryID, generation); err != nil {
+			if _, err := s.artifacts.BindCatalogGenerationChangesTx(tx, libraryID, generation, write.ArtifactChanges); err != nil {
 				return err
 			}
 		} else if requiresArtifacts {

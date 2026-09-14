@@ -53,6 +53,12 @@ const (
 	CapabilitySiteHistory      Capability = "site.history"
 	CapabilityPlaybackProgress Capability = "playback.progress_sync"
 	CapabilityLibraryArtwork   Capability = "library.artwork_candidates"
+	CapabilityResourceSearch   Capability = "resource.search"
+	CapabilityResourceResolve  Capability = "resource.resolve"
+	CapabilityResourceHealth   Capability = "resource.health"
+	CapabilityResourceLogin    Capability = "resource.auth.login"
+	CapabilityResourceCaptcha  Capability = "resource.auth.captcha"
+	CapabilityResourceCookie   Capability = "resource.auth.cookie"
 )
 
 var knownCapabilities = map[Capability]struct{}{
@@ -62,6 +68,8 @@ var knownCapabilities = map[Capability]struct{}{
 	CapabilityMediaDownload: {}, CapabilityHomeContribution: {}, CapabilityFeedRefresh: {},
 	CapabilityMediaMetadata: {},
 	CapabilitySiteHistory:   {}, CapabilityPlaybackProgress: {}, CapabilityLibraryArtwork: {},
+	CapabilityResourceSearch: {}, CapabilityResourceResolve: {}, CapabilityResourceHealth: {},
+	CapabilityResourceLogin: {}, CapabilityResourceCaptcha: {}, CapabilityResourceCookie: {},
 }
 
 type PermissionKind string

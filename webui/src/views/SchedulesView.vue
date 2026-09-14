@@ -2,6 +2,7 @@
 import { computed, onMounted, ref, watch } from 'vue'
 import { api } from '@/api/client'
 import { Permissions } from '@/auth/generated-permissions'
+import ClearHistoryButton from '@/components/ClearHistoryButton.vue'
 import type { FollowSummary } from '@/follows'
 import { useAuthStore } from '@/stores/auth'
 import type { ConnectionSummary, ListResponse, MediaLibraryDetail, ScheduleAction, ScheduleDefinition, ScheduleRun } from '@/types/api'
@@ -49,7 +50,7 @@ onMounted(load)
 </script>
 
 <template>
-  <section><div class="flex flex-wrap items-end justify-between gap-4"><div><h2 class="m-0 text-2xl font-800">计划任务</h2><p class="page-description mt-2">所有可配置调度统一使用标准五段 Cron；可视化选择只负责生成表达式，执行仍进入持久化任务队列。</p></div><button v-if="auth.can(Permissions.SettingsUpdate)" class="btn-primary" @click="createNew">新建计划</button></div>
+  <section><div class="flex flex-wrap items-end justify-between gap-4"><div><h2 class="m-0 text-2xl font-800">计划任务</h2><p class="page-description mt-2">所有可配置调度统一使用标准五段 Cron；可视化选择只负责生成表达式，执行仍进入持久化任务队列。</p></div><div class="flex flex-wrap gap-2"><ClearHistoryButton v-if="selected && !editorOpen && auth.can(Permissions.SettingsUpdate)" scope="schedule_runs" :resource-id="selected.id" label="清除当前计划运行历史" @cleared="loadRuns(selected.id)" /><button v-if="auth.can(Permissions.SettingsUpdate)" class="btn-primary" @click="createNew">新建计划</button></div></div>
     <p v-if="error" class="semantic-error mt-5 p-3 text-sm">{{ error }}</p><p v-if="notice" class="semantic-success mt-5 p-3 text-sm">{{ notice }}</p>
     <div v-if="loading" class="text-subtle mt-8">正在加载计划任务…</div><div v-else class="mt-7 grid gap-5 xl:grid-cols-[22rem_minmax(0,1fr)]">
       <div class="panel p-2"><button v-for="item in schedules" :key="item.id" class="semantic-list-item mb-1 w-full p-3 text-left" :class="{'semantic-list-item--selected':selectedId===item.id}" @click="selectedId=item.id"><div class="flex justify-between gap-2"><strong>{{ item.name }}</strong><span class="status-chip" :class="item.enabled?'status-chip--ready':''">{{ item.enabled?'启用':'停用' }}</span></div><div class="text-subtle mt-1 text-xs font-mono">{{ item.cron_expression }} · {{ item.timezone }}</div><div class="text-subtle mt-1 text-xs">下次 {{ time(item.next_run_at) }} · {{ item.last_status }}</div></button><p v-if="!schedules.length" class="text-subtle p-4 text-sm">尚无计划任务。</p></div>

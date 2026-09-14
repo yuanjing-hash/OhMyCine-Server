@@ -42,6 +42,8 @@ if ($CheckDependenciesOnly) {
 
 & (Join-Path $PSScriptRoot 'scripts\test-windows-common.ps1')
 if ($LASTEXITCODE -ne 0) { throw "Windows script contract checks failed (exit code $LASTEXITCODE)" }
+& (Join-Path $PSScriptRoot 'scripts\test-install-node.ps1')
+if ($LASTEXITCODE -ne 0) { throw "Node installer contract checks failed (exit code $LASTEXITCODE)" }
 
 if (-not $SkipWebUi) {
     Install-WebUiDependencies $tools.Npm

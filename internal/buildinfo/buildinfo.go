@@ -12,8 +12,9 @@ import (
 
 // Version and Commit are overridden only by the official release workflow.
 var (
-	Version = "dev"
-	Commit  = "unknown"
+	Version                    = "dev"
+	Commit                     = "unknown"
+	NodeReleasePublicKeyBase64 = ""
 )
 
 var (

@@ -472,16 +472,21 @@ func (c *Client) Upload(ctx context.Context, request cloud.UploadRequest) (cloud
 		c.onCallResult(mapError(uploadErr))
 	}
 	if uploadErr != nil {
-		return cloud.Item{}, mapError(uploadErr)
+		mapped := mapError(uploadErr)
+		code, _ := cloud.ErrorInfo(mapped)
+		if code != cloud.CodeAuthExpired && code != cloud.CodeCookieInvalid && code != cloud.CodeRateLimited {
+			return cloud.Item{}, cloud.Error(cloud.CodeMutationUnknown, true, errors.New("115 upload outcome requires reconciliation"))
+		}
+		return cloud.Item{}, mapped
 	}
 	if err := ctx.Err(); err != nil {
-		return cloud.Item{}, mapError(err)
+		return cloud.Item{}, cloud.Error(cloud.CodeMutationUnknown, true, errors.New("115 upload outcome requires reconciliation"))
 	}
 	matches := make([]cloud.Item, 0, 1)
 	for offset := int64(0); offset < 10_000; offset += maxPageSize {
 		page, err := c.List(ctx, parentID, cloud.PageRequest{Offset: offset, Limit: maxPageSize})
 		if err != nil {
-			return cloud.Item{}, err
+			return cloud.Item{}, cloud.Error(cloud.CodeMutationUnknown, true, errors.New("115 upload outcome requires reconciliation"))
 		}
 		for _, item := range page.Items {
 			if item.Name == name && !item.IsDir && item.Size == request.Size {

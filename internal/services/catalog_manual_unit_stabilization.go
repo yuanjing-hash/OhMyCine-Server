@@ -18,9 +18,9 @@ type existingRecognitionEntryIndex struct {
 func indexExistingRecognitionEntries(entries []models.MediaLibraryEntry) existingRecognitionEntryIndex {
 	index := existingRecognitionEntryIndex{byPath: map[string]models.MediaLibraryEntry{}, byProvider: map[string]models.MediaLibraryEntry{}}
 	for _, entry := range entries {
-		if entry.RecognitionID == nil {
-			continue
-		}
+		// Pending entries are still existing physical members. Keep them in the
+		// index so the new-episode extension cannot absorb a cleared automatic
+		// assignment into a neighboring manual override after fast publication.
 		index.byPath[entry.RelativePath] = entry
 		if entry.ProviderID != "" {
 			if previous, ok := index.byProvider[entry.ProviderID]; ok && previous.ID != entry.ID {

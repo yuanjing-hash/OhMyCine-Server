@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -13,12 +14,89 @@ import (
 	"github.com/google/uuid"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
+
+const (
+	catalogArtifactScopeFull        = "full"
+	catalogArtifactScopeIncremental = "incremental"
+)
+
+// CatalogArtifactChangeSet is prepared from the exact before/after facts that
+// authorize one Catalog publication. It is persisted with the binding in the
+// publication transaction; workers never rediscover it by walking the Catalog.
+type CatalogArtifactChangeSet struct {
+	Entries      []uint
+	Recognitions []uint
+	SourceAssets []uint
+}
+
+func (c CatalogArtifactChangeSet) Empty() bool {
+	return len(c.Entries) == 0 && len(c.Recognitions) == 0 && len(c.SourceAssets) == 0
+}
+
+func catalogArtifactChangesFromFacts(facts CatalogFactBatch) CatalogArtifactChangeSet {
+	changes := CatalogArtifactChangeSet{}
+	for _, fact := range facts.Entries {
+		changes.Entries = append(changes.Entries, fact.ID)
+		if fact.RecognitionID != nil {
+			changes.Recognitions = append(changes.Recognitions, *fact.RecognitionID)
+		}
+	}
+	for _, fact := range facts.Recognitions {
+		changes.Recognitions = append(changes.Recognitions, fact.ID)
+	}
+	for _, fact := range facts.SourceAssets {
+		changes.SourceAssets = append(changes.SourceAssets, fact.ID)
+	}
+	return normalizeCatalogArtifactChanges(changes)
+}
+
+func normalizeCatalogArtifactChanges(changes CatalogArtifactChangeSet) CatalogArtifactChangeSet {
+	dedupe := func(values []uint) []uint {
+		seen := make(map[uint]struct{}, len(values))
+		out := make([]uint, 0, len(values))
+		for _, value := range values {
+			if value == 0 {
+				continue
+			}
+			if _, ok := seen[value]; ok {
+				continue
+			}
+			seen[value] = struct{}{}
+			out = append(out, value)
+		}
+		sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+		return out
+	}
+	changes.Entries = dedupe(changes.Entries)
+	changes.Recognitions = dedupe(changes.Recognitions)
+	changes.SourceAssets = dedupe(changes.SourceAssets)
+	return changes
+}
 
 // BindCatalogGenerationTx is called after head publication in the same writer.
 // It performs no filesystem/network work. Pending bindings survive a crash
 // before ScheduleGeneration and are the only legal input to versioned work.
 func (s *MediaArtifactService) BindCatalogGenerationTx(tx *gorm.DB, libraryID uint, generation uint64) (models.CatalogArtifactBinding, error) {
+	return s.bindCatalogGenerationTx(tx, libraryID, generation, catalogArtifactScopeFull, CatalogArtifactChangeSet{})
+}
+
+// BindCatalogGenerationChangesTx persists a precise incremental workset. Only
+// callers holding explicit baseline/reconcile intent may request a full audit;
+// absence of an older binding is not evidence that an established library
+// should be expanded into full work after an upgrade.
+func (s *MediaArtifactService) BindCatalogGenerationChangesTx(tx *gorm.DB, libraryID uint, generation uint64, changes CatalogArtifactChangeSet) (models.CatalogArtifactBinding, error) {
+	return s.bindCatalogGenerationTx(tx, libraryID, generation, catalogArtifactScopeIncremental, normalizeCatalogArtifactChanges(changes))
+}
+
+// BindCatalogGenerationFactsTx is for mutation publishers whose immutable
+// delta facts already are the exact before/after change evidence.
+func (s *MediaArtifactService) BindCatalogGenerationFactsTx(tx *gorm.DB, libraryID uint, generation uint64, facts CatalogFactBatch) (models.CatalogArtifactBinding, error) {
+	return s.BindCatalogGenerationChangesTx(tx, libraryID, generation, catalogArtifactChangesFromFacts(facts))
+}
+
+func (s *MediaArtifactService) bindCatalogGenerationTx(tx *gorm.DB, libraryID uint, generation uint64, requestedMode string, changes CatalogArtifactChangeSet) (models.CatalogArtifactBinding, error) {
 	if s == nil || s.catalogStore == nil || generation == 0 {
 		return models.CatalogArtifactBinding{}, ErrCatalogInvalid
 	}
@@ -51,11 +129,52 @@ func (s *MediaArtifactService) BindCatalogGenerationTx(tx *gorm.DB, libraryID ui
 		return existing, err
 	}
 	now := time.Now().UTC()
-	row := models.CatalogArtifactBinding{ID: id, LibraryID: libraryID, Generation: generation, HeadRevision: binding.Head.Revision, SourceEpoch: binding.Head.SourceEpoch, SourceFingerprint: binding.Head.SourceFingerprint, ConfigFingerprint: binding.Head.ConfigFingerprint, SourceConfigFingerprint: catalogArtifactSourceFingerprint(source), LayersJSON: string(layers), State: "pending", CreatedAt: now, UpdatedAt: now}
+	sourceConfig := catalogArtifactSourceFingerprint(source)
+	mode := requestedMode
+	var predecessor models.CatalogArtifactBinding
+	if mode == catalogArtifactScopeIncremental {
+		err := tx.Where("library_id = ? AND head_revision < ? AND source_epoch = ? AND source_fingerprint = ? AND config_fingerprint = ? AND source_config_fingerprint = ?", libraryID, source.Head.Revision, source.Head.SourceEpoch, source.Head.SourceFingerprint, source.Head.ConfigFingerprint, sourceConfig).Order("head_revision DESC").First(&predecessor).Error
+		if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+			return existing, err
+		}
+	}
+	row := models.CatalogArtifactBinding{ID: id, LibraryID: libraryID, Generation: generation, HeadRevision: binding.Head.Revision, SourceEpoch: binding.Head.SourceEpoch, SourceFingerprint: binding.Head.SourceFingerprint, ConfigFingerprint: binding.Head.ConfigFingerprint, SourceConfigFingerprint: sourceConfig, LayersJSON: string(layers), ScopeMode: mode, ScopePrepared: false, State: "pending", CreatedAt: now, UpdatedAt: now}
 	if err := tx.Create(&row).Error; err != nil {
 		return row, err
 	}
+	if mode == catalogArtifactScopeIncremental {
+		items := catalogArtifactBindingItems(row.ID, changes)
+		if predecessor.ID != "" && predecessor.State != "completed" {
+			var pending []models.CatalogArtifactBindingItem
+			if err := tx.Where("binding_id = ? AND status <> ?", predecessor.ID, "completed").Find(&pending).Error; err != nil {
+				return row, err
+			}
+			for _, item := range pending {
+				item.BindingID, item.Status, item.Attempts, item.Outcome, item.ErrorCode, item.UpdatedAt = row.ID, "pending", 0, "", "", now
+				items = append(items, item)
+			}
+		}
+		if len(items) > 0 {
+			if err := tx.Clauses(clause.OnConflict{DoNothing: true}).CreateInBatches(items, CatalogBatchRows).Error; err != nil {
+				return row, err
+			}
+		}
+	}
 	return row, tx.Model(&models.MediaLibrary{}).Where("id = ?", libraryID).Updates(map[string]any{"artifact_generation": generation, "artifact_status": models.MediaArtifactStatusQueued, "artifact_error": "", "artifact_updated_at": now}).Error
+}
+
+func catalogArtifactBindingItems(bindingID string, changes CatalogArtifactChangeSet) []models.CatalogArtifactBindingItem {
+	items := make([]models.CatalogArtifactBindingItem, 0, len(changes.Entries)+len(changes.Recognitions)+len(changes.SourceAssets))
+	for _, id := range changes.Entries {
+		items = append(items, models.CatalogArtifactBindingItem{BindingID: bindingID, EntityKind: "entry", EntityID: id})
+	}
+	for _, id := range changes.Recognitions {
+		items = append(items, models.CatalogArtifactBindingItem{BindingID: bindingID, EntityKind: "recognition", EntityID: id})
+	}
+	for _, id := range changes.SourceAssets {
+		items = append(items, models.CatalogArtifactBindingItem{BindingID: bindingID, EntityKind: "asset", EntityID: id})
+	}
+	return items
 }
 
 func artifactCatalogSnapshot(row models.CatalogArtifactBinding) (CatalogSnapshotBinding, error) {
@@ -80,7 +199,12 @@ func (s *MediaArtifactService) bindScheduledArtifactPolicy(policy *mediaArtifact
 		if err := reader.tx.Where("library_id = ? AND generation = ?", policy.LibraryID, policy.Generation).Order("head_revision DESC").First(&row).Error; err != nil {
 			return err
 		}
-		policy.CatalogBindingID = row.ID
+		policy.CatalogBindingID, policy.CatalogScopeMode = row.ID, row.ScopeMode
+		if row.ScopeMode == catalogArtifactScopeIncremental {
+			// Exact publication-time tombstones make cleanup safe even for a
+			// partial/event scan; only manifests owned by this scope are retired.
+			policy.CleanupEligible = true
+		}
 		return s.validateArtifactBindingTx(reader.tx, *policy, nil, nil, false)
 	})
 }
@@ -91,7 +215,9 @@ func (s *MediaArtifactService) validateArtifactBindingTx(tx *gorm.DB, policy med
 	if err := tx.First(&row, "id = ?", policy.CatalogBindingID).Error; err != nil {
 		return err
 	}
-	if row.LibraryID != policy.LibraryID || row.Generation != policy.Generation || row.State == "superseded" {
+	if row.LibraryID != policy.LibraryID || row.Generation != policy.Generation || row.State == "superseded" ||
+		(row.ScopeMode != catalogArtifactScopeFull && row.ScopeMode != catalogArtifactScopeIncremental) ||
+		(policy.CatalogScopeMode != "" && policy.CatalogScopeMode != row.ScopeMode) {
 		return ErrCatalogFence
 	}
 	var newest models.CatalogArtifactBinding
@@ -117,7 +243,7 @@ func (s *MediaArtifactService) validateArtifactBindingTx(tx *gorm.DB, policy med
 		if err := tx.First(&current, "id = ?", run.ID).Error; err != nil {
 			return err
 		}
-		if current.PolicyJSON != run.PolicyJSON || current.Generation != row.Generation || current.Status != models.MediaArtifactStatusRunning {
+		if current.PolicyJSON != run.PolicyJSON || current.Generation != row.Generation || current.CatalogBindingID != row.ID || current.Status != models.MediaArtifactStatusRunning {
 			return ErrCatalogFence
 		}
 	}
@@ -170,7 +296,7 @@ func (s *MediaArtifactService) RecoverCatalogArtifactBindings(ctx context.Contex
 		// Only repair the publication-to-enqueue crash window. Once a queue job
 		// exists, its retry limits/cancellation are authoritative, never revived.
 		var run models.MediaArtifactRun
-		findErr := s.catalogStore.readDB.WithContext(ctx).Where("library_id = ? AND generation = ?", row.LibraryID, row.Generation).First(&run).Error
+		findErr := s.catalogStore.readDB.WithContext(ctx).Where("library_id = ? AND catalog_binding_id = ?", row.LibraryID, row.ID).First(&run).Error
 		if findErr != nil && !errors.Is(findErr, gorm.ErrRecordNotFound) {
 			return findErr
 		}

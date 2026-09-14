@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/medialibrary"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
@@ -16,6 +17,8 @@ import (
 )
 
 const maxProviderChangeScopeItems = 512
+
+var errProviderChangeScopeUnproven = errors.New("provider event scope cannot be proven; full scan prohibited")
 
 type providerEventPayload struct {
 	Kind             string `json:"kind"`
@@ -34,13 +37,15 @@ type providerChangeEvent struct {
 }
 
 type providerChangeScope struct {
-	Events        []providerChangeEvent
-	ParentIDs     []string
-	DeliveryIDs   []uint
-	EventCount    int
-	DeliveryMaxID uint
-	FullFallback  bool
-	FallbackCode  string
+	LocalPaths     []string
+	VerifiedResult *medialibrary.Result
+	Events         []providerChangeEvent
+	ParentIDs      []string
+	DeliveryIDs    []uint
+	EventCount     int
+	DeliveryMaxID  uint
+	Blocked        bool
+	BlockCode      string
 }
 
 type providerChangeScopeContextKey struct{}
@@ -58,7 +63,7 @@ func providerChangeScopeFromContext(ctx context.Context) (providerChangeScope, b
 }
 
 func (s providerChangeScope) empty() bool {
-	return !s.FullFallback && len(s.Events) == 0 && len(s.ParentIDs) == 0
+	return !s.Blocked && len(s.Events) == 0 && len(s.ParentIDs) == 0 && len(s.LocalPaths) == 0
 }
 
 // providerChangeAccumulator is shared by one supervisor and its provider
@@ -71,8 +76,8 @@ type providerChangeAccumulator struct {
 	deliveryIDs   map[uint]struct{}
 	eventCount    int
 	deliveryMaxID uint
-	fullFallback  bool
-	fallbackCode  string
+	blocked       bool
+	blockCode     string
 }
 
 func newProviderChangeAccumulator() *providerChangeAccumulator {
@@ -89,18 +94,14 @@ func (a *providerChangeAccumulator) add(rows []models.ProviderEvent) {
 		a.eventCount++
 		payload, ok := decodePersistedProviderEvent(row)
 		if !ok {
-			a.markFallbackLocked("invalid_event_payload")
+			a.markBlockedLocked("invalid_event_payload")
 			continue
 		}
 		if payload.Kind == cloudpkg.ChangeFallback {
-			a.markFallbackLocked("cursor_gap")
+			a.markBlockedLocked("cursor_gap")
 			continue
 		}
-		if payload.Kind == cloudpkg.ChangeMoved {
-			a.markFallbackLocked("move_scope_unknown")
-			continue
-		}
-		if a.fullFallback {
+		if a.blocked {
 			continue
 		}
 		event := providerChangeEvent(payload)
@@ -112,7 +113,7 @@ func (a *providerChangeAccumulator) add(rows []models.ProviderEvent) {
 			a.parents[event.PreviousParentID] = struct{}{}
 		}
 		if len(a.events)+len(a.parents) > maxProviderChangeScopeItems {
-			a.markFallbackLocked("scope_overflow")
+			a.markBlockedLocked("scope_overflow")
 		}
 	}
 }
@@ -130,7 +131,7 @@ func (a *providerChangeAccumulator) addDeliveries(rows []models.MediaLibraryProv
 		if row.ID > a.deliveryMaxID {
 			a.deliveryMaxID = row.ID
 		}
-		if a.fullFallback {
+		if a.blocked {
 			continue
 		}
 		if row.ID != 0 {
@@ -142,15 +143,11 @@ func (a *providerChangeAccumulator) addDeliveries(rows []models.MediaLibraryProv
 		a.eventCount++
 		payload, ok := decodeProviderEventPayload(row.PayloadJSON)
 		if !ok {
-			a.markFallbackLocked("invalid_event_payload")
+			a.markBlockedLocked("invalid_event_payload")
 			continue
 		}
 		if payload.Kind == cloudpkg.ChangeFallback {
-			a.markFallbackLocked("cursor_gap")
-			continue
-		}
-		if payload.Kind == cloudpkg.ChangeMoved {
-			a.markFallbackLocked("move_scope_unknown")
+			a.markBlockedLocked("cursor_gap")
 			continue
 		}
 		event := providerChangeEvent(payload)
@@ -162,7 +159,7 @@ func (a *providerChangeAccumulator) addDeliveries(rows []models.MediaLibraryProv
 			a.parents[event.PreviousParentID] = struct{}{}
 		}
 		if len(a.events)+len(a.parents) > maxProviderChangeScopeItems {
-			a.markFallbackLocked("scope_overflow")
+			a.markBlockedLocked("scope_overflow")
 		}
 	}
 }
@@ -187,11 +184,11 @@ func (a *providerChangeAccumulator) merge(scope providerChangeScope) {
 			a.eventCount++
 		}
 	}
-	if scope.FullFallback {
-		a.markFallbackLocked(scope.FallbackCode)
+	if scope.Blocked {
+		a.markBlockedLocked(scope.BlockCode)
 		return
 	}
-	if a.fullFallback {
+	if a.blocked {
 		return
 	}
 	for _, event := range scope.Events {
@@ -201,24 +198,24 @@ func (a *providerChangeAccumulator) merge(scope providerChangeScope) {
 		a.parents[parentID] = struct{}{}
 	}
 	if len(a.events)+len(a.parents) > maxProviderChangeScopeItems {
-		a.markFallbackLocked("scope_overflow")
+		a.markBlockedLocked("scope_overflow")
 	}
 }
 
-func (a *providerChangeAccumulator) markFullFallback(code string) {
+func (a *providerChangeAccumulator) markBlocked(code string) {
 	if a == nil {
 		return
 	}
 	a.mu.Lock()
 	a.eventCount++
-	a.markFallbackLocked(code)
+	a.markBlockedLocked(code)
 	a.mu.Unlock()
 }
 
-func (a *providerChangeAccumulator) markFallbackLocked(code string) {
-	a.fullFallback = true
-	if a.fallbackCode == "" {
-		a.fallbackCode = code
+func (a *providerChangeAccumulator) markBlockedLocked(code string) {
+	a.blocked = true
+	if a.blockCode == "" {
+		a.blockCode = code
 	}
 	clear(a.events)
 	clear(a.parents)
@@ -230,7 +227,7 @@ func (a *providerChangeAccumulator) take() providerChangeScope {
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	scope := providerChangeScope{EventCount: a.eventCount, DeliveryMaxID: a.deliveryMaxID, FullFallback: a.fullFallback, FallbackCode: a.fallbackCode}
+	scope := providerChangeScope{EventCount: a.eventCount, DeliveryMaxID: a.deliveryMaxID, Blocked: a.blocked, BlockCode: a.blockCode}
 	for _, event := range a.events {
 		scope.Events = append(scope.Events, event)
 	}
@@ -246,7 +243,7 @@ func (a *providerChangeAccumulator) take() providerChangeScope {
 	a.events = make(map[string]providerChangeEvent)
 	a.parents = make(map[string]struct{})
 	a.deliveryIDs = make(map[uint]struct{})
-	a.eventCount, a.deliveryMaxID, a.fullFallback, a.fallbackCode = 0, 0, false, ""
+	a.eventCount, a.deliveryMaxID, a.blocked, a.blockCode = 0, 0, false, ""
 	return scope
 }
 
@@ -282,15 +279,22 @@ func decodeProviderEventPayload(value string) (providerEventPayload, bool) {
 	return payload, true
 }
 
-func (s *MediaLibraryService) knownPan115CatalogProviderIDs(ctx context.Context, libraryID uint) (map[string]struct{}, error) {
+func (s *MediaLibraryService) knownPan115CatalogProviderIDs(ctx context.Context, libraryID uint, scope providerChangeScope) (map[string]struct{}, error) {
 	identities := make(map[string]struct{})
+	ids := make([]string, 0, len(scope.Events))
+	for _, event := range scope.Events {
+		ids = append(ids, event.ItemID)
+	}
+	if len(ids) == 0 {
+		return identities, nil
+	}
 	var entryIDs []string
 	var assetIDs []string
 	if err := s.withCatalogRead(ctx, []uint{libraryID}, func(tx *gorm.DB, reader *CatalogReader) error {
-		if err := reader.Entries().Pluck("provider_id", &entryIDs).Error; err != nil {
+		if err := reader.Entries().Where("provider_id IN ?", ids).Pluck("provider_id", &entryIDs).Error; err != nil {
 			return err
 		}
-		return reader.SourceAssets().Pluck("provider_id", &assetIDs).Error
+		return reader.SourceAssets().Where("provider_id IN ?", ids).Pluck("provider_id", &assetIDs).Error
 	}); err != nil {
 		return nil, err
 	}
@@ -423,4 +427,220 @@ func mergeScopedPan115CatalogFacts(delta medialibrary.Result, entries []models.M
 	sort.Slice(merged.Assets, func(i, j int) bool { return merged.Assets[i].RelativePath < merged.Assets[j].RelativePath })
 	sort.Strings(merged.DeletedProviderIDs)
 	return merged, nil
+}
+
+// providerDeltaAlreadyApplied compares only identities named by this delivery.
+// A late/repeated provider notification must not allocate another artifact batch.
+func (s *MediaLibraryService) providerDeltaAlreadyApplied(ctx context.Context, libraryID uint, delta medialibrary.Result) (bool, error) {
+	ids := make([]string, 0, len(delta.Files)+len(delta.Assets)+len(delta.DeletedProviderIDs))
+	for _, f := range delta.Files {
+		ids = append(ids, f.ProviderID)
+	}
+	for _, a := range delta.Assets {
+		ids = append(ids, a.ProviderID)
+	}
+	ids = append(ids, delta.DeletedProviderIDs...)
+	if len(ids) == 0 {
+		return true, nil
+	}
+	entries := map[string]models.MediaLibraryEntry{}
+	assets := map[string]models.MediaLibrarySourceAsset{}
+	err := s.withCatalogRead(ctx, []uint{libraryID}, func(tx *gorm.DB, reader *CatalogReader) error {
+		for start := 0; start < len(ids); start += 250 {
+			end := start + 250
+			if end > len(ids) {
+				end = len(ids)
+			}
+			var es []models.MediaLibraryEntry
+			if err := reader.Entries().Where("provider_id IN ?", ids[start:end]).Find(&es).Error; err != nil {
+				return err
+			}
+			for _, e := range es {
+				entries[e.ProviderID] = e
+			}
+			var as []models.MediaLibrarySourceAsset
+			if err := reader.SourceAssets().Where("provider_id IN ?", ids[start:end]).Find(&as).Error; err != nil {
+				return err
+			}
+			for _, a := range as {
+				assets[a.ProviderID] = a
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return false, err
+	}
+	for _, f := range delta.Files {
+		e, ok := entries[f.ProviderID]
+		if !ok || e.RelativePath != f.RelativePath || e.Size != f.Size || !e.ModifiedAt.Equal(f.ModifiedAt) {
+			return false, nil
+		}
+	}
+	for _, a := range delta.Assets {
+		existing, ok := assets[a.ProviderID]
+		if !ok || existing.RelativePath != a.RelativePath || existing.Size != a.Size || !existing.ModifiedAt.Equal(a.ModifiedAt) || existing.HashHint != a.HashHint {
+			return false, nil
+		}
+	}
+	for _, id := range delta.DeletedProviderIDs {
+		if _, ok := entries[id]; ok {
+			return false, nil
+		}
+		if _, ok := assets[id]; ok {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+// prepareProviderDeliveryPage isolates unprovable deliveries before publication.
+// Successful identities form one verified delta; failed rows stay durable and
+// rotate behind newer work, so a deleted directory cannot starve valid files.
+func (s *MediaLibraryService) prepareProviderDeliveryPage(ctx context.Context, libraryID uint, scope providerChangeScope) (providerChangeScope, error) {
+	if len(scope.DeliveryIDs) == 0 {
+		return scope, nil
+	}
+	var library models.MediaLibrary
+	if err := s.db.WithContext(ctx).First(&library, libraryID).Error; err != nil {
+		return scope, err
+	}
+	var storage models.Storage
+	if err := s.db.WithContext(ctx).First(&storage, library.StorageID).Error; err != nil {
+		return scope, err
+	}
+	// Honor physical ownership before any provider calls.
+	entered, err := catalogPhysicalWriteEntered(ctx, s.db, libraryID)
+	if err != nil {
+		return scope, err
+	}
+	if entered {
+		return scope, errMediaLibraryEventReconcileDeferred
+	}
+	readiness, err := libraryReadiness(s.db.WithContext(ctx), libraryID)
+	if err != nil {
+		return scope, err
+	}
+	if readiness.ReadinessStatus == "repairing" || readiness.ReadinessStatus == "repair_failed" || readiness.ReadinessStatus == "credentials_required" || readiness.ReadinessStatus == "checking" {
+		return scope, errMediaLibraryEventReconcileDeferred
+	}
+	backend, err := s.backends.Get(storage.Type)
+	if err != nil {
+		return scope, err
+	}
+	var extra, ignores []string
+	_ = json.Unmarshal([]byte(library.STRMAssetExtraExtensionsJSON), &extra)
+	_ = json.Unmarshal([]byte(library.IgnorePatternsJSON), &ignores)
+	known, err := s.knownPan115CatalogProviderIDs(ctx, libraryID, scope)
+	if err != nil {
+		return scope, err
+	}
+	var rows []models.MediaLibraryProviderEvent
+	if err := s.db.WithContext(ctx).Where("library_id = ? AND id IN ?", libraryID, scope.DeliveryIDs).Order("id").Find(&rows).Error; err != nil {
+		return scope, err
+	}
+	result := medialibrary.Result{Partial: true, Scoped: true}
+	files := map[string]medialibrary.File{}
+	assets := map[string]medialibrary.SourceAsset{}
+	deleted := map[string]struct{}{}
+	prepared := providerChangeScope{}
+	for _, row := range rows {
+		if err := ctx.Err(); err != nil {
+			return scope, err
+		}
+		payload, valid := decodeProviderEventPayload(row.PayloadJSON)
+		if !valid || payload.Kind == cloudpkg.ChangeFallback {
+			continue
+		}
+		if isPan115DirectoryTreeTombstone(storage.Type, payload, known, effectiveSourceAssetExtensions(extra)) {
+			prepared.Events = append(prepared.Events, providerChangeEvent(payload))
+			prepared.DeliveryIDs = append(prepared.DeliveryIDs, row.ID)
+			if row.ID > prepared.DeliveryMaxID {
+				prepared.DeliveryMaxID = row.ID
+			}
+			prepared.EventCount++
+			continue
+		}
+		single := providerChangeScope{Events: []providerChangeEvent{providerChangeEvent(payload)}}
+		delta, scanErr := backend.Scan(ctx, MediaLibraryScanRequest{Library: library, Storage: storage, VideoExtensions: defaultVideoExtensions, AssetExtensions: effectiveSourceAssetExtensions(extra), IgnorePatterns: ignores, providerScope: &single, knownProviderIDs: known})
+		if scanErr == nil && result.Enumerated+delta.Enumerated > maxPan115ScopedEntries {
+			scanErr = errProviderChangeScopeUnproven
+		}
+		if scanErr != nil {
+			if err := s.db.WithContext(ctx).Model(&models.MediaLibraryProviderEvent{}).Where("id = ?", row.ID).Update("updated_at", time.Now().UTC()).Error; err != nil {
+				return scope, err
+			}
+			s.log.Warn().Uint("library_id", libraryID).Uint("delivery_id", row.ID).Msg("单个事件范围无法确认，保留重试；继续处理其他文件")
+			continue
+		}
+		prepared.Events = append(prepared.Events, single.Events...)
+		prepared.DeliveryIDs = append(prepared.DeliveryIDs, row.ID)
+		if row.ID > prepared.DeliveryMaxID {
+			prepared.DeliveryMaxID = row.ID
+		}
+		prepared.EventCount++
+		result.Enumerated += delta.Enumerated
+		for _, f := range delta.Files {
+			files[f.ProviderID] = f
+			delete(deleted, f.ProviderID)
+		}
+		for _, a := range delta.Assets {
+			assets[a.ProviderID] = a
+			delete(deleted, a.ProviderID)
+		}
+		for _, id := range delta.DeletedProviderIDs {
+			deleted[id] = struct{}{}
+			delete(files, id)
+			delete(assets, id)
+		}
+	}
+	if len(prepared.DeliveryIDs) == 0 {
+		return scope, errProviderChangeScopeUnproven
+	}
+	for _, f := range files {
+		result.Files = append(result.Files, f)
+	}
+	for _, a := range assets {
+		result.Assets = append(result.Assets, a)
+	}
+	for id := range deleted {
+		result.DeletedProviderIDs = append(result.DeletedProviderIDs, id)
+	}
+	sort.Slice(result.Files, func(i, j int) bool { return result.Files[i].RelativePath < result.Files[j].RelativePath })
+	sort.Slice(result.Assets, func(i, j int) bool { return result.Assets[i].RelativePath < result.Assets[j].RelativePath })
+	sort.Strings(result.DeletedProviderIDs)
+	prepared.VerifiedResult = &result
+	return prepared, nil
+}
+
+// Ignore only an untracked 115 directory export tombstone. Tracked identities
+// and explicitly configured text assets always retain ordinary deletion handling.
+// This runs for durable deliveries too, so older queued notices are acknowledged.
+func isPan115DirectoryTreeTombstone(storageType string, p providerEventPayload, known map[string]struct{}, assetExtensions []string) bool {
+	if storageType != models.StorageTypePan115 || p.Kind != cloudpkg.ChangeDeleted || p.ParentID != "0" || p.PreviousParentID != "" {
+		return false
+	}
+	if _, exists := known[p.ItemID]; exists {
+		return false
+	}
+	for _, ext := range assetExtensions {
+		if strings.EqualFold(strings.TrimPrefix(strings.TrimSpace(ext), "."), "txt") {
+			return false
+		}
+	}
+	if !strings.HasSuffix(p.Name, "_目录树.txt") {
+		return false
+	}
+	prefix := strings.TrimSuffix(p.Name, "_目录树.txt")
+	if !strings.HasPrefix(prefix, "共享") || len(prefix) != len("共享")+14 {
+		return false
+	}
+	timestamp := prefix[len("共享"):]
+	for _, r := range timestamp {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	_, err := time.Parse("20060102150405", timestamp)
+	return err == nil
 }

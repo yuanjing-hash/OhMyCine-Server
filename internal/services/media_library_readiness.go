@@ -28,20 +28,21 @@ const readinessRepairCurrentSQL = `NOT EXISTS (
 	)))
 )`
 
-const readinessRepairFailedSQL = `(r.succeeded_items>0 AND (r.failed_items>0 OR r.blocked_items>0)) OR ` + readinessRepairCurrentSQL
+const readinessRepairFailedSQL = readinessRepairCurrentSQL
 
 // A cancelled original admission never entered file execution. Do not let the
 // stale domain phase hold the library forever; a retry removes this exemption.
 // Missing receipts, partial results and unacknowledged leases remain blocking.
-const readinessRepairCancelledUnenteredSQL = `r.succeeded_items=0 AND EXISTS (
+const readinessRepairCancelledUnenteredSQL = `EXISTS (
 	SELECT 1 FROM catalog_physical_writes cp JOIN jobs cj ON cj.id=cp.job_id
 	WHERE cp.library_id=l.id AND cp.owner_kind='repair' AND cp.owner_id=r.id
-	AND cp.job_id=r.job_id AND cp.state='admitted'
+	AND cp.job_id=r.job_id AND ((cp.state='admitted' AND r.succeeded_items=0) OR cp.state='settled')
 	AND cj.job_type='media_library_repair' AND cj.status='cancelled'
 	AND cj.lease_token_hash='' AND cj.lease_expires_at IS NULL
 )`
 
-const readinessRepairActiveSQL = `r.phase IN ('queued','executing','reconciling') AND NOT (` + readinessRepairCancelledUnenteredSQL + `)`
+const readinessRepairActiveSQL = `(r.phase IN ('queued','executing','reconciling') AND NOT (` + readinessRepairCancelledUnenteredSQL + `)) OR
+	(r.phase='failed' AND EXISTS(SELECT 1 FROM jobs retry_job WHERE retry_job.id=r.job_id AND retry_job.job_type='media_library_repair' AND retry_job.status IN ('queued','running')))`
 
 func libraryReadinessRows(db *gorm.DB, ids []uint) (map[uint]MediaLibraryReadiness, error) {
 	type row struct {

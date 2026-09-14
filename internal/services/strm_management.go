@@ -62,6 +62,21 @@ type STRMArtifactPage struct {
 	Page     int                    `json:"page"`
 	PageSize int                    `json:"page_size"`
 }
+type STRMFailureItem struct {
+	Kind         string     `json:"kind"`
+	RelativePath string     `json:"relative_path"`
+	ErrorCode    string     `json:"error_code"`
+	ErrorMessage string     `json:"error_message"`
+	Retryable    bool       `json:"retryable"`
+	Attempts     int        `json:"attempts"`
+	NextRetryAt  *time.Time `json:"next_retry_at"`
+}
+type STRMFailurePage struct {
+	List     []STRMFailureItem `json:"list"`
+	Total    int64             `json:"total"`
+	Page     int               `json:"page"`
+	PageSize int               `json:"page_size"`
+}
 type STRMCleanupPreview struct {
 	Count             int            `json:"count"`
 	KindCounts        map[string]int `json:"kind_counts"`
@@ -167,7 +182,7 @@ func (s *STRMManagementService) Runs(actor Actor, libraryID uint, page, pageSize
 		return STRMRunPage{}, appError(CodePermissionDenied, "无权查看 STRM 历史", nil)
 	}
 	page, pageSize = pageBounds(page, pageSize)
-	query := s.db.Model(&models.MediaArtifactRun{})
+	query := s.db.Model(&models.MediaArtifactRun{}).Where("history_cleared_at IS NULL")
 	if libraryID != 0 {
 		if !actor.CanResource(authz.PermissionSTRMRunsRead, models.AuthorizationResourceMediaLibrary, uintID(libraryID)) {
 			return STRMRunPage{}, appError(CodePermissionDenied, "无权查看这个媒体库的 STRM 历史", nil)
@@ -224,6 +239,33 @@ func (s *STRMManagementService) Artifacts(actor Actor, libraryID uint, page, pag
 		return STRMArtifactPage{}, err
 	}
 	return STRMArtifactPage{List: list, Total: total, Page: page, PageSize: pageSize}, nil
+}
+
+func (s *STRMManagementService) Failures(actor Actor, runID string, page, pageSize int) (STRMFailurePage, error) {
+	page, pageSize = pageBounds(page, pageSize)
+	var run models.MediaArtifactRun
+	if err := s.db.First(&run, "id = ?", strings.TrimSpace(runID)).Error; err != nil {
+		return STRMFailurePage{}, appError(CodeNotFound, "STRM 运行记录不存在", err)
+	}
+	if !actor.CanResource(authz.PermissionSTRMRunsRead, models.AuthorizationResourceMediaLibrary, uintID(run.LibraryID)) {
+		return STRMFailurePage{}, appError(CodePermissionDenied, "无权查看这个媒体库的失败项", nil)
+	}
+	result := STRMFailurePage{List: []STRMFailureItem{}, Page: page, PageSize: pageSize}
+	if run.CatalogBindingID == "" {
+		return result, nil
+	}
+	query := s.db.Model(&models.CatalogArtifactBindingItem{}).Where("binding_id = ? AND status = ?", run.CatalogBindingID, "failed")
+	if err := query.Count(&result.Total).Error; err != nil {
+		return result, err
+	}
+	var rows []models.CatalogArtifactBindingItem
+	if err := query.Order("entity_kind,entity_id").Offset((page - 1) * pageSize).Limit(pageSize).Find(&rows).Error; err != nil {
+		return result, err
+	}
+	for _, row := range rows {
+		result.List = append(result.List, STRMFailureItem{Kind: row.EntityKind, RelativePath: row.SafeRelativePath, ErrorCode: row.ErrorCode, ErrorMessage: row.ErrorMessage, Retryable: row.Retryable && row.Attempts < catalogArtifactItemMaxAttempts, Attempts: row.Attempts, NextRetryAt: row.NextAttemptAt})
+	}
+	return result, nil
 }
 
 func (s *STRMManagementService) RequestReconcile(actor Actor, libraryID uint, mode string) (JobDTO, error) {
@@ -285,7 +327,12 @@ func (s *STRMManagementService) RetryRun(actor Actor, runID string) error {
 	}
 	now := time.Now().UTC()
 	if err := s.db.Transaction(func(tx *gorm.DB) error {
-		result := tx.Model(&models.MediaArtifactRun{}).Where("id = ? AND status = ?", run.ID, models.MediaArtifactStatusFailed).Updates(map[string]any{"status": models.MediaArtifactStatusQueued, "retry_count": gorm.Expr("retry_count + 1"), "error_code": "", "cleanup_status": models.MediaArtifactCleanupPending, "cleanup_error_code": "", "cleanup_at": nil, "finished_at": nil, "updated_at": now})
+		if run.CatalogBindingID != "" {
+			if err := tx.Model(&models.CatalogArtifactBindingItem{}).Where("binding_id = ? AND status = ?", run.CatalogBindingID, "failed").Updates(map[string]any{"status": "pending", "attempts": 0, "error_code": "", "error_message": "", "retryable": false, "next_attempt_at": nil, "finished_at": nil, "updated_at": now}).Error; err != nil {
+				return err
+			}
+		}
+		result := tx.Model(&models.MediaArtifactRun{}).Where("id = ? AND status = ?", run.ID, models.MediaArtifactStatusFailed).Updates(map[string]any{"status": models.MediaArtifactStatusQueued, "retry_count": gorm.Expr("retry_count + 1"), "error_code": "", "cleanup_status": models.MediaArtifactCleanupPending, "cleanup_error_code": "", "cleanup_at": nil, "finished_at": nil, "history_cleared_at": nil, "updated_at": now})
 		if result.Error != nil {
 			return result.Error
 		}
@@ -453,8 +500,9 @@ func (s *STRMManagementService) buildCleanupPlan(libraryID uint, runID string, a
 		// Older local-adjacent policies predate automatic metadata cleanup and
 		// therefore persisted CleanupEligible=false. A successful complete scan
 		// remains sufficient because only inactive managed artifacts are eligible.
-		cleanupEligible := plan.Policy.CleanupEligible || targetKind == models.MediaArtifactTargetLocalAdjacent
-		if !cleanupEligible || plan.Policy.ScanRunID == 0 || plan.Policy.ScanPartial || !automaticCleanupScanKind(plan.Policy.ScanKind) {
+		exactIncrementalScope := plan.Policy.CatalogScopeMode == catalogArtifactScopeIncremental
+		cleanupEligible := exactIncrementalScope || plan.Policy.CleanupEligible || targetKind == models.MediaArtifactTargetLocalAdjacent
+		if !cleanupEligible || (!exactIncrementalScope && (plan.Policy.ScanRunID == 0 || plan.Policy.ScanPartial || !automaticCleanupScanKind(plan.Policy.ScanKind))) {
 			return plan, &artifactCleanupSkip{reason: "artifact_cleanup_scan_ineligible"}
 		}
 		if targetKind != models.MediaArtifactTargetLocalProjection && targetKind != models.MediaArtifactTargetLocalAdjacent {
@@ -480,9 +528,11 @@ func (s *STRMManagementService) buildCleanupPlan(libraryID uint, runID string, a
 		if plan.Library.ArtifactGeneration != run.Generation || plan.Library.ArtifactAppliedGeneration != run.Generation {
 			return plan, &artifactCleanupSkip{reason: "artifact_cleanup_generation_changed"}
 		}
-		var scan models.MediaLibraryScanRun
-		if err := s.db.First(&scan, "id = ? AND library_id = ? AND generation = ?", plan.Policy.ScanRunID, libraryID, run.Generation).Error; err != nil || scan.Status != "success" || scan.Partial || scan.Kind != plan.Policy.ScanKind {
-			return plan, &artifactCleanupSkip{reason: "artifact_cleanup_scan_ineligible"}
+		if !exactIncrementalScope {
+			var scan models.MediaLibraryScanRun
+			if err := s.db.First(&scan, "id = ? AND library_id = ? AND generation = ?", plan.Policy.ScanRunID, libraryID, run.Generation).Error; err != nil || scan.Status != "success" || scan.Partial || scan.Kind != plan.Policy.ScanKind {
+				return plan, &artifactCleanupSkip{reason: "artifact_cleanup_scan_ineligible"}
+			}
 		}
 		plan.Run = &run
 	} else if strings.TrimSpace(rootPath) == "" {

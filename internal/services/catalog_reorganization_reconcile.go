@@ -52,9 +52,6 @@ func (w *MediaReorganizationWorker) reconcileCatalogReorganization(ctx context.C
 			if current.ContentRevision == next.Catalog.PublishedContentRevision {
 				requiresArtifacts = mediaLibraryRequiresArtifacts(storage.Type, current, libraries.artifacts != nil)
 				if requiresArtifacts {
-					if _, err := libraries.artifacts.BindCatalogGenerationTx(tx, library.ID, next.Catalog.ArtifactGeneration); err != nil {
-						return err
-					}
 				} else if libraries.changes != nil {
 					var err error
 					readied, err = libraries.changes.MarkGenerationReadyTx(tx, library.ID, next.Catalog.ArtifactGeneration)

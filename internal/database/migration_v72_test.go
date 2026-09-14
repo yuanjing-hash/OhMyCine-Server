@@ -175,8 +175,14 @@ func seedStructureMigrationLibrary(t *testing.T, db *gorm.DB, version int, name,
 	}
 	diagnosis := models.MediaLibraryStructureDiagnosis{LibraryID: library.ID, JobID: job.ID, Generation: 2, Status: diagnosisStatus, SourceRevision: 1, IssueCount: diagnosisCount, RepairableCount: diagnosisCount, DuplicateTargetCount: diagnosisCount, IssuesJSON: `[{"code":"duplicate_target"}]`, CreatedAt: now, UpdatedAt: now}
 	query := db
+	if version < 102 {
+		query = query.Omit("NamingMismatchCount", "LocationMismatchCount")
+	}
+	if version < 95 {
+		query = query.Omit("NamingMismatchCount", "LocationMismatchCount", "RecognitionSuspectConflictCount", "CatalogDuplicateConflictCount")
+	}
 	if version < 71 {
-		query = query.Omit("Automatic", "SourceRevision")
+		query = query.Omit("NamingMismatchCount", "LocationMismatchCount", "RecognitionSuspectConflictCount", "CatalogDuplicateConflictCount", "Automatic", "SourceRevision")
 	}
 	if err := query.Create(&diagnosis).Error; err != nil {
 		t.Fatal(err)

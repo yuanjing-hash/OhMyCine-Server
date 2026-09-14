@@ -227,6 +227,70 @@ func TestHostHTTPCredentialCaptureRequiresExplicitOneShotCommit(t *testing.T) {
 	}
 }
 
+func TestHostHTTPMultiStepCredentialCaptureAttachesAndMergesCommittedSession(t *testing.T) {
+	fixture := newHostFixture(t, []contract.Permission{
+		{Kind: contract.PermissionNetworkHTTP, Domains: []string{"api.example.test"}},
+		{Kind: contract.PermissionCredentialUse, Scopes: []string{"site.session"}},
+	})
+	if err := fixture.db.Model(&models.PluginConnection{}).Where("id = ?", fixture.connection.ID).Updates(map[string]any{
+		"credential_ciphertext": "", "credential_scope": "site.session", "credential_mode": models.PluginCredentialModeCookie,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	step := 0
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		step++
+		switch step {
+		case 1:
+			if cookie := request.Header.Get("Cookie"); cookie != "" {
+				t.Fatalf("initial login request unexpectedly attached cookie %q", cookie)
+			}
+			return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Set-Cookie": {"session=step-one; Path=/; Secure", "csrf=old; Path=/; Secure"}}, Body: io.NopCloser(strings.NewReader(`{}`)), Request: request}, nil
+		case 2:
+			cookie := request.Header.Get("Cookie")
+			if !strings.Contains(cookie, "session=step-one") || !strings.Contains(cookie, "csrf=old") {
+				t.Fatalf("captcha request did not attach committed login session: %q", cookie)
+			}
+			return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Set-Cookie": {"csrf=new; Path=/; Secure", "challenge=ready; Path=/; Secure"}}, Body: io.NopCloser(strings.NewReader(`{}`)), Request: request}, nil
+		default:
+			return nil, fmt.Errorf("unexpected request step %d", step)
+		}
+	})}
+	host := New(fixture.db, fixture.credentials, zerolog.Nop(), WithHTTPClient(client), WithResolver(publicResolver))
+	captureAndCommit := func(credential string) {
+		t.Helper()
+		payload, _ := json.Marshal(httpRequest{
+			ConnectionID: fixture.connection.ID, Method: http.MethodPost, URL: "https://api.example.test/login",
+			Credential: credential, CaptureCredentialScope: "site.session",
+		})
+		response, err := host.Call(context.Background(), fixture.pluginID, OperationHTTP, payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var envelope struct {
+			Data httpResponse `json:"data"`
+		}
+		if err := json.Unmarshal(response, &envelope); err != nil || envelope.Data.CredentialCaptureRef == "" {
+			t.Fatalf("capture response=%s err=%v", response, err)
+		}
+		commit, _ := json.Marshal(credentialCommitRequest{ConnectionID: fixture.connection.ID, Scope: "site.session", CaptureRef: envelope.Data.CredentialCaptureRef})
+		if _, err := host.Call(context.Background(), fixture.pluginID, OperationCredentialCommit, commit); err != nil {
+			t.Fatal(err)
+		}
+	}
+	captureAndCommit("")
+	captureAndCommit("site.session")
+
+	var stored models.PluginConnection
+	if err := fixture.db.First(&stored, "id = ?", fixture.connection.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	plaintext, err := fixture.credentials.Decrypt(CredentialPurpose(fixture.pluginID, fixture.connection.ID, "site.session"), stored.CredentialCiphertext)
+	if err != nil || plaintext != "challenge=ready; csrf=new; session=step-one" || stored.CredentialVersion != 2 {
+		t.Fatalf("credential=%q version=%d err=%v", plaintext, stored.CredentialVersion, err)
+	}
+}
+
 func TestHostHTTPCredentialCaptureRejectsCrossOriginAndInvalidCookieScope(t *testing.T) {
 	fixture := newHostFixture(t, []contract.Permission{
 		{Kind: contract.PermissionNetworkHTTP, Domains: []string{"api.example.test", "cdn.example.test"}},

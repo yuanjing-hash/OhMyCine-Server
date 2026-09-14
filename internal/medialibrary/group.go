@@ -84,6 +84,8 @@ func recognitionGroup(relative string, parsed ParsedMedia) (string, string) {
 		seriesDirectory := directory
 		if _, ok := seasonFolderNumber(path.Base(directory)); ok {
 			seriesDirectory = path.Dir(directory)
+		} else if isWorkSeasonReleaseDirectory(path.Base(directory), path.Base(path.Dir(directory)), parsed) {
+			seriesDirectory = path.Dir(directory)
 		}
 		if seriesDirectory == "." || seriesDirectory == "/" {
 			name := strings.TrimSpace(parsed.SeriesTitle)

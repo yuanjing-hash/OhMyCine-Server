@@ -266,7 +266,7 @@ export interface MediaLibraryStructureSelectionPreview {
 }
 export interface MediaLibraryStructurePreviewItem { action: 'keep' | 'move' | 'recycle'; kind: 'video' | 'sidecar'; current_path: string; expected_path: string }
 export type MediaLibraryStructurePreviewItemPage = PageResponse<MediaLibraryStructurePreviewItem>
-export interface MediaLibraryStructureClassifications { unrecognized: number; missing_season_episode: number; invalid_path: number; template_unavailable: number; duplicate_target: number; sidecar_target_conflict: number }
+export interface MediaLibraryStructureClassifications { unrecognized: number; missing_season_episode: number; naming_mismatch: number; location_mismatch: number; invalid_path: number; template_unavailable: number; duplicate_target: number; recognition_suspect_conflict: number; catalog_duplicate_conflict: number; sidecar_target_conflict: number }
 export interface MediaLibraryStructureDiagnostics { library_id: number; job_id?: string; scan_run_id?: number; generation: number; scan_kind: string; status: MediaLibraryDetail['structure_status']; total_items: number; processed_items: number; issue_count: number; repairable_count: number; unrecognized: number; classifications: MediaLibraryStructureClassifications; error_code: string; started_at?: string; checked_at?: string; issues: MediaLibraryStructureIssue[]; revision: string }
 export interface MediaLibraryStructurePreview { library_id: number; revision: string; issue_count: number; repairable_count: number; move_count: number; issues: MediaLibraryStructureIssue[]; confirmation_token: string; expires_at: string }
 export interface MediaLibraryStructureRepair { id: string; job_id?: string; library_id: number; scope: 'full' | 'work'; generation: number; phase: 'queued' | 'executing' | 'reconciling' | 'completed' | 'partial_failed' | 'failed'; issue_count: number; total_items: number; processed_items: number; succeeded_items: number; failed_items: number; blocked_items: number; last_error_code: string; created_at: string; updated_at: string; finished_at?: string }
@@ -319,6 +319,8 @@ export interface DownloaderCapabilities {
 }
 export interface DownloaderSummary {
   id: string; name: string; type: 'fake' | 'qbittorrent' | 'pan115_offline'; base_url: string; enabled: boolean
+  execution_location: 'server' | 'node'; node_id?: string; node_name?: string
+  downloader_save_root?: string; node_mount_root?: string
   storage_id: number | null; storage_name: string; provider_directory_path: string
   auto_listen_life_events: boolean
   life_event_default_library_id?: number; life_event_default_library_name: string
@@ -326,6 +328,21 @@ export interface DownloaderSummary {
   health: { status: 'unknown' | 'online' | 'offline'; version: string; error_code: string; last_checked_at: string | null }
   created_at: string; updated_at: string
 }
+export interface TransferNodeCapabilities {
+  codes: string[]; max_concurrent: number; managed_free_bytes?: number; managed_free_bytes_known: boolean
+}
+export interface TransferNodeSummary {
+  id: string; name: string; api_url: string
+  status: 'pending' | 'online' | 'offline' | 'disabled' | 'revoked'
+  platform: 'linux' | 'windows'; architecture: 'amd64' | 'arm64'
+  protocol_min: number; protocol_max: number; agent_version: string
+  capabilities: TransferNodeCapabilities; free_bytes?: number; free_bytes_known: boolean
+  last_error_code?: string; last_heartbeat_at?: string; revision: number; default: boolean
+  created_at: string; updated_at: string
+}
+export interface TransferNodeSettings { default_node_id?: string; revision: number }
+export interface TransferNodeInstallation { available: boolean; shell?: 'bash' | 'powershell'; command?: string }
+export interface CreateTransferNodeResult { node: TransferNodeSummary; enrollment_token: string; expires_in_seconds: number; installation: TransferNodeInstallation }
 export interface DownloadSettings {
   configured: boolean; absolute_path: string; revision: number; updated_at: string
 }
@@ -355,6 +372,7 @@ export interface DownloadTaskSummary {
   transfer_task_id: string; transfer_job_id: string; transfer_job_status: string
   seeding_task_id: string; seeding_job_id: string; seeding_job_status: string; seeding_phase: string
   lifecycle_scope: 'active' | 'history'
+  execution_location: 'server' | 'node'; node_id?: string; node_name?: string
 }
 
 export interface SeedingSettings {

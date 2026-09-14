@@ -1,0 +1,16 @@
+services:
+  server:
+    image: ghcr.io/yuanjing-hash/ohmycine-server:${OMC_IMAGE_TAG:-beta}
+    restart: unless-stopped
+    ports:
+      - "${OMC_BIND_ADDRESS:-127.0.0.1}:3000:3000"
+    environment:
+      OMC_PUBLIC_ORIGIN: ${OMC_PUBLIC_ORIGIN:-http://127.0.0.1:3000}
+    volumes:
+      - server-state:/var/lib/ohmycine
+    # Add only your media/STRM roots, using the same paths in the Server UI.
+    # - /srv/media:/media
+    # - /srv/strm:/strm
+    stop_grace_period: 60s
+volumes:
+  server-state:

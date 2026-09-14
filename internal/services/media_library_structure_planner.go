@@ -102,12 +102,16 @@ type StructurePlan struct {
 }
 
 type StructureIssueClassifications struct {
-	Unrecognized    int `json:"unrecognized"`
-	MissingEpisode  int `json:"missing_season_episode"`
-	InvalidPath     int `json:"invalid_path"`
-	TemplateError   int `json:"template_unavailable"`
-	DuplicateTarget int `json:"duplicate_target"`
-	SidecarConflict int `json:"sidecar_target_conflict"`
+	Unrecognized               int `json:"unrecognized"`
+	MissingEpisode             int `json:"missing_season_episode"`
+	NamingMismatch             int `json:"naming_mismatch"`
+	LocationMismatch           int `json:"location_mismatch"`
+	InvalidPath                int `json:"invalid_path"`
+	TemplateError              int `json:"template_unavailable"`
+	DuplicateTarget            int `json:"duplicate_target"`
+	RecognitionSuspectConflict int `json:"recognition_suspect_conflict"`
+	CatalogDuplicateConflict   int `json:"catalog_duplicate_conflict"`
+	SidecarConflict            int `json:"sidecar_target_conflict"`
 }
 
 // StructurePlanner contains no storage behavior. It turns catalog facts and
@@ -131,20 +135,21 @@ type structurePlanTask struct {
 }
 
 type structurePlanCandidate struct {
-	index            int
-	kind             string
-	workKey          string
-	title            string
-	source           string
-	target           string
-	providerID       string
-	recognitionID    uint
-	parentProviderID string
-	size             int64
-	modifiedAt       int64
-	allowRootSource  bool
-	moveIssueCode    string
-	issue            *StructureIssue
+	index             int
+	kind              string
+	namingDirectories []int
+	workKey           string
+	title             string
+	source            string
+	target            string
+	providerID        string
+	recognitionID     uint
+	parentProviderID  string
+	size              int64
+	modifiedAt        int64
+	allowRootSource   bool
+	moveIssueCode     string
+	issue             *StructureIssue
 }
 
 type structureVideoAssociation struct {
@@ -158,6 +163,7 @@ type structureAssociationIndex struct {
 	singleWorkByDirectory map[string]string
 	workRoots             map[string]string
 	workTitles            map[string]string
+	workNamingDirectories map[string][]int
 	workKeysByDirectory   map[string]map[string]struct{}
 }
 
@@ -329,11 +335,16 @@ func buildStructureVideoCandidate(library models.MediaLibrary, entry models.Medi
 		return candidate
 	}
 	candidate.target = target
+	directoryTemplate := library.MovieDirectoryTemplate
+	if entry.MediaType == "tv" {
+		directoryTemplate = library.TVDirectoryTemplate
+	}
+	candidate.namingDirectories = structureTemplateNamingDirectoryIndexes(directoryTemplate)
 	return candidate
 }
 
 func buildStructureAssociationIndex(candidates []structurePlanCandidate, entries []models.MediaLibraryEntry) *structureAssociationIndex {
-	index := &structureAssociationIndex{byDirectoryBase: map[string]map[string][]structureVideoAssociation{}, singleWorkByDirectory: map[string]string{}, workRoots: map[string]string{}, workTitles: map[string]string{}, workKeysByDirectory: map[string]map[string]struct{}{}}
+	index := &structureAssociationIndex{byDirectoryBase: map[string]map[string][]structureVideoAssociation{}, singleWorkByDirectory: map[string]string{}, workRoots: map[string]string{}, workTitles: map[string]string{}, workNamingDirectories: map[string][]int{}, workKeysByDirectory: map[string]map[string]struct{}{}}
 	groups := map[string][]structurePlanCandidate{}
 	for _, candidate := range candidates {
 		if candidate.source != "" && candidate.workKey != "" {
@@ -369,6 +380,7 @@ func buildStructureAssociationIndex(candidates []structurePlanCandidate, entries
 			index.workRoots[candidate.workKey] = workRoot
 		}
 		index.workTitles[candidate.workKey] = candidate.title
+		index.workNamingDirectories[candidate.workKey] = append([]int(nil), candidate.namingDirectories...)
 	}
 	for directory, byBase := range index.byDirectoryBase {
 		for base := range byBase {
@@ -401,6 +413,7 @@ func buildStructureSidecarCandidate(asset models.MediaLibrarySourceAsset, index 
 	}
 	candidate.target, candidate.workKey = target, associatedWork
 	candidate.title = associations.workTitles[associatedWork]
+	candidate.namingDirectories = append([]int(nil), associations.workNamingDirectories[associatedWork]...)
 	return candidate
 }
 
@@ -469,10 +482,65 @@ func appendStructureCandidates(plan *StructurePlan, candidates []structurePlanCa
 		plan.Items = append(plan.Items, StructurePlanItem{Kind: candidate.kind, WorkKey: candidate.workKey, Title: candidate.title, RecognitionID: candidate.recognitionID, SourceRelative: candidate.source, TargetRelative: candidate.target, ProviderID: candidate.providerID, ParentProviderID: candidate.parentProviderID, AllowProviderRootSource: candidate.allowRootSource, Size: candidate.size, ModifiedAtUnixNano: candidate.modifiedAt})
 		issueCode := candidate.moveIssueCode
 		if issueCode == "" {
-			issueCode = "path_mismatch"
+			issueCode = structurePathMismatchCode(candidate.source, candidate.target, candidate.namingDirectories)
 		}
 		plan.addIssue(StructureIssue{Code: issueCode, Kind: candidate.kind, WorkKey: candidate.workKey, Title: candidate.title, CurrentPath: candidate.source, ExpectedPath: candidate.target, Repairable: true, RecognitionID: candidate.recognitionID})
 	}
+}
+
+// structureTemplateNamingDirectoryIndexes derives naming positions from the
+// active Profile template instead of assuming fixed movie/TV depths. Category
+// placeholders are routing decisions and intentionally remain location data.
+func structureTemplateNamingDirectoryIndexes(template string) []int {
+	result := make([]int, 0, 2)
+	for index, segment := range strings.Split(strings.Trim(filepath.ToSlash(strings.TrimSpace(template)), "/"), "/") {
+		lower := strings.ToLower(segment)
+		// A segment which also carries the category changes the routing
+		// position when that category changes. Treat the complete segment as
+		// location data instead of guessing which placeholder caused the
+		// rendered difference.
+		if strings.Contains(lower, "{category}") {
+			continue
+		}
+		for _, token := range []string{"{title", "{year", "{season", "{episode", "{version"} {
+			if strings.Contains(lower, token) {
+				result = append(result, index)
+				break
+			}
+		}
+	}
+	return result
+}
+
+// structurePathMismatchCode separates name normalization from an actual
+// location/layout change after recognition has established the work identity.
+// Directory positions containing naming placeholders come from the active
+// Profile; any depth change or differing routing/category position is a
+// location mismatch, including a move which also renames the item.
+func structurePathMismatchCode(source, target string, namingDirectories []int) string {
+	source = safeStructurePath(source)
+	target = safeStructurePath(target)
+	if source == "" || target == "" {
+		return "location_mismatch"
+	}
+	sourceParts, targetParts := strings.Split(source, "/"), strings.Split(target, "/")
+	if len(sourceParts) != len(targetParts) || len(sourceParts) == 0 {
+		return "location_mismatch"
+	}
+	sourceDirs, targetDirs := sourceParts[:len(sourceParts)-1], targetParts[:len(targetParts)-1]
+	naming := make(map[int]struct{}, len(namingDirectories))
+	for _, index := range namingDirectories {
+		naming[index] = struct{}{}
+	}
+	for index := range targetDirs {
+		if strings.EqualFold(sourceDirs[index], targetDirs[index]) {
+			continue
+		}
+		if _, allowed := naming[index]; !allowed {
+			return "location_mismatch"
+		}
+	}
+	return "naming_mismatch"
 }
 
 func structureTargetConflictCode(candidates []structurePlanCandidate, members []int) string {
@@ -578,14 +646,20 @@ func (p *StructurePlan) addIssue(issue StructureIssue) {
 		p.Classifications.Unrecognized++
 	case "missing_season_episode":
 		p.Classifications.MissingEpisode++
+	case "naming_mismatch":
+		p.Classifications.NamingMismatch++
+	case "location_mismatch":
+		p.Classifications.LocationMismatch++
 	case "invalid_path":
 		p.Classifications.InvalidPath++
 	case "template_unavailable":
 		p.Classifications.TemplateError++
 	case "duplicate_target":
 		p.Classifications.DuplicateTarget++
-	case "recognition_suspect_conflict", "catalog_duplicate_conflict":
-		p.Classifications.DuplicateTarget++
+	case "recognition_suspect_conflict":
+		p.Classifications.RecognitionSuspectConflict++
+	case "catalog_duplicate_conflict":
+		p.Classifications.CatalogDuplicateConflict++
 	case "sidecar_target_conflict":
 		p.Classifications.SidecarConflict++
 	}

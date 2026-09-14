@@ -109,6 +109,9 @@ func TestJobWaitReasonCancelledPhysicalReceiptNeedsVerification(t *testing.T) {
 	if err != nil || got.WaitReason == nil || got.WaitReason.Code != "library_busy" {
 		t.Fatalf("waiting=%+v err=%v", got, err)
 	}
+	if !strings.Contains(got.WaitReason.Message, "无需手动确认") || !strings.Contains(got.WaitReason.Message, "自动继续") {
+		t.Fatalf("busy wait reason must explain automatic recovery: %+v", got.WaitReason)
+	}
 	b, _ := json.Marshal(got.WaitReason)
 	for _, secret := range []string{old.ID, "private-owner", "private-digest", "private old owner"} {
 		if strings.Contains(string(b), secret) {

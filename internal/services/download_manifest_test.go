@@ -269,6 +269,81 @@ func TestSelectDownloadPackageManifestDoesNotFallbackToLargestUnknownTVVideo(t *
 	}
 }
 
+func TestSelectDownloadPackageManifestAllowsMissingAndUnknownEpisodes(t *testing.T) {
+	manifest := downloadpkg.Manifest{Name: "Series", Complete: true, Files: []downloadpkg.File{
+		{RelativePath: "Series.E01.mp4", Size: 500 << 20},
+		{RelativePath: "Series.E03.mp4", Size: 400 << 20},
+		{RelativePath: "unknown.mp4", Size: 450 << 20},
+		{RelativePath: "Series.E03.zh.ass", Size: 1024},
+		{RelativePath: "unknown.zh.ass", Size: 1024},
+		{RelativePath: "advertisement.jpg", Size: 1024},
+		{RelativePath: "advertisement.url", Size: 100},
+	}}
+	selected, err := selectDownloadPackageManifest(manifest, "tv")
+	if err != nil || len(selected.Files) != 3 {
+		t.Fatalf("selected=%+v err=%v", selected, err)
+	}
+	for i, want := range []string{"Series.E01.mp4", "Series.E03.mp4", "Series.E03.zh.ass"} {
+		if selected.Files[i].RelativePath != want {
+			t.Fatalf("selected=%+v", selected.Files)
+		}
+	}
+	// Transfer's second selection gate must accept the filtered package.
+	again, err := selectDownloadPackageManifest(selected, "tv")
+	if err != nil || !sameAutomaticTransferFiles(selected.Files, again.Files) {
+		t.Fatalf("selection is not stable: %+v err=%v", again, err)
+	}
+	queue, _, download, _, _ := transferFixture(t, models.MediaLibraryTransferMove, models.MediaLibraryConflictOverwrite, false)
+	download.ScrapeMediaType = "tv"
+	_, identityJSON, err := buildDownloadIdentitySnapshot(download, scrapeMatch{MediaType: "tv", Title: download.ScrapeTitle, Category: download.ScrapeCategory, TMDBID: download.ScrapeTMDBID}, selected, download.IdentitySource, download.IdentityStatus, download.IdentityLocked, download.IdentityRevision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	download.IdentitySnapshotJSON = identityJSON
+	service := NewTransferService(queue.db, queue.audit, queue, zerolog.Nop())
+	if err := service.EnqueuePackage(download, selected, manifest); err != nil {
+		t.Fatalf("filtered episodes could not enter Transfer: %v", err)
+	}
+}
+
+func TestPersistScrapeEpisodeSnapshotUsesSelectedFiles(t *testing.T) {
+	downloads, _, queue, actor, _ := downloadFixture(t)
+	manifest := downloadpkg.Manifest{Name: "Series", Complete: true, Files: []downloadpkg.File{
+		{RelativePath: "Series.E01.mp4", Size: 500 << 20},
+		{RelativePath: "Series.E03.mp4", Size: 400 << 20},
+		{RelativePath: "sample.E99.mp4", Size: 1 << 20},
+		{RelativePath: "unknown.mp4", Size: 450 << 20},
+	}}
+	raw, err := encodeCompletedDownloadManifest(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	task := models.DownloadTask{ID: "partial-episode-snapshot", OwnerID: actor.User.ID, CompletedManifestJSON: raw}
+	_, err = queue.EnqueueWith(EnqueueJobInput{OwnerID: actor.User.ID, JobType: "download", DisplayName: "Series", Payload: downloadJobPayload{DownloadTaskID: task.ID}}, func(tx *gorm.DB, job models.Job) error {
+		task.JobID = job.ID
+		return tx.Create(&task).Error
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := int64(105053)
+	match := scrapeMatch{MediaType: "tv", Title: "Series", Category: "国产剧", TMDBID: &id}
+	if err := NewDownloadWorker(downloads).persistScrape(&task, match, "completed_verified", 2); err != nil {
+		t.Fatal(err)
+	}
+	identity, err := decodeMediaIdentity(task.IdentitySnapshotJSON)
+	if err != nil || len(identity.Episodes) != 2 || task.CompletedManifestJSON != raw {
+		t.Fatalf("identity=%+v err=%v source preserved=%v", identity, err, task.CompletedManifestJSON == raw)
+	}
+	selected, err := selectDownloadPackageManifest(manifest, "tv")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := transferEpisodeFactsForManifest(task, selected); err != nil {
+		t.Fatalf("selected snapshot cannot reach planner: %v", err)
+	}
+}
+
 func TestTransferEnqueueRejectsUnrecognizedPackageBeforePlanning(t *testing.T) {
 	queue, _, download, _, _ := transferFixture(t, models.MediaLibraryTransferMove, models.MediaLibraryConflictOverwrite, false)
 	download.ScrapeStatus = "completed_unrecognized"

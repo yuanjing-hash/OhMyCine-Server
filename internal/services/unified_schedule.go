@@ -22,7 +22,7 @@ const JobTypeUnifiedSchedule = "unified_schedule"
 var fiveFieldCronParser = cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
 
 var scheduleActions = map[string]string{
-	"media_library_scan":               "媒体库全量扫描",
+	"media_library_scan":               "媒体库全量核对（仅处理云端差异）",
 	"media_library_structure_diagnose": "媒体库目录诊断",
 	"media_library_structure_repair":   "媒体库目录修复",
 	"strm_reconcile":                   "STRM/元数据一致性检查",
@@ -140,7 +140,7 @@ func (s *UnifiedScheduleService) Runs(actor Actor, id string, limit int) ([]mode
 		limit = 50
 	}
 	var rows []models.ScheduleRun
-	if err := s.db.Where("schedule_id = ?", id).Order("scheduled_at DESC,id").Limit(limit).Find(&rows).Error; err != nil {
+	if err := s.db.Where("schedule_id = ? AND history_cleared_at IS NULL", id).Order("scheduled_at DESC,id").Limit(limit).Find(&rows).Error; err != nil {
 		return nil, err
 	}
 	return rows, nil
@@ -388,6 +388,11 @@ func syncManagedSchedule(tx *gorm.DB, ownerID uint, name, actionType, targetType
 		return err
 	}
 	if !overwriteExisting {
+		// Refresh only recognizable generated labels. Keep user names and all
+		// execution settings, including an edited Cron, untouched at startup.
+		if actionType == "media_library_scan" && (strings.HasPrefix(existing.Name, "媒体库增量复核 · ") || strings.HasPrefix(existing.Name, "媒体库全量扫描 · ")) {
+			return tx.Model(&existing).Updates(map[string]any{"name": name, "updated_at": now}).Error
+		}
 		return nil
 	}
 	updates := map[string]any{"owner_id": ownerID, "name": name, "cron_expression": expression, "timezone": timezone, "enabled": enabled, "revision": gorm.Expr("revision + 1"), "updated_at": now}
@@ -441,7 +446,7 @@ func syncMediaLibraryUnifiedSchedule(tx *gorm.DB, ownerID uint, library models.M
 	if err != nil {
 		return err
 	}
-	return syncManagedSchedule(tx, ownerID, "媒体库全量扫描 · "+library.Name+" · "+strconv.FormatUint(uint64(library.ID), 10), "media_library_scan", "media_library", strconv.FormatUint(uint64(library.ID), 10), expression, "Asia/Shanghai", library.Enabled, overwriteExisting, now)
+	return syncManagedSchedule(tx, ownerID, "媒体库全量核对（仅处理云端差异） · "+library.Name+" · "+strconv.FormatUint(uint64(library.ID), 10), "media_library_scan", "media_library", strconv.FormatUint(uint64(library.ID), 10), expression, "Asia/Shanghai", library.Enabled, overwriteExisting, now)
 }
 
 func (s *UnifiedScheduleService) syncLegacyDefinitions() error {
@@ -626,13 +631,16 @@ func (s *UnifiedScheduleService) run(ctx context.Context, _ JobRuntime, claimed 
 	}
 	switch definition.ActionType {
 	case "media_library_scan":
-		_, err = s.libraries.ScanNow(runCtx, actor, uint(targetID))
+		// Scheduled reconciliation is an explicit full provider comparison. The
+		// publication layer computes exact before/after deltas and only queues
+		// artifacts for changed entries; unchanged cloud objects are skipped.
+		_, err = s.libraries.Scan(runCtx, actor, uint(targetID), "full")
 	case "media_library_structure_diagnose":
 		_, err = s.structure.Diagnose(runCtx, uint(targetID), "")
 	case "media_library_structure_repair":
 		_, err = s.structure.EnqueueRepair(runCtx, actor, uint(targetID), "", RequestContext{})
 	case "strm_reconcile":
-		_, err = s.strm.RequestReconcile(actor, uint(targetID), "full")
+		_, err = s.strm.RequestReconcile(actor, uint(targetID), "incremental")
 	case "follow_search":
 		_, err = s.follows.Enqueue(runCtx, actor, definition.TargetID, "schedule", RequestContext{})
 	case "cookiecloud_sync":

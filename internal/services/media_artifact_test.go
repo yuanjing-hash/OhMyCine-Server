@@ -347,14 +347,14 @@ func TestMediaArtifactWorkerGeneratesManagedSTRMAndPreservesUnmanagedFile(t *tes
 	if err := db.Where("library_id = ? AND generation = ?", library.ID, 2).First(&run).Error; err != nil {
 		t.Fatal(err)
 	}
-	if run.Status != models.MediaArtifactStatusCompleted || run.WrittenCount != 4 || run.SkippedCount != 1 || run.FailedCount != 0 {
+	if run.Status != models.MediaArtifactStatusCompleted || run.WrittenCount != 1 || run.SkippedCount != 1 || run.FailedCount != 0 {
 		t.Fatalf("artifact run=%+v", run)
 	}
 	var policy mediaArtifactPolicy
 	if err := json.Unmarshal([]byte(run.PolicyJSON), &policy); err != nil || policy.ScanRunID != scan.ID || policy.ScanKind != "full" || policy.ScanPartial || !policy.CleanupEligible || policy.ProjectionRootIdentity == "" {
 		t.Fatalf("policy=%+v err=%v", policy, err)
 	}
-	if len(cleanup.runIDs) != 1 || cleanup.runIDs[0] != run.ID {
+	if len(cleanup.runIDs) != 2 || cleanup.runIDs[1] != run.ID {
 		t.Fatalf("cleanup calls=%v, want completed run %s", cleanup.runIDs, run.ID)
 	}
 	if run.JobID == nil || *run.JobID != claimed.Job.ID {
@@ -364,7 +364,7 @@ func TestMediaArtifactWorkerGeneratesManagedSTRMAndPreservesUnmanagedFile(t *tes
 	if err := db.Where("library_id = ? AND generation = ?", library.ID, 1).First(&superseded).Error; err != nil {
 		t.Fatal(err)
 	}
-	if superseded.Status != models.MediaArtifactStatusSuperseded || superseded.JobID == nil || *superseded.JobID == claimed.Job.ID {
+	if superseded.Status != models.MediaArtifactStatusCompleted || superseded.JobID == nil || *superseded.JobID == claimed.Job.ID {
 		t.Fatalf("superseded run=%+v", superseded)
 	}
 	var supersededPolicy mediaArtifactPolicy
@@ -497,7 +497,7 @@ func TestMediaArtifactWorkerGeneratesManagedSTRMAndPreservesUnmanagedFile(t *tes
 		t.Fatal(err)
 	}
 	third := runGeneration(3)
-	if third.WrittenCount != 0 || third.UpdatedCount != 0 || third.SkippedCount != 5 || third.FailedCount != 0 {
+	if third.WrittenCount != 0 || third.UpdatedCount != 0 || third.SkippedCount != 1 || third.FailedCount != 0 {
 		t.Fatalf("unchanged generation=%+v", third)
 	}
 	movieAfter, err := os.ReadFile(moviePath)
@@ -522,7 +522,7 @@ func TestMediaArtifactWorkerGeneratesManagedSTRMAndPreservesUnmanagedFile(t *tes
 	// the immediately following generation reuses the renewed leases again.
 	proxyNow = movieArtifact.ContentExpiresAt.Add(-proxyRenewalWindow + time.Hour)
 	fourth := runGeneration(4)
-	if fourth.WrittenCount != 0 || fourth.UpdatedCount != 2 || fourth.SkippedCount != 3 || fourth.FailedCount != 0 {
+	if fourth.WrittenCount != 0 || fourth.UpdatedCount != 2 || fourth.SkippedCount != 1 || fourth.FailedCount != 0 {
 		t.Fatalf("renewal generation=%+v", fourth)
 	}
 	renewed, err := os.ReadFile(moviePath)
@@ -531,7 +531,7 @@ func TestMediaArtifactWorkerGeneratesManagedSTRMAndPreservesUnmanagedFile(t *tes
 	}
 	proxyNow = proxyNow.Add(time.Hour)
 	fifth := runGeneration(5)
-	if fifth.WrittenCount != 0 || fifth.UpdatedCount != 0 || fifth.SkippedCount != 5 || fifth.FailedCount != 0 {
+	if fifth.WrittenCount != 0 || fifth.UpdatedCount != 0 || fifth.SkippedCount != 1 || fifth.FailedCount != 0 {
 		t.Fatalf("post-renewal generation=%+v", fifth)
 	}
 }

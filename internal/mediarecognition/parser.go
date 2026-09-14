@@ -17,7 +17,7 @@ import (
 var (
 	videoExtensionPattern           = regexp.MustCompile(`(?i)\.(mkv|mp4|m4v|avi|mov|wmv|ts|m2ts|mts|webm|flv|iso|vob)$`)
 	episodePattern                  = regexp.MustCompile(`(?i)(?:^|[^[:alnum:]])S\s*0*([0-9]{1,2})\s*E\s*0*([0-9]{1,5})(?:[^[:alnum:]]|$)|(?:^|[^[:alnum:]])0*([0-9]{1,2})x0*([0-9]{1,5})(?:[^[:alnum:]]|$)`)
-	standaloneEpisodePattern        = regexp.MustCompile(`(?i)(?:^|[^[:alnum:]])(?:ep|episode)\s*0*([0-9]{1,5})(?:[^[:alnum:]]|$)`)
+	standaloneEpisodePattern        = regexp.MustCompile(`(?i)(?:^|[^[:alnum:]])(?:e|ep|episode)\s*0*([0-9]{1,5})(?:[^[:alnum:]]|$)`)
 	seasonPattern                   = regexp.MustCompile(`(?i)(?:^|[^[:alnum:]])(?:season|s)\s*0*([0-9]{1,2})(?:[^[:alnum:]]|$)`)
 	episodeRangePattern             = regexp.MustCompile(`(?i)(?:^|[^[:alnum:]])(?:ep?|episodes?)?\s*0*([0-9]{1,5})\s*[-~～—]\s*0*([0-9]{1,5})(?:\s*(?:tv)?(?:全集|全))?(?:[^[:alnum:]]|$)`)
 	bracketRangePattern             = regexp.MustCompile(`(?i)(?:\[|【)\s*(?:ep?|episodes?)?\s*0*([0-9]{1,5})\s*[-~～—]\s*0*([0-9]{1,5})[^\]】]{0,32}(?:\]|】)`)

@@ -73,7 +73,6 @@ func TestLibraryRetirementConfigurationConnectionOrdering(t *testing.T) {
 			s := NewMediaLibraryService(store.writeDB, NewAuditService(store.writeDB), zerolog.Nop())
 			s.SetCatalogSnapshotStore(store)
 			s.SetQueueService(NewQueueService(store.writeDB, s.audit))
-			s.SetRetirementPhysicalGuard(AssertCatalogPhysicalDrainedTx)
 			actor.Permissions[authz.PermissionMediaLibrariesDelete] = struct{}{}
 			var claim ClaimedJob
 			var row models.MediaLibraryRetirement

@@ -241,19 +241,23 @@ func (a *API) ScanMediaLibrary(c *gin.Context) {
 		writeError(c, a.log, &services.AppError{Code: services.CodeInvalidRequest, Message: "扫描请求无效", Cause: err})
 		return
 	}
-	mode := input.Mode
-	if mode == "" {
-		// Existing clients used an empty object and historically expected the
-		// expensive comprehensive scan. Preserve that behavior while exposing a
-		// separate immediate incremental action in the UI.
-		mode = "full"
-	}
+	mode := requestedMediaLibraryScanMode(input.Mode)
 	run, err := a.libraries.Scan(c.Request.Context(), actor, id, mode)
 	if err != nil {
 		writeError(c, a.log, err)
 		return
 	}
 	success(c, http.StatusOK, run)
+}
+
+func requestedMediaLibraryScanMode(mode string) string {
+	if mode == "" {
+		// Empty/older client requests are routine refreshes. Only an explicit
+		// "full" request may start a complete tree reconciliation; the initial
+		// baseline remains owned by the library supervisor.
+		return "incremental"
+	}
+	return mode
 }
 func (a *API) RetryMediaLibrary(c *gin.Context) {
 	actor, _ := middleware.ActorFrom(c)

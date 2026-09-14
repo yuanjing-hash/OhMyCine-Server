@@ -22,6 +22,7 @@
 - [x] Discover → Download → Transfer → Import → Notify 持久任务流水线。
 - [x] 本地、115、OpenList/Alist、CloudDrive2 等来源/目标抽象。
 - [x] qBittorrent、Transmission 与 115 离线下载路由能力。
+- [~] 公网 `ohmycine-node` 已覆盖 qB/PT→115、qB/PT→本地、115 A→B、115→本地，包含冻结计划、断点校验、短期密封授权、三平台签名资产和一键安装命令；真实公网 HTTPS Node 与 115 账号端到端验收待完成。
 - [x] 跨数据源本地暂存、刮削和目标上传；同一 115 保持云端快速路径。
 - [x] 自动分类统一使用 `电影` / `电视剧` 一级目录。
 - [x] 自动监听 115 生活事件、来源目录回收和定时清空回收站。

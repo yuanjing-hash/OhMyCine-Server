@@ -93,6 +93,18 @@ func TestUpdateServiceCheckSettingsAndSafeStatus(t *testing.T) {
 	}
 }
 
+func TestUpdateServiceLinuxARM64UsesNativeUpdateButContainerRemainsManaged(t *testing.T) {
+	service, _, _, _ := testUpdateService(t)
+	service.goos, service.goarch = "linux", "arm64"
+	if managed, reason := service.deploymentManaged(); managed {
+		t.Fatalf("native Linux ARM64 should support updates: %s", reason)
+	}
+	service.container = func() bool { return true }
+	if managed, reason := service.deploymentManaged(); !managed || reason != updateManagedContainer {
+		t.Fatalf("container must update through image replacement: %v %s", managed, reason)
+	}
+}
+
 func TestUpdateServiceInstallStartsHelperThenRequestsShutdown(t *testing.T) {
 	service, client, store, executable := testUpdateService(t)
 	status, err := service.Check(context.Background(), updateAdminActor(), RequestContext{})

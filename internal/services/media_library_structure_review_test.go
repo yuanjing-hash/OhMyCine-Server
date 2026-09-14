@@ -265,3 +265,47 @@ func TestStructureReviewBulkUsesBoundedStatements(t *testing.T) {
 		t.Fatalf("bulk review used %d SQL statements, want bounded batches", statements)
 	}
 }
+
+func TestStructureReviewBulkSkipCoversOneCategoryAcrossAllPages(t *testing.T) {
+	s, actor, library := structureConfirmationFixture(t)
+	now := time.Now().UTC()
+	job := enqueueFake(t, s.queue, actor, "category review bulk", "category-review-bulk")
+	diagnosis := models.MediaLibraryStructureDiagnosis{LibraryID: library.ID, JobID: job.ID, Generation: library.BaselineGeneration, ScanKind: "manual", Status: models.MediaLibraryStructureIssues, CreatedAt: now, UpdatedAt: now}
+	if err := s.db.Create(&diagnosis).Error; err != nil {
+		t.Fatal(err)
+	}
+	issues := make([]StructureIssue, 0, 275)
+	for index := 0; index < 225; index++ {
+		issues = append(issues, StructureIssue{Code: "naming_mismatch", Kind: "video", CurrentPath: fmt.Sprintf("电影/影片%03d旧名.mkv", index), ExpectedPath: fmt.Sprintf("电影/影片%03d.mkv", index), Repairable: true})
+	}
+	for index := 0; index < 50; index++ {
+		issues = append(issues, StructureIssue{Code: "location_mismatch", Kind: "video", CurrentPath: fmt.Sprintf("待整理/影片%03d.mkv", index), ExpectedPath: fmt.Sprintf("电影/影片%03d.mkv", index), Repairable: true})
+	}
+	if err := s.db.Transaction(func(tx *gorm.DB) error {
+		return persistStructureIssuesTx(tx, library.ID, job.ID, library.BaselineGeneration, StructurePlan{AllIssues: issues}, now)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	diagnostics, err := s.Diagnostics(context.Background(), actor, library.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.SaveStructureReviewBulk(context.Background(), actor, library.ID, MediaLibraryStructureReviewBulkInput{DiagnosisRevision: diagnostics.Revision, ReviewRevision: 0, Codes: []string{"naming_mismatch"}, Action: StructureSelectionSkip}, RequestContext{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Updated != 225 {
+		t.Fatalf("updated=%d want=225", result.Updated)
+	}
+	handled, err := s.StructureIssues(context.Background(), actor, library.ID, MediaLibraryStructureIssueQuery{Page: 1, PageSize: 50, Code: "naming_mismatch", Actionable: true, ReviewState: "handled"})
+	if err != nil || handled.Total != 225 || len(handled.List) != 50 {
+		t.Fatalf("handled=%+v err=%v", handled, err)
+	}
+	pendingLocation, err := s.StructureIssues(context.Background(), actor, library.ID, MediaLibraryStructureIssueQuery{Page: 1, PageSize: 50, Code: "location_mismatch", Actionable: true, ReviewState: "pending"})
+	if err != nil || pendingLocation.Total != 50 {
+		t.Fatalf("location category was changed: page=%+v err=%v", pendingLocation, err)
+	}
+	if _, err := s.SaveStructureReviewBulk(context.Background(), actor, library.ID, MediaLibraryStructureReviewBulkInput{DiagnosisRevision: diagnostics.Revision, ReviewRevision: result.ReviewRevision, Codes: []string{"naming_mismatch"}, Action: StructureSelectionKeepRecommended}, RequestContext{}); ErrorCode(err) != CodeInvalidRequest {
+		t.Fatalf("keep recommended accepted for naming mismatch: %v", err)
+	}
+}

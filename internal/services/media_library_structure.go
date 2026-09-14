@@ -118,6 +118,7 @@ type MediaLibraryStructureService struct {
 	planner      StructurePlanner
 	backends     *MediaLibraryStructureBackendRegistry
 	reconcile    func(uint)
+	scanBoundary func(uint) *sync.Mutex
 	confirmKey   []byte
 }
 
@@ -773,8 +774,10 @@ func (s *MediaLibraryStructureService) diagnosticsForLibrary(ctx context.Context
 	}
 	classifications := StructureIssueClassifications{
 		Unrecognized: diagnosis.UnrecognizedCount, MissingEpisode: diagnosis.MissingEpisodeCount,
+		NamingMismatch: diagnosis.NamingMismatchCount, LocationMismatch: diagnosis.LocationMismatchCount,
 		InvalidPath: diagnosis.InvalidPathCount, TemplateError: diagnosis.TemplateErrorCount,
 		DuplicateTarget: diagnosis.DuplicateTargetCount, SidecarConflict: diagnosis.SidecarConflictCount,
+		RecognitionSuspectConflict: diagnosis.RecognitionSuspectConflictCount, CatalogDuplicateConflict: diagnosis.CatalogDuplicateConflictCount,
 	}
 	return MediaLibraryStructureDiagnostics{
 		LibraryID: diagnosis.LibraryID, JobID: diagnosis.JobID, ScanRunID: cloneOptionalUint(diagnosis.ScanRunID), Generation: diagnosis.Generation,
@@ -914,7 +917,7 @@ func (s *MediaLibraryStructureService) enqueueDiagnosisGuarded(ctx context.Conte
 			LibraryID: libraryID, JobID: job.ID, ScanRunID: scanRunIDPtr, Generation: generation, ScanKind: scanKind,
 			Automatic: automatic, SourceRevision: sourceRevision, Status: models.MediaLibraryStructureQueued, IssuesJSON: "[]", CreatedAt: now, UpdatedAt: now,
 		}
-		columns := []string{"job_id", "scan_run_id", "generation", "scan_kind", "automatic", "source_revision", "status", "total_items", "processed_items", "issue_count", "repairable_count", "unrecognized_count", "missing_episode_count", "invalid_path_count", "template_error_count", "duplicate_target_count", "sidecar_conflict_count", "issues_json", "last_error_code", "started_at", "finished_at", "updated_at"}
+		columns := []string{"job_id", "scan_run_id", "generation", "scan_kind", "automatic", "source_revision", "status", "total_items", "processed_items", "issue_count", "repairable_count", "unrecognized_count", "missing_episode_count", "naming_mismatch_count", "location_mismatch_count", "invalid_path_count", "template_error_count", "duplicate_target_count", "recognition_suspect_conflict_count", "catalog_duplicate_conflict_count", "sidecar_conflict_count", "issues_json", "last_error_code", "started_at", "finished_at", "updated_at"}
 		if err := tx.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "library_id"}}, DoUpdates: clause.AssignmentColumns(columns)}).Create(&diagnosis).Error; err != nil {
 			return err
 		}
@@ -1519,8 +1522,10 @@ func (s *MediaLibraryStructureService) runDiagnosis(ctx context.Context, runtime
 			Updates(map[string]any{
 				"status": status, "processed_items": total, "issue_count": plan.IssueCount, "repairable_count": len(plan.Items),
 				"unrecognized_count": plan.Classifications.Unrecognized, "missing_episode_count": plan.Classifications.MissingEpisode,
+				"naming_mismatch_count": plan.Classifications.NamingMismatch, "location_mismatch_count": plan.Classifications.LocationMismatch,
 				"invalid_path_count": plan.Classifications.InvalidPath, "template_error_count": plan.Classifications.TemplateError,
 				"duplicate_target_count": plan.Classifications.DuplicateTarget, "sidecar_conflict_count": plan.Classifications.SidecarConflict,
+				"recognition_suspect_conflict_count": plan.Classifications.RecognitionSuspectConflict, "catalog_duplicate_conflict_count": plan.Classifications.CatalogDuplicateConflict,
 				"issues_json": string(issuesJSON), "last_error_code": "", "finished_at": finished, "updated_at": finished,
 			})
 		if updated.Error != nil {
@@ -1570,6 +1575,7 @@ func (s *MediaLibraryStructureService) runDiagnosis(ctx context.Context, runtime
 	structureDiagnosisLogEvent(serverlog.OperationMediaLibraryStructureDiagnosis.Event(s.log.Info()), payload, "completed").
 		Str("status", status).Int("total", total).Int("issue_count", plan.IssueCount).Int("repairable_count", len(plan.Items)).
 		Int("unrecognized", plan.Classifications.Unrecognized).Int("missing_season_episode", plan.Classifications.MissingEpisode).
+		Int("naming_mismatch", plan.Classifications.NamingMismatch).Int("location_mismatch", plan.Classifications.LocationMismatch).
 		Int("invalid_path", plan.Classifications.InvalidPath).Int("template_unavailable", plan.Classifications.TemplateError).
 		Int("duplicate_target", plan.Classifications.DuplicateTarget).Int("sidecar_target_conflict", plan.Classifications.SidecarConflict).
 		Int64("duration_ms", time.Since(started).Milliseconds()).Msg(serverlog.OperationMediaLibraryStructureDiagnosis.Message("目录结构诊断完成，未移动任何文件"))
@@ -1876,6 +1882,7 @@ func (s *MediaLibraryStructureService) runRepair(ctx context.Context, runtime Jo
 	}
 	defer s.finishStructurePhysicalWrite(permit)
 	_ = progressAt // item checkpoints own progress updates now
+	defer s.finishCancelledStructureRepair(permit, repair, plan, boundary, backend)
 	execution := s.executeStructureRepairItems(ctx, runtime, repair, plan, boundary, backend, claim)
 	if execution.GlobalErr != nil {
 		if execution.GlobalCode == "pan115_auth_expired" {
@@ -1888,6 +1895,11 @@ func (s *MediaLibraryStructureService) runRepair(ctx context.Context, runtime Jo
 		return s.failRepair(repair, execution.GlobalCode, "媒体库结构修复已安全停止")
 	}
 	appliedPlan := execution.Plan
+	if execution.Failed+execution.Blocked > 0 {
+		if err := s.verifyStructureUnchangedFailures(ctx, repair, plan, boundary, backend); err != nil {
+			return s.failRepair(repair, CodeMediaLibraryStructureApplyFailed, "部分文件结果尚未确认，已保留进度；请核对原任务后重试")
+		}
+	}
 	providerParents, err := s.repairedManagedProviderParents(ctx, library, storage, appliedPlan.Items)
 	if err != nil {
 		return s.failRepair(repair, CodeMediaLibraryStructureApplyFailed, "媒体库结构修复结果验证失败")
@@ -1931,11 +1943,20 @@ func (s *MediaLibraryStructureService) runRepair(ctx context.Context, runtime Jo
 		if execution.Failed+execution.Blocked > 0 {
 			phase, lastError = "failed", CodeMediaLibraryStructureApplyFailed
 		}
-		if err := tx.Model(&repair).Updates(map[string]any{"phase": phase, "processed_items": totalMutations, "succeeded_items": execution.Succeeded, "failed_items": execution.Failed, "blocked_items": execution.Blocked, "last_error_code": lastError, "finished_at": finished, "updated_at": finished}).Error; err != nil {
+		// The attempt's physical results are now fully accounted for: successes
+		// are committed below and failed sources were observed unchanged. Settle
+		// with the completed execution outcome, then retain the partial failure
+		// presentation in this SAME transaction (never publish false success).
+		if err := tx.Model(&repair).Updates(map[string]any{"phase": "completed", "processed_items": totalMutations, "succeeded_items": execution.Succeeded, "failed_items": execution.Failed, "blocked_items": execution.Blocked, "last_error_code": lastError, "finished_at": finished, "updated_at": finished}).Error; err != nil {
 			return err
 		}
 		if err := SettleCatalogPhysicalWriteTx(tx, permit, claim); err != nil {
 			return err
+		}
+		if phase != "completed" {
+			if err := tx.Model(&repair).Update("phase", phase).Error; err != nil {
+				return err
+			}
 		}
 		outcome := "success"
 		if execution.Failed+execution.Blocked > 0 {

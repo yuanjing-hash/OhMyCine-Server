@@ -12,7 +12,7 @@ func findActiveStructureRepair(db *gorm.DB, libraryID uint, scope, workKey strin
 	var repair models.MediaLibraryStructureRepair
 	err := db.Table("media_library_structure_repairs AS r").Select("r.*").
 		Joins("JOIN media_libraries AS l ON l.id=r.library_id").
-		Where("r.library_id=? AND r.scope=? AND r.work_key=? AND (("+readinessRepairActiveSQL+") OR (r.phase='failed' AND r.succeeded_items>0 AND (r.failed_items>0 OR r.blocked_items>0)))", libraryID, scope, workKey).
+		Where("r.library_id=? AND r.scope=? AND r.work_key=? AND (("+readinessRepairActiveSQL+") OR (r.phase='failed' AND ("+readinessRepairFailedSQL+")))", libraryID, scope, workKey).
 		Order("r.created_at DESC").Take(&repair).Error
 	return repair, err
 }

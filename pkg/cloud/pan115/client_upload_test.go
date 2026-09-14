@@ -23,6 +23,7 @@ type uploadTestSDK struct {
 	uploadSize   int64
 	uploadBody   []byte
 	uploadErr    error
+	listErr      error
 }
 
 func (s *uploadTestSDK) UploadFastOrByMultipart(parentID, name string, size int64, file *os.File, _ ...pan115sdk.UploadMultipartOption) error {
@@ -38,6 +39,9 @@ func (s *uploadTestSDK) UploadFastOrByMultipart(parentID, name string, size int6
 
 func (s *uploadTestSDK) ListPage(_ string, offset, _ int64, _ ...pan115sdk.ListOption) (*[]pan115sdk.File, error) {
 	s.listPageCalls++
+	if s.listErr != nil {
+		return nil, s.listErr
+	}
 	items := append([]pan115sdk.File(nil), s.pages[offset]...)
 	return &items, nil
 }
@@ -144,6 +148,18 @@ func TestUploadMapsProviderFailureWithoutAttemptingReconciliation(t *testing.T) 
 		t.Fatalf("code=%q retryable=%t err=%v", code, retryable, err)
 	}
 	if sdk.uploadCalls != 1 || sdk.listPageCalls != 0 {
+		t.Fatalf("upload=%d list=%d", sdk.uploadCalls, sdk.listPageCalls)
+	}
+}
+
+func TestUploadTreatsPostMutationReconciliationFailureAsUnknownOutcome(t *testing.T) {
+	body := []byte("managed upload")
+	sdk := &uploadTestSDK{bulkSDK: &bulkSDK{}, pages: map[int64][]pan115sdk.File{}, listErr: errors.New("HTTP 503 unavailable")}
+	_, err := newUploadTestClient(sdk).Upload(context.Background(), cloud.UploadRequest{ParentID: "parent", Name: "video.mkv", Size: int64(len(body)), Reader: managedUploadFile(t, body)})
+	if code, retryable := cloud.ErrorInfo(err); code != cloud.CodeMutationUnknown || !retryable {
+		t.Fatalf("code=%q retryable=%t err=%v", code, retryable, err)
+	}
+	if sdk.uploadCalls != 1 || sdk.listPageCalls != 1 {
 		t.Fatalf("upload=%d list=%d", sdk.uploadCalls, sdk.listPageCalls)
 	}
 }

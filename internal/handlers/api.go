@@ -30,6 +30,7 @@ type API struct {
 	queue                 *services.QueueService
 	queueEvents           *services.QueueEventHub
 	downloaders           *services.DownloaderService
+	transferNodes         *services.TransferNodeService
 	downloads             *services.DownloadService
 	transfers             *services.TransferService
 	reorganizations       *services.MediaReorganizationService
@@ -73,8 +74,11 @@ func (a *API) SetMediaLibraryStructureService(service *services.MediaLibraryStru
 func (a *API) SetQueueService(service *services.QueueService)           { a.queue = service }
 func (a *API) SetQueueEventHub(hub *services.QueueEventHub)             { a.queueEvents = hub }
 func (a *API) SetDownloaderService(service *services.DownloaderService) { a.downloaders = service }
-func (a *API) SetDownloadService(service *services.DownloadService)     { a.downloads = service }
-func (a *API) SetTransferService(service *services.TransferService)     { a.transfers = service }
+func (a *API) SetTransferNodeService(service *services.TransferNodeService) {
+	a.transferNodes = service
+}
+func (a *API) SetDownloadService(service *services.DownloadService) { a.downloads = service }
+func (a *API) SetTransferService(service *services.TransferService) { a.transfers = service }
 func (a *API) SetMediaReorganizationService(service *services.MediaReorganizationService) {
 	a.reorganizations = service
 }

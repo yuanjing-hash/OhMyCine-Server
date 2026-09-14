@@ -28,7 +28,11 @@ describe('repair progress', () => {
   const wrapper = mount(LibraryReadiness, { props: { library: { ready: true, readiness_status: 'ready' } } })
   expect(wrapper.text()).toBe('已准备好')
   await wrapper.setProps({ library: { ready: false, readiness_status: 'repairing' } })
-  expect(wrapper.text()).toContain('整理修复中'); wrapper.unmount()
+  expect(wrapper.text()).toContain('整理修复中')
+  await wrapper.setProps({ library: { ready: false, readiness_status: 'busy' } })
+  expect(wrapper.text()).toContain('正在自动核验文件结果')
+  expect(wrapper.text()).not.toContain('待确认')
+  wrapper.unmount()
  })
  it('resumes automatic refresh after access is restored by a manual retry', async () => {
   mocks.get.mockRejectedValueOnce(new APIError(403, 'permission_denied', '权限已变化')).mockResolvedValue(result('restored'))

@@ -190,7 +190,7 @@ describe('media library form boundary', () => {
 
   it('keeps background structure diagnosis read-only and does not restart it while viewing progress', () => {
     const source = readFileSync(new URL('./views/MediaLibrariesView.vue', import.meta.url), 'utf8')
-    for (const text of ['目录结构诊断正在后台', '目录结构诊断系统失败', '诊断全程只读，不会移动文件', 'processed_items', 'classifications.duplicate_target', 'classifications.sidecar_target_conflict']) expect(source).toContain(text)
+    for (const text of ['目录结构诊断正在后台', '目录结构诊断系统失败', '诊断全程只读，不会移动文件', '系统正在自动核验文件结果，无需手动确认', '在任务中心查看', 'processed_items', 'classifications.duplicate_target', 'classifications.sidecar_target_conflict']) expect(source).toContain(text)
     expect(source).toContain('async function viewStructureDiagnostics()')
     expect(source).toContain('await showStructureDiagnostics(false)')
     expect(source).toContain('await loadStructureIssues(libraryID)')

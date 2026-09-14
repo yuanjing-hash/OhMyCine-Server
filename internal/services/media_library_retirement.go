@@ -3,6 +3,7 @@ package services
 import (
 	"context"
 	"errors"
+	"strconv"
 	"time"
 
 	"github.com/google/uuid"
@@ -12,6 +13,12 @@ import (
 )
 
 const JobTypeMediaLibraryRetirement = "media_library_retirement"
+
+func mediaLibraryRetirementResourceKey(libraryID uint) string {
+	// Retirement must be claimable while an ordinary library worker still owns
+	// its resource lane; claiming retirement is what asks that worker to stop.
+	return "media-library-retirement:" + strconv.FormatUint(uint64(libraryID), 10)
+}
 
 type MediaLibraryDeletionResult struct {
 	Deleted bool   `json:"deleted"`
@@ -34,37 +41,25 @@ func retirementResult(row models.MediaLibraryRetirement) MediaLibraryDeletionRes
 	return MediaLibraryDeletionResult{Status: "deleting", JobID: row.JobID}
 }
 
-// The shared durable physical admission guard is installed with the converter /
-// Transfer integration. Missing proof is a refusal, never permission to delete.
-func (s *MediaLibraryService) SetRetirementPhysicalGuard(guard func(*gorm.DB, uint) error) {
-	s.retirementPhysicalGuard = guard
-}
-
 var errRetirementAlreadyAccepted = errors.New("library retirement already accepted")
 
-// DeleteRequest is management-only. Legacy Delete retains its synchronous
-// contract and refuses snapshot-backed libraries rather than falsely succeeding.
+// DeleteRequest is the single management deletion path. Every library uses the
+// same durable, bounded retirement flow, including a library that has not yet
+// published its first CatalogHead.
 func (s *MediaLibraryService) DeleteRequest(ctx context.Context, actor Actor, id uint, request RequestContext) (MediaLibraryDeletionResult, error) {
 	if !actor.CanResource(authz.PermissionMediaLibrariesDelete, models.AuthorizationResourceMediaLibrary, uintID(id)) {
 		return MediaLibraryDeletionResult{}, appError(CodePermissionDenied, "无权删除这个媒体库", nil)
 	}
 	var retirement *models.MediaLibraryRetirement
-	var needsAsync bool
 	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var err error
 		retirement, err = mediaLibraryRetirementTx(tx, id)
 		if err != nil || retirement != nil {
 			return err
 		}
-		var library models.MediaLibrary
-		if err := tx.First(&library, id).Error; err != nil {
+		if err := tx.First(&models.MediaLibrary{}, id).Error; err != nil {
 			return mediaLibraryNotFound(err)
 		}
-		var count int64
-		if err := tx.Model(&models.CatalogHead{}).Where("library_id=?", id).Count(&count).Error; err != nil {
-			return err
-		}
-		needsAsync = count > 0
 		return nil
 	})
 	if err != nil {
@@ -73,17 +68,11 @@ func (s *MediaLibraryService) DeleteRequest(ctx context.Context, actor Actor, id
 	if retirement != nil {
 		return retirementResult(*retirement), nil
 	}
-	if !needsAsync {
-		if err := s.Delete(actor, id, request); err != nil {
-			return MediaLibraryDeletionResult{}, err
-		}
-		return MediaLibraryDeletionResult{Deleted: true}, nil
-	}
-	if s.queue == nil || s.retirementPhysicalGuard == nil {
+	if s.queue == nil {
 		return MediaLibraryDeletionResult{}, appError(CodeConflict, "媒体库移除服务尚未就绪，请稍后重试", nil)
 	}
 	row := models.MediaLibraryRetirement{ID: uuid.NewString(), LibraryID: id, ActorID: actor.User.ID, Phase: "queued", Revision: 1, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()}
-	_, err = s.queue.EnqueueWith(EnqueueJobInput{OwnerID: actor.User.ID, JobType: JobTypeMediaLibraryRetirement, DisplayName: "移除媒体库索引", Provider: "media_library", ResourceKey: mediaArtifactResourceKey(id), Payload: map[string]any{"retirement_id": row.ID}}, func(tx *gorm.DB, job models.Job) error {
+	_, err = s.queue.EnqueueWith(EnqueueJobInput{OwnerID: actor.User.ID, JobType: JobTypeMediaLibraryRetirement, DisplayName: "移除媒体库", Provider: "media_library", ResourceKey: mediaLibraryRetirementResourceKey(id), Payload: map[string]any{"retirement_id": row.ID}}, func(tx *gorm.DB, job models.Job) error {
 		if !actor.CanResource(authz.PermissionMediaLibrariesDelete, models.AuthorizationResourceMediaLibrary, uintID(id)) {
 			return appError(CodePermissionDenied, "无权删除这个媒体库", nil)
 		}
@@ -104,13 +93,8 @@ func (s *MediaLibraryService) DeleteRequest(ctx context.Context, actor Actor, id
 				return err
 			}
 		}
-		// Check before changing enabled/head/source: a refused physical task
-		// must retain every original recovery fence.
-		if err := s.retirementPhysicalGuard(tx, id); err != nil {
-			return err
-		}
 		var head models.CatalogHead
-		if err := tx.First(&head, "library_id=?", id).Error; err != nil {
+		if err := tx.First(&head, "library_id=?", id).Error; err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
 			return err
 		}
 		row.JobID = job.ID
@@ -119,6 +103,19 @@ func (s *MediaLibraryService) DeleteRequest(ctx context.Context, actor Actor, id
 		row.ConfigFingerprint = head.ConfigFingerprint
 		if err := tx.Create(&row).Error; err != nil {
 			return err
+		}
+		var jobIDs []string
+		if err := retirementLibraryJobs(tx, id).Order("id").Pluck("id", &jobIDs).Error; err != nil {
+			return err
+		}
+		owned := make([]models.MediaLibraryRetirementJob, 0, len(jobIDs))
+		for _, jobID := range jobIDs {
+			owned = append(owned, models.MediaLibraryRetirementJob{RetirementID: row.ID, JobID: jobID, CreatedAt: row.CreatedAt})
+		}
+		if len(owned) > 0 {
+			if err := tx.CreateInBatches(&owned, CatalogBatchRows).Error; err != nil {
+				return err
+			}
 		}
 		if err := tx.Model(&models.MediaLibrary{}).Where("id=?", id).Updates(map[string]any{"enabled": false, "updated_at": time.Now().UTC()}).Error; err != nil {
 			return err

@@ -49,7 +49,7 @@ type TransferService struct {
 // STRM implementation; the media-library service remains the sole owner of
 // that reconciliation pipeline.
 type transferMediaLibraryReconciler interface {
-	RequestReconcile(uint)
+	ReconcileTransferBatch(context.Context, string) error
 }
 
 type transferJobPayload struct {
@@ -180,7 +180,7 @@ func (s *TransferService) EnqueuePackage(download models.DownloadTask, manifest,
 	}
 	now := time.Now().UTC()
 	id := uuid.NewString()
-	record := models.TransferTask{ID: id, OwnerID: download.OwnerID, DownloadTaskID: download.ID, LibraryID: *download.TargetLibraryID, LibraryName: download.TargetLibraryName, ManifestJSON: string(raw), SourceManifestJSON: string(sourceRaw), SourceDataSourceJSON: download.SourceDataSourceJSON, TargetDataSourceJSON: download.TargetDataSourceJSON, RouteKind: download.TransferRouteKind, RouteVersion: download.TransferRouteVersion, Phase: models.TransferTaskStatusQueued, CleanupStatus: models.TransferCleanupPending, TotalFiles: len(manifest.Files), CreatedAt: now, UpdatedAt: now}
+	record := models.TransferTask{ID: id, OwnerID: download.OwnerID, DownloadTaskID: download.ID, ExecutionLocation: normalizeExecutionLocation(download.ExecutionLocation), NodeID: download.NodeID, NodeName: download.NodeName, LibraryID: *download.TargetLibraryID, LibraryName: download.TargetLibraryName, ManifestJSON: string(raw), SourceManifestJSON: string(sourceRaw), SourceDataSourceJSON: download.SourceDataSourceJSON, TargetDataSourceJSON: download.TargetDataSourceJSON, RouteKind: download.TransferRouteKind, RouteVersion: download.TransferRouteVersion, Phase: models.TransferTaskStatusQueued, CleanupStatus: models.TransferCleanupPending, TotalFiles: len(manifest.Files), CreatedAt: now, UpdatedAt: now}
 	provider := models.StorageTypeLocal
 	resourceKey := "library:" + strconv.FormatUint(uint64(*download.TargetLibraryID), 10)
 	if download.TargetStorageType == models.StorageTypePan115 && download.TargetConnectionID != nil {
@@ -259,9 +259,11 @@ type TransferPlanSummaryItem struct {
 }
 
 type TransferPlanSummary struct {
-	Items      []TransferPlanSummaryItem `json:"items"`
-	TotalFiles int                       `json:"total_files"`
-	Truncated  bool                      `json:"truncated"`
+	Items          []TransferPlanSummaryItem `json:"items"`
+	TotalFiles     int                       `json:"total_files"`
+	Truncated      bool                      `json:"truncated"`
+	CompletedFiles int                       `json:"completed_files"`
+	SkippedFiles   int                       `json:"skipped_files"`
 }
 
 func (w *TransferWorker) Run(ctx context.Context, runtime JobRuntime, job ClaimedJob) WorkerResult {
@@ -344,6 +346,25 @@ func (w *TransferWorker) Run(ctx context.Context, runtime JobRuntime, job Claime
 	route, err := w.resolveTransferRoute(task, download)
 	if err != nil {
 		return w.fail(task, CodeTransferRouteUnsupported, "下载来源与目标媒体库之间没有可用的入库执行器")
+	}
+	if normalizeExecutionLocation(download.ExecutionLocation) == models.NodeLocationRemote {
+		switch route {
+		case transferRouteLocalToPan115, transferRoutePan115ToOtherCloud:
+			return w.runRemoteNodeUpload(ctx, runtime, job, task, download, manifest, started)
+		case transferRouteLocal, transferRoutePan115ToLocal:
+			materializedTask, managedRoot, materializeErr := w.materializeRemoteNodeSource(ctx, runtime, task, download, manifest)
+			if materializeErr != nil {
+				return w.cloudFailure(materializedTask, materializeErr)
+			}
+			task = materializedTask
+			download.StagingAbsolutePath = managedRoot
+			download.StagingCategory = "."
+			route = transferRouteLocal
+		default:
+			// A Node route may never be disguised as an equivalent Server-side
+			// provider operation because that would move media traffic home.
+			return w.fail(task, CodeTransferRouteUnsupported, "该远端下载目标尚未具备节点直传能力，已阻止媒体流量回退主 Server")
+		}
 	}
 	switch route {
 	case transferRoutePan115Native:
@@ -450,7 +471,8 @@ func (w *TransferWorker) Run(ctx context.Context, runtime JobRuntime, job Claime
 				return w.fail(task, "transfer_write_failed", "文件入库失败")
 			}
 		}
-		if index < len(summary.Items) {
+		var completedRelative string
+		{
 			relative, relativeErr := filepath.Rel(targetRoot, destination)
 			if relativeErr != nil {
 				return w.fail(task, "transfer_plan_invalid", "入库结果路径无效")
@@ -459,12 +481,20 @@ func (w *TransferWorker) Run(ctx context.Context, runtime JobRuntime, job Claime
 			if relativeErr != nil {
 				return w.fail(task, "transfer_plan_invalid", "入库结果路径无效")
 			}
-			summary.Items[index].RelativePath = safeRelative
-			if skip {
-				summary.Items[index].Result = "skipped"
-			} else {
-				summary.Items[index].Result = "completed"
+			completedRelative = safeRelative
+			if index < len(summary.Items) {
+				summary.Items[index].RelativePath = safeRelative
+				if skip {
+					summary.Items[index].Result = "skipped"
+				} else {
+					summary.Items[index].Result = "completed"
+				}
 			}
+		}
+		if skip {
+			summary.SkippedFiles++
+		} else {
+			summary.CompletedFiles++
 		}
 		encodedSummary, err = encodeTransferPlanSummary(summary)
 		if err != nil {
@@ -475,16 +505,24 @@ func (w *TransferWorker) Run(ctx context.Context, runtime JobRuntime, job Claime
 		if err := runtime.Heartbeat(&progress, &processed, &total, nil, nil); err != nil {
 			return WorkerResult{ErrorCode: CodeQueueLeaseInvalid, ErrorMessage: "入库任务租约已失效"}
 		}
-		if err := w.service.db.Model(&task).Updates(map[string]any{"processed_files": processed, "plan_summary_json": encodedSummary, "updated_at": time.Now().UTC()}).Error; err != nil {
+		if err := w.service.db.Transaction(func(tx *gorm.DB) error {
+			if !skip {
+				kind := models.MediaManagedItemKindSidecar
+				if isVideoFile(completedRelative) {
+					kind = models.MediaManagedItemKindVideo
+				}
+				if err := upsertManagedItem(tx, task, download, completedRelative, kind, item.Size, "", ""); err != nil {
+					return err
+				}
+			}
+			return tx.Model(&task).Updates(map[string]any{"processed_files": processed, "plan_summary_json": encodedSummary, "updated_at": time.Now().UTC()}).Error
+		}); err != nil {
 			return w.fail(task, "transfer_state_persist_failed", "入库结果保存失败")
 		}
 	}
 	now := time.Now().UTC()
 	err = w.service.db.Transaction(func(tx *gorm.DB) error {
 		if err := ensureDownloadPipelineActive(tx, task.DownloadTaskID); err != nil {
-			return err
-		}
-		if err := captureLocalManagedItems(tx, task, download, summary); err != nil {
 			return err
 		}
 		if err := tx.Model(&models.MediaLibrary{}).Where("id = ?", task.LibraryID).UpdateColumn("dirty_generation", gorm.Expr("dirty_generation + 1")).Error; err != nil {

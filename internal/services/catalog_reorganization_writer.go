@@ -280,10 +280,11 @@ func (w *MediaReorganizationWorker) validateCatalogExecutionGuardTx(tx *gorm.DB,
 }
 
 type reorganizationPrepared struct {
-	Head      models.CatalogHead
-	Candidate models.CatalogSnapshot
-	Token     string
-	Facts     CatalogFactBatch
+	Head            models.CatalogHead
+	Candidate       models.CatalogSnapshot
+	Token           string
+	Facts           CatalogFactBatch
+	ArtifactChanges CatalogArtifactChangeSet
 }
 
 func (w *MediaReorganizationWorker) reorganizationMutationFacts(ctx context.Context, task models.MediaReorganizationTask, plan reorganizationPlan, state reorganizationState) (CatalogFactBatch, error) {
@@ -464,6 +465,11 @@ func (w *MediaReorganizationWorker) prepareReorganization(ctx context.Context, t
 	if err != nil {
 		return p, err
 	}
+	p.ArtifactChanges = catalogArtifactChangesFromFacts(p.Facts)
+	for id := range oldIDs {
+		p.ArtifactChanges.Recognitions = append(p.ArtifactChanges.Recognitions, id)
+	}
+	p.ArtifactChanges = normalizeCatalogArtifactChanges(p.ArtifactChanges)
 	if err := store.appendCatalogFactBatches(ctx, p.Candidate, p.Token, p.Facts); err != nil {
 		return p, err
 	}

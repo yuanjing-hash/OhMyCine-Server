@@ -23,7 +23,7 @@ export interface VisibleNavigationGroup extends Omit<NavigationGroup, 'items'> {
 
 const discoveryPermissions = [Permissions.DiscoveryRead] as const
 const followPermissions = [Permissions.FollowsReadOwn, Permissions.FollowsReadAll] as const
-const downloadPermissions = [Permissions.DownloadsReadOwn, Permissions.DownloadsReadAll, Permissions.DownloadersRead] as const
+const downloadPermissions = [Permissions.DownloadsReadOwn, Permissions.DownloadsReadAll, Permissions.DownloadersRead, Permissions.TransferNodesRead] as const
 const taskPermissions = [
 	Permissions.JobsReadOwn,
 	Permissions.JobsReadAll,

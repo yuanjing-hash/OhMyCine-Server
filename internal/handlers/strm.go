@@ -55,6 +55,16 @@ func (a *API) STRMArtifacts(c *gin.Context) {
 	}
 	success(c, http.StatusOK, data)
 }
+func (a *API) STRMFailures(c *gin.Context) {
+	actor, _ := middleware.ActorFrom(c)
+	page, size := queryPage(c)
+	data, err := a.strm.Failures(actor, strings.TrimSpace(c.Param("run")), page, size)
+	if err != nil {
+		writeError(c, a.log, err)
+		return
+	}
+	success(c, http.StatusOK, data)
+}
 func (a *API) ReconcileSTRM(c *gin.Context) {
 	id, err := strmLibraryID(c)
 	if err != nil {

@@ -18,7 +18,9 @@ func (w *MediaArtifactWorker) RecoverStoppedWork(ctx context.Context, after uint
 	var rows []models.CatalogPhysicalWrite
 	err := w.service.db.WithContext(ctx).Model(&models.CatalogPhysicalWrite{}).
 		Joins("JOIN jobs j ON j.id=catalog_physical_writes.job_id").
-		Where("catalog_physical_writes.id>? AND owner_kind=? AND state='quiescent' AND runtime_id<>'' AND artifact_receipt_version=1 AND j.status=? AND j.lease_token_hash='' AND j.lease_expires_at IS NULL", after, CatalogPhysicalArtifact, models.JobStatusCancelled).
+		Where(`catalog_physical_writes.id>? AND owner_kind=? AND state='quiescent' AND runtime_id<>''
+			AND ((artifact_receipt_version=1 AND j.status=?) OR (artifact_receipt_version=0 AND j.status IN ?))
+			AND j.finished_at IS NOT NULL AND j.lease_token_hash='' AND j.lease_expires_at IS NULL AND j.interrupt_status=''`, after, CatalogPhysicalArtifact, models.JobStatusCancelled, historyTerminalStatuses()).
 		Select("catalog_physical_writes.*").Order("catalog_physical_writes.id").Limit(8).Find(&rows).Error
 	if err != nil || len(rows) == 0 {
 		return 0, err
@@ -32,7 +34,12 @@ func (w *MediaArtifactWorker) RecoverStoppedWork(ctx context.Context, after uint
 		if ctx.Err() != nil {
 			return after, ctx.Err()
 		}
-		if err != nil {
+		if row.ArtifactReceiptVersion == 0 && err != nil {
+			w.service.recordCancelledArtifactRecovery(ctx, row.JobID, "artifact_legacy_no_io_reconciliation_pending", "旧任务已结束；现有记录无法证明未写入文件，系统已保留恢复证据")
+		} else if row.ArtifactReceiptVersion == 0 {
+			w.service.recordCancelledArtifactRecovery(ctx, row.JobID, "artifact_legacy_no_io_reconciled", "旧任务已结束；已确认没有写入文件并清理未执行占位")
+			w.service.queue.wake()
+		} else if err != nil {
 			w.service.recordCancelledArtifactRecovery(ctx, row.JobID, "artifact_cancelled_reconciliation_pending", "已取消；文件结果仍需核验。请检查存储连接及文件是否被外部修改，系统会自动再次核验")
 		} else {
 			w.service.recordCancelledArtifactRecovery(ctx, row.JobID, "artifact_cancelled_reconciled", "已取消；文件结果已核验，未继续执行整理或删除")
@@ -43,6 +50,16 @@ func (w *MediaArtifactWorker) RecoverStoppedWork(ctx context.Context, after uint
 }
 
 func (s *MediaArtifactService) recoverCancelledArtifact(ctx context.Context, id uint64) error {
+	var version uint
+	if err := s.db.WithContext(ctx).Model(&models.CatalogPhysicalWrite{}).Select("artifact_receipt_version").Where("id=?", id).Scan(&version).Error; err != nil {
+		return err
+	}
+	if version == 0 {
+		return s.recoverLegacyCancelledArtifactNoIO(ctx, id)
+	}
+	if version != 1 {
+		return ErrCatalogFence
+	}
 	var permit CatalogPhysicalWritePermit
 	var policy mediaArtifactPolicy
 	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
@@ -91,6 +108,19 @@ func (s *MediaArtifactService) recoverCancelledArtifact(ctx context.Context, id 
 		return err
 	}
 	return s.settleStoppedArtifactExecutionContext(ctx, permit, policy, true)
+}
+
+func (s *MediaArtifactService) recoverLegacyCancelledArtifactNoIO(ctx context.Context, id uint64) error {
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		settled, err := database.ReconcileLegacyArtifactNoIOPhysicalWriteTx(tx, id)
+		if err != nil {
+			return err
+		}
+		if !settled {
+			return ErrCatalogFence
+		}
+		return nil
+	})
 }
 
 func (s *MediaArtifactService) recordCancelledArtifactRecovery(parent context.Context, jobID, code, message string) {

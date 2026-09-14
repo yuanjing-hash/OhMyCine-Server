@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"os"
 	"testing"
 	"time"
@@ -194,5 +195,214 @@ func TestCancelledArtifactAfterWorkerExitRecoversOriginalJob(t *testing.T) {
 				t.Fatalf("replacement jobs=%d %v", count, err)
 			}
 		})
+	}
+}
+
+func TestCancelledLegacyArtifactWithPositiveNoIOEvidenceUnblocksLibraryAndHistory(t *testing.T) {
+	queue, actor, _ := queueFixture(t)
+	actor = historyAdmin(actor)
+	library := historyLibrary(t, queue, "legacy-artifact-no-io")
+	if err := queue.db.Model(&library).Updates(map[string]any{
+		"enabled": true, "baseline_generation": 1, "dirty_generation": 1,
+		"status": models.MediaLibraryStatusListening,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	runID := "cancelled-legacy-no-io-run"
+	job := models.Job{
+		ID: "cancelled-legacy-no-io-job", CreatedByKind: "system", JobType: JobTypeMediaArtifact,
+		Status: models.JobStatusCancelled, Revision: 2, DisplayName: "legacy artifact",
+		PayloadJSON: fmt.Sprintf(`{"artifact_run_id":%q}`, runID), CheckpointJSON: `{}`,
+		CancellationAsked: true, FinishedAt: &now, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := queue.db.Create(&job).Error; err != nil {
+		t.Fatal(err)
+	}
+	run := models.MediaArtifactRun{
+		ID: runID, LibraryID: library.ID, Generation: 1, JobID: &job.ID, PolicyJSON: `{}`,
+		Status: models.MediaArtifactStatusFailed, ExpectedCount: 12144, ProcessedCount: 12144,
+		SkippedCount: 24115, FailedCount: 173, ErrorCode: "historic failure",
+		CleanupStatus: models.MediaArtifactCleanupSkipped, CleanupAt: &now, FinishedAt: &now,
+		CreatedAt: now, UpdatedAt: now,
+	}
+	if err := queue.db.Create(&run).Error; err != nil {
+		t.Fatal(err)
+	}
+	for index := 0; index < 3; index++ {
+		artifact := models.MediaArtifact{
+			OpaqueID: fmt.Sprintf("cancelled-legacy-placeholder-%d", index), RunID: run.ID, LibraryID: library.ID,
+			Kind: models.MediaArtifactKindNFO, TargetKind: models.MediaArtifactTargetLocalProjection,
+			RelativePath: fmt.Sprintf("/pending-%d.nfo", index), Managed: true, Active: true,
+			Status: models.MediaArtifactStatusQueued, CreatedAt: now, UpdatedAt: now,
+		}
+		if err := queue.db.Create(&artifact).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	physical := models.CatalogPhysicalWrite{
+		LibraryID: library.ID, OwnerKind: CatalogPhysicalArtifact, OwnerID: run.ID,
+		Revision: 2, State: "quiescent", JobID: job.ID, JobLeaseHash: "historic-lease",
+		RuntimeID: "historic-runtime", OwnerDigest: "owner", SourceFingerprint: "source",
+		ConfigFingerprint: "config", ArtifactReceiptVersion: 0, EnteredAt: now, UpdatedAt: now,
+	}
+	if err := queue.db.Create(&physical).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	other := historyLibrary(t, queue, "legacy-artifact-other-library")
+	otherPhysical := models.CatalogPhysicalWrite{
+		LibraryID: other.ID, OwnerKind: CatalogPhysicalArtifact, OwnerID: "other-unsafe-run",
+		Revision: 1, State: "quiescent", RuntimeID: "other-runtime", OwnerDigest: "other",
+		SourceFingerprint: "other-source", ConfigFingerprint: "other-config", EnteredAt: now, UpdatedAt: now,
+	}
+	if err := queue.db.Create(&otherPhysical).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	diagnosis, err := queue.Enqueue(EnqueueJobInput{
+		System: true, JobType: JobTypeMediaLibraryStructureDiagnosis, DisplayName: "目录诊断",
+		ResourceKey:   "structure-diagnosis-library:" + uintID(library.ID),
+		CoalescingKey: "manual", Payload: map[string]any{"library_id": library.ID},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := queue.Claim([]string{JobTypeMediaLibraryStructureDiagnosis}); err != nil || got != nil {
+		t.Fatalf("diagnosis was not initially blocked: claim=%v err=%v", got, err)
+	}
+
+	service := NewMediaArtifactService(queue.db, queue, nil, zerolog.Nop())
+	worker := NewMediaArtifactWorker(service)
+	if _, err := worker.RecoverStoppedWork(context.Background(), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := queue.db.First(&physical, physical.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if physical.State != "settled" || physical.SettledAt == nil {
+		t.Fatalf("legacy no-I/O physical proof was not settled: %+v", physical)
+	}
+	var placeholders int64
+	if err := queue.db.Model(&models.MediaArtifact{}).Where("run_id=?", run.ID).Count(&placeholders).Error; err != nil || placeholders != 0 {
+		t.Fatalf("legacy placeholders=%d err=%v", placeholders, err)
+	}
+	readiness, err := libraryReadiness(queue.db, library.ID)
+	if err != nil || !readiness.Ready || readiness.ReadinessStatus != "ready" {
+		t.Fatalf("readiness=%+v err=%v", readiness, err)
+	}
+	var untouched models.CatalogPhysicalWrite
+	if err := queue.db.First(&untouched, otherPhysical.ID).Error; err != nil || untouched.State != "quiescent" {
+		t.Fatalf("other library evidence changed: %+v err=%v", untouched, err)
+	}
+
+	claim, err := queue.Claim([]string{JobTypeMediaLibraryStructureDiagnosis})
+	if err != nil || claim == nil || claim.Job.ID != diagnosis.ID {
+		t.Fatalf("diagnosis did not resume: claim=%v err=%v", claim, err)
+	}
+	if err := queue.Complete(claim.Job.ID, claim.LeaseToken); err != nil {
+		t.Fatal(err)
+	}
+	result, err := queue.PurgeHistory(actor, HistoryPurgeInput{Scope: HistoryScopeTasks}, RequestContext{})
+	if err != nil || result.Deleted < 1 {
+		t.Fatalf("history purge=%+v err=%v", result, err)
+	}
+	if err := queue.db.First(&job, "id=?", job.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if job.HistoryClearedAt == nil {
+		t.Fatal("reconciled cancelled artifact job remained visible in history")
+	}
+}
+
+func TestLegacyArtifactEnteredAtMigrationRecoversAfterStartupQuiescence(t *testing.T) {
+	queue, _, _ := queueFixture(t)
+	var databases []struct{ Name, File string }
+	if err := queue.db.Raw("PRAGMA database_list").Scan(&databases).Error; err != nil {
+		t.Fatal(err)
+	}
+	path := ""
+	for _, item := range databases {
+		if item.Name == "main" {
+			path = item.File
+			break
+		}
+	}
+	runtime, err := database.AcquireExclusiveRuntime(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = runtime.Close() })
+	bound, err := runtime.Bind(queue.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	queue.db = bound
+
+	// Re-run the numbered upgrade around production startup ordering: v101 is
+	// applied before the held runtime changes a previous process' entered row
+	// to quiescent. Runtime stopped-work recovery must finish that safe row.
+	if err := bound.Exec("DELETE FROM schema_migrations WHERE version=101").Error; err != nil {
+		t.Fatal(err)
+	}
+	library := historyLibrary(t, queue, "legacy-entered-startup")
+	now := time.Now().UTC()
+	runID := "legacy-entered-startup-run"
+	job := models.Job{
+		ID: "legacy-entered-startup-job", CreatedByKind: "system", JobType: JobTypeMediaArtifact,
+		Status: models.JobStatusFailed, Revision: 2, DisplayName: "legacy entered artifact",
+		PayloadJSON: fmt.Sprintf(`{"artifact_run_id":%q}`, runID), CheckpointJSON: `{}`,
+		FinishedAt: &now, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := bound.Create(&job).Error; err != nil {
+		t.Fatal(err)
+	}
+	run := models.MediaArtifactRun{
+		ID: runID, LibraryID: library.ID, Generation: 1, JobID: &job.ID, PolicyJSON: `{}`,
+		Status: models.MediaArtifactStatusFailed, ExpectedCount: 1, ProcessedCount: 1, FailedCount: 1,
+		CleanupStatus: models.MediaArtifactCleanupSkipped, CleanupAt: &now, FinishedAt: &now,
+		CreatedAt: now, UpdatedAt: now,
+	}
+	if err := bound.Create(&run).Error; err != nil {
+		t.Fatal(err)
+	}
+	artifact := models.MediaArtifact{
+		OpaqueID: "legacy-entered-startup-placeholder", RunID: run.ID, LibraryID: library.ID,
+		Kind: models.MediaArtifactKindNFO, TargetKind: models.MediaArtifactTargetLocalProjection,
+		RelativePath: "/pending.nfo", Managed: true, Active: true,
+		Status: models.MediaArtifactStatusQueued, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := bound.Create(&artifact).Error; err != nil {
+		t.Fatal(err)
+	}
+	physical := models.CatalogPhysicalWrite{
+		LibraryID: library.ID, OwnerKind: CatalogPhysicalArtifact, OwnerID: run.ID,
+		Revision: 2, State: "entered", JobID: job.ID, JobLeaseHash: "historic-lease",
+		RuntimeID: "previous-runtime", OwnerDigest: "owner", SourceFingerprint: "source",
+		ConfigFingerprint: "config", ArtifactReceiptVersion: 0, EnteredAt: now, UpdatedAt: now,
+	}
+	if err := bound.Create(&physical).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	if err := database.Migrate(bound); err != nil {
+		t.Fatal(err)
+	}
+	if err := bound.First(&physical, physical.ID).Error; err != nil || physical.State != "entered" {
+		t.Fatalf("v101 must not settle a possibly live entered row: %+v err=%v", physical, err)
+	}
+	if recovered, err := RecoverCatalogPhysicalRuntimeBatch(context.Background(), bound); err != nil || recovered != 1 {
+		t.Fatalf("startup quiescence recovered=%d err=%v", recovered, err)
+	}
+	service := NewMediaArtifactService(bound, queue, nil, zerolog.Nop())
+	if _, err := NewMediaArtifactWorker(service).RecoverStoppedWork(context.Background(), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := bound.First(&physical, physical.ID).Error; err != nil || physical.State != "settled" || physical.SettledAt == nil {
+		t.Fatalf("runtime recovery did not settle safe v0 row: %+v err=%v", physical, err)
+	}
+	var placeholders int64
+	if err := bound.Model(&models.MediaArtifact{}).Where("run_id=?", run.ID).Count(&placeholders).Error; err != nil || placeholders != 0 {
+		t.Fatalf("legacy placeholders=%d err=%v", placeholders, err)
 	}
 }

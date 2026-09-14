@@ -23,6 +23,7 @@ const (
 	CodeResponseInvalid     = "plugin_runtime_response_invalid"
 	CodeResponseTooLarge    = "plugin_runtime_response_too_large"
 	defaultCallTimeout      = 2 * time.Second
+	resourceCallTimeout     = 16 * time.Second
 	defaultMemoryLimitPage  = 1024 // 64 MiB
 	maxRequestBytes         = 256 * 1024
 	maxResponseBytes        = 4 * 1024 * 1024
@@ -54,6 +55,12 @@ var operationCodes = map[string]uint64{
 	"site.auth.poll":             11,
 	"media.metadata":             12,
 	"library.artwork_candidates": 13,
+	"resource.search":            14,
+	"resource.resolve":           15,
+	"resource.health":            16,
+	"resource.auth.login":        17,
+	"resource.auth.captcha":      18,
+	"resource.auth.cookie":       19,
 }
 
 type Error struct {
@@ -167,7 +174,7 @@ func (host *Host) Invoke(ctx context.Context, pluginID, operation string, reques
 	if allocate == nil || invoke == nil {
 		return nil, &Error{Code: CodeCapabilityDenied, Cause: errors.New("plugin does not expose the invocation ABI")}
 	}
-	callContext, cancel := context.WithTimeout(ctx, defaultCallTimeout)
+	callContext, cancel := context.WithTimeout(ctx, operationTimeout(operation))
 	defer cancel()
 	allocated, err := allocate.Call(callContext, uint64(len(request)))
 	if err != nil || len(allocated) != 1 {
@@ -197,6 +204,16 @@ func (host *Host) Invoke(ctx context.Context, pluginID, operation string, reques
 		}
 	}
 	return copied, nil
+}
+
+func operationTimeout(operation string) time.Duration {
+	if strings.HasPrefix(operation, "resource.") {
+		// Resource operations perform one bounded provider request through the
+		// Host, whose own maximum timeout is 15 seconds. Keep a small outer margin
+		// so the Host can return its stable timeout result before WASM is stopped.
+		return resourceCallTimeout
+	}
+	return defaultCallTimeout
 }
 
 func (host *Host) Stop(pluginID string) error {

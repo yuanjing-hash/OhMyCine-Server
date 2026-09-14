@@ -24,6 +24,10 @@ type downloaderPayload struct {
 	ProviderDirectoryToken *string `json:"provider_directory_token"`
 	AutoListenLifeEvents   *bool   `json:"auto_listen_life_events"`
 	Enabled                *bool   `json:"enabled"`
+	ExecutionLocation      *string `json:"execution_location"`
+	NodeID                 *string `json:"node_id"`
+	DownloaderSaveRoot     *string `json:"downloader_save_root"`
+	NodeMountRoot          *string `json:"node_mount_root"`
 }
 
 func (a *API) Downloaders(c *gin.Context) {
@@ -60,7 +64,20 @@ func (a *API) CreateDownloader(c *gin.Context) {
 		token = *payload.ProviderDirectoryToken
 	}
 	autoListen := payload.AutoListenLifeEvents != nil && *payload.AutoListenLifeEvents
-	item, err := a.downloaders.CreateContext(c.Request.Context(), actor, services.DownloaderInput{Name: payload.Name, Type: payload.Type, BaseURL: payload.BaseURL, Username: username, Password: password, Enabled: enabled, StorageID: payload.StorageID, ProviderDirectoryToken: token, AutoListenLifeEvents: autoListen}, middleware.RequestContextFrom(c))
+	executionLocation, nodeID, downloaderSaveRoot, nodeMountRoot := "", "", "", ""
+	if payload.ExecutionLocation != nil {
+		executionLocation = *payload.ExecutionLocation
+	}
+	if payload.NodeID != nil {
+		nodeID = *payload.NodeID
+	}
+	if payload.DownloaderSaveRoot != nil {
+		downloaderSaveRoot = *payload.DownloaderSaveRoot
+	}
+	if payload.NodeMountRoot != nil {
+		nodeMountRoot = *payload.NodeMountRoot
+	}
+	item, err := a.downloaders.CreateContext(c.Request.Context(), actor, services.DownloaderInput{Name: payload.Name, Type: payload.Type, BaseURL: payload.BaseURL, Username: username, Password: password, Enabled: enabled, StorageID: payload.StorageID, ProviderDirectoryToken: token, AutoListenLifeEvents: autoListen, ExecutionLocation: executionLocation, NodeID: nodeID, DownloaderSaveRoot: downloaderSaveRoot, NodeMountRoot: nodeMountRoot}, middleware.RequestContextFrom(c))
 	if err != nil {
 		writeError(c, a.log, err)
 		return
@@ -87,7 +104,7 @@ func (a *API) UpdateDownloader(c *gin.Context) {
 	if payload.BaseURL != "" {
 		baseURL = &payload.BaseURL
 	}
-	item, err := a.downloaders.UpdateContext(c.Request.Context(), actor, id, services.UpdateDownloaderInput{Name: name, BaseURL: baseURL, Username: payload.Username, Password: payload.Password, ClearUsername: payload.ClearUsername, ClearPassword: payload.ClearPassword, Enabled: payload.Enabled, StorageID: payload.StorageID, ProviderDirectoryToken: payload.ProviderDirectoryToken, AutoListenLifeEvents: payload.AutoListenLifeEvents}, middleware.RequestContextFrom(c))
+	item, err := a.downloaders.UpdateContext(c.Request.Context(), actor, id, services.UpdateDownloaderInput{Name: name, BaseURL: baseURL, Username: payload.Username, Password: payload.Password, ClearUsername: payload.ClearUsername, ClearPassword: payload.ClearPassword, Enabled: payload.Enabled, StorageID: payload.StorageID, ProviderDirectoryToken: payload.ProviderDirectoryToken, AutoListenLifeEvents: payload.AutoListenLifeEvents, ExecutionLocation: payload.ExecutionLocation, NodeID: payload.NodeID, DownloaderSaveRoot: payload.DownloaderSaveRoot, NodeMountRoot: payload.NodeMountRoot}, middleware.RequestContextFrom(c))
 	if err != nil {
 		writeError(c, a.log, err)
 		return

@@ -54,7 +54,7 @@ func TestFirstSuccessfulScanCreatesTMDBCollection(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	run, err := service.ScanNow(context.Background(), actor, library.ID)
+	run, err := service.Scan(context.Background(), actor, library.ID, "full")
 	if err != nil || run.Matched != 2 {
 		t.Fatalf("first scan=%+v err=%v", run, err)
 	}

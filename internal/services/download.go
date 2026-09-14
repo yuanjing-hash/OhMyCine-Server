@@ -26,6 +26,7 @@ import (
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
 	downloadpkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/downloader"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/metadata/tmdb"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/nodeprotocol"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
@@ -127,6 +128,7 @@ func (s *DownloadService) acceptRetry(tx *gorm.DB, job models.Job, now time.Time
 		"last_error_code":    "",
 		"last_error_message": "",
 		"finished_at":        nil,
+		"history_cleared_at": nil,
 		"updated_at":         now,
 	})
 	if result.Error != nil {
@@ -177,12 +179,16 @@ type DownloadSourceInput struct {
 }
 
 type SubmitDownloadInput struct {
-	DownloaderID   string
-	MediaLibraryID *uint
-	ProfileID      uint
-	DisplayName    string
-	Priority       int
-	Source         DownloadSourceInput
+	DownloaderID          string
+	MediaLibraryID        *uint
+	ProfileID             uint
+	DisplayName           string
+	Priority              int
+	Source                DownloadSourceInput
+	PluginID              string
+	PluginVersion         string
+	PluginConnectionID    string
+	PluginResourceClaimID string
 	// RecognitionOverride is an internal-only, already GetByID-verified media
 	// identity. Public download handlers never deserialize this field.
 	RecognitionOverride       *DownloadRecognitionIdentity
@@ -344,6 +350,9 @@ type DownloadTaskSummary struct {
 	SeedingJobStatus  string     `json:"seeding_job_status"`
 	SeedingPhase      string     `json:"seeding_phase"`
 	LifecycleScope    string     `json:"lifecycle_scope"`
+	ExecutionLocation string     `json:"execution_location"`
+	NodeID            *string    `json:"node_id,omitempty"`
+	NodeName          string     `json:"node_name,omitempty"`
 }
 
 const (
@@ -417,6 +426,12 @@ func (s *DownloadService) submit(ctx context.Context, ownerID uint, input Submit
 	}
 	if source.Kind == downloadpkg.SourcePan115Share {
 		sourceOrigin = models.DownloadSourceOriginShare
+	}
+	if normalizeExecutionLocation(downloaderRecord.ExecutionLocation) == models.NodeLocationRemote && downloaderRecord.Type == models.DownloaderTypePan115Offline && source.Kind == downloadpkg.SourceURL && !strings.HasPrefix(strings.ToLower(source.URL), "magnet:") {
+		return DownloadTaskSummary{}, appError(CodeTransferRouteUnsupported, "传输节点首版只支持磁力离线下载；普通 HTTP(S) URL 请使用主 Server 的 115 下载器", nil)
+	}
+	if normalizeExecutionLocation(downloaderRecord.ExecutionLocation) == models.NodeLocationRemote && downloaderRecord.Type == models.DownloaderTypePan115Offline && input.MediaLibraryID == nil {
+		return DownloadTaskSummary{}, appError(CodeMediaLibraryStorageUnavailable, "传输节点下载必须选择唯一的最终媒体库", nil)
 	}
 	capabilities, capabilitiesKnown := s.downloader.registry.Capabilities(downloaderRecord.Type)
 	if source.Kind == downloadpkg.SourcePan115Share && (!capabilitiesKnown || !capabilities.ShareReceive || downloaderRecord.Type != models.DownloaderTypePan115Offline) {
@@ -506,7 +521,17 @@ func (s *DownloadService) submit(ctx context.Context, ownerID uint, input Submit
 			return DownloadTaskSummary{}, err
 		}
 	}
-	record := models.DownloadTask{ID: taskID, OwnerID: ownerID, DownloaderID: &downloaderRecord.ID, DownloaderName: downloaderRecord.Name, ProviderType: downloaderRecord.Type, ProviderTag: "omc-" + taskID, SourceCiphertext: encryptedSource, StagingAbsolutePath: staging.AbsolutePath, IngestSourceKey: strings.TrimSpace(ingestSourceKey), SourceOrigin: sourceOrigin, FollowSubscriptionID: input.FollowSubscriptionID, FollowResourceFingerprint: input.FollowResourceFingerprint, ProfileID: profile.ID, ProfileRevision: profile.Revision, ProfileRulesJSON: canonicalRules, ProfileBuiltinRecognitionPacksJSON: organization.BuiltinRecognitionPacksJSON, ProfileRecognitionRulesJSON: organization.RecognitionRulesJSON, SeedingCleanupEnabled: seedingPolicy.CleanupEnabled, SeedingMinimumMinutes: seedingPolicy.MinimumSeedMinutes, SeedingMinimumRatio: seedingPolicy.MinimumRatio, SeedingCompletionMode: seedingPolicy.CompletionMode, DisplayName: displayName, Phase: models.DownloadTaskStatusQueued, CreatedAt: now, UpdatedAt: now}
+	executionLocation := normalizeExecutionLocation(downloaderRecord.ExecutionLocation)
+	if strings.TrimSpace(input.PluginID) != "" {
+		sourceOrigin = models.DownloadSourceOriginPlugin
+	}
+	record := models.DownloadTask{ID: taskID, OwnerID: ownerID, DownloaderID: &downloaderRecord.ID, DownloaderName: downloaderRecord.Name, ProviderType: downloaderRecord.Type, ExecutionLocation: executionLocation, NodeID: downloaderRecord.NodeID, NodeName: downloaderRecord.NodeName, ProviderTag: "omc-" + taskID, SourceCiphertext: encryptedSource, StagingAbsolutePath: staging.AbsolutePath, IngestSourceKey: strings.TrimSpace(ingestSourceKey), SourceOrigin: sourceOrigin, PluginID: strings.TrimSpace(input.PluginID), PluginVersion: strings.TrimSpace(input.PluginVersion), PluginConnectionID: strings.TrimSpace(input.PluginConnectionID), PluginResourceClaimID: strings.TrimSpace(input.PluginResourceClaimID), FollowSubscriptionID: input.FollowSubscriptionID, FollowResourceFingerprint: input.FollowResourceFingerprint, ProfileID: profile.ID, ProfileRevision: profile.Revision, ProfileRulesJSON: canonicalRules, ProfileBuiltinRecognitionPacksJSON: organization.BuiltinRecognitionPacksJSON, ProfileRecognitionRulesJSON: organization.RecognitionRulesJSON, SeedingCleanupEnabled: seedingPolicy.CleanupEnabled, SeedingMinimumMinutes: seedingPolicy.MinimumSeedMinutes, SeedingMinimumRatio: seedingPolicy.MinimumRatio, SeedingCompletionMode: seedingPolicy.CompletionMode, DisplayName: displayName, Phase: models.DownloadTaskStatusQueued, CreatedAt: now, UpdatedAt: now}
+	if executionLocation == models.NodeLocationRemote {
+		if record.NodeID == nil || strings.TrimSpace(record.NodeName) == "" {
+			return DownloadTaskSummary{}, appError(CodeDownloaderUnavailable, "下载器的传输节点绑定不完整", nil)
+		}
+		record.ProtocolVersion = nodeprotocol.VersionV1
+	}
 	if input.RecognitionOverride != nil {
 		// Every internal override has already been verified through GetByID.
 		// Locked distinguishes a user correction from a direct identity binding;
@@ -530,12 +555,15 @@ func (s *DownloadService) submit(ctx context.Context, ownerID uint, input Submit
 	if downloaderRecord.Type == models.DownloaderTypePan115Offline {
 		record.StagingStorageID = downloaderRecord.StorageID
 		record.StagingRelativePath = "/"
+		if executionLocation == models.NodeLocationRemote {
+			record.StagingProviderDirectoryID = strings.TrimSpace(downloaderRecord.ProviderDirectoryID)
+		}
 	}
 	if target != nil {
 		// The media-library intake directory is an override only for share
 		// receive and internally adopted provider items. Ordinary 115 offline
 		// downloads must keep using the downloader's own configured directory.
-		if source.Kind == downloadpkg.SourcePan115Share || source.Kind == downloadpkg.SourceProviderItem {
+		if executionLocation != models.NodeLocationRemote && (source.Kind == downloadpkg.SourcePan115Share || source.Kind == downloadpkg.SourceProviderItem) {
 			record.StagingProviderDirectoryID = target.IngestProviderRootID
 		}
 		record.TargetLibraryID = &target.LibraryID
@@ -557,10 +585,26 @@ func (s *DownloadService) submit(ctx context.Context, ownerID uint, input Submit
 		record.TVDirectoryTemplate = organization.TVDirectoryTemplate
 		record.TVFilenameTemplate = organization.TVFilenameTemplate
 	}
+	if executionLocation == models.NodeLocationRemote {
+		_, revision, digest, err := nodeTaskRoutePlan(s.db, downloaderRecord, record.StagingAbsolutePath, requestedTargetID(record.TargetLibraryID))
+		if err != nil {
+			return DownloadTaskSummary{}, err
+		}
+		record.RoutePlanRevision, record.RoutePlanDigest = revision, digest
+	}
 	job, err := s.queue.EnqueueWith(EnqueueJobInput{OwnerID: ownerID, JobType: "download", Priority: input.Priority, DisplayName: displayName, Provider: downloaderRecord.Type, ResourceKey: downloadQueueResourceKey(downloaderRecord), Payload: downloadJobPayload{DownloadTaskID: taskID}}, func(tx *gorm.DB, job models.Job) error {
 		if input.BeforePersist != nil {
 			if err := input.BeforePersist(tx); err != nil {
 				return err
+			}
+		}
+		if executionLocation == models.NodeLocationRemote {
+			_, revision, digest, routeErr := nodeTaskRoutePlan(tx, downloaderRecord, record.StagingAbsolutePath, requestedTargetID(record.TargetLibraryID))
+			if routeErr != nil {
+				return routeErr
+			}
+			if revision != record.RoutePlanRevision || digest != record.RoutePlanDigest {
+				return appError(CodeConflict, "下载器的传输节点或路径映射已变化，请重新提交任务", nil)
 			}
 		}
 		record.JobID = job.ID
@@ -866,6 +910,7 @@ func (s *DownloadService) ListScoped(actor Actor, scope string, limit int) ([]Do
 		limit = 200
 	}
 	query := s.db.Model(&models.DownloadTask{}).
+		Where("download_tasks.history_cleared_at IS NULL").
 		Joins("JOIN jobs AS download_scope_job ON download_scope_job.id = download_tasks.job_id").
 		Joins("LEFT JOIN transfer_tasks AS transfer_scope ON transfer_scope.download_task_id = download_tasks.id").
 		Joins("LEFT JOIN jobs AS transfer_scope_job ON transfer_scope_job.id = transfer_scope.job_id").
@@ -1119,6 +1164,9 @@ func (s *DownloadService) cancelPipeline(ctx context.Context, actor Actor, id st
 			}
 			releaseLease(updates)
 			if err := tx.Model(job).Updates(updates).Error; err != nil {
+				return err
+			}
+			if err := finalizeTerminalNoIOCatalogJobTx(tx, job.ID); err != nil {
 				return err
 			}
 			if err := tx.Model(&models.JobActionRequest{}).Where("job_id = ? AND response = ''", job.ID).Updates(map[string]any{"response": "closed_by_control", "responded_by": actor.User.ID, "responded_at": now}).Error; err != nil {
@@ -1466,7 +1514,14 @@ func normalizeDownloadDisplayName(requestedName, fallback string) (string, error
 func downloadSourcePurpose(id string) string { return "download-task:" + id + ":source" }
 
 func downloadTaskSummary(record models.DownloadTask, jobStatus string) DownloadTaskSummary {
-	return DownloadTaskSummary{ID: record.ID, JobID: record.JobID, OwnerID: record.OwnerID, DownloaderID: record.DownloaderID, DownloaderName: record.DownloaderName, ProviderType: record.ProviderType, DisplayName: record.DisplayName, JobStatus: jobStatus, ProviderStatus: record.ProviderStatus, Phase: record.Phase, Progress: record.Progress, BytesCompleted: record.BytesCompleted, BytesTotal: record.BytesTotal, DownloadSpeed: record.DownloadSpeed, UploadSpeed: record.UploadSpeed, ETASeconds: record.ETASeconds, LastSampledAt: record.LastSampledAt, LastErrorCode: record.LastErrorCode, LastErrorMessage: record.LastErrorMessage, CreatedAt: record.CreatedAt, UpdatedAt: record.UpdatedAt, FinishedAt: record.FinishedAt, ProfileID: record.ProfileID, ProfileRevision: record.ProfileRevision, ScrapeStatus: record.ScrapeStatus, ScrapeTitle: record.ScrapeTitle, ScrapeMediaType: record.ScrapeMediaType, ScrapeCategory: record.ScrapeCategory, ScrapeTMDBID: record.ScrapeTMDBID, ScrapeConfidence: record.ScrapeConfidence, ScrapeSeason: cloneInt(record.ScrapeSeason), ScrapeEpisode: cloneInt(record.ScrapeEpisode), IdentitySource: record.IdentitySource, IdentityStatus: record.IdentityStatus, IdentityLocked: record.IdentityLocked, IdentityRevision: record.IdentityRevision, ManifestFiles: record.ManifestFileCount, TargetLibraryID: record.TargetLibraryID, TargetLibraryName: record.TargetLibraryName, TransferMode: record.TransferMode, ConflictPolicy: record.ConflictPolicy, RouteKind: record.TransferRouteKind}
+	return DownloadTaskSummary{ID: record.ID, JobID: record.JobID, OwnerID: record.OwnerID, DownloaderID: record.DownloaderID, DownloaderName: record.DownloaderName, ProviderType: record.ProviderType, DisplayName: record.DisplayName, JobStatus: jobStatus, ProviderStatus: record.ProviderStatus, Phase: record.Phase, Progress: record.Progress, BytesCompleted: record.BytesCompleted, BytesTotal: record.BytesTotal, DownloadSpeed: record.DownloadSpeed, UploadSpeed: record.UploadSpeed, ETASeconds: record.ETASeconds, LastSampledAt: record.LastSampledAt, LastErrorCode: record.LastErrorCode, LastErrorMessage: record.LastErrorMessage, CreatedAt: record.CreatedAt, UpdatedAt: record.UpdatedAt, FinishedAt: record.FinishedAt, ProfileID: record.ProfileID, ProfileRevision: record.ProfileRevision, ScrapeStatus: record.ScrapeStatus, ScrapeTitle: record.ScrapeTitle, ScrapeMediaType: record.ScrapeMediaType, ScrapeCategory: record.ScrapeCategory, ScrapeTMDBID: record.ScrapeTMDBID, ScrapeConfidence: record.ScrapeConfidence, ScrapeSeason: cloneInt(record.ScrapeSeason), ScrapeEpisode: cloneInt(record.ScrapeEpisode), IdentitySource: record.IdentitySource, IdentityStatus: record.IdentityStatus, IdentityLocked: record.IdentityLocked, IdentityRevision: record.IdentityRevision, ManifestFiles: record.ManifestFileCount, TargetLibraryID: record.TargetLibraryID, TargetLibraryName: record.TargetLibraryName, TransferMode: record.TransferMode, ConflictPolicy: record.ConflictPolicy, RouteKind: record.TransferRouteKind, ExecutionLocation: normalizeExecutionLocation(record.ExecutionLocation), NodeID: record.NodeID, NodeName: record.NodeName}
+}
+
+func requestedTargetID(value *uint) uint {
+	if value == nil {
+		return 0
+	}
+	return *value
 }
 
 type DownloadWorker struct {
@@ -1503,7 +1558,7 @@ func (w *DownloadWorker) Run(ctx context.Context, runtime JobRuntime, job Claime
 		} else if exists {
 			return w.runCompletedRecognitionRecovery(ctx, runtime, recoveryTask, manifest)
 		}
-		manifestClient, clientErr := w.completedRecognitionManifestClient(recoveryTask)
+		manifestClient, clientErr := w.completedRecognitionManifestClient(ctx, recoveryTask)
 		if clientErr != nil {
 			return w.failure(recoveryTask, clientErr)
 		}
@@ -1790,16 +1845,13 @@ func isCompletedRecognitionRecovery(task models.DownloadTask) bool {
 	return task.ScrapeStatus == "completed_unrecognized" && (hasSnapshot || task.ProviderTaskID != "") && task.TargetLibraryID != nil
 }
 
-func (w *DownloadWorker) completedRecognitionManifestClient(task models.DownloadTask) (downloadpkg.ManifestClient, error) {
+func (w *DownloadWorker) completedRecognitionManifestClient(ctx context.Context, task models.DownloadTask) (downloadpkg.ManifestClient, error) {
 	if task.ProviderTaskID == "" || task.DownloaderID == nil {
 		return nil, appError("download_completion_manifest_unavailable", "已完成下载的文件清单不可用", nil)
 	}
-	record, client, err := w.service.downloader.client(*task.DownloaderID)
+	_, client, _, err := w.taskDownloaderClient(ctx, &task)
 	if err != nil {
 		return nil, err
-	}
-	if !record.Enabled {
-		return nil, appError(CodeDownloaderUnavailable, "下载器已停用", nil)
 	}
 	manifestClient, ok := client.(downloadpkg.ManifestClient)
 	if !ok {
@@ -1963,7 +2015,7 @@ func (w *DownloadWorker) resetFailedPan115ForExplicitRetry(ctx context.Context, 
 }
 
 func (w *DownloadWorker) pan115ConnectionID(ctx context.Context, record models.Downloader) (uint, bool) {
-	if record.Type != models.DownloaderTypePan115Offline || record.StorageID == nil || w.service == nil || w.service.providerEvents == nil {
+	if record.Type != models.DownloaderTypePan115Offline || normalizeExecutionLocation(record.ExecutionLocation) == models.NodeLocationRemote || record.StorageID == nil || w.service == nil || w.service.providerEvents == nil {
 		return 0, false
 	}
 	var storage models.Storage
@@ -2241,6 +2293,11 @@ func (w *DownloadWorker) persistScrape(task *models.DownloadTask, match scrapeMa
 		revision = 1
 	}
 	manifest, _, _ := completedDownloadManifest(task.CompletedManifestJSON)
+	if status == "completed_verified" {
+		if selected, err := selectDownloadPackageManifest(manifest, match.MediaType); err == nil {
+			manifest = selected
+		}
+	}
 	_, snapshotJSON, snapshotErr := buildDownloadIdentitySnapshot(*task, match, manifest, identitySource, identityStatus, identityLocked, revision)
 	if snapshotErr != nil {
 		return snapshotErr
@@ -2438,7 +2495,7 @@ func (w *DownloadWorker) verifyCompleted(ctx context.Context, task *models.Downl
 			return downloadpkg.Manifest{}, appError("download_state_persist_failed", "完成后刮削结果保存失败", persistErr)
 		}
 		if errors.Is(err, errPackageEpisodeUnrecognized) {
-			return downloadpkg.Manifest{}, appError(CodeTransferEpisodeUnrecognized, "媒体身份已确认，但无法完整确定每个视频的集号；已保留完整来源等待整理", nil)
+			return downloadpkg.Manifest{}, appError(CodeTransferEpisodeUnrecognized, "媒体身份已确认，但没有识别出可入库的剧集集号；来源文件已保留", nil)
 		}
 		return downloadpkg.Manifest{}, appError(CodeTransferMediaUnrecognized, "下载已完成，但没有找到可信主媒体，未自动入库", nil)
 	}
@@ -2520,23 +2577,9 @@ func (w *DownloadWorker) load(ctx context.Context, job ClaimedJob) (models.Downl
 	if task.DownloaderID == nil {
 		return task, models.Downloader{}, nil, downloadpkg.Source{}, "", appError(CodeDownloaderUnavailable, "下载器配置已不存在", nil)
 	}
-	record, client, err := w.service.downloader.client(*task.DownloaderID)
+	record, client, savePath, err := w.taskDownloaderClient(ctx, &task)
 	if err != nil {
 		return task, record, nil, downloadpkg.Source{}, "", err
-	}
-	if !record.Enabled {
-		return task, record, nil, downloadpkg.Source{}, "", appError(CodeDownloaderUnavailable, "下载器已停用", nil)
-	}
-	savePath, err := w.service.settings.ResolveSnapshot(ctx, record.Type, task.StagingAbsolutePath, task.StagingStorageID, task.StagingRelativePath)
-	if err != nil {
-		return task, record, nil, downloadpkg.Source{}, "", err
-	}
-	if task.StagingAbsolutePath == "" && savePath != "" {
-		// Legacy tasks snapshot a Storage plus provider-relative path. Once that
-		// immutable pair has been resolved and root-constrained, promote the
-		// canonical result in memory so the strict routing boundary below remains
-		// identical for legacy and current tasks. Do not persist from a worker read.
-		task.StagingAbsolutePath = savePath
 	}
 	plaintext, err := w.service.credentials.Decrypt(downloadSourcePurpose(task.ID), task.SourceCiphertext)
 	if err != nil {
@@ -2547,6 +2590,35 @@ func (w *DownloadWorker) load(ctx context.Context, job ClaimedJob) (models.Downl
 		return task, record, nil, downloadpkg.Source{}, "", err
 	}
 	return task, record, client, downloadpkg.Source{Kind: source.Kind, URL: source.URL, Torrent: source.Torrent, Filename: source.Filename, ProviderItemID: source.ProviderItemID}, savePath, nil
+}
+
+func (w *DownloadWorker) taskDownloaderClient(ctx context.Context, task *models.DownloadTask) (models.Downloader, downloadpkg.Client, string, error) {
+	var record models.Downloader
+	if task == nil || task.DownloaderID == nil {
+		return record, nil, "", appError(CodeDownloaderUnavailable, "下载器配置已不存在", nil)
+	}
+	if err := w.service.db.WithContext(ctx).First(&record, "id = ?", *task.DownloaderID).Error; err != nil {
+		return record, nil, "", downloaderNotFound(err)
+	}
+	if !record.Enabled {
+		return record, nil, "", appError(CodeDownloaderUnavailable, "下载器已停用", nil)
+	}
+	savePath, err := w.service.settings.ResolveSnapshot(ctx, record.Type, task.StagingAbsolutePath, task.StagingStorageID, task.StagingRelativePath)
+	if err != nil {
+		return record, nil, "", err
+	}
+	if task.StagingAbsolutePath == "" && savePath != "" {
+		// Legacy tasks snapshot a Storage plus provider-relative path. Once that
+		// immutable pair has been resolved and root-constrained, promote the
+		// canonical result in memory so the strict routing boundary below remains
+		// identical for legacy and current tasks. Do not persist from a worker read.
+		task.StagingAbsolutePath = savePath
+	}
+	client, err := w.service.downloader.clientForTask(ctx, record, *task, savePath)
+	if err != nil {
+		return record, nil, "", err
+	}
+	return record, client, savePath, nil
 }
 
 // updateActiveTask is the worker-side cancellation barrier. Pipeline cancel
@@ -2736,7 +2808,7 @@ func downloadFailureMessage(code string, retryable bool) string {
 	case CodeTransferMediaUnrecognized:
 		return "下载已完成，但媒体未识别，未自动入库；请修正识别条件后重试"
 	case CodeTransferEpisodeUnrecognized:
-		return "媒体身份已确认，但剧集集号仍待整理；完整来源不会被部分入库"
+		return "媒体身份已确认，但没有识别出可入库的剧集集号；来源文件已保留"
 	case "download_state_persist_failed":
 		return "下载完成后的识别结果保存失败，请重试"
 	case "download_completion_manifest_invalid":

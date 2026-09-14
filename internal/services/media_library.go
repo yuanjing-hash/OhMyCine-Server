@@ -30,34 +30,33 @@ import (
 const maxSourceAssetExtraExtensions = 16
 
 type MediaLibraryService struct {
-	db                      *gorm.DB
-	catalogStore            *CatalogSnapshotStore
-	catalogScanCommit       CatalogScanCommit
-	catalogFollowupMu       sync.Mutex
-	audit                   *AuditService
-	log                     zerolog.Logger
-	mu                      sync.Mutex
-	supervisors             map[uint]supervisorHandle
-	scanLocks               map[uint]*sync.Mutex
-	connections             *ConnectionService
-	metadata                *MetadataSettingsService
-	aiRecognition           *AIRecognitionSettingsService
-	ingest                  MediaLibraryIngestEnqueuer
-	artifacts               *MediaArtifactService
-	changes                 *MediaChangeService
-	closed                  bool
-	lifeEventCtx            context.Context
-	lifeEventStop           context.CancelFunc
-	lifeEventDone           <-chan struct{}
-	lifeEventWG             sync.WaitGroup
-	lifeEventRechecks       map[uint]struct{}
-	lifeEventMu             sync.Mutex
-	lifeEvents              map[string]downloaderLifeEventCandidate
-	backends                *MediaLibraryBackendRegistry
-	structure               *MediaLibraryStructureService
-	libraryArtwork          MediaLibraryArtworkScheduler
-	queue                   *QueueService
-	retirementPhysicalGuard func(*gorm.DB, uint) error
+	db                *gorm.DB
+	catalogStore      *CatalogSnapshotStore
+	catalogScanCommit CatalogScanCommit
+	catalogFollowupMu sync.Mutex
+	audit             *AuditService
+	log               zerolog.Logger
+	mu                sync.Mutex
+	supervisors       map[uint]supervisorHandle
+	scanLocks         map[uint]*sync.Mutex
+	connections       *ConnectionService
+	metadata          *MetadataSettingsService
+	aiRecognition     *AIRecognitionSettingsService
+	ingest            MediaLibraryIngestEnqueuer
+	artifacts         *MediaArtifactService
+	changes           *MediaChangeService
+	closed            bool
+	lifeEventCtx      context.Context
+	lifeEventStop     context.CancelFunc
+	lifeEventDone     <-chan struct{}
+	lifeEventWG       sync.WaitGroup
+	lifeEventRechecks map[uint]struct{}
+	lifeEventMu       sync.Mutex
+	lifeEvents        map[string]downloaderLifeEventCandidate
+	backends          *MediaLibraryBackendRegistry
+	structure         *MediaLibraryStructureService
+	libraryArtwork    MediaLibraryArtworkScheduler
+	queue             *QueueService
 }
 
 // MediaLibraryIngestEnqueuer is the narrow boundary from provider directory
@@ -189,6 +188,9 @@ func (s *MediaLibraryService) SetMediaChangeService(changes *MediaChangeService)
 }
 func (s *MediaLibraryService) SetStructureService(structure *MediaLibraryStructureService) {
 	s.structure = structure
+	if structure != nil {
+		structure.scanBoundary = s.scanLock
+	}
 }
 func (s *MediaLibraryService) SetLibraryArtworkScheduler(artwork MediaLibraryArtworkScheduler) {
 	s.libraryArtwork = artwork
@@ -598,66 +600,6 @@ func (s *MediaLibraryService) Reorder(actor Actor, ids []uint, request RequestCo
 	return s.List(actor)
 }
 
-func (s *MediaLibraryService) Delete(actor Actor, id uint, request RequestContext) error {
-	if !actor.HasPermission(authz.PermissionMediaLibrariesDelete) {
-		return appError(CodePermissionDenied, "无权删除媒体库", nil)
-	}
-	var existing models.MediaLibrary
-	if err := s.db.First(&existing, id).Error; err != nil {
-		return mediaLibraryNotFound(err)
-	}
-	if !actor.CanResource(authz.PermissionMediaLibrariesDelete, models.AuthorizationResourceMediaLibrary, uintID(existing.ID)) {
-		return appError(CodePermissionDenied, "无权删除这个媒体库", nil)
-	}
-	if existing.DefaultIngestConnectionID != nil {
-		if err := requireNoEnabledLifeEventListener(context.Background(), s.db, *existing.DefaultIngestConnectionID); err != nil {
-			return err
-		}
-	}
-	s.stopSupervisor(id)
-	lock := s.scanLock(id)
-	lock.Lock()
-	defer lock.Unlock()
-	err := s.db.Transaction(func(tx *gorm.DB) error {
-		var record models.MediaLibrary
-		if err := tx.First(&record, id).Error; err != nil {
-			return mediaLibraryNotFound(err)
-		}
-		if err := requireMediaLibraryNotRetiringTx(tx, id); err != nil {
-			return err
-		}
-		var heads int64
-		if err := tx.Model(&models.CatalogHead{}).Where("library_id=?", id).Count(&heads).Error; err != nil {
-			return err
-		}
-		if heads != 0 {
-			return appError(CodeConflict, "该媒体库需要异步移除索引，请使用媒体库管理删除入口", nil)
-		}
-		if err := AssertCatalogPhysicalDrainedTx(tx, id); err != nil {
-			return err
-		}
-		if record.DefaultIngestConnectionID != nil {
-			if err := requireNoEnabledLifeEventListener(context.Background(), tx, *record.DefaultIngestConnectionID); err != nil {
-				return err
-			}
-		}
-		if err := tx.Where("managed_key = ?", managedScheduleKey("media_library_scan", "media_library", uintID(id))).Delete(&models.ScheduleDefinition{}).Error; err != nil {
-			return err
-		}
-		if err := tx.Delete(&record).Error; err != nil {
-			return err
-		}
-		return s.audit.Record(tx, &actor.User.ID, "media_library.delete", "media_library", uintID(id), "success", map[string]any{"storage_id": record.StorageID, "relative_root": record.RelativeRoot}, request)
-	})
-	if err == nil {
-		s.mu.Lock()
-		delete(s.scanLocks, id)
-		s.mu.Unlock()
-	} else if existing.Enabled {
-		s.startSupervisor(context.Background(), id)
-	}
-	return err
-}
 func (s *MediaLibraryService) Retry(actor Actor, id uint) error {
 	if !actor.HasPermission(authz.PermissionMediaLibrariesScan) {
 		return appError(CodePermissionDenied, "无权扫描媒体库", nil)
@@ -682,9 +624,8 @@ func (s *MediaLibraryService) ScanNow(ctx context.Context, actor Actor, id uint)
 	return s.Scan(ctx, actor, id, "incremental")
 }
 
-// Scan runs a user-requested reconciliation. The mode is intentionally
-// explicit in the run history even where a provider's current incremental
-// capability still needs a tree reconciliation as its safety fallback.
+// Scan runs an explicitly requested reconciliation. Incremental mode requires
+// a bounded change scope; only an explicit full mode can enumerate the library.
 func (s *MediaLibraryService) Scan(ctx context.Context, actor Actor, id uint, mode string) (models.MediaLibraryScanRun, error) {
 	if !actor.CanResource(authz.PermissionMediaLibrariesScan, models.AuthorizationResourceMediaLibrary, uintID(id)) {
 		return models.MediaLibraryScanRun{}, appError(CodePermissionDenied, "无权扫描媒体库", nil)
@@ -736,7 +677,7 @@ func (s *MediaLibraryService) Runs(actor Actor, id uint, limit int) ([]models.Me
 		limit = 20
 	}
 	var items []models.MediaLibraryScanRun
-	if err := s.db.Where("library_id = ?", id).Order("id DESC").Limit(limit).Find(&items).Error; err != nil {
+	if err := s.db.Where("library_id = ? AND history_cleared_at IS NULL", id).Order("id DESC").Limit(limit).Find(&items).Error; err != nil {
 		return nil, err
 	}
 	return items, nil
@@ -1311,14 +1252,12 @@ func (s *MediaLibraryService) stopSupervisor(id uint) {
 func (s *MediaLibraryService) RequestReconcile(id uint) {
 	s.mu.Lock()
 	handle, ok := s.supervisors[id]
+	s.mu.Unlock()
 	if ok {
-		handle.pending.markFullFallback("unscoped_wakeup")
-		select {
-		case handle.wake <- struct{}{}:
-		default:
+		if err := s.hydratePendingProviderChanges(context.Background(), id, handle.pending, handle.wake); err != nil {
+			s.log.Warn().Uint("library_id", id).Msg("无法加载有界事件范围，未触发全量扫描")
 		}
 	}
-	s.mu.Unlock()
 }
 
 func (s *MediaLibraryService) supervise(ctx context.Context, id uint, wake chan struct{}, pending *providerChangeAccumulator) {
@@ -1381,32 +1320,36 @@ func (s *MediaLibraryService) supervise(ctx context.Context, id uint, wake chan 
 				continue
 			}
 		}
-		// Provider wakeups are buffered while the initial snapshot and listener
-		// attachment run. For 115, consuming that buffered wake in listener.Run
-		// closes the race without repeating an unconditional full enumeration.
-		// Local filesystem watchers retain the conservative catch-up pass.
-		if storage.Type != models.StorageTypePan115 {
-			_ = s.setStatus(id, models.MediaLibraryStatusReconciling, "", nil)
-			if _, err := s.reconcile(ctx, id, "catch_up"); err != nil {
-				_ = listener.Close()
-				next := time.Now().UTC().Add(delay)
-				_ = s.setStatus(id, models.MediaLibraryStatusInitializationFailed, CodeMediaLibraryScanFailed, &next)
-				if !waitForRetry(ctx, delay) {
-					return
-				}
-				delay = nextRetryDelay(delay)
-				continue
-			}
-		} else {
-			serverlog.OperationLibraryInitialScan.Event(s.log.Info()).Uint("library_id", id).Str("phase", "listener_attached").Msg(serverlog.OperationLibraryInitialScan.Message("115 监听已接管，跳过无变化的重复全量扫描"))
-		}
+		// Listener attachment never authorizes an unscoped catch-up scan.
+		// Provider deliveries are hydrated above; local change scopes remain
+		// explicit failures until their watcher can provide bounded paths.
 		_ = s.sweepIngest(ctx, id)
 		_ = s.setStatus(id, models.MediaLibraryStatusListening, "", nil)
 		_ = listener.Run(ctx, func(reconcileCtx context.Context, reason string) error {
+			if scope, ok := providerChangeScopeFromContext(reconcileCtx); ok {
+				if len(scope.DeliveryIDs) > 0 {
+					fresh := newProviderChangeAccumulator()
+					if err := s.hydratePendingProviderChanges(reconcileCtx, id, fresh, nil); err != nil {
+						return err
+					}
+					scope = fresh.take()
+					if scope.empty() {
+						return nil
+					}
+				}
+				prepared, err := s.prepareProviderDeliveryPage(reconcileCtx, id, scope)
+				if err != nil {
+					return err
+				}
+				reconcileCtx = withProviderChangeScope(reconcileCtx, prepared)
+			}
 			_, reconcileErr := s.reconcile(reconcileCtx, id, reason)
 			if reconcileErr == nil {
 				if scope, ok := providerChangeScopeFromContext(reconcileCtx); ok && scope.DeliveryMaxID > 0 {
-					reconcileErr = s.ackPendingProviderChanges(reconcileCtx, id, scope.DeliveryMaxID)
+					reconcileErr = s.ackProviderChangeScope(reconcileCtx, id, scope.DeliveryIDs)
+					if reconcileErr == nil {
+						reconcileErr = s.hydratePendingProviderChanges(reconcileCtx, id, pending, wake)
+					}
 				}
 			}
 			if reconcileErr == nil {
@@ -1577,27 +1520,56 @@ func (s *MediaLibraryService) hydratePendingProviderChanges(ctx context.Context,
 	if libraryID == 0 || pending == nil {
 		return nil
 	}
-	var watermark struct{ MaxID uint }
-	if err := s.db.WithContext(ctx).Model(&models.MediaLibraryProviderEvent{}).
-		Select("COALESCE(MAX(id), 0) AS max_id").
-		Where("library_id = ? AND processed_at IS NULL", libraryID).Scan(&watermark).Error; err != nil || watermark.MaxID == 0 {
-		return err
+	// Invalid events remain durable for diagnosis, but cannot poison unrelated
+	// valid deliveries. Acknowledge explicit IDs, never a watermark across gaps.
+	rows := make([]models.MediaLibraryProviderEvent, 0, maxProviderChangeScopeItems/3)
+	offset := 0
+	for len(rows) < maxProviderChangeScopeItems/3 {
+		var page []models.MediaLibraryProviderEvent
+		if err := s.db.WithContext(ctx).Where("library_id = ? AND processed_at IS NULL", libraryID).
+			Order("updated_at, id").Offset(offset).Limit(maxProviderChangeScopeItems / 3).Find(&page).Error; err != nil {
+			return err
+		}
+		if len(page) == 0 {
+			break
+		}
+		for _, row := range page {
+			offset++
+			payload, valid := decodeProviderEventPayload(row.PayloadJSON)
+			if !valid || payload.Kind == cloudpkg.ChangeFallback {
+				s.log.Warn().Uint("library_id", libraryID).Uint("delivery_id", row.ID).Msg("事件范围无效，保留待处理；禁止全量扫描")
+				continue
+			}
+			rows = append(rows, row)
+			if len(rows) == maxProviderChangeScopeItems/3 {
+				break
+			}
+		}
 	}
-	var rows []models.MediaLibraryProviderEvent
-	if err := s.db.WithContext(ctx).Where("library_id = ? AND processed_at IS NULL AND id <= ?", libraryID, watermark.MaxID).
-		Order("id").Limit(maxProviderChangeScopeItems + 1).Find(&rows).Error; err != nil {
-		return err
+	if len(rows) == 0 {
+		return nil
 	}
-	if len(rows) > maxProviderChangeScopeItems {
-		pending.merge(providerChangeScope{EventCount: len(rows), DeliveryMaxID: watermark.MaxID, FullFallback: true, FallbackCode: "scope_overflow"})
-	} else {
-		pending.addDeliveries(rows, watermark.MaxID)
-	}
+	pending.addDeliveries(rows, rows[len(rows)-1].ID)
 	select {
 	case wake <- struct{}{}:
 	default:
 	}
 	return nil
+}
+
+func (s *MediaLibraryService) ackProviderChangeScope(ctx context.Context, libraryID uint, deliveryIDs []uint) error {
+	if len(deliveryIDs) == 0 {
+		return nil
+	}
+	now := time.Now().UTC()
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Where("library_id = ? AND id IN ? AND inbox_event_id IN (?)", libraryID, deliveryIDs,
+			tx.Model(&models.ProviderEvent{}).Select("id").Where("processed_at IS NOT NULL")).Delete(&models.MediaLibraryProviderEvent{}).Error; err != nil {
+			return err
+		}
+		return tx.Model(&models.MediaLibraryProviderEvent{}).Where("library_id = ? AND processed_at IS NULL AND id IN ?", libraryID, deliveryIDs).
+			Updates(map[string]any{"processed_at": now, "updated_at": now}).Error
+	})
 }
 
 func (s *MediaLibraryService) ackPendingProviderChanges(ctx context.Context, libraryID, deliveryMaxID uint) error {
@@ -1943,9 +1915,13 @@ func (s *MediaLibraryService) reconcile(ctx context.Context, id uint, kind strin
 	started := time.Now()
 	operation := mediaLibraryScanOperation(kind)
 	providerScope, hasProviderScope := providerChangeScopeFromContext(ctx)
+	batchResult, isTransferBatch := transferBatchResultFromContext(ctx)
 	lock := s.scanLock(id)
 	lock.Lock()
 	defer lock.Unlock()
+	if err := s.recoverBatchArtifactFollowups(ctx, id); err != nil {
+		return models.MediaLibraryScanRun{}, err
+	}
 	var library models.MediaLibrary
 	var storage models.Storage
 	var profile models.MediaClassificationProfile
@@ -1983,6 +1959,12 @@ func (s *MediaLibraryService) reconcile(ctx context.Context, id uint, kind strin
 			return models.MediaLibraryScanRun{}, errMediaLibraryEventReconcileDeferred
 		}
 	}
+	if (hasProviderScope && (providerScope.Blocked || providerScope.empty())) ||
+		((kind == "event" || kind == "incremental" || kind == "catch_up" || kind == "strm_incremental_manual") && !hasProviderScope) {
+		operation.Event(s.log.Warn()).Uint("library_id", id).Str("scope_error", providerScope.BlockCode).
+			Msg(operation.Message("事件范围无法确认，保留待处理事件；禁止全量扫描"))
+		return models.MediaLibraryScanRun{}, errProviderChangeScopeUnproven
+	}
 	if err := s.db.First(&profile, library.ProfileID).Error; err != nil {
 		return models.MediaLibraryScanRun{}, err
 	}
@@ -1997,44 +1979,45 @@ func (s *MediaLibraryService) reconcile(ctx context.Context, id uint, kind strin
 	assetExtensions := effectiveSourceAssetExtensions(extraAssetExtensions)
 	generation := library.DirtyGeneration + 1
 	run := models.MediaLibraryScanRun{LibraryID: id, Kind: kind, Status: "running", Phase: "enumerating", Generation: generation, SourceFingerprint: mediaLibraryScanSourceFingerprint(library, storage, profile), CheckpointJSON: "{}", StartedAt: time.Now().UTC()}
+	if isTransferBatch {
+		checkpoint, err := json.Marshal(map[string]string{"transfer_batch_id": transferBatchIDFromContext(ctx)})
+		if err != nil {
+			return run, err
+		}
+		run.CheckpointJSON = string(checkpoint)
+	}
 	if err := s.db.Create(&run).Error; err != nil {
 		return run, err
 	}
 	operation.Event(s.log.Info()).Uint("library_id", id).Uint("scan_run_id", run.ID).Uint64("generation", generation).
 		Str("scan_kind", kind).Str("phase", "enumerating").Msg(operation.Message("开始从数据源枚举媒体"))
 	if hasProviderScope {
-		if providerScope.FullFallback {
-			operation.Event(s.log.Info()).Uint("library_id", id).Uint("scan_run_id", run.ID).Uint64("generation", generation).
-				Str("scan_kind", kind).Str("phase", "scope_fallback").Str("fallback_code", providerScope.FallbackCode).
-				Int("event_count", providerScope.EventCount).Msg(operation.Message("增量事件范围不完整，回退全量对账"))
-			hasProviderScope = false
-		} else {
-			operation.Event(s.log.Info()).Uint("library_id", id).Uint("scan_run_id", run.ID).Uint64("generation", generation).
-				Str("scan_kind", kind).Str("phase", "scope_reconciliation").Int("event_count", providerScope.EventCount).
-				Int("scope_items", len(providerScope.Events)).Int("scope_parents", len(providerScope.ParentIDs)).
-				Msg(operation.Message("开始按受影响范围增量对账"))
-		}
+		operation.Event(s.log.Info()).Uint("library_id", id).Uint("scan_run_id", run.ID).
+			Str("scan_kind", kind).Int("scope_items", len(providerScope.Events)).
+			Msg(operation.Message("开始按受影响范围增量对账"))
 	}
 	backend, backendErr := s.backends.Get(storage.Type)
 	var result medialibrary.Result
 	var scanErr error
-	if backendErr != nil {
+	if hasProviderScope && providerScope.VerifiedResult != nil {
+		result = *providerScope.VerifiedResult
+	} else if isTransferBatch {
+		result = batchResult
+	} else if backendErr != nil {
 		scanErr = backendErr
 	} else {
 		timing := cloudpkg.NewOperationTimingCollector()
 		scanCtx := cloudpkg.WithOperationTimingCollector(ctx, timing)
 		request := MediaLibraryScanRequest{Library: library, Storage: storage, VideoExtensions: extensions, AssetExtensions: assetExtensions, IgnorePatterns: ignores}
-		if hasProviderScope && storage.Type == models.StorageTypePan115 {
+		if hasProviderScope {
 			request.providerScope = &providerScope
-			request.knownProviderIDs, scanErr = s.knownPan115CatalogProviderIDs(scanCtx, id)
+			if storage.Type == models.StorageTypePan115 {
+				request.knownProviderIDs, scanErr = s.knownPan115CatalogProviderIDs(scanCtx, id, providerScope)
+			} else if storage.Type == models.StorageTypeLocal {
+				request.knownLocalPaths, scanErr = s.knownLocalCatalogPaths(scanCtx, id, storage, library, providerScope.LocalPaths)
+			}
 		}
 		request.Progress = func(progress cloudpkg.TreeScanProgress) {
-			if progress.Phase == "scope_fallback" {
-				operation.Event(s.log.Info()).Uint("library_id", id).Uint("scan_run_id", run.ID).Uint64("generation", generation).
-					Str("scan_kind", kind).Str("phase", "scope_fallback").Str("fallback_code", "scope_unproven").
-					Msg(operation.Message("无法证明增量范围完整，回退全量对账"))
-				return
-			}
 			phase := "enumerating"
 			_ = s.db.Model(&models.MediaLibraryScanRun{}).Where("id = ?", run.ID).Updates(map[string]any{"phase": phase, "enumerated": progress.Enumerated}).Error
 			operation.Event(s.log.Info()).Uint("library_id", id).Uint("scan_run_id", run.ID).Uint64("generation", generation).Str("scan_kind", kind).
@@ -2077,14 +2060,26 @@ func (s *MediaLibraryService) reconcile(ctx context.Context, id uint, kind strin
 		operation.Event(s.log.Error()).Str("error_code", CodeMediaLibraryScanFailed).Uint("library_id", id).Uint("scan_run_id", run.ID).Str("scan_kind", kind).Int64("duration_ms", time.Since(started).Milliseconds()).Msg(operation.Message("失败"))
 		return run, appError(CodeMediaLibraryScanFailed, "媒体库扫描失败", scanErr)
 	}
+	if hasProviderScope {
+		applied, err := s.providerDeltaAlreadyApplied(ctx, id, result)
+		if err != nil {
+			return s.failFastScanPersistence(run, operation, started, mediaLibraryPersistenceStageLoadEntries, err)
+		}
+		if applied {
+			run.Status, run.Phase, run.Partial = "success", "completed", true
+			run.Generation = library.BaselineGeneration
+			run.FinishedAt, run.CatalogPublishedAt = &finished, &finished
+			return run, s.db.WithContext(ctx).Save(&run).Error
+		}
+	}
 	if versionedScan {
-		published, err := s.publishCatalogScan(ctx, library, storage, profile, run, result, storage.Type == models.StorageTypePan115 && s.queue != nil, s.catalogScanCommit)
+		published, err := s.publishCatalogScan(ctx, library, storage, profile, run, result, storage.Type == models.StorageTypePan115 && s.queue != nil && !isTransferBatch && !hasProviderScope, s.catalogScanCommit)
 		if err != nil {
 			return s.failFastScanPersistence(run, operation, started, mediaLibraryPersistenceStageEntries, err)
 		}
 		return published, nil
 	}
-	if storage.Type == models.StorageTypePan115 && s.queue != nil {
+	if storage.Type == models.StorageTypePan115 && s.queue != nil && !isTransferBatch && !hasProviderScope {
 		if result.Scoped {
 			result, scanErr = s.mergeScopedPan115Catalog(ctx, id, result)
 			if scanErr != nil {
@@ -2099,10 +2094,20 @@ func (s *MediaLibraryService) reconcile(ctx context.Context, id uint, kind strin
 	units := medialibrary.GroupRecognitionUnits(result.Files)
 	recognitionStarted := time.Now()
 	serverlog.OperationMediaRecognition.Event(s.log.Info()).Uint("library_id", id).Uint("scan_run_id", run.ID).Int("unit_count", len(units)).Msg(serverlog.OperationMediaRecognition.Message("开始"))
-	units, recognitionErr := s.stabilizeExistingRecognitionUnits(ctx, id, units)
+	var recognitionErr error
 	var recognizedUnits []mediaLibraryRecognizedUnit
-	if recognitionErr == nil {
-		recognizedUnits, recognitionErr = s.recognizeLibraryUnits(ctx, library, profile, units)
+	if result.Partial {
+		var baseline catalogScanBaseline
+		baseline, recognitionErr = s.loadCatalogBatchBaseline(ctx, id, result)
+		if recognitionErr == nil {
+			units = stabilizeRecognitionUnits(units, baseline.entries, baseline.recognitions)
+			recognizedUnits, recognitionErr = s.recognizeLibraryUnitsWithExisting(ctx, library, profile, units, baseline.recognitions)
+		}
+	} else {
+		units, recognitionErr = s.stabilizeExistingRecognitionUnits(ctx, id, units)
+		if recognitionErr == nil {
+			recognizedUnits, recognitionErr = s.recognizeLibraryUnits(ctx, library, profile, units)
+		}
 	}
 	if recognitionErr != nil {
 		run.Status = "failed"
@@ -2151,8 +2156,20 @@ func (s *MediaLibraryService) reconcile(ctx context.Context, id uint, kind strin
 			return wrapMediaLibraryPersistence(mediaLibraryPersistenceStageConfiguration, errMediaLibraryConfigurationChanged)
 		}
 		var existing []models.MediaLibraryEntry
-		if err := tx.Where("library_id = ?", id).Find(&existing).Error; err != nil {
-			return wrapMediaLibraryPersistence(mediaLibraryPersistenceStageLoadEntries, err)
+		var existingAssets []models.MediaLibrarySourceAsset
+		if result.Partial {
+			var err error
+			existing, existingAssets, err = loadLegacyBatchFactsTx(tx, id, result)
+			if err != nil {
+				return wrapMediaLibraryPersistence(mediaLibraryPersistenceStageLoadEntries, err)
+			}
+		} else {
+			if err := tx.Where("library_id = ?", id).Find(&existing).Error; err != nil {
+				return wrapMediaLibraryPersistence(mediaLibraryPersistenceStageLoadEntries, err)
+			}
+			if err := tx.Where("library_id = ?", id).Find(&existingAssets).Error; err != nil {
+				return wrapMediaLibraryPersistence(mediaLibraryPersistenceStageSourceAssets, err)
+			}
 		}
 		byPath := map[string]models.MediaLibraryEntry{}
 		byProvider := map[string]models.MediaLibraryEntry{}
@@ -2163,10 +2180,6 @@ func (s *MediaLibraryService) reconcile(ctx context.Context, id uint, kind strin
 			}
 		}
 		now := time.Now().UTC()
-		var existingAssets []models.MediaLibrarySourceAsset
-		if err := tx.Where("library_id = ?", id).Find(&existingAssets).Error; err != nil {
-			return wrapMediaLibraryPersistence(mediaLibraryPersistenceStageSourceAssets, err)
-		}
 		assetsByPath := make(map[string]models.MediaLibrarySourceAsset, len(existingAssets))
 		for _, asset := range existingAssets {
 			assetsByPath[asset.RelativePath] = asset
@@ -2287,6 +2300,17 @@ func (s *MediaLibraryService) reconcile(ctx context.Context, id uint, kind strin
 			delete(byPath, file.RelativePath)
 			delete(byProvider, file.ProviderID)
 		}
+		// Scoped provider proof permits exact deletions; partial absence never does.
+		if len(result.DeletedProviderIDs) > 0 {
+			removed := tx.Where("library_id = ? AND provider_id IN ?", id, result.DeletedProviderIDs).Delete(&models.MediaLibraryEntry{})
+			if removed.Error != nil {
+				return wrapMediaLibraryPersistence(mediaLibraryPersistenceStagePrune, removed.Error)
+			}
+			run.Removed += int(removed.RowsAffected)
+			if err := tx.Where("library_id = ? AND provider_id IN ?", id, result.DeletedProviderIDs).Delete(&models.MediaLibrarySourceAsset{}).Error; err != nil {
+				return wrapMediaLibraryPersistence(mediaLibraryPersistenceStagePrune, err)
+			}
+		}
 		// A bounded partial enumeration is not proof of deletion. Preserve
 		// unseen entries until a complete reconciliation can confirm absence.
 		if !result.Partial {
@@ -2309,8 +2333,18 @@ func (s *MediaLibraryService) reconcile(ctx context.Context, id uint, kind strin
 				}
 			}
 		}
-		if err := reconcileTMDBCollectionsTx(tx, id, result.Partial, now); err != nil {
-			return wrapMediaLibraryPersistence(mediaLibraryPersistenceStageCollections, err)
+		var collectionErr error
+		if result.Partial {
+			paths := make([]string, 0, len(result.Files))
+			for _, file := range result.Files {
+				paths = append(paths, file.RelativePath)
+			}
+			collectionErr = reconcileTMDBBatchCollectionsTx(tx, id, paths, now)
+		} else {
+			collectionErr = reconcileTMDBCollectionsTx(tx, id, false, now)
+		}
+		if collectionErr != nil {
+			return wrapMediaLibraryPersistence(mediaLibraryPersistenceStageCollections, collectionErr)
 		}
 		updates := map[string]any{"dirty_generation": generation, "baseline_generation": generation, "last_scan_at": finished, "last_successful_scan_at": finished, "profile_revision": profile.Revision, "reclassification_due": false, "status_error_code": "", "next_retry_at": nil}
 		if err := tx.Model(&models.MediaLibrary{}).Where("id = ?", id).Updates(updates).Error; err != nil {
@@ -2320,10 +2354,15 @@ func (s *MediaLibraryService) reconcile(ctx context.Context, id uint, kind strin
 		run.Phase = "completed"
 		run.CatalogPublishedAt = &finished
 		run.FinishedAt = &finished
+		if run.Partial && s.artifacts != nil {
+			if err := freezeBatchArtifactCheckpointTx(tx, &run); err != nil {
+				return err
+			}
+		}
 		if err := tx.Save(&run).Error; err != nil {
 			return wrapMediaLibraryPersistence(mediaLibraryPersistenceStageScanRun, err)
 		}
-		if s.changes != nil && !run.Partial && (run.Added > 0 || run.Updated > 0 || run.Removed > 0 || metadataProjectionChanged) {
+		if s.changes != nil && (!run.Partial || isTransferBatch || hasProviderScope) && (run.Added > 0 || run.Updated > 0 || run.Removed > 0 || metadataProjectionChanged) {
 			kind := models.MediaLibraryChangeCatalog
 			if run.Added == 0 && run.Updated == 0 && run.Removed == 0 {
 				kind = models.MediaLibraryChangeMetadata
@@ -2368,10 +2407,17 @@ func (s *MediaLibraryService) reconcile(ctx context.Context, id uint, kind strin
 	serverlog.OperationMetadataSnapshot.Event(s.log.Info()).Uint("library_id", id).Uint("scan_run_id", run.ID).Uint64("generation", generation).Int("units", len(recognizedUnits)).Int("matched", matched).Int("snapshots", snapshots).Int("cache_hits", cacheHits).Msg(serverlog.OperationMetadataSnapshot.Message("提交"))
 	if s.artifacts != nil && mediaLibraryArtifactGenerationRequired(kind, run, metadataProjectionChanged) {
 		if err := s.artifacts.ScheduleGeneration(id, generation); err != nil {
+			if isTransferBatch || hasProviderScope || run.Partial {
+				return run, err
+			}
 			serverlog.OperationMediaArtifact.Event(s.log.Error()).Uint("library_id", id).Uint64("generation", generation).Str("error_code", "artifact_schedule_failed").Msg(serverlog.OperationMediaArtifact.Message("入队失败"))
+		} else if run.Partial {
+			if err := s.acknowledgeBatchArtifactFollowup(ctx, run.ID); err != nil {
+				return run, err
+			}
 		}
 	}
-	if s.libraryArtwork != nil {
+	if s.libraryArtwork != nil && !isTransferBatch && !hasProviderScope {
 		if err := s.libraryArtwork.ScheduleGeneration(id, !run.Partial); err != nil {
 			s.log.Warn().Uint("library_id", id).Str("error_code", "library_artwork_schedule_failed").Msg("媒体库分类封面生成入队失败")
 		}
