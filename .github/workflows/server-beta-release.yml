@@ -129,6 +129,11 @@ jobs:
           npm run lint
           npm run build
 
+      - name: Lint Server
+        uses: golangci/golangci-lint-action@v7
+        with:
+          version: v2.4.0
+
       - name: Verify Server
         run: |
           go mod verify
@@ -139,11 +144,6 @@ jobs:
           cd webui
           go mod verify
           go test .
-
-      - name: Lint Server
-        uses: golangci/golangci-lint-action@v7
-        with:
-          version: v2.4.0
 
       - name: Derive Node release trust root
         env:

@@ -137,14 +137,15 @@ func TestDeletedArtifactScopedCleanup(t *testing.T) {
 				s.removeFile = func(string) error { return errors.New("synthetic failure") }
 			}
 			result := s.AutoCleanup(ctx, run.ID)
-			if scenario == "active_counterpart" {
+			switch scenario {
+			case "active_counterpart":
 				if result.Removed != 0 {
 					t.Fatalf("restored manifest removed: %+v", result)
 				}
 				if _, err := os.Stat(path); err != nil {
 					t.Fatal("restored output removed")
 				}
-			} else if scenario == "modified" || scenario == "root_changed" || scenario == "restored" || scenario == "shared_work_restored" || scenario == "retry" {
+			case "modified", "root_changed", "restored", "shared_work_restored", "retry":
 				if result.ErrorCode == "" {
 					t.Fatalf("unsafe cleanup accepted: %+v", result)
 				}
@@ -160,7 +161,7 @@ func TestDeletedArtifactScopedCleanup(t *testing.T) {
 						t.Fatalf("retry failed %+v", next)
 					}
 				}
-			} else {
+			default:
 				if result.ErrorCode != "" || result.Skipped {
 					t.Fatalf("cleanup %+v", result)
 				}

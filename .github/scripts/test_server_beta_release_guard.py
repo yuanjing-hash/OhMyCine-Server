@@ -25,6 +25,12 @@ class VersionTests(unittest.TestCase):
 
 
 class WorkflowTests(unittest.TestCase):
+    def test_lint_fails_fast_after_webui_and_before_long_go_gate(self) -> None:
+        source = guard.DEFAULT_WORKFLOW.read_text(encoding="utf-8")
+        self.assertLess(source.index("- name: Build embedded Web UI"), source.index("- name: Lint Server"))
+        self.assertLess(source.index("- name: Lint Server\n"), source.index("- name: Verify Server\n"))
+        self.assertIn("go test ./... -timeout 30m", source)
+
     def test_detects_missing_server_arm64_checksum_or_upload(self) -> None:
         source = guard.DEFAULT_WORKFLOW.read_text(encoding="utf-8")
         for value in (

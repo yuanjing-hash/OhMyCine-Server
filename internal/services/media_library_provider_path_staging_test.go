@@ -134,7 +134,7 @@ func TestProviderPathStagingWritesBoundedPagesAndActivationOnlyHeader(t *testing
 	}); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { db.Callback().Create().Remove(callback) })
+	t.Cleanup(func() { _ = db.Callback().Create().Remove(callback) })
 	if err := stageProviderPaths(context.Background(), db, library, storage, result, run); err != nil {
 		t.Fatal(err)
 	}

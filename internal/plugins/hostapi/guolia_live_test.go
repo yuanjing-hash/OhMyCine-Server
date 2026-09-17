@@ -88,7 +88,6 @@ func TestGuoliaLiveHost(t *testing.T) {
 			t.Fatal("credential encryption failed")
 		}
 	}
-	cookie = ""
 	connection := models.PluginConnection{ID: connectionID, PluginID: pluginID, Name: "isolated live diagnosis", ResourceType: "bt_resource", EntryOrigin: origin, ConfigJSON: `{"entryOrigin":"` + origin + `/"}`, CredentialScope: scope, CredentialMode: models.PluginCredentialModeCookie, CredentialCiphertext: ciphertext, Enabled: true, Revision: 1, CreatedAt: now, UpdatedAt: now}
 	if err := db.Create(&connection).Error; err != nil {
 		t.Fatal("connection setup failed")
@@ -116,7 +115,7 @@ func TestGuoliaLiveHost(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
 	defer cancel()
 	runtime := pluginruntime.NewHost(ctx)
-	defer runtime.Close(context.Background())
+	defer func() { _ = runtime.Close(context.Background()) }()
 	runtime.SetCapabilityHost(host)
 	if err := runtime.Start(ctx, pluginID, wasmPath, 1); err != nil {
 		t.Fatalf("WASM start code=%s", pluginruntime.ErrorCode(err))

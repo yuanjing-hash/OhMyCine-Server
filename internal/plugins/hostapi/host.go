@@ -646,7 +646,7 @@ func (host *Host) http(ctx context.Context, pluginID string, authorization plugi
 			if browserErr != nil {
 				return httpResponse{}, invalid("plugin_browser_unavailable", nil)
 			}
-			defer response.Body.Close()
+			defer func() { _ = response.Body.Close() }()
 			body, err := io.ReadAll(io.LimitReader(response.Body, maxHTTPResponseBytes+1))
 			if err != nil || len(body) > maxHTTPResponseBytes {
 				return httpResponse{}, invalid("plugin_http_response_too_large", nil)
@@ -786,10 +786,6 @@ func mergeCredentialCaptureCookies(base, final []capturedCookie) []capturedCooki
 		result = append(result, byName[name])
 	}
 	return result
-}
-
-func (host *Host) commitCredential(pluginID string, authorization pluginAuthorization, payload []byte) (map[string]any, error) {
-	return host.commitCredentialContext(context.Background(), pluginID, authorization, payload)
 }
 
 func (host *Host) commitCredentialContext(ctx context.Context, pluginID string, authorization pluginAuthorization, payload []byte) (map[string]any, error) {

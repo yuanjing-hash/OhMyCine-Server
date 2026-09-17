@@ -23,7 +23,7 @@ func TestTransferBatchPublishesOnlySuccessfulTargetsWithoutProviderEnumeration(t
 	s.connections = f.service.connections
 	installHydrationMetadata(t, s, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"id":%d,"name":"Known","title":"Known","poster_path":"/poster.jpg"}`, *f.download.ScrapeTMDBID)
+		_, _ = fmt.Fprintf(w, `{"id":%d,"name":"Known","title":"Known","poster_path":"/poster.jpg"}`, *f.download.ScrapeTMDBID)
 	})
 	var task models.TransferTask
 	if err := f.queue.db.First(&task, "download_task_id = ?", f.download.ID).Error; err != nil {

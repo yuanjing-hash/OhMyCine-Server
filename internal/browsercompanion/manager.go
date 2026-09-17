@@ -192,7 +192,7 @@ func (m *Manager) call(ctx context.Context, operation string, input, output any)
 	if err != nil {
 		return ErrUnavailable
 	}
-	defer response.Body.Close()
+	defer func() { _ = response.Body.Close() }()
 	body, err := io.ReadAll(io.LimitReader(response.Body, (4<<20)+1))
 	if err != nil || len(body) > 4<<20 {
 		return ErrUnavailable

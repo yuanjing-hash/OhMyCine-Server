@@ -149,12 +149,12 @@ func TestStructureReviewRegressionUnavailableSessionReadIsNotEmpty(t *testing.T)
 	key := "review-summary-read-failure"
 	if err := s.db.Callback().Query().Before("gorm:query").Register(key, func(tx *gorm.DB) {
 		if tx.Statement.Table == "media_library_structure_review_sessions" {
-			tx.AddError(sentinel)
+			_ = tx.AddError(sentinel)
 		}
 	}); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { s.db.Callback().Query().Remove(key) })
+	t.Cleanup(func() { _ = s.db.Callback().Query().Remove(key) })
 	_, err := s.StructureIssues(context.Background(), actor, library.ID, MediaLibraryStructureIssueQuery{Page: 1, PageSize: 50, Actionable: true, ReviewState: "pending"})
 	if !errors.Is(err, sentinel) {
 		t.Fatalf("session error became healthy zero totals: %v", err)

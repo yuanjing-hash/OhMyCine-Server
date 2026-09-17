@@ -402,9 +402,8 @@ func (s *MediaLibraryService) deferProviderDelivery(ctx context.Context, row mod
 	if review {
 		code = providerEventNeedsReview
 		message = "删除通知仍有关联但暂不能安全处理，已保留；系统将继续本地检查，不重复请求网盘"
-	} else {
-		// Existing supervisor/provider adaptive delay owns transient failures.
 	}
+	// Existing supervisor/provider adaptive delay owns transient failures.
 	if err := s.db.WithContext(ctx).Model(&models.MediaLibraryProviderEvent{}).Where("id = ? AND library_id = ? AND processed_at IS NULL", row.ID, row.LibraryID).Updates(map[string]any{"resolution_code": code, "resolution_reason": reason, "retry_after": next, "updated_at": now}).Error; err != nil {
 		return err
 	}

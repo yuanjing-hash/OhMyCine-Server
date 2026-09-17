@@ -28,7 +28,7 @@ func TestErrorClassNeverIncludesDriverText(t *testing.T) {
 		t.Fatal(err)
 	}
 	pool, _ := db.DB()
-	defer pool.Close()
+	defer func() { _ = pool.Close() }()
 	if err := db.Exec("CREATE TABLE private_fixture (id INTEGER PRIMARY KEY)").Error; err != nil {
 		t.Fatal(err)
 	}

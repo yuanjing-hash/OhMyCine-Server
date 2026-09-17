@@ -255,7 +255,7 @@ func TestPluginBrowserAutomaticLoginResumeAndEncryptedRestore(t *testing.T) {
 	if err != nil || !handled {
 		t.Fatalf("stored login not restored: %v", err)
 	}
-	response.Body.Close()
+	_ = response.Body.Close()
 	// A new service/process and Runtime generation must restore the durable
 	// cookie, not treat resource idle/process lifetime as account expiration.
 	if err := s.db.Model(&models.PluginInstallation{}).Where("plugin_id = ?", connection.PluginID).Update("runtime_generation", 2).Error; err != nil {

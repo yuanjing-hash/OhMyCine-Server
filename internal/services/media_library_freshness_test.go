@@ -69,7 +69,7 @@ func TestFastScanSharedSnapshotDoesNotStarveWriter(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	defer db.Callback().Query().Remove(callback)
+	defer func() { _ = db.Callback().Query().Remove(callback) }()
 	heartbeat := make(chan error, 1)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()

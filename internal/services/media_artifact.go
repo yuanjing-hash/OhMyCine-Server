@@ -527,7 +527,7 @@ func (s *MediaArtifactService) loadRun(runID string) (models.MediaArtifactRun, m
 		return models.MediaArtifactRun{}, mediaArtifactPolicy{}, err
 	}
 	var policy mediaArtifactPolicy
-	if err := json.Unmarshal([]byte(run.PolicyJSON), &policy); err != nil || policy.LibraryID != run.LibraryID || policy.Generation != run.Generation || (!policy.STRMEnabled && !policy.Metadata && !(policy.CloudEmptyCleanupEnabled && len(policy.CloudCleanupDirectories) > 0)) || (policy.TargetKind != models.MediaArtifactTargetLocalAdjacent && policy.TargetKind != models.MediaArtifactTargetLocalProjection && policy.TargetKind != artifactTargetCloudCleanup) {
+	if err := json.Unmarshal([]byte(run.PolicyJSON), &policy); err != nil || policy.LibraryID != run.LibraryID || policy.Generation != run.Generation || (!policy.STRMEnabled && !policy.Metadata && (!policy.CloudEmptyCleanupEnabled || len(policy.CloudCleanupDirectories) == 0)) || (policy.TargetKind != models.MediaArtifactTargetLocalAdjacent && policy.TargetKind != models.MediaArtifactTargetLocalProjection && policy.TargetKind != artifactTargetCloudCleanup) {
 		return models.MediaArtifactRun{}, mediaArtifactPolicy{}, errors.New("artifact policy is invalid")
 	}
 	if artifactRequiresBoundedScope(policy) && policy.CatalogBindingID == "" && policy.ScopeVersion != 1 {

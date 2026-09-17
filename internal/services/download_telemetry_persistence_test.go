@@ -24,7 +24,7 @@ func downloadTestBusyError(t *testing.T) error {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 	if _, err = db.Exec("CREATE TABLE sample (id INTEGER)"); err != nil {
 		t.Fatal(err)
 	}
@@ -32,11 +32,11 @@ func downloadTestBusyError(t *testing.T) error {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	if _, err = conn.ExecContext(context.Background(), "BEGIN IMMEDIATE"); err != nil {
 		t.Fatal(err)
 	}
-	defer conn.ExecContext(context.Background(), "ROLLBACK")
+	defer func() { _, _ = conn.ExecContext(context.Background(), "ROLLBACK") }()
 	_, err = db.Exec("INSERT INTO sample VALUES (1)")
 	if !database.IsTransientWriteError(err) {
 		t.Fatalf("expected typed busy, got %T", err)
@@ -84,10 +84,10 @@ func TestDownloadTelemetryPersistenceRecovery(t *testing.T) {
 				}
 				writes++
 				if mode == "temporary" && writes <= 2 || mode == "persistent" || mode == "unconfirmed_identity" {
-					tx.AddError(busy)
+					_ = tx.AddError(busy)
 				}
 				if mode == "permanent" {
-					tx.AddError(errors.New("private database details must not be logged"))
+					_ = tx.AddError(errors.New("private database details must not be logged"))
 				}
 			}))
 			t.Cleanup(func() { _ = queue.db.Callback().Update().Remove("test:telemetry-persist") })

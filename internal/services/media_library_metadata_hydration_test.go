@@ -43,7 +43,7 @@ func TestTransferMetadataHydrationPreservesIdentityAndEpisodes(t *testing.T) {
 		}
 		calls.Add(1)
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, `{"id":42,"name":"Verified Show","overview":"Details","poster_path":"/poster.jpg","backdrop_path":"/back.jpg"}`)
+		_, _ = fmt.Fprint(w, `{"id":42,"name":"Verified Show","overview":"Details","poster_path":"/poster.jpg","backdrop_path":"/back.jpg"}`)
 	})
 	id := int64(42)
 	library := models.MediaLibrary{MetadataConcurrency: 4}
@@ -87,7 +87,7 @@ func TestTransferMetadataHydrationMissingImagesAndRetry(t *testing.T) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, `{"id":42,"name":"No images"}`)
+		_, _ = fmt.Fprint(w, `{"id":42,"name":"No images"}`)
 	})
 	id := int64(42)
 	ctx := context.WithValue(context.Background(), transferBatchContextKey{}, transferCatalogBatch{Identity: MediaIdentitySnapshot{TMDBID: &id, MediaType: "tv", Title: "Known"}})
@@ -138,7 +138,7 @@ func TestMetadataHydrationRetryGeneratesOnlyWorkArtifacts(t *testing.T) {
 	installHydrationMetadata(t, s, func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/movie/42" {
 			w.Header().Set("Content-Type", "application/json")
-			fmt.Fprint(w, `{"id":42,"title":"Known","overview":"Full details","poster_path":"/poster.jpg","backdrop_path":"/back.jpg"}`)
+			_, _ = fmt.Fprint(w, `{"id":42,"title":"Known","overview":"Full details","poster_path":"/poster.jpg","backdrop_path":"/back.jpg"}`)
 			return
 		}
 		if strings.HasSuffix(r.URL.Path, ".jpg") {
@@ -225,7 +225,7 @@ func TestTransferMetadataTVFirstImportGeneratesArtwork(t *testing.T) {
 	installHydrationMetadata(t, s, func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/tv/42" {
 			w.Header().Set("Content-Type", "application/json")
-			fmt.Fprint(w, `{"id":42,"name":"Show","overview":"Show detail","poster_path":"/poster.jpg","backdrop_path":"/back.jpg","seasons":[{"id":43,"season_number":1,"poster_path":"/season.jpg"}]}`)
+			_, _ = fmt.Fprint(w, `{"id":42,"name":"Show","overview":"Show detail","poster_path":"/poster.jpg","backdrop_path":"/back.jpg","seasons":[{"id":43,"season_number":1,"poster_path":"/season.jpg"}]}`)
 			return
 		}
 		if strings.HasSuffix(r.URL.Path, ".jpg") {
