@@ -269,6 +269,12 @@ func libraryJobBlocked(db *gorm.DB, job models.Job, caches ...map[uint]MediaLibr
 	if r.ReadinessStatus == "credentials_required" {
 		return true, nil
 	}
+	if r.ReadinessStatus == "busy" && job.JobType == "download" {
+		independent, err := downloadIndependentOfLibraryArtifacts(db, job, uint(id))
+		if err != nil || independent {
+			return !independent, err
+		}
+	}
 	if job.JobType == JobTypeMediaLibraryRepair {
 		var repair models.MediaLibraryStructureRepair
 		if err := db.Where("library_id=? AND job_id=?", id, job.ID).First(&repair).Error; err != nil {

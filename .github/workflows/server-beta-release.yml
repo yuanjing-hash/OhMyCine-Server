@@ -112,6 +112,13 @@ jobs:
             go.sum
             webui/go.sum
 
+      - name: Check browser companion without downloading browser binaries
+        working-directory: browser-companion
+        run: |
+          npm ci --omit=dev --ignore-scripts
+          npm test
+          python3 ../.github/scripts/test_browser_packaging.py
+
       - name: Build embedded Web UI
         working-directory: webui
         run: |
@@ -218,6 +225,14 @@ jobs:
           cp LICENSE "${windows_dir}/LICENSE"
           cp LICENSE "${linux_dir}/LICENSE"
           cp README.md LICENSE "$linux_arm64_dir/"
+          # Wrapper source and dependency lock only; browser acquisition requires
+          # the administrator's explicit runtime license acceptance.
+          for server_dir in "$windows_dir" "$linux_dir" "$linux_arm64_dir"; do
+            mkdir -p "${server_dir}/browser-companion"
+            cp browser-companion/package.json browser-companion/package-lock.json "${server_dir}/browser-companion/"
+            cp -R browser-companion/src "${server_dir}/browser-companion/"
+            cp docs/deployment/browser-companion.md "${server_dir}/BROWSER-SETUP.md"
+          done
           for node_dir in "$node_windows_dir" "$node_linux_amd64_dir" "$node_linux_arm64_dir"; do
             cp LICENSE "${node_dir}/LICENSE"
           done

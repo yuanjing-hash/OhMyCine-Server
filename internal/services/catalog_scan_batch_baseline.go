@@ -81,10 +81,46 @@ func (s *MediaLibraryService) loadCatalogBatchBaseline(ctx context.Context, libr
 			}
 		}
 		baseline.protectedRecognitions = map[uint]bool{}
+		// Separate season folders can have separate recognition identities for
+		// one TMDB work. Include that exact group for deletion: a surviving season
+		// protects shared metadata, while the final deletion can retire all of it.
+		groups := map[uint][]uint{}
+		if len(input.DeletedProviderIDs) > 0 {
+			for _, record := range append([]models.MediaLibraryRecognition(nil), baseline.recognitions...) {
+				if _, seen := groups[record.ID]; seen || record.TMDBID == nil || *record.TMDBID <= 0 || record.MediaType == "" {
+					continue
+				}
+				var related []models.MediaLibraryRecognition
+				if err := reader.Recognitions().Where("tmdb_id = ? AND media_type = ?", *record.TMDBID, record.MediaType).Limit(CatalogMaxDeltaRows + 1).Find(&related).Error; err != nil {
+					return err
+				}
+				group := make([]uint, 0, len(related))
+				for _, sibling := range related {
+					group = append(group, sibling.ID)
+					if !recSeen[sibling.ID] {
+						baseline.recognitions = append(baseline.recognitions, sibling)
+						recSeen[sibling.ID] = true
+					}
+				}
+				if len(baseline.recognitions) > CatalogMaxDeltaRows {
+					return ErrCatalogBudget
+				}
+				for _, id := range group {
+					groups[id] = group
+				}
+			}
+		}
 		// Existing episodes outside this batch keep their shared recognition.
 		for _, record := range baseline.recognitions {
+			if baseline.protectedRecognitions[record.ID] {
+				continue
+			}
+			group := groups[record.ID]
+			if len(group) == 0 {
+				group = []uint{record.ID}
+			}
 			var count int64
-			query := reader.Entries().Where("recognition_id = ?", record.ID)
+			query := reader.Entries().Where("recognition_id IN ?", group)
 			if len(entryIDs) > 0 {
 				query = query.Where("id NOT IN ?", entryIDs)
 			}
@@ -92,7 +128,9 @@ func (s *MediaLibraryService) loadCatalogBatchBaseline(ctx context.Context, libr
 				return err
 			}
 			if count > 0 {
-				baseline.protectedRecognitions[record.ID] = true
+				for _, id := range group {
+					baseline.protectedRecognitions[id] = true
+				}
 			}
 		}
 		return nil

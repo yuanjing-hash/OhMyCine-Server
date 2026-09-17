@@ -29,10 +29,11 @@ type CatalogArtifactChangeSet struct {
 	Entries      []uint
 	Recognitions []uint
 	SourceAssets []uint
+	Manifests    []uint
 }
 
 func (c CatalogArtifactChangeSet) Empty() bool {
-	return len(c.Entries) == 0 && len(c.Recognitions) == 0 && len(c.SourceAssets) == 0
+	return len(c.Entries) == 0 && len(c.Recognitions) == 0 && len(c.SourceAssets) == 0 && len(c.Manifests) == 0
 }
 
 func catalogArtifactChangesFromFacts(facts CatalogFactBatch) CatalogArtifactChangeSet {
@@ -72,6 +73,7 @@ func normalizeCatalogArtifactChanges(changes CatalogArtifactChangeSet) CatalogAr
 	changes.Entries = dedupe(changes.Entries)
 	changes.Recognitions = dedupe(changes.Recognitions)
 	changes.SourceAssets = dedupe(changes.SourceAssets)
+	changes.Manifests = dedupe(changes.Manifests)
 	return changes
 }
 
@@ -173,6 +175,9 @@ func catalogArtifactBindingItems(bindingID string, changes CatalogArtifactChange
 	}
 	for _, id := range changes.SourceAssets {
 		items = append(items, models.CatalogArtifactBindingItem{BindingID: bindingID, EntityKind: "asset", EntityID: id})
+	}
+	for _, id := range changes.Manifests {
+		items = append(items, models.CatalogArtifactBindingItem{BindingID: bindingID, EntityKind: "manifest", EntityID: id})
 	}
 	return items
 }

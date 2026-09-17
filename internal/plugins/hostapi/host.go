@@ -25,6 +25,7 @@ import (
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/credential"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/plugins/contract"
+	"golang.org/x/net/idna"
 	"golang.org/x/net/publicsuffix"
 	"gorm.io/gorm"
 )
@@ -70,22 +71,32 @@ func (e *Error) PermissionDenied() bool { return e.Denied }
 type Resolver func(context.Context, string) ([]net.IPAddr, error)
 
 type Host struct {
-	db          *gorm.DB
-	credentials *credential.Store
-	log         zerolog.Logger
-	client      *http.Client
-	resolve     Resolver
-	now         func() time.Time
-	eventsMu    sync.Mutex
-	eventSeq    uint64
-	events      map[string][]eventRecord
-	assetsMu    sync.Mutex
-	assets      map[string]Asset
-	capturesMu  sync.Mutex
-	captures    map[string]credentialCapture
+	browserRequest func(context.Context, string, string, string, *http.Request) (*http.Response, bool, error)
+	browserCommit  func(context.Context, models.PluginConnection)
+	db             *gorm.DB
+	credentials    *credential.Store
+	log            zerolog.Logger
+	client         *http.Client
+	resolve        Resolver
+	now            func() time.Time
+	eventsMu       sync.Mutex
+	eventSeq       uint64
+	events         map[string][]eventRecord
+	assetsMu       sync.Mutex
+	assets         map[string]Asset
+	capturesMu     sync.Mutex
+	captures       map[string]credentialCapture
 }
 
 type Option func(*Host)
+
+func (host *Host) SetBrowserRequest(request func(context.Context, string, string, string, *http.Request) (*http.Response, bool, error)) {
+	host.browserRequest = request
+}
+
+func (host *Host) SetBrowserCommit(commit func(context.Context, models.PluginConnection)) {
+	host.browserCommit = commit
+}
 
 func WithHTTPClient(client *http.Client) Option { return func(host *Host) { host.client = client } }
 func WithResolver(resolver Resolver) Option     { return func(host *Host) { host.resolve = resolver } }
@@ -182,7 +193,7 @@ func (host *Host) Call(ctx context.Context, pluginID string, operation uint32, p
 	case OperationAssetRegister:
 		response, err = host.registerAsset(ctx, pluginID, authorization, payload)
 	case OperationCredentialCommit:
-		response, err = host.commitCredential(pluginID, authorization, payload)
+		response, err = host.commitCredentialContext(ctx, pluginID, authorization, payload)
 	case OperationConfigGet:
 		response, err = host.configGet(pluginID, payload)
 	default:
@@ -616,6 +627,43 @@ func (host *Host) http(ctx context.Context, pluginID string, authorization plugi
 		if err := host.db.First(&connection, "id = ? AND plugin_id = ? AND enabled = ?", input.ConnectionID, pluginID, true).Error; err != nil || connection.CredentialScope != input.CaptureCredentialScope || connection.CredentialMode != models.PluginCredentialModeCookie {
 			return httpResponse{}, denied("plugin_credential_capture_denied", err)
 		}
+		if !resourceCredentialOriginAllowed(connection, target) {
+			return httpResponse{}, denied("plugin_credential_origin_denied", nil)
+		}
+	}
+	if input.Credential != "" {
+		if !scopeAllowed(input.Credential, permissions) {
+			return httpResponse{}, denied("plugin_credential_scope_denied", nil)
+		}
+	}
+	if host.browserRequest != nil && input.ConnectionID != "" && (input.Credential != "" || browserAuthenticationAllowed(ctx, pluginID, input.ConnectionID)) {
+		scope := input.Credential
+		if scope == "" {
+			scope = input.CaptureCredentialScope
+		}
+		response, handled, browserErr := host.browserRequest(requestContext, pluginID, input.ConnectionID, scope, request)
+		if handled {
+			if browserErr != nil {
+				return httpResponse{}, invalid("plugin_browser_unavailable", nil)
+			}
+			defer response.Body.Close()
+			body, err := io.ReadAll(io.LimitReader(response.Body, maxHTTPResponseBytes+1))
+			if err != nil || len(body) > maxHTTPResponseBytes {
+				return httpResponse{}, invalid("plugin_http_response_too_large", nil)
+			}
+			result := httpResponse{Status: response.StatusCode, Headers: map[string]string{"content-type": response.Header.Get("Content-Type")}, BodyBase64: base64.StdEncoding.EncodeToString(body)}
+			if input.CaptureCredentialScope != "" {
+				ref, expires, err := host.captureCredential(pluginID, input.ConnectionID, input.CaptureCredentialScope, authorization, target, response, nil)
+				if err != nil {
+					return httpResponse{}, err
+				}
+				result.CredentialCaptureRef = ref
+				if !expires.IsZero() {
+					result.CredentialCaptureExpiresAt = expires.Format(time.RFC3339Nano)
+				}
+			}
+			return result, nil
+		}
 	}
 	if input.Credential != "" {
 		if err := host.attachCredential(pluginID, input.ConnectionID, input.Credential, input.CredentialBindings, permissions, request); err != nil {
@@ -741,6 +789,10 @@ func mergeCredentialCaptureCookies(base, final []capturedCookie) []capturedCooki
 }
 
 func (host *Host) commitCredential(pluginID string, authorization pluginAuthorization, payload []byte) (map[string]any, error) {
+	return host.commitCredentialContext(context.Background(), pluginID, authorization, payload)
+}
+
+func (host *Host) commitCredentialContext(ctx context.Context, pluginID string, authorization pluginAuthorization, payload []byte) (map[string]any, error) {
 	permissions := authorization.Permissions
 	var input credentialCommitRequest
 	if err := strictJSON(payload, &input); err != nil || !scopeAllowed(input.Scope, permissions) {
@@ -770,6 +822,10 @@ func (host *Host) commitCredential(pluginID string, authorization pluginAuthoriz
 	if err := host.db.First(&connection, "id = ? AND plugin_id = ? AND enabled = ?", input.ConnectionID, pluginID, true).Error; err != nil || connection.CredentialScope != input.Scope || connection.CredentialMode != models.PluginCredentialModeCookie {
 		return nil, denied("plugin_credential_commit_denied", err)
 	}
+	captureOrigin, parseErr := url.Parse(capture.Origin)
+	if parseErr != nil || !resourceCredentialOriginAllowed(connection, captureOrigin) {
+		return nil, denied("plugin_credential_origin_denied", nil)
+	}
 	merged, err := host.mergeCapturedCredential(pluginID, connection, capture.Cookies)
 	if err != nil {
 		return nil, err
@@ -786,6 +842,9 @@ func (host *Host) commitCredential(pluginID string, authorization pluginAuthoriz
 	}
 	if result.RowsAffected != 1 {
 		return nil, denied("plugin_credential_connection_changed", nil)
+	}
+	if host.browserCommit != nil {
+		host.browserCommit(ctx, connection)
 	}
 	return map[string]any{"credentialUpdated": true}, nil
 }
@@ -917,6 +976,24 @@ func allowedAssetPort(port string) bool {
 	}
 }
 
+// Resource connections bind credentials to one selected mirror. Online-media
+// connections may intentionally use several declared API hosts instead.
+func resourceCredentialOriginAllowed(connection models.PluginConnection, target *url.URL) bool {
+	if connection.ResourceType == "" && connection.EntryOrigin == "" {
+		return true
+	}
+	entry, err := url.Parse(connection.EntryOrigin)
+	if err != nil || target == nil || entry.Scheme != "https" || target.Scheme != "https" || entry.User != nil || target.User != nil || entry.Hostname() == "" || target.Hostname() == "" || entry.Port() != "" || target.Port() != "" || (entry.Path != "" && entry.Path != "/") || entry.RawQuery != "" || entry.Fragment != "" {
+		return false
+	}
+	entryHost, err := idna.Lookup.ToASCII(entry.Hostname())
+	if err != nil {
+		return false
+	}
+	targetHost, err := idna.Lookup.ToASCII(target.Hostname())
+	return err == nil && strings.EqualFold(entryHost, targetHost)
+}
+
 func (host *Host) attachCredential(pluginID, connectionID, scope string, bindings []credentialBinding, permissions []contract.Permission, request *http.Request) error {
 	if !scopeAllowed(scope, permissions) {
 		return denied("plugin_credential_scope_denied", nil)
@@ -927,6 +1004,9 @@ func (host *Host) attachCredential(pluginID, connectionID, scope string, binding
 	}
 	if connection.CredentialScope != scope || connection.CredentialCiphertext == "" {
 		return denied("plugin_credential_unavailable", nil)
+	}
+	if !resourceCredentialOriginAllowed(connection, request.URL) {
+		return denied("plugin_credential_origin_denied", nil)
 	}
 	plaintext, err := host.credentials.Decrypt(CredentialPurpose(pluginID, connectionID, scope), connection.CredentialCiphertext)
 	if err != nil {

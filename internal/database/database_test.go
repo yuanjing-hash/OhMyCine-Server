@@ -321,7 +321,7 @@ func TestArtifactAutoCleanupMigrationBackfillsHistoricalRuns(t *testing.T) {
 		t.Fatal(err)
 	}
 	library := models.MediaLibrary{Name: "Cleanup library", NameNormalized: "cleanup-library", StorageID: storage.ID, ProfileID: profile.ID, ProfileRevision: profile.Revision, RelativeRoot: "/", Enabled: true, Recursive: true, FullScanIntervalHours: 24, IncrementalMinutes: 15, VideoExtensionsJSON: `[".mkv"]`, STRMAssetExtraExtensionsJSON: `[]`, IgnorePatternsJSON: `[]`, MetadataLanguage: "zh-CN", MetadataRegion: "CN", MatchStrategy: "balanced", ProviderRatePerSecond: 100, ProviderConcurrency: 2, MetadataRatePerSecond: 5, MetadataConcurrency: 1, Status: models.MediaLibraryStatusListening, CreatedAt: now, UpdatedAt: now}
-	if err := db.Omit("ArtifactCleanupRemoved", "ArtifactCleanupError", "ArtifactCleanupAt", "ContentRevision", "DefaultIngestConnectionID", "StructureStatus", "StructureIssueCount", "StructureErrorCode", "StructureCheckedAt").Create(&library).Error; err != nil {
+	if err := db.Omit("CloudEmptyCleanupEnabled", "ArtifactCleanupRemoved", "ArtifactCleanupError", "ArtifactCleanupAt", "ContentRevision", "DefaultIngestConnectionID", "StructureStatus", "StructureIssueCount", "StructureErrorCode", "StructureCheckedAt").Create(&library).Error; err != nil {
 		t.Fatal(err)
 	}
 	for _, item := range []struct {

@@ -162,7 +162,11 @@ func seedStructureMigrationLibrary(t *testing.T, db *gorm.DB, version int, name,
 		t.Fatal(err)
 	}
 	library := models.MediaLibrary{Name: name, NameNormalized: name, StorageID: storage.ID, ProfileID: profile.ID, ProfileRevision: profile.Revision, RelativeRoot: "/", Status: models.MediaLibraryStatusListening, StructureStatus: status, StructureIssueCount: issueCount, StructureCheckedAt: &now, CreatedAt: now, UpdatedAt: now}
-	if err := db.Create(&library).Error; err != nil {
+	libraryQuery := db
+	if version < 111 {
+		libraryQuery = libraryQuery.Omit("CloudEmptyCleanupEnabled")
+	}
+	if err := libraryQuery.Create(&library).Error; err != nil {
 		t.Fatal(err)
 	}
 	job := models.Job{ID: name + "-job", CreatedByKind: "system", JobType: "media_library_structure_diagnosis", Status: models.JobStatusCompleted, Revision: 1, Generation: 2, PayloadJSON: "{}", CheckpointJSON: "{}", DisplayName: name, CreatedAt: now, UpdatedAt: now}

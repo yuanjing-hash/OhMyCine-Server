@@ -15,7 +15,7 @@ import (
 // library content, including when an older caller forgot to mark a scan partial.
 func artifactRequiresBoundedScope(policy mediaArtifactPolicy) bool {
 	switch policy.ScanKind {
-	case "event", "incremental", "catch_up", "transfer_batch":
+	case "event", "incremental", "catch_up", "transfer_batch", "metadata", "deletion":
 		return true
 	}
 	return policy.ScanPartial
@@ -61,6 +61,8 @@ func (s *MediaArtifactService) freezeLegacyArtifactScope(policy *mediaArtifactPo
 			}
 			entryQuery = entryQuery.Where("id IN ?", frozen.EntryIDs)
 			policy.SourceAssetIDs = frozen.SourceAssetIDs
+			policy.DeletedManifestIDs = frozen.DeletedManifestIDs
+			policy.DeletedWorkGuards = frozen.DeletedWorkGuards
 			policy.ChangeRevisions = frozen.ChangeRevisions
 			policy.BatchSourceFingerprint = frozen.BatchSourceFingerprint
 		} else {
@@ -73,6 +75,7 @@ func (s *MediaArtifactService) freezeLegacyArtifactScope(policy *mediaArtifactPo
 			if checkpoint.Version == 1 {
 				entryQuery = entryQuery.Where("id IN ?", checkpoint.EntryIDs)
 				policy.SourceAssetIDs = checkpoint.AssetIDs
+				policy.DeletedManifestIDs = checkpoint.DeletedManifestIDs
 				policy.BatchSourceFingerprint = checkpoint.SourceFingerprint
 			} else {
 				var library models.MediaLibrary

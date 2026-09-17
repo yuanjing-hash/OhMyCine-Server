@@ -12,10 +12,28 @@ const issue = { token: 'issue', recognition_token: 'recognition', code: 'media_u
 const wrappers: VueWrapper[] = []
 function deferred<T>() { let resolve!: (value: T) => void; let reject!: (reason: unknown) => void; const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no }); return { promise, resolve, reject } }
 function button(wrapper: VueWrapper, text: string) { const result = wrapper.findAll('button').find(item => item.text() === text); if (!result) throw Error(`Missing button ${text}`); return result }
-async function open() {
+const emptyClasses = () => ({ unrecognized: 0, missing_season_episode: 0, naming_mismatch: 0, location_mismatch: 0, invalid_path: 0, template_unavailable: 0, duplicate_target: 0, recognition_suspect_conflict: 0, catalog_duplicate_conflict: 0, sidecar_target_conflict: 0 })
+// Existing behavior fixtures also supply the additive authoritative summary.
+// New failure tests can disable this fixture adapter to exercise missing DTOs.
+async function open(showDialog = true, supplySummary = true) {
+  if (supplySummary) {
+    const implementation = mocks.api.getMockImplementation()!
+    let snapshot = diagnostics()
+    mocks.api.mockImplementation(async (path, ...args) => {
+      const result = await implementation(path, ...args)
+      if (path.endsWith('/structure')) snapshot = result
+      if (path.includes('/structure/issues?')) {
+        const pending = result.pending_total ?? snapshot.issue_count
+        const handled = result.handled_total ?? 0
+        return { diagnosis_revision: snapshot.revision, review_revision: 0, pending_total: pending, handled_total: handled, pending_repairable_count: Math.min(pending, snapshot.repairable_count), pending_classifications: { ...emptyClasses(), ...(pending ? snapshot.classifications : {}) }, handled_classifications: { ...emptyClasses(), ...(handled ? snapshot.classifications : {}) }, ...result }
+      }
+      return result
+    })
+  }
   const wrapper = mount(MediaLibrariesView, { attachTo: document.body, global: { stubs: { RouterLink: true, DirectoryPickerDialog: true, MediaReorganizationDialog: true, MediaLibrarySettingsFields: true } } })
   wrappers.push(wrapper)
   await flushPromises()
+  if (showDialog) { await button(wrapper, '查看诊断与处理入口').trigger('click'); await flushPromises() }
   return wrapper
 }
 beforeEach(() => {
@@ -29,6 +47,172 @@ beforeEach(() => {
   })
 })
 afterEach(() => { wrappers.splice(0).forEach(wrapper => wrapper.unmount()); vi.restoreAllMocks(); vi.useRealTimers() })
+const reviewPage = (pending = 0, handled = 16457, revision = 1) => ({ diagnosis_revision: 'rev', review_revision: revision, pending_total: pending, handled_total: handled, pending_repairable_count: 0, pending_classifications: { ...emptyClasses(), unrecognized: pending }, handled_classifications: { ...emptyClasses(), unrecognized: handled }, list: [] as object[], total: pending, page: 1, page_size: 50 })
+describe('scoped recognition metadata completion', () => {
+  async function openRecognition(manual = false, failed = false) {
+    const base = mocks.api.getMockImplementation()!
+    const recognition = { token: 'known/work', status: 'matched', tmdb_id: 254498, title: '已识别剧集', media_type: 'tv', manual_override: manual, file_count: 28 }
+    mocks.api.mockImplementation((path, options, ...args) => {
+      if (path.endsWith('/retry')) return failed ? Promise.reject(new Error('服务暂不可用')) : Promise.resolve(recognition)
+      if (path.includes('/recognitions?')) return Promise.resolve({ list: [recognition], total: 1, page: 1, page_size: 50 })
+      return base(path, options, ...args)
+    })
+    const wrapper = await open(false)
+    await button(wrapper, '媒体清单').trigger('click'); await flushPromises()
+    await button(wrapper, '核对识别').trigger('click'); await flushPromises()
+    return wrapper
+  }
+  it('completes one known identity without diagnosis or full scan, then refreshes the list', async () => {
+    const wrapper = await openRecognition()
+    await button(wrapper, '补全资料').trigger('click'); await flushPromises()
+    expect(mocks.api.mock.calls.filter(([, options]) => options?.method === 'POST')).toEqual([
+      ['/api/v1/media-libraries/1/recognitions/known%2Fwork/retry', { method: 'POST', body: '{}' }],
+    ])
+    expect(wrapper.text()).toContain('已按当前作品身份检查并补全资料')
+    expect(wrapper.text()).toContain('后续生成进度')
+    expect(mocks.api.mock.calls.filter(([path]) => path.includes('/recognitions?')).length).toBeGreaterThan(1)
+  })
+  it('completes manual matches without clearing their chosen identity', async () => {
+    const wrapper = await openRecognition(true)
+    expect(button(wrapper, '清除人工匹配').exists()).toBe(true)
+    await button(wrapper, '补全资料').trigger('click'); await flushPromises()
+    const mutations = mocks.api.mock.calls.filter(([, options]) => options?.method && options.method !== 'GET')
+    expect(mutations).toEqual([
+      ['/api/v1/media-libraries/1/recognitions/known%2Fwork/retry', { method: 'POST', body: '{}' }],
+    ])
+    expect(button(wrapper, '清除人工匹配').exists()).toBe(true)
+  })
+  it('reports completion failure without claiming success and permits retry', async () => {
+    const wrapper = await openRecognition(false, true)
+    await button(wrapper, '补全资料').trigger('click'); await flushPromises()
+    expect(wrapper.text()).toContain('补全资料失败')
+    expect(wrapper.text()).not.toContain('已按当前作品身份检查并补全资料')
+    expect(button(wrapper, '补全资料').attributes('disabled')).toBeUndefined()
+  })
+})
+
+describe('authoritative diagnosis review lifecycle', () => {
+  function installReview(read: (path: string, options?: { method?: string }) => unknown) {
+    const base = mocks.api.getMockImplementation()!
+    mocks.api.mockImplementation((path, options, ...args) => path.includes('/structure/issues?') || path.includes('/structure/review/') ? Promise.resolve(read(path, options)) : path.endsWith('/structure') ? Promise.resolve({ ...diagnostics(), issue_count: 16457 }) : base(path, options, ...args))
+  }
+  it('never opens or starts diagnosis on entry, polling, or remount; view is explicit and read-only', async () => {
+    installReview(() => reviewPage())
+    const wrapper = await open(false, false)
+    await vi.advanceTimersByTimeAsync(12000); await flushPromises()
+    expect(wrapper.find('[role="dialog"]').exists()).toBe(false)
+    expect(mocks.api.mock.calls.some(([, options]) => options?.method === 'POST')).toBe(false)
+    await button(wrapper, '查看诊断与处理入口').trigger('click'); await flushPromises()
+    expect(wrapper.find('[role="dialog"]').exists()).toBe(true)
+    expect(mocks.api.mock.calls.some(([, options]) => options?.method === 'POST')).toBe(false)
+    await button(wrapper, '重新检查').trigger('click'); await flushPromises()
+    expect(mocks.api.mock.calls.filter(([path]) => path.endsWith('/structure/diagnose'))).toHaveLength(1)
+    wrapper.unmount(); wrappers.splice(wrappers.indexOf(wrapper), 1)
+    const remount = await open(false, false)
+    expect(remount.find('[role="dialog"]').exists()).toBe(false)
+    expect(mocks.api.mock.calls.filter(([path]) => path.endsWith('/structure/diagnose'))).toHaveLength(1)
+  })
+  it('shows persisted skip-all under handled and restores pending after undo without diagnosing', async () => {
+    let undone = false, revision = 1
+    installReview((path, options) => {
+      if (options?.method === 'DELETE') { undone = true; return { review_revision: ++revision } }
+      if (options?.method === 'PUT') { undone = false; return { review_revision: ++revision } }
+      const handled = path.includes('review_state=handled')
+      return { ...reviewPage(undone ? 1 : 0, undone ? 16456 : 16457, revision), total: handled ? 16457 : undone ? 1 : 0, list: handled ? [{ ...issue, review_state: 'handled', review_action: 'skip' }] : undone ? [issue] : [] }
+    })
+    const wrapper = await open(false, false)
+    const notice = wrapper.get('[aria-label="本次诊断处理摘要"]')
+    expect(notice.classes()).not.toContain('semantic-warning')
+    expect(notice.text()).toContain('本次已处理 16457 项')
+    await button(wrapper, '查看诊断与处理入口').trigger('click'); await flushPromises()
+    expect(button(wrapper, '待处理 0').exists()).toBe(true)
+    expect(wrapper.get('[role="dialog"]').text()).not.toContain('识别失败或无匹配 16457')
+    await button(wrapper, '本次已处理 16457').trigger('click'); await flushPromises()
+    expect(button(wrapper, '识别失败或无匹配 16457').exists()).toBe(true)
+    await button(wrapper, '撤销本次选择').trigger('click'); await flushPromises()
+    expect(button(wrapper, '待处理 1').exists()).toBe(true)
+    expect(button(wrapper, '本次已处理 16456').exists()).toBe(true)
+    await button(wrapper, '关闭').trigger('click'); await flushPromises()
+    await button(wrapper, '查看诊断与处理入口').trigger('click'); await flushPromises()
+    expect(button(wrapper, '本次已处理 16456').exists()).toBe(true)
+    expect(mocks.api.mock.calls.some(([path]) => path.endsWith('/structure/diagnose'))).toBe(false)
+    await button(wrapper, '本次跳过').trigger('click'); await flushPromises()
+    expect(button(wrapper, '待处理 0').exists()).toBe(true)
+    expect(button(wrapper, '本次已处理 16457').exists()).toBe(true)
+    expect(mocks.api.mock.calls.some(([, options]) => options?.method === 'PUT')).toBe(true)
+  })
+  it('keeps global tab totals while a category filters rows and switches category counts with handled tab', async () => {
+    installReview(path => ({ ...reviewPage(3, 7), pending_classifications: { ...emptyClasses(), unrecognized: 1, naming_mismatch: 2 }, handled_classifications: { ...emptyClasses(), naming_mismatch: 7 }, total: path.includes('code=') ? 1 : 3, list: [issue] }))
+    const wrapper = await open(true, false)
+    await button(wrapper, '识别失败或无匹配 1').trigger('click'); await flushPromises()
+    expect(button(wrapper, '待处理 3').exists()).toBe(true)
+    expect(button(wrapper, '本次已处理 7').exists()).toBe(true)
+    await button(wrapper, '本次已处理 7').trigger('click'); await flushPromises()
+    expect(button(wrapper, '命名不规范 7').exists()).toBe(true)
+    expect(wrapper.findAll('button').some(item => item.text() === '识别失败或无匹配 1')).toBe(false)
+  })
+  it.each(['missing', 'malformed', 'failed'])('does not turn %s summaries into zero/healthy, and supports retry', async mode => {
+    let recovered = false
+    installReview(() => {
+      if (recovered) return reviewPage()
+      if (mode === 'failed') return Promise.reject(new Error('读取失败'))
+      return mode === 'missing' ? { list: [], total: 0 } : { ...reviewPage(), pending_total: -1 }
+    })
+    const wrapper = await open(false, false)
+    expect(wrapper.get('[aria-label="本次诊断处理摘要"]').text()).toContain('处理统计读取失败')
+    expect(wrapper.text()).not.toContain('本次没有待处理项目')
+    await button(wrapper, '查看诊断与处理入口').trigger('click'); await flushPromises()
+    expect(button(wrapper, '待处理 —').exists()).toBe(true)
+    expect(button(wrapper, '预览').attributes('disabled')).toBeDefined()
+    expect(wrapper.get('[role="dialog"]').text()).not.toContain('当前筛选没有待处理问题')
+    await button(wrapper, '关闭').trigger('click'); await flushPromises()
+    recovered = true
+    await button(wrapper, '重试读取统计').trigger('click'); await flushPromises()
+    expect(wrapper.get('[aria-label="本次诊断处理摘要"]').text()).toContain('本次已处理 16457 项')
+  })
+  it('ignores selected-library summary completed after switching libraries', async () => {
+    const delayed = deferred<ReturnType<typeof reviewPage>>()
+    installReview(path => path.includes('/1/') ? delayed.promise : reviewPage(2, 3))
+    const wrapper = await open(false, false)
+    await wrapper.findAll('button').find(item => item.text().startsWith('库2'))!.trigger('click'); await flushPromises()
+    delayed.resolve(reviewPage(999, 0)); await flushPromises()
+    expect(wrapper.get('[aria-label="本次诊断处理摘要"]').text()).toContain('本次还有 2 项')
+    expect(wrapper.get('[aria-label="本次诊断处理摘要"]').text()).not.toContain('999')
+  })
+  it('does not let pre-mutation summary overwrite the saved workspace', async () => {
+    const delayed = deferred<ReturnType<typeof reviewPage>>()
+    let saved = false
+    installReview((path, options) => {
+      if (options?.method === 'PUT') { saved = true; return { review_revision: 2 } }
+      if (path.includes('page_size=1&')) return delayed.promise
+      return { ...reviewPage(saved ? 0 : 1, saved ? 1 : 0, saved ? 2 : 1), list: saved ? [] : [issue] }
+    })
+    const wrapper = await open(true, false)
+    await button(wrapper, '本次跳过').trigger('click'); await flushPromises()
+    delayed.resolve(reviewPage(999, 0, 1)); await flushPromises()
+    expect(button(wrapper, '待处理 0').exists()).toBe(true)
+    expect(wrapper.get('[aria-label="本次诊断处理摘要"]').text()).toContain('本次已处理 1 项')
+  })
+  it('rejects summary from another diagnosis revision instead of displaying its counts', async () => {
+    installReview(() => ({ ...reviewPage(999, 0), diagnosis_revision: 'other' }))
+    const wrapper = await open(true, false)
+    expect(wrapper.get('[role="dialog"]').text()).toContain('本次诊断已更新')
+    expect(button(wrapper, '待处理 —').exists()).toBe(true)
+  })
+  it('ignores mutation completion after closing and opening another library', async () => {
+    const pending = deferred<{ review_revision: number }>()
+    installReview((path, options) => options?.method === 'PUT' ? pending.promise : { ...reviewPage(path.includes('/1/') ? 1 : 2, 0), list: [issue] })
+    const wrapper = await open(true, false)
+    await button(wrapper, '本次跳过').trigger('click'); await flushPromises()
+    await button(wrapper, '关闭').trigger('click'); await flushPromises()
+    await wrapper.findAll('button').find(item => item.text().startsWith('库2'))!.trigger('click'); await flushPromises()
+    await button(wrapper, '查看诊断与处理入口').trigger('click'); await flushPromises()
+    pending.resolve({ review_revision: 99 }); await flushPromises()
+    expect(button(wrapper, '待处理 2').exists()).toBe(true)
+    expect(wrapper.get('[role="dialog"]').text()).not.toContain('已保存到本次工作区：本次跳过')
+    expect(button(wrapper, '预览').attributes('disabled')).toBeUndefined()
+  })
+})
 describe('diagnosis dialog', () => {
   it.each([
     ['recognition_suspect_conflict', '识别冲突', '核对并修正识别'],
@@ -184,7 +368,7 @@ describe('diagnosis dialog', () => {
     await button(wrapper, '本次已处理 1').trigger('click'); await flushPromises()
     expect(wrapper.get('[role="dialog"]').text()).toContain('当前选择：本次跳过')
     await button(wrapper, '撤销本次选择').trigger('click'); await flushPromises()
-    expect(wrapper.get('[role="dialog"]').text()).toContain('本次检测还没有已处理项目')
+    expect(wrapper.get('[role="dialog"]').text()).toContain('当前筛选没有已处理项目')
     await button(wrapper, '待处理 1').trigger('click'); await flushPromises()
     expect(wrapper.get('[role="dialog"]').text()).toContain('待识别')
   })
@@ -222,21 +406,21 @@ describe('diagnosis dialog', () => {
     expect(wrapper.get('[role="dialog"]').text()).toContain('42 / 100')
     expect(wrapper.get('[role="dialog"]').text()).toContain('状态暂时读取失败')
     await vi.advanceTimersByTimeAsync(2000); await flushPromises()
-    expect(wrapper.get('[role="dialog"]').text()).toContain('发现目录结构问题')
+    expect(wrapper.get('[role="dialog"]').text()).toContain('本次仍有待处理项目')
     expect(wrapper.get('[role="dialog"]').text()).not.toContain('暂时不可用')
   })
   it('keeps selections and retries a legacy infrastructure error mislabeled as 401', async () => {
     const wrapper = await open()
-    await button(wrapper, '本次跳过').trigger('click')
+    await button(wrapper, '本次跳过').trigger('click'); await flushPromises()
     const base = mocks.api.getMockImplementation()!
     let reads = 0
     mocks.api.mockImplementation((path, ...args) => path.endsWith('/structure') ? (++reads === 1 ? Promise.reject(new APIError(401, 'INTERNAL_ERROR', '服务器内部错误')) : Promise.resolve(diagnostics())) : base(path, ...args))
     document.dispatchEvent(new Event('visibilitychange')); await flushPromises()
     expect(wrapper.get('[role="dialog"]').text()).toContain('状态暂时读取失败')
-    expect(wrapper.get('[role="dialog"]').text()).toContain('本次已处理 1 项')
+    expect(wrapper.get('[role="dialog"]').text()).toContain('已保存到本次工作区：本次跳过')
     await vi.advanceTimersByTimeAsync(1500); await flushPromises()
     expect(wrapper.get('[role="dialog"]').text()).not.toContain('服务器内部错误')
-    expect(wrapper.get('[role="dialog"]').text()).toContain('本次已处理 1 项')
+    expect(wrapper.get('[role="dialog"]').text()).toContain('已保存到本次工作区：本次跳过')
   })
   it('reconciles an uncertain POST using GET only without hiding the dialog', async () => {
     const base = mocks.api.getMockImplementation()!
@@ -264,7 +448,7 @@ describe('diagnosis dialog', () => {
     await button(wrapper, '查看诊断与处理入口').trigger('click'); await flushPromises()
     pending.reject(Error('old failure')); await flushPromises()
     expect(signal.aborted).toBe(true)
-    expect(wrapper.get('[role="dialog"]').text()).toContain('发现目录结构问题')
+    expect(wrapper.get('[role="dialog"]').text()).toContain('本次仍有待处理项目')
     expect(wrapper.text()).not.toContain('old failure')
     mocks.api.mockImplementation(base)
   })
@@ -305,28 +489,29 @@ describe('diagnosis dialog', () => {
   })
   it('opens exact recognition and preserves only unaffected cross-page choices after issue tokens change', async () => {
     const base = mocks.api.getMockImplementation()!
-    let saved = false
+    let saved = false, marked = false
     mocks.api.mockImplementation((path, ...args) => {
       if (path.endsWith('/recognitions/recognition')) return Promise.resolve({ token: 'recognition', title: '目标', media_type: 'tv', source_directory: '哆啦A梦 (2005)', source_summary: '01.mkv', status: 'unrecognized' })
       if (path.includes('/tmdb-candidates?')) return Promise.resolve({ list: [{ id: 123, title: '正确作品', media_type: 'tv', release_year: 2005 }] })
       if (path.endsWith('/override')) { saved = true; return Promise.resolve({ token: 'recognition', title: '正确作品', status: 'matched', media_type: 'tv', release_year: 2005, tmdb_id: 123, manual_override: true }) }
       if (path.endsWith('/structure/review/recognitions/recognition')) {
         expect(JSON.parse(args[0].body).review_revision).toBe(7)
+        marked = true
         return Promise.resolve({ review_revision: 8 })
       }
       if (path.endsWith('/structure/selection-status')) return Promise.resolve({ revision: 'new-rev', invalid_issue_tokens: ['issue'] })
       if (path.includes('/structure/issues?')) {
         const page = Number(new URLSearchParams(path.split('?')[1]).get('page'))
         const unrecognized = new URLSearchParams(path.split('?')[1]).get('code') === 'media_unrecognized'
-        return Promise.resolve({ list: saved && page === 2 && unrecognized ? [] : [page === 1 ? { ...issue, token: 'unaffected', title: '其他作品' } : saved ? { ...issue, token: 'replacement', code: 'path_mismatch', title: '正确作品', state: 'manual_identity_resolved', repairable: true } : issue], total: 101, page, page_size: 50, review_revision: saved ? 7 : 0 })
+        return Promise.resolve({ list: saved && page === 2 && unrecognized ? [] : [page === 1 ? { ...issue, token: 'unaffected', title: '其他作品' } : saved ? { ...issue, token: 'replacement', code: 'path_mismatch', title: '正确作品', state: 'manual_identity_resolved', repairable: true } : issue], total: 101, page, page_size: 50, review_revision: marked ? 8 : saved ? 7 : 0, handled_total: saved ? 1 : 0 })
       }
       return base(path, ...args)
     })
     const wrapper = await open()
     await button(wrapper, '识别失败或无匹配 1').trigger('click'); await flushPromises()
-    await button(wrapper, '本次跳过').trigger('click')
+    await button(wrapper, '本次跳过').trigger('click'); await flushPromises()
     await button(wrapper, '下一页').trigger('click'); await flushPromises()
-    await button(wrapper, '本次跳过').trigger('click')
+    await button(wrapper, '本次跳过').trigger('click'); await flushPromises()
     await button(wrapper, '手动识别此项').trigger('click'); await flushPromises()
     expect(mocks.api.mock.calls.some(([path]) => path.endsWith('/recognitions/recognition'))).toBe(true)
     await button(wrapper, '取消并返回诊断').trigger('click'); await flushPromises()
@@ -418,7 +603,7 @@ describe('diagnosis dialog', () => {
     await wrapper.get('[role="dialog"] form').trigger('submit'); await flushPromises()
     await button(wrapper, '候选 · 年份未知 · TMDB 1 · 保存此识别').trigger('click'); await flushPromises()
     expect(wrapper.get('[role="dialog"]').text()).toContain('身份已保存，但草稿核对暂未完成')
-    expect(wrapper.get('[role="dialog"]').text()).toContain('本次已处理 1 项')
+    expect(wrapper.get('[role="dialog"]').text()).toContain('已保存到本次工作区：本次跳过')
     expect(button(wrapper, '预览').attributes('disabled')).toBeDefined()
     await button(wrapper, '重新核对草稿').trigger('click'); await flushPromises()
     expect(wrapper.get('[role="dialog"]').text()).toContain('本次已处理 0 项')

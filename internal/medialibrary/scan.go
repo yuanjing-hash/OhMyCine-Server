@@ -52,6 +52,7 @@ type SourceAsset struct {
 	HashHint         string
 }
 type Result struct {
+	Directories  []cloudpkg.TreeEntry
 	Files        []File
 	Assets       []SourceAsset
 	Partial      bool
@@ -116,6 +117,7 @@ func ScanProvider(ctx context.Context, driver cloudpkg.Driver, rootID string, re
 				continue
 			}
 			if item.IsDir {
+				result.Directories = append(result.Directories, cloudpkg.TreeEntry{Item: item, RelativePath: relativePath})
 				if !recursive || current.Depth+1 >= MaxDepth {
 					continue
 				}
@@ -191,15 +193,18 @@ func scanProviderTreeStream(ctx context.Context, driver cloudpkg.TreeStreamDrive
 	}
 
 	type streamOutcome struct {
-		err     error
-		partial bool
-		entries int
+		directories []cloudpkg.TreeEntry
+		err         error
+		partial     bool
+		entries     int
 	}
 	streamDone := make(chan streamOutcome, 1)
 	go func() {
 		sequence := 0
 		partial := false
+		var directories []cloudpkg.TreeEntry
 		err := driver.StreamTree(workerCtx, rootID, MaxEntries, func(batch cloudpkg.TreeBatch) error {
+			directories = append(directories, batch.Directories...)
 			partial = partial || batch.Partial
 			for _, entry := range batch.Entries {
 				select {
@@ -214,7 +219,7 @@ func scanProviderTreeStream(ctx context.Context, driver cloudpkg.TreeStreamDrive
 		close(jobs)
 		workers.Wait()
 		close(processed)
-		streamDone <- streamOutcome{err: err, partial: partial, entries: sequence}
+		streamDone <- streamOutcome{err: err, partial: partial, entries: sequence, directories: directories}
 	}()
 
 	result := Result{Files: make([]File, 0), Assets: make([]SourceAsset, 0)}
@@ -268,6 +273,7 @@ func scanProviderTreeStream(ctx context.Context, driver cloudpkg.TreeStreamDrive
 		}
 	}
 	outcome := <-streamDone
+	result.Directories = outcome.directories
 	result.Partial = outcome.partial || processingPartial
 	result.Enumerated = outcome.entries
 	if outcome.err != nil {
@@ -341,6 +347,10 @@ func ProjectProviderEntries(entries []cloudpkg.TreeEntry, extensions, assetExten
 	seenPaths := make(map[string]struct{}, len(entries))
 	seenProviders := make(map[string]struct{}, len(entries))
 	for sequence, entry := range entries {
+		if entry.IsDir {
+			result.Directories = append(result.Directories, entry)
+			continue
+		}
 		projected := processProviderTreeEntry(sequence, entry, extensionsSet, assetExtensionsSet, ignores)
 		pathValue, providerID := "", ""
 		if projected.file != nil {
@@ -377,6 +387,7 @@ func scanProviderTree(ctx context.Context, driver cloudpkg.BulkTreeDriver, rootI
 		return Result{}, err
 	}
 	result := Result{Files: make([]File, 0, min(len(tree.Entries), MaxEntries)), Assets: make([]SourceAsset, 0), Partial: tree.Partial, Enumerated: len(tree.Entries)}
+	result.Directories = tree.Directories
 	seenPaths := make(map[string]struct{}, len(tree.Entries))
 	seenProviders := make(map[string]struct{}, len(tree.Entries))
 	for sequence, entry := range tree.Entries {

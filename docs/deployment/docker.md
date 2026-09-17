@@ -37,6 +37,8 @@ docker compose -f compose.server.yml up -d
 
 ## 公网 Node
 
+主 Server 的受管浏览器组件、许可确认及缓存说明见 [浏览器组件部署](browser-companion.md)。Node 子系统镜像不捆绑该组件。
+
 1. 在主 Server 的传输节点管理创建节点，填写公网 API 地址及对应 Linux 架构。取得返回的节点 ID 和一次性令牌；复制的安装命令中也包含这些值。
 2. 在公网机器保存 `deploy/compose.node.yml`，同目录建立仅管理员可读的 `.env`，填写上述 `OMC_NODE_ID`、`OMC_NODE_ENROLLMENT_TOKEN`。不能自行编造。令牌有效期 10 分钟，超时需在主 Server 重新生成并更新容器环境。
 3. 执行 `docker compose -f compose.node.yml up -d`，放行主 Server 到 Node 的公网 4433 端口。

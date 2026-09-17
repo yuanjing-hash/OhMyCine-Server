@@ -1,6 +1,9 @@
 package services
 
 import (
+	"context"
+	"encoding/json"
+	"reflect"
 	"testing"
 	"time"
 
@@ -78,10 +81,57 @@ func TestPersistCatalogMetadataResultsIsAtomicAcrossRecognitions(t *testing.T) {
 	if err := service.db.Create(&entries).Error; err != nil {
 		t.Fatal(err)
 	}
+	other := records[0]
+	other.ID, other.SourceKey = 0, "unrelated-work"
+	if err := service.db.Create(&other).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := service.db.First(&other, other.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	asset := models.MediaLibrarySourceAsset{LibraryID: library.ID, RelativePath: "/unrelated/poster.jpg", Active: true, Generation: 4}
+	if err := service.db.Create(&asset).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := service.db.First(&asset, asset.ID).Error; err != nil {
+		t.Fatal(err)
+	}
 	edited := base("Edited Together")
 	updates := []catalogMetadataResult{{Record: records[0], Profile: profile, Result: edited}, {Record: records[1], Profile: profile, Result: edited}}
 	if err := service.persistCatalogMetadataResults(updates); err != nil {
 		t.Fatal(err)
+	}
+	var unchanged models.MediaLibraryRecognition
+	var unchangedAsset models.MediaLibrarySourceAsset
+	if err := service.db.First(&unchanged, other.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := service.db.First(&unchangedAsset, asset.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(other, unchanged) || !reflect.DeepEqual(asset, unchangedAsset) {
+		t.Fatal("editor modified unrelated catalog facts")
+	}
+	var artifact models.MediaArtifactRun
+	if err := service.db.Where("library_id = ?", library.ID).First(&artifact).Error; err != nil {
+		t.Fatal(err)
+	}
+	var policy mediaArtifactPolicy
+	if err := json.Unmarshal([]byte(artifact.PolicyJSON), &policy); err != nil {
+		t.Fatal(err)
+	}
+	if policy.ScopeVersion != 1 || !policy.ScanPartial || policy.CleanupEligible || !reflect.DeepEqual(policy.EntryIDs, []uint{entries[0].ID, entries[1].ID}) || len(policy.SourceAssetIDs) != 0 {
+		t.Fatalf("editor expanded scope: %+v", policy)
+	}
+	if err := service.recoverBatchArtifactFollowups(context.Background(), library.ID); err != nil {
+		t.Fatal(err)
+	}
+	var retried models.MediaArtifactRun
+	if err := service.db.First(&retried, "id = ?", artifact.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if retried.PolicyJSON != artifact.PolicyJSON {
+		t.Fatal("retry changed frozen scope")
 	}
 	var stored []models.MediaLibraryRecognition
 	if err := service.db.Where("id IN ?", []uint{records[0].ID, records[1].ID}).Order("id").Find(&stored).Error; err != nil {

@@ -58,6 +58,13 @@ if (-not [String]::IsNullOrWhiteSpace($applicationApiKey) -and ($applicationApiK
 if (-not $SkipBuild) {
     $go = Get-CompatibleGo -InstallIfMissing
     $tools = Get-NodeTools
+    $nodeVersion = & $tools.Node --version
+    if ($LASTEXITCODE -ne 0 -or $nodeVersion -notmatch '^v(\d+)\.' -or [int]$Matches[1] -lt 20) { throw 'Browser companion requires Node.js 20 or newer.' }
+    Push-Location (Join-Path $script:ServerDirectory 'browser-companion')
+    try {
+        Write-Step 'Preparing browser companion dependencies (no browser download)'
+        Invoke-Checked $tools.Npm @('ci', '--omit=dev', '--ignore-scripts') 'Browser companion dependency install failed'
+    } finally { Pop-Location }
     Install-WebUiDependencies $tools.Npm
     Write-Step 'Building Web UI'
     Push-Location $script:WebUiDirectory
@@ -92,6 +99,12 @@ $env:OMC_SERVER_PORT = $listenSettings.Port
 $env:OMC_PUBLIC_ORIGIN = $listenSettings.PublicOrigin
 $env:OMC_DATABASE_PATH = $database
 $env:OMC_LOG_DIR = $logDirectory
+if (-not [Environment]::GetEnvironmentVariable('OMC_CLOAK_COMPANION', 'Process')) {
+    $env:OMC_CLOAK_COMPANION = Join-Path $script:ServerDirectory 'browser-companion\src\main.mjs'
+}
+if (-not [Environment]::GetEnvironmentVariable('OMC_CLOAK_DATA_DIR', 'Process')) {
+    $env:OMC_CLOAK_DATA_DIR = Join-Path $runtime 'browser'
+}
 if (-not [Environment]::GetEnvironmentVariable('OMC_FFMPEG_PATH', 'Process')) {
     $env:OMC_FFMPEG_PATH = Join-Path $runtime 'tools\ffmpeg\bin\ffmpeg.exe'
 }

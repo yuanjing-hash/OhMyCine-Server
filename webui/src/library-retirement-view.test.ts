@@ -50,6 +50,7 @@ describe('library retirement view', () => {
       return { list: [], total: 0 }
     })
     const view = await open()
+    await view.findAll('button').find(button => button.text() === '查看诊断与处理入口')!.trigger('click'); await flushPromises()
     expect(view.find('[role="dialog"]').exists()).toBe(true)
     retired = true
     await view.findAll('button').find(button => button.text() === '刷新')!.trigger('click'); await flushPromises()

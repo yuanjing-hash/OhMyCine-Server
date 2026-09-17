@@ -341,6 +341,7 @@ func (s *MediaLibraryService) ConfirmCatalogDeletion(ctx context.Context, actor 
 	}
 	requiresArtifacts := mediaLibraryRequiresArtifacts(storage.Type, library, s.artifacts != nil)
 	var changeRevision, generation uint64
+	var artifactScanID uint
 	changeReady := false
 	for _, item := range snapshot.Items {
 		if !state.Completed[item.EntryID] {
@@ -349,6 +350,33 @@ func (s *MediaLibraryService) ConfirmCatalogDeletion(ctx context.Context, actor 
 	}
 	if err := s.commitCatalogDeletion(ctx, &write, func(tx *gorm.DB) error {
 		current := write.Entries
+		var profile models.MediaClassificationProfile
+		if requiresArtifacts && write.Head.Mode != "versioned" {
+			if err := tx.First(&profile, library.ProfileID).Error; err != nil {
+				return err
+			}
+		}
+		var deletedScopes []deletedRecognitionScope
+		var deletedManifests []uint
+		if requiresArtifacts && write.Head.Mode != "versioned" {
+			var err error
+			deletedScopes, err = captureDeletedEntryRecognitionScopesTx(tx, libraryID, current)
+			if err != nil {
+				return err
+			}
+			for _, entry := range current {
+				var manifests []models.MediaArtifact
+				if err := tx.Where("library_id = ? AND source_identity = ? AND managed = ?", libraryID, fmt.Sprintf("entry:%d", entry.ID), true).Find(&manifests).Error; err != nil {
+					return err
+				}
+				for _, manifest := range manifests {
+					if err := validateDeletedArtifactOwnerTx(tx, library, storage, profile, manifest.RunID); err != nil {
+						return err
+					}
+					deletedManifests = append(deletedManifests, manifest.ID)
+				}
+			}
+		}
 		ids, paths, recognitionIDs := make([]uint, 0, len(current)), make([]string, 0, len(current)), make([]uint, 0)
 		for _, entry := range current {
 			ids = append(ids, entry.ID)
@@ -368,7 +396,7 @@ func (s *MediaLibraryService) ConfirmCatalogDeletion(ctx context.Context, actor 
 			}
 		}
 		for _, recognitionID := range recognitionIDs {
-			if write.Head.Mode == "versioned" {
+			if write.Head.Mode == "versioned" || requiresArtifacts {
 				break
 			}
 			var count int64
@@ -381,11 +409,8 @@ func (s *MediaLibraryService) ConfirmCatalogDeletion(ctx context.Context, actor 
 				}
 			}
 		}
-		generations := map[string]any{"dirty_generation": gorm.Expr("dirty_generation + 1"), "artifact_generation": gorm.Expr("artifact_generation + 1")}
-		if write.Head.Mode == "versioned" {
-			next := max(max(library.DirtyGeneration, library.ArtifactGeneration), library.BaselineGeneration) + 1
-			generations = map[string]any{"dirty_generation": next, "artifact_generation": next}
-		}
+		next := max(max(library.DirtyGeneration, library.ArtifactGeneration), library.BaselineGeneration) + 1
+		generations := map[string]any{"dirty_generation": next, "artifact_generation": next}
 		if err := tx.Model(&models.MediaLibrary{}).Where("id = ?", libraryID).Updates(generations).Error; err != nil {
 			return err
 		}
@@ -399,16 +424,28 @@ func (s *MediaLibraryService) ConfirmCatalogDeletion(ctx context.Context, actor 
 				return err
 			}
 		} else if requiresArtifacts {
-			// A deletion generation is a complete projection of all remaining
-			// facts. Carry unchanged metadata and source assets forward so the
-			// artifact worker can remove only artifacts whose source disappeared.
 			now := time.Now().UTC()
-			if err := tx.Model(&models.MediaLibraryRecognition{}).Where("library_id = ?", libraryID).Updates(map[string]any{"last_generation": generation, "updated_at": now}).Error; err != nil {
+			shared, err := pruneDeletedEmptyRecognitionsTx(tx, library, storage, profile, deletedScopes)
+			if err != nil {
 				return err
 			}
-			if err := tx.Model(&models.MediaLibrarySourceAsset{}).Where("library_id = ? AND active = ?", libraryID, true).Updates(map[string]any{"generation": generation, "updated_at": now}).Error; err != nil {
+			fingerprint, err := artifactBatchSourceFingerprint(tx, library)
+			if err != nil {
 				return err
 			}
+			checkpoint := batchArtifactCheckpoint{Version: 1, Pending: true, SourceFingerprint: fingerprint, DeletedManifestIDs: append(deletedManifests, shared...)}
+			raw, err := json.Marshal(checkpoint)
+			if err != nil {
+				return err
+			}
+			run := models.MediaLibraryScanRun{LibraryID: libraryID, Generation: generation, Kind: "deletion", Status: "success", Partial: true, CheckpointJSON: string(raw), StartedAt: now, FinishedAt: &now}
+			if err := freezeDeletedWorkGuards(&run, deletedScopes); err != nil {
+				return err
+			}
+			if err := tx.Create(&run).Error; err != nil {
+				return err
+			}
+			artifactScanID = run.ID
 		}
 		if s.changes != nil {
 			change, changeErr := s.changes.RecordTx(tx, libraryID, updated.DirtyGeneration, models.MediaLibraryChangeRemoval, !requiresArtifacts)
@@ -437,6 +474,10 @@ func (s *MediaLibraryService) ConfirmCatalogDeletion(ctx context.Context, actor 
 	if requiresArtifacts && generation > 0 {
 		if err := s.artifacts.ScheduleGeneration(libraryID, generation); err != nil {
 			s.log.Warn().Uint("library_id", libraryID).Str("error_code", "artifact_schedule_pending").Msg("删除已保存，媒体产物任务等待恢复调度")
+		} else if artifactScanID > 0 {
+			if err := s.acknowledgeBatchArtifactFollowup(ctx, artifactScanID); err != nil {
+				return MediaCatalogDeletionResult{}, err
+			}
 		}
 	}
 	s.wakeCatalogDeletionReconcile(libraryID)

@@ -114,6 +114,9 @@ func catalogConfigFingerprint(library models.MediaLibrary, storage models.Storag
 	// authority. Use actual Profile.Revision; ignore baseline/artifact counters.
 	value := []string{"catalog-config-v1", mediaLibraryScanSourceFingerprint(library, storage, profile), strconv.FormatBool(library.Enabled), strconv.FormatBool(storage.Enabled), storage.Capabilities, library.MovieDirectoryTemplate, library.MovieFilenameTemplate, library.TVDirectoryTemplate, library.TVFilenameTemplate, library.STRMLocalRoot, strconv.FormatBool(library.STRMEnabled), strconv.FormatBool(library.SignedProxyEnabled), strconv.FormatBool(library.MetadataArtifactsEnabled), profile.RulesJSON, profile.BuiltinRecognitionPacksJSON, profile.RecognitionRulesJSON, profile.MovieDirectoryTemplate, profile.MovieFilenameTemplate, profile.TVDirectoryTemplate, profile.TVFilenameTemplate}
 	encoded, _ := json.Marshal(value)
+	if library.CloudEmptyCleanupEnabled {
+		encoded = append(encoded, []byte("\x00cloud-empty-cleanup-v1")...)
+	}
 	sum := sha256.Sum256(encoded)
 	return hex.EncodeToString(sum[:])
 }

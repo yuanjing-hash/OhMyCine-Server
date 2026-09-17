@@ -195,7 +195,8 @@ func (s *MediaArtifactService) settleStoppedArtifactExecutionContext(ctx context
 			return err
 		}
 	}
-	return s.catalogArtifactWriteTx(ctx, func(tx *gorm.DB) error {
+	var abandoned int64
+	err := s.catalogArtifactWriteTx(ctx, func(tx *gorm.DB) error {
 		proof, run, err := catalogArtifactPermitTx(tx, permit)
 		if err != nil {
 			return err
@@ -221,6 +222,21 @@ func (s *MediaArtifactService) settleStoppedArtifactExecutionContext(ctx context
 		if result.RowsAffected != 1 {
 			return ErrCatalogFence
 		}
+		// Only the original, joined/quiescent owner may abandon its optional
+		// cloud-directory intent. Keep the record and never report a recycle
+		// success or resume provider mutations on this stopped execution.
+		if proof.State != "quiescent" {
+			return ErrCatalogFence
+		}
+		result = tx.Model(&models.CatalogCloudCleanupClaim{}).Where("physical_write_id=? AND run_id=? AND library_id=? AND source_fingerprint=? AND status='prepared'", proof.ID, run.ID, proof.LibraryID, proof.SourceFingerprint).Updates(map[string]any{"status": "abandoned", "updated_at": now})
+		if result.Error != nil {
+			return result.Error
+		}
+		abandoned = result.RowsAffected
 		return SettleSupersededCatalogArtifactTx(tx, permit)
 	})
+	if err == nil && abandoned > 0 {
+		s.log.Info().Uint("library_id", permit.evidence.LibraryID).Str("task_id", permit.evidence.OwnerID).Int64("abandoned", abandoned).Msg("【云端空目录】任务已停止，未确认的回收结果保留在记录中，不再执行云端操作")
+	}
+	return err
 }

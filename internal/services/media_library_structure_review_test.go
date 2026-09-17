@@ -305,6 +305,28 @@ func TestStructureReviewBulkSkipCoversOneCategoryAcrossAllPages(t *testing.T) {
 	if err != nil || pendingLocation.Total != 50 {
 		t.Fatalf("location category was changed: page=%+v err=%v", pendingLocation, err)
 	}
+	if pendingLocation.PendingTotal != 50 || pendingLocation.HandledTotal != 225 || pendingLocation.PendingRepairableCount != 50 || pendingLocation.PendingClassifications.LocationMismatch != 50 || pendingLocation.HandledClassifications.NamingMismatch != 225 || pendingLocation.DiagnosisRevision != diagnostics.Revision {
+		t.Fatalf("category filter narrowed global review summary: %+v", pendingLocation)
+	}
+	emptyCategory, err := s.StructureIssues(context.Background(), actor, library.ID, MediaLibraryStructureIssueQuery{Page: 1, PageSize: 1, Code: "invalid_path", Actionable: true, ReviewState: "pending"})
+	if err != nil || emptyCategory.Total != 0 || emptyCategory.PendingTotal != 50 || emptyCategory.HandledTotal != 225 {
+		t.Fatalf("empty category lost review summary: %+v err=%v", emptyCategory, err)
+	}
+	allSkipped, err := s.SaveStructureReviewBulk(context.Background(), actor, library.ID, MediaLibraryStructureReviewBulkInput{DiagnosisRevision: diagnostics.Revision, ReviewRevision: result.ReviewRevision, Codes: []string{"location_mismatch"}, Action: StructureSelectionSkip}, RequestContext{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := s.StructureIssues(context.Background(), actor, library.ID, MediaLibraryStructureIssueQuery{Page: 1, PageSize: 1, Actionable: true, ReviewState: "pending"})
+	if err != nil || reloaded.Total != 0 || reloaded.PendingTotal != 0 || reloaded.HandledTotal != 275 || reloaded.PendingRepairableCount != 0 || reloaded.PendingClassifications != (StructureIssueClassifications{}) || reloaded.HandledClassifications.LocationMismatch != 50 {
+		t.Fatalf("skip all/reload=%+v err=%v", reloaded, err)
+	}
+	if _, err := s.DeleteStructureReviewChoice(context.Background(), actor, library.ID, handled.List[0].Token, MediaLibraryStructureReviewChoiceInput{DiagnosisRevision: diagnostics.Revision, ReviewRevision: allSkipped.ReviewRevision}, RequestContext{}); err != nil {
+		t.Fatal(err)
+	}
+	undone, err := s.StructureIssues(context.Background(), actor, library.ID, MediaLibraryStructureIssueQuery{Page: 1, PageSize: 1, Actionable: true, ReviewState: "pending"})
+	if err != nil || undone.Total != 1 || undone.PendingRepairableCount != 1 || undone.PendingClassifications.NamingMismatch != 1 || undone.HandledTotal != 274 || undone.HandledClassifications.NamingMismatch != 224 {
+		t.Fatalf("undo summary=%+v err=%v", undone, err)
+	}
 	if _, err := s.SaveStructureReviewBulk(context.Background(), actor, library.ID, MediaLibraryStructureReviewBulkInput{DiagnosisRevision: diagnostics.Revision, ReviewRevision: result.ReviewRevision, Codes: []string{"naming_mismatch"}, Action: StructureSelectionKeepRecommended}, RequestContext{}); ErrorCode(err) != CodeInvalidRequest {
 		t.Fatalf("keep recommended accepted for naming mismatch: %v", err)
 	}

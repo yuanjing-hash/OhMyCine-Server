@@ -144,6 +144,9 @@ func TestListTreeUsesRecursiveBulkStreamsAndBuildsPaths(t *testing.T) {
 	if result.Partial || len(result.Entries) != 2 {
 		t.Fatalf("result=%+v", result)
 	}
+	if len(result.Directories) != 1 || result.Directories[0].ID != "movies" || result.Directories[0].RelativePath != "/电影" || !result.Directories[0].IsDir {
+		t.Fatalf("directory evidence=%+v", result.Directories)
+	}
 	paths := map[string]string{}
 	for _, entry := range result.Entries {
 		paths[entry.ID] = entry.RelativePath

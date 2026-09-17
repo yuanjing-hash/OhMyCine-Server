@@ -3,6 +3,7 @@ package services
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"path/filepath"
 	"slices"
 	"testing"
@@ -265,6 +266,19 @@ func TestPan115CatalogDeletionQueuesArtifactsBeforePublishingRefresh(t *testing.
 	artifacts.SetMediaChangeService(changes)
 	fixture.service.SetMediaChangeService(changes)
 	fixture.service.SetArtifactService(artifacts)
+	var sourceStorage models.Storage
+	if err := fixture.service.db.First(&sourceStorage, fixture.library.StorageID).Error; err != nil {
+		t.Fatal(err)
+	}
+	ownerPolicy, _ := json.Marshal(mediaArtifactPolicy{LibraryID: fixture.library.ID, StorageID: sourceStorage.ID, SourceBoundaryFingerprint: catalogSourceFingerprint(fixture.library, sourceStorage)})
+	owner := models.MediaArtifactRun{ID: "deletion-previous-owner", LibraryID: fixture.library.ID, PolicyJSON: string(ownerPolicy)}
+	if err := fixture.service.db.Create(&owner).Error; err != nil {
+		t.Fatal(err)
+	}
+	manifest := models.MediaArtifact{OpaqueID: "deleted-entry-manifest", RunID: owner.ID, LibraryID: fixture.library.ID, SourceIdentity: fmt.Sprintf("entry:%d", fixture.entries[0].ID), RelativePath: "/Delete-A.strm", Managed: true, Active: true, Kind: models.MediaArtifactKindSTRM, TargetKind: models.MediaArtifactTargetLocalProjection, Status: models.MediaArtifactStatusCompleted}
+	if err := fixture.service.db.Create(&manifest).Error; err != nil {
+		t.Fatal(err)
+	}
 	now := time.Now().UTC()
 	target := models.MediaServerRefreshTarget{LibraryID: fixture.library.ID, ConnectionID: *fixture.serviceStorageConnectionID(t, fixture.library.StorageID), UpstreamLibraryID: "upstream", UpstreamLibraryName: "电影", Enabled: true, LastStatus: "idle", Revision: 1, CreatedAt: now, UpdatedAt: now}
 	if err := fixture.service.db.Create(&target).Error; err != nil {
@@ -306,20 +320,23 @@ func TestPan115CatalogDeletionQueuesArtifactsBeforePublishingRefresh(t *testing.
 	if err := fixture.service.db.Where("library_id = ? AND generation = ?", fixture.library.ID, library.ArtifactGeneration).First(&run).Error; err != nil || run.Status != models.MediaArtifactStatusQueued || run.JobID == nil {
 		t.Fatalf("artifact run=%+v err=%v", run, err)
 	}
-	if err := fixture.service.db.First(&otherRecognition, otherRecognition.ID).Error; err != nil || otherRecognition.LastGeneration != library.ArtifactGeneration {
+	if err := fixture.service.db.First(&otherRecognition, otherRecognition.ID).Error; err != nil || otherRecognition.LastGeneration != 1 {
 		t.Fatalf("recognition=%+v err=%v", otherRecognition, err)
 	}
-	if err := fixture.service.db.First(&sourceAsset, sourceAsset.ID).Error; err != nil || sourceAsset.Generation != library.ArtifactGeneration {
+	if err := fixture.service.db.First(&sourceAsset, sourceAsset.ID).Error; err != nil || sourceAsset.Generation != 1 {
 		t.Fatalf("source asset=%+v err=%v", sourceAsset, err)
 	}
-	// The carry-forward assertions above exercise the deletion transaction.
-	// Remove these synthetic facts before running the real artifact worker;
-	// unlike a scanned source asset they deliberately have no provider bytes.
-	if err := fixture.service.db.Delete(&sourceAsset).Error; err != nil {
+	// Unrelated synthetic source assets have no provider bytes: a bounded
+	// deletion must leave them untouched and must not try to download them.
+	var policy mediaArtifactPolicy
+	if err := json.Unmarshal([]byte(run.PolicyJSON), &policy); err != nil {
 		t.Fatal(err)
 	}
-	if err := fixture.service.db.Delete(&otherRecognition).Error; err != nil {
-		t.Fatal(err)
+	if policy.ScopeVersion != 1 || !policy.ScanPartial || policy.CleanupEligible || len(policy.EntryIDs) != 0 || len(policy.SourceAssetIDs) != 0 {
+		t.Fatalf("deletion expanded scope: %+v", policy)
+	}
+	if len(policy.DeletedManifestIDs) != 1 || policy.DeletedManifestIDs[0] != manifest.ID {
+		t.Fatalf("lost exact deletion membership: %+v", policy)
 	}
 	claimed, err := fixture.queue.Claim([]string{JobTypeMediaArtifact})
 	if err != nil || claimed == nil {

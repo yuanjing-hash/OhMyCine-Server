@@ -309,6 +309,7 @@ func scanPan115ProviderScope(ctx context.Context, driver cloudpkg.Driver, rootID
 			if item.ID == root.ID || !scanPan115ScopedSubtree(ctx, driver, item, relative, entriesByID) {
 				return medialibrary.Result{}, true
 			}
+			entriesByID[item.ID] = cloudpkg.TreeEntry{Item: item, RelativePath: relative}
 			continue
 		}
 		entriesByID[item.ID] = cloudpkg.TreeEntry{Item: item, RelativePath: relative}
@@ -335,7 +336,7 @@ func scanPan115ProviderScope(ctx context.Context, driver cloudpkg.Driver, rootID
 	// An affected file which is now ignored or has a non-media extension must
 	// be removed from the catalog just as an explicit provider deletion is.
 	for _, event := range scope.Events {
-		if _, exists := entriesByID[event.ItemID]; exists {
+		if entry, exists := entriesByID[event.ItemID]; exists && !entry.IsDir {
 			if _, kept := projected[event.ItemID]; !kept {
 				deleted[event.ItemID] = struct{}{}
 			}
@@ -373,6 +374,7 @@ func scanPan115ScopedSubtree(ctx context.Context, driver cloudpkg.Driver, root c
 			}
 			childPath := path.Join(current.relative, item.Name)
 			if item.IsDir {
+				entries[item.ID] = cloudpkg.TreeEntry{Item: item, RelativePath: childPath}
 				if _, exists := seen[item.ID]; exists {
 					return false
 				}

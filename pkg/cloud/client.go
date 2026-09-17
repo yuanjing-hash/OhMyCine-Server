@@ -81,6 +81,7 @@ type TreeEntry struct {
 }
 
 type TreeResult struct {
+	Directories  []TreeEntry
 	Entries      []TreeEntry
 	Partial      bool
 	Deduplicated int
@@ -95,10 +96,11 @@ type BulkTreeDriver interface {
 
 // TreeBatch is one ordered page from a recursive provider enumeration.
 type TreeBatch struct {
-	Offset  int64
-	Total   int64
-	Entries []TreeEntry
-	Partial bool
+	Directories []TreeEntry
+	Offset      int64
+	Total       int64
+	Entries     []TreeEntry
+	Partial     bool
 }
 
 // TreeScanProgress contains aggregate-only facts safe for operation logs.

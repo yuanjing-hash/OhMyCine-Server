@@ -82,6 +82,10 @@ func (s *PluginRepositoryService) SearchResource(ctx context.Context, input Plug
 	if !manifestHasCapability(manifest, contract.CapabilityResourceResolve) {
 		return PluginResourceSearchPage{}, appError(CodePermissionDenied, "插件未声明资源站解析能力", nil)
 	}
+	if err := s.restoreResourceBrowser(ctx, input.ConnectionID); err != nil {
+		return PluginResourceSearchPage{}, err
+	}
+	ctx = s.browserStateContext(ctx, input.ConnectionID)
 	raw, err := s.InvokePlugin(ctx, input.ConnectionID, "resource.search", request)
 	if err != nil {
 		mapped := mapPluginResourceError(err)
@@ -116,6 +120,9 @@ func (s *PluginRepositoryService) SearchResource(ctx context.Context, input Plug
 		}
 		result.Items = append(result.Items, PluginResourceSearchItem{ID: item.ID, Title: item.Title, SizeBytes: item.SizeBytes, Seeders: item.Seeders, UpdatedAt: updated, Tags: append([]string(nil), item.Tags...)})
 	}
+	if err := s.saveBrowserState(ctx, input.ConnectionID); err != nil {
+		return PluginResourceSearchPage{}, err
+	}
 	return result, nil
 }
 
@@ -127,6 +134,10 @@ func (s *PluginRepositoryService) ResolveResource(ctx context.Context, input Plu
 	if _, err := s.resourceManifest(input.ConnectionID, contract.CapabilityResourceResolve); err != nil {
 		return PluginResourceResolveResult{}, err
 	}
+	if err := s.restoreResourceBrowser(ctx, input.ConnectionID); err != nil {
+		return PluginResourceResolveResult{}, err
+	}
+	ctx = s.browserStateContext(ctx, input.ConnectionID)
 	raw, err := s.InvokePlugin(ctx, input.ConnectionID, "resource.resolve", request)
 	if err != nil {
 		mapped := mapPluginResourceError(err)
@@ -141,6 +152,9 @@ func (s *PluginRepositoryService) ResolveResource(ctx context.Context, input Plu
 	magnet, ok := contract.NormalizeMagnet(response.Magnet)
 	if !ok {
 		return PluginResourceResolveResult{}, appError("resource_magnet_invalid", "插件返回的磁力链接无效", nil)
+	}
+	if err := s.saveBrowserState(ctx, input.ConnectionID); err != nil {
+		return PluginResourceResolveResult{}, err
 	}
 	return PluginResourceResolveResult{Magnet: magnet}, nil
 }
@@ -160,26 +174,61 @@ func (s *PluginRepositoryService) resourceHealth(ctx context.Context, connection
 	if err := s.db.Select("credential_mode", "credential_ciphertext").First(&connection, "id = ? AND enabled = ?", connectionID, true).Error; err != nil {
 		return contract.ResourceHealthResponse{}, appError(CodeNotFound, "资源站连接不存在或已停用", err)
 	}
-	if connection.CredentialMode != models.PluginCredentialModeNone && strings.TrimSpace(connection.CredentialCiphertext) == "" {
+	var browserConnection models.PluginConnection
+	_ = s.db.Select("plugin_id").First(&browserConnection, "id = ?", connectionID).Error
+	if connection.CredentialMode != models.PluginCredentialModeNone && strings.TrimSpace(connection.CredentialCiphertext) == "" && !s.browserLive(ctx, browserConnection.PluginID, connectionID) && !s.hasBrowserState(connectionID) {
 		response := contract.ResourceHealthResponse{Status: "auth_required"}
 		if err := s.persistResourceHealth(connectionID, response); err != nil {
 			return contract.ResourceHealthResponse{}, err
 		}
 		return response, nil
 	}
+	if err := s.restoreResourceBrowser(ctx, connectionID); err != nil {
+		return contract.ResourceHealthResponse{}, err
+	}
+	ctx = s.browserStateContext(ctx, connectionID)
+	diagnostic := &browserDiagnostic{}
+	ctx = context.WithValue(ctx, browserDiagnosticKey{}, diagnostic)
 	raw, err := s.InvokePlugin(ctx, connectionID, "resource.health", contract.ResourceHealthRequest{ConnectionID: connectionID})
+	// A close/configuration edit while the guest was running must not publish
+	// health for a different session or allow a stale confirmation to succeed.
+	if expected, scoped := ctx.Value(browserAuthKey{}).(browserAuthScope); scoped {
+		s.browserMu.Lock()
+		valid := s.validBrowserLocked(ctx, expected.PluginID, connectionID) && s.browserSession.ID == expected.SessionID
+		s.browserMu.Unlock()
+		if !valid {
+			return contract.ResourceHealthResponse{}, appError("resource_browser_session_expired", "浏览器会话已变化，请重新确认", nil)
+		}
+	}
 	if err != nil {
 		mapped := mapPluginResourceError(err)
+		if failure := diagnostic.failure(); failure != nil {
+			mapped = failure
+		}
 		s.persistResourceFailure(connectionID, mapped)
 		return contract.ResourceHealthResponse{}, mapped
 	}
 	var response contract.ResourceHealthResponse
 	if err := decodePluginResourceResponse(raw, &response); err != nil {
+		if failure := diagnostic.failure(); failure != nil {
+			err = failure
+		}
 		s.persistResourceFailure(connectionID, err)
 		return contract.ResourceHealthResponse{}, err
 	}
 	if !map[string]bool{"healthy": true, "auth_required": true, "unavailable": true, "rate_limited": true}[response.Status] {
 		return contract.ResourceHealthResponse{}, appError(CodePluginResponseInvalid, "插件资源站健康响应无效", nil)
+	}
+	if response.Status != "healthy" {
+		if failure := diagnostic.failure(); failure != nil {
+			s.persistResourceFailure(connectionID, failure)
+			return contract.ResourceHealthResponse{}, failure
+		}
+	}
+	if response.Status == "healthy" {
+		if err := s.saveBrowserState(ctx, connectionID); err != nil {
+			return contract.ResourceHealthResponse{}, err
+		}
 	}
 	if err := s.persistResourceHealth(connectionID, response); err != nil {
 		return contract.ResourceHealthResponse{}, err
@@ -201,6 +250,9 @@ func (s *PluginRepositoryService) persistResourceHealth(connectionID string, res
 	if status == "rate_limited" {
 		updates["last_health_error_code"] = "resource_rate_limited"
 	}
+	if status == "browser_verification_required" {
+		updates["last_health_error_code"] = "resource_browser_verification_required"
+	}
 	if status == "unavailable" {
 		updates["last_health_error_code"] = "resource_entry_unavailable"
 	}
@@ -221,7 +273,14 @@ func (s *PluginRepositoryService) persistResourceHealth(connectionID string, res
 	return nil
 }
 
-func (s *PluginRepositoryService) LoginResource(ctx context.Context, actor Actor, pluginID string, request contract.ResourceLoginRequest) (contract.ResourceLoginResponse, error) {
+func (s *PluginRepositoryService) LoginResource(ctx context.Context, actor Actor, pluginID string, request contract.ResourceLoginRequest) (result contract.ResourceLoginResponse, resultErr error) {
+	s.browserAuthMu.Lock()
+	defer s.browserAuthMu.Unlock()
+	return s.loginResourceLocked(ctx, actor, pluginID, request)
+}
+
+// Caller holds browserAuthMu, including confirmation's health-first continuation.
+func (s *PluginRepositoryService) loginResourceLocked(ctx context.Context, actor Actor, pluginID string, request contract.ResourceLoginRequest) (result contract.ResourceLoginResponse, resultErr error) {
 	if !actor.Can(authz.PermissionPluginsInstall) {
 		return contract.ResourceLoginResponse{}, appError(CodePermissionDenied, "无权登录资源站", nil)
 	}
@@ -233,6 +292,43 @@ func (s *PluginRepositoryService) LoginResource(ctx context.Context, actor Actor
 	}
 	if _, err := s.resourceManifest(request.ConnectionID, contract.CapabilityResourceLogin); err != nil {
 		return contract.ResourceLoginResponse{}, err
+	}
+	if s.browser != nil {
+		s.browserMu.Lock()
+		if expected, continuing := ctx.Value(browserAuthKey{}).(browserAuthScope); continuing &&
+			(!s.validBrowserLocked(ctx, pluginID, request.ConnectionID) || s.browserSession.ID != expected.SessionID || s.browserSession.Owner != actor.User.ID) {
+			s.browserMu.Unlock()
+			return contract.ResourceLoginResponse{}, appError("resource_browser_session_expired", "浏览器会话已变化，请重新确认", nil)
+		}
+		err := s.prepareBrowserLocked(ctx, actor.User.ID, pluginID, request.ConnectionID)
+		if err != nil {
+			s.browserMu.Unlock()
+			return contract.ResourceLoginResponse{}, err
+		}
+		session := s.browserSession
+		if session.Owner != actor.User.ID {
+			s.browserMu.Unlock()
+			return contract.ResourceLoginResponse{}, appError(CodeConflict, "浏览器正在被其他管理员使用", nil)
+		}
+		clearPending(session)
+		session.Authenticating = true
+		ctx = context.WithValue(ctx, browserAuthKey{}, browserAuthScope{pluginID, request.ConnectionID, session.ID})
+		ctx = hostapi.WithBrowserAuthentication(ctx, pluginID, request.ConnectionID)
+		s.browserMu.Unlock()
+		defer func() {
+			s.browserMu.Lock()
+			defer s.browserMu.Unlock()
+			if s.browserSession != session {
+				return
+			}
+			session.Authenticating = false
+			if ctx.Err() == nil && ErrorCode(resultErr) == "resource_browser_verification_required" {
+				session.Pending = &pendingBrowserLogin{Username: request.Username, Password: []byte(request.Password), Expires: time.Now().Add(5 * time.Minute)}
+				if session.LastGET != "" {
+					_ = s.browser.Call(ctx, "session/navigate", map[string]any{"sessionId": session.ID, "identity": session.Identity, "url": session.LastGET}, nil)
+				}
+			}
+		}()
 	}
 	raw, err := s.InvokePlugin(ctx, request.ConnectionID, "resource.auth.login", request)
 	if err != nil {
@@ -249,6 +345,8 @@ func (s *PluginRepositoryService) LoginResource(ctx context.Context, actor Actor
 }
 
 func (s *PluginRepositoryService) SubmitResourceCookie(ctx context.Context, actor Actor, pluginID string, request contract.ResourceCookieRequest) (contract.ResourceLoginResponse, error) {
+	s.browserAuthMu.Lock()
+	defer s.browserAuthMu.Unlock()
 	if !actor.Can(authz.PermissionPluginsInstall) {
 		return contract.ResourceLoginResponse{}, appError(CodePermissionDenied, "无权登录资源站", nil)
 	}
@@ -319,13 +417,15 @@ func (s *PluginRepositoryService) SubmitResourceCookie(ctx context.Context, acto
 	case "auth_required":
 		return contract.ResourceLoginResponse{}, appError("resource_auth_failed", "Cookie 已失效或不属于当前入口", nil)
 	case "rate_limited":
-		return contract.ResourceLoginResponse{}, appError("resource_rate_limited", "资源站请求受到限流或安全验证，请稍后重试", nil)
+		return contract.ResourceLoginResponse{}, appError("resource_rate_limited", "资源站请求受到限流，请稍后重试", nil)
 	default:
 		return contract.ResourceLoginResponse{}, appError("resource_entry_unavailable", "当前资源站入口暂时不可用", nil)
 	}
 }
 
 func (s *PluginRepositoryService) SubmitResourceCaptcha(ctx context.Context, actor Actor, pluginID string, request contract.ResourceCaptchaRequest) (contract.ResourceLoginResponse, error) {
+	s.browserAuthMu.Lock()
+	defer s.browserAuthMu.Unlock()
 	if !actor.Can(authz.PermissionPluginsInstall) {
 		return contract.ResourceLoginResponse{}, appError(CodePermissionDenied, "无权提交验证码", nil)
 	}
@@ -337,6 +437,25 @@ func (s *PluginRepositoryService) SubmitResourceCaptcha(ctx context.Context, act
 	}
 	if _, err := s.resourceManifest(request.ConnectionID, contract.CapabilityResourceCaptcha); err != nil {
 		return contract.ResourceLoginResponse{}, err
+	}
+	if s.browser != nil {
+		s.browserMu.Lock()
+		if !s.validBrowserLocked(ctx, pluginID, request.ConnectionID) || s.browserSession.Owner != actor.User.ID {
+			s.browserMu.Unlock()
+			return contract.ResourceLoginResponse{}, appError("resource_browser_login_expired", "本次登录已结束，请重新登录", nil)
+		}
+		ctx = context.WithValue(ctx, browserAuthKey{}, browserAuthScope{pluginID, request.ConnectionID, s.browserSession.ID})
+		ctx = hostapi.WithBrowserAuthentication(ctx, pluginID, request.ConnectionID)
+		session := s.browserSession
+		session.Authenticating = true
+		s.browserMu.Unlock()
+		defer func() {
+			s.browserMu.Lock()
+			defer s.browserMu.Unlock()
+			if s.browserSession == session {
+				session.Authenticating = false
+			}
+		}()
 	}
 	raw, err := s.InvokePlugin(ctx, request.ConnectionID, "resource.auth.captcha", request)
 	if err != nil {
@@ -363,6 +482,10 @@ func (s *PluginRepositoryService) finalizeResourceLogin(ctx context.Context, con
 	if err != nil {
 		return contract.ResourceLoginResponse{}, err
 	}
+	return resourceLoginHealthResult(response, health)
+}
+
+func resourceLoginHealthResult(response contract.ResourceLoginResponse, health contract.ResourceHealthResponse) (contract.ResourceLoginResponse, error) {
 	switch health.Status {
 	case "healthy":
 		if health.AccountName != "" {
@@ -372,7 +495,7 @@ func (s *PluginRepositoryService) finalizeResourceLogin(ctx context.Context, con
 	case "auth_required":
 		return contract.ResourceLoginResponse{}, appError("resource_auth_failed", "资源站登录未生效，请重新登录", nil)
 	case "rate_limited":
-		return contract.ResourceLoginResponse{}, appError("resource_rate_limited", "资源站请求受到限流或安全验证，请稍后重试", nil)
+		return contract.ResourceLoginResponse{}, appError("resource_rate_limited", "资源站请求受到限流，请稍后重试", nil)
 	default:
 		return contract.ResourceLoginResponse{}, appError("resource_entry_unavailable", "当前资源站入口暂时不可用", nil)
 	}
@@ -445,6 +568,8 @@ func (s *PluginRepositoryService) persistResourceFailure(connectionID string, er
 		status = "auth_required"
 	case "resource_rate_limited":
 		status = "rate_limited"
+	case "resource_browser_verification_required":
+		status = "browser_verification_required"
 	case "resource_entry_unavailable":
 		status = "unavailable"
 	}
@@ -458,7 +583,7 @@ func (s *PluginRepositoryService) resourceManifest(connectionID string, capabili
 	if err := s.db.First(&connection, "id = ? AND enabled = ?", connectionID, true).Error; err != nil {
 		return contract.Manifest{}, appError(CodeNotFound, "资源站连接不存在或已停用", err)
 	}
-	if resourceOperationNeedsCredential(capability) && connection.CredentialMode != models.PluginCredentialModeNone && strings.TrimSpace(connection.CredentialCiphertext) == "" {
+	if resourceOperationNeedsCredential(capability) && connection.CredentialMode != models.PluginCredentialModeNone && strings.TrimSpace(connection.CredentialCiphertext) == "" && !s.hasBrowserState(connectionID) {
 		return contract.Manifest{}, appError("resource_auth_required", "资源站尚未登录，请先完成登录", nil)
 	}
 	manifest, err := s.installedManifest(connection.PluginID)
@@ -496,6 +621,8 @@ func mapPluginResourceError(err error) error {
 	}
 	code := ErrorCode(err)
 	switch code {
+	case "plugin_browser_unavailable":
+		return browserFailure()
 	case "plugin_http_domain_denied", "plugin_http_private_address_denied", "plugin_http_upstream_unavailable", "plugin_runtime_unavailable", "plugin_runtime_start_timeout":
 		return appError("resource_entry_unavailable", "资源站入口暂时不可用", nil)
 	case "plugin_http_response_too_large":
@@ -518,8 +645,10 @@ func decodePluginResourceResponse(raw []byte, destination any) error {
 		switch code {
 		case "not-authenticated":
 			return appError("resource_auth_required", "资源站登录已失效，请重新登录", nil)
-		case "rate-limited", "browser-verification-required":
-			return appError("resource_rate_limited", "资源站请求受到限流或安全验证，请稍后重试", nil)
+		case "rate-limited":
+			return appError("resource_rate_limited", "资源站请求受到限流，请稍后重试", nil)
+		case "browser-verification-required":
+			return appError("resource_browser_verification_required", "资源站要求浏览器安全验证，暂时无法确认登录状态；请在当前镜像完成验证。若浏览器已通过但插件仍失败，需要检查站点对服务器请求的限制", nil)
 		case "captcha-expired":
 			return appError("resource_captcha_expired", "验证码已过期，请重新登录", nil)
 		case "captcha-required":

@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
 import SecretInput from '@/components/SecretInput.vue'
+import PluginBrowserLogin from '@/components/PluginBrowserLogin.vue'
 import {
   pluginResourceCaptchaAssetPath,
   type PluginConnectionSummary,
@@ -17,6 +18,7 @@ const props = withDefaults(defineProps<{
   healthResponse?: ResourceHealthResponse
   busy?: boolean
   error?: string
+  browserVerification?: boolean
 }>(), { canManage: true, response: undefined, healthResponse: undefined, error: '' })
 
 const emit = defineEmits<{
@@ -24,6 +26,8 @@ const emit = defineEmits<{
   cookie: [cookie: string]
   captcha: [payload: { challengeId: string, points: ResourceCaptchaPoint[] }]
   health: []
+  browserResult: [response: ResourceLoginResponse]
+  browserCancel: []
 }>()
 
 const mode = ref<'password' | 'cookie'>('password')
@@ -39,6 +43,9 @@ const captchaURL = computed(() => challenge.value
   : '')
 
 watch(() => challenge.value?.challengeId, () => { points.value = [] })
+watch(() => [props.pluginId, props.connection.id, props.connection.entry_origin, props.connection.enabled, props.canManage], () => {
+  username.value = ''; password.value = ''; cookie.value = ''; points.value = []
+})
 
 function submitLogin() {
   const secret = password.value
@@ -70,6 +77,7 @@ function submitCaptcha() {
 }
 
 function healthLabel() {
+  if (props.error) return '本次验证未通过，请查看下方原因'
   if (props.healthResponse?.status === 'healthy') return '入口可用，登录有效'
   if (props.healthResponse?.status === 'auth_required') return '入口可用，需要重新登录'
   if (props.healthResponse?.status === 'rate_limited') return '站点正在限流，请稍后再试'
@@ -79,11 +87,13 @@ function healthLabel() {
   if (props.connection.health_status === 'auth_pending') return '凭据已保存，等待验证'
   if (props.connection.health_status === 'auth_expired' || props.connection.health_status === 'auth_required') return '登录已过期，请重新登录'
   if (props.connection.health_status === 'rate_limited') return '站点正在限流，请稍后再试'
+  if (props.connection.health_status === 'browser_verification_required') return '站点要求浏览器验证，登录状态待确认'
   if (props.connection.health_status === 'unavailable' || props.connection.health_status === 'error') return '当前入口不可用'
   return '尚未检测入口状态'
 }
 
 function healthClass() {
+  if (props.error) return 'status-chip status-chip--warning'
   const status = props.healthResponse?.status ?? props.connection.health_status
   if (status === 'healthy') return 'status-chip status-chip--ready'
   if (status === 'unavailable' || status === 'error') return 'status-chip status-chip--error'
@@ -145,7 +155,7 @@ function healthClass() {
       </div>
     </section>
 
-    <template v-else-if="canManage !== false">
+    <template v-else-if="canManage !== false && !browserVerification">
       <nav class="management-tabs" aria-label="资源站登录方式">
         <button type="button" class="management-tab" :class="{ 'management-tab--active': mode === 'password' }" @click="mode = 'password'">账号密码</button>
         <button type="button" class="management-tab" :class="{ 'management-tab--active': mode === 'cookie' }" @click="mode = 'cookie'">粘贴 Cookie</button>
@@ -154,7 +164,7 @@ function healthClass() {
       <form v-if="mode === 'password'" class="grid gap-3" @submit.prevent="submitLogin">
         <div><label class="label">用户名或邮箱</label><input v-model="username" class="input" minlength="2" maxlength="128" required autocomplete="username" :disabled="actionDisabled" /></div>
         <div><label class="label">密码</label><SecretInput v-model="password" class="input" required autocomplete="current-password" :disabled="actionDisabled" /></div>
-        <p class="text-subtle m-0 text-xs">密码只用于这一次登录请求；提交后立即从表单清除，Server 不会持久化密码。</p>
+        <p class="text-subtle m-0 text-xs">默认使用 Server 内置浏览器登录，仅遇到验证时需要你手动操作。密码提交后立即清空，Server 不会持久化密码。</p>
         <button class="btn-primary" :disabled="actionDisabled || username.trim().length < 2 || password.length < 6">{{ busy ? '正在登录…' : '登录' }}</button>
       </form>
 
@@ -164,6 +174,7 @@ function healthClass() {
         <button class="btn-primary" :disabled="actionDisabled || !cookie.trim()">{{ busy ? '正在保存…' : '保存 Cookie 并登录' }}</button>
       </form>
     </template>
-    <p v-else class="text-subtle m-0 text-xs">当前账户没有管理权限，只能查看资源站连接状态。</p>
+    <p v-else-if="canManage === false" class="text-subtle m-0 text-xs">当前账户没有管理权限，只能查看资源站连接状态。</p>
+    <PluginBrowserLogin v-if="canManage !== false && browserVerification" :key="`${pluginId}:${connection.id}:${connection.entry_origin}`" :plugin-id="pluginId" :connection-id="connection.id" :origin="connection.entry_origin || ''" :disabled="actionDisabled" @result="emit('browserResult', $event)" @cancel="emit('browserCancel')" />
   </section>
 </template>

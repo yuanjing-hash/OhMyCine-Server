@@ -150,6 +150,9 @@ func (s *MediaLibraryService) recognizeLibraryUnitsWithExisting(ctx context.Cont
 		}
 	}
 	bySource := make(map[string]models.MediaLibraryRecognition, len(existing))
+	if lookup != nil {
+		lookup = &batchDetailLookup{mediaRecognitionLookup: lookup, calls: make(map[string]*detailLookupCall)}
+	}
 	for _, record := range existing {
 		bySource[record.SourceKey] = record
 	}
@@ -182,6 +185,12 @@ func (s *MediaLibraryService) recognizeLibraryUnitsWithExisting(ctx context.Cont
 			if decodeErr != nil {
 				return decodeErr
 			}
+			if _, importing := transferBatchRecognition(workerCtx, unit); importing {
+				result, decodeErr = hydrateRecognitionDetails(workerCtx, lookup, rateGate, library.MetadataLanguage, result, rules)
+				if decodeErr != nil {
+					return decodeErr
+				}
+			}
 			results[index] = mediaLibraryRecognizedUnit{Unit: unit, Result: result, Manual: true}
 			return nil
 		}
@@ -193,6 +202,11 @@ func (s *MediaLibraryService) recognizeLibraryUnitsWithExisting(ctx context.Cont
 					verified.Result.Snapshot = stored.Snapshot
 					verified.Result.Metadata = stored.Metadata
 				}
+			}
+			var hydrationErr error
+			verified.Result, hydrationErr = hydrateRecognitionDetails(workerCtx, lookup, rateGate, library.MetadataLanguage, verified.Result, rules)
+			if hydrationErr != nil {
+				return hydrationErr
 			}
 			results[index] = verified
 			return nil

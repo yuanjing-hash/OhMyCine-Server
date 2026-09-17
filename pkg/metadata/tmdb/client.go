@@ -93,6 +93,7 @@ type Match struct {
 // configured image origin or a temporary/tokenized URL.
 type Snapshot struct {
 	Version             int               `json:"version"`
+	DetailsFetched      bool              `json:"details_fetched,omitempty"`
 	TMDBID              int64             `json:"tmdb_id"`
 	IMDbID              string            `json:"imdb_id,omitempty"`
 	MediaType           string            `json:"media_type"`
@@ -952,6 +953,7 @@ func populateCommonSnapshot(snapshot *Snapshot, genres []detailGenre, production
 }
 
 func matchFromSnapshot(snapshot Snapshot) Match {
+	snapshot.DetailsFetched = true
 	match := Match{ID: snapshot.TMDBID, Title: snapshot.Title, MediaType: snapshot.MediaType, OriginalLanguage: snapshot.OriginalLanguage, ProductionCountries: append([]string(nil), snapshot.ProductionCountries...), OriginCountries: append([]string(nil), snapshot.OriginCountries...), ReleaseYear: parseYear(snapshot.ReleaseDate), Snapshot: snapshot}
 	for _, genre := range snapshot.Genres {
 		match.GenreIDs = append(match.GenreIDs, genre.ID)

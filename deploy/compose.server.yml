@@ -2,6 +2,8 @@ services:
   server:
     image: ghcr.io/yuanjing-hash/ohmycine-server:${OMC_IMAGE_TAG:-beta}
     restart: unless-stopped
+    init: true
+    shm_size: "256mb"
     ports:
       - "${OMC_BIND_ADDRESS:-127.0.0.1}:3000:3000"
     environment:

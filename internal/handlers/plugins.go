@@ -382,6 +382,7 @@ func (a *API) PollPluginConnectionAuth(c *gin.Context) {
 }
 
 func (a *API) LoginPluginResource(c *gin.Context) {
+	defer browserOperationDeadline(c)()
 	actor, _ := middleware.ActorFrom(c)
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 32<<10)
 	var payload contract.ResourceLoginRequest
@@ -399,6 +400,7 @@ func (a *API) LoginPluginResource(c *gin.Context) {
 }
 
 func (a *API) SubmitPluginResourceCaptcha(c *gin.Context) {
+	defer browserOperationDeadline(c)()
 	actor, _ := middleware.ActorFrom(c)
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 16<<10)
 	var payload contract.ResourceCaptchaRequest
@@ -416,6 +418,7 @@ func (a *API) SubmitPluginResourceCaptcha(c *gin.Context) {
 }
 
 func (a *API) SubmitPluginResourceCookie(c *gin.Context) {
+	defer browserOperationDeadline(c)()
 	actor, _ := middleware.ActorFrom(c)
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 40<<10)
 	var payload contract.ResourceCookieRequest
@@ -433,6 +436,7 @@ func (a *API) SubmitPluginResourceCookie(c *gin.Context) {
 }
 
 func (a *API) CheckPluginResourceHealth(c *gin.Context) {
+	defer browserOperationDeadline(c)()
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 1024)
 	var payload struct{}
 	if err := strictJSON(c, &payload); err != nil {

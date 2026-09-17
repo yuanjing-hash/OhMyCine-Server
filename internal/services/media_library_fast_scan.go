@@ -73,6 +73,9 @@ func (s *MediaLibraryService) publishFastPan115Scan(ctx context.Context, library
 		return published, nil
 	}
 	run.Discovered = len(result.Files)
+	if err := stageProviderPaths(ctx, s.db, library, storage, result, run); err != nil {
+		return s.failFastScanPersistence(run, operation, started, mediaLibraryPersistenceStageEntries, err)
+	}
 	run.Enumerated = max(result.Enumerated, len(result.Files)+len(result.Assets)+result.Deduplicated)
 	run.Processed = len(result.Files) + len(result.Assets)
 	run.Deduplicated = result.Deduplicated
@@ -158,6 +161,12 @@ func (s *MediaLibraryService) publishFastPan115Scan(ctx context.Context, library
 			if mediaLibraryScanSourceFingerprint(currentLibrary, currentStorage, currentProfile) != run.SourceFingerprint {
 				return wrapMediaLibraryPersistence(mediaLibraryPersistenceStageConfiguration, errMediaLibraryConfigurationChanged)
 			}
+			if err := validateProviderDeletionScopeTx(ctx, tx, currentLibrary, currentStorage); err != nil {
+				return err
+			}
+			if err := persistProviderPathsTx(tx, currentLibrary, currentStorage, result, run.StartedAt, run.ID); err != nil {
+				return err
+			}
 
 			var existing []models.MediaLibraryEntry
 			if err := tx.Where("library_id = ?", library.ID).Find(&existing).Error; err != nil {
@@ -172,6 +181,13 @@ func (s *MediaLibraryService) publishFastPan115Scan(ctx context.Context, library
 				}
 			}
 			deletedProviderIDs := make(map[string]struct{}, len(result.DeletedProviderIDs))
+			deletedScopes, err := captureDeletedRecognitionScopesTx(tx, library.ID, result.DeletedProviderIDs)
+			if err != nil {
+				return err
+			}
+			if err := freezeDeletedWorkGuards(&run, deletedScopes); err != nil {
+				return err
+			}
 			var deletedEntryIDs []uint
 			for _, providerID := range result.DeletedProviderIDs {
 				deletedProviderIDs[providerID] = struct{}{}
@@ -191,8 +207,10 @@ func (s *MediaLibraryService) publishFastPan115Scan(ctx context.Context, library
 				return wrapMediaLibraryPersistence(mediaLibraryPersistenceStageRecognition, err)
 			}
 			bySource := make(map[string]models.MediaLibraryRecognition, len(recognitionRecords))
+			projectionFresh := make(map[string]bool, len(recognitionRecords))
 			for _, record := range recognitionRecords {
 				bySource[record.SourceKey] = record
+				projectionFresh[record.SourceKey] = mediaLibraryRecognitionProjectionFresh(record)
 			}
 
 			now := time.Now().UTC()
@@ -274,7 +292,7 @@ func (s *MediaLibraryService) publishFastPan115Scan(ctx context.Context, library
 				parsed := parsedByPath[file.RelativePath]
 				unit := unitByPath[file.RelativePath]
 				record, reusable := bySource[unit.SourceKey]
-				reusable = reusable && record.Status != mediaRecognitionStatusPending && record.ProfileID == profile.ID && record.ProfileRevision == profile.Revision && (record.ManualOverride || record.InputFingerprint == unit.InputFingerprint) && mediaLibraryRecognitionProjectionFresh(record)
+				reusable = reusable && record.Status != mediaRecognitionStatusPending && record.ProfileID == profile.ID && record.ProfileRevision == profile.Revision && (record.ManualOverride || record.InputFingerprint == unit.InputFingerprint) && projectionFresh[unit.SourceKey]
 				if reusable {
 					reusedSourceStatus[unit.SourceKey] = record.Status
 					entry.RecognitionID = &record.ID
@@ -381,7 +399,11 @@ func (s *MediaLibraryService) publishFastPan115Scan(ctx context.Context, library
 					}
 				}
 			}
-			if result.Scoped {
+			deletedSharedManifests, err := pruneDeletedEmptyRecognitionsTx(tx, currentLibrary, currentStorage, currentProfile, deletedScopes)
+			if err != nil {
+				return err
+			}
+			if result.Scoped && len(result.DeletedProviderIDs) == 0 {
 				if err := tx.Where("library_id = ? AND NOT EXISTS (SELECT 1 FROM media_library_entries WHERE media_library_entries.recognition_id = media_library_recognitions.id)", library.ID).
 					Delete(&models.MediaLibraryRecognition{}).Error; err != nil {
 					return wrapMediaLibraryPersistence(mediaLibraryPersistenceStageRecognition, err)
@@ -393,7 +415,7 @@ func (s *MediaLibraryService) publishFastPan115Scan(ctx context.Context, library
 				}
 			}
 			if run.RecognitionTotal == 0 {
-				if !result.Partial || result.Scoped {
+				if !result.Partial || (result.Scoped && len(result.DeletedProviderIDs) == 0) {
 					var staleIDs []uint
 					for _, record := range recognitionRecords {
 						if _, current := currentSourceKeys[record.SourceKey]; !current {
@@ -418,6 +440,17 @@ func (s *MediaLibraryService) publishFastPan115Scan(ctx context.Context, library
 				run.Status, run.Phase, run.RecognitionCompleted, run.FinishedAt = "success", "completed", 0, &publishedAt
 			}
 			run.Persisted = len(result.Files) + len(result.Assets)
+			if result.Partial && len(result.DeletedProviderIDs) > 0 {
+				if err := freezeBatchArtifactCheckpointTx(tx, &run); err != nil {
+					return err
+				}
+				if err := freezeDeletedArtifactCheckpointTx(tx, &run, result.DeletedProviderIDs); err != nil {
+					return err
+				}
+				if err := appendDeletedArtifactCheckpoint(&run, deletedSharedManifests); err != nil {
+					return err
+				}
+			}
 			if err := tx.Save(&run).Error; err != nil {
 				return wrapMediaLibraryPersistence(mediaLibraryPersistenceStageScanRun, err)
 			}
@@ -429,7 +462,7 @@ func (s *MediaLibraryService) publishFastPan115Scan(ctx context.Context, library
 				if run.Removed > 0 && run.Added == 0 && run.Updated == 0 {
 					kind = models.MediaLibraryChangeRemoval
 				}
-				requiresArtifacts := mediaLibraryRequiresArtifacts(storage.Type, currentLibrary, s.artifacts != nil)
+				requiresArtifacts := mediaLibraryRequiresArtifacts(storage.Type, currentLibrary, s.artifacts != nil) || mediaLibraryRequiresCloudCleanup(currentLibrary, run, s.artifacts != nil)
 				change, err := s.changes.RecordTx(tx, library.ID, run.Generation, kind, !requiresArtifacts)
 				if err != nil {
 					return wrapMediaLibraryPersistence(mediaLibraryPersistenceStageChange, err)
@@ -481,7 +514,7 @@ func (s *MediaLibraryService) publishFastPan115Scan(ctx context.Context, library
 	// STRM and base artwork are allowed to consume the published pending
 	// catalog immediately. The recognition worker schedules the same generation
 	// again only when metadata changes; the artifact service coalesces it.
-	if s.artifacts != nil && mediaLibraryArtifactGenerationRequired(run.Kind, run, false) {
+	if s.artifacts != nil && (mediaLibraryArtifactGenerationRequired(run.Kind, run, false) || mediaLibraryRequiresCloudCleanup(library, run, true)) {
 		if err := s.artifacts.ScheduleGeneration(library.ID, run.Generation); err != nil {
 			serverlog.OperationMediaArtifact.Event(s.log.Warn()).Uint("library_id", library.ID).Uint("scan_run_id", run.ID).Uint64("generation", run.Generation).
 				Str("scan_kind", run.Kind).Str("phase", "artifact_scheduling").Str("error_code", "artifact_schedule_failed").Msg(serverlog.OperationMediaArtifact.Message("基础目录产物入队失败"))

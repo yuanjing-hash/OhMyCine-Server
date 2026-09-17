@@ -199,7 +199,7 @@ export interface MediaLibraryDetail {
   metadata_language: string; metadata_region: string; match_strategy: string
   provider_rate_per_second: number; provider_concurrency: number; metadata_rate_per_second: number; metadata_concurrency: number
   strm_enabled: boolean; strm_local_path: string; signed_proxy_enabled: boolean
-  metadata_artifacts_enabled: boolean; upload_sidecars: boolean
+  metadata_artifacts_enabled: boolean; upload_sidecars: boolean; cloud_empty_cleanup_enabled?: boolean
   artifact_generation: number; artifact_applied_generation: number; artifact_status: string; artifact_error: string; artifact_updated_at: string | null
   status: MediaLibraryStatus; status_error_code: string; next_retry_at: string | null
   last_scan_at: string | null; last_successful_scan_at: string | null; baseline_generation: number; dirty_generation: number
@@ -254,7 +254,8 @@ export interface MediaLibraryStructureIssueSummary {
   conflict_source_count?: number; affected_file_count?: number; recommended_member_token?: string; members: MediaLibraryStructureIssueMember[]
   review_action?: MediaLibraryStructureSelectionAction | 'manual_recognition'; review_member_token?: string; review_state?: 'draft' | 'submitted'
 }
-export interface MediaLibraryStructureIssuePage extends PageResponse<MediaLibraryStructureIssueSummary> { review_revision: number; pending_total: number; handled_total: number }
+export interface MediaLibraryStructureReviewSummary { diagnosis_revision: string; review_revision: number; pending_total: number; handled_total: number; pending_repairable_count: number; pending_classifications: MediaLibraryStructureClassifications; handled_classifications: MediaLibraryStructureClassifications }
+export interface MediaLibraryStructureIssuePage extends PageResponse<MediaLibraryStructureIssueSummary>, MediaLibraryStructureReviewSummary {}
 export type MediaLibraryStructureIssueMemberPage = PageResponse<MediaLibraryStructureIssueMember>
 export type MediaLibraryStructureSelectionAction = 'repair' | 'keep_recommended' | 'keep_member' | 'keep_all_versions' | 'skip'
 export interface MediaLibraryStructureSelection { issue_token: string; action: MediaLibraryStructureSelectionAction; member_token?: string }
@@ -296,7 +297,7 @@ export interface MediaLibraryWritePayload {
   enabled: boolean; recursive: boolean; full_scan_interval_hours: number; incremental_minutes: number
   video_extensions: string[]; strm_asset_extra_extensions: string[]; ignore_patterns: string[]; metadata_language: string; metadata_region: string; match_strategy: string
   provider_rate_per_second: number; provider_concurrency: number; metadata_rate_per_second: number; metadata_concurrency: number
-  strm_enabled: boolean; strm_local_root_token?: string; metadata_artifacts_enabled: boolean; upload_sidecars: boolean
+  strm_enabled: boolean; strm_local_root_token?: string; metadata_artifacts_enabled: boolean; upload_sidecars: boolean; cloud_empty_cleanup_enabled?: boolean
   transfer_mode: 'move' | 'copy' | 'symlink'; conflict_policy: 'ask' | 'overwrite' | 'skip' | 'rename'
   movie_directory_template: string; movie_filename_template: string
   tv_directory_template: string; tv_filename_template: string
@@ -358,6 +359,7 @@ export interface AIRecognitionSettings {
 }
 export interface AIProviderModel { id: string; display_name: string }
 export interface DownloadTaskSummary {
+  wait_reason?: { code: string; message: string }
   id: string; job_id: string; owner_id: number; downloader_id: string | null; downloader_name: string; provider_type: string
   display_name: string; job_status: string; provider_status: string; phase: string; progress: number | null
   bytes_completed: number | null; bytes_total: number | null; download_speed: number | null; upload_speed: number | null

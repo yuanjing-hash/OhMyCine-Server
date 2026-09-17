@@ -13,6 +13,7 @@ import (
 	"github.com/robfig/cron/v3"
 	"github.com/rs/zerolog"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/authz"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/database"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
 	"gorm.io/gorm"
 )
@@ -542,7 +543,10 @@ func (s *UnifiedScheduleService) Poll(ctx context.Context) error {
 				continue
 			}
 			scheduledAt := *row.NextRunAt
-			next, err := PreviewSchedule(row.CronExpression, row.Timezone, 1, scheduledAt)
+			// run_once merges all missed occurrences into this one run. Computing
+			// from the old due time leaves the definition overdue and replays every
+			// missed day across polls/restarts (including after cancelling this run).
+			next, err := PreviewSchedule(row.CronExpression, row.Timezone, 1, now)
 			if err != nil {
 				s.db.Model(&row).Updates(map[string]any{"enabled": false, "last_status": "failed", "last_error_code": CodeInvalidRequest, "next_run_at": nil})
 				continue
@@ -569,7 +573,13 @@ func (s *UnifiedScheduleService) Poll(ctx context.Context) error {
 				continue
 			}
 			var active int64
-			if err := s.db.Model(&models.ScheduleRun{}).Where("schedule_id = ? AND status IN ?", row.ID, []string{"queued", "running"}).Count(&active).Error; err != nil {
+			if err := s.db.Model(&models.ScheduleRun{}).
+				Where("schedule_id = ?", row.ID).
+				// Queue control is authoritative: cancelling a single occurrence
+				// does not disable the definition, and its stale run projection must
+				// not prevent the next day's occurrence. Pending retry still owns it.
+				Where("(job_id = '' AND status IN ?) OR EXISTS (SELECT 1 FROM jobs j WHERE j.id = schedule_runs.job_id AND j.status IN ?)", []string{"queued", "running", "retry_wait"}, activeJobStatuses()).
+				Count(&active).Error; err != nil {
 				return err
 			}
 			if active > 0 && row.OverlapPolicy == "skip" {
@@ -622,7 +632,11 @@ func (s *UnifiedScheduleService) run(ctx context.Context, _ JobRuntime, claimed 
 		return s.failOrRetry(payload.RunID, definition, claimed.Job.AttemptCount, err)
 	}
 	started := s.now()
-	_ = s.db.Model(&models.ScheduleRun{}).Where("id = ?", payload.RunID).Updates(map[string]any{"status": "running", "started_at": started, "updated_at": started}).Error
+	start := s.db.WithContext(ctx).Model(&models.ScheduleRun{}).Where("id = ? AND schedule_id = ?", payload.RunID, definition.ID).Updates(map[string]any{"status": "running", "started_at": started, "updated_at": started})
+	if start.Error != nil || start.RowsAffected != 1 {
+		s.log.Warn().Str("run_id", payload.RunID).Str("database_error_class", database.ErrorClass(start.Error)).Msg("计划任务开始状态保存失败，未执行业务")
+		return WorkerResult{ErrorCode: "schedule_state_failed", ErrorMessage: "计划任务状态保存失败，尚未开始执行"}
+	}
 	runCtx, cancel := context.WithTimeout(ctx, time.Duration(definition.MaxRuntimeSeconds)*time.Second)
 	defer cancel()
 	targetID, _ := strconv.ParseUint(definition.TargetID, 10, 64)
@@ -687,13 +701,19 @@ func (s *UnifiedScheduleService) failOrRetry(runID string, definition models.Sch
 func (s *UnifiedScheduleService) finishRun(runID, status, code string) WorkerResult {
 	now := s.now()
 	var run models.ScheduleRun
-	_ = s.db.First(&run, "id = ?", runID).Error
-	_ = s.db.Transaction(func(tx *gorm.DB) error {
+	if err := s.db.First(&run, "id = ?", runID).Error; err != nil {
+		s.log.Warn().Str("run_id", runID).Str("database_error_class", database.ErrorClass(err)).Msg("计划任务结果读取失败")
+		return WorkerResult{ErrorCode: "schedule_state_failed", ErrorMessage: "计划任务结果保存失败，请检查任务状态"}
+	}
+	if err := s.db.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Model(&models.ScheduleRun{}).Where("id = ?", runID).Updates(map[string]any{"status": status, "error_code": code, "finished_at": now, "updated_at": now}).Error; err != nil {
 			return err
 		}
 		return tx.Model(&models.ScheduleDefinition{}).Where("id = ?", run.ScheduleID).Updates(map[string]any{"last_status": status, "last_error_code": code, "updated_at": now}).Error
-	})
+	}); err != nil {
+		s.log.Warn().Str("run_id", runID).Str("database_error_class", database.ErrorClass(err)).Msg("计划任务结果保存失败")
+		return WorkerResult{ErrorCode: "schedule_state_failed", ErrorMessage: "计划任务结果保存失败，请检查任务状态"}
+	}
 	if status == "failed" {
 		if code == "" {
 			code = "schedule_action_failed"

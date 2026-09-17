@@ -35,11 +35,12 @@ func (s *MediaLibraryService) commitCatalogScanFollowupTx(tx *gorm.DB, p Catalog
 	if err != nil {
 		return err
 	}
-	requiresArtifacts := mediaLibraryRequiresArtifacts(storage.Type, library, s.artifacts != nil)
+	cloudCleanup := mediaLibraryRequiresCloudCleanup(library, p.Run, s.artifacts != nil)
+	requiresArtifacts := mediaLibraryRequiresArtifacts(storage.Type, library, s.artifacts != nil) || cloudCleanup
 	// Initial and explicit STRM full scans establish policy. An unchanged
 	// routine full scan is not a request to rebuild or audit every artifact.
 	fullArtifactReconcile := !p.RecognitionOnly && (p.Run.Kind == "initial" || p.Run.Kind == "strm_full_manual" || (p.Run.Kind == "full" && !p.NoContentChange))
-	generate := requiresArtifacts && (fullArtifactReconcile || mediaLibraryArtifactGenerationRequired(p.Run.Kind, p.Run, p.MetadataChanged))
+	generate := requiresArtifacts && (fullArtifactReconcile || mediaLibraryArtifactGenerationRequired(p.Run.Kind, p.Run, p.MetadataChanged) || len(p.ArtifactChanges.Manifests) > 0)
 	if p.ArtifactChanges.Empty() && !fullArtifactReconcile {
 		generate = false
 	}
@@ -50,6 +51,9 @@ func (s *MediaLibraryService) commitCatalogScanFollowupTx(tx *gorm.DB, p Catalog
 	// generation it just finished. Earlier changed batches already bound it.
 	if p.RecognitionOnly && p.NoContentChange {
 		generate = false
+	}
+	if cloudCleanup && !p.NoContentChange && !p.RecognitionOnly {
+		generate = true
 	}
 	artifactGeneration := max(p.Run.Generation, max(library.DirtyGeneration, library.ArtifactGeneration))
 	if generate && p.Run.Kind == "strm_full_manual" && p.NoContentChange {

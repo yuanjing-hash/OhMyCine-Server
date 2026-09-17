@@ -47,33 +47,6 @@ func TestProviderListenerRequeuesScopeAfterReconcileFailure(t *testing.T) {
 	}
 }
 
-func TestPan115DirectoryTreeTombstoneFilterIsStrict(t *testing.T) {
-	base := providerEventPayload{Kind: cloudpkg.ChangeDeleted, ItemID: "ep", ParentID: "0", Name: "共享20260914020547_目录树.txt"}
-	if !isPan115DirectoryTreeTombstone(models.StorageTypePan115, base, map[string]struct{}{}, nil) {
-		t.Fatal("expected bookkeeping tombstone")
-	}
-	cases := []struct {
-		name  string
-		typ   string
-		p     providerEventPayload
-		known map[string]struct{}
-		ext   []string
-		want  bool
-	}{
-		{"video", models.StorageTypePan115, providerEventPayload{Kind: cloudpkg.ChangeDeleted, ItemID: "v", ParentID: "0", Name: "共享20260914020547_目录树.mkv"}, nil, nil, false},
-		{"known", models.StorageTypePan115, base, map[string]struct{}{"ep": {}}, nil, false},
-		{"asset", models.StorageTypePan115, base, nil, []string{".txt"}, false},
-		{"parent", models.StorageTypePan115, providerEventPayload{Kind: cloudpkg.ChangeDeleted, ItemID: "x", ParentID: "root", Name: base.Name}, nil, nil, false},
-		{"shape", models.StorageTypePan115, providerEventPayload{Kind: cloudpkg.ChangeDeleted, ItemID: "x", ParentID: "0", Name: "共享123_目录树.txt"}, nil, nil, false},
-		{"storage", models.StorageTypeLocal, base, nil, nil, false},
-	}
-	for _, tc := range cases {
-		if got := isPan115DirectoryTreeTombstone(tc.typ, tc.p, tc.known, tc.ext); got != tc.want {
-			t.Errorf("%s got %v", tc.name, got)
-		}
-	}
-}
-
 func TestProviderEventReconcileDefersBeforeScanAllocationWhilePhysicalWriteEntered(t *testing.T) {
 	service, db, actor, storage, profile := mediaLibraryTestService(t)
 	library, err := service.Create(context.Background(), actor, testLibraryInput("event barrier", storage, profile, false), RequestContext{})
@@ -492,15 +465,15 @@ func TestProviderPageIsolatesUnresolvedDelivery(t *testing.T) {
 	pending := newProviderChangeAccumulator()
 	pending.addDeliveries(rows, rows[2].ID)
 	prepared, err := service.prepareProviderDeliveryPage(context.Background(), library.ID, pending.take())
-	if err != nil || len(prepared.DeliveryIDs) != 2 || prepared.DeliveryIDs[0] != rows[1].ID || prepared.DeliveryIDs[1] != rows[2].ID || prepared.VerifiedResult == nil || len(prepared.VerifiedResult.Files) != 1 || driver.streamCalls != 0 {
+	if err != nil || len(prepared.DeliveryIDs) != 1 || prepared.DeliveryIDs[0] != rows[1].ID || prepared.VerifiedResult == nil || len(prepared.VerifiedResult.Files) != 1 || driver.streamCalls != 0 {
 		t.Fatalf("prepared=%+v err=%v", prepared, err)
 	}
 	if err := service.ackProviderChangeScope(context.Background(), library.ID, prepared.DeliveryIDs); err != nil {
 		t.Fatal(err)
 	}
 	var filtered models.MediaLibraryProviderEvent
-	if err := db.First(&filtered, rows[2].ID).Error; err != nil || filtered.ProcessedAt == nil {
-		t.Fatalf("historical directory export not acknowledged: %+v err=%v", filtered, err)
+	if err := db.First(&filtered, rows[2].ID).Error; err != nil || filtered.ProcessedAt != nil || filtered.ResolutionCode != providerEventNeedsReview {
+		t.Fatalf("unproven name must park, never authorize deletion: %+v err=%v", filtered, err)
 	}
 	var unresolved models.MediaLibraryProviderEvent
 	if err := db.First(&unresolved, rows[0].ID).Error; err != nil || unresolved.ProcessedAt != nil {

@@ -955,6 +955,7 @@ func (c *Client) ResolveDirectory(ctx context.Context, providerPath string) (clo
 func (c *Client) ListTree(ctx context.Context, rootID string, maxEntries int) (cloud.TreeResult, error) {
 	result := cloud.TreeResult{Entries: make([]cloud.TreeEntry, 0)}
 	err := c.StreamTree(ctx, rootID, maxEntries, func(batch cloud.TreeBatch) error {
+		result.Directories = append(result.Directories, batch.Directories...)
 		result.Entries = append(result.Entries, batch.Entries...)
 		result.Partial = result.Partial || batch.Partial
 		return nil
@@ -1006,6 +1007,10 @@ func (c *Client) StreamTree(ctx context.Context, rootID string, maxEntries int, 
 	if err != nil {
 		return cloud.Error(cloud.CodeResponseInvalid, true, err)
 	}
+	directories := make([]cloud.TreeEntry, 0, len(folders))
+	for _, folder := range folders {
+		directories = append(directories, cloud.TreeEntry{Item: cloud.Item{ID: folder.ID, ParentID: folder.ParentID, Name: folder.Name, IsDir: true}, RelativePath: folderPaths[folder.ID]})
+	}
 	if tuning.Progress != nil {
 		tuning.Progress(cloud.TreeScanProgress{Phase: "folders", BatchEntries: len(folders), Duration: time.Since(started)})
 	}
@@ -1040,7 +1045,7 @@ func (c *Client) StreamTree(ctx context.Context, rootID string, maxEntries int, 
 	}
 	pageCount := int((limit + bulkTreePageSize - 1) / bulkTreePageSize)
 	if pageCount == 0 {
-		return emit(cloud.TreeBatch{Offset: 0, Total: first.total, Partial: partial})
+		return emit(cloud.TreeBatch{Offset: 0, Total: first.total, Partial: partial, Directories: directories})
 	}
 
 	workCtx, cancel := context.WithCancel(ctx)
@@ -1121,7 +1126,11 @@ func (c *Client) StreamTree(ctx context.Context, rootID string, maxEntries int, 
 		// Invalid provider rows are isolated instead of failing the whole scan,
 		// but they make deletion proof incomplete. Propagate partial so callers
 		// retain the previous catalog rows until a clean snapshot succeeds.
-		if err := emit(cloud.TreeBatch{Offset: page.offset, Total: first.total, Entries: entries, Partial: partial || invalid > 0}); err != nil {
+		batch := cloud.TreeBatch{Offset: page.offset, Total: first.total, Entries: entries, Partial: partial || invalid > 0}
+		if page.offset == 0 {
+			batch.Directories = directories
+		}
+		if err := emit(batch); err != nil {
 			return err
 		}
 		if tuning.Progress != nil {

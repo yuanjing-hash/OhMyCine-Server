@@ -94,8 +94,12 @@ func schemaMigrationsThrough98() []migration {
 	return append(schemaMigrationsThrough97(), migration{Version: 98, Apply: migrateManagementHistoryRetry})
 }
 
+func schemaMigrationsThrough109() []migration {
+	return append(schemaMigrationsThrough98(), migration{Version: 99, Apply: migrateManagementSeedingHistory}, migration{Version: 100, Apply: migrateLibraryRetirementJobs}, migration{Version: 101, Apply: migrateLegacyArtifactNoIORecovery}, migration{Version: 102, Apply: migrateStructureMismatchClassifications}, migration{Version: 103, Apply: migrateRemoteTransferNodes}, migration{Version: 104, Apply: migrateBoundedAutomaticJobs}, migration{Version: 105, Apply: migrateRemoteTransferFiles}, migration{Version: 106, Apply: migrateRemoteUploadFiles}, migration{Version: 107, Apply: migratePluginResourceSites}, migration{Version: 108, Apply: migrateArtifactSourceFingerprint}, migration{Version: 109, Apply: migratePluginBrowserState})
+}
+
 func schemaMigrations() []migration {
-	return append(schemaMigrationsThrough98(), migration{Version: 99, Apply: migrateManagementSeedingHistory}, migration{Version: 100, Apply: migrateLibraryRetirementJobs}, migration{Version: 101, Apply: migrateLegacyArtifactNoIORecovery}, migration{Version: 102, Apply: migrateStructureMismatchClassifications}, migration{Version: 103, Apply: migrateRemoteTransferNodes}, migration{Version: 104, Apply: migrateBoundedAutomaticJobs}, migration{Version: 105, Apply: migrateRemoteTransferFiles}, migration{Version: 106, Apply: migrateRemoteUploadFiles}, migration{Version: 107, Apply: migratePluginResourceSites}, migration{Version: 108, Apply: migrateArtifactSourceFingerprint})
+	return append(schemaMigrationsThrough109(), migration{Version: 110, Apply: migrateProviderDeletion}, migration{Version: 111, Apply: migrateCloudEmptyCleanup})
 }
 
 func migrateStructureDraftPreviewRows(db *gorm.DB) error {

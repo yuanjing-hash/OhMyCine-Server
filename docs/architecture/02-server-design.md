@@ -2,6 +2,18 @@
 
 ## 1. 概述
 
+### 云端空目录清理（2026-09）
+
+媒体库配置 `cloud_empty_cleanup_enabled` 默认关闭，更新请求省略字段时保留原值。
+当前仅支持具备目录读取及回收能力的 115 连接，不要求配置本地 STRM 输出目录或 signed 302。
+删除事件发布时固定受影响文件的已发布目录关系，仅在原媒体产物任务中自下而上检查这些目录。
+完整成功读取确认真正为空才移入网盘回收站；媒体库根目录永不处理，绝不退化为永久删除。
+当前没有云端附属文件的系统归属证明，因此任何 NFO、海报、字幕或用户文件都会保留目录。
+存在下载/入库任务时跳过本次可选清理，不占住后续入库；凭据失效与限流复用连接的既有处理策略。
+每次回收前保存独立恢复记录，丢失响应后在同一任务按原目录 ID 确认结果；未确认记录不得清除历史。
+任务取消或被替代且原文件操作已全部退出时，可选目录清理的未确认意图记为 `abandoned` 并保留，
+不声称回收成功，也不再访问网盘。数据库版本迁移 111 增加开关及恢复记录表。
+
 OhMyCine Server 是一个**以媒体流水线为核心**的自托管后端，负责：
 - **发现** — 聚合 PT/BT 站点搜索，自动匹配元数据
 - **下载** — 管理qBittorrent/Transmission下载任务
@@ -1368,6 +1380,7 @@ POST   /api/v1/media-libraries/{id}/scan               # 立即扫描
 GET    /api/v1/media-libraries/{id}/entries            # 文件事实分页
 GET    /api/v1/media-libraries/{id}/catalog            # 作品聚合分页
 GET    /api/v1/media-libraries/{id}/runs               # 扫描记录
+GET    /api/v1/media-libraries/{id}/provider-events?page=1 # 暂停自动处理的通知，固定每页 50 条
 GET    /api/v1/media-libraries/{id}/recognitions       # 识别单元分页
 POST   /api/v1/media-libraries/{id}/recognitions/{token}/retry
 GET    /api/v1/media-libraries/{id}/recognitions/{token}/tmdb-candidates
@@ -1884,3 +1897,9 @@ Server 本地库。一个下载任务只能绑定一个最终媒体库。远端 
 Node 安装只安装 `ohmycine-node`，不安装 qBittorrent、防火墙或反向代理。正式
 Server 可生成 Linux bash 或 Windows PowerShell 完整命令；命令先校验 RSA-3072
 签名清单和 installer SHA-256，再执行对应平台安装器。开发构建不生成伪官方命令。
+
+### 诊断工作区的当前用户摘要
+
+`GET /api/v1/media-libraries/{id}/structure/issues` 在同一只读快照中返回分页列表及工作区摘要。`total` 受分类和 `review_state` 筛选；`pending_total`、`handled_total`、`pending_repairable_count`、`pending_classifications`、`handled_classifications` 始终覆盖当前用户、当前诊断的全部可处理问题，不受页码或分类筛选影响。缺集提示不计入工作区摘要。`diagnosis_revision` 与诊断详情的 `revision` 一致，`review_revision` 是当前用户工作区版本。
+
+摘要沿用列表的诊断任务、诊断代数和来源版本边界，不使用随后普通扫描的代数去替换诊断快照。跳过只保存在该用户本次诊断中，重载仍能从已处理列表撤销；原始诊断发现数不代表尚待用户处理的数量。读取失败返回错误，客户端必须显示不可用，不能替换成健康的零计数。概览仅为当前选中库读取小页摘要，不为每张媒体库卡产生额外查询。

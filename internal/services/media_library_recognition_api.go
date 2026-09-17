@@ -3,6 +3,7 @@ package services
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"path"
 	"strconv"
@@ -136,10 +137,31 @@ func (s *MediaLibraryService) RetryRecognition(ctx context.Context, actor Actor,
 	if err != nil {
 		return MediaRecognitionSummary{}, err
 	}
-	if record.ManualOverride {
+	knownIdentity := record.Status == mediaRecognitionStatusMatched && record.TMDBID != nil && *record.TMDBID > 0 && (record.MediaType == "movie" || record.MediaType == "tv")
+	if record.ManualOverride && !knownIdentity {
 		return MediaRecognitionSummary{}, appError(CodeConflict, "请先清除人工匹配再重试", nil)
 	}
-	result, err := s.recognizeStoredUnit(ctx, source.Library, source.Profile, entries)
+	var result MediaRecognitionResult
+	if knownIdentity {
+		rules, rulesErr := classification.DecodeStrict([]byte(source.Profile.RulesJSON))
+		if rulesErr != nil {
+			return MediaRecognitionSummary{}, rulesErr
+		}
+		result, err = recognitionResultFromStored(record, rules)
+		if err != nil {
+			return MediaRecognitionSummary{}, err
+		}
+		var lookup mediaRecognitionLookup
+		if s.metadata != nil {
+			client, _, _, clientErr := s.metadata.clientWithCredentialInfo()
+			if clientErr == nil {
+				lookup = client
+			}
+		}
+		result, err = hydrateRecognitionDetails(ctx, lookup, nil, source.Library.MetadataLanguage, result, rules)
+	} else {
+		result, err = s.recognizeStoredUnit(ctx, source.Library, source.Profile, entries)
+	}
 	if err != nil {
 		return MediaRecognitionSummary{}, err
 	}
@@ -149,7 +171,7 @@ func (s *MediaLibraryService) RetryRecognition(ctx context.Context, actor Actor,
 		// administrator can supply an explicit title through manual recovery.
 		result.ErrorCode = mediaLibraryRecognitionInputInvalid
 	}
-	if err := s.persistRecognitionResult(record, source.Profile, result, false, source); err != nil {
+	if err := s.persistRecognitionResult(record, source.Profile, result, record.ManualOverride, source); err != nil {
 		return MediaRecognitionSummary{}, err
 	}
 	_ = s.audit.Record(s.db, &actor.User.ID, "media_recognition.retry", "media_library_recognition", strconv.FormatUint(uint64(record.ID), 10), "success", map[string]any{"library_id": libraryID, "status": result.Status, "error_code": result.ErrorCode}, request)
@@ -402,6 +424,7 @@ func (s *MediaLibraryService) persistRecognitionResult(record models.MediaLibrar
 	now := time.Now().UTC()
 	var committedChange models.MediaLibraryChange
 	var artifactGeneration uint64
+	var artifactScanID uint
 	err = s.db.WithContext(source.Context).Transaction(func(tx *gorm.DB) error {
 		reader, err := PinCatalogTx(tx, []uint{record.LibraryID})
 		if err != nil {
@@ -443,19 +466,29 @@ func (s *MediaLibraryService) persistRecognitionResult(record models.MediaLibrar
 			return err
 		}
 		if artifactGeneration > 0 {
-			// A manual metadata correction is a complete logical projection
-			// generation. Carry all unchanged recognition/source-asset facts into
-			// it so the artifact worker can safely rewrite the full sidecar set;
-			// cleanup remains ineligible because this was not a complete scan.
-			if err := tx.Model(&models.MediaLibraryRecognition{}).Where("library_id = ?", record.LibraryID).Updates(map[string]any{"last_generation": artifactGeneration, "updated_at": now}).Error; err != nil {
-				return err
-			}
-			if err := tx.Model(&models.MediaLibrarySourceAsset{}).Where("library_id = ?", record.LibraryID).Updates(map[string]any{"generation": artifactGeneration, "updated_at": now}).Error; err != nil {
-				return err
-			}
 			if err := tx.Model(&models.MediaLibrary{}).Where("id = ?", record.LibraryID).Updates(map[string]any{"dirty_generation": artifactGeneration, "updated_at": now}).Error; err != nil {
 				return err
 			}
+			// Freeze only this work. Persist the follow-up before committing so
+			// queue failure cannot lose its artwork recovery or expand its scope.
+			checkpoint := batchArtifactCheckpoint{Version: 1, Pending: true}
+			if err := tx.Model(&models.MediaLibraryEntry{}).Where("library_id = ? AND recognition_id = ?", record.LibraryID, record.ID).Order("id").Pluck("id", &checkpoint.EntryIDs).Error; err != nil {
+				return err
+			}
+			fingerprint, err := artifactBatchSourceFingerprint(tx, library)
+			if err != nil {
+				return err
+			}
+			checkpoint.SourceFingerprint = fingerprint
+			raw, err := json.Marshal(checkpoint)
+			if err != nil {
+				return err
+			}
+			run := models.MediaLibraryScanRun{LibraryID: library.ID, Generation: generation, Kind: "metadata", Status: "success", Partial: true, CheckpointJSON: string(raw), StartedAt: now, FinishedAt: &now}
+			if err := tx.Create(&run).Error; err != nil {
+				return err
+			}
+			artifactScanID = run.ID
 		}
 		if s.changes != nil {
 			change, err := s.changes.RecordTx(tx, record.LibraryID, generation, models.MediaLibraryChangeMetadata, artifactGeneration == 0)
@@ -470,7 +503,10 @@ func (s *MediaLibraryService) persistRecognitionResult(record models.MediaLibrar
 		return err
 	}
 	if artifactGeneration > 0 {
-		return s.artifacts.ScheduleGeneration(record.LibraryID, artifactGeneration)
+		if err := s.artifacts.ScheduleGeneration(record.LibraryID, artifactGeneration); err != nil {
+			return err
+		}
+		return s.acknowledgeBatchArtifactFollowup(source.Context, artifactScanID)
 	}
 	if committedChange.State == models.MediaLibraryChangeReady && s.changes != nil {
 		s.changes.NotifyCommitted(committedChange.LibraryID, committedChange.Revision)

@@ -207,6 +207,11 @@ func (host *Host) Invoke(ctx context.Context, pluginID, operation string, reques
 }
 
 func operationTimeout(operation string) time.Duration {
+	if operation == "resource.auth.login" || operation == "resource.auth.captcha" {
+		// Login can bootstrap a form, submit credentials and fetch a challenge.
+		// Each Host request retains its 15-second cap; bound the whole sequence.
+		return 60 * time.Second
+	}
 	if strings.HasPrefix(operation, "resource.") {
 		// Resource operations perform one bounded provider request through the
 		// Host, whose own maximum timeout is 15 seconds. Keep a small outer margin

@@ -5,8 +5,7 @@ import (
 	"errors"
 	"time"
 
-	"modernc.org/sqlite"
-	sqlite3 "modernc.org/sqlite/lib"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/database"
 )
 
 const mediaLibraryBusyRetryAttempts = 3
@@ -63,25 +62,7 @@ func mediaLibraryPersistenceDiagnostics(err error) (string, string) {
 	if errors.Is(err, errMediaLibraryConfigurationChanged) {
 		return stage, mediaLibraryDatabaseErrorConfigurationChanged
 	}
-	var sqliteErr *sqlite.Error
-	if !errors.As(err, &sqliteErr) {
-		return stage, mediaLibraryDatabaseErrorUnknown
-	}
-	code := sqliteErr.Code()
-	switch code {
-	case sqlite3.SQLITE_CONSTRAINT_FOREIGNKEY:
-		return stage, mediaLibraryDatabaseErrorForeignKey
-	case sqlite3.SQLITE_CONSTRAINT_UNIQUE, sqlite3.SQLITE_CONSTRAINT_PRIMARYKEY:
-		return stage, mediaLibraryDatabaseErrorUnique
-	}
-	switch code & 0xff {
-	case sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED:
-		return stage, mediaLibraryDatabaseErrorBusy
-	case sqlite3.SQLITE_CONSTRAINT:
-		return stage, mediaLibraryDatabaseErrorConstraint
-	default:
-		return stage, mediaLibraryDatabaseErrorUnknown
-	}
+	return stage, database.ErrorClass(err)
 }
 
 // retryMediaLibraryBusy retries only SQLite's transient busy/locked class.

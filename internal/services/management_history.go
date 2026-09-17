@@ -301,6 +301,7 @@ func (s *QueueService) assertHistoryRecordClearableTx(tx *gorm.DB, scope, id str
 		}{
 			{"catalog_artifact_write_receipts", "run_id = ? AND phase IN ('prepared','conflict')", []any{id}},
 			{"catalog_artifact_cleanup_claims", "owner_run_id = ?", []any{id}},
+			{"catalog_cloud_cleanup_claims", "run_id = ? AND status = 'prepared'", []any{id}},
 			{"catalog_physical_writes", "owner_kind = 'artifact' AND owner_id = ? AND state <> 'settled'", []any{id}},
 		} {
 			if count, err := countTable(tx, ref.table, ref.where, ref.args...); err != nil {

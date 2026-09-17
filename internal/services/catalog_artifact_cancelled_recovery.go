@@ -42,7 +42,7 @@ func (w *MediaArtifactWorker) RecoverStoppedWork(ctx context.Context, after uint
 		} else if err != nil {
 			w.service.recordCancelledArtifactRecovery(ctx, row.JobID, "artifact_cancelled_reconciliation_pending", "已取消；文件结果仍需核验。请检查存储连接及文件是否被外部修改，系统会自动再次核验")
 		} else {
-			w.service.recordCancelledArtifactRecovery(ctx, row.JobID, "artifact_cancelled_reconciled", "已取消；文件结果已核验，未继续执行整理或删除")
+			w.service.recordCancelledArtifactRecovery(ctx, row.JobID, "artifact_cancelled_reconciled", "已取消；文件操作恢复记录已处理，未继续整理或删除。可选云端清理的未确认结果保留在原记录中")
 			w.service.queue.wake()
 		}
 	}

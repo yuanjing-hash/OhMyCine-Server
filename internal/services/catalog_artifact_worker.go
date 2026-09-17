@@ -891,9 +891,11 @@ func (s *MediaArtifactService) generateBoundArtifacts(ctx context.Context, runti
 		}
 		// Resolve filesystem identity outside the catalog transaction, including
 		// after upstream downloads and immediately before each physical write.
-		_, identity, err := canonicalProjectionRoot(policy.ProjectionRoot)
-		if err != nil || identity != policy.ProjectionRootIdentity {
-			return ErrCatalogFence
+		if policy.TargetKind != artifactTargetCloudCleanup {
+			_, identity, err := canonicalProjectionRoot(policy.ProjectionRoot)
+			if err != nil || identity != policy.ProjectionRootIdentity {
+				return ErrCatalogFence
+			}
 		}
 		return s.catalogStore.readDB.WithContext(checkCtx).Transaction(func(tx *gorm.DB) error { return s.validateArtifactBindingTx(tx, policy, &run, &claim, true) })
 	}
@@ -903,9 +905,12 @@ func (s *MediaArtifactService) generateBoundArtifacts(ctx context.Context, runti
 	if row.State == "applying" {
 		return s.finalizeBoundArtifacts(ctx, claim, run, policy, binding, fail)
 	}
-	root, err := (storagefs.LocalDriver{}).CanonicalizeRoot(policy.ProjectionRoot)
-	if err != nil {
-		return fail(err)
+	root := ""
+	if policy.TargetKind != artifactTargetCloudCleanup {
+		root, err = (storagefs.LocalDriver{}).CanonicalizeRoot(policy.ProjectionRoot)
+		if err != nil {
+			return fail(err)
+		}
 	}
 	if superseded, err := s.artifactPolicySuperseded(policy); err != nil || superseded {
 		return fail(ErrCatalogFence)

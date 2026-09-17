@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import QRCode from 'qrcode'
-import { api } from '@/api/client'
+import { api, APIError } from '@/api/client'
 import { Permissions } from '@/auth/generated-permissions'
 import PluginSettingsForm from '@/components/PluginSettingsForm.vue'
 import PluginResourceLogin from '@/components/PluginResourceLogin.vue'
@@ -109,10 +109,51 @@ const resourceLoginResponses = ref<Record<string, ResourceLoginResponse | undefi
 const resourceHealthResponses = ref<Record<string, ResourceHealthResponse | undefined>>({})
 const resourceLoginErrors = ref<Record<string, string>>({})
 const resourceLoginBusyID = ref('')
+const resourceBrowserVerification = ref<Record<string, boolean>>({})
+let resourceGeneration = 0
+let resourceController: AbortController | undefined
+function cancelResourceRequest() {
+  resourceGeneration++; resourceController?.abort(); resourceLoginBusyID.value = ''
+  resourceBrowserVerification.value = {}; resourceLoginResponses.value = {}; resourceLoginErrors.value = {}
+}
+function beginResourceRequest() {
+  resourceController?.abort()
+  const version = ++resourceGeneration
+  const controller = new AbortController(); resourceController = controller
+  const timer = setTimeout(() => controller.abort(), 180000)
+  return { signal: controller.signal, current: () => version === resourceGeneration,
+    finish: () => { clearTimeout(timer); if (version === resourceGeneration) resourceLoginBusyID.value = '' } }
+}
+watch(expandedPluginID, cancelResourceRequest)
+
+function resourceFailure(id: string, reason: unknown) {
+  if (reason instanceof APIError && reason.errorCode === 'resource_browser_verification_required') {
+    resourceBrowserVerification.value = { ...resourceBrowserVerification.value, [id]: true }
+    resourceLoginErrors.value = { ...resourceLoginErrors.value, [id]: '' }
+  } else {
+    resourceBrowserVerification.value = { ...resourceBrowserVerification.value, [id]: false }
+    const browserErrors: Record<string, string> = {
+      resource_browser_start_failed: 'Server 浏览器已安装，但未能启动。请到系统设置 → 内置浏览器检查运行状态后重试登录。',
+      resource_browser_unavailable: 'Server 内置浏览器不可用。请先到系统设置 → 内置浏览器完成安装或检查运行依赖。',
+      resource_browser_login_expired: '本次登录验证已过期，请重新输入账号密码。已保存的登录状态不会因此删除。',
+    }
+    resourceLoginErrors.value = { ...resourceLoginErrors.value, [id]: reason instanceof APIError ? browserErrors[reason.errorCode] ?? message(reason) : message(reason) }
+  }
+}
+
+async function browserResult(plugin: InstalledPluginSummary, connection: PluginConnectionSummary, response: ResourceLoginResponse) {
+  resourceBrowserVerification.value = { ...resourceBrowserVerification.value, [connection.id]: false }
+  resourceLoginErrors.value = { ...resourceLoginErrors.value, [connection.id]: '' }
+  resourceLoginResponses.value = { ...resourceLoginResponses.value, [connection.id]: response }
+  if (response.state === 'authenticated') {
+    try { await loadConnections(plugin) } catch { resourceLoginErrors.value = { ...resourceLoginErrors.value, [connection.id]: '登录已验证，但刷新连接列表失败，请重新打开连接列表。' } }
+  }
+}
 const authPollTimers = new Map<string, number>()
 let installDialogReturnFocus: HTMLElement | null = null
 
 const canManage = computed(() => auth.can(Permissions.PluginsInstall))
+watch(canManage, allowed => { if (!allowed) cancelResourceRequest() })
 
 async function loadRepositories() {
   repositoriesLoading.value = true
@@ -179,69 +220,86 @@ function resourceEntryOptions(plugin: InstalledPluginSummary) {
 }
 
 async function submitResourceLogin(plugin: InstalledPluginSummary, connection: PluginConnectionSummary, credentials: { username: string, password: string }) {
+  const request = beginResourceRequest()
+  resourceHealthResponses.value = { ...resourceHealthResponses.value, [connection.id]: undefined }
   resourceLoginBusyID.value = connection.id
   resourceLoginErrors.value = { ...resourceLoginErrors.value, [connection.id]: '' }
   resourceLoginResponses.value = { ...resourceLoginResponses.value, [connection.id]: undefined }
   try {
-    const response = await api<ResourceLoginResponse>(pluginResourceAuthPath(plugin.id, connection.id, 'login'), { method: 'POST', body: JSON.stringify(buildPluginResourceLoginPayload(credentials.username, credentials.password)) })
+    const body = JSON.stringify(buildPluginResourceLoginPayload(credentials.username, credentials.password))
+    credentials.password = ''
+    const response = await api<ResourceLoginResponse>(pluginResourceAuthPath(plugin.id, connection.id, 'login'), { method: 'POST', body, signal: request.signal })
+    if (!request.current()) return
     resourceLoginResponses.value = { ...resourceLoginResponses.value, [connection.id]: response }
     if (response.state === 'authenticated') {
       notify(response.accountName ? `资源站登录成功：${response.accountName}` : '资源站登录成功', 'success')
       await loadConnections(plugin)
     }
   } catch (reason) {
-    resourceLoginErrors.value = { ...resourceLoginErrors.value, [connection.id]: message(reason) }
+    if (request.current()) resourceFailure(connection.id, reason)
   } finally {
-    resourceLoginBusyID.value = ''
+    credentials.password = ''; request.finish()
   }
 }
 
 async function checkResourceHealth(plugin: InstalledPluginSummary, connection: PluginConnectionSummary) {
+  const request = beginResourceRequest()
+  resourceLoginResponses.value = { ...resourceLoginResponses.value, [connection.id]: undefined }
   resourceLoginBusyID.value = connection.id
   resourceLoginErrors.value = { ...resourceLoginErrors.value, [connection.id]: '' }
   try {
-    const response = await api<ResourceHealthResponse>(pluginResourceHealthPath(plugin.id, connection.id), { method: 'POST', body: '{}' })
+    const response = await api<ResourceHealthResponse>(pluginResourceHealthPath(plugin.id, connection.id), { method: 'POST', body: '{}', signal: request.signal })
+    if (!request.current()) return
     resourceHealthResponses.value = { ...resourceHealthResponses.value, [connection.id]: response }
     if (response.status === 'healthy') notify(response.accountName ? `入口与登录正常：${response.accountName}` : '入口与登录正常', 'success')
     await loadConnections(plugin)
   } catch (reason) {
-    resourceHealthResponses.value = { ...resourceHealthResponses.value, [connection.id]: undefined }
-    resourceLoginErrors.value = { ...resourceLoginErrors.value, [connection.id]: message(reason) }
+    if (request.current()) {
+      resourceHealthResponses.value = { ...resourceHealthResponses.value, [connection.id]: undefined }
+      resourceFailure(connection.id, reason)
+    }
   } finally {
-    resourceLoginBusyID.value = ''
+    request.finish()
   }
 }
 
 async function submitResourceCookie(plugin: InstalledPluginSummary, connection: PluginConnectionSummary, cookie: string) {
+  const request = beginResourceRequest()
+  resourceHealthResponses.value = { ...resourceHealthResponses.value, [connection.id]: undefined }
   resourceLoginBusyID.value = connection.id
   resourceLoginErrors.value = { ...resourceLoginErrors.value, [connection.id]: '' }
   resourceLoginResponses.value = { ...resourceLoginResponses.value, [connection.id]: undefined }
   try {
-    const response = await api<ResourceLoginResponse>(pluginResourceAuthPath(plugin.id, connection.id, 'cookie'), { method: 'POST', body: JSON.stringify(buildPluginResourceCookiePayload(cookie)) })
+    const body = JSON.stringify(buildPluginResourceCookiePayload(cookie)); cookie = ''
+    const response = await api<ResourceLoginResponse>(pluginResourceAuthPath(plugin.id, connection.id, 'cookie'), { method: 'POST', body, signal: request.signal })
+    if (!request.current()) return
     resourceLoginResponses.value = { ...resourceLoginResponses.value, [connection.id]: response }
     notify('Cookie 已加密保存', 'success')
     await loadConnections(plugin)
   } catch (reason) {
-    resourceLoginErrors.value = { ...resourceLoginErrors.value, [connection.id]: message(reason) }
+    if (request.current()) resourceFailure(connection.id, reason)
   } finally {
-    resourceLoginBusyID.value = ''
+    cookie = ''; request.finish()
   }
 }
 
 async function submitResourceCaptcha(plugin: InstalledPluginSummary, connection: PluginConnectionSummary, challengeID: string, points: ResourceCaptchaPoint[]) {
+  const request = beginResourceRequest()
+  resourceHealthResponses.value = { ...resourceHealthResponses.value, [connection.id]: undefined }
   resourceLoginBusyID.value = connection.id
   resourceLoginErrors.value = { ...resourceLoginErrors.value, [connection.id]: '' }
   try {
-    const response = await api<ResourceLoginResponse>(pluginResourceAuthPath(plugin.id, connection.id, 'captcha'), { method: 'POST', body: JSON.stringify(buildPluginResourceCaptchaPayload(challengeID, points)) })
+    const response = await api<ResourceLoginResponse>(pluginResourceAuthPath(plugin.id, connection.id, 'captcha'), { method: 'POST', body: JSON.stringify(buildPluginResourceCaptchaPayload(challengeID, points)), signal: request.signal })
+    if (!request.current()) return
     resourceLoginResponses.value = { ...resourceLoginResponses.value, [connection.id]: response }
     if (response.state === 'authenticated') {
       notify(response.accountName ? `资源站登录成功：${response.accountName}` : '资源站登录成功', 'success')
       await loadConnections(plugin)
     }
   } catch (reason) {
-    resourceLoginErrors.value = { ...resourceLoginErrors.value, [connection.id]: message(reason) }
+    if (request.current()) resourceFailure(connection.id, reason)
   } finally {
-    resourceLoginBusyID.value = ''
+    request.finish()
   }
 }
 
@@ -289,6 +347,7 @@ async function createConnection(plugin: InstalledPluginSummary) {
 }
 
 function beginEditConnection(connection: PluginConnectionSummary) {
+  cancelResourceRequest()
   editingConnectionID.value = connection.id
   connectionEditConfig.value = { ...connection.config }
   connectionEditCredential.value = ''
@@ -300,6 +359,7 @@ function cancelEditConnection() {
 }
 
 async function saveConnectionConfig(plugin: InstalledPluginSummary, connection: PluginConnectionSummary) {
+  cancelResourceRequest()
   connectionBusyID.value = connection.id
   try {
     await api(pluginConnectionPath(plugin.id, connection.id), { method: 'PATCH', body: JSON.stringify(buildPluginConnectionConfigPayload(connection, connectionEditConfig.value, connectionEditCredential.value)) })
@@ -314,6 +374,7 @@ async function saveConnectionConfig(plugin: InstalledPluginSummary, connection: 
 }
 
 async function setConnectionEnabled(plugin: InstalledPluginSummary, connection: PluginConnectionSummary, enabled: boolean) {
+  cancelResourceRequest()
   connectionBusyID.value = connection.id
   try {
     await api(pluginConnectionPath(plugin.id, connection.id), { method: 'PATCH', body: JSON.stringify(buildPluginConnectionTogglePayload(connection, enabled)) })
@@ -328,6 +389,7 @@ async function setConnectionEnabled(plugin: InstalledPluginSummary, connection: 
 
 async function deleteConnection(plugin: InstalledPluginSummary, connection: PluginConnectionSummary) {
   if (!window.confirm(`确认删除插件连接“${connection.name}”？远端账号与内容不会被删除。`)) return
+  cancelResourceRequest()
   connectionBusyID.value = connection.id
   try {
     await api(pluginConnectionPath(plugin.id, connection.id), { method: 'DELETE', body: JSON.stringify(buildPluginConnectionDeletePayload(connection)) })
@@ -396,6 +458,7 @@ function connectionHealthLabel(connection: PluginConnectionSummary) {
   if (connection.health_status === 'auth_pending') return connection.resource_type === 'bt_resource' ? '等待登录验证' : '等待扫码'
   if (connection.health_status === 'auth_expired' || connection.health_status === 'auth_required') return '需要登录'
   if (connection.health_status === 'rate_limited') return '站点限流中'
+  if (connection.health_status === 'browser_verification_required') return '需要浏览器验证'
   if (connection.health_status === 'unavailable') return '入口不可用'
   if (connection.health_status === 'error') return '连接异常'
   return connection.enabled ? '待检测' : '已停用'
@@ -406,6 +469,7 @@ function credentialScopes(plugin: InstalledPluginSummary) {
 }
 
 onBeforeUnmount(() => {
+  cancelResourceRequest()
   for (const timer of authPollTimers.values()) window.clearTimeout(timer)
   authPollTimers.clear()
 })
@@ -802,6 +866,9 @@ onMounted(() => { void loadAll() })
                   :health-response="resourceHealthResponses[connection.id]"
                   :error="resourceLoginErrors[connection.id]"
                   :busy="resourceLoginBusyID === connection.id"
+                  :browser-verification="resourceBrowserVerification[connection.id]"
+                  @browser-result="browserResult(plugin, connection, $event)"
+                  @browser-cancel="resourceBrowserVerification[connection.id] = false"
                   @login="submitResourceLogin(plugin, connection, $event)"
                   @cookie="submitResourceCookie(plugin, connection, $event)"
                   @captcha="submitResourceCaptcha(plugin, connection, $event.challengeId, $event.points)"

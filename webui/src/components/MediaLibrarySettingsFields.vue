@@ -10,6 +10,10 @@ const cloud115 = computed(() => props.storageType === 'pan115')
 
 <template>
   <div>
+    <section v-if="cloud115" class="semantic-inset mb-5 p-4">
+      <label class="text-muted flex items-center gap-3 text-sm"><input v-model="model.cloud_empty_cleanup_enabled" type="checkbox" :disabled="disabled" />云端空媒体目录清理</label>
+      <p class="text-subtle mb-0 mt-2 text-xs">默认关闭。开启后，仅检查删除事件影响的目录，确认目录为空且没有正在写入的任务时移入网盘回收站；不会删除媒体库根目录。有任何文件（包括 NFO、海报、字幕）或检查失败时均保留，不会永久删除。</p>
+    </section>
     <section class="semantic-inset mb-5 p-4">
       <h3 class="m-0 text-base">入库与文件整理</h3>
       <p class="text-subtle mb-4 mt-1 text-sm">{{ cloud115 ? '115 离线下载完成后，会在同一账号内按这里的策略重命名并整理到当前媒体库。' : '下载仍进入全局暂存目录；完成后按这里的策略重命名并转移到当前媒体库。' }}</p>

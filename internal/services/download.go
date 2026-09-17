@@ -20,6 +20,7 @@ import (
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/authz"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/classification"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/credential"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/database"
 	serverlog "github.com/yuanjing-hash/OhMyCine-Server/internal/logging"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/medialibrary"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/mediarecognition"
@@ -299,60 +300,61 @@ type downloadJobPayload struct {
 }
 
 type DownloadTaskSummary struct {
-	ID                string     `json:"id"`
-	JobID             string     `json:"job_id"`
-	OwnerID           uint       `json:"owner_id"`
-	DownloaderID      *string    `json:"downloader_id"`
-	DownloaderName    string     `json:"downloader_name"`
-	ProviderType      string     `json:"provider_type"`
-	DisplayName       string     `json:"display_name"`
-	JobStatus         string     `json:"job_status"`
-	ProviderStatus    string     `json:"provider_status"`
-	Phase             string     `json:"phase"`
-	Progress          *float64   `json:"progress"`
-	BytesCompleted    *int64     `json:"bytes_completed"`
-	BytesTotal        *int64     `json:"bytes_total"`
-	DownloadSpeed     *int64     `json:"download_speed"`
-	UploadSpeed       *int64     `json:"upload_speed"`
-	ETASeconds        *int64     `json:"eta_seconds"`
-	LastSampledAt     *time.Time `json:"last_sampled_at"`
-	LastErrorCode     string     `json:"last_error_code"`
-	LastErrorMessage  string     `json:"last_error_message"`
-	CreatedAt         time.Time  `json:"created_at"`
-	UpdatedAt         time.Time  `json:"updated_at"`
-	FinishedAt        *time.Time `json:"finished_at"`
-	ProfileID         uint       `json:"profile_id"`
-	ProfileRevision   uint64     `json:"profile_revision"`
-	ScrapeStatus      string     `json:"scrape_status"`
-	ScrapeTitle       string     `json:"scrape_title"`
-	ScrapeMediaType   string     `json:"scrape_media_type"`
-	ScrapeCategory    string     `json:"scrape_category"`
-	ScrapeTMDBID      *int64     `json:"scrape_tmdb_id"`
-	ScrapeConfidence  *float64   `json:"scrape_confidence"`
-	ScrapeSeason      *int       `json:"scrape_season"`
-	ScrapeEpisode     *int       `json:"scrape_episode"`
-	IdentitySource    string     `json:"identity_source"`
-	IdentityStatus    string     `json:"identity_status"`
-	IdentityLocked    bool       `json:"identity_locked"`
-	IdentityRevision  uint64     `json:"identity_revision"`
-	ManifestFiles     int        `json:"manifest_file_count"`
-	TargetLibraryID   *uint      `json:"target_library_id"`
-	TargetLibraryName string     `json:"target_library_name"`
-	TransferMode      string     `json:"transfer_mode"`
-	ConflictPolicy    string     `json:"conflict_policy"`
-	RouteKind         string     `json:"route_kind"`
-	TransferPhase     string     `json:"transfer_phase"`
-	TransferTaskID    string     `json:"transfer_task_id"`
-	TransferJobID     string     `json:"transfer_job_id"`
-	TransferJobStatus string     `json:"transfer_job_status"`
-	SeedingTaskID     string     `json:"seeding_task_id"`
-	SeedingJobID      string     `json:"seeding_job_id"`
-	SeedingJobStatus  string     `json:"seeding_job_status"`
-	SeedingPhase      string     `json:"seeding_phase"`
-	LifecycleScope    string     `json:"lifecycle_scope"`
-	ExecutionLocation string     `json:"execution_location"`
-	NodeID            *string    `json:"node_id,omitempty"`
-	NodeName          string     `json:"node_name,omitempty"`
+	ID                string            `json:"id"`
+	JobID             string            `json:"job_id"`
+	OwnerID           uint              `json:"owner_id"`
+	DownloaderID      *string           `json:"downloader_id"`
+	DownloaderName    string            `json:"downloader_name"`
+	ProviderType      string            `json:"provider_type"`
+	DisplayName       string            `json:"display_name"`
+	JobStatus         string            `json:"job_status"`
+	ProviderStatus    string            `json:"provider_status"`
+	Phase             string            `json:"phase"`
+	Progress          *float64          `json:"progress"`
+	BytesCompleted    *int64            `json:"bytes_completed"`
+	BytesTotal        *int64            `json:"bytes_total"`
+	DownloadSpeed     *int64            `json:"download_speed"`
+	UploadSpeed       *int64            `json:"upload_speed"`
+	ETASeconds        *int64            `json:"eta_seconds"`
+	LastSampledAt     *time.Time        `json:"last_sampled_at"`
+	LastErrorCode     string            `json:"last_error_code"`
+	LastErrorMessage  string            `json:"last_error_message"`
+	CreatedAt         time.Time         `json:"created_at"`
+	UpdatedAt         time.Time         `json:"updated_at"`
+	FinishedAt        *time.Time        `json:"finished_at"`
+	ProfileID         uint              `json:"profile_id"`
+	ProfileRevision   uint64            `json:"profile_revision"`
+	ScrapeStatus      string            `json:"scrape_status"`
+	ScrapeTitle       string            `json:"scrape_title"`
+	ScrapeMediaType   string            `json:"scrape_media_type"`
+	ScrapeCategory    string            `json:"scrape_category"`
+	ScrapeTMDBID      *int64            `json:"scrape_tmdb_id"`
+	ScrapeConfidence  *float64          `json:"scrape_confidence"`
+	ScrapeSeason      *int              `json:"scrape_season"`
+	ScrapeEpisode     *int              `json:"scrape_episode"`
+	IdentitySource    string            `json:"identity_source"`
+	IdentityStatus    string            `json:"identity_status"`
+	IdentityLocked    bool              `json:"identity_locked"`
+	IdentityRevision  uint64            `json:"identity_revision"`
+	ManifestFiles     int               `json:"manifest_file_count"`
+	TargetLibraryID   *uint             `json:"target_library_id"`
+	TargetLibraryName string            `json:"target_library_name"`
+	WaitReason        *JobWaitReasonDTO `json:"wait_reason,omitempty"`
+	TransferMode      string            `json:"transfer_mode"`
+	ConflictPolicy    string            `json:"conflict_policy"`
+	RouteKind         string            `json:"route_kind"`
+	TransferPhase     string            `json:"transfer_phase"`
+	TransferTaskID    string            `json:"transfer_task_id"`
+	TransferJobID     string            `json:"transfer_job_id"`
+	TransferJobStatus string            `json:"transfer_job_status"`
+	SeedingTaskID     string            `json:"seeding_task_id"`
+	SeedingJobID      string            `json:"seeding_job_id"`
+	SeedingJobStatus  string            `json:"seeding_job_status"`
+	SeedingPhase      string            `json:"seeding_phase"`
+	LifecycleScope    string            `json:"lifecycle_scope"`
+	ExecutionLocation string            `json:"execution_location"`
+	NodeID            *string           `json:"node_id,omitempty"`
+	NodeName          string            `json:"node_name,omitempty"`
 }
 
 const (
@@ -940,6 +942,7 @@ func (s *DownloadService) ListScoped(actor Actor, scope string, limit int) ([]Do
 		jobIDs = append(jobIDs, record.JobID)
 	}
 	jobs := map[string]string{}
+	waitReasons := map[string]*JobWaitReasonDTO{}
 	type transferSummary struct {
 		ID             string
 		DownloadTaskID string
@@ -958,11 +961,20 @@ func (s *DownloadService) ListScoped(actor Actor, scope string, limit int) ([]Do
 	seeding := map[string]seedingSummary{}
 	if len(jobIDs) > 0 {
 		var rows []models.Job
-		if err := s.db.Select("id", "status").Where("id IN ?", jobIDs).Find(&rows).Error; err != nil {
+		if err := s.db.Where("id IN ?", jobIDs).Find(&rows).Error; err != nil {
 			return nil, 0, err
 		}
-		for _, job := range rows {
+		jobDTOs := make([]JobDTO, len(rows))
+		reader := s.queue
+		if reader == nil {
+			reader = NewQueueService(s.db, s.audit)
+		}
+		if err := reader.projectJobWaitReasons(actor, rows, jobDTOs); err != nil {
+			return nil, 0, err
+		}
+		for i, job := range rows {
 			jobs[job.ID] = job.Status
+			waitReasons[job.ID] = jobDTOs[i].WaitReason
 		}
 	}
 	if len(records) > 0 {
@@ -996,6 +1008,7 @@ func (s *DownloadService) ListScoped(actor Actor, scope string, limit int) ([]Do
 	items := make([]DownloadTaskSummary, 0, len(records))
 	for _, record := range records {
 		item := downloadTaskSummary(record, jobs[record.JobID])
+		item.WaitReason = waitReasons[record.JobID]
 		if transfer, ok := transfers[record.ID]; ok {
 			item.TransferPhase = transfer.Phase
 			item.TransferTaskID = transfer.ID
@@ -1679,14 +1692,18 @@ func (w *DownloadWorker) Run(ctx context.Context, runtime JobRuntime, job Claime
 			}
 			return w.failure(task, err)
 		}
+		durableProviderID := task.ProviderTaskID
 		if providerTask.ID != "" && providerTask.ID != task.ProviderTaskID {
 			task.ProviderTaskID = providerTask.ID
 		}
-		if err := w.persistTelemetry(&task, providerTask); err != nil {
-			if errors.Is(err, context.Canceled) {
+		if err := w.persistTrackedTelemetry(ctx, job, &task, providerTask); err != nil {
+			if ctx.Err() != nil || errors.Is(err, context.Canceled) {
 				return WorkerResult{}
 			}
-			return WorkerResult{ErrorCode: "download_state_persist_failed", ErrorMessage: "下载任务状态保存失败"}
+			if ErrorCode(err) == CodeQueueLeaseInvalid {
+				return WorkerResult{ErrorCode: CodeQueueLeaseInvalid, ErrorMessage: "下载跟踪租约已失效，旧执行器已停止写入"}
+			}
+			return w.telemetryPersistenceFailure(task, durableProviderID, err)
 		}
 		if task.ProviderTag != "" && (nextTagCleanupAt.IsZero() || !time.Now().Before(nextTagCleanupAt)) {
 			if cleanupErr := w.service.cleanupManagedProviderTag(ctx, &task, client); cleanupErr != nil {
@@ -1705,7 +1722,13 @@ func (w *DownloadWorker) Run(ctx context.Context, runtime JobRuntime, job Claime
 			speed = &value
 		}
 		if err := runtime.Heartbeat(progress, providerTask.BytesCompleted, providerTask.BytesTotal, speed, providerTask.ETASeconds); err != nil {
-			return WorkerResult{ErrorCode: CodeQueueLeaseInvalid, ErrorMessage: "下载任务租约已失效"}
+			if ctx.Err() != nil {
+				return WorkerResult{}
+			}
+			if ErrorCode(err) == CodeQueueLeaseInvalid {
+				return WorkerResult{ErrorCode: CodeQueueLeaseInvalid, ErrorMessage: "下载任务租约已失效"}
+			}
+			return w.telemetryPersistenceFailure(task, task.ProviderTaskID, err)
 		}
 		if providerTask.Completed {
 			operation.Event(w.service.log.Info()).Str("task_id", task.ID).Str("downloader_id", downloaderRecord.ID).Msg(operation.Message("下载器已报告完成，开始复核文件清单"))
@@ -2676,7 +2699,47 @@ func (w *DownloadWorker) cancelLateSubmittedProvider(ctx context.Context, task *
 	return appError(CodeDownloaderUnavailable, "下载器任务取消失败，请重试删除该下载记录", nil)
 }
 
+// Retry the sampled state, not the provider operation. Every attempt rechecks
+// cancellation and the exact queue lease in the same write transaction.
+func (w *DownloadWorker) persistTrackedTelemetry(ctx context.Context, job ClaimedJob, task *models.DownloadTask, provider downloadpkg.Task) error {
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		if err = ctx.Err(); err != nil {
+			return err
+		}
+		err = w.persistTelemetryContext(ctx, task, provider, &job)
+		if err == nil || !database.IsTransientWriteError(err) || attempt == 2 {
+			return err
+		}
+		timer := time.NewTimer(time.Duration(attempt+1) * 100 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return err
+}
+
+func (w *DownloadWorker) telemetryPersistenceFailure(task models.DownloadTask, durableProviderID string, err error) WorkerResult {
+	class := database.ErrorClass(err)
+	result := WorkerResult{ErrorCode: "download_state_persist_failed", ErrorMessage: "下载进度保存失败，已停止本次跟踪；下载器中的任务未被取消，请检查数据库状态后重试跟踪"}
+	if database.IsTransientWriteError(err) && isEstablishedProviderTask(durableProviderID) {
+		next := time.Now().UTC().Add(10 * time.Second)
+		result.RetryAt = &next
+		result.ErrorCode = "download_tracking_persist_wait"
+		result.ErrorMessage = "数据库暂时忙碌，将自动恢复原下载任务的进度跟踪；不会重新提交下载"
+	}
+	downloadOperation(task.ProviderType, task.SourceOrigin).Event(w.service.log.Warn()).Str("task_id", task.ID).Str("error_code", result.ErrorCode).Str("database_error_class", class).Bool("tracking_retry", result.RetryAt != nil).Msg("下载进度保存失败；下载器任务保留，未重复提交")
+	return result
+}
+
 func (w *DownloadWorker) persistTelemetry(task *models.DownloadTask, provider downloadpkg.Task) error {
+	return w.persistTelemetryContext(context.Background(), task, provider, nil)
+}
+
+func (w *DownloadWorker) persistTelemetryContext(ctx context.Context, task *models.DownloadTask, provider downloadpkg.Task, claim *ClaimedJob) error {
 	now := time.Now().UTC()
 	clearTerminalError := !provider.Failed && (task.Phase == models.DownloadTaskStatusFailed || recoverableDownloadTelemetryError(task.LastErrorCode))
 	phase := models.DownloadTaskStatusDownloading
@@ -2689,7 +2752,15 @@ func (w *DownloadWorker) persistTelemetry(task *models.DownloadTask, provider do
 	if clearTerminalError {
 		updates["last_error_code"], updates["last_error_message"], updates["finished_at"] = "", "", nil
 	}
-	err := w.service.db.Transaction(func(tx *gorm.DB) error {
+	err := w.service.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if claim != nil {
+			if claim.Job.ID != task.JobID {
+				return appError(CodeQueueLeaseInvalid, "任务租约已失效", nil)
+			}
+			if _, err := w.service.queue.verifyLease(tx, task.JobID, claim.LeaseToken); err != nil {
+				return err
+			}
+		}
 		result := tx.Model(&models.DownloadTask{}).
 			Where("id = ? AND phase <> ?", task.ID, models.DownloadTaskStatusCancelled).
 			Updates(updates)

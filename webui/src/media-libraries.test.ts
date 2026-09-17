@@ -10,6 +10,14 @@ function storage(type: string, direct = false, signed = false): StorageSummary {
 }
 
 describe('media library form boundary', () => {
+  it('defaults cloud empty cleanup off and submits it only for supported cloud sources', () => {
+    const draft = emptyMediaLibraryDraft(1, 2)
+    expect(draft.cloud_empty_cleanup_enabled).toBe(false)
+    draft.cloud_empty_cleanup_enabled = true
+    expect(payloadFromDraft(draft, storage('pan115')).cloud_empty_cleanup_enabled).toBe(true)
+    expect(payloadFromDraft(draft, storage('local')).cloud_empty_cleanup_enabled).toBe(false)
+    expect(payloadFromDraft(draft, storage('alist')).cloud_empty_cleanup_enabled).toBe(false)
+  })
   it('distinguishes accepted retirement from completed deletion', () => {
     expect(mediaLibraryDeletionNotice({ deleted: false, status: 'deleting', job_id: 'job' })).toContain('尚未删除完成')
     expect(mediaLibraryDeletionNotice({ deleted: true })).toContain('已删除')
@@ -190,7 +198,7 @@ describe('media library form boundary', () => {
 
   it('keeps background structure diagnosis read-only and does not restart it while viewing progress', () => {
     const source = readFileSync(new URL('./views/MediaLibrariesView.vue', import.meta.url), 'utf8')
-    for (const text of ['目录结构诊断正在后台', '目录结构诊断系统失败', '诊断全程只读，不会移动文件', '系统正在自动核验文件结果，无需手动确认', '在任务中心查看', 'processed_items', 'classifications.duplicate_target', 'classifications.sidecar_target_conflict']) expect(source).toContain(text)
+    for (const text of ['目录结构诊断正在后台', '目录结构诊断系统失败', '诊断全程只读，不会移动文件', '系统正在自动核验文件结果，无需手动确认', '在任务中心查看', 'processed_items', 'pending_classifications', 'handled_classifications']) expect(source).toContain(text)
     expect(source).toContain('async function viewStructureDiagnostics()')
     expect(source).toContain('await showStructureDiagnostics(false)')
     expect(source).toContain('await loadStructureIssues(libraryID)')

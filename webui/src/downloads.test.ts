@@ -6,6 +6,11 @@ import type { DownloadTaskSummary } from '@/types/api'
 const task = { job_status: 'queued' } as DownloadTaskSummary
 
 describe('download presentation', () => {
+  it('shows the authoritative queued dependency explanation separately from errors', () => {
+    const source = readFileSync(new URL('./views/DownloadsView.vue', import.meta.url), 'utf8')
+    expect(source).toContain('v-if="task.wait_reason"')
+    expect(source).toContain('{{ task.wait_reason.message }}')
+  })
   it('keeps unknown telemetry unknown instead of rendering zero', () => {
     expect(formatBytes(null)).toBe('未知')
     expect(formatProgress(null)).toBe('未知')

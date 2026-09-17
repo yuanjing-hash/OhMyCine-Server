@@ -12,6 +12,35 @@ const connection: PluginConnectionSummary = {
 }
 
 describe('plugin resource login', () => {
+  it('normal login has no separate browser installation or browser-login workflow', () => {
+    const wrapper = mount(PluginResourceLogin, { props: { pluginId: 'org.example.resource', connection } })
+    expect(wrapper.text()).toContain('默认使用 Server 内置浏览器登录')
+    expect(wrapper.text()).not.toContain('打开浏览器登录')
+    expect(wrapper.text()).not.toContain('接受许可')
+    expect(wrapper.findComponent({ name: 'PluginBrowserLogin' }).exists()).toBe(false)
+    wrapper.unmount()
+  })
+  it('does not present stale login expiry or success when the latest check failed', () => {
+    for (const status of ['healthy', 'auth_required'] as const) {
+      const wrapper = mount(PluginResourceLogin, { props: {
+        pluginId: 'org.example.resource', connection, healthResponse: { status },
+        error: '资源站要求浏览器安全验证，暂时无法确认登录状态',
+      } })
+      expect(wrapper.text()).toContain('本次验证未通过，请查看下方原因')
+      expect(wrapper.text()).not.toContain('入口可用，需要重新登录')
+      expect(wrapper.text()).not.toContain('入口可用，登录有效')
+      expect(wrapper.get('.status-chip').classes()).toContain('status-chip--warning')
+    }
+  })
+
+  it('distinguishes persisted browser verification from expired credentials and rate limits', () => {
+    const wrapper = mount(PluginResourceLogin, { props: {
+      pluginId: 'org.example.resource', connection: { ...connection, health_status: 'browser_verification_required' },
+    } })
+    expect(wrapper.text()).toContain('站点要求浏览器验证，登录状态待确认')
+    expect(wrapper.text()).not.toContain('登录已过期')
+    expect(wrapper.text()).not.toContain('站点正在限流')
+  })
   it('emits a generic health check and renders only the normalized result', async () => {
     const wrapper = mount(PluginResourceLogin, {
       props: { pluginId: 'org.example.resource', connection, healthResponse: { status: 'healthy', accountName: '测试账号' } },

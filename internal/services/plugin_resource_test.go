@@ -112,6 +112,54 @@ func TestPluginResourceAuthenticatedLoginRequiresHealthyProbe(t *testing.T) {
 	}
 }
 
+func TestPluginResourceHealthDistinguishesVerificationFromRateLimit(t *testing.T) {
+	for _, tc := range []struct{ provider, code, status string }{
+		{"browser-verification-required", "resource_browser_verification_required", "browser_verification_required"},
+		{"rate-limited", "resource_rate_limited", "rate_limited"},
+		{"not-authenticated", "resource_auth_required", "auth_required"},
+	} {
+		t.Run(tc.provider, func(t *testing.T) {
+			service, _, runtime, _, connection, site := resourcePluginServiceFixture(t, "org.ohmycine.resource-health")
+			runtime.responses["resource.health"] = []byte(`{"pluginError":{"code":"` + tc.provider + `","message":"untrusted upstream content"}}`)
+			_, err := service.ResourceHealth(context.Background(), connection.PluginID, connection.ID)
+			if ErrorCode(err) != tc.code {
+				t.Fatalf("code=%s want=%s", ErrorCode(err), tc.code)
+			}
+			var stored models.PluginConnection
+			if err := service.db.First(&stored, "id = ?", connection.ID).Error; err != nil {
+				t.Fatal(err)
+			}
+			if stored.LastHealthStatus != tc.status || stored.LastHealthErrorCode != tc.code {
+				t.Fatalf("status=%s code=%s", stored.LastHealthStatus, stored.LastHealthErrorCode)
+			}
+			var storedSite models.Site
+			if err := service.db.First(&storedSite, site.ID).Error; err != nil {
+				t.Fatal(err)
+			}
+			if storedSite.LastHealthStatus != tc.status {
+				t.Fatalf("site status=%s", storedSite.LastHealthStatus)
+			}
+		})
+	}
+}
+
+func TestPluginResourceCookieVerificationRestoresCredentialWithoutAuthExpiryError(t *testing.T) {
+	service, actor, runtime, _, connection, _ := resourcePluginServiceFixture(t, "org.ohmycine.resource-challenge")
+	runtime.responses["resource.auth.cookie"] = []byte(`{"state":"authenticated"}`)
+	runtime.responses["resource.health"] = []byte(`{"pluginError":{"code":"browser-verification-required"}}`)
+	_, err := service.SubmitResourceCookie(context.Background(), actor, connection.PluginID, contract.ResourceCookieRequest{ConnectionID: connection.ID, Cookie: "session=test; verification=test"})
+	if ErrorCode(err) != "resource_browser_verification_required" {
+		t.Fatalf("code=%s", ErrorCode(err))
+	}
+	var stored models.PluginConnection
+	if err := service.db.First(&stored, "id = ?", connection.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if stored.CredentialCiphertext != connection.CredentialCiphertext || stored.LastHealthStatus != connection.LastHealthStatus {
+		t.Fatal("failed replacement changed previous credential or health")
+	}
+}
+
 func TestPluginResourceInvalidPastedCookieRestoresPreviousCredential(t *testing.T) {
 	service, actor, runtime, store, connection, _ := resourcePluginServiceFixture(t, "org.ohmycine.resource-cookie")
 	runtime.responses["resource.auth.cookie"] = []byte(`{"state":"authenticated"}`)

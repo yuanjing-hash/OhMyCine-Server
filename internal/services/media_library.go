@@ -112,6 +112,7 @@ type MediaLibraryInput struct {
 	STRMLocalRoot            string
 	MetadataArtifactsEnabled *bool
 	UploadSidecars           bool
+	CloudEmptyCleanupEnabled *bool
 	TransferMode             string
 	ConflictPolicy           string
 	MovieDirectoryTemplate   string
@@ -337,6 +338,10 @@ func (s *MediaLibraryService) Update(ctx context.Context, actor Actor, id uint, 
 	if input.MetadataArtifactsEnabled == nil {
 		value := existing.MetadataArtifactsEnabled
 		input.MetadataArtifactsEnabled = &value
+	}
+	if input.CloudEmptyCleanupEnabled == nil {
+		value := existing.CloudEmptyCleanupEnabled
+		input.CloudEmptyCleanupEnabled = &value
 	}
 	// Legacy intake configuration belongs to already-running compatibility
 	// routes. Ignore request fields and copy the persisted snapshot back after
@@ -634,7 +639,27 @@ func (s *MediaLibraryService) Scan(ctx context.Context, actor Actor, id uint, mo
 	case "incremental":
 		return s.reconcile(ctx, id, "incremental")
 	case "full":
-		return s.reconcile(ctx, id, "full")
+		run, err := s.reconcile(ctx, id, "full")
+		if err == nil {
+			followupErr := resolveCoveredProviderDeletions(s.db.WithContext(ctx), id, run.ID, func(tx *gorm.DB) (bool, error) {
+				var library models.MediaLibrary
+				if err := tx.First(&library, id).Error; err != nil {
+					return false, err
+				}
+				if library.STRMEnabled || library.MetadataArtifactsEnabled {
+					return false, nil
+				}
+				var artifacts []models.MediaArtifact
+				if err := tx.Select("id").Where("library_id = ? AND managed = ?", id, true).Limit(1).Find(&artifacts).Error; err != nil {
+					return false, err
+				}
+				return len(artifacts) == 0, nil
+			})
+			if followupErr != nil {
+				s.log.Warn().Uint("library_id", id).Msg("完整扫描已完成，旧删除通知的整理暂未完成")
+			}
+		}
+		return run, err
 	default:
 		return models.MediaLibraryScanRun{}, appError(CodeInvalidRequest, "媒体库扫描模式无效", nil)
 	}
@@ -754,6 +779,19 @@ func (s *MediaLibraryService) validateInput(ctx context.Context, id uint, actor 
 		}
 	}
 	metadataArtifactsEnabled := storage.Type == models.StorageTypeLocal || input.STRMEnabled
+	cloudEmptyCleanupEnabled := input.CloudEmptyCleanupEnabled != nil && *input.CloudEmptyCleanupEnabled
+	if cloudEmptyCleanupEnabled {
+		if storage.Type != models.StorageTypePan115 || storage.ConnectionID == nil || s.connections == nil {
+			return models.MediaLibrary{}, appError(CodeInvalidRequest, "该来源不支持可恢复的云端空目录清理", nil)
+		}
+		_, driver, err := s.connections.driver(*storage.ConnectionID)
+		if err != nil {
+			return models.MediaLibrary{}, err
+		}
+		if !driver.Capabilities().Recycle || !driver.Capabilities().DirectoryList {
+			return models.MediaLibrary{}, appError(CodeInvalidRequest, "来源不支持目录检查和回收，不能启用云端空目录清理", nil)
+		}
+	}
 	if input.MetadataArtifactsEnabled != nil {
 		metadataArtifactsEnabled = *input.MetadataArtifactsEnabled
 	}
@@ -978,7 +1016,7 @@ func (s *MediaLibraryService) validateInput(ctx context.Context, id uint, actor 
 	if input.Enabled {
 		status = models.MediaLibraryStatusInitializing
 	}
-	return models.MediaLibrary{Name: name, NameNormalized: strings.ToLower(name), StorageID: input.StorageID, ProfileID: input.ProfileID, ProfileRevision: profile.Revision, RelativeRoot: relativeRoot, ProviderRootID: strings.TrimSpace(input.ProviderRootID), Enabled: input.Enabled, Recursive: input.Recursive, FullScanIntervalHours: input.FullScanIntervalHours, IncrementalMinutes: input.IncrementalMinutes, VideoExtensionsJSON: string(extJSON), STRMAssetExtraExtensionsJSON: string(assetExtJSON), IgnorePatternsJSON: string(ignoreJSON), MetadataLanguage: input.MetadataLanguage, MetadataRegion: input.MetadataRegion, MatchStrategy: input.MatchStrategy, ProviderRatePerSecond: input.ProviderRatePerSecond, ProviderConcurrency: input.ProviderConcurrency, MetadataRatePerSecond: input.MetadataRatePerSecond, MetadataConcurrency: input.MetadataConcurrency, STRMEnabled: input.STRMEnabled, STRMLocalRoot: strmLocalRoot, SignedProxyEnabled: input.STRMEnabled, MetadataArtifactsEnabled: metadataArtifactsEnabled, UploadSidecars: input.UploadSidecars, ArtifactStatus: models.MediaArtifactStatusIdle, TransferMode: input.TransferMode, ConflictPolicy: input.ConflictPolicy, MovieDirectoryTemplate: input.MovieDirectoryTemplate, MovieFilenameTemplate: input.MovieFilenameTemplate, TVDirectoryTemplate: input.TVDirectoryTemplate, TVFilenameTemplate: input.TVFilenameTemplate, IngestEnabled: input.IngestEnabled, IngestDownloaderID: optionalString(ingestDownloaderID), IngestOwnerID: ingestOwnerID, IngestProviderRootID: ingestProviderRootID, IngestRelativeRoot: ingestRelativeRoot, Status: status}, nil
+	return models.MediaLibrary{Name: name, NameNormalized: strings.ToLower(name), StorageID: input.StorageID, ProfileID: input.ProfileID, ProfileRevision: profile.Revision, RelativeRoot: relativeRoot, ProviderRootID: strings.TrimSpace(input.ProviderRootID), Enabled: input.Enabled, Recursive: input.Recursive, FullScanIntervalHours: input.FullScanIntervalHours, IncrementalMinutes: input.IncrementalMinutes, VideoExtensionsJSON: string(extJSON), STRMAssetExtraExtensionsJSON: string(assetExtJSON), IgnorePatternsJSON: string(ignoreJSON), MetadataLanguage: input.MetadataLanguage, MetadataRegion: input.MetadataRegion, MatchStrategy: input.MatchStrategy, ProviderRatePerSecond: input.ProviderRatePerSecond, ProviderConcurrency: input.ProviderConcurrency, MetadataRatePerSecond: input.MetadataRatePerSecond, MetadataConcurrency: input.MetadataConcurrency, STRMEnabled: input.STRMEnabled, STRMLocalRoot: strmLocalRoot, SignedProxyEnabled: input.STRMEnabled, MetadataArtifactsEnabled: metadataArtifactsEnabled, UploadSidecars: input.UploadSidecars, CloudEmptyCleanupEnabled: cloudEmptyCleanupEnabled, ArtifactStatus: models.MediaArtifactStatusIdle, TransferMode: input.TransferMode, ConflictPolicy: input.ConflictPolicy, MovieDirectoryTemplate: input.MovieDirectoryTemplate, MovieFilenameTemplate: input.MovieFilenameTemplate, TVDirectoryTemplate: input.TVDirectoryTemplate, TVFilenameTemplate: input.TVFilenameTemplate, IngestEnabled: input.IngestEnabled, IngestDownloaderID: optionalString(ingestDownloaderID), IngestOwnerID: ingestOwnerID, IngestProviderRootID: ingestProviderRootID, IngestRelativeRoot: ingestRelativeRoot, Status: status}, nil
 }
 
 func normalizeSourceAssetExtraExtensions(values []string) ([]string, error) {
@@ -1341,9 +1379,27 @@ func (s *MediaLibraryService) supervise(ctx context.Context, id uint, wake chan 
 				if err != nil {
 					return err
 				}
+				if prepared.empty() {
+					return nil
+				}
 				reconcileCtx = withProviderChangeScope(reconcileCtx, prepared)
 			}
 			_, reconcileErr := s.reconcile(reconcileCtx, id, reason)
+			if errors.Is(reconcileErr, ErrCatalogBudget) {
+				if failedScope, ok := providerChangeScopeFromContext(reconcileCtx); ok {
+					for _, guard := range failedScope.DeletionGuards {
+						var delivery models.MediaLibraryProviderEvent
+						if err := s.db.WithContext(reconcileCtx).Where("library_id = ? AND id = ?", id, guard.DeliveryID).First(&delivery).Error; err != nil {
+							return err
+						}
+						if payload, valid := decodeProviderEventPayload(delivery.PayloadJSON); valid {
+							if err := s.deferProviderDelivery(reconcileCtx, delivery, payload, "deletion_scope_too_large", true); err != nil {
+								return err
+							}
+						}
+					}
+				}
+			}
 			if reconcileErr == nil {
 				if scope, ok := providerChangeScopeFromContext(reconcileCtx); ok && scope.DeliveryMaxID > 0 {
 					reconcileErr = s.ackProviderChangeScope(reconcileCtx, id, scope.DeliveryIDs)
@@ -1469,11 +1525,22 @@ func (s *MediaLibraryService) ProviderEventsChanged(ctx context.Context, connect
 	now := time.Now().UTC()
 	if err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		for _, id := range ids {
+			var library models.MediaLibrary
+			var storage models.Storage
+			if err := tx.First(&library, id).Error; err != nil {
+				return err
+			}
+			if err := tx.First(&storage, library.StorageID).Error; err != nil {
+				return err
+			}
+			if storage.ConnectionID == nil || *storage.ConnectionID != connectionID {
+				continue
+			}
 			for _, event := range events {
 				if event.ID == 0 || strings.TrimSpace(event.PayloadJSON) == "" {
 					return errors.New("provider event delivery is invalid")
 				}
-				delivery := models.MediaLibraryProviderEvent{LibraryID: id, InboxEventID: event.ID, PayloadJSON: event.PayloadJSON, CreatedAt: now, UpdatedAt: now}
+				delivery := models.MediaLibraryProviderEvent{LibraryID: id, InboxEventID: event.ID, PayloadJSON: event.PayloadJSON, SourceFingerprint: catalogSourceFingerprint(library, storage), CreatedAt: now, UpdatedAt: now}
 				if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&delivery).Error; err != nil {
 					return err
 				}
@@ -1520,13 +1587,16 @@ func (s *MediaLibraryService) hydratePendingProviderChanges(ctx context.Context,
 	if libraryID == 0 || pending == nil {
 		return nil
 	}
+	if err := s.recheckPausedProviderDeletions(ctx, libraryID); err != nil {
+		return err
+	}
 	// Invalid events remain durable for diagnosis, but cannot poison unrelated
 	// valid deliveries. Acknowledge explicit IDs, never a watermark across gaps.
 	rows := make([]models.MediaLibraryProviderEvent, 0, maxProviderChangeScopeItems/3)
 	offset := 0
 	for len(rows) < maxProviderChangeScopeItems/3 {
 		var page []models.MediaLibraryProviderEvent
-		if err := s.db.WithContext(ctx).Where("library_id = ? AND processed_at IS NULL", libraryID).
+		if err := s.db.WithContext(ctx).Where("library_id = ? AND processed_at IS NULL AND resolution_code != ? AND (retry_after IS NULL OR retry_after <= ?)", libraryID, providerEventNeedsReview, time.Now().UTC()).
 			Order("updated_at, id").Offset(offset).Limit(maxProviderChangeScopeItems / 3).Find(&page).Error; err != nil {
 			return err
 		}
@@ -1539,6 +1609,16 @@ func (s *MediaLibraryService) hydratePendingProviderChanges(ctx context.Context,
 			if !valid || payload.Kind == cloudpkg.ChangeFallback {
 				s.log.Warn().Uint("library_id", libraryID).Uint("delivery_id", row.ID).Msg("事件范围无效，保留待处理；禁止全量扫描")
 				continue
+			}
+			if payload.Kind == cloudpkg.ChangeDeleted {
+				completed, err := s.completeAbsentProviderDeletion(ctx, libraryID, row.ID, payload.ItemID)
+				if err != nil {
+					return err
+				}
+				if completed {
+					offset--
+					continue
+				}
 			}
 			rows = append(rows, row)
 			if len(rows) == maxProviderChangeScopeItems/3 {
@@ -2042,6 +2122,9 @@ func (s *MediaLibraryService) reconcile(ctx context.Context, id uint, kind strin
 		return run, appError(CodeMediaLibraryScanFailed, "媒体库扫描失败", scanErr)
 	}
 	if hasProviderScope {
+		if err := stageProviderPaths(ctx, s.db, library, storage, result, run); err != nil {
+			return s.failFastScanPersistence(run, operation, started, mediaLibraryPersistenceStageEntries, err)
+		}
 		applied, err := s.providerDeltaAlreadyApplied(ctx, id, result)
 		if err != nil {
 			return s.failFastScanPersistence(run, operation, started, mediaLibraryPersistenceStageLoadEntries, err)
@@ -2050,7 +2133,26 @@ func (s *MediaLibraryService) reconcile(ctx context.Context, id uint, kind strin
 			run.Status, run.Phase, run.Partial = "success", "completed", true
 			run.Generation = library.BaselineGeneration
 			run.FinishedAt, run.CatalogPublishedAt = &finished, &finished
-			return run, s.db.WithContext(ctx).Save(&run).Error
+			return run, s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+				var current models.MediaLibrary
+				var currentStorage models.Storage
+				if err := tx.First(&current, id).Error; err != nil {
+					return err
+				}
+				if err := tx.First(&currentStorage, current.StorageID).Error; err != nil {
+					return err
+				}
+				if catalogSourceFingerprint(current, currentStorage) != catalogSourceFingerprint(library, storage) {
+					return errMediaLibraryConfigurationChanged
+				}
+				if err := validateProviderDeletionScopeTx(ctx, tx, current, currentStorage); err != nil {
+					return err
+				}
+				if err := persistProviderPathsTx(tx, current, currentStorage, result, run.StartedAt, run.ID); err != nil {
+					return err
+				}
+				return tx.Save(&run).Error
+			})
 		}
 	}
 	if versionedScan {
@@ -2071,6 +2173,11 @@ func (s *MediaLibraryService) reconcile(ctx context.Context, id uint, kind strin
 				Msg(operation.Message("受影响范围已确认，准备安全发布增量结果"))
 		}
 		return s.publishFastPan115Scan(ctx, library, storage, profile, run, result, started, operation)
+	}
+	if !hasProviderScope {
+		if err := stageProviderPaths(ctx, s.db, library, storage, result, run); err != nil {
+			return s.failFastScanPersistence(run, operation, started, mediaLibraryPersistenceStageEntries, err)
+		}
 	}
 	units := medialibrary.GroupRecognitionUnits(result.Files)
 	recognitionStarted := time.Now()
@@ -2281,8 +2388,22 @@ func (s *MediaLibraryService) reconcile(ctx context.Context, id uint, kind strin
 			delete(byPath, file.RelativePath)
 			delete(byProvider, file.ProviderID)
 		}
+		if err := validateProviderDeletionScopeTx(ctx, tx, currentLibrary, storage); err != nil {
+			return err
+		}
+		if err := persistProviderPathsTx(tx, currentLibrary, storage, result, run.StartedAt, run.ID); err != nil {
+			return err
+		}
 		// Scoped provider proof permits exact deletions; partial absence never does.
+		var deletedSharedManifestIDs []uint
 		if len(result.DeletedProviderIDs) > 0 {
+			deletedScopes, err := captureDeletedRecognitionScopesTx(tx, id, result.DeletedProviderIDs)
+			if err != nil {
+				return err
+			}
+			if err := freezeDeletedWorkGuards(&run, deletedScopes); err != nil {
+				return err
+			}
 			removed := tx.Where("library_id = ? AND provider_id IN ?", id, result.DeletedProviderIDs).Delete(&models.MediaLibraryEntry{})
 			if removed.Error != nil {
 				return wrapMediaLibraryPersistence(mediaLibraryPersistenceStagePrune, removed.Error)
@@ -2290,6 +2411,10 @@ func (s *MediaLibraryService) reconcile(ctx context.Context, id uint, kind strin
 			run.Removed += int(removed.RowsAffected)
 			if err := tx.Where("library_id = ? AND provider_id IN ?", id, result.DeletedProviderIDs).Delete(&models.MediaLibrarySourceAsset{}).Error; err != nil {
 				return wrapMediaLibraryPersistence(mediaLibraryPersistenceStagePrune, err)
+			}
+			deletedSharedManifestIDs, err = pruneDeletedEmptyRecognitionsTx(tx, currentLibrary, storage, currentProfile, deletedScopes)
+			if err != nil {
+				return err
 			}
 		}
 		// A bounded partial enumeration is not proof of deletion. Preserve
@@ -2339,6 +2464,12 @@ func (s *MediaLibraryService) reconcile(ctx context.Context, id uint, kind strin
 			if err := freezeBatchArtifactCheckpointTx(tx, &run); err != nil {
 				return err
 			}
+			if err := freezeDeletedArtifactCheckpointTx(tx, &run, result.DeletedProviderIDs); err != nil {
+				return err
+			}
+			if err := appendDeletedArtifactCheckpoint(&run, deletedSharedManifestIDs); err != nil {
+				return err
+			}
 		}
 		if err := tx.Save(&run).Error; err != nil {
 			return wrapMediaLibraryPersistence(mediaLibraryPersistenceStageScanRun, err)
@@ -2350,7 +2481,7 @@ func (s *MediaLibraryService) reconcile(ctx context.Context, id uint, kind strin
 			} else if run.Removed > 0 && run.Added == 0 && run.Updated == 0 {
 				kind = models.MediaLibraryChangeRemoval
 			}
-			requiresArtifacts := mediaLibraryRequiresArtifacts(storage.Type, currentLibrary, s.artifacts != nil)
+			requiresArtifacts := mediaLibraryRequiresArtifacts(storage.Type, currentLibrary, s.artifacts != nil) || mediaLibraryRequiresCloudCleanup(currentLibrary, run, s.artifacts != nil)
 			change, err := s.changes.RecordTx(tx, id, generation, kind, !requiresArtifacts)
 			if err != nil {
 				return wrapMediaLibraryPersistence(mediaLibraryPersistenceStageChange, err)
@@ -2386,7 +2517,7 @@ func (s *MediaLibraryService) reconcile(ctx context.Context, id uint, kind strin
 		}
 	}
 	serverlog.OperationMetadataSnapshot.Event(s.log.Info()).Uint("library_id", id).Uint("scan_run_id", run.ID).Uint64("generation", generation).Int("units", len(recognizedUnits)).Int("matched", matched).Int("snapshots", snapshots).Int("cache_hits", cacheHits).Msg(serverlog.OperationMetadataSnapshot.Message("提交"))
-	if s.artifacts != nil && mediaLibraryArtifactGenerationRequired(kind, run, metadataProjectionChanged) {
+	if s.artifacts != nil && (mediaLibraryArtifactGenerationRequired(kind, run, metadataProjectionChanged) || mediaLibraryRequiresCloudCleanup(library, run, true)) {
 		if err := s.artifacts.ScheduleGeneration(id, generation); err != nil {
 			if isTransferBatch || hasProviderScope || run.Partial {
 				return run, err

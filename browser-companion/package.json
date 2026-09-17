@@ -1,0 +1,13 @@
+{
+  "name": "@ohmycine/browser-companion",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=20" },
+  "scripts": { "start": "node src/main.mjs", "test": "node --test" },
+  "dependencies": {
+    "cloakbrowser": "0.5.10",
+    "playwright-core": "1.62.0",
+    "ipaddr.js": "2.2.0"
+  }
+}

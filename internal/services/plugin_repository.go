@@ -15,6 +15,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/rs/zerolog"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/authz"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/browsercompanion"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/credential"
 	serverlog "github.com/yuanjing-hash/OhMyCine-Server/internal/logging"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
@@ -65,17 +66,21 @@ func WithPluginCredentialStore(store *credential.Store) PluginServiceOption {
 }
 
 type PluginRepositoryService struct {
-	db            *gorm.DB
-	audit         *AuditService
-	fetcher       PluginRegistryFetcher
-	log           zerolog.Logger
-	version       string
-	assets        PluginAssetFetcher
-	runtime       PluginRuntimeHost
-	credentials   *credential.Store
-	pluginRoot    string
-	lifecycleMu   sync.Mutex
-	navigationKey [32]byte
+	browser        browsercompanion.Caller
+	browserMu      sync.Mutex
+	browserAuthMu  sync.Mutex
+	browserSession *resourceBrowserSession
+	db             *gorm.DB
+	audit          *AuditService
+	fetcher        PluginRegistryFetcher
+	log            zerolog.Logger
+	version        string
+	assets         PluginAssetFetcher
+	runtime        PluginRuntimeHost
+	credentials    *credential.Store
+	pluginRoot     string
+	lifecycleMu    sync.Mutex
+	navigationKey  [32]byte
 }
 
 type PluginRepositorySummary struct {

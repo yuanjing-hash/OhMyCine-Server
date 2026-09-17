@@ -500,7 +500,17 @@ func (s *STRMManagementService) buildCleanupPlan(libraryID uint, runID string, a
 		// Older local-adjacent policies predate automatic metadata cleanup and
 		// therefore persisted CleanupEligible=false. A successful complete scan
 		// remains sufficient because only inactive managed artifacts are eligible.
-		exactIncrementalScope := plan.Policy.CatalogScopeMode == catalogArtifactScopeIncremental
+		exactIncrementalScope := (plan.Policy.CatalogBindingID != "" && plan.Policy.CatalogScopeMode == catalogArtifactScopeIncremental) || (plan.Policy.ScopeVersion == 1 && len(plan.Policy.DeletedManifestIDs) > 0 && plan.Policy.BatchSourceFingerprint != "")
+		if plan.Policy.ScopeVersion == 1 && len(plan.Policy.DeletedManifestIDs) > 0 {
+			fingerprint, err := artifactBatchSourceFingerprint(s.db, plan.Library)
+			if err != nil || fingerprint != plan.Policy.BatchSourceFingerprint {
+				return plan, cleanupFailure("artifact_cleanup_root_changed")
+			}
+			var scan models.MediaLibraryScanRun
+			if err := s.db.First(&scan, "id = ? AND library_id = ? AND generation = ?", plan.Policy.ScanRunID, libraryID, run.Generation).Error; err != nil || scan.Status != "success" {
+				return plan, cleanupFailure("artifact_cleanup_scan_ineligible")
+			}
+		}
 		cleanupEligible := exactIncrementalScope || plan.Policy.CleanupEligible || targetKind == models.MediaArtifactTargetLocalAdjacent
 		if !cleanupEligible || (!exactIncrementalScope && (plan.Policy.ScanRunID == 0 || plan.Policy.ScanPartial || !automaticCleanupScanKind(plan.Policy.ScanKind))) {
 			return plan, &artifactCleanupSkip{reason: "artifact_cleanup_scan_ineligible"}
@@ -546,8 +556,62 @@ func (s *STRMManagementService) buildCleanupPlan(libraryID uint, runID string, a
 		return plan, cleanupFailure("artifact_cleanup_root_changed")
 	}
 	plan.Root, plan.RootIdentity, plan.Automatic = root, identity, automatic
-	if err := s.db.Where("library_id = ? AND target_kind = ? AND managed = ? AND active = ?", libraryID, targetKind, true, false).Order("id").Find(&plan.Artifacts).Error; err != nil {
+	query := s.db.Where("library_id = ? AND target_kind = ? AND managed = ? AND active = ?", libraryID, targetKind, true, false)
+	if automatic {
+		query = scopedCleanupArtifactQuery(query, plan.Policy)
+	}
+	if err := query.Order("id").Find(&plan.Artifacts).Error; err != nil {
 		return plan, err
+	}
+	if automatic && (plan.Policy.ScopeVersion == 1 || plan.Policy.CatalogScopeMode == catalogArtifactScopeIncremental) {
+		if err := s.libraries.withCatalogRead(context.Background(), []uint{libraryID}, func(tx *gorm.DB, reader *CatalogReader) error {
+			if err := checkDeletedWorkRestoration(tx, reader, plan.Policy, plan.Artifacts); err != nil { return err }
+			for start := 0; start < len(plan.Artifacts); start += CatalogBatchRows {
+				ids := []string{}
+				paths := []string{}
+				for _, artifact := range plan.Artifacts[start:min(start+CatalogBatchRows, len(plan.Artifacts))] {
+					paths = append(paths, artifact.RelativePath)
+				}
+				var active []models.MediaArtifact
+				if err := tx.Where("library_id = ? AND target_kind = ? AND relative_path IN ? AND active = ?", libraryID, targetKind, paths, true).Limit(1).Find(&active).Error; err != nil {
+					return err
+				}
+				if len(active) > 0 {
+					return cleanupFailure("artifact_cleanup_source_restored")
+				}
+				for _, artifact := range plan.Artifacts[start:min(start+CatalogBatchRows, len(plan.Artifacts))] {
+					if plan.Policy.CatalogBindingID != "" {
+						var count int64
+						if err := tx.Model(&models.CatalogArtifactBindingItem{}).Where("binding_id = ? AND entity_kind = ? AND entity_id = ?", plan.Policy.CatalogBindingID, "manifest", artifact.ID).Count(&count).Error; err != nil {
+							return err
+						}
+						if count == 0 {
+							continue
+						}
+					}
+					if artifact.ProviderItemID != "" {
+						ids = append(ids, artifact.ProviderItemID)
+					}
+				}
+				if len(ids) == 0 {
+					continue
+				}
+				var entries []models.MediaLibraryEntry
+				if err := reader.Entries().Where("provider_id IN ?", ids).Limit(1).Find(&entries).Error; err != nil {
+					return err
+				}
+				var assets []models.MediaLibrarySourceAsset
+				if err := reader.SourceAssets().Where("provider_id IN ?", ids).Limit(1).Find(&assets).Error; err != nil {
+					return err
+				}
+				if len(entries)+len(assets) > 0 {
+					return cleanupFailure("artifact_cleanup_source_restored")
+				}
+			}
+			return nil
+		}); err != nil {
+			return plan, err
+		}
 	}
 	targets, boundaryIdentity, err := s.resolveCleanupCandidateRoots(plan.Artifacts, root, identity, targetKind, automatic)
 	if err != nil {
@@ -761,6 +825,13 @@ func (s *STRMManagementService) executeCleanupPlan(ctx context.Context, plan art
 			return removed, removedDirectories, err
 		}
 		if exists {
+			if plan.Automatic && (plan.Policy.ScopeVersion == 1 || plan.Policy.CatalogScopeMode == catalogArtifactScopeIncremental) {
+				observed, err := inspectArtifactReceiptFile(ctx, cleanupTarget.Root, cleanupTarget.RootIdentity, current.RelativePath)
+				if err != nil || !observed.Exists || observed.Fingerprint != current.ContentFingerprint {
+					s.restoreCleanupArtifact(current, originalStatus)
+					return removed, removedDirectories, cleanupFailure("artifact_cleanup_content_changed")
+				}
+			}
 			if _, stillExists, err := safeCleanupTarget(cleanupTarget.Root, cleanupTarget.RootIdentity, current.RelativePath); err != nil || !stillExists {
 				s.restoreCleanupArtifact(current, originalStatus)
 				if err != nil {
@@ -1143,7 +1214,8 @@ func (s *STRMManagementService) AutoCleanup(ctx context.Context, runID string) A
 
 func (s *STRMManagementService) persistAutoCleanup(run models.MediaArtifactRun, removed, removedDirectories int, errorCode, outcome, auditCode string) error {
 	now := time.Now().UTC()
-	return s.db.Transaction(func(tx *gorm.DB) error {
+	var auditScanRunID uint
+	err := s.db.Transaction(func(tx *gorm.DB) error {
 		cleanupStatus := models.MediaArtifactCleanupCompleted
 		switch outcome {
 		case "failed":
@@ -1164,6 +1236,15 @@ func (s *STRMManagementService) persistAutoCleanup(run models.MediaArtifactRun, 
 				return result.Error
 			}
 		}
+		if outcome == "success" && errorCode == "" {
+			var policy mediaArtifactPolicy
+			if err := json.Unmarshal([]byte(run.PolicyJSON), &policy); err != nil {
+				return err
+			}
+			if !policy.ScanPartial && (policy.ScanKind == "full" || policy.ScanKind == "strm_full_manual") && (policy.CatalogBindingID == "" || policy.CatalogScopeMode == catalogArtifactScopeFull) {
+				auditScanRunID = policy.ScanRunID
+			}
+		}
 		metadata := map[string]any{"run_id": run.ID, "generation": run.Generation, "count": removed, "directory_count": removedDirectories, "total_count": current.RemovedCount}
 		if auditCode != "" {
 			if outcome == "skipped" {
@@ -1174,6 +1255,21 @@ func (s *STRMManagementService) persistAutoCleanup(run models.MediaArtifactRun, 
 		}
 		return s.audit.Record(tx, nil, "strm.cleanup.auto", "media_library", strconv.FormatUint(uint64(run.LibraryID), 10), outcome, metadata, RequestContext{})
 	})
+	if err != nil {
+		return err
+	}
+	if auditScanRunID != 0 {
+		if followupErr := resolveCoveredProviderDeletions(s.db, run.LibraryID, auditScanRunID, func(tx *gorm.DB) (bool, error) {
+			var current models.MediaArtifactRun
+			if err := tx.First(&current, "id = ?", run.ID).Error; err != nil {
+				return false, err
+			}
+			return current.CleanupStatus == models.MediaArtifactCleanupCompleted && current.CleanupErrorCode == "" && current.Generation == run.Generation && current.PolicyJSON == run.PolicyJSON, nil
+		}); followupErr != nil {
+			s.log.Warn().Uint("library_id", run.LibraryID).Msg("产物清理已完成，旧删除通知的整理暂未完成")
+		}
+	}
+	return nil
 }
 
 func (s *STRMManagementService) signCleanupClaim(claim strmCleanupClaim) (string, error) {

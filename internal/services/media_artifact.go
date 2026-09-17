@@ -29,36 +29,42 @@ import (
 )
 
 const JobTypeMediaArtifact = "media_artifact"
+const artifactTargetCloudCleanup = "cloud_empty_cleanup"
 
 func mediaArtifactResourceKey(libraryID uint) string {
 	return fmt.Sprintf("media-artifact-library:%d", libraryID)
 }
 
 type mediaArtifactPolicy struct {
-	BatchSourceFingerprint string   `json:"batch_source_fingerprint,omitempty"`
-	ChangeRevisions        []uint64 `json:"change_revisions,omitempty"`
-	ScopeVersion           int      `json:"scope_version,omitempty"`
-	EntryIDs               []uint   `json:"entry_ids,omitempty"`
-	RecognitionIDs         []uint   `json:"recognition_ids,omitempty"`
-	SourceAssetIDs         []uint   `json:"source_asset_ids,omitempty"`
-	LibraryID              uint     `json:"library_id"`
-	Generation             uint64   `json:"generation"`
-	StorageID              uint     `json:"storage_id"`
-	StorageType            string   `json:"storage_type"`
-	ConnectionID           uint     `json:"connection_id,omitempty"`
-	ProjectionRoot         string   `json:"projection_root"`
-	ProjectionRootIdentity string   `json:"projection_root_identity,omitempty"`
-	TargetKind             string   `json:"target_kind"`
-	STRMEnabled            bool     `json:"strm_enabled"`
-	Metadata               bool     `json:"metadata_artifacts_enabled"`
-	AssetExtensions        []string `json:"asset_extensions,omitempty"`
-	ScanRunID              uint     `json:"scan_run_id,omitempty"`
-	ScanKind               string   `json:"scan_kind,omitempty"`
-	ScanPartial            bool     `json:"scan_partial,omitempty"`
-	CleanupEligible        bool     `json:"cleanup_eligible,omitempty"`
-	RefreshSerial          int64    `json:"refresh_serial,omitempty"`
-	CatalogBindingID       string   `json:"catalog_binding_id,omitempty"`
-	CatalogScopeMode       string   `json:"catalog_scope_mode,omitempty"`
+	DeletedWorkGuards         []deletedRecognitionScope `json:"deleted_work_guards,omitempty"`
+	CloudEmptyCleanupEnabled  bool                      `json:"cloud_empty_cleanup_enabled,omitempty"`
+	CloudCleanupDirectories   []cloudCleanupDirectory   `json:"cloud_cleanup_directories,omitempty"`
+	SourceBoundaryFingerprint string                    `json:"source_boundary_fingerprint,omitempty"`
+	BatchSourceFingerprint    string                    `json:"batch_source_fingerprint,omitempty"`
+	ChangeRevisions           []uint64                  `json:"change_revisions,omitempty"`
+	ScopeVersion              int                       `json:"scope_version,omitempty"`
+	EntryIDs                  []uint                    `json:"entry_ids,omitempty"`
+	RecognitionIDs            []uint                    `json:"recognition_ids,omitempty"`
+	SourceAssetIDs            []uint                    `json:"source_asset_ids,omitempty"`
+	DeletedManifestIDs        []uint                    `json:"deleted_manifest_ids,omitempty"`
+	LibraryID                 uint                      `json:"library_id"`
+	Generation                uint64                    `json:"generation"`
+	StorageID                 uint                      `json:"storage_id"`
+	StorageType               string                    `json:"storage_type"`
+	ConnectionID              uint                      `json:"connection_id,omitempty"`
+	ProjectionRoot            string                    `json:"projection_root"`
+	ProjectionRootIdentity    string                    `json:"projection_root_identity,omitempty"`
+	TargetKind                string                    `json:"target_kind"`
+	STRMEnabled               bool                      `json:"strm_enabled"`
+	Metadata                  bool                      `json:"metadata_artifacts_enabled"`
+	AssetExtensions           []string                  `json:"asset_extensions,omitempty"`
+	ScanRunID                 uint                      `json:"scan_run_id,omitempty"`
+	ScanKind                  string                    `json:"scan_kind,omitempty"`
+	ScanPartial               bool                      `json:"scan_partial,omitempty"`
+	CleanupEligible           bool                      `json:"cleanup_eligible,omitempty"`
+	RefreshSerial             int64                     `json:"refresh_serial,omitempty"`
+	CatalogBindingID          string                    `json:"catalog_binding_id,omitempty"`
+	CatalogScopeMode          string                    `json:"catalog_scope_mode,omitempty"`
 }
 
 type mediaArtifactJobPayload struct {
@@ -138,7 +144,21 @@ func (s *MediaArtifactService) scheduleGeneration(libraryID uint, generation uin
 	}
 	var extraAssetExtensions []string
 	_ = json.Unmarshal([]byte(library.STRMAssetExtraExtensionsJSON), &extraAssetExtensions)
-	policy := mediaArtifactPolicy{LibraryID: library.ID, Generation: generation, StorageID: library.StorageID, StorageType: storage.Type, Metadata: library.MetadataArtifactsEnabled, AssetExtensions: effectiveSourceAssetExtensions(extraAssetExtensions)}
+	policy := mediaArtifactPolicy{LibraryID: library.ID, Generation: generation, StorageID: library.StorageID, StorageType: storage.Type, Metadata: library.MetadataArtifactsEnabled, AssetExtensions: effectiveSourceAssetExtensions(extraAssetExtensions), SourceBoundaryFingerprint: catalogSourceFingerprint(library, storage)}
+	var scanRun models.MediaLibraryScanRun
+	if err := s.db.Where("library_id = ? AND generation = ?", library.ID, generation).Order("id DESC").First(&scanRun).Error; err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+		return err
+	}
+	if library.CloudEmptyCleanupEnabled && storage.Type == models.StorageTypePan115 && scanRun.CatalogPublishedAt != nil && (scanRun.Status == "success" || scanRun.Status == "catalog_ready") {
+		var checkpoint struct {
+			Directories []cloudCleanupDirectory `json:"cloud_cleanup_directories"`
+		}
+		if err := json.Unmarshal([]byte(scanRun.CheckpointJSON), &checkpoint); err != nil {
+			return err
+		}
+		policy.CloudCleanupDirectories = checkpoint.Directories
+		policy.CloudEmptyCleanupEnabled = len(checkpoint.Directories) > 0
+	}
 	switch storage.Type {
 	case models.StorageTypeLocal:
 		if !library.MetadataArtifactsEnabled {
@@ -155,20 +175,27 @@ func (s *MediaArtifactService) scheduleGeneration(libraryID uint, generation uin
 		policy.ProjectionRoot, policy.TargetKind = canonical, models.MediaArtifactTargetLocalAdjacent
 	default:
 		if !library.STRMEnabled || !library.SignedProxyEnabled || s.signedProxy == nil {
-			return nil
+			if !policy.CloudEmptyCleanupEnabled {
+				return nil
+			}
+			policy.Metadata = false
+			policy.TargetKind = artifactTargetCloudCleanup
 		}
 		if storage.ConnectionID == nil || *storage.ConnectionID == 0 {
 			return appError(CodeConnectionUnavailable, "媒体库连接不可用", nil)
 		}
 		policy.ConnectionID = *storage.ConnectionID
-		policy.ProjectionRoot, policy.TargetKind, policy.STRMEnabled = library.STRMLocalRoot, models.MediaArtifactTargetLocalProjection, true
+		if policy.TargetKind != artifactTargetCloudCleanup {
+			policy.ProjectionRoot, policy.TargetKind, policy.STRMEnabled = library.STRMLocalRoot, models.MediaArtifactTargetLocalProjection, true
+		}
 	}
-	canonicalRoot, rootIdentity, err := canonicalProjectionRoot(policy.ProjectionRoot)
-	if err != nil {
-		return appError(CodeInvalidRequest, "媒体产物目录不可用", nil)
+	if policy.TargetKind != artifactTargetCloudCleanup {
+		canonicalRoot, rootIdentity, err := canonicalProjectionRoot(policy.ProjectionRoot)
+		if err != nil {
+			return appError(CodeInvalidRequest, "媒体产物目录不可用", nil)
+		}
+		policy.ProjectionRoot, policy.ProjectionRootIdentity = canonicalRoot, rootIdentity
 	}
-	policy.ProjectionRoot, policy.ProjectionRootIdentity = canonicalRoot, rootIdentity
-	var scanRun models.MediaLibraryScanRun
 	if err := s.db.Where("library_id = ? AND generation = ?", library.ID, generation).Order("id DESC").First(&scanRun).Error; err == nil {
 		policy.ScanRunID = scanRun.ID
 		policy.ScanKind = scanRun.Kind
@@ -184,6 +211,9 @@ func (s *MediaArtifactService) scheduleGeneration(libraryID uint, generation uin
 		return err
 	}
 	if err := s.freezeLegacyArtifactScope(&policy); err != nil {
+		return err
+	}
+	if err := s.db.Transaction(func(tx *gorm.DB) error { return freezeArtifactDeletedWorkGuardsTx(tx, &policy) }); err != nil {
 		return err
 	}
 	policyJSON, err := json.Marshal(policy)
@@ -458,6 +488,8 @@ func (w *MediaArtifactWorker) Run(ctx context.Context, runtime JobRuntime, job C
 	var result WorkerResult
 	if policy.CatalogBindingID != "" {
 		result = w.service.generateBoundArtifacts(ctx, runtime, job, permit, run, policy)
+	} else if policy.TargetKind == artifactTargetCloudCleanup {
+		result = w.service.completeCloudOnlyArtifactGeneration(ctx, job, run, policy)
 	} else {
 		result = w.service.generateArtifacts(ctx, runtime, job, permit, run, policy)
 	}
@@ -495,13 +527,48 @@ func (s *MediaArtifactService) loadRun(runID string) (models.MediaArtifactRun, m
 		return models.MediaArtifactRun{}, mediaArtifactPolicy{}, err
 	}
 	var policy mediaArtifactPolicy
-	if err := json.Unmarshal([]byte(run.PolicyJSON), &policy); err != nil || policy.LibraryID != run.LibraryID || policy.Generation != run.Generation || (!policy.STRMEnabled && !policy.Metadata) || (policy.TargetKind != models.MediaArtifactTargetLocalAdjacent && policy.TargetKind != models.MediaArtifactTargetLocalProjection) {
+	if err := json.Unmarshal([]byte(run.PolicyJSON), &policy); err != nil || policy.LibraryID != run.LibraryID || policy.Generation != run.Generation || (!policy.STRMEnabled && !policy.Metadata && !(policy.CloudEmptyCleanupEnabled && len(policy.CloudCleanupDirectories) > 0)) || (policy.TargetKind != models.MediaArtifactTargetLocalAdjacent && policy.TargetKind != models.MediaArtifactTargetLocalProjection && policy.TargetKind != artifactTargetCloudCleanup) {
 		return models.MediaArtifactRun{}, mediaArtifactPolicy{}, errors.New("artifact policy is invalid")
 	}
 	if artifactRequiresBoundedScope(policy) && policy.CatalogBindingID == "" && policy.ScopeVersion != 1 {
 		return models.MediaArtifactRun{}, mediaArtifactPolicy{}, errors.New("artifact batch scope is missing; obsolete task must be deleted")
 	}
 	return run, policy, nil
+}
+
+func (s *MediaArtifactService) completeCloudOnlyArtifactGeneration(ctx context.Context, claim ClaimedJob, run models.MediaArtifactRun, policy mediaArtifactPolicy) WorkerResult {
+	err := s.catalogArtifactWriteTx(ctx, func(tx *gorm.DB) error {
+		if _, err := s.queue.verifyLease(tx, claim.Job.ID, claim.LeaseToken); err != nil {
+			return err
+		}
+		var current models.MediaArtifactRun
+		var library models.MediaLibrary
+		var storage models.Storage
+		if err := tx.First(&current, "id = ?", run.ID).Error; err != nil {
+			return err
+		}
+		if current.PolicyJSON != run.PolicyJSON || current.JobID == nil || *current.JobID != claim.Job.ID {
+			return ErrCatalogFence
+		}
+		if err := tx.First(&library, run.LibraryID).Error; err != nil {
+			return err
+		}
+		if err := tx.First(&storage, library.StorageID).Error; err != nil {
+			return err
+		}
+		if !artifactPolicyMatchesLibrary(policy, library) || catalogSourceFingerprint(library, storage) != policy.SourceBoundaryFingerprint {
+			return ErrCatalogFence
+		}
+		now := time.Now().UTC()
+		if err := tx.Model(&current).Updates(map[string]any{"status": models.MediaArtifactStatusCompleted, "finished_at": now, "updated_at": now, "error_code": ""}).Error; err != nil {
+			return err
+		}
+		return tx.Model(&library).Where("artifact_generation = ?", run.Generation).Updates(map[string]any{"artifact_applied_generation": run.Generation, "artifact_status": models.MediaArtifactStatusCompleted, "artifact_updated_at": now, "artifact_error": ""}).Error
+	})
+	if err != nil {
+		return WorkerResult{ErrorCode: "artifact_state_persist_failed", ErrorMessage: "云端清理任务状态保存失败"}
+	}
+	return WorkerResult{}
 }
 
 func (s *MediaArtifactService) generateArtifacts(ctx context.Context, runtime JobRuntime, claim ClaimedJob, permit CatalogPhysicalWritePermit, run models.MediaArtifactRun, policy mediaArtifactPolicy) WorkerResult {
@@ -754,6 +821,10 @@ func (s *MediaArtifactService) generateArtifacts(ctx context.Context, runtime Jo
 				if err := tx.Model(&models.MediaArtifact{}).Where("library_id = ? AND target_kind = ? AND run_id <> ? AND active = ?", run.LibraryID, policy.TargetKind, run.ID, true).Updates(map[string]any{"active": false, "updated_at": finished}).Error; err != nil {
 					return err
 				}
+			} else if len(policy.DeletedManifestIDs) > 0 {
+				if err := tx.Model(&models.MediaArtifact{}).Where("library_id = ? AND id IN ? AND managed = ? AND target_kind = ? AND run_id <> ?", run.LibraryID, policy.DeletedManifestIDs, true, policy.TargetKind, run.ID).Updates(map[string]any{"active": false, "updated_at": finished}).Error; err != nil {
+					return err
+				}
 			}
 			if err := tx.Model(&models.MediaArtifactRun{}).Where("id = ?", run.ID).Updates(map[string]any{"status": status, "expected_count": run.ExpectedCount, "written_count": run.WrittenCount, "updated_count": run.UpdatedCount, "skipped_count": run.SkippedCount, "failed_count": run.FailedCount, "error_code": code, "cleanup_status": models.MediaArtifactCleanupPending, "cleanup_error_code": "", "cleanup_at": nil, "finished_at": finished, "updated_at": finished}).Error; err != nil {
 				return err
@@ -792,14 +863,28 @@ func (s *MediaArtifactService) generateArtifacts(ctx context.Context, runtime Jo
 // The physical permit spans generation AND automatic cleanup. Only their
 // verified durable completion may settle it, before announcing readiness.
 func (s *MediaArtifactService) finishArtifactGeneration(ctx context.Context, claim ClaimedJob, permit CatalogPhysicalWritePermit, run models.MediaArtifactRun, policy mediaArtifactPolicy) WorkerResult {
-	if s.cleanup != nil {
+	if policy.CloudEmptyCleanupEnabled {
+		if err := s.cleanupCloudEmptyDirectories(ctx, claim, permit, run, policy); err != nil {
+			next := time.Now().UTC().Add(time.Minute * time.Duration(1<<min(max(claim.Job.AttemptCount-1, 0), 4)))
+			code, message := "cloud_empty_cleanup_failed", "云端空目录清理尚未完成，已保留进度"
+			if providerCode, _ := cloudpkg.ErrorInfo(err); providerCode != "" {
+				code = providerCode
+				if code == cloudpkg.CodeAuthExpired || code == cloudpkg.CodeCookieInvalid {
+					next = time.Now().UTC()
+					message = "云盘登录凭据已失效，已保存进度并等待更新凭据"
+				}
+			}
+			return WorkerResult{RetryAt: &next, ErrorCode: code, ErrorMessage: message}
+		}
+	}
+	if s.cleanup != nil && policy.TargetKind != artifactTargetCloudCleanup {
 		cleanup := s.cleanup.AutoCleanup(withArtifactCleanupPermit(ctx, permit), run.ID)
 		if cleanup.ErrorCode != "" {
 			return WorkerResult{ErrorCode: cleanup.ErrorCode, ErrorMessage: "媒体产物清理失败，媒体变更尚未发布"}
 		}
 	}
 	if err := s.catalogArtifactWriteTx(ctx, func(tx *gorm.DB) error {
-		if s.cleanup == nil {
+		if s.cleanup == nil || policy.TargetKind == artifactTargetCloudCleanup {
 			now := time.Now().UTC()
 			if err := tx.Model(&models.MediaArtifactRun{}).Where("id = ? AND status = ?", run.ID, models.MediaArtifactStatusCompleted).Updates(map[string]any{"cleanup_status": models.MediaArtifactCleanupSkipped, "cleanup_at": now, "updated_at": now}).Error; err != nil {
 				return err
@@ -823,6 +908,16 @@ func mediaLibraryRequiresArtifacts(storageType string, library models.MediaLibra
 		return library.MetadataArtifactsEnabled
 	}
 	return library.STRMEnabled && library.SignedProxyEnabled
+}
+
+func mediaLibraryRequiresCloudCleanup(library models.MediaLibrary, run models.MediaLibraryScanRun, available bool) bool {
+	if !available || !library.CloudEmptyCleanupEnabled {
+		return false
+	}
+	var checkpoint struct {
+		Directories []cloudCleanupDirectory `json:"cloud_cleanup_directories"`
+	}
+	return json.Unmarshal([]byte(run.CheckpointJSON), &checkpoint) == nil && len(checkpoint.Directories) > 0
 }
 
 func (s *MediaArtifactService) publishGenerationReady(libraryID uint, generation uint64, policy mediaArtifactPolicy) WorkerResult {
@@ -881,10 +976,15 @@ func (s *MediaArtifactService) publishGenerationReady(libraryID uint, generation
 }
 
 func artifactPolicyMatchesLibrary(policy mediaArtifactPolicy, library models.MediaLibrary) bool {
+	if policy.CloudEmptyCleanupEnabled && !library.CloudEmptyCleanupEnabled {
+		return false
+	}
 	if library.StorageID != policy.StorageID || (policy.ScopeVersion != 1 && library.ArtifactGeneration != policy.Generation) {
 		return false
 	}
 	switch policy.TargetKind {
+	case artifactTargetCloudCleanup:
+		return library.Enabled && library.CloudEmptyCleanupEnabled && policy.CloudEmptyCleanupEnabled && len(policy.CloudCleanupDirectories) > 0
 	case models.MediaArtifactTargetLocalProjection:
 		if !library.Enabled || !library.STRMEnabled || !library.SignedProxyEnabled {
 			return false

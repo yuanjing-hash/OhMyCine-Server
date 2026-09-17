@@ -309,5 +309,12 @@ func assertCatalogArtifactReceiptsResolvedTx(tx *gorm.DB, proof models.CatalogPh
 	if cleanup != 0 {
 		return catalogPhysicalUnsettledError()
 	}
+	var cloudClaim uint
+	if err := tx.Model(&models.CatalogCloudCleanupClaim{}).Select("id").Where("library_id=? AND status='prepared'", proof.LibraryID).Limit(1).Scan(&cloudClaim).Error; err != nil {
+		return err
+	}
+	if cloudClaim != 0 {
+		return catalogPhysicalUnsettledError()
+	}
 	return nil
 }

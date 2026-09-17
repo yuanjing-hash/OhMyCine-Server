@@ -31,6 +31,11 @@ for arch in amd64 arm64; do
       --retry-all-errors --max-time 5 "$endpoint" >/dev/null
   done
   docker exec "${prefix}-server" test -s /var/lib/ohmycine/data/credentials.key
+  # Validate the managed wrapper, not licensed browser acquisition/launch.
+  docker exec "${prefix}-server" /usr/local/bin/node -e 'if(Number(process.versions.node.split(".")[0])<20) process.exit(1)'
+  docker exec "${prefix}-server" test -s /opt/ohmycine/browser-companion/src/main.mjs
+  docker exec "${prefix}-server" test -s /opt/ohmycine/browser-companion/node_modules/cloakbrowser/package.json
+  docker exec "${prefix}-server" test -w /var/lib/ohmycine/browser
   docker exec "${prefix}-node" test -s /var/lib/ohmycine-node/node.key
   docker restart "${prefix}-server" "${prefix}-node" >/dev/null
   curl --fail --silent --show-error --retry 30 --retry-delay 2 --retry-all-errors \

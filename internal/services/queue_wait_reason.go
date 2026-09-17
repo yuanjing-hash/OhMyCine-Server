@@ -26,13 +26,47 @@ func waitReasonLibraryID(job models.Job) uint {
 }
 
 func (s *QueueService) projectJobWaitReasons(actor Actor, jobs []models.Job, dtos []JobDTO) error {
+	jobLibraries := make(map[string]uint, len(jobs))
+	var downloadIDs, transferIDs []string
+	for _, job := range jobs {
+		jobLibraries[job.ID] = waitReasonLibraryID(job)
+		if job.Status != models.JobStatusQueued && job.Status != models.JobStatusRetryWait {
+			continue
+		}
+		if job.JobType == "download" {
+			downloadIDs = append(downloadIDs, job.ID)
+		}
+		if job.JobType == "transfer" {
+			transferIDs = append(transferIDs, job.ID)
+		}
+	}
+	type binding struct {
+		JobID     string
+		LibraryID uint
+	}
+	for table, ids := range map[string][]string{"download_tasks": downloadIDs, "transfer_tasks": transferIDs} {
+		if len(ids) == 0 {
+			continue
+		}
+		column := "library_id"
+		if table == "download_tasks" {
+			column = "target_library_id"
+		}
+		var rows []binding
+		if err := s.db.Table(table).Select("job_id, "+column+" AS library_id").Where("job_id IN ?", ids).Scan(&rows).Error; err != nil {
+			return err
+		}
+		for _, row := range rows {
+			jobLibraries[row.JobID] = row.LibraryID
+		}
+	}
 	ids := make([]uint, 0, len(jobs))
 	seen := make(map[uint]bool)
 	for _, job := range jobs {
 		if job.Status != models.JobStatusQueued && job.Status != models.JobStatusRetryWait {
 			continue
 		}
-		if id := waitReasonLibraryID(job); id != 0 && !seen[id] {
+		if id := jobLibraries[job.ID]; id != 0 && !seen[id] {
 			seen[id] = true
 			ids = append(ids, id)
 		}
@@ -51,7 +85,7 @@ func (s *QueueService) projectJobWaitReasons(actor Actor, jobs []models.Job, dto
 		if job.Status != models.JobStatusQueued && job.Status != models.JobStatusRetryWait {
 			continue
 		}
-		if id := waitReasonLibraryID(job); id != 0 {
+		if id := jobLibraries[job.ID]; id != 0 {
 			if readiness, exists := cache[id]; exists {
 				blocked, err := libraryJobBlocked(s.db, job, cache)
 				if err != nil {

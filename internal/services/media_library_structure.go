@@ -179,13 +179,17 @@ type MediaLibraryStructureIssueSummary struct {
 }
 
 type MediaLibraryStructureIssuePage struct {
-	List           []MediaLibraryStructureIssueSummary `json:"list"`
-	Total          int64                               `json:"total"`
-	Page           int                                 `json:"page"`
-	PageSize       int                                 `json:"page_size"`
-	ReviewRevision uint64                              `json:"review_revision"`
-	PendingTotal   int64                               `json:"pending_total"`
-	HandledTotal   int64                               `json:"handled_total"`
+	List                   []MediaLibraryStructureIssueSummary `json:"list"`
+	Total                  int64                               `json:"total"`
+	Page                   int                                 `json:"page"`
+	PageSize               int                                 `json:"page_size"`
+	ReviewRevision         uint64                              `json:"review_revision"`
+	PendingTotal           int64                               `json:"pending_total"`
+	HandledTotal           int64                               `json:"handled_total"`
+	DiagnosisRevision      string                              `json:"diagnosis_revision"`
+	PendingRepairableCount int64                               `json:"pending_repairable_count"`
+	PendingClassifications StructureIssueClassifications       `json:"pending_classifications"`
+	HandledClassifications StructureIssueClassifications       `json:"handled_classifications"`
 }
 
 type MediaLibraryStructureIssueQuery struct {
@@ -432,13 +436,12 @@ func (s *MediaLibraryStructureService) structureIssuesTx(tx *gorm.DB, reader *Ca
 			return MediaLibraryStructureIssuePage{}, err
 		}
 	}
-	choiceExists := "EXISTS (SELECT 1 FROM media_library_structure_review_choices rc WHERE rc.session_id = ? AND (rc.subject_key = ('issue:' || media_library_structure_issues.token) OR (media_library_structure_issues.recognition_id IS NOT NULL AND rc.subject_key = ('recognition:' || CAST(media_library_structure_issues.recognition_id AS TEXT)))))"
 	if reviewSession.ID != "" {
 		switch query.ReviewState {
 		case "pending":
-			db = db.Where("NOT "+choiceExists, reviewSession.ID)
+			db = db.Where("NOT "+structureReviewChoiceExistsSQL, reviewSession.ID, reviewSession.ID)
 		case "handled":
-			db = db.Where(choiceExists, reviewSession.ID)
+			db = db.Where(structureReviewChoiceExistsSQL, reviewSession.ID, reviewSession.ID)
 		}
 	} else if query.ReviewState == "handled" {
 		db = db.Where("1 = 0")
@@ -474,27 +477,8 @@ func (s *MediaLibraryStructureService) structureIssuesTx(tx *gorm.DB, reader *Ca
 		}
 	}
 	result := MediaLibraryStructureIssuePage{List: make([]MediaLibraryStructureIssueSummary, 0, len(rows)), Total: total, Page: query.Page, PageSize: query.PageSize, ReviewRevision: reviewSession.Revision}
-	if diagnosis.JobID != "" {
-		base := tx.Model(&models.MediaLibraryStructureIssue{}).Where("library_id = ? AND diagnosis_job_id = ? AND generation = ? AND code <> ?", libraryID, diagnosis.JobID, diagnosis.Generation, "missing_season_episode")
-		if query.Code != "" && query.Code != "all" {
-			base = base.Where("code = ?", query.Code)
-		}
-		if reviewSession.ID == "" {
-			if err := base.Count(&result.PendingTotal).Error; err != nil {
-				return MediaLibraryStructureIssuePage{}, err
-			}
-		} else {
-			if err := base.Where(choiceExists, reviewSession.ID).Count(&result.HandledTotal).Error; err != nil {
-				return MediaLibraryStructureIssuePage{}, err
-			}
-			base = tx.Model(&models.MediaLibraryStructureIssue{}).Where("library_id = ? AND diagnosis_job_id = ? AND generation = ? AND code <> ?", libraryID, diagnosis.JobID, diagnosis.Generation, "missing_season_episode")
-			if query.Code != "" && query.Code != "all" {
-				base = base.Where("code = ?", query.Code)
-			}
-			if err := base.Where("NOT "+choiceExists, reviewSession.ID).Count(&result.PendingTotal).Error; err != nil {
-				return MediaLibraryStructureIssuePage{}, err
-			}
-		}
+	if err := populateStructureReviewSummaryTx(tx, libraryID, reviewSession.ID, &result); err != nil {
+		return MediaLibraryStructureIssuePage{}, err
 	}
 	choicesBySubject := map[string]models.MediaLibraryStructureReviewChoice{}
 	if reviewSession.ID != "" && len(rows) > 0 {

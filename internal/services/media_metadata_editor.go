@@ -2,6 +2,7 @@ package services
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"sort"
 	"strconv"
@@ -401,6 +402,7 @@ func (s *MediaLibraryService) persistCatalogMetadataResults(updates []catalogMet
 	now := time.Now().UTC()
 	var committedChange models.MediaLibraryChange
 	var artifactGeneration uint64
+	var artifactScanID uint
 	err = s.db.WithContext(source.Context).Transaction(func(tx *gorm.DB) error {
 		reader, err := PinCatalogTx(tx, []uint{libraryID})
 		if err != nil {
@@ -449,15 +451,31 @@ func (s *MediaLibraryService) persistCatalogMetadataResults(updates []catalogMet
 			}
 		}
 		if artifactGeneration > 0 {
-			if err := tx.Model(&models.MediaLibraryRecognition{}).Where("library_id = ?", libraryID).Updates(map[string]any{"last_generation": artifactGeneration, "updated_at": now}).Error; err != nil {
-				return err
-			}
-			if err := tx.Model(&models.MediaLibrarySourceAsset{}).Where("library_id = ?", libraryID).Updates(map[string]any{"generation": artifactGeneration, "updated_at": now}).Error; err != nil {
-				return err
-			}
 			if err := tx.Model(&models.MediaLibrary{}).Where("id = ?", libraryID).Updates(map[string]any{"dirty_generation": artifactGeneration, "updated_at": now}).Error; err != nil {
 				return err
 			}
+			checkpoint := batchArtifactCheckpoint{Version: 1, Pending: true}
+			for _, update := range updates {
+				var ids []uint
+				if err := tx.Model(&models.MediaLibraryEntry{}).Where("library_id = ? AND recognition_id = ?", libraryID, update.Record.ID).Order("id").Pluck("id", &ids).Error; err != nil {
+					return err
+				}
+				checkpoint.EntryIDs = append(checkpoint.EntryIDs, ids...)
+			}
+			fingerprint, err := artifactBatchSourceFingerprint(tx, library)
+			if err != nil {
+				return err
+			}
+			checkpoint.SourceFingerprint = fingerprint
+			raw, err := json.Marshal(checkpoint)
+			if err != nil {
+				return err
+			}
+			run := models.MediaLibraryScanRun{LibraryID: libraryID, Generation: generation, Kind: "metadata", Status: "success", Partial: true, CheckpointJSON: string(raw), StartedAt: now, FinishedAt: &now}
+			if err := tx.Create(&run).Error; err != nil {
+				return err
+			}
+			artifactScanID = run.ID
 		}
 		if s.changes != nil {
 			change, err := s.changes.RecordTx(tx, libraryID, generation, models.MediaLibraryChangeMetadata, artifactGeneration == 0)
@@ -472,7 +490,10 @@ func (s *MediaLibraryService) persistCatalogMetadataResults(updates []catalogMet
 		return err
 	}
 	if artifactGeneration > 0 {
-		return s.artifacts.ScheduleGeneration(libraryID, artifactGeneration)
+		if err := s.artifacts.ScheduleGeneration(libraryID, artifactGeneration); err != nil {
+			return err
+		}
+		return s.acknowledgeBatchArtifactFollowup(source.Context, artifactScanID)
 	}
 	if committedChange.State == models.MediaLibraryChangeReady && s.changes != nil {
 		s.changes.NotifyCommitted(committedChange.LibraryID, committedChange.Revision)

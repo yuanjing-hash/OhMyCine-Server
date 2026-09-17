@@ -10,11 +10,12 @@ import (
 )
 
 type batchArtifactCheckpoint struct {
-	Version           int    `json:"artifact_scope_version"`
-	Pending           bool   `json:"artifact_followup_pending"`
-	EntryIDs          []uint `json:"artifact_entry_ids"`
-	AssetIDs          []uint `json:"artifact_asset_ids"`
-	SourceFingerprint string `json:"artifact_source_fingerprint"`
+	Version            int    `json:"artifact_scope_version"`
+	Pending            bool   `json:"artifact_followup_pending"`
+	EntryIDs           []uint `json:"artifact_entry_ids"`
+	AssetIDs           []uint `json:"artifact_asset_ids"`
+	DeletedManifestIDs []uint `json:"artifact_deleted_manifest_ids,omitempty"`
+	SourceFingerprint  string `json:"artifact_source_fingerprint"`
 }
 
 func freezeBatchArtifactCheckpointTx(tx *gorm.DB, run *models.MediaLibraryScanRun) error {

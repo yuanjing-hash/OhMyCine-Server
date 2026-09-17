@@ -16,6 +16,7 @@ import (
 
 	"gorm.io/gorm"
 
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/browsercompanion"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/config"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/credential"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/database"
@@ -272,7 +273,14 @@ func main() {
 	pluginHost := pluginruntime.NewHost(context.Background())
 	pluginHostAPI := pluginhostapi.New(db, credentialStore, logManager.Logger("plugin", "host"))
 	pluginHost.SetCapabilityHost(pluginHostAPI)
-	pluginRepositories := services.NewPluginRepositoryService(db, audit, pluginrepository.NewGitHubClient(nil), logManager.Logger("plugin", "repository"), services.WithPluginRoot(cfg.PluginDirectory), services.WithPluginRuntimeHost(pluginHost), services.WithPluginCredentialStore(credentialStore))
+	browserManager := browsercompanion.New()
+	defer browserManager.Close()
+	pluginRepositories := services.NewPluginRepositoryService(db, audit, pluginrepository.NewGitHubClient(nil), logManager.Logger("plugin", "repository"), services.WithPluginRoot(cfg.PluginDirectory), services.WithPluginRuntimeHost(pluginHost), services.WithPluginCredentialStore(credentialStore), services.WithPluginBrowser(browserManager))
+	pluginHostAPI.SetBrowserRequest(pluginRepositories.BrowserRequest)
+	pluginHostAPI.SetBrowserCommit(pluginRepositories.BrowserCredentialCommitted)
+	browserContext, stopBrowserMonitor := context.WithCancel(context.Background())
+	defer stopBrowserMonitor()
+	go pluginRepositories.MonitorBrowserSession(browserContext)
 	sites.SetPluginResourceBridge(pluginRepositories)
 	libraryArtwork := services.NewLibraryArtworkService(
 		db, metadataSettings, pluginRepositories, pluginHostAPI, logManager.Logger("library_artwork", "generator"),

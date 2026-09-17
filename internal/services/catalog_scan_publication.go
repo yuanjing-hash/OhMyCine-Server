@@ -190,6 +190,9 @@ func (s *MediaLibraryService) commitCatalogScan(ctx context.Context, candidate m
 	}
 	return s.catalogStore.writeCatalogBatch(ctx, func(tx *gorm.DB) error {
 		revision, err := s.catalogStore.PublishTx(tx, candidate.ID, token, candidate.ParentRevision, func(tx *gorm.DB) error {
+			if err := validateProviderDeletionScopeTx(ctx, tx, library, models.Storage{}); err != nil {
+				return err
+			}
 			return s.validateCatalogScanRunTx(tx, library.ID, *run)
 		})
 		if err != nil {
@@ -303,6 +306,9 @@ func (s *MediaLibraryService) commitNoopCatalogScan(ctx context.Context, head mo
 		if err := tx.First(&storage, library.StorageID).Error; err != nil {
 			return err
 		}
+		if err := validateProviderDeletionScopeTx(ctx, tx, library, storage); err != nil {
+			return err
+		}
 		library.DirtyGeneration = library.BaselineGeneration
 		run.SourceFingerprint = mediaLibraryScanSourceFingerprint(library, storage, profile)
 		return s.finishCatalogScanTx(tx, profile, run, CatalogScanPublication{Head: current, NoContentChange: true, PreserveGeneration: true}, hook)
@@ -320,6 +326,16 @@ func abandonCatalogScan(store *CatalogSnapshotStore, id, token string) {
 func (s *MediaLibraryService) publishCatalogScan(ctx context.Context, library models.MediaLibrary, storage models.Storage, profile models.MediaClassificationProfile, run models.MediaLibraryScanRun, input medialibrary.Result, fast bool, hook CatalogScanCommit) (models.MediaLibraryScanRun, error) {
 	if s.catalogStore == nil || hook == nil {
 		return run, ErrCatalogInvalid
+	}
+	if err := stageProviderPaths(ctx, s.db, library, storage, input, run); err != nil {
+		return run, err
+	}
+	originalHook := hook
+	hook = func(tx *gorm.DB, publication CatalogScanPublication) error {
+		if err := persistProviderPathsTx(tx, library, storage, input, run.StartedAt, run.ID); err != nil {
+			return err
+		}
+		return originalHook(tx, publication)
 	}
 	operation := mediaLibraryScanOperation(run.Kind)
 	for attempt := 0; attempt < 3; attempt++ {
@@ -390,7 +406,7 @@ func (s *MediaLibraryService) publishCatalogScan(ctx context.Context, library mo
 		preparedRun.Discovered, preparedRun.Enumerated, preparedRun.Processed = len(result.Files), max(input.Enumerated, len(input.Files)+len(input.Assets)+input.Deduplicated), len(result.Files)+len(result.Assets)
 		preparedRun.Deduplicated, preparedRun.Partial = input.Deduplicated, result.Partial
 		facts, metadataChanged, artifactChanges, err := s.prepareCatalogScanFacts(ctx, candidate, token, library, storage, profile, &preparedRun, result, baseline, units, recognized, fast)
-		if err == nil && kind == "delta" && preparedRun.Persisted == 0 {
+		if err == nil && kind == "delta" && preparedRun.Persisted == 0 && artifactChanges.Empty() {
 			abandonCatalogScan(s.catalogStore, candidate.ID, token)
 			err = s.commitNoopCatalogScan(ctx, baseline.head, profile, &preparedRun, hook)
 			if errors.Is(err, ErrCatalogFence) {
@@ -624,7 +640,7 @@ func (s *MediaLibraryService) prepareCatalogScanFacts(ctx context.Context, candi
 				facts.Entries = append(facts.Entries, fact)
 			}
 			artifactChanges.Entries = append(artifactChanges.Entries, old.ID)
-			if old.RecognitionID != nil {
+			if old.RecognitionID != nil && !baseline.protectedRecognitions[*old.RecognitionID] {
 				artifactChanges.Recognitions = append(artifactChanges.Recognitions, *old.RecognitionID)
 			}
 		} else if old.RecognitionID != nil {
@@ -646,8 +662,14 @@ func (s *MediaLibraryService) prepareCatalogScanFacts(ctx context.Context, candi
 		}
 	}
 	if (candidate.Kind == "base" && !result.Partial) || result.Scoped {
+		deletedWorkGuards := []deletedRecognitionScope{}
 		for _, record := range baseline.recognitions {
 			if !survivingRecognitions[record.ID] {
+				guard := deletedRecognitionScope{RecognitionID: record.ID, RecognitionIDs: []uint{record.ID}, TMDBID: record.TMDBID, MediaType: record.MediaType}
+				for _, entry := range baseline.entries {
+					if entry.RecognitionID != nil && *entry.RecognitionID == record.ID && entry.WorkKey != "" { guard.WorkKeys = append(guard.WorkKeys, entry.WorkKey) }
+				}
+				deletedWorkGuards = append(deletedWorkGuards, guard)
 				if candidate.Kind == "delta" {
 					fact := CatalogRecognitionFromLegacy(record)
 					fact.Tombstone = true
@@ -656,6 +678,7 @@ func (s *MediaLibraryService) prepareCatalogScanFacts(ctx context.Context, candi
 				artifactChanges.Recognitions = append(artifactChanges.Recognitions, record.ID)
 			}
 		}
+		if err := freezeDeletedWorkGuards(run, deletedWorkGuards); err != nil { return facts, false, artifactChanges, err }
 	}
 	assetFacts, assetChanges, err := s.prepareCatalogScanAssets(ctx, candidate, token, library, storage, run, result, baseline.assets, deleted, now)
 	if err != nil {
@@ -663,6 +686,12 @@ func (s *MediaLibraryService) prepareCatalogScanFacts(ctx context.Context, candi
 	}
 	facts.SourceAssets = assetFacts
 	artifactChanges.SourceAssets = append(artifactChanges.SourceAssets, assetChanges...)
+	manifestIDs, manifestErr := deletedProviderArtifactIDs(s.catalogStore.readDB.WithContext(ctx), library.ID, result.DeletedProviderIDs)
+	if manifestErr != nil {
+		return facts, false, artifactChanges, manifestErr
+	}
+	artifactChanges.Manifests = append(artifactChanges.Manifests, manifestIDs...)
+	if err := freezeCloudCleanupDirectoriesTx(s.catalogStore.readDB.WithContext(ctx), run, result.DeletedProviderIDs); err != nil { return facts, false, artifactChanges, err }
 	run.Persisted = len(facts.Entries) + len(facts.Recognitions) + len(facts.SourceAssets)
 	if candidate.Kind == "delta" && (run.Persisted > CatalogMaxDeltaRows || catalogBatchSize(facts) > CatalogMaxDeltaBytes) {
 		return facts, false, artifactChanges, ErrCatalogBudget

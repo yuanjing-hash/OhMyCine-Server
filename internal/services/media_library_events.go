@@ -8,7 +8,6 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/medialibrary"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
@@ -37,15 +36,17 @@ type providerChangeEvent struct {
 }
 
 type providerChangeScope struct {
-	LocalPaths     []string
-	VerifiedResult *medialibrary.Result
-	Events         []providerChangeEvent
-	ParentIDs      []string
-	DeliveryIDs    []uint
-	EventCount     int
-	DeliveryMaxID  uint
-	Blocked        bool
-	BlockCode      string
+	DeletionGeneration *uint64
+	DeletionGuards     []providerDeletionGuard
+	LocalPaths         []string
+	VerifiedResult     *medialibrary.Result
+	Events             []providerChangeEvent
+	ParentIDs          []string
+	DeliveryIDs        []uint
+	EventCount         int
+	DeliveryMaxID      uint
+	Blocked            bool
+	BlockCode          string
 }
 
 type providerChangeScopeContextKey struct{}
@@ -263,9 +264,6 @@ func decodeProviderEventPayload(value string) (providerEventPayload, bool) {
 	default:
 		return providerEventPayload{}, false
 	}
-	if payload.Kind == cloudpkg.ChangeDeleted && payload.ParentID == "" {
-		return providerEventPayload{}, false
-	}
 	return payload, true
 }
 
@@ -481,6 +479,15 @@ func (s *MediaLibraryService) providerDeltaAlreadyApplied(ctx context.Context, l
 			return false, nil
 		}
 	}
+	for start := 0; start < len(delta.DeletedProviderIDs); start += CatalogBatchRows {
+		var count int64
+		if err := s.db.WithContext(ctx).Model(&models.MediaArtifact{}).Where("library_id = ? AND provider_item_id IN ? AND managed = ?", libraryID, delta.DeletedProviderIDs[start:min(start+CatalogBatchRows, len(delta.DeletedProviderIDs))], true).Count(&count).Error; err != nil {
+			return false, err
+		}
+		if count > 0 {
+			return false, nil
+		}
+	}
 	return true, nil
 }
 
@@ -521,12 +528,18 @@ func (s *MediaLibraryService) prepareProviderDeliveryPage(ctx context.Context, l
 	var extra, ignores []string
 	_ = json.Unmarshal([]byte(library.STRMAssetExtraExtensionsJSON), &extra)
 	_ = json.Unmarshal([]byte(library.IgnorePatternsJSON), &ignores)
-	known, err := s.knownPan115CatalogProviderIDs(ctx, libraryID, scope)
-	if err != nil {
-		return scope, err
-	}
 	var rows []models.MediaLibraryProviderEvent
 	if err := s.db.WithContext(ctx).Where("library_id = ? AND id IN ?", libraryID, scope.DeliveryIDs).Order("id").Find(&rows).Error; err != nil {
+		return scope, err
+	}
+	identityScope := providerChangeScope{}
+	for _, row := range rows {
+		if p, ok := decodeProviderEventPayload(row.PayloadJSON); ok {
+			identityScope.Events = append(identityScope.Events, providerChangeEvent(p))
+		}
+	}
+	known, err := s.knownPan115CatalogProviderIDs(ctx, libraryID, identityScope)
+	if err != nil {
 		return scope, err
 	}
 	result := medialibrary.Result{Partial: true, Scoped: true}
@@ -534,6 +547,7 @@ func (s *MediaLibraryService) prepareProviderDeliveryPage(ctx context.Context, l
 	assets := map[string]medialibrary.SourceAsset{}
 	deleted := map[string]struct{}{}
 	prepared := providerChangeScope{}
+	prepared.DeletionGeneration = &library.DirtyGeneration
 	for _, row := range rows {
 		if err := ctx.Err(); err != nil {
 			return scope, err
@@ -542,25 +556,40 @@ func (s *MediaLibraryService) prepareProviderDeliveryPage(ctx context.Context, l
 		if !valid || payload.Kind == cloudpkg.ChangeFallback {
 			continue
 		}
-		if isPan115DirectoryTreeTombstone(storage.Type, payload, known, effectiveSourceAssetExtensions(extra)) {
-			prepared.Events = append(prepared.Events, providerChangeEvent(payload))
-			prepared.DeliveryIDs = append(prepared.DeliveryIDs, row.ID)
-			if row.ID > prepared.DeliveryMaxID {
-				prepared.DeliveryMaxID = row.ID
-			}
-			prepared.EventCount++
-			continue
-		}
 		single := providerChangeScope{Events: []providerChangeEvent{providerChangeEvent(payload)}}
-		delta, scanErr := backend.Scan(ctx, MediaLibraryScanRequest{Library: library, Storage: storage, VideoExtensions: defaultVideoExtensions, AssetExtensions: effectiveSourceAssetExtensions(extra), IgnorePatterns: ignores, providerScope: &single, knownProviderIDs: known})
+		var delta medialibrary.Result
+		var scanErr error
+		if payload.Kind == cloudpkg.ChangeDeleted {
+			var reason string
+			delta, reason, scanErr = s.prepareLocalProviderDeletion(ctx, library, storage, row, payload, known)
+			if scanErr == nil && reason == providerDeletionNoResiduals {
+				continue
+			}
+			if scanErr == nil && reason != "" {
+				if err := s.deferProviderDelivery(ctx, row, payload, reason, true); err != nil {
+					return scope, err
+				}
+				continue
+			}
+			if scanErr == nil && len(delta.DeletedProviderIDs) > 0 {
+				_, scanErr = deletedProviderArtifactIDs(s.db.WithContext(ctx), libraryID, delta.DeletedProviderIDs)
+				if errors.Is(scanErr, ErrCatalogFence) || errors.Is(scanErr, gorm.ErrRecordNotFound) {
+					if err := s.deferProviderDelivery(ctx, row, payload, "deletion_artifact_source_unproven", true); err != nil {
+						return scope, err
+					}
+					continue
+				}
+			}
+		} else {
+			delta, scanErr = backend.Scan(ctx, MediaLibraryScanRequest{Library: library, Storage: storage, VideoExtensions: defaultVideoExtensions, AssetExtensions: effectiveSourceAssetExtensions(extra), IgnorePatterns: ignores, providerScope: &single, knownProviderIDs: known})
+		}
 		if scanErr == nil && result.Enumerated+delta.Enumerated > maxPan115ScopedEntries {
 			scanErr = errProviderChangeScopeUnproven
 		}
 		if scanErr != nil {
-			if err := s.db.WithContext(ctx).Model(&models.MediaLibraryProviderEvent{}).Where("id = ?", row.ID).Update("updated_at", time.Now().UTC()).Error; err != nil {
+			if err := s.deferProviderDelivery(ctx, row, payload, "provider_scope_unavailable", false); err != nil {
 				return scope, err
 			}
-			s.log.Warn().Uint("library_id", libraryID).Uint("delivery_id", row.ID).Msg("单个事件范围无法确认，保留重试；继续处理其他文件")
 			continue
 		}
 		prepared.Events = append(prepared.Events, single.Events...)
@@ -569,7 +598,11 @@ func (s *MediaLibraryService) prepareProviderDeliveryPage(ctx context.Context, l
 			prepared.DeliveryMaxID = row.ID
 		}
 		prepared.EventCount++
+		if payload.Kind == cloudpkg.ChangeDeleted && len(delta.DeletedProviderIDs) > 0 {
+			prepared.DeletionGuards = append(prepared.DeletionGuards, providerDeletionGuard{DeliveryID: row.ID, ProviderIDs: append([]string(nil), delta.DeletedProviderIDs...)})
+		}
 		result.Enumerated += delta.Enumerated
+		result.Directories = append(result.Directories, delta.Directories...)
 		for _, f := range delta.Files {
 			files[f.ProviderID] = f
 			delete(deleted, f.ProviderID)
@@ -583,9 +616,6 @@ func (s *MediaLibraryService) prepareProviderDeliveryPage(ctx context.Context, l
 			delete(files, id)
 			delete(assets, id)
 		}
-	}
-	if len(prepared.DeliveryIDs) == 0 {
-		return scope, errProviderChangeScopeUnproven
 	}
 	for _, f := range files {
 		result.Files = append(result.Files, f)
@@ -601,36 +631,4 @@ func (s *MediaLibraryService) prepareProviderDeliveryPage(ctx context.Context, l
 	sort.Strings(result.DeletedProviderIDs)
 	prepared.VerifiedResult = &result
 	return prepared, nil
-}
-
-// Ignore only an untracked 115 directory export tombstone. Tracked identities
-// and explicitly configured text assets always retain ordinary deletion handling.
-// This runs for durable deliveries too, so older queued notices are acknowledged.
-func isPan115DirectoryTreeTombstone(storageType string, p providerEventPayload, known map[string]struct{}, assetExtensions []string) bool {
-	if storageType != models.StorageTypePan115 || p.Kind != cloudpkg.ChangeDeleted || p.ParentID != "0" || p.PreviousParentID != "" {
-		return false
-	}
-	if _, exists := known[p.ItemID]; exists {
-		return false
-	}
-	for _, ext := range assetExtensions {
-		if strings.EqualFold(strings.TrimPrefix(strings.TrimSpace(ext), "."), "txt") {
-			return false
-		}
-	}
-	if !strings.HasSuffix(p.Name, "_目录树.txt") {
-		return false
-	}
-	prefix := strings.TrimSuffix(p.Name, "_目录树.txt")
-	if !strings.HasPrefix(prefix, "共享") || len(prefix) != len("共享")+14 {
-		return false
-	}
-	timestamp := prefix[len("共享"):]
-	for _, r := range timestamp {
-		if r < '0' || r > '9' {
-			return false
-		}
-	}
-	_, err := time.Parse("20060102150405", timestamp)
-	return err == nil
 }

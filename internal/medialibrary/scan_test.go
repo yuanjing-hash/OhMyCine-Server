@@ -32,6 +32,7 @@ type bulkScanCloudDriver struct {
 }
 
 type streamScanCloudDriver struct {
+	directories []cloudpkg.TreeEntry
 	*scanCloudDriver
 	batches [][]cloudpkg.TreeEntry
 	partial bool
@@ -43,11 +44,23 @@ func (d *streamScanCloudDriver) StreamTree(_ context.Context, _ string, _ int, e
 		total += len(batch)
 	}
 	for index, batch := range d.batches {
-		if err := emit(cloudpkg.TreeBatch{Offset: int64(index * 1000), Total: int64(total), Entries: batch, Partial: d.partial}); err != nil {
+		page := cloudpkg.TreeBatch{Offset: int64(index * 1000), Total: int64(total), Entries: batch, Partial: d.partial}
+		if index == 0 {
+			page.Directories = d.directories
+		}
+		if err := emit(page); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func TestScanProviderPreservesDirectoryEvidenceWithoutFileCountInflation(t *testing.T) {
+	d := &streamScanCloudDriver{scanCloudDriver: &scanCloudDriver{}, directories: []cloudpkg.TreeEntry{{Item: cloudpkg.Item{ID: "show", ParentID: "root", IsDir: true}, RelativePath: "/Show"}, {Item: cloudpkg.Item{ID: "s9", ParentID: "show", IsDir: true}, RelativePath: "/Show/Season09"}}, batches: [][]cloudpkg.TreeEntry{{{Item: cloudpkg.Item{ID: "episode", ParentID: "s9", Name: "01.mkv"}, RelativePath: "/Show/Season09/01.mkv"}}}}
+	result, err := ScanProvider(context.Background(), d, "root", true, []string{".mkv"}, nil, nil)
+	if err != nil || len(result.Directories) != 2 || len(result.Files) != 1 || result.Enumerated != 1 || d.statCalls != 0 || len(d.calls) != 0 {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
 }
 
 func (d *bulkScanCloudDriver) ListTree(context.Context, string, int) (cloudpkg.TreeResult, error) {

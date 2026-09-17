@@ -810,13 +810,17 @@ type ProviderEvent struct {
 // private copy exists; the library delivery is acknowledged only after its
 // catalog reconciliation commits successfully.
 type MediaLibraryProviderEvent struct {
-	ID           uint       `gorm:"primaryKey" json:"-"`
-	LibraryID    uint       `gorm:"not null;uniqueIndex:idx_media_library_provider_event;index" json:"-"`
-	InboxEventID uint       `gorm:"not null;uniqueIndex:idx_media_library_provider_event;index" json:"-"`
-	PayloadJSON  string     `gorm:"type:text;not null" json:"-"`
-	ProcessedAt  *time.Time `gorm:"index" json:"-"`
-	CreatedAt    time.Time  `gorm:"not null" json:"-"`
-	UpdatedAt    time.Time  `gorm:"not null" json:"-"`
+	SourceFingerprint string     `gorm:"not null;default:''" json:"-"`
+	ResolutionCode    string     `gorm:"not null;default:''" json:"-"`
+	ResolutionReason  string     `gorm:"not null;default:''" json:"-"`
+	RetryAfter        *time.Time `json:"-"`
+	ID                uint       `gorm:"primaryKey" json:"-"`
+	LibraryID         uint       `gorm:"not null;uniqueIndex:idx_media_library_provider_event;index" json:"-"`
+	InboxEventID      uint       `gorm:"not null;uniqueIndex:idx_media_library_provider_event;index" json:"-"`
+	PayloadJSON       string     `gorm:"type:text;not null" json:"-"`
+	ProcessedAt       *time.Time `gorm:"index" json:"-"`
+	CreatedAt         time.Time  `gorm:"not null" json:"-"`
+	UpdatedAt         time.Time  `gorm:"not null" json:"-"`
 }
 
 type ProviderCursor struct {
@@ -905,6 +909,7 @@ type MediaLibrary struct {
 	SignedProxyEnabled           bool       `gorm:"not null;default:false" json:"signed_proxy_enabled"`
 	MetadataArtifactsEnabled     bool       `gorm:"not null;default:false" json:"metadata_artifacts_enabled"`
 	UploadSidecars               bool       `gorm:"not null;default:false" json:"upload_sidecars"`
+	CloudEmptyCleanupEnabled     bool       `gorm:"not null;default:false" json:"cloud_empty_cleanup_enabled"`
 	ArtifactGeneration           uint64     `gorm:"not null;default:0" json:"artifact_generation"`
 	ArtifactAppliedGeneration    uint64     `gorm:"not null;default:0" json:"artifact_applied_generation"`
 	ArtifactStatus               string     `gorm:"size:32;not null;default:'idle'" json:"artifact_status"`

@@ -23,13 +23,27 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -tags webui -tr
   -ldflags "-s -w -X=github.com/yuanjing-hash/OhMyCine-Server/internal/buildinfo.Version=${VERSION} -X=github.com/yuanjing-hash/OhMyCine-Server/internal/buildinfo.Commit=${COMMIT} -X=github.com/yuanjing-hash/OhMyCine-Server/internal/buildinfo.NodeReleasePublicKeyBase64=${NODE_RELEASE_PUBLIC_KEY_B64}" \
   -o /out/ohmycine-server ./cmd/server
 
-FROM debian:bookworm-slim AS runtime
+FROM --platform=$BUILDPLATFORM node:22-bookworm-slim AS browser-companion
+WORKDIR /opt/ohmycine/browser-companion
+COPY browser-companion/package*.json ./
+# Never execute upstream installers or acquire a browser during image builds.
+RUN npm ci --omit=dev --ignore-scripts
+COPY browser-companion/src ./src
+
+FROM node:22-bookworm-slim AS runtime
 COPY LICENSE /usr/share/doc/ohmycine/LICENSE
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates tzdata ffmpeg \
+    libasound2 libatk-bridge2.0-0 libatk1.0-0 libatspi2.0-0 libcups2 libdbus-1-3 \
+    libdrm2 libgbm1 libnspr4 libnss3 libx11-6 libxcb1 libxcomposite1 libxdamage1 \
+    libxext6 libxfixes3 libxkbcommon0 libxrandr2 libpango-1.0-0 libcairo2 \
+    fonts-liberation fonts-noto-cjk fonts-noto-color-emoji \
     && rm -rf /var/lib/apt/lists/* \
-    && mkdir -p /var/lib/ohmycine/data /var/lib/ohmycine/logs /var/lib/ohmycine/plugins \
+    && mkdir -p /var/lib/ohmycine/data /var/lib/ohmycine/logs /var/lib/ohmycine/plugins /var/lib/ohmycine/browser \
+    && chmod 700 /var/lib/ohmycine/browser \
     && chown -R 65532:65532 /var/lib/ohmycine
+COPY --from=browser-companion /opt/ohmycine/browser-companion /opt/ohmycine/browser-companion
 ENV OMC_ENV=production OMC_SERVER_HOST=0.0.0.0 OMC_SERVER_PORT=3000 OMC_DATABASE_PATH=/var/lib/ohmycine/data/ohmycine.db OMC_LOG_DIR=/var/lib/ohmycine/logs OMC_PLUGIN_DIR=/var/lib/ohmycine/plugins
+ENV OMC_CLOAK_NODE=/usr/local/bin/node OMC_CLOAK_COMPANION=/opt/ohmycine/browser-companion/src/main.mjs OMC_CLOAK_DATA_DIR=/var/lib/ohmycine/browser
 VOLUME ["/var/lib/ohmycine"]
 EXPOSE 3000
 USER 65532:65532
