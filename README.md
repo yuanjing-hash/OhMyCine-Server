@@ -4,6 +4,12 @@
 
 本仓库是 OhMyCine 的独立 Server/CLI 仓库。Player 位于 [OhMyCine](https://github.com/yuanjing-hash/OhMyCine)，官方插件、Plugin SDK 与 Hub 位于 [OhMyCine-Plugins](https://github.com/yuanjing-hash/OhMyCine-Plugins)。历史 Server Release 仍保留在原仓库；拆分后的新版本从本仓库发布。
 
+## Docker 部署
+
+NAS / Linux 容器部署请阅读 [Docker 部署指南](README.docker.md)，包含 Docker Compose、`docker run`、局域网访问、数据持久化、媒体与 STRM 挂载、备份和升级示例。仓库自带配置位于 [deploy/compose.server.yml](deploy/compose.server.yml)。
+
+容器应用状态保存在 `/var/lib/ohmycine`；它与下面 Windows/Linux 启动脚本的 `.runtime` 目录不同。
+
 ## 推荐启动方式（Windows PowerShell）
 
 Windows 本地开发优先使用系统自带的 Windows PowerShell 5.1 或更高版本，在仓库根目录运行：
