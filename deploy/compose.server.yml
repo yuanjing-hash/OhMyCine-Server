@@ -9,10 +9,10 @@ services:
     environment:
       OMC_PUBLIC_ORIGIN: ${OMC_PUBLIC_ORIGIN:-http://127.0.0.1:3000}
     volumes:
-      - server-state:/var/lib/ohmycine
-    # Add only your media/STRM roots, using the same paths in the Server UI.
-    # - /srv/media:/media
-    # - /srv/strm:/strm
+      - ./data:/var/lib/ohmycine
+      # 启动前将下面的中文占位符替换为实际绝对路径；不需要的挂载可删除。
+      - "<宿主机媒体库目录>:/media"
+      - "<下载工具实际使用的宿主机下载目录>:/downloads"
+      # Optional STRM output directory:
+      # - /srv/strm:/strm
     stop_grace_period: 60s
-volumes:
-  server-state:

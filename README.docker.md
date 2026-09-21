@@ -12,7 +12,7 @@
 
 ## Docker Compose
 
-新建一个部署目录，在其中保存以下 `compose.yaml`：
+新建一个部署目录，在其中保存以下 `compose.yaml`。将 `<宿主机媒体库目录>` 和 `<下载工具实际使用的宿主机下载目录>` 替换为宿主机实际的媒体库目录与下载工具使用的下载目录；不需要的挂载可以删除：
 
 ```yaml
 services:
@@ -26,11 +26,16 @@ services:
     environment:
       OMC_PUBLIC_ORIGIN: http://127.0.0.1:3000
     volumes:
-      - server-state:/var/lib/ohmycine
+      - ./data:/var/lib/ohmycine
+      - "<宿主机媒体库目录>:/media"
+      - "<下载工具实际使用的宿主机下载目录>:/downloads"
     stop_grace_period: 60s
+```
 
-volumes:
-  server-state:
+镜像以 **UID/GID 65532:65532** 运行。首次启动前，在部署目录创建应用状态目录；媒体与下载目录也需预先存在，并通过 NAS 权限界面或 ACL 授予所需的读写权限：
+
+```bash
+sudo install -d -m 0750 -o 65532 -g 65532 ./data
 ```
 
 启动并查看日志：
@@ -47,6 +52,8 @@ docker compose logs -f --tail=100 server
 docker compose -f deploy/compose.server.yml up -d
 ```
 
+使用仓库配置时，`./data` 相对于 Compose 文件所在的 `deploy/` 目录，即 `deploy/data/`，不是终端当前目录。应在该位置准备数据目录，并先修改配置中的媒体与下载路径；也可以把 Compose 文件复制到独立部署目录使用。
+
 自带配置支持 `OMC_IMAGE_TAG`、`OMC_BIND_ADDRESS` 和 `OMC_PUBLIC_ORIGIN` 插值。例如在 NAS 的局域网地址 `192.168.1.10` 上运行：
 
 ```bash
@@ -55,7 +62,7 @@ OMC_PUBLIC_ORIGIN=http://192.168.1.10:3000 \
 docker compose -f deploy/compose.server.yml up -d
 ```
 
-后续维护必须沿用同一份 Compose 文件、项目名和环境配置；也可以把这些非敏感变量保存到 Compose 使用的 `.env` 文件。更换项目名可能创建另一个空数据卷。
+后续维护必须沿用同一份 Compose 文件、项目名和环境配置；也可以把这些非敏感变量保存到 Compose 使用的 `.env` 文件。移动 Compose 文件会改变相对路径的基准，请一并迁移 `data/` 或使用固定绝对路径。
 
 ### 局域网访问与端口
 
@@ -70,7 +77,7 @@ docker compose -f deploy/compose.server.yml up -d
 以下命令与最小 Compose 示例等价，不要与占用同一端口的 Compose 实例同时运行：
 
 ```bash
-docker volume create ohmycine-server-state
+sudo install -d -m 0750 -o 65532 -g 65532 ./data
 
 docker run -d \
   --name ohmycine-server \
@@ -80,7 +87,9 @@ docker run -d \
   --stop-timeout=60 \
   -p 127.0.0.1:3000:3000 \
   -e OMC_PUBLIC_ORIGIN=http://127.0.0.1:3000 \
-  -v ohmycine-server-state:/var/lib/ohmycine \
+  -v "$(pwd)/data:/var/lib/ohmycine" \
+  -v "<宿主机媒体库目录>:/media" \
+  -v "<下载工具实际使用的宿主机下载目录>:/downloads" \
   ghcr.io/yuanjing-hash/ohmycine-server:beta
 
 docker logs -f --tail=100 ohmycine-server
@@ -90,7 +99,7 @@ docker logs -f --tail=100 ohmycine-server
 
 ## 持久化数据在哪里
 
-镜像将应用状态统一放在 `/var/lib/ohmycine`。上面的命名卷会保留这些数据，容器重建后仍可使用：
+镜像将应用状态统一放在 `/var/lib/ohmycine`。这里将整个目录绑定到宿主机的 `./data`，容器重建后仍可使用：
 
 | 容器内路径 | 内容 |
 |---|---|
@@ -101,34 +110,36 @@ docker logs -f --tail=100 ohmycine-server
 | `/var/lib/ohmycine/plugins/` | 插件文件 |
 | `/var/lib/ohmycine/browser/` | 浏览器 companion 状态 |
 
-命名卷由 Docker 管理，并不是部署目录下的 `./data`。可以用 `docker volume inspect <卷名>` 查看卷信息；Compose 的实际卷名通常带项目名前缀。
+这里的 `./data` 是整个应用状态根目录，所以数据库实际位于 `./data/data/ohmycine.db`，日志位于 `./data/logs/`，插件位于 `./data/plugins/`，浏览器状态位于 `./data/browser/`。内外两层 `data` 是路径映射的正常结果。
 
-如果需要直接管理宿主机文件，可以把状态卷改成 `/srv/ohmycine/state:/var/lib/ohmycine`。镜像以 **UID/GID 65532:65532** 运行，需要提前创建专用目录并授予该用户写权限。例如仅对新建的应用状态目录执行：
-
-```bash
-sudo install -d -m 0750 -o 65532 -g 65532 /srv/ohmycine/state
-```
+已有命名卷部署不要直接切换到空目录：先停止旧实例，将旧卷中 `/var/lib/ohmycine` 的全部内容复制到新的 `./data`，保留数据库、密钥及其他状态并检查 UID/GID 65532:65532 的权限，再用新配置启动。确认迁移成功前保留旧卷。
 
 已有 NAS 目录请使用 NAS 权限界面或 ACL 授权；不要递归修改整个媒体盘的所有权。
 
-## 本地媒体和 STRM 目录挂载
+## 媒体库、下载与 STRM 目录
 
-应用状态卷不会自动挂载宿主机媒体目录。在 Compose 的 `volumes` 下按需要增加：
+示例已经挂载媒体库 `<宿主机媒体库目录>:/media` 和下载目录 `<下载工具实际使用的宿主机下载目录>:/downloads`。应用状态 `./data` 与这两个目录相互独立。需要 STRM 输出时，在 Compose 的 `volumes` 下额外增加：
 
 ```yaml
-      - /srv/media:/media
       - /srv/strm:/strm
 ```
 
-`docker run` 对应增加 `-v /srv/media:/media -v /srv/strm:/strm`。宿主机目录需提前创建；只挂载实际需要的目录。
+`docker run` 对应额外增加 `-v /srv/strm:/strm`。宿主机目录需提前创建；只挂载实际需要的目录。
 
 在 Server Web UI 中填写的是 **容器内路径**：
 
-- 本地存储根目录：`/media`，而不是宿主机的 `/srv/media`。
+- 本地存储根目录：`/media`，而不是宿主机的 `<宿主机媒体库目录>`。
+- 下载目录：`/downloads`，对应下载工具实际写入的宿主机目录 `<下载工具实际使用的宿主机下载目录>`。
 - 网盘媒体库的 STRM 本地输出根目录：`/strm` 或其中的子目录。
-- 仅读取本地媒体时可以挂载 `/srv/media:/media:ro`；启用本地 NFO/图片生成、整理或删除时，需要对应目录的写权限。
+- 仅读取本地媒体时可以挂载 `<宿主机媒体库目录>:/media:ro`；启用本地 NFO/图片生成、整理或删除时，需要对应目录的写权限。
 - STRM 输出目录需要 UID/GID 65532:65532 的写权限。
 - Emby/Jellyfin 需要另外挂载并扫描生成的 STRM 目录；它们也必须能访问 `OMC_PUBLIC_ORIGIN`。
+
+### 与下载工具保持路径一致
+
+如果 qBittorrent/Transmission 也运行在同一宿主机的容器里，建议两边都挂载 `<下载工具实际使用的宿主机下载目录>:/downloads`，并在下载工具中把保存路径设置为 `/downloads` 或其子目录。这样下载工具返回的路径也能被 Server 直接访问。仅容器内目录同名还不够，两边必须对应同一份宿主机文件。若下载工具返回不同路径，需要配置对应的路径映射。下载工具运行在另一台机器时，本地挂载并不能访问远端磁盘，应使用共享存储或远程 Node 的路径与传输配置。
+
+若整理使用硬链接，下载与媒体目录必须位于同一文件系统，并通过同一个父目录挂载暴露给容器；分开的 bind mount 可能导致跨挂载点硬链接失败。例如用 `/srv/storage:/storage` 替代媒体和下载的两条挂载，让下载工具与 Server 都使用 `/storage/downloads`，媒体库使用 `/storage/media`。复制模式可以使用前面的分开挂载布局。
 
 网盘扫描和 Player 读取媒体库不要求开启 STRM。识别元数据保存在数据库中，Player 通过 Server API 获取；当前影片图片通过 Server 图片代理按需获取，不会因为扫描就全部下载到状态卷。
 
@@ -159,7 +170,7 @@ docker rm ohmycine-server
 # 重新执行前文 docker run，并保留你实际使用的所有参数
 ```
 
-`docker rm` 不删除上述命名卷。Compose 日常停止使用 `docker compose stop`，移除容器使用 `docker compose down`；**不要添加 `-v`，它会删除命名卷中的应用数据。**
+`docker rm` 和 `docker compose down` 不删除上述宿主机绑定目录。Compose 日常停止使用 `docker compose stop`；仍在使用旧命名卷的部署不要执行 `docker compose down -v`，以免删除旧数据。
 
 备份时先停止 Server，再备份完整状态卷或绑定目录，完成后启动。数据库与 `credentials.key` 必须一起保留；如果使用外部 `OMC_CREDENTIAL_MASTER_KEY`，另行安全保管该密钥。媒体、STRM 目录需单独备份。跨版本恢复时应配套使用对应版本的数据备份，不能假定旧镜像兼容已升级的数据库。
 
