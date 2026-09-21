@@ -311,12 +311,23 @@ func (s *Scheduler) dispatch(ctx context.Context) {
 			defer s.wg.Done()
 			defer func() { cancel(); s.runningMu.Lock(); delete(s.running, job.Job.ID); s.runningMu.Unlock() }()
 			runtime := workerRuntime{queue: s.queue, job: job}
-			keepalive := s.startLeaseKeepalive(workerCtx, cancel, job)
+			// Cancellation stops new work, not ownership of cleanup still running.
+			// Keep the lease until Run and its deferred physical cleanup return.
+			keepalive := s.startLeaseKeepalive(context.WithoutCancel(workerCtx), cancel, job)
 			defer func() {
 				if err := keepalive.Stop(); err != nil {
 					serverlog.OperationTaskQueue.Event(s.log.Warn()).Str("job_id", job.Job.ID).Str("error_code", "queue_lease_keepalive_failed").Msg(serverlog.OperationTaskQueue.Message("任务租约续期停止失败"))
 				}
 			}()
+			// Control may commit after Claim but before running is registered.
+			// Refresh its durable intent after registration so that window cannot
+			// lose cancellation and start fresh file operations.
+			current, err := s.queue.verifyLease(s.queue.db, job.Job.ID, job.LeaseToken)
+			if err != nil {
+				return
+			}
+			job.Job.InterruptStatus = current.InterruptStatus
+			job.Job.CheckpointJSON = current.CheckpointJSON
 			if job.Job.InterruptStatus == models.JobStatusPaused || job.Job.InterruptStatus == models.JobStatusCancelled {
 				action := "pause"
 				if job.Job.InterruptStatus == models.JobStatusCancelled {
@@ -348,6 +359,19 @@ func (s *Scheduler) dispatch(ctx context.Context) {
 						return
 					}
 				} else {
+					providerControl := (job.Job.JobType == "download" || job.Job.JobType == "seeding") && job.Job.Provider != "" && job.Job.Provider != models.DownloaderTypeFake
+					if !providerControl {
+						// A recovered local cancellation is not a provider command.
+						// Never enter Run again; physical receipts remain available
+						// for observation/recovery without resuming mutations.
+						if keepalive.Stop() != nil {
+							return
+						}
+						if err := s.queue.AcknowledgeInterrupt(job.Job.ID, job.LeaseToken); err != nil {
+							s.log.Warn().Str("job_id", job.Job.ID).Str("error_code", "queue_interrupt_ack_failed").Msg("本地任务停止状态保存失败")
+						}
+						return
+					}
 					if leaseReleasesOnReject && keepalive.Stop() != nil {
 						return
 					}
