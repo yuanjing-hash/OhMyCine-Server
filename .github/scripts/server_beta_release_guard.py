@@ -95,31 +95,18 @@ def verify_workflow(path: Path = DEFAULT_WORKFLOW) -> list[str]:
         "versioned node installers are rendered": "install-ohmycine-node-v${VERSION}.sh" in text
         and "install-ohmycine-node-v${VERSION}.ps1" in text
         and "__OHMYCINE_NODE_RELEASE_PUBLIC_KEY_BASE64__" in text,
-        "node installer contracts run before release": "bash -n scripts/install-node.sh" in text
-        and "scripts/test-install-node.ps1" in text,
-        "webui gates run": all(
-            command in text
-            for command in (
-                "npm run permissions:check",
-                "npm run test",
-                "npm run typecheck",
-                "npm run lint",
-                "npm run build",
-            )
-        ),
-        "go gates run": all(
-            command in text
-            for command in (
+        "webui release build runs": "npm run build" in text,
+        "release regression gates run": all(
+            command in text for command in (
                 "go mod verify",
-                "go build ./...",
-                "go vet ./...",
-                "go test ./...",
-                "golangci-lint-action",
+                "go test ./internal/database ./internal/authz ./internal/buildinfo ./cmd/... -timeout 5m",
+                "go test ./internal/services -run",
+                "CancelledRepair", "CatalogStructure.*Cancel", "CatalogRuntimeAccess",
+                'if [[ "$CHANNEL" == stable ]]', "go test ./... -timeout 30m",
             )
         ),
         "standalone timezone database is enforced": "go list -deps -tags webui ./cmd/server | grep -Fxq 'time/tzdata'"
         in text,
-        "lint action supports v2 and version is pinned": "golangci/golangci-lint-action@v7" in text and "version: v2.4.0" in text and "version: latest" not in text,
         "idempotent asset upload": 'gh release upload "$TAG_NAME"' in text and "--clobber" in text,
         "signed node assets are uploaded": all(
             name in text

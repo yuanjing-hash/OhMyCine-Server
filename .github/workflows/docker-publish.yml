@@ -118,6 +118,8 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=server-release
+          cache-to: type=gha,mode=max,scope=server-release
       - uses: docker/metadata-action@v5
         id: node-meta
         with:
@@ -135,6 +137,8 @@ jobs:
           push: true
           tags: ${{ steps.node-meta.outputs.tags }}
           labels: ${{ steps.node-meta.outputs.labels }}
+          cache-from: type=gha,scope=node-release
+          cache-to: type=gha,mode=max,scope=node-release
       - name: Smoke test both architectures with isolated state
         env:
           IMAGE_REGISTRIES: ghcr.io/${{ env.IMAGE_OWNER }},docker.io/${{ env.DOCKERHUB_NAMESPACE }}

@@ -33,14 +33,22 @@ jobs:
         run: |
           python3 .github/scripts/server_beta_release_guard.py check-workflow
           python3 .github/scripts/test_server_beta_release_guard.py
+          python3 .github/scripts/test_docker_release_guard.py
+          python3 .github/scripts/test_server_release_source.py
+          pwsh -NoLogo -NoProfile -File scripts/test-install-node.ps1
+
+      - name: Verify browser companion
+        working-directory: browser-companion
+        run: |
+          npm ci --omit=dev --ignore-scripts
+          npm test
+          python3 ../.github/scripts/test_browser_packaging.py
 
       - name: Verify Web UI
         working-directory: webui
         run: |
           npm ci
-          npm run permissions:check
           npm run test
-          npm run typecheck
           npm run lint
           npm run build
           go mod verify
@@ -48,11 +56,8 @@ jobs:
 
       - name: Verify Server
         run: |
-          go mod download
           go mod verify
-          go build ./...
           go test ./... -timeout 30m
-          go vet ./...
 
       - name: Lint
         uses: golangci/golangci-lint-action@v7

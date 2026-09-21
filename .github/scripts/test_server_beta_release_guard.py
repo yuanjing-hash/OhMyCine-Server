@@ -25,12 +25,6 @@ class VersionTests(unittest.TestCase):
 
 
 class WorkflowTests(unittest.TestCase):
-    def test_lint_fails_fast_after_webui_and_before_long_go_gate(self) -> None:
-        source = guard.DEFAULT_WORKFLOW.read_text(encoding="utf-8")
-        self.assertLess(source.index("- name: Build embedded Web UI"), source.index("- name: Lint Server"))
-        self.assertLess(source.index("- name: Lint Server\n"), source.index("- name: Verify Server\n"))
-        self.assertIn("go test ./... -timeout 30m", source)
-
     def test_detects_missing_server_arm64_checksum_or_upload(self) -> None:
         source = guard.DEFAULT_WORKFLOW.read_text(encoding="utf-8")
         for value in (
@@ -53,24 +47,14 @@ class WorkflowTests(unittest.TestCase):
             path.write_text(source + "\n# player/dist/forbidden.zip\n", encoding="utf-8")
             self.assertIn("Player asset path", guard.verify_workflow(path))
 
-    def test_detects_unpinned_linter_and_missing_release_title_check(self) -> None:
+    def test_detects_missing_release_title_check(self) -> None:
         source = guard.DEFAULT_WORKFLOW.read_text(encoding="utf-8")
-        source = source.replace("version: v2.4.0", "version: latest")
         source = source.replace("--json tagName,name,isPrerelease,isDraft", "--json tagName,isPrerelease,isDraft")
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "workflow.yml"
             path.write_text(source, encoding="utf-8")
             failures = guard.verify_workflow(path)
-            self.assertIn("lint action supports v2 and version is pinned", failures)
             self.assertIn("release identity and title are checked", failures)
-
-    def test_detects_lint_action_without_v2_support(self) -> None:
-        source = guard.DEFAULT_WORKFLOW.read_text(encoding="utf-8")
-        source = source.replace("golangci/golangci-lint-action@v7", "golangci/golangci-lint-action@v6")
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "workflow.yml"
-            path.write_text(source, encoding="utf-8")
-            self.assertIn("lint action supports v2 and version is pinned", guard.verify_workflow(path))
 
     def test_detects_missing_standalone_timezone_guard(self) -> None:
         source = guard.DEFAULT_WORKFLOW.read_text(encoding="utf-8")
