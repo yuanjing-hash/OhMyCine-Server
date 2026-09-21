@@ -10,6 +10,8 @@ package services
 // collection queries retain exact library/generation filters and mode gates.
 // Health/naming planners add no queries; retirement uses child-first batches.
 var catalogRuntimeAccessAllowlist = map[string]string{
+	// Row-catalog scan transaction: stable ProviderID rename, bounded by library/id/provider.
+	"internal/services/media_library_asset_identity.go:matchRenamedSourceAssetsTx":         "model:A=3,query:Model:A=1|07fb089edf33a31a",
 	"internal/services/media_artifact_deletions.go:captureDeletedEntryRecognitionScopesTx": "model:E=1,model:R=2,query:First:R=1,query:Model:R=1,query:Where:R=1|0b136dc598c84da1",
 	// Exact event-only no-op writes; legacy-only work pruning and pinned restore checks.
 	"internal/services/media_library_event_deletion.go:MediaLibraryService.completeAbsentProviderDeletion": "model:A=1,model:E=1,query:Find:A=2,query:Find:E=2|e7237e5fe03bc93b",
@@ -107,7 +109,7 @@ var catalogRuntimeAccessAllowlist = map[string]string{
 	"internal/services/media_coverage.go:uniqueEntryLibraries":                                               "model:E=1|6f3a02a90b57b2c6",
 	"internal/services/media_library.go:MediaLibraryService.Entries":                                         "model:E=2,query:Find:E=1|e2acb4a0449482a9",
 	"internal/services/media_library.go:MediaLibraryService.Update":                                          "model:A=1,model:E=1,model:R=1,query:Delete:A=1,query:Delete:E=1,query:Delete:R=1|664ebb2bb9cffcf5",
-	"internal/services/media_library.go:MediaLibraryService.reconcile":                                       "call:mergeScopedPan115Catalog=1,call:publishFastPan115Scan=1,call:recognizeLibraryUnits=1,call:reconcileTMDBCollectionsTx=1,call:stabilizeExistingRecognitionUnits=1,model:A=4,model:E=5,model:R=3,query:Delete:A=2,query:Delete:E=2,query:Delete:R=1,query:Find:A=1,query:Find:E=1,query:First:R=1,query:Save:A=1,query:Save:E=1,query:Save:R=1|47670bc74374d9fc",
+	"internal/services/media_library.go:MediaLibraryService.reconcile":                                       "call:mergeScopedPan115Catalog=1,call:publishFastPan115Scan=1,call:recognizeLibraryUnits=1,call:reconcileTMDBCollectionsTx=1,call:stabilizeExistingRecognitionUnits=1,model:A=4,model:E=5,model:R=3,query:Delete:A=2,query:Delete:E=2,query:Delete:R=1,query:Find:A=1,query:Find:E=1,query:First:R=1,query:Save:A=1,query:Save:E=1,query:Save:R=1|275fb0389705bf72",
 	"internal/services/media_library.go:applyRecognitionEpisodeHints":                                        "model:E=1|7d763b9b7156f0fa",
 	"internal/services/media_library.go:mediaLibraryEntryProjectionChanged":                                  "model:E=1|256c6390a86c4f76",
 	"internal/services/media_library.go:mediaRecognitionProjectionChanged":                                   "model:R=1|67d93d5424dac75c",
@@ -139,7 +141,7 @@ var catalogRuntimeAccessAllowlist = map[string]string{
 	// versioned state/head before reaching these original-table writes. Only
 	// verified successes reach the legacy outcome transaction; failures are
 	// observed unchanged before partial settlement. Global physical fences stay.
-	"internal/services/media_library_structure.go:MediaLibraryStructureService.runRepair":         "call:removeStructureCatalogItems=1,call:updateStructureCatalogPaths=1|b564ca760656b88d",
+	"internal/services/media_library_structure.go:MediaLibraryStructureService.runRepair":         "call:removeStructureCatalogItems=1,call:updateStructureCatalogPaths=1|2c6c03c723644d87",
 	"internal/services/media_library_structure.go:MediaLibraryStructureService.structureIssuesTx": "model:R=2,query:Find:R=1|ed44d1d7f35e2fb7",
 	"internal/services/media_library_structure.go:removeStructureCatalogItems":                    "helper:removeStructureCatalogItems=1,model:A=1,model:E=1,query:Delete:A=1,query:Delete:E=1|a46b1f03b11411a5",
 	"internal/services/media_library_structure.go:updateStructureCatalogPaths":                    "helper:updateStructureCatalogPaths=1,model:A=1,model:E=1,query:Model:A=1,query:Model:E=1|f2f4bad6fa3d9870",
