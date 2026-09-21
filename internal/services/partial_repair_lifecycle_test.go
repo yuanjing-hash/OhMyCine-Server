@@ -58,7 +58,7 @@ func (b *interruptAfterMoveBackend) Apply(ctx context.Context, boundary Structur
 }
 
 func TestCancelledRepairObservesUncheckpointedMoveWithoutReplay(t *testing.T) {
-	for _, mode := range []string{"running_cancel", "pause_then_cancel", "changed_after_cancel", "replaced_catalog"} {
+	for _, mode := range []string{"running_cancel", "pause_then_cancel", "changed_after_cancel", "replaced_catalog", "later_item_unavailable"} {
 		t.Run(mode, func(t *testing.T) {
 			s, actor, library, diagnostics := prepareLegacyStructureRepair(t)
 			var databases []struct{ Name, File string }
@@ -89,6 +89,7 @@ func TestCancelledRepairObservesUncheckpointedMoveWithoutReplay(t *testing.T) {
 			}
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
+			var hiddenSource string
 			backend := &interruptAfterMoveBackend{after: func() {
 				action := "cancel"
 				if mode == "pause_then_cancel" || mode == "replaced_catalog" {
@@ -98,6 +99,20 @@ func TestCancelledRepairObservesUncheckpointedMoveWithoutReplay(t *testing.T) {
 					t.Fatal(err)
 				}
 				cancel()
+				if mode == "later_item_unavailable" {
+					var plan StructurePlan
+					if err := json.Unmarshal([]byte(repair.PlanJSON), &plan); err != nil {
+						t.Fatal(err)
+					}
+					var storage models.Storage
+					if err := s.db.First(&storage, library.StorageID).Error; err != nil {
+						t.Fatal(err)
+					}
+					hiddenSource = filepath.Join(storage.RootPath, filepath.FromSlash(plan.Items[1].SourceRelative))
+					if err := os.Rename(hiddenSource, hiddenSource+".hold"); err != nil {
+						t.Fatal(err)
+					}
+				}
 				if mode == "changed_after_cancel" {
 					var plan StructurePlan
 					if err := json.Unmarshal([]byte(repair.PlanJSON), &plan); err != nil {
@@ -116,6 +131,28 @@ func TestCancelledRepairObservesUncheckpointedMoveWithoutReplay(t *testing.T) {
 			_ = NewMediaLibraryRepairWorker(s).Run(ctx, fastScanTestRuntime{}, *claim)
 			if err := s.queue.AcknowledgeInterrupt(claim.Job.ID, claim.LeaseToken); err != nil {
 				t.Fatal(err)
+			}
+			if mode == "later_item_unavailable" {
+				var stored models.MediaLibraryStructureRepair
+				if err := s.db.First(&stored, "id=?", repair.ID).Error; err != nil {
+					t.Fatal(err)
+				}
+				var progress struct {
+					CancelVerified int `json:"cancel_verified"`
+				}
+				if err := json.Unmarshal([]byte(stored.StateJSON), &progress); err != nil || progress.CancelVerified != 1 || stored.SucceededItems != 1 {
+					t.Fatalf("verified prefix lost: %+v %+v %v", progress, stored, err)
+				}
+				var proof models.CatalogPhysicalWrite
+				if err := s.db.First(&proof, "owner_kind=? AND owner_id=?", CatalogPhysicalRepair, repair.ID).Error; err != nil || proof.State != "quiescent" {
+					t.Fatalf("unfinished verification settled: %+v %v", proof, err)
+				}
+				if err := os.Rename(hiddenSource+".hold", hiddenSource); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := NewMediaLibraryRepairWorker(s).RecoverStoppedWork(context.Background(), 0); err != nil {
+					t.Fatal(err)
+				}
 			}
 			if mode == "changed_after_cancel" {
 				var proof models.CatalogPhysicalWrite

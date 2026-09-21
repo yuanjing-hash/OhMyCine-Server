@@ -3,6 +3,7 @@ package services
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"time"
 
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
@@ -17,7 +18,7 @@ func (s *MediaLibraryStructureService) finishCancelledCatalogStructureRepair(per
 		return
 	}
 	quiesceCatalogPhysicalWrite(s.db, permit, s.log)
-	if err := s.finalizeCancelledCatalogStructureResult(ctx, permit, repair, plan, boundary, backend); err != nil {
+	if err := s.finalizeCancelledCatalogStructureResult(ctx, permit, repair, plan, boundary, backend); err != nil && !errors.Is(err, errStructureCancelProgress) {
 		s.log.Warn().Uint("library_id", repair.LibraryID).Str("error_code", "structure_cancelled_outcome_pending").Msg("已取消整理的文件结果尚未确认，保留原任务明细")
 	}
 }
@@ -50,7 +51,9 @@ func (s *MediaLibraryStructureService) finalizeCancelledCatalogStructureResult(c
 		return err
 	}
 	if state.Stage != "catalog_published" && state.Stage != "reconciling" {
-		observe, err := structureFileObserver(ctx, boundary, backend)
+		observeCtx, stopObserve := context.WithTimeout(ctx, 20*time.Second)
+		defer stopObserve()
+		observe, err := structureFileObserver(observeCtx, boundary, backend)
 		if err != nil {
 			return err
 		}
@@ -64,7 +67,10 @@ func (s *MediaLibraryStructureService) finalizeCancelledCatalogStructureResult(c
 				return err
 			}
 		}
-		for offset := 0; offset < total; {
+		if state.CancelVerified < 0 || state.CancelVerified > total {
+			return ErrCatalogFence
+		}
+		for offset := state.CancelVerified; offset < total; {
 			var rows []models.MediaLibraryStructureRepairItem
 			if err := s.db.WithContext(ctx).Where("repair_id=? AND ordinal>=?", repair.ID, offset).Order("ordinal").Limit(CatalogBatchRows).Find(&rows).Error; err != nil {
 				return err
@@ -72,54 +78,73 @@ func (s *MediaLibraryStructureService) finalizeCancelledCatalogStructureResult(c
 			if len(rows) == 0 {
 				return ErrCatalogFence
 			}
+			batchStarted := time.Now()
+			verified := 0
+			var observationErr error
 			for i := range rows {
-				row := &rows[i]
-				if row.Ordinal != offset || offset >= total {
-					return ErrCatalogFence
-				}
-				var source, target, provider, kind, action string
-				var size, modified int64
-				recycle := offset < len(plan.RecycleItems)
-				if recycle {
-					item := plan.RecycleItems[offset]
-					source, target, provider, size, modified, kind, action = item.SourceRelative, item.RecycleRelative, item.ProviderID, item.Size, item.ModifiedAtUnixNano, item.Kind, "recycle"
-				} else {
-					item := plan.Items[offset-len(plan.RecycleItems)]
-					source, target, provider, size, modified, kind, action = item.SourceRelative, item.TargetRelative, item.ProviderID, item.Size, item.ModifiedAtUnixNano, item.Kind, "move"
-				}
-				if row.SourceRelative != safeStructurePath(source) || row.TargetRelative != safeStructurePath(target) || row.Action != action || row.Kind != kind {
-					return ErrCatalogFence
-				}
-				if row.Status == structureRepairItemSucceeded && !recycle {
-					exact, _, err := observe(target, provider, size, modified)
-					if err != nil {
-						return err
-					}
-					if !exact {
+				err := func() error {
+					row := &rows[i]
+					if row.Ordinal != offset || offset >= total {
 						return ErrCatalogFence
 					}
-				}
-				if row.Status != structureRepairItemSucceeded {
-					row.FinishedAt = nil
-					atSource, missing, err := observe(source, provider, size, modified)
-					if err != nil {
-						return err
-					}
-					if atSource {
-						row.Status = structureRepairItemFailed
+					var source, target, provider, kind, action string
+					var size, modified int64
+					recycle := offset < len(plan.RecycleItems)
+					if recycle {
+						item := plan.RecycleItems[offset]
+						source, target, provider, size, modified, kind, action = item.SourceRelative, item.RecycleRelative, item.ProviderID, item.Size, item.ModifiedAtUnixNano, item.Kind, "recycle"
 					} else {
-						if (!missing && boundary.Storage.Type != models.StorageTypePan115) || (recycle && boundary.Storage.Type != models.StorageTypeLocal) {
-							return ErrCatalogFence
-						}
-						atTarget, _, err := observe(target, provider, size, modified)
-						if err != nil || !atTarget {
-							return ErrCatalogFence
-						}
-						row.Status = structureRepairItemSucceeded
+						item := plan.Items[offset-len(plan.RecycleItems)]
+						source, target, provider, size, modified, kind, action = item.SourceRelative, item.TargetRelative, item.ProviderID, item.Size, item.ModifiedAtUnixNano, item.Kind, "move"
 					}
+					if row.SourceRelative != safeStructurePath(source) || row.TargetRelative != safeStructurePath(target) || row.Action != action || row.Kind != kind {
+						return ErrCatalogFence
+					}
+					if row.Status == structureRepairItemSucceeded && !recycle {
+						exact, _, err := observe(target, provider, size, modified)
+						if err != nil {
+							return err
+						}
+						if !exact {
+							return ErrCatalogFence
+						}
+					}
+					if row.Status != structureRepairItemSucceeded {
+						row.FinishedAt = nil
+						atSource, missing, err := observe(source, provider, size, modified)
+						if err != nil {
+							return err
+						}
+						if atSource {
+							row.Status = structureRepairItemFailed
+						} else {
+							if (!missing && boundary.Storage.Type != models.StorageTypePan115) || (recycle && boundary.Storage.Type != models.StorageTypeLocal) {
+								return ErrCatalogFence
+							}
+							atTarget, _, err := observe(target, provider, size, modified)
+							if err != nil || !atTarget {
+								return ErrCatalogFence
+							}
+							row.Status = structureRepairItemSucceeded
+						}
+					}
+					return nil
+				}()
+				if err != nil {
+					observationErr = err
+					break
 				}
 				offset++
+				verified++
+				if time.Since(batchStarted) >= 5*time.Second {
+					break
+				}
 			}
+			if verified == 0 {
+				return observationErr
+			}
+			rows = rows[:verified]
+			state.CancelVerified = offset
 			if err := s.structureCatalogWriteTx(ctx, func(tx *gorm.DB) error {
 				if err := s.validateCatalogStructureExecutionTx(tx, repair, state, nil, true); err != nil {
 					return err
@@ -138,9 +163,12 @@ func (s *MediaLibraryStructureService) finalizeCancelledCatalogStructureResult(c
 						return err
 					}
 				}
-				return nil
+				return persistCatalogStructureStateTx(tx, repair.ID, state, nil)
 			}); err != nil {
 				return err
+			}
+			if offset < total {
+				return errStructureCancelProgress
 			}
 		}
 		applied, err := s.catalogStructureSucceededPlan(ctx, repair, plan, state.RetryCheckpointBefore)

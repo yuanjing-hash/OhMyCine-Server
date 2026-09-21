@@ -16,6 +16,8 @@ import (
 	"gorm.io/gorm"
 )
 
+var errStructureCancelProgress = errors.New("structure cancellation verification continues")
+
 // This runs only on the original synchronous execution stack after all file
 // calls returned. It never resumes the cancelled plan; it only accounts for
 // observed outcomes. Pause/shutdown remain resumable and take no such path.
@@ -27,7 +29,7 @@ func (s *MediaLibraryStructureService) finishCancelledStructureRepair(permit Cat
 		return
 	}
 	quiesceCatalogPhysicalWrite(s.db, permit, s.log)
-	if err := s.reconcileCancelledStructureRepair(ctx, permit, repair, plan, boundary, backend); err != nil {
+	if err := s.reconcileCancelledStructureRepair(ctx, permit, repair, plan, boundary, backend); err != nil && !errors.Is(err, errStructureCancelProgress) {
 		s.log.Warn().Uint("library_id", repair.LibraryID).Str("error_code", "structure_cancelled_outcome_pending").Msg("已取消整理的部分文件结果尚未确认，保留原任务明细")
 	}
 }
@@ -40,7 +42,17 @@ func (s *MediaLibraryStructureService) reconcileCancelledStructureRepair(ctx con
 		}
 		defer lock.Unlock()
 	}
-	if err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error { return validateCancelledStructurePermitTx(tx, permit, repair) }); err != nil {
+	if err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := validateCancelledStructurePermitTx(tx, permit, repair); err != nil {
+			return err
+		}
+		var current models.MediaLibraryStructureRepair
+		if err := tx.First(&current, "id=?", repair.ID).Error; err != nil {
+			return err
+		}
+		repair.StateJSON = current.StateJSON
+		return nil
+	}); err != nil {
 		return err
 	}
 	// Preserve versioned bindings: their publication owner must account for its
@@ -50,7 +62,10 @@ func (s *MediaLibraryStructureService) reconcileCancelledStructureRepair(ctx con
 	if state.Version != 0 {
 		return ErrCatalogFence
 	}
-	observe, err := structureFileObserver(ctx, boundary, backend)
+	// Leave time to commit an observed prefix even if a provider read times out.
+	observeCtx, stopObserve := context.WithTimeout(ctx, 20*time.Second)
+	defer stopObserve()
+	observe, err := structureFileObserver(observeCtx, boundary, backend)
 	if err != nil {
 		return err
 	}
@@ -75,69 +90,97 @@ func (s *MediaLibraryStructureService) reconcileCancelledStructureRepair(ctx con
 	if len(rows) != len(plan.Items)+len(plan.RecycleItems) {
 		return ErrCatalogFence
 	}
+	var progress struct {
+		CancelVerified int `json:"cancel_verified"`
+	}
+	if err := json.Unmarshal([]byte(repair.StateJSON), &progress); err != nil {
+		return err
+	}
+	if progress.CancelVerified < 0 || progress.CancelVerified > len(rows) {
+		return ErrCatalogFence
+	}
 	var succeeded []int
-	for index, row := range rows {
-		if row.Ordinal != index {
-			return ErrCatalogFence
-		}
-		var source, target, providerID string
-		var size, modified int64
-		recycle := index < len(plan.RecycleItems)
-		if recycle {
-			item := plan.RecycleItems[index]
-			source, target, providerID, size, modified = item.SourceRelative, item.RecycleRelative, item.ProviderID, item.Size, item.ModifiedAtUnixNano
-		} else {
-			item := plan.Items[index-len(plan.RecycleItems)]
-			source, target, providerID, size, modified = item.SourceRelative, item.TargetRelative, item.ProviderID, item.Size, item.ModifiedAtUnixNano
-		}
-		if row.SourceRelative != safeStructurePath(source) {
-			return ErrCatalogFence
-		}
-		if row.TargetRelative != safeStructurePath(target) || (recycle && row.Action != "recycle") || (!recycle && row.Action != "move") {
-			return ErrCatalogFence
-		}
-		success := row.Status == structureRepairItemSucceeded
-		if success && !recycle {
-			atTarget, _, err := observe(target, providerID, size, modified)
-			if err != nil {
-				return err
+	next := progress.CancelVerified
+	batchStarted := time.Now()
+	var observationErr error
+	for index := next; index < len(rows) && index < progress.CancelVerified+CatalogBatchRows; index++ {
+		row := rows[index]
+		success, err := func() (bool, error) {
+			if row.Ordinal != index {
+				return false, ErrCatalogFence
 			}
-			if !atTarget {
-				return ErrCatalogFence
+			var source, target, providerID string
+			var size, modified int64
+			recycle := index < len(plan.RecycleItems)
+			if recycle {
+				item := plan.RecycleItems[index]
+				source, target, providerID, size, modified = item.SourceRelative, item.RecycleRelative, item.ProviderID, item.Size, item.ModifiedAtUnixNano
+			} else {
+				item := plan.Items[index-len(plan.RecycleItems)]
+				source, target, providerID, size, modified = item.SourceRelative, item.TargetRelative, item.ProviderID, item.Size, item.ModifiedAtUnixNano
 			}
-		}
-		if !success {
-			atSource, missingSource, err := observe(source, providerID, size, modified)
-			if err != nil {
-				return err
+			if row.SourceRelative != safeStructurePath(source) {
+				return false, ErrCatalogFence
 			}
-			if !atSource {
-				// Provider recycle exits the library boundary. Absence alone never
-				// proves its recycle destination; retain an ambiguous receipt.
-				if (!missingSource && boundary.Storage.Type != models.StorageTypePan115) || (recycle && boundary.Storage.Type != models.StorageTypeLocal) {
-					return ErrCatalogFence
-				}
+			if row.TargetRelative != safeStructurePath(target) || (recycle && row.Action != "recycle") || (!recycle && row.Action != "move") {
+				return false, ErrCatalogFence
+			}
+			success := row.Status == structureRepairItemSucceeded
+			if success && !recycle {
 				atTarget, _, err := observe(target, providerID, size, modified)
-				if err != nil || !atTarget {
-					return ErrCatalogFence
+				if err != nil {
+					return false, err
 				}
-				success = true
+				if !atTarget {
+					return false, ErrCatalogFence
+				}
 			}
+			if !success {
+				atSource, missingSource, err := observe(source, providerID, size, modified)
+				if err != nil {
+					return false, err
+				}
+				if !atSource {
+					// Provider recycle exits the library boundary. Absence alone never
+					// proves its recycle destination; retain an ambiguous receipt.
+					if (!missingSource && boundary.Storage.Type != models.StorageTypePan115) || (recycle && boundary.Storage.Type != models.StorageTypeLocal) {
+						return false, ErrCatalogFence
+					}
+					atTarget, _, err := observe(target, providerID, size, modified)
+					if err != nil || !atTarget {
+						return false, ErrCatalogFence
+					}
+					success = true
+				}
+			}
+			return success, nil
+		}()
+		if err != nil {
+			observationErr = err
+			break
 		}
 		if success {
 			succeeded = append(succeeded, index)
-			if recycle {
+			if index < len(plan.RecycleItems) {
 				applied.RecycleItems = append(applied.RecycleItems, plan.RecycleItems[index])
 			} else {
 				applied.Items = append(applied.Items, plan.Items[index-len(plan.RecycleItems)])
 			}
 		}
+		next = index + 1
+		if time.Since(batchStarted) >= 5*time.Second {
+			break
+		}
 	}
+	if next == progress.CancelVerified && observationErr != nil {
+		return observationErr
+	}
+	complete := next == len(rows)
 	parents, err := s.repairedManagedProviderParents(ctx, boundary.Library, boundary.Storage, applied.Items)
 	if err != nil {
 		return err
 	}
-	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if err := validateCancelledStructurePermitTx(tx, permit, repair); err != nil {
 			return err
 		}
@@ -164,14 +207,17 @@ func (s *MediaLibraryStructureService) reconcileCancelledStructureRepair(ctx con
 				return err
 			}
 		}
-		var failed, blocked int64
+		var totalSucceeded, failed, blocked int64
+		if err := tx.Model(&models.MediaLibraryStructureRepairItem{}).Where("repair_id=? AND status=?", repair.ID, structureRepairItemSucceeded).Count(&totalSucceeded).Error; err != nil {
+			return err
+		}
 		if err := tx.Model(&models.MediaLibraryStructureRepairItem{}).Where("repair_id=? AND status=?", repair.ID, structureRepairItemFailed).Count(&failed).Error; err != nil {
 			return err
 		}
 		if err := tx.Model(&models.MediaLibraryStructureRepairItem{}).Where("repair_id=? AND status=?", repair.ID, structureRepairItemBlocked).Count(&blocked).Error; err != nil {
 			return err
 		}
-		if err := tx.Model(&models.MediaLibraryStructureRepair{}).Where("id=?", repair.ID).Updates(map[string]any{"phase": "failed", "last_error_code": "structure_cancelled", "succeeded_items": len(succeeded), "failed_items": failed, "blocked_items": blocked, "processed_items": int64(len(succeeded)) + failed + blocked, "current_action": "", "current_item": "", "current_batch_size": 0, "finished_at": now, "updated_at": now}).Error; err != nil {
+		if err := tx.Model(&models.MediaLibraryStructureRepair{}).Where("id=?", repair.ID).Updates(map[string]any{"phase": "failed", "last_error_code": "structure_cancelled", "succeeded_items": totalSucceeded, "failed_items": failed, "blocked_items": blocked, "processed_items": totalSucceeded + failed + blocked, "current_action": "", "current_item": "", "current_batch_size": 0, "finished_at": now, "updated_at": now}).Error; err != nil {
 			return err
 		}
 		if len(succeeded) > 0 {
@@ -182,6 +228,24 @@ func (s *MediaLibraryStructureService) reconcileCancelledStructureRepair(ctx con
 		if err := refreshStructureSummaryTx(tx, repair.LibraryID, now); err != nil {
 			return err
 		}
+		var durable map[string]any
+		if err := json.Unmarshal([]byte(repair.StateJSON), &durable); err != nil {
+			return err
+		}
+		if durable == nil {
+			durable = map[string]any{}
+		}
+		durable["cancel_verified"] = next
+		raw, err := json.Marshal(durable)
+		if err != nil {
+			return err
+		}
+		if err := tx.Model(&models.MediaLibraryStructureRepair{}).Where("id=?", repair.ID).Update("state_json", string(raw)).Error; err != nil {
+			return err
+		}
+		if !complete {
+			return nil
+		}
 		changed := tx.Model(&models.CatalogPhysicalWrite{}).Where("id=? AND revision=? AND state='quiescent'", permit.evidence.ID, permit.evidence.Revision).Updates(map[string]any{"state": "settled", "settled_at": now, "updated_at": now})
 		if changed.Error != nil {
 			return changed.Error
@@ -191,6 +255,13 @@ func (s *MediaLibraryStructureService) reconcileCancelledStructureRepair(ctx con
 		}
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	if !complete {
+		return errStructureCancelProgress
+	}
+	return nil
 }
 
 // A paused attempt may be followed by a read-only scan. Never apply a frozen

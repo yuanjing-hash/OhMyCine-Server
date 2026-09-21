@@ -3,6 +3,8 @@ package services
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"math"
 	"time"
 
@@ -26,7 +28,18 @@ func (w *MediaLibraryRepairWorker) RecoverStoppedWork(ctx context.Context, after
 		after = row.ID
 		err := w.service.recoverStoppedStructureRepair(ctx, row.ID)
 		code, message := "structure_cancelled_reconciled", "已取消；文件结果已确认，未继续执行整理"
-		if err != nil {
+		if errors.Is(err, errStructureCancelProgress) {
+			code, message = "structure_cancelled_verifying", "已取消；正在分批核验文件结果，进度已保存"
+			var repair models.MediaLibraryStructureRepair
+			if w.service.db.WithContext(ctx).First(&repair, "id=?", row.OwnerID).Error == nil {
+				var state structureCatalogRepairState
+				if json.Unmarshal([]byte(repair.StateJSON), &state) == nil {
+					message = fmt.Sprintf("已取消；正在核验文件结果（已核验 %d 项），进度已保存", state.CancelVerified)
+				}
+			}
+			// Continue this owner next cycle instead of spending a cycle wrapping.
+			after = row.ID - 1
+		} else if err != nil {
 			code, message = "structure_cancelled_outcome_pending", "已取消；部分文件结果尚未确认，请检查数据源连接或原任务中的文件是否发生变化"
 		}
 		w.service.recordCancelledStructureOutcome(ctx, row.JobID, code, message)
@@ -41,7 +54,7 @@ func (s *MediaLibraryStructureService) recordCancelledStructureOutcome(parent co
 	ctx, cancel := context.WithTimeout(parent, 5*time.Second)
 	defer cancel()
 	_ = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		changed := tx.Model(&models.Job{}).Where("id=? AND status=? AND last_error_code<>?", jobID, models.JobStatusCancelled, code).Updates(map[string]any{"last_error_code": code, "last_error_message": message, "updated_at": time.Now().UTC()})
+		changed := tx.Model(&models.Job{}).Where("id=? AND status=? AND (last_error_code<>? OR last_error_message<>?)", jobID, models.JobStatusCancelled, code, message).Updates(map[string]any{"last_error_code": code, "last_error_message": message, "updated_at": time.Now().UTC()})
 		if changed.Error != nil || changed.RowsAffected == 0 {
 			return changed.Error
 		}

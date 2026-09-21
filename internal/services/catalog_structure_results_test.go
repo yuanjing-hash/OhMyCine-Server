@@ -16,9 +16,9 @@ import (
 )
 
 func TestCatalogStructureRepairCancelPublishesObservedMoveWithoutReplay(t *testing.T) {
-	for _, action := range []string{"cancel", "pause", "pause_then_cancel"} {
+	for _, action := range []string{"cancel", "pause", "pause_then_cancel", "later_item_unavailable"} {
 		t.Run(action, func(t *testing.T) {
-			s, repair, plan, entries, _ := catalogStructureRepairFixture(t)
+			s, repair, plan, entries, root := catalogStructureRepairFixture(t)
 			var databases []struct{ Name, File string }
 			if err := s.db.Raw("PRAGMA database_list").Scan(&databases).Error; err != nil {
 				t.Fatal(err)
@@ -69,6 +69,9 @@ func TestCatalogStructureRepairCancelPublishesObservedMoveWithoutReplay(t *testi
 			backend.after = func() {
 				actor := Actor{User: models.User{ID: repair.OwnerID}, Permissions: map[string]struct{}{authz.PermissionJobsControlAll: {}, authz.PermissionJobsReadAll: {}}}
 				control := action
+				if action == "later_item_unavailable" {
+					control = "cancel"
+				}
 				if action == "pause_then_cancel" {
 					control = "pause"
 				}
@@ -76,6 +79,12 @@ func TestCatalogStructureRepairCancelPublishesObservedMoveWithoutReplay(t *testi
 					t.Fatal(err)
 				}
 				cancel()
+				if action == "later_item_unavailable" {
+					source := filepath.Join(root, filepath.FromSlash(plan.Items[1].SourceRelative))
+					if err := os.Rename(source, source+".hold"); err != nil {
+						t.Fatal(err)
+					}
+				}
 			}
 			s.backends.Register(backend)
 			var before models.CatalogHead
@@ -86,6 +95,24 @@ func TestCatalogStructureRepairCancelPublishesObservedMoveWithoutReplay(t *testi
 			}
 			if err := s.queue.AcknowledgeInterrupt(job.ID, claim.LeaseToken); err != nil {
 				t.Fatal(err)
+			}
+			if action == "later_item_unavailable" {
+				assertPhysicalOwnerState(t, s.db, CatalogPhysicalRepair, repair.ID, "quiescent")
+				var stored models.MediaLibraryStructureRepair
+				if err := s.db.First(&stored, "id=?", repair.ID).Error; err != nil {
+					t.Fatal(err)
+				}
+				var state structureCatalogRepairState
+				if err := json.Unmarshal([]byte(stored.StateJSON), &state); err != nil || state.CancelVerified != 1 {
+					t.Fatalf("verified prefix lost: %+v %v", state, err)
+				}
+				source := filepath.Join(root, filepath.FromSlash(plan.Items[1].SourceRelative))
+				if err := os.Rename(source+".hold", source); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := NewMediaLibraryRepairWorker(s).RecoverStoppedWork(context.Background(), 0); err != nil {
+					t.Fatal(err)
+				}
 			}
 			if action == "pause" {
 				assertPhysicalOwnerState(t, s.db, CatalogPhysicalRepair, repair.ID, "quiescent")

@@ -149,7 +149,7 @@ var catalogRuntimeAccessAllowlist = map[string]string{
 	// runtime/revision/source/epoch permit, read-only physical observations, then
 	// replacement-identity validation and checked-subset writes/settlement in
 	// one transaction. Versioned cancellation uses snapshot publication instead.
-	"internal/services/media_library_structure_cancel.go:MediaLibraryStructureService.reconcileCancelledStructureRepair": "call:removeStructureCatalogItems=1,call:updateStructureCatalogPaths=1|2d25030159a54fbf",
+	"internal/services/media_library_structure_cancel.go:MediaLibraryStructureService.reconcileCancelledStructureRepair": "call:removeStructureCatalogItems=1,call:updateStructureCatalogPaths=1|b39afbabb81f994d",
 	// Sole caller is the preceding legacy cancellation transaction. Reads only
 	// provider ID, size and mtime for this library's frozen source/target paths;
 	// rejects replacement rows before any update/delete. No E/A mutation here.

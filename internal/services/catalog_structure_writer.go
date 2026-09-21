@@ -46,6 +46,7 @@ type structureCatalogRepairState struct {
 	FailedItems              int                   `json:"failed_items,omitempty"`
 	BlockedItems             int                   `json:"blocked_items,omitempty"`
 	OriginalTotalItems       int                   `json:"original_total_items,omitempty"`
+	CancelVerified           int                   `json:"cancel_verified,omitempty"`
 	Cancelled                bool                  `json:"cancelled,omitempty"`
 	RetryCheckpointBefore    time.Time             `json:"retry_checkpoint_before,omitempty"`
 	// Only the exiting execution stack may supply cancellation authority.
