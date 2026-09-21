@@ -2268,6 +2268,13 @@ func (s *MediaLibraryService) reconcile(ctx context.Context, id uint, kind strin
 			}
 		}
 		now := time.Now().UTC()
+		if storage.Type != models.StorageTypeLocal {
+			var err error
+			existingAssets, err = matchRenamedSourceAssetsTx(tx, id, existingAssets, result.Assets)
+			if err != nil {
+				return wrapMediaLibraryPersistence(mediaLibraryPersistenceStageSourceAssets, err)
+			}
+		}
 		assetsByPath := make(map[string]models.MediaLibrarySourceAsset, len(existingAssets))
 		for _, asset := range existingAssets {
 			assetsByPath[asset.RelativePath] = asset

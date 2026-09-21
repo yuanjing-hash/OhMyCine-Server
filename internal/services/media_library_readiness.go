@@ -23,7 +23,7 @@ const readinessRepairCurrentSQL = `NOT EXISTS (
 	SELECT 1 FROM catalog_physical_writes rp
 	WHERE rp.owner_kind='repair' AND rp.owner_id=r.id AND rp.library_id=l.id
 	AND (rp.state='settled' OR (rp.state='admitted' AND (
-		EXISTS(SELECT 1 FROM jobs j WHERE j.id=r.job_id AND j.status='cancelled' AND j.lease_token_hash='' AND j.lease_expires_at IS NULL)
+		EXISTS(SELECT 1 FROM jobs j WHERE j.id=r.job_id AND j.status IN ('cancelled','failed') AND j.lease_token_hash='' AND j.lease_expires_at IS NULL)
 		OR EXISTS(SELECT 1 FROM catalog_heads h WHERE h.library_id=l.id AND h.source_epoch<>rp.source_epoch)
 	)))
 )`

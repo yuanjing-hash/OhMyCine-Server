@@ -60,6 +60,7 @@ type structureCloudDriver struct {
 	moveBatches      [][]string
 	recycleBatch     [][]string
 	listCalls        map[string]int
+	renameCalls      int
 	statCalls        int
 	nonPipelineReads int
 }
@@ -115,6 +116,7 @@ func (d *structureCloudDriver) Move(_ context.Context, id, parent string) error 
 }
 func (*structureCloudDriver) Copy(context.Context, string, string) error { return errors.New("unused") }
 func (d *structureCloudDriver) Rename(_ context.Context, id, name string) error {
+	d.renameCalls++
 	item := d.items[id]
 	item.Name = name
 	d.items[id] = item
@@ -369,5 +371,37 @@ func TestLocalStructureBackendRejectsSymlinkedSourceAncestor(t *testing.T) {
 	}
 	if data, readErr := os.ReadFile(filepath.Join(outside, "movie.mkv")); readErr != nil || string(data) != "outside" {
 		t.Fatalf("outside file changed: %q err=%v", data, readErr)
+	}
+}
+
+func TestPan115StructureBackendResumesSameDirectoryRename(t *testing.T) {
+	for _, mode := range []string{"completed", "unrelated_name", "wrong_size", "destination_conflict"} {
+		t.Run(mode, func(t *testing.T) {
+			driver := &structureCloudDriver{items: map[string]cloudpkg.Item{
+				"root": {ID: "root", IsDir: true}, "folder": {ID: "folder", ParentID: "root", Name: "movies", IsDir: true},
+				"video": {ID: "video", ParentID: "folder", Name: "new.mkv", Size: 7},
+			}}
+			current := driver.items["video"]
+			switch mode {
+			case "unrelated_name":
+				current.Name = "other.mkv"
+			case "wrong_size":
+				current.Size = 8
+			case "destination_conflict":
+				driver.items["other"] = cloudpkg.Item{ID: "other", ParentID: "folder", Name: "new.mkv", Size: 7}
+			}
+			driver.items["video"] = current
+			backend := pan115MediaLibraryStructureBackend{driver: func(uint) (cloudpkg.Driver, error) { return driver, nil }}
+			connectionID := uint(3)
+			boundary := StructureBoundary{Library: models.MediaLibrary{ProviderRootID: "root"}, Storage: models.Storage{ConnectionID: &connectionID, RootPath: "root"}}
+			item := StructurePlanItem{Kind: "video", ProviderID: "video", SourceRelative: "movies/old.mkv", TargetRelative: "movies/new.mkv", Size: 7}
+			err := backend.Apply(context.Background(), boundary, []StructurePlanItem{item}, nil)
+			if (err == nil) != (mode == "completed") {
+				t.Fatalf("mode=%s error=%v", mode, err)
+			}
+			if driver.renameCalls != 0 || len(driver.moveBatches) != 0 || driver.items["video"] != current {
+				t.Fatal("retry mutated an already completed or invalid item")
+			}
+		})
 	}
 }

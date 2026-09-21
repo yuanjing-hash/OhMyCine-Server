@@ -425,6 +425,38 @@ func structureModifiedAtUnixNano(value time.Time) int64 {
 }
 
 func appendStructureCandidates(plan *StructurePlan, candidates []structurePlanCandidate) {
+	// Identity conflicts apply even when aliases have different proposed targets
+	// or one alias cannot be associated with a recognized video.
+	byProvider := make(map[string][]int)
+	for i, candidate := range candidates {
+		if id := strings.TrimSpace(candidate.providerID); id != "" {
+			byProvider[id] = append(byProvider[id], i)
+		}
+	}
+	duplicates := make(map[int]bool)
+	providerIDs := make([]string, 0, len(byProvider))
+	for id := range byProvider {
+		providerIDs = append(providerIDs, id)
+	}
+	sort.Strings(providerIDs)
+	for _, id := range providerIDs {
+		members := byProvider[id]
+		if len(members) < 2 {
+			continue
+		}
+		target := candidates[members[0]].target
+		if target == "" {
+			target = candidates[members[0]].source
+		}
+		group := StructureConflictGroup{Code: "catalog_duplicate_conflict", Kind: candidates[members[0]].kind, TargetRelative: target}
+		for _, member := range members {
+			duplicates[member] = true
+			c := candidates[member]
+			group.Members = append(group.Members, StructurePlanItem{Kind: c.kind, SourceRelative: c.source, TargetRelative: target, ProviderID: c.providerID})
+			plan.addIssue(StructureIssue{Code: "catalog_duplicate_conflict", Kind: c.kind, WorkKey: c.workKey, Title: c.title, CurrentPath: c.source, ExpectedPath: target, RecognitionID: c.recognitionID, ConflictSources: boundedStructureConflictSources(candidates, members), AllConflictSources: allStructureConflictSources(candidates, members), ConflictSourceCount: len(members)})
+		}
+		plan.ConflictGroups = append(plan.ConflictGroups, group)
+	}
 	groups := make(map[string][]int, len(candidates))
 	for i := range candidates {
 		if candidates[i].target != "" {
@@ -444,11 +476,23 @@ func appendStructureCandidates(plan *StructurePlan, candidates []structurePlanCa
 			continue
 		}
 		code := structureTargetConflictCode(candidates, members)
+		if code == "catalog_duplicate_conflict" {
+			continue
+		} // Already grouped by stable identity above.
+		identityConflict := false
 		for _, member := range members {
-			if candidates[member].kind == "sidecar" {
+			if duplicates[member] {
+				identityConflict = true
+			}
+		}
+		for _, member := range members {
+			if candidates[member].kind == "sidecar" && !identityConflict {
 				code = "sidecar_target_conflict"
 				break
 			}
+		}
+		if identityConflict {
+			code = "catalog_duplicate_conflict"
 		}
 		conflict := targetConflict{code: code, sources: boundedStructureConflictSources(candidates, members), allSources: allStructureConflictSources(candidates, members), sourceCount: len(members)}
 		group := StructureConflictGroup{Code: code, Kind: candidates[members[0]].kind, TargetRelative: candidates[members[0]].target, Members: make([]StructurePlanItem, 0, len(members))}
@@ -469,7 +513,7 @@ func appendStructureCandidates(plan *StructurePlan, candidates []structurePlanCa
 		return strings.ToLower(plan.ConflictGroups[i].TargetRelative) < strings.ToLower(plan.ConflictGroups[j].TargetRelative)
 	})
 	for i, candidate := range candidates {
-		if candidate.target == "" {
+		if duplicates[i] || candidate.target == "" {
 			continue
 		}
 		if conflict, exists := blocked[i]; exists {

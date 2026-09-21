@@ -239,10 +239,11 @@ func (s *MediaLibraryStructureService) runCatalogStructureRepair(ctx context.Con
 		originalTotal := len(fullPlan.Items) + len(fullPlan.RecycleItems)
 		state.FailedItems, state.BlockedItems, state.OriginalTotalItems = execution.Failed, execution.Blocked, originalTotal
 		if execution.Failed+execution.Blocked > 0 {
-			if err := s.verifyStructureUnchangedFailures(ctx, repair, fullPlan, boundary, backend); err != nil {
+			if err := s.reconcileStructureFailureOutcomes(ctx, repair, fullPlan, boundary, backend, claim, &execution); err != nil {
 				return fail(err)
 			}
 		}
+		state.FailedItems, state.BlockedItems = execution.Failed, execution.Blocked
 		plan = execution.Plan
 		if !state.RetryCheckpointBefore.IsZero() {
 			plan, err = s.catalogStructureSucceededPlan(ctx, repair, fullPlan, state.RetryCheckpointBefore)

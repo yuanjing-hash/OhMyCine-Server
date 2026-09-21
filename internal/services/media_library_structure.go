@@ -1805,7 +1805,14 @@ func (s *MediaLibraryStructureService) runRepair(ctx context.Context, runtime Jo
 	if plan.RuleFingerprint != libraryRuleFingerprint(library) || plan.Generation != library.BaselineGeneration {
 		return s.failRepair(repair, CodeMediaLibraryStructureBoundaryChanged, "媒体库已变化，请重新诊断后再修复")
 	}
-	if plan.SelectionBound {
+	// Diagnosis is an admission fence, not a lifetime dependency of an
+	// already entered immutable plan. Physical entry still checks its exact
+	// owner, source/config boundary and current lease on every retry.
+	var priorExecution int64
+	if err := s.db.Model(&models.CatalogPhysicalWrite{}).Where("library_id=? AND owner_kind=? AND owner_id=? AND state IN ?", repair.LibraryID, CatalogPhysicalRepair, repair.ID, []string{"quiescent", "settled"}).Count(&priorExecution).Error; err != nil {
+		return s.failRepair(repair, CodeMediaLibraryStructureUnavailable, "无法读取整理执行记录")
+	}
+	if plan.SelectionBound && priorExecution == 0 {
 		diagnosisGeneration := plan.DiagnosisGeneration
 		if diagnosisGeneration == 0 {
 			diagnosisGeneration = plan.Generation
@@ -1876,12 +1883,12 @@ func (s *MediaLibraryStructureService) runRepair(ctx context.Context, runtime Jo
 		}
 		return s.failRepair(repair, execution.GlobalCode, "媒体库结构修复已安全停止")
 	}
-	appliedPlan := execution.Plan
 	if execution.Failed+execution.Blocked > 0 {
-		if err := s.verifyStructureUnchangedFailures(ctx, repair, plan, boundary, backend); err != nil {
+		if err := s.reconcileStructureFailureOutcomes(ctx, repair, plan, boundary, backend, claim, &execution); err != nil {
 			return s.failRepair(repair, CodeMediaLibraryStructureApplyFailed, "部分文件结果尚未确认，已保留进度；请核对原任务后重试")
 		}
 	}
+	appliedPlan := execution.Plan
 	providerParents, err := s.repairedManagedProviderParents(ctx, library, storage, appliedPlan.Items)
 	if err != nil {
 		return s.failRepair(repair, CodeMediaLibraryStructureApplyFailed, "媒体库结构修复结果验证失败")
@@ -2556,7 +2563,10 @@ func (b pan115MediaLibraryStructureBackend) Apply(ctx context.Context, boundary 
 				return listErr
 			}
 			stat = sourceListing.byID[item.ProviderID]
-			if stat.ID != "" && (stat.ParentID != sourceParent || stat.Name != pathpkg.Base(item.SourceRelative)) {
+			// Same-directory rename may already have committed before its ACK.
+			// Only the exact frozen destination may replace the source name.
+			nameValid := stat.Name == pathpkg.Base(item.SourceRelative) || (sourceDirectory == pathpkg.Dir(item.TargetRelative) && stat.Name == targetName)
+			if stat.ID != "" && (stat.ParentID != sourceParent || !nameValid) {
 				return errors.New("provider item identity changed")
 			}
 		}
