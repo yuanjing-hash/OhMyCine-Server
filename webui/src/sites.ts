@@ -1,3 +1,5 @@
+export const defaultPanSouBaseURL = 'https://so.252035.xyz'
+
 export interface SiteHealth {
   status: 'unknown' | 'online' | 'offline' | 'healthy' | 'auth_required' | 'rate_limited' | 'unavailable'
   error_code: string
@@ -52,7 +54,7 @@ export interface SiteCatalogItem {
   key: string
   name: string
   engine: string
-  base_urls: string[]
+  base_urls: string[] | null
   auto_discover: boolean
   site_type: 'pt' | 'bt' | 'cloud_share'
   credential_kind: 'cookie' | 'api_key' | 'none'

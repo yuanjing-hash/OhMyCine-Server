@@ -7,6 +7,7 @@ import SecretInput from '@/components/SecretInput.vue'
 import { credentialLoader } from '@/credentials'
 import { notify } from '@/toast'
 import {
+  defaultPanSouBaseURL,
   cookieCloudErrorLabel,
   cookieCloudSettingsPath,
   cookieCloudSyncPath,
@@ -81,7 +82,7 @@ const cookieCloudSyncing = ref(false)
 const cookieCloudSettings = ref<CookieCloudSettings | null>(null)
 const cookieCloudForm = ref<CookieCloudForm>(emptyCookieCloudForm())
 
-const title = computed(() => editing.value ? `编辑 ${editing.value.name}` : selectedType.value === 'cloud_share' ? '添加网盘 / TG 站点' : `添加 ${selectedType.value.toUpperCase()} 站点`)
+const title = computed(() => editing.value ? `编辑 ${editing.value.name}` : selectedType.value === 'cloud_share' ? '添加网盘分享站' : `添加 ${selectedType.value.toUpperCase()} 站点`)
 const filteredCatalog = computed(() => siteCatalog.value.filter(item => item.site_type === selectedType.value))
 const selectedCatalog = computed(() => siteCatalog.value.find(item => item.key === form.value.kind))
 const credentialKind = computed(() => form.value.kind === 'auto_bt' ? 'none' : selectedCatalog.value?.credential_kind || editing.value?.credential_kind || 'cookie')
@@ -144,7 +145,12 @@ function selectSiteType(type: 'pt' | 'bt' | 'cloud_share') {
     if (first) form.value.kind = first.key
   }
   applyCatalogSelection()
-  if (type === 'cloud_share') { form.value.name = '115 TG 资源'; form.value.timeoutSeconds = 30 }
+  if (type === 'cloud_share') {
+    form.value.kind = 'pansou_tg'
+    form.value.name = '盘搜 · 115 分享'
+    form.value.baseURL = defaultPanSouBaseURL
+    form.value.timeoutSeconds = 30
+  }
   dialogStep.value = 'form'
 }
 
@@ -159,7 +165,7 @@ function applyCatalogSelection() {
   const selected = siteCatalog.value.find(item => item.key === form.value.kind)
   if (!selected) return
   form.value.name = selected.name
-  form.value.baseURL = selected.base_urls[0] || ''
+  form.value.baseURL = selected.base_urls?.[0] ?? ''
 }
 
 async function resolveBT() {
@@ -390,7 +396,7 @@ onMounted(loadSites)
       <div>
         <p class="text-xs font-700 uppercase tracking-widest text-[var(--text-subtle)]">Sites</p>
         <h1 class="mt-1 text-2xl font-800">站点管理</h1>
-        <p class="page-description mt-1">统一管理 PT、公开 BT 与 Torznab 连接。Cookie、passkey 与 API Key 只加密保存在 Server。</p>
+        <p class="page-description mt-1">统一管理 PT、公开 BT、Torznab 与网盘分享站。Cookie、passkey 与 API Key 只加密保存在 Server。</p>
       </div>
       <div class="flex flex-wrap gap-2">
         <button class="btn-secondary" type="button" @click="openCookieCloud">CookieCloud</button>
@@ -404,14 +410,14 @@ onMounted(loadSites)
     </div>
     <div v-else-if="!sites.length" class="panel py-12 text-center">
       <h2 class="m-0 text-lg">尚未添加站点</h2>
-      <p class="page-description mt-2">可添加内建 PT、公开 BT，或连接 Jackett/Prowlarr 的 Torznab API。</p>
+      <p class="page-description mt-2">可添加 PT、公开 BT、网盘分享站，或连接 Jackett/Prowlarr 的 Torznab API。</p>
       <button class="btn-primary mt-4" @click="openCreate">添加第一个站点</button>
     </div>
     <div v-else class="site-grid">
       <article v-for="site in sites" :key="site.id" class="panel flex min-h-72 flex-col">
         <header class="flex items-start justify-between gap-3">
           <div class="min-w-0">
-            <div class="flex flex-wrap items-center gap-2"><h2 class="m-0 truncate text-lg">{{ site.name }}</h2><span class="status-chip">{{ site.site_type === 'cloud_share' ? '网盘 / TG' : site.site_type.toUpperCase() }}</span></div>
+            <div class="flex flex-wrap items-center gap-2"><h2 class="m-0 truncate text-lg">{{ site.name }}</h2><span class="status-chip">{{ site.site_type === 'cloud_share' ? '网盘分享站' : site.site_type.toUpperCase() }}</span></div>
             <p class="text-subtle mt-1 truncate font-mono text-xs" :title="site.base_url">{{ site.base_url }}</p>
           </div>
           <span :class="site.enabled ? 'status-chip status-chip--ready' : 'status-chip'">{{ site.enabled ? '已启用' : '已停用' }}</span>
@@ -453,8 +459,8 @@ onMounted(loadSites)
           <span class="ml-auto text-subtle">下一步 →</span>
         </button>
         <button class="type-card mt-3 w-full text-left" type="button" @click="selectSiteType('cloud_share')">
-          <span class="type-card__icon">TG</span>
-          <span><strong class="block">网盘 / TG</strong><span class="text-subtle mt-1 block text-sm">把多个 TG 频道聚合成一个资源站点，参与搜索与订阅，分享资源直接转存入库。</span></span>
+          <span class="type-card__icon">分享</span>
+          <span><strong class="block">网盘分享站</strong><span class="text-subtle mt-1 block text-sm">把多个 TG 频道聚合成一个资源站点，参与搜索与订阅，分享资源直接转存入库。</span></span>
           <span class="ml-auto text-subtle">下一步 →</span>
         </button>
       </section>
@@ -468,18 +474,20 @@ onMounted(loadSites)
         <div class="mt-5 grid gap-4 sm:grid-cols-2">
           <div v-if="selectedType === 'pt' || editing && selectedType !== 'cloud_share'" class="sm:col-span-2"><label class="label" for="site-catalog">站点适配</label><select id="site-catalog" v-model="form.kind" class="input" :disabled="Boolean(editing)" @change="applyCatalogSelection"><option v-if="editing && !selectedCatalog" :value="editing.kind">{{ editing.name }} · 内建适配</option><option v-for="item in filteredCatalog" :key="item.key" :value="item.key">{{ item.name }} · {{ item.engine === 'nexusphp' ? 'NexusPHP' : item.engine.toUpperCase() }}</option></select></div>
           <div v-else-if="selectedType === 'bt'" class="sm:col-span-2"><label class="label" for="site-bt-mode">BT 接入方式</label><select id="site-bt-mode" v-model="form.kind" class="input" @change="applyCatalogSelection"><option value="auto_bt">输入官网自动识别</option><option value="torznab">Torznab · Jackett/Prowlarr</option></select><p class="text-subtle mb-0 mt-1 text-xs">Server 内置适配器，但不会列出、探测或访问尚未由你添加的公共 BT 站点。</p></div>
-          <div><label class="label" for="site-name">显示名称</label><input id="site-name" v-model="form.name" class="input" maxlength="128" required /></div>
-          <div><label class="label" for="site-url">{{ selectedType === 'cloud_share' ? 'PanSou API 地址（HTTPS）' : 'HTTPS 根地址' }}</label><input id="site-url" v-model="form.baseURL" class="input font-mono" type="url" placeholder="https://example.test" required autocomplete="off" :readonly="Boolean(editing && selectedCatalog?.engine === 'rss')" @input="btResolution = null" /></div>
+          <div v-else-if="selectedType === 'cloud_share'" class="sm:col-span-2"><label class="label" for="site-share-kind">站点分类</label><select id="site-share-kind" v-model="form.kind" class="input" :disabled="Boolean(editing)"><option value="pansou_tg">盘搜（PanSou）</option></select></div>
+          <div v-if="selectedType !== 'cloud_share'"><label class="label" for="site-name">显示名称</label><input id="site-name" v-model="form.name" class="input" maxlength="128" required /></div>
+          <div :class="{ 'sm:col-span-2': selectedType === 'cloud_share' }"><label class="label" for="site-url">{{ selectedType === 'cloud_share' ? 'PanSou 服务地址（HTTPS）' : 'HTTPS 根地址' }}</label><input id="site-url" v-model="form.baseURL" class="input font-mono" type="url" placeholder="https://example.test" required autocomplete="off" :readonly="Boolean(editing && selectedCatalog?.engine === 'rss')" @input="btResolution = null" /><p v-if="selectedType === 'cloud_share'" class="text-subtle mb-0 mt-1 text-xs">已预填默认盘搜服务，可修改为其他 PanSou 服务的 HTTPS 根地址，无需添加 /api/search。</p></div>
           <template v-if="selectedType === 'cloud_share'">
-            <div class="semantic-inset rounded-lg p-4 sm:col-span-2">
-              <label class="label" for="site-cloud">网盘分类</label>
-              <select id="site-cloud" v-model="form.cloudProvider" class="input"><option value="115">115 网盘 · 分享转存</option></select>
-              <p class="text-subtle mb-0 mt-2 text-xs">当前支持 115。站点只提供分享资源，转存账号和目录沿用已有下载器配置。</p>
-            </div>
             <div class="sm:col-span-2">
               <label class="label" for="site-channels">TG 频道</label>
               <textarea id="site-channels" v-model="form.channels" class="input min-h-32 font-mono text-sm" required placeholder="每行一个频道，最多 100 个&#10;@channel_name&#10;https://t.me/channel_name" />
               <p class="text-subtle mb-0 mt-2 text-xs">支持频道名称和公开频道链接。频道会作为一个站点参与统一搜索；结果显示具体来源。</p>
+            </div>
+            <div><label class="label" for="site-name">显示名称</label><input id="site-name" v-model="form.name" class="input" maxlength="128" required /></div>
+            <div>
+              <label class="label" for="site-cloud">网盘类型</label>
+              <select id="site-cloud" v-model="form.cloudProvider" class="input"><option value="115">115 网盘 · 分享转存</option></select>
+              <p class="text-subtle mb-0 mt-2 text-xs">转存账号和目录沿用已有下载器配置。</p>
             </div>
             <label class="flex items-center gap-2 text-sm sm:col-span-2"><input v-model="form.authEnabled" type="checkbox" />PanSou 服务需要账号认证</label>
             <template v-if="form.authEnabled">

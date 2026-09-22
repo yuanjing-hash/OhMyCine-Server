@@ -521,7 +521,7 @@ onBeforeUnmount(() => {
         </nav>
 
         <form class="panel grid gap-3 md:grid-cols-2 xl:grid-cols-[auto_auto_11rem_11rem_9rem_10rem_9rem_auto] xl:items-end" @submit.prevent>
-          <fieldset class="flex flex-wrap gap-3"><legend class="label">站点类型</legend><label class="text-sm"><input v-model="enabledSiteTypes" type="checkbox" value="pt" /> PT</label><label class="text-sm"><input v-model="enabledSiteTypes" type="checkbox" value="bt" /> 公共 BT</label><label class="text-sm"><input v-model="enabledSiteTypes" type="checkbox" value="bt_resource" /> 插件资源站</label><label class="text-sm"><input v-model="enabledSiteTypes" type="checkbox" value="cloud_share" /> 网盘 / TG</label></fieldset>
+          <fieldset class="flex flex-wrap gap-3"><legend class="label">站点类型</legend><label class="text-sm"><input v-model="enabledSiteTypes" type="checkbox" value="pt" /> PT</label><label class="text-sm"><input v-model="enabledSiteTypes" type="checkbox" value="bt" /> 公共 BT</label><label class="text-sm"><input v-model="enabledSiteTypes" type="checkbox" value="bt_resource" /> 插件资源站</label><label class="text-sm"><input v-model="enabledSiteTypes" type="checkbox" value="cloud_share" /> 网盘分享站</label></fieldset>
           <label><span class="label">分辨率</span><select v-model="resolutionFilter" class="input"><option value="">全部</option><option v-for="value in resolutionOptions" :key="value" :value="value">{{ value }}</option></select></label>
           <label><span class="label">优惠</span><select v-model="promotionFilter" class="input"><option value="">全部</option><option value="free">FREE</option><option value="2xfree">2X FREE</option><option value="2x">2X</option></select></label>
           <label><span class="label">最低做种</span><input v-model.number="minimumSeeders" class="input" type="number" min="0" placeholder="不限" /></label>
@@ -567,7 +567,7 @@ onBeforeUnmount(() => {
         <div v-else class="mt-4 grid gap-2 sm:grid-cols-2">
           <label v-for="site in siteOptions" :key="site.id" class="semantic-list-item flex items-start gap-3 p-3" :class="{ 'opacity-60': !site.searchable }">
             <input v-model="selectedSiteIDs" type="checkbox" :value="site.id" :disabled="!site.searchable" />
-            <span class="min-w-0"><strong class="block break-words">{{ site.name }}</strong><small class="text-subtle mt-1 block">{{ site.site_type === 'cloud_share' ? '网盘 / TG' : site.site_type.toUpperCase() }} · {{ site.health_status || 'unknown' }}</small><small v-if="site.reason" class="semantic-danger-text mt-1 block">{{ site.reason }}</small></span>
+            <span class="min-w-0"><strong class="block break-words">{{ site.name }}</strong><small class="text-subtle mt-1 block">{{ site.site_type === 'cloud_share' ? '网盘分享站' : site.site_type.toUpperCase() }} · {{ site.health_status || 'unknown' }}</small><small v-if="site.reason" class="semantic-danger-text mt-1 block">{{ site.reason }}</small></span>
           </label>
         </div>
         <p v-if="!siteOptionsLoading && !siteOptionsError && selectedSiteIDs.length === 0" class="semantic-warning mt-4 p-3 text-sm" role="alert">至少选择一个可搜索站点后才能开始搜索。</p>
