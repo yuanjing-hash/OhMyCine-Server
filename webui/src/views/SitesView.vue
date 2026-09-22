@@ -26,6 +26,11 @@ import type { ListResponse } from '@/types/api'
 import { useAuthStore } from '@/stores/auth'
 
 interface SiteForm {
+  channels: string
+  cloudProvider: '115'
+  authEnabled: boolean
+  username: string
+  password: string
   kind: string
   name: string
   baseURL: string
@@ -64,7 +69,7 @@ const saving = ref(false)
 const busyID = ref<number | null>(null)
 const dialogOpen = ref(false)
 const dialogStep = ref<'type' | 'form'>('type')
-const selectedType = ref<'pt' | 'bt'>('pt')
+const selectedType = ref<'pt' | 'bt' | 'cloud_share'>('pt')
 const editing = ref<SiteSummary | null>(null)
 const form = ref<SiteForm>(emptyForm())
 const btResolution = ref<SiteResolution | null>(null)
@@ -76,7 +81,7 @@ const cookieCloudSyncing = ref(false)
 const cookieCloudSettings = ref<CookieCloudSettings | null>(null)
 const cookieCloudForm = ref<CookieCloudForm>(emptyCookieCloudForm())
 
-const title = computed(() => editing.value ? `编辑 ${editing.value.name}` : `添加 ${selectedType.value.toUpperCase()} 站点`)
+const title = computed(() => editing.value ? `编辑 ${editing.value.name}` : selectedType.value === 'cloud_share' ? '添加网盘 / TG 站点' : `添加 ${selectedType.value.toUpperCase()} 站点`)
 const filteredCatalog = computed(() => siteCatalog.value.filter(item => item.site_type === selectedType.value))
 const selectedCatalog = computed(() => siteCatalog.value.find(item => item.key === form.value.kind))
 const credentialKind = computed(() => form.value.kind === 'auto_bt' ? 'none' : selectedCatalog.value?.credential_kind || editing.value?.credential_kind || 'cookie')
@@ -93,6 +98,7 @@ const cookieCloudEndpoint = computed(() => {
 
 function emptyForm(): SiteForm {
   return {
+    channels: '', cloudProvider: '115', authEnabled: false, username: '', password: '',
     kind: 'pttime', name: 'PTTime', baseURL: '', cookie: '', passkey: '', apiKey: '', userAgent: '', enabled: true,
     priority: 100, timeoutSeconds: 12, rateLimitPerMinute: 12,
     browserEmulation: false, browserServiceURL: '', clearBrowserService: false, clearPasskey: false, clearAPIKey: false,
@@ -125,7 +131,8 @@ function openCreate() {
   dialogOpen.value = true
 }
 
-function selectSiteType(type: 'pt' | 'bt') {
+function selectSiteType(type: 'pt' | 'bt' | 'cloud_share') {
+  form.value = emptyForm()
   selectedType.value = type
   btResolution.value = null
   if (type === 'bt') {
@@ -137,6 +144,7 @@ function selectSiteType(type: 'pt' | 'bt') {
     if (first) form.value.kind = first.key
   }
   applyCatalogSelection()
+  if (type === 'cloud_share') { form.value.name = '115 TG 资源'; form.value.timeoutSeconds = 30 }
   dialogStep.value = 'form'
 }
 
@@ -179,6 +187,7 @@ function openEdit(site: SiteSummary) {
   btResolution.value = null
   editing.value = site
   form.value = {
+    channels: site.cloud_config?.channels.join('\n') ?? '', cloudProvider: '115', authEnabled: site.cloud_config?.auth_enabled ?? false, username: site.login_username ?? '', password: '',
     kind: site.kind, name: site.name, baseURL: site.base_url, cookie: '', passkey: '', apiKey: '', userAgent: site.user_agent,
     enabled: site.enabled, priority: site.priority, timeoutSeconds: site.timeout_seconds,
     rateLimitPerMinute: site.rate_limit_per_minute, browserEmulation: site.browser_emulation,
@@ -202,7 +211,12 @@ async function save() {
   try {
     if (!editing.value && form.value.kind === 'auto_bt' && !await resolveBT()) return
     const current = editing.value
+    const cloudFields = form.value.kind === 'pansou_tg' ? {
+      cloud_config: { provider: form.value.cloudProvider, channels: [...new Set(form.value.channels.split(/[,，\n]/).map(value => value.trim()).filter(Boolean))], auth_enabled: form.value.authEnabled },
+      username: form.value.username, password: form.value.password || undefined,
+    } : {}
     const common = {
+      ...cloudFields,
       name: form.value.name,
       base_url: form.value.baseURL,
       user_agent: form.value.userAgent,
@@ -397,16 +411,16 @@ onMounted(loadSites)
       <article v-for="site in sites" :key="site.id" class="panel flex min-h-72 flex-col">
         <header class="flex items-start justify-between gap-3">
           <div class="min-w-0">
-            <div class="flex flex-wrap items-center gap-2"><h2 class="m-0 truncate text-lg">{{ site.name }}</h2><span class="status-chip">{{ site.site_type.toUpperCase() }}</span></div>
+            <div class="flex flex-wrap items-center gap-2"><h2 class="m-0 truncate text-lg">{{ site.name }}</h2><span class="status-chip">{{ site.site_type === 'cloud_share' ? '网盘 / TG' : site.site_type.toUpperCase() }}</span></div>
             <p class="text-subtle mt-1 truncate font-mono text-xs" :title="site.base_url">{{ site.base_url }}</p>
           </div>
           <span :class="site.enabled ? 'status-chip status-chip--ready' : 'status-chip'">{{ site.enabled ? '已启用' : '已停用' }}</span>
         </header>
         <dl class="mt-5 grid grid-cols-2 gap-3 text-sm">
           <div><dt class="text-subtle text-xs">连接状态</dt><dd class="m-0 mt-1">{{ healthLabel(site) }}</dd></div>
-          <div><dt class="text-subtle text-xs">凭据</dt><dd class="m-0 mt-1">{{ site.credential_kind === 'plugin' ? '由插件连接管理' : site.credential_kind === 'none' ? '无需凭据' : site.credential_configured ? '已安全配置' : '未配置' }}</dd></div>
+          <div><dt class="text-subtle text-xs">凭据</dt><dd class="m-0 mt-1">{{ site.cloud_config ? (site.cloud_config.auth_enabled ? 'PanSou 登录已安全配置' : 'PanSou 无需登录') : site.credential_kind === 'plugin' ? '由插件连接管理' : site.credential_kind === 'none' ? '无需凭据' : site.credential_configured ? '已安全配置' : '未配置' }}</dd></div>
           <div><dt class="text-subtle text-xs">请求策略</dt><dd class="m-0 mt-1">{{ site.rate_limit_per_minute }} 次/分钟</dd></div>
-          <div><dt class="text-subtle text-xs">连接方式</dt><dd class="m-0 mt-1">{{ site.site_type === 'bt_resource' ? 'WASM 插件' : site.kind === 'torznab' ? 'Torznab API' : site.browser_emulation ? '浏览器仿真' : '原生适配' }}</dd></div>
+          <div><dt class="text-subtle text-xs">连接方式<span v-if="site.cloud_config"> · {{ site.cloud_config.channels.length }} 个频道</span></dt><dd class="m-0 mt-1">{{ site.site_type === 'bt_resource' ? 'WASM 插件' : site.site_type === 'cloud_share' ? 'PanSou · 115 分享转存' : site.kind === 'torznab' ? 'Torznab API' : site.browser_emulation ? '浏览器仿真' : '原生适配' }}</dd></div>
         </dl>
         <p v-if="site.health.error_code" class="semantic-warning mt-4 p-3 text-xs">最近检测：<span class="font-mono">{{ site.health.error_code }}</span>。更新候选凭据失败时原配置会保留。</p>
         <div class="mt-auto flex flex-wrap gap-2 pt-5">
@@ -438,19 +452,41 @@ onMounted(loadSites)
           <span><strong class="block">公开 BT / Torznab</strong><span class="text-subtle mt-1 block text-sm">输入受支持站点的 HTTPS 官网，或连接 Jackett/Prowlarr；未添加的站点不会被访问。</span></span>
           <span class="ml-auto text-subtle">下一步 →</span>
         </button>
+        <button class="type-card mt-3 w-full text-left" type="button" @click="selectSiteType('cloud_share')">
+          <span class="type-card__icon">TG</span>
+          <span><strong class="block">网盘 / TG</strong><span class="text-subtle mt-1 block text-sm">把多个 TG 频道聚合成一个资源站点，参与搜索与订阅，分享资源直接转存入库。</span></span>
+          <span class="ml-auto text-subtle">下一步 →</span>
+        </button>
       </section>
 
       <form v-else class="panel max-h-[92vh] w-full max-w-2xl overflow-y-auto" role="dialog" aria-modal="true" aria-labelledby="site-dialog-title" @submit.prevent="save">
         <div class="flex items-start justify-between gap-3">
-          <div><h2 id="site-dialog-title" class="m-0 text-xl">{{ title }}</h2><p class="page-description mt-1 text-sm">{{ editing ? '敏感字段留空会继续使用原凭据；保存前会测试完整候选配置。' : credentialKind === 'cookie' ? '请配置已登录账号的 Cookie，或先在 CookieCloud 中统一同步。' : credentialKind === 'api_key' ? '请填写 Torznab API 地址与 API Key。' : '公开 BT 索引无需登录凭据，Server 会使用受控内建地址。' }}</p></div>
+          <div><h2 id="site-dialog-title" class="m-0 text-xl">{{ title }}</h2><p class="page-description mt-1 text-sm">{{ selectedType === 'cloud_share' ? '配置 PanSou 搜索服务和频道，保存后即可像其他站点一样搜索和订阅。' : editing ? '敏感字段留空会继续使用原凭据；保存前会测试完整候选配置。' : credentialKind === 'cookie' ? '请配置已登录账号的 Cookie，或先在 CookieCloud 中统一同步。' : credentialKind === 'api_key' ? '请填写 Torznab API 地址与 API Key。' : '公开 BT 索引无需登录凭据，Server 会使用受控内建地址。' }}</p></div>
           <button class="btn-secondary" type="button" :disabled="saving" @click="closeDialog">关闭</button>
         </div>
         <button v-if="!editing" class="link-button mt-4" type="button" @click="dialogStep = 'type'">← 返回选择类型</button>
         <div class="mt-5 grid gap-4 sm:grid-cols-2">
-          <div v-if="selectedType === 'pt' || editing" class="sm:col-span-2"><label class="label" for="site-catalog">站点适配</label><select id="site-catalog" v-model="form.kind" class="input" :disabled="Boolean(editing)" @change="applyCatalogSelection"><option v-if="editing && !selectedCatalog" :value="editing.kind">{{ editing.name }} · 内建适配</option><option v-for="item in filteredCatalog" :key="item.key" :value="item.key">{{ item.name }} · {{ item.engine === 'nexusphp' ? 'NexusPHP' : item.engine.toUpperCase() }}</option></select></div>
-          <div v-else class="sm:col-span-2"><label class="label" for="site-bt-mode">BT 接入方式</label><select id="site-bt-mode" v-model="form.kind" class="input" @change="applyCatalogSelection"><option value="auto_bt">输入官网自动识别</option><option value="torznab">Torznab · Jackett/Prowlarr</option></select><p class="text-subtle mb-0 mt-1 text-xs">Server 内置适配器，但不会列出、探测或访问尚未由你添加的公共 BT 站点。</p></div>
+          <div v-if="selectedType === 'pt' || editing && selectedType !== 'cloud_share'" class="sm:col-span-2"><label class="label" for="site-catalog">站点适配</label><select id="site-catalog" v-model="form.kind" class="input" :disabled="Boolean(editing)" @change="applyCatalogSelection"><option v-if="editing && !selectedCatalog" :value="editing.kind">{{ editing.name }} · 内建适配</option><option v-for="item in filteredCatalog" :key="item.key" :value="item.key">{{ item.name }} · {{ item.engine === 'nexusphp' ? 'NexusPHP' : item.engine.toUpperCase() }}</option></select></div>
+          <div v-else-if="selectedType === 'bt'" class="sm:col-span-2"><label class="label" for="site-bt-mode">BT 接入方式</label><select id="site-bt-mode" v-model="form.kind" class="input" @change="applyCatalogSelection"><option value="auto_bt">输入官网自动识别</option><option value="torznab">Torznab · Jackett/Prowlarr</option></select><p class="text-subtle mb-0 mt-1 text-xs">Server 内置适配器，但不会列出、探测或访问尚未由你添加的公共 BT 站点。</p></div>
           <div><label class="label" for="site-name">显示名称</label><input id="site-name" v-model="form.name" class="input" maxlength="128" required /></div>
-          <div><label class="label" for="site-url">HTTPS 根地址</label><input id="site-url" v-model="form.baseURL" class="input font-mono" type="url" placeholder="https://example.test" required autocomplete="off" :readonly="Boolean(editing && selectedCatalog?.engine === 'rss')" @input="btResolution = null" /></div>
+          <div><label class="label" for="site-url">{{ selectedType === 'cloud_share' ? 'PanSou API 地址（HTTPS）' : 'HTTPS 根地址' }}</label><input id="site-url" v-model="form.baseURL" class="input font-mono" type="url" placeholder="https://example.test" required autocomplete="off" :readonly="Boolean(editing && selectedCatalog?.engine === 'rss')" @input="btResolution = null" /></div>
+          <template v-if="selectedType === 'cloud_share'">
+            <div class="semantic-inset rounded-lg p-4 sm:col-span-2">
+              <label class="label" for="site-cloud">网盘分类</label>
+              <select id="site-cloud" v-model="form.cloudProvider" class="input"><option value="115">115 网盘 · 分享转存</option></select>
+              <p class="text-subtle mb-0 mt-2 text-xs">当前支持 115。站点只提供分享资源，转存账号和目录沿用已有下载器配置。</p>
+            </div>
+            <div class="sm:col-span-2">
+              <label class="label" for="site-channels">TG 频道</label>
+              <textarea id="site-channels" v-model="form.channels" class="input min-h-32 font-mono text-sm" required placeholder="每行一个频道，最多 100 个&#10;@channel_name&#10;https://t.me/channel_name" />
+              <p class="text-subtle mb-0 mt-2 text-xs">支持频道名称和公开频道链接。频道会作为一个站点参与统一搜索；结果显示具体来源。</p>
+            </div>
+            <label class="flex items-center gap-2 text-sm sm:col-span-2"><input v-model="form.authEnabled" type="checkbox" />PanSou 服务需要账号认证</label>
+            <template v-if="form.authEnabled">
+              <div><label class="label" for="site-user">PanSou 用户名</label><input id="site-user" v-model="form.username" class="input" required autocomplete="off" maxlength="128" /></div>
+              <div><label class="label" for="site-password">密码{{ editing?.password_configured ? '（留空保留）' : '' }}</label><SecretInput id="site-password" v-model="form.password" class="input" :configured="Boolean(editing?.password_configured)" :required="!editing?.password_configured" autocomplete="new-password" /></div>
+            </template>
+          </template>
           <div v-if="!editing && form.kind === 'auto_bt'" class="flex items-end"><button class="btn-secondary w-full" type="button" :disabled="resolvingBT || !form.baseURL.trim()" @click="resolveBT">{{ resolvingBT ? '正在识别…' : '识别官网' }}</button></div>
           <div v-if="btResolution" class="semantic-inset p-3 text-sm sm:col-span-2"><strong>已识别：{{ btResolution.name }}</strong><span class="text-subtle ml-2 font-mono text-xs">{{ btResolution.kind }}</span><p class="mb-0 mt-1 text-xs text-muted">保存时 Server 会再次按官网 host 解析，浏览器返回的类型不会被信任。</p></div>
           <div v-if="credentialKind === 'cookie'" class="sm:col-span-2"><label class="label" for="site-cookie">Cookie{{ editing ? '（留空不修改）' : '' }}</label><SecretInput id="site-cookie" v-model="form.cookie" class="input min-h-24 font-mono text-xs" multiline :configured="Boolean(editing?.cookie_configured)" :load-secret="auth.can(Permissions.ConnectionsSecretsExport) && editing?.cookie_configured ? credentialLoader({ resourceType: 'site', resourceID: editing.id, field: 'cookie' }) : undefined" :reset-key="editing?.id" :required="!editing" autocomplete="off" spellcheck="false" /><p class="text-subtle mb-0 mt-1 text-xs">CookieCloud 同步成功后也可在此继续手动更新，不会写入日志或普通任务字段。</p></div>

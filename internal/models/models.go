@@ -1717,6 +1717,7 @@ type DiscoveryCache struct {
 // Site is an administrator-managed PT connection. CredentialCiphertext holds
 // the cookie/passkey envelope and is never serialized or copied to jobs.
 type Site struct {
+	CloudConfigJSON      string     `gorm:"type:text;not null;default:'{}'" json:"-"`
 	ID                   uint       `gorm:"primaryKey" json:"id"`
 	Name                 string     `gorm:"size:128;not null" json:"name"`
 	NameNormalized       string     `gorm:"size:128;not null;uniqueIndex" json:"-"`

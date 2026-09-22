@@ -69,12 +69,12 @@ let source: EventSource | null = null
 let streamTimeout: number | undefined
 let mediaSearchRequest: AbortController | null = null
 
-const enabledDownloaders = computed(() => downloaders.value.filter(item => item.enabled))
+const enabledDownloaders = computed(() => downloaders.value.filter(item => item.enabled && (downloadDialog.value?.source_kind !== '115_share' || item.type === 'pan115_offline' && item.capabilities.share_receive)))
 const selectedRoute = computed(() => routeTargetByID(routePreview.value, downloadForm.value.mediaLibraryID))
 const selectedLibrary = computed(() => libraries.value.find(item => item.id === selectedRoute.value?.media_library_id) ?? null)
 const selectableSiteOptions = computed(() => siteOptions.value.filter(item => item.searchable))
 const activeChannel = ref<'all' | number>('all')
-const enabledSiteTypes = ref<Array<'pt' | 'bt' | 'bt_resource'>>(['pt', 'bt', 'bt_resource'])
+const enabledSiteTypes = ref<Array<'pt' | 'bt' | 'bt_resource' | 'cloud_share'>>(['pt', 'bt', 'bt_resource', 'cloud_share'])
 const resolutionFilter = ref('')
 const promotionFilter = ref('')
 const minimumSeeders = ref<number | undefined>()
@@ -327,7 +327,7 @@ async function loadRoutePreview() {
   try {
     const preview = await previewDownloadRoutes({
       downloader_id: downloadForm.value.downloaderID,
-      source_kind: 'torrent',
+      source_kind: downloadDialog.value.source_kind === '115_share' ? '115_share' : 'torrent',
       site_id: downloadSiteID.value,
       expected_bytes: downloadDialog.value.size_bytes ?? undefined,
     }, controller.signal)
@@ -521,7 +521,7 @@ onBeforeUnmount(() => {
         </nav>
 
         <form class="panel grid gap-3 md:grid-cols-2 xl:grid-cols-[auto_auto_11rem_11rem_9rem_10rem_9rem_auto] xl:items-end" @submit.prevent>
-          <fieldset class="flex flex-wrap gap-3"><legend class="label">站点类型</legend><label class="text-sm"><input v-model="enabledSiteTypes" type="checkbox" value="pt" /> PT</label><label class="text-sm"><input v-model="enabledSiteTypes" type="checkbox" value="bt" /> 公共 BT</label><label class="text-sm"><input v-model="enabledSiteTypes" type="checkbox" value="bt_resource" /> 插件资源站</label></fieldset>
+          <fieldset class="flex flex-wrap gap-3"><legend class="label">站点类型</legend><label class="text-sm"><input v-model="enabledSiteTypes" type="checkbox" value="pt" /> PT</label><label class="text-sm"><input v-model="enabledSiteTypes" type="checkbox" value="bt" /> 公共 BT</label><label class="text-sm"><input v-model="enabledSiteTypes" type="checkbox" value="bt_resource" /> 插件资源站</label><label class="text-sm"><input v-model="enabledSiteTypes" type="checkbox" value="cloud_share" /> 网盘 / TG</label></fieldset>
           <label><span class="label">分辨率</span><select v-model="resolutionFilter" class="input"><option value="">全部</option><option v-for="value in resolutionOptions" :key="value" :value="value">{{ value }}</option></select></label>
           <label><span class="label">优惠</span><select v-model="promotionFilter" class="input"><option value="">全部</option><option value="free">FREE</option><option value="2xfree">2X FREE</option><option value="2x">2X</option></select></label>
           <label><span class="label">最低做种</span><input v-model.number="minimumSeeders" class="input" type="number" min="0" placeholder="不限" /></label>
@@ -537,10 +537,10 @@ onBeforeUnmount(() => {
             <div class="flex min-w-0 flex-1 gap-4">
               <div class="flex h-32 w-22 shrink-0 items-center justify-center overflow-hidden rounded-lg bg-[var(--surface-subtle)] text-center text-xs text-subtle">
                 <img v-if="recognitions[entry.item.token]?.poster_url" :src="recognitions[entry.item.token].poster_url" :alt="`${recognitions[entry.item.token].title} 海报`" class="h-full w-full object-cover" loading="lazy" />
-                <span v-else>{{ entry.group.site_name }}<br />{{ entry.group.site_type.toUpperCase() }}</span>
+                <span v-else>{{ entry.group.site_name }}<br />{{ entry.group.site_type === 'cloud_share' ? '115 网盘' : entry.group.site_type.toUpperCase() }}</span>
               </div>
               <div class="min-w-0 flex-1">
-                <div class="flex flex-wrap gap-1.5"><span class="status-chip">{{ entry.group.site_name }}</span><span class="status-chip">{{ entry.group.site_type.toUpperCase() }}</span><span v-if="entry.item.matched_name" class="status-chip status-chip--ready">命中 {{ entry.item.matched_name }}</span><span v-if="entry.item.promotion" class="status-chip status-chip--ready">{{ entry.item.promotion.toUpperCase() }}</span><span v-for="label in ptRecognitionSpecLabels(entry.item.specifications || {})" :key="label" class="status-chip">{{ label }}</span><span v-if="entry.item.quality" class="status-chip">{{ entry.item.quality }}</span><span v-for="tag in entry.item.tags || []" :key="tag" class="status-chip">{{ tag }}</span></div>
+                <div class="flex flex-wrap gap-1.5"><span class="status-chip">{{ entry.group.site_name }}</span><span class="status-chip">{{ entry.group.site_type === 'cloud_share' ? '115 网盘' : entry.group.site_type.toUpperCase() }}</span><span v-if="entry.item.channel" class="status-chip">@{{ entry.item.channel }}</span><a v-if="entry.item.post_url" :href="entry.item.post_url" target="_blank" rel="noopener noreferrer" class="text-xs">原帖 ↗</a><span v-if="entry.item.matched_name" class="status-chip status-chip--ready">命中 {{ entry.item.matched_name }}</span><span v-if="entry.item.promotion" class="status-chip status-chip--ready">{{ entry.item.promotion.toUpperCase() }}</span><span v-for="label in ptRecognitionSpecLabels(entry.item.specifications || {})" :key="label" class="status-chip">{{ label }}</span><span v-if="entry.item.quality" class="status-chip">{{ entry.item.quality }}</span><span v-for="tag in entry.item.tags || []" :key="tag" class="status-chip">{{ tag }}</span></div>
                 <h2 class="mt-3 break-words text-base font-750">{{ entry.item.title }}</h2>
                 <p v-if="entry.item.subtitle" class="text-subtle mb-0 mt-1 line-clamp-2 text-xs">{{ entry.item.subtitle }}</p>
                 <div class="text-subtle mt-3 flex flex-wrap gap-x-4 gap-y-1 text-xs"><span>{{ formatBytes(entry.item.size_bytes ?? null) }}</span><span>{{ formatTime(entry.item.published_at) }}</span><strong>做种 {{ count(entry.item.seeders) }}</strong><span>下载 {{ count(entry.item.leechers) }}</span><span>完成 {{ count(entry.item.completed) }}</span></div>
@@ -548,7 +548,7 @@ onBeforeUnmount(() => {
                 <p v-if="recognitionErrors[entry.item.token]" class="semantic-warning mb-0 mt-3 p-3 text-xs">{{ recognitionErrors[entry.item.token] }}</p>
               </div>
             </div>
-            <footer class="mt-4 flex flex-wrap justify-end gap-2 border-t border-[var(--border)] pt-4"><button class="btn-secondary" :disabled="recognizingTokens.includes(entry.item.token)" @click="recognizeResult(entry.item)">{{ recognizingTokens.includes(entry.item.token) ? '检测中…' : '检测' }}</button><button class="btn-secondary" :disabled="!auth.can(Permissions.DownloadsCreate)" @click="openManualRecognition(entry.item)">手动检测</button><button class="btn-primary" :disabled="!auth.can(Permissions.DownloadsCreate)" @click="openDownload(entry.item)">入库</button></footer>
+            <footer class="mt-4 flex flex-wrap justify-end gap-2 border-t border-[var(--border)] pt-4"><button class="btn-secondary" :disabled="recognizingTokens.includes(entry.item.token)" @click="recognizeResult(entry.item)">{{ recognizingTokens.includes(entry.item.token) ? '检测中…' : '检测' }}</button><button class="btn-secondary" :disabled="!auth.can(Permissions.DownloadsCreate)" @click="openManualRecognition(entry.item)">手动检测</button><button class="btn-primary" :disabled="!auth.can(Permissions.DownloadsCreate)" @click="openDownload(entry.item)">{{ entry.item.source_kind === '115_share' ? '转存入库' : '入库' }}</button></footer>
           </article>
         </div>
         <footer v-if="activeGroup?.status === 'success'" class="panel flex items-center justify-center gap-3"><button class="btn-secondary" :disabled="searching || activeGroup.page <= 1" @click="previousPage(activeGroup)">上一页</button><span class="text-sm">{{ activeGroup.site_name }} · 第 {{ activeGroup.page }} 页</span><button class="btn-secondary" :disabled="searching || !activeGroup.has_next" @click="nextPage(activeGroup)">下一页</button></footer>
@@ -567,7 +567,7 @@ onBeforeUnmount(() => {
         <div v-else class="mt-4 grid gap-2 sm:grid-cols-2">
           <label v-for="site in siteOptions" :key="site.id" class="semantic-list-item flex items-start gap-3 p-3" :class="{ 'opacity-60': !site.searchable }">
             <input v-model="selectedSiteIDs" type="checkbox" :value="site.id" :disabled="!site.searchable" />
-            <span class="min-w-0"><strong class="block break-words">{{ site.name }}</strong><small class="text-subtle mt-1 block">{{ site.site_type.toUpperCase() }} · {{ site.health_status || 'unknown' }}</small><small v-if="site.reason" class="semantic-danger-text mt-1 block">{{ site.reason }}</small></span>
+            <span class="min-w-0"><strong class="block break-words">{{ site.name }}</strong><small class="text-subtle mt-1 block">{{ site.site_type === 'cloud_share' ? '网盘 / TG' : site.site_type.toUpperCase() }} · {{ site.health_status || 'unknown' }}</small><small v-if="site.reason" class="semantic-danger-text mt-1 block">{{ site.reason }}</small></span>
           </label>
         </div>
         <p v-if="!siteOptionsLoading && !siteOptionsError && selectedSiteIDs.length === 0" class="semantic-warning mt-4 p-3 text-sm" role="alert">至少选择一个可搜索站点后才能开始搜索。</p>
@@ -598,15 +598,16 @@ onBeforeUnmount(() => {
 
     <div v-if="downloadDialog" class="modal-backdrop fixed inset-0 z-50 flex items-center justify-center p-4" @click.self="!submitting && (downloadDialog = null)">
       <form class="panel w-full max-w-xl" role="dialog" aria-modal="true" aria-labelledby="pt-download-title" @submit.prevent="submitDownload">
-        <div class="flex items-start justify-between gap-3"><div><h2 id="pt-download-title" class="m-0 text-xl">创建下载任务</h2><p class="page-description mt-1 line-clamp-2 text-sm">{{ downloadDialog.title }}</p></div><button class="btn-secondary" type="button" :disabled="submitting" @click="downloadDialog = null">关闭</button></div>
+        <div class="flex items-start justify-between gap-3"><div><h2 id="pt-download-title" class="m-0 text-xl">{{ downloadDialog.source_kind === '115_share' ? '转存到媒体库' : '创建下载任务' }}</h2><p class="page-description mt-1 line-clamp-2 text-sm">{{ downloadDialog.title }}</p></div><button class="btn-secondary" type="button" :disabled="submitting" @click="downloadDialog = null">关闭</button></div>
         <div class="mt-5 grid gap-4 sm:grid-cols-2">
-          <div><label class="label">下载器</label><select v-model="downloadForm.downloaderID" class="input" required><option value="" disabled>请选择</option><option v-for="item in enabledDownloaders" :key="item.id" :value="item.id">{{ item.name }} · {{ item.type === 'pan115_offline' ? '115 离线' : item.type }}</option></select></div>
+          <div><label class="label">下载器</label><select v-model="downloadForm.downloaderID" class="input" required><option value="" disabled>请选择</option><option v-for="item in enabledDownloaders" :key="item.id" :value="item.id">{{ item.name }} · {{ item.type === 'pan115_offline' ? '115 网盘' : item.type }}</option></select></div>
+          <p v-if="downloadDialog.source_kind === '115_share' && !enabledDownloaders.length" class="semantic-warning sm:col-span-2">请先在下载器设置中启用支持分享转存的 115 下载器，并配置网盘账号和接收目录。</p>
           <DownloadRouteTargetPicker v-model="downloadForm.mediaLibraryID" :preview="routePreview" :loading="routePreviewLoading" />
           <div class="sm:col-span-2"><label class="label">队列优先级</label><input v-model.number="downloadForm.priority" class="input" type="number" min="-100" max="100" /></div>
         </div>
         <div v-if="selectedLibrary && selectedRoute" class="semantic-inset mt-4 grid gap-3 p-4 text-sm sm:grid-cols-2"><div><span class="text-subtle block text-xs">最终媒体库</span><strong>{{ selectedLibrary.name }}</strong></div><div><span class="text-subtle block text-xs">分类与入库</span><strong>{{ selectedRoute.route_label }} · {{ selectedLibrary.profile_name }} · {{ selectedLibrary.transfer_mode }}</strong></div></div>
-        <p class="text-subtle mt-4 text-xs">确认后 Server 才会凭短期令牌获取种子，并复用现有下载 → 识别 → 整理 → 入库流水线。真实种子地址和 passkey 不会进入页面。</p>
-        <div class="mt-5 flex justify-end gap-3"><button class="btn-secondary" type="button" :disabled="submitting" @click="downloadDialog = null">取消</button><button class="btn-primary" :disabled="submitting || routePreviewLoading || !downloadForm.downloaderID || !selectedRoute?.enabled || !selectedLibrary">{{ submitting ? '正在获取种子并入队…' : '确认并入队' }}</button></div>
+        <p class="text-subtle mt-4 text-xs">{{ downloadDialog.source_kind === '115_share' ? '分享内容将转存到 115 下载器目录，随后自动识别、整理并入库。' : '确认后获取资源，自动识别、整理并入库。' }}</p>
+        <div class="mt-5 flex justify-end gap-3"><button class="btn-secondary" type="button" :disabled="submitting" @click="downloadDialog = null">取消</button><button class="btn-primary" :disabled="submitting || routePreviewLoading || !downloadForm.downloaderID || !selectedRoute?.enabled || !selectedLibrary">{{ submitting ? '正在提交…' : downloadDialog.source_kind === '115_share' ? '确认转存' : '确认并入队' }}</button></div>
       </form>
     </div>
   </section>

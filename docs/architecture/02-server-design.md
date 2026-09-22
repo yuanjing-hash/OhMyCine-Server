@@ -1903,3 +1903,7 @@ Server 可生成 Linux bash 或 Windows PowerShell 完整命令；命令先校�
 `GET /api/v1/media-libraries/{id}/structure/issues` 在同一只读快照中返回分页列表及工作区摘要。`total` 受分类和 `review_state` 筛选；`pending_total`、`handled_total`、`pending_repairable_count`、`pending_classifications`、`handled_classifications` 始终覆盖当前用户、当前诊断的全部可处理问题，不受页码或分类筛选影响。缺集提示不计入工作区摘要。`diagnosis_revision` 与诊断详情的 `revision` 一致，`review_revision` 是当前用户工作区版本。
 
 摘要沿用列表的诊断任务、诊断代数和来源版本边界，不使用随后普通扫描的代数去替换诊断快照。跳过只保存在该用户本次诊断中，重载仍能从已处理列表撤销；原始诊断发现数不代表尚待用户处理的数量。读取失败返回错误，客户端必须显示不可用，不能替换成健康的零计数。概览仅为当前选中库读取小页摘要，不为每张媒体库卡产生额外查询。
+
+## TG 网盘站点
+
+新增原生 `pansou_tg` 适配器，站点类型为 `cloud_share`。一个站点保存一种网盘类型和多个公开 TG 频道；当前通过 PanSou 搜索 115 分享，统一进入搜索、订阅和现有分享转存入库链路。网盘账号、接收目录、执行位置沿用 115 下载器，协议和配置方式见 [TG 网盘站点](../deployment/tg-cloud-sites.md)。

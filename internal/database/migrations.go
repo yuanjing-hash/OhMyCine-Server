@@ -99,7 +99,7 @@ func schemaMigrationsThrough109() []migration {
 }
 
 func schemaMigrations() []migration {
-	return append(schemaMigrationsThrough109(), migration{Version: 110, Apply: migrateProviderDeletion}, migration{Version: 111, Apply: migrateCloudEmptyCleanup})
+	return append(schemaMigrationsThrough109(), migration{Version: 110, Apply: migrateProviderDeletion}, migration{Version: 111, Apply: migrateCloudEmptyCleanup}, migration{Version: 112, Apply: migrateTGCloudSites})
 }
 
 func migrateStructureDraftPreviewRows(db *gorm.DB) error {

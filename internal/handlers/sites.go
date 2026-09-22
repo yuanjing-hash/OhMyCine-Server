@@ -10,22 +10,26 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/middleware"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/services"
+	sitepkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/site"
 )
 
 type siteWritePayload struct {
-	Name               string `json:"name"`
-	Kind               string `json:"kind"`
-	BaseURL            string `json:"base_url"`
-	Cookie             string `json:"cookie"`
-	Passkey            string `json:"passkey"`
-	APIKey             string `json:"api_key"`
-	UserAgent          string `json:"user_agent"`
-	BrowserEmulation   bool   `json:"browser_emulation"`
-	BrowserServiceURL  string `json:"browser_service_url"`
-	Enabled            *bool  `json:"enabled"`
-	Priority           int    `json:"priority"`
-	TimeoutSeconds     int    `json:"timeout_seconds"`
-	RateLimitPerMinute int    `json:"rate_limit_per_minute"`
+	CloudConfig        *sitepkg.CloudConfig `json:"cloud_config"`
+	Username           string               `json:"username"`
+	Password           string               `json:"password"`
+	Name               string               `json:"name"`
+	Kind               string               `json:"kind"`
+	BaseURL            string               `json:"base_url"`
+	Cookie             string               `json:"cookie"`
+	Passkey            string               `json:"passkey"`
+	APIKey             string               `json:"api_key"`
+	UserAgent          string               `json:"user_agent"`
+	BrowserEmulation   bool                 `json:"browser_emulation"`
+	BrowserServiceURL  string               `json:"browser_service_url"`
+	Enabled            *bool                `json:"enabled"`
+	Priority           int                  `json:"priority"`
+	TimeoutSeconds     int                  `json:"timeout_seconds"`
+	RateLimitPerMinute int                  `json:"rate_limit_per_minute"`
 }
 
 func (a *API) Sites(c *gin.Context) {
@@ -89,7 +93,7 @@ func (a *API) CreateSite(c *gin.Context) {
 	if payload.Enabled != nil {
 		enabled = *payload.Enabled
 	}
-	item, err := a.sites.Create(c.Request.Context(), actor, services.SiteInput{Name: payload.Name, Kind: payload.Kind, BaseURL: payload.BaseURL, Cookie: payload.Cookie, Passkey: payload.Passkey, APIKey: payload.APIKey, UserAgent: payload.UserAgent, BrowserEmulation: payload.BrowserEmulation, BrowserServiceURL: payload.BrowserServiceURL, Enabled: enabled, Priority: payload.Priority, TimeoutSeconds: payload.TimeoutSeconds, RateLimitPerMinute: payload.RateLimitPerMinute}, middleware.RequestContextFrom(c))
+	item, err := a.sites.Create(c.Request.Context(), actor, services.SiteInput{CloudConfig: payload.CloudConfig, Username: payload.Username, Password: payload.Password, Name: payload.Name, Kind: payload.Kind, BaseURL: payload.BaseURL, Cookie: payload.Cookie, Passkey: payload.Passkey, APIKey: payload.APIKey, UserAgent: payload.UserAgent, BrowserEmulation: payload.BrowserEmulation, BrowserServiceURL: payload.BrowserServiceURL, Enabled: enabled, Priority: payload.Priority, TimeoutSeconds: payload.TimeoutSeconds, RateLimitPerMinute: payload.RateLimitPerMinute}, middleware.RequestContextFrom(c))
 	if err != nil {
 		writeError(c, a.log, err)
 		return
@@ -105,27 +109,31 @@ func (a *API) UpdateSite(c *gin.Context) {
 	}
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 64<<10)
 	var payload struct {
-		Name               *string `json:"name"`
-		BaseURL            *string `json:"base_url"`
-		Cookie             *string `json:"cookie"`
-		Passkey            *string `json:"passkey"`
-		ClearPasskey       bool    `json:"clear_passkey"`
-		APIKey             *string `json:"api_key"`
-		ClearAPIKey        bool    `json:"clear_api_key"`
-		UserAgent          *string `json:"user_agent"`
-		BrowserEmulation   *bool   `json:"browser_emulation"`
-		BrowserServiceURL  *string `json:"browser_service_url"`
-		Enabled            *bool   `json:"enabled"`
-		Priority           *int    `json:"priority"`
-		TimeoutSeconds     *int    `json:"timeout_seconds"`
-		RateLimitPerMinute *int    `json:"rate_limit_per_minute"`
-		Revision           uint64  `json:"revision"`
+		CloudConfig        *sitepkg.CloudConfig `json:"cloud_config"`
+		Username           *string              `json:"username"`
+		Password           *string              `json:"password"`
+		ClearPassword      bool                 `json:"clear_password"`
+		Name               *string              `json:"name"`
+		BaseURL            *string              `json:"base_url"`
+		Cookie             *string              `json:"cookie"`
+		Passkey            *string              `json:"passkey"`
+		ClearPasskey       bool                 `json:"clear_passkey"`
+		APIKey             *string              `json:"api_key"`
+		ClearAPIKey        bool                 `json:"clear_api_key"`
+		UserAgent          *string              `json:"user_agent"`
+		BrowserEmulation   *bool                `json:"browser_emulation"`
+		BrowserServiceURL  *string              `json:"browser_service_url"`
+		Enabled            *bool                `json:"enabled"`
+		Priority           *int                 `json:"priority"`
+		TimeoutSeconds     *int                 `json:"timeout_seconds"`
+		RateLimitPerMinute *int                 `json:"rate_limit_per_minute"`
+		Revision           uint64               `json:"revision"`
 	}
 	if err := strictJSON(c, &payload); err != nil {
 		writeError(c, a.log, invalid("站点配置无效", err))
 		return
 	}
-	item, err := a.sites.Update(c.Request.Context(), actor, id, services.SiteUpdateInput{Name: payload.Name, BaseURL: payload.BaseURL, Cookie: payload.Cookie, Passkey: payload.Passkey, ClearPasskey: payload.ClearPasskey, APIKey: payload.APIKey, ClearAPIKey: payload.ClearAPIKey, UserAgent: payload.UserAgent, BrowserEmulation: payload.BrowserEmulation, BrowserServiceURL: payload.BrowserServiceURL, Enabled: payload.Enabled, Priority: payload.Priority, TimeoutSeconds: payload.TimeoutSeconds, RateLimitPerMinute: payload.RateLimitPerMinute, Revision: payload.Revision}, middleware.RequestContextFrom(c))
+	item, err := a.sites.Update(c.Request.Context(), actor, id, services.SiteUpdateInput{CloudConfig: payload.CloudConfig, Username: payload.Username, Password: payload.Password, ClearPassword: payload.ClearPassword, Name: payload.Name, BaseURL: payload.BaseURL, Cookie: payload.Cookie, Passkey: payload.Passkey, ClearPasskey: payload.ClearPasskey, APIKey: payload.APIKey, ClearAPIKey: payload.ClearAPIKey, UserAgent: payload.UserAgent, BrowserEmulation: payload.BrowserEmulation, BrowserServiceURL: payload.BrowserServiceURL, Enabled: payload.Enabled, Priority: payload.Priority, TimeoutSeconds: payload.TimeoutSeconds, RateLimitPerMinute: payload.RateLimitPerMinute, Revision: payload.Revision}, middleware.RequestContextFrom(c))
 	if err != nil {
 		writeError(c, a.log, err)
 		return

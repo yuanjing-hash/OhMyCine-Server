@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"regexp"
 	"sort"
 	"strconv"
@@ -191,6 +192,11 @@ func (w *FollowSearchWorker) Run(ctx context.Context, runtime JobRuntime, job Cl
 		if len(episodes) == 0 {
 			continue
 		}
+		// An evolving share can contain new episodes under the same share code.
+		// Keep retry identity stable for this missing set, not for the whole share.
+		if candidate.Item.SourceKind == "115_share" {
+			candidate.Fingerprint = followFingerprint(candidate.SiteID, fmt.Sprintf("%s:%d:%v", candidate.Fingerprint, candidate.Season, episodes), 0, nil)
+		}
 		claimed, err := w.reserveEpisodes(run, subscription.ID, candidate, episodes)
 		if err != nil || !claimed {
 			continue
@@ -286,11 +292,15 @@ func (w *FollowSearchWorker) searchCandidates(ctx context.Context, actor Actor, 
 						summary[reason]++
 						continue
 					}
-					if _, duplicate := seen[candidate.Fingerprint]; duplicate {
+					candidateKey := candidate.Fingerprint
+					if item.SourceKind == "115_share" {
+						candidateKey = fmt.Sprintf("%s:%d", candidateKey, season)
+					}
+					if _, duplicate := seen[candidateKey]; duplicate {
 						summary["duplicate"]++
 						continue
 					}
-					seen[candidate.Fingerprint] = struct{}{}
+					seen[candidateKey] = struct{}{}
 					covers := false
 					for _, episode := range candidate.Episodes {
 						if _, ok := missing[[2]int{season, episode}]; ok {
@@ -358,7 +368,7 @@ func buildFollowCandidate(item SiteSearchResult, siteID uint, sitePriority, seas
 	if matchesAllowed(spec.ReleaseGroup, snapshot.Filters.ExcludeReleaseGroups) {
 		return followCandidate{}, "excluded_release_group", false
 	}
-	if snapshot.Filters.MinSeeders > 0 && (item.Seeders == nil || *item.Seeders < snapshot.Filters.MinSeeders) {
+	if item.SourceKind != "115_share" && snapshot.Filters.MinSeeders > 0 && (item.Seeders == nil || *item.Seeders < snapshot.Filters.MinSeeders) {
 		return followCandidate{}, "seeders", false
 	}
 	if (snapshot.Filters.MinSizeBytes != nil || snapshot.Filters.MaxSizeBytes != nil) && item.SizeBytes <= 0 {

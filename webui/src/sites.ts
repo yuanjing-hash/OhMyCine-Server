@@ -5,11 +5,15 @@ export interface SiteHealth {
   checked_at?: string
 }
 
+export interface CloudSiteConfig { provider: '115'; channels: string[]; auth_enabled: boolean }
 export interface SiteSummary {
+  cloud_config?: CloudSiteConfig
+  login_username?: string
+  password_configured?: boolean
   id: number
   name: string
   kind: string
-  site_type: 'pt' | 'bt' | 'bt_resource'
+  site_type: 'pt' | 'bt' | 'bt_resource' | 'cloud_share'
   credential_kind: 'cookie' | 'api_key' | 'none' | 'plugin'
   capabilities: SiteCapabilities
   base_url: string
@@ -33,7 +37,7 @@ export interface SiteSummary {
 export interface SearchSiteOption {
   id: number
   name: string
-  site_type: 'pt' | 'bt' | 'bt_resource'
+  site_type: 'pt' | 'bt' | 'bt_resource' | 'cloud_share'
   health_status: string
   searchable: boolean
   reason?: string
@@ -50,7 +54,7 @@ export interface SiteCatalogItem {
   engine: string
   base_urls: string[]
   auto_discover: boolean
-  site_type: 'pt' | 'bt'
+  site_type: 'pt' | 'bt' | 'cloud_share'
   credential_kind: 'cookie' | 'api_key' | 'none'
   capabilities: SiteCapabilities
 }
@@ -100,6 +104,10 @@ export interface CookieCloudSyncIssue {
 }
 
 export interface PTSearchResult {
+  source_kind?: string
+  cloud_provider?: string
+  channel?: string
+  post_url?: string
   token: string
   matched_name?: string
   title: string
@@ -119,7 +127,7 @@ export interface PTSearchResult {
 export interface PTSearchGroup {
   site_id: number
   site_name: string
-  site_type: 'pt' | 'bt' | 'bt_resource'
+  site_type: 'pt' | 'bt' | 'bt_resource' | 'cloud_share'
   status: 'success' | 'error'
   error_code?: string
   page: number
@@ -179,7 +187,7 @@ export type TorrentResultSort = 'seeders' | 'published' | 'size'
 export type TorrentResultDirection = 'asc' | 'desc'
 export interface TorrentResultFilters {
   activeChannel: 'all' | number
-  enabledSiteTypes: ReadonlyArray<'pt' | 'bt' | 'bt_resource'>
+  enabledSiteTypes: ReadonlyArray<'pt' | 'bt' | 'bt_resource' | 'cloud_share'>
   resolution?: string
   promotion?: string
   minimumSeeders?: number
@@ -340,8 +348,8 @@ export function filterAndSortTorrentResults(groups: readonly PTSearchGroup[], fi
     .flatMap(group => group.status === 'success' ? group.items.map(item => ({ item, group })) : [])
     .filter(({ group }) => filters.enabledSiteTypes.includes(group.site_type))
     .filter(({ item }) => !resolution || item.specifications?.resolution === resolution || item.quality === resolution)
-    .filter(({ item }) => !promotion || item.promotion?.toLowerCase() === promotion)
-    .filter(({ item }) => filters.minimumSeeders == null || (item.seeders ?? -1) >= filters.minimumSeeders)
+    .filter(({ item }) => item.source_kind === '115_share' || !promotion || item.promotion?.toLowerCase() === promotion)
+    .filter(({ item }) => item.source_kind === '115_share' || filters.minimumSeeders == null || (item.seeders ?? -1) >= filters.minimumSeeders)
     .sort((left, right) => {
       if (filters.sort === 'published') return compareOptionalNumber(timestamp(left.item.published_at), timestamp(right.item.published_at)) || stableTieBreak(left, right)
       if (filters.sort === 'size') return compareOptionalNumber(left.item.size_bytes, right.item.size_bytes) || stableTieBreak(left, right)

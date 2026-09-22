@@ -13,7 +13,7 @@ export interface FollowExecutionSnapshot {
   schedule: FollowSchedule; filters: FollowFilters; max_resources_per_run: number; download_priority: number
 }
 export interface FollowOption { id: string; name: string; type: string; connection_id?: number }
-export interface FollowSiteOption { id: number; name: string; site_type: 'pt' | 'bt' | 'bt_resource' }
+export interface FollowSiteOption { id: number; name: string; site_type: 'pt' | 'bt' | 'bt_resource' | 'cloud_share' }
 export interface FollowLibraryOption { id: number; name: string; storage_type: string; connection_id?: number }
 export interface FollowDefaults {
   snapshot: FollowExecutionSnapshot; sites: FollowSiteOption[]; downloaders: FollowOption[]
@@ -50,7 +50,7 @@ export function compatibleFollowDownloaders(defaults: FollowDefaults, libraryID:
 export function compatibleFollowSites(defaults: FollowDefaults, libraryID: number, downloaderID: string) {
   const downloader = compatibleFollowDownloaders(defaults, libraryID).find(item => item.id === downloaderID)
   if (!downloader) return []
-  return defaults.sites.filter(item => downloader.type !== 'pan115_offline' || item.site_type === 'bt' || item.site_type === 'bt_resource')
+  return defaults.sites.filter(item => item.site_type === 'cloud_share' ? downloader.type === 'pan115_offline' : downloader.type !== 'pan115_offline' || item.site_type === 'bt' || item.site_type === 'bt_resource')
 }
 export function canSubmitFollow(defaults: FollowDefaults | null, snapshot: FollowExecutionSnapshot | null) {
   if (!defaults || !snapshot || !snapshot.seasons.length || !snapshot.site_ids.length || !snapshot.downloader_id || !snapshot.media_library_id) return false

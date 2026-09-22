@@ -32,3 +32,27 @@ func TestMigrationV111CloudCleanupDefaultsOff(t *testing.T) {
 		}
 	}
 }
+
+func TestMigrationV112CloudSiteDefaults(t *testing.T) {
+	for _, previous := range []int{0, 111} {
+		db, err := Open(filepath.Join(t.TempDir(), "cloud-sites.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		sqlDB, _ := db.DB()
+		t.Cleanup(func() { _ = sqlDB.Close() })
+		if previous != 0 {
+			applyMigrationsThrough(t, db, previous)
+		}
+		if err := Migrate(db); err != nil {
+			t.Fatal(err)
+		}
+		var value string
+		if err := db.Raw("SELECT dflt_value FROM pragma_table_info('sites') WHERE name = 'cloud_config_json'").Scan(&value).Error; err != nil || value != "'{}'" {
+			t.Fatal(value, err)
+		}
+		if err := Migrate(db); err != nil {
+			t.Fatal(err)
+		}
+	}
+}

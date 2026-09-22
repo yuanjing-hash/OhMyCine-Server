@@ -14,7 +14,16 @@ var (
 	ErrNotFound       = errors.New("site_result_not_found")
 )
 
+type CloudConfig struct {
+	Provider    string   `json:"provider"`
+	Channels    []string `json:"channels"`
+	AuthEnabled bool     `json:"auth_enabled"`
+}
+
 type Config struct {
+	Cloud             *CloudConfig
+	Username          string
+	Password          string
 	BaseURL           string
 	Cookie            string
 	Passkey           string
@@ -27,11 +36,13 @@ type Config struct {
 }
 
 // Source is the server-only download material resolved from an opaque search
-// result identity. Exactly one of Torrent or Magnet is populated.
+// result identity. Exactly one of Torrent, Magnet or ShareURL is populated.
 type Source struct {
-	Torrent  []byte
-	Filename string
-	Magnet   string
+	ShareURL      string
+	CloudProvider string
+	Torrent       []byte
+	Filename      string
+	Magnet        string
 }
 
 type Query struct {
@@ -43,17 +54,22 @@ type Query struct {
 }
 
 type Result struct {
-	TorrentID string     `json:"-"`
-	Title     string     `json:"title"`
-	Subtitle  string     `json:"subtitle,omitempty"`
-	SizeBytes int64      `json:"size_bytes,omitempty"`
-	Published *time.Time `json:"published_at,omitempty"`
-	Seeders   *int       `json:"seeders,omitempty"`
-	Leechers  *int       `json:"leechers,omitempty"`
-	Completed *int       `json:"completed,omitempty"`
-	Promotion string     `json:"promotion,omitempty"`
-	Quality   string     `json:"quality,omitempty"`
-	Tags      []string   `json:"tags,omitempty"`
+	SourceKind    string     `json:"source_kind,omitempty"`
+	CloudProvider string     `json:"cloud_provider,omitempty"`
+	Channel       string     `json:"channel,omitempty"`
+	PostURL       string     `json:"post_url,omitempty"`
+	Fingerprint   string     `json:"-"`
+	TorrentID     string     `json:"-"`
+	Title         string     `json:"title"`
+	Subtitle      string     `json:"subtitle,omitempty"`
+	SizeBytes     int64      `json:"size_bytes,omitempty"`
+	Published     *time.Time `json:"published_at,omitempty"`
+	Seeders       *int       `json:"seeders,omitempty"`
+	Leechers      *int       `json:"leechers,omitempty"`
+	Completed     *int       `json:"completed,omitempty"`
+	Promotion     string     `json:"promotion,omitempty"`
+	Quality       string     `json:"quality,omitempty"`
+	Tags          []string   `json:"tags,omitempty"`
 }
 
 type Page struct {
@@ -75,9 +91,9 @@ type Adapter interface {
 	Download(context.Context, Config, string) ([]byte, string, error)
 }
 
-// SourceResolver is implemented by public BT and Torznab adapters whose
-// search identities resolve to either a bounded torrent file or a normalized
-// magnet. The identity never leaves the SiteService result vault.
+// SourceResolver resolves native site identities to bounded torrent files,
+// normalized magnets, or provider-validated cloud share URLs. The identity
+// never leaves the SiteService result vault.
 type SourceResolver interface {
 	ResolveSource(context.Context, Config, string) (Source, error)
 }

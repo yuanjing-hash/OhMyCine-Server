@@ -114,7 +114,7 @@ func (s *SiteService) SearchMediaIdentityEachProgress(ctx context.Context, actor
 
 func (s *SiteService) searchMediaIdentitySite(ctx context.Context, actor Actor, input MediaIdentitySearchInput, verified tmdb.Match, names []tmdb.SearchName, record models.Site) SiteSearchGroup {
 	var target *SiteSearchGroup
-	privateKeys := make(map[string]struct{})
+	privateKeys := make(map[string]int)
 	for _, name := range names {
 		if ctx.Err() != nil {
 			break
@@ -147,8 +147,13 @@ func (s *SiteService) searchMediaIdentitySite(ctx context.Context, actor Actor, 
 				target.Skipped++
 				continue
 			}
-			key := strconv.FormatUint(uint64(group.SiteID), 10) + ":" + claim.TorrentID
-			if _, duplicate := privateKeys[key]; duplicate {
+			identity := claim.TorrentID
+			if item.SourceKind == "115_share" && item.ResourceFingerprint != "" {
+				identity = item.ResourceFingerprint
+			}
+			key := strconv.FormatUint(uint64(group.SiteID), 10) + ":" + identity
+			index, duplicate := privateKeys[key]
+			if duplicate && (item.SourceKind != "115_share" || compareOptionalTime(item.Published, target.Items[index].Published) <= 0) {
 				s.deleteClaim(item.Token)
 				continue
 			}
@@ -156,10 +161,16 @@ func (s *SiteService) searchMediaIdentitySite(ctx context.Context, actor Actor, 
 				s.deleteClaim(item.Token)
 				continue
 			}
-			privateKeys[key] = struct{}{}
 			item.MatchedName = name.Value
-			item.ResourceFingerprint = privateResultFingerprint(group.SiteID, claim.TorrentID)
-			target.Items = append(target.Items, item)
+			item.ResourceFingerprint = privateResultFingerprint(group.SiteID, identity)
+			if duplicate {
+				// Another language query may find a newer post for the same evolving share.
+				s.deleteClaim(target.Items[index].Token)
+				target.Items[index] = item
+			} else {
+				privateKeys[key] = len(target.Items)
+				target.Items = append(target.Items, item)
+			}
 		}
 	}
 	if target == nil {

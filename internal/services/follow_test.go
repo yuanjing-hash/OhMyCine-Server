@@ -93,6 +93,19 @@ func TestFollowSnapshotValidationAndRunSnapshotAreStable(t *testing.T) {
 	if _, _, err := service.validateSnapshot(actor, 100, bt115Snapshot); ErrorCode(err) != CodeFollowConfigurationInvalid {
 		t.Fatalf("115 downloader accepted mixed BT/PT follow: %v", err)
 	}
+	cloudSite := models.Site{Name: "TG", NameNormalized: "tg-follow", Kind: "pansou_tg", BaseURL: "https://pansou.example.test", Enabled: true, CloudConfigJSON: `{"provider":"115","channels":["movies"]}`, Revision: 1}
+	if err := queue.db.Create(&cloudSite).Error; err != nil {
+		t.Fatal(err)
+	}
+	cloudSnapshot := bt115Snapshot
+	cloudSnapshot.SiteIDs = []uint{cloudSite.ID}
+	if _, _, err := service.validateSnapshot(actor, 100, cloudSnapshot); err != nil {
+		t.Fatalf("cloud follow rejected: %v", err)
+	}
+	cloudSnapshot.DownloaderID = downloader.ID
+	if _, _, err := service.validateSnapshot(actor, 100, cloudSnapshot); ErrorCode(err) != CodeFollowConfigurationInvalid {
+		t.Fatalf("cloud follow accepted ordinary downloader: %v", err)
+	}
 	now := clock.Now()
 	record := models.FollowSubscription{ID: "follow-stable", OwnerID: actor.User.ID, MediaType: "tv", TMDBID: 100, Title: "Stable", Status: models.FollowStatusActive, Revision: 1, ExecutionSnapshotJSON: string(raw), NextRunAt: &now, CreatedAt: now, UpdatedAt: now}
 	if err := queue.db.Create(&record).Error; err != nil {
@@ -150,6 +163,16 @@ func TestFollowCandidateFilteringAndDeterministicSetCover(t *testing.T) {
 	}
 	if len(candidate.Episodes) != 3 {
 		t.Fatalf("episodes=%v", candidate.Episodes)
+	}
+	cloudItem := item
+	cloudItem.SourceKind = "115_share"
+	cloudItem.Seeders = nil
+	if _, reason, ok := buildFollowCandidate(cloudItem, 2, 1, 1, snapshot); !ok {
+		t.Fatalf("cloud share rejected by BT filter: %s", reason)
+	}
+	cloudItem.SourceKind = ""
+	if _, reason, ok := buildFollowCandidate(cloudItem, 2, 1, 1, snapshot); ok || reason != "seeders" {
+		t.Fatalf("ordinary torrent lost seeder filter: %s", reason)
 	}
 	missing := map[[2]int]struct{}{{1, 1}: {}, {1, 2}: {}, {1, 3}: {}, {1, 4}: {}}
 	single := candidate

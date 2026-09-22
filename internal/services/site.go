@@ -21,6 +21,7 @@ import (
 	serverlog "github.com/yuanjing-hash/OhMyCine-Server/internal/logging"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/mediarecognition"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud/pan115"
 	downloadpkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/downloader"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/metadata/tmdb"
 	sitepkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/site"
@@ -62,11 +63,14 @@ type siteLimiter struct {
 	limiter  *rate.Limiter
 }
 type siteCredentialEnvelope struct {
-	Cookie  string `json:"cookie"`
-	Passkey string `json:"passkey,omitempty"`
-	APIKey  string `json:"api_key,omitempty"`
+	Username string `json:"username,omitempty"`
+	Password string `json:"password,omitempty"`
+	Cookie   string `json:"cookie"`
+	Passkey  string `json:"passkey,omitempty"`
+	APIKey   string `json:"api_key,omitempty"`
 }
 type siteResultClaim struct {
+	SiteRevision      uint64
 	ActorID, SiteID   uint
 	PluginClaimID     string
 	TorrentID, Title  string
@@ -83,12 +87,17 @@ type siteResultClaim struct {
 }
 
 type SiteInput struct {
+	CloudConfig                                                                *sitepkg.CloudConfig
+	Username, Password                                                         string
 	Name, Kind, BaseURL, Cookie, Passkey, APIKey, UserAgent, BrowserServiceURL string
 	Enabled                                                                    bool
 	BrowserEmulation                                                           bool
 	Priority, TimeoutSeconds, RateLimitPerMinute                               int
 }
 type SiteUpdateInput struct {
+	CloudConfig                                                          *sitepkg.CloudConfig
+	Username, Password                                                   *string
+	ClearPassword                                                        bool
 	Name, BaseURL, Cookie, Passkey, APIKey, UserAgent, BrowserServiceURL *string
 	ClearPasskey                                                         bool
 	ClearAPIKey                                                          bool
@@ -104,28 +113,31 @@ type SiteHealthSummary struct {
 	CheckedAt *time.Time `json:"checked_at,omitempty"`
 }
 type SiteSummary struct {
-	ID                       uint              `json:"id"`
-	Name                     string            `json:"name"`
-	Kind                     string            `json:"kind"`
-	SiteType                 string            `json:"site_type"`
-	CredentialKind           string            `json:"credential_kind"`
-	Capabilities             SiteCapabilities  `json:"capabilities"`
-	BaseURL                  string            `json:"base_url"`
-	UserAgent                string            `json:"user_agent"`
-	BrowserEmulation         bool              `json:"browser_emulation"`
-	BrowserServiceConfigured bool              `json:"browser_service_configured"`
-	Enabled                  bool              `json:"enabled"`
-	Priority                 int               `json:"priority"`
-	TimeoutSeconds           int               `json:"timeout_seconds"`
-	RateLimitPerMinute       int               `json:"rate_limit_per_minute"`
-	CredentialConfigured     bool              `json:"credential_configured"`
-	CookieConfigured         bool              `json:"cookie_configured"`
-	PasskeyConfigured        bool              `json:"passkey_configured"`
-	APIKeyConfigured         bool              `json:"api_key_configured"`
-	Health                   SiteHealthSummary `json:"health"`
-	Revision                 uint64            `json:"revision"`
-	CreatedAt                time.Time         `json:"created_at"`
-	UpdatedAt                time.Time         `json:"updated_at"`
+	CloudConfig              *sitepkg.CloudConfig `json:"cloud_config,omitempty"`
+	LoginUsername            string               `json:"login_username,omitempty"`
+	PasswordConfigured       bool                 `json:"password_configured"`
+	ID                       uint                 `json:"id"`
+	Name                     string               `json:"name"`
+	Kind                     string               `json:"kind"`
+	SiteType                 string               `json:"site_type"`
+	CredentialKind           string               `json:"credential_kind"`
+	Capabilities             SiteCapabilities     `json:"capabilities"`
+	BaseURL                  string               `json:"base_url"`
+	UserAgent                string               `json:"user_agent"`
+	BrowserEmulation         bool                 `json:"browser_emulation"`
+	BrowserServiceConfigured bool                 `json:"browser_service_configured"`
+	Enabled                  bool                 `json:"enabled"`
+	Priority                 int                  `json:"priority"`
+	TimeoutSeconds           int                  `json:"timeout_seconds"`
+	RateLimitPerMinute       int                  `json:"rate_limit_per_minute"`
+	CredentialConfigured     bool                 `json:"credential_configured"`
+	CookieConfigured         bool                 `json:"cookie_configured"`
+	PasskeyConfigured        bool                 `json:"passkey_configured"`
+	APIKeyConfigured         bool                 `json:"api_key_configured"`
+	Health                   SiteHealthSummary    `json:"health"`
+	Revision                 uint64               `json:"revision"`
+	CreatedAt                time.Time            `json:"created_at"`
+	UpdatedAt                time.Time            `json:"updated_at"`
 }
 type SiteCapabilities struct {
 	Search   bool `json:"search"`
@@ -166,6 +178,10 @@ type SiteSearchOption struct {
 	Reason       string `json:"reason,omitempty"`
 }
 type SiteSearchResult struct {
+	SourceKind          string                        `json:"source_kind,omitempty"`
+	CloudProvider       string                        `json:"cloud_provider,omitempty"`
+	Channel             string                        `json:"channel,omitempty"`
+	PostURL             string                        `json:"post_url,omitempty"`
 	Token               string                        `json:"token"`
 	ResourceFingerprint string                        `json:"-"`
 	MatchedName         string                        `json:"matched_name,omitempty"`
@@ -380,15 +396,23 @@ func (s *SiteService) Create(ctx context.Context, actor Actor, input SiteInput, 
 	if err != nil {
 		return SiteSummary{}, err
 	}
+	credential.Username, credential.Password = input.Username, input.Password
+	cloudConfig, err := normalizeCloudSite(kind, input.CloudConfig, &credential)
+	if err != nil {
+		return SiteSummary{}, err
+	}
 	priority, timeout, limit, userAgent, err := normalizeSitePolicy(input.Priority, input.TimeoutSeconds, input.RateLimitPerMinute, input.UserAgent)
 	if err != nil {
 		return SiteSummary{}, err
+	}
+	if cloudConfig != nil && input.BrowserEmulation {
+		return SiteSummary{}, appError(CodeInvalidRequest, "网盘站点不使用浏览器仿真", nil)
 	}
 	browserURL, err := normalizeBrowserService(input.BrowserEmulation, input.BrowserServiceURL)
 	if err != nil {
 		return SiteSummary{}, err
 	}
-	health, err := adapter.Test(ctx, sitepkg.Config{BaseURL: baseURL, Cookie: credential.Cookie, Passkey: credential.Passkey, APIKey: credential.APIKey, UserAgent: userAgent, Timeout: time.Duration(timeout) * time.Second, BrowserEmulation: input.BrowserEmulation, BrowserServiceURL: browserURL, RenderedFetcher: s.renderedFetcher})
+	health, err := adapter.Test(ctx, sitepkg.Config{Cloud: cloudConfig, Username: credential.Username, Password: credential.Password, BaseURL: baseURL, Cookie: credential.Cookie, Passkey: credential.Passkey, APIKey: credential.APIKey, UserAgent: userAgent, Timeout: time.Duration(timeout) * time.Second, BrowserEmulation: input.BrowserEmulation, BrowserServiceURL: browserURL, RenderedFetcher: s.renderedFetcher})
 	if err != nil {
 		return SiteSummary{}, siteAdapterError(err, "站点连接测试失败，未保存配置")
 	}
@@ -397,7 +421,7 @@ func (s *SiteService) Create(ctx context.Context, actor Actor, input SiteInput, 
 		return SiteSummary{}, err
 	}
 	now := s.now()
-	record := models.Site{Name: name, NameNormalized: normalized, Kind: kind, BaseURL: baseURL, CredentialCiphertext: ciphertext, UserAgent: userAgent, BrowserEmulation: input.BrowserEmulation, BrowserServiceURL: browserURL, Enabled: input.Enabled, Priority: priority, TimeoutSeconds: timeout, RateLimitPerMinute: limit, LastHealthStatus: "online", LastHealthUsername: safeLabel(health.Username, 128), LastHealthCheckedAt: &now, Revision: 1, CreatedAt: now, UpdatedAt: now}
+	record := models.Site{CloudConfigJSON: cloudConfigJSON(cloudConfig), Name: name, NameNormalized: normalized, Kind: kind, BaseURL: baseURL, CredentialCiphertext: ciphertext, UserAgent: userAgent, BrowserEmulation: input.BrowserEmulation, BrowserServiceURL: browserURL, Enabled: input.Enabled, Priority: priority, TimeoutSeconds: timeout, RateLimitPerMinute: limit, LastHealthStatus: "online", LastHealthUsername: safeLabel(health.Username, 128), LastHealthCheckedAt: &now, Revision: 1, CreatedAt: now, UpdatedAt: now}
 	err = s.db.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Create(&record).Error; err != nil {
 			return err
@@ -563,7 +587,27 @@ func (s *SiteService) Update(ctx context.Context, actor Actor, id uint, input Si
 		credential.APIKey = ""
 	}
 	definition, _ := builtin.DefinitionForKey(record.Kind)
-	credential, err = normalizeSiteCredential(definition.CredentialKind, credential.Cookie, credential.Passkey, credential.APIKey)
+	if definition.SiteType != builtin.SiteTypeCloud {
+		credential, err = normalizeSiteCredential(definition.CredentialKind, credential.Cookie, credential.Passkey, credential.APIKey)
+	}
+	if input.Username != nil {
+		credential.Username = *input.Username
+	}
+	if input.Password != nil && *input.Password != "" {
+		credential.Password = *input.Password
+	}
+	if input.ClearPassword {
+		credential.Password = ""
+	}
+	cloudConfig := cloudSiteConfig(record)
+	if input.CloudConfig != nil {
+		cloudConfig = input.CloudConfig
+	}
+	cloudConfig, cloudErr := normalizeCloudSite(record.Kind, cloudConfig, &credential)
+	if cloudErr != nil {
+		return SiteSummary{}, cloudErr
+	}
+	record.CloudConfigJSON = cloudConfigJSON(cloudConfig)
 	if err != nil {
 		return SiteSummary{}, err
 	}
@@ -592,6 +636,9 @@ func (s *SiteService) Update(ctx context.Context, actor Actor, id uint, input Si
 	if err != nil {
 		return SiteSummary{}, err
 	}
+	if cloudConfig != nil && browserEmulation {
+		return SiteSummary{}, appError(CodeInvalidRequest, "网盘站点不使用浏览器仿真", nil)
+	}
 	browserURL, err = normalizeBrowserService(browserEmulation, browserURL)
 	if err != nil {
 		return SiteSummary{}, err
@@ -600,7 +647,7 @@ func (s *SiteService) Update(ctx context.Context, actor Actor, id uint, input Si
 		record.Enabled = *input.Enabled
 	}
 	adapter := s.adapters[record.Kind]
-	health, err := adapter.Test(ctx, sitepkg.Config{BaseURL: record.BaseURL, Cookie: credential.Cookie, Passkey: credential.Passkey, APIKey: credential.APIKey, UserAgent: userAgent, Timeout: time.Duration(timeout) * time.Second, BrowserEmulation: browserEmulation, BrowserServiceURL: browserURL, RenderedFetcher: s.renderedFetcher})
+	health, err := adapter.Test(ctx, sitepkg.Config{Cloud: cloudSiteConfig(record), Username: credential.Username, Password: credential.Password, BaseURL: record.BaseURL, Cookie: credential.Cookie, Passkey: credential.Passkey, APIKey: credential.APIKey, UserAgent: userAgent, Timeout: time.Duration(timeout) * time.Second, BrowserEmulation: browserEmulation, BrowserServiceURL: browserURL, RenderedFetcher: s.renderedFetcher})
 	if err != nil {
 		return SiteSummary{}, siteAdapterError(err, "候选站点配置测试失败，原配置已保留")
 	}
@@ -610,7 +657,7 @@ func (s *SiteService) Update(ctx context.Context, actor Actor, id uint, input Si
 	}
 	now := s.now()
 	nextRevision := record.Revision + 1
-	updates := map[string]any{"name": record.Name, "name_normalized": record.NameNormalized, "base_url": record.BaseURL, "credential_ciphertext": ciphertext, "user_agent": userAgent, "browser_emulation": browserEmulation, "browser_service_url": browserURL, "enabled": record.Enabled, "priority": priority, "timeout_seconds": timeout, "rate_limit_per_minute": limit, "last_health_status": "online", "last_health_error_code": "", "last_health_username": safeLabel(health.Username, 128), "last_health_checked_at": now, "revision": nextRevision, "updated_at": now}
+	updates := map[string]any{"cloud_config_json": record.CloudConfigJSON, "name": record.Name, "name_normalized": record.NameNormalized, "base_url": record.BaseURL, "credential_ciphertext": ciphertext, "user_agent": userAgent, "browser_emulation": browserEmulation, "browser_service_url": browserURL, "enabled": record.Enabled, "priority": priority, "timeout_seconds": timeout, "rate_limit_per_minute": limit, "last_health_status": "online", "last_health_error_code": "", "last_health_username": safeLabel(health.Username, 128), "last_health_checked_at": now, "revision": nextRevision, "updated_at": now}
 	err = s.db.Transaction(func(tx *gorm.DB) error {
 		result := tx.Model(&models.Site{}).Where("id = ? AND revision = ?", id, input.Revision).Updates(updates)
 		if result.Error != nil {
@@ -635,7 +682,7 @@ func (s *SiteService) Update(ctx context.Context, actor Actor, id uint, input Si
 }
 
 func siteUpdateDisablesOnly(input SiteUpdateInput) bool {
-	return input.Enabled != nil && !*input.Enabled &&
+	return input.CloudConfig == nil && input.Username == nil && input.Password == nil && !input.ClearPassword && input.Enabled != nil && !*input.Enabled &&
 		input.Name == nil && input.BaseURL == nil && input.Cookie == nil && input.Passkey == nil && input.APIKey == nil &&
 		!input.ClearPasskey && !input.ClearAPIKey && input.UserAgent == nil && input.Priority == nil &&
 		input.TimeoutSeconds == nil && input.RateLimitPerMinute == nil && input.BrowserEmulation == nil && input.BrowserServiceURL == nil
@@ -979,6 +1026,7 @@ func (s *SiteService) searchSite(ctx context.Context, actor Actor, record models
 	expires := s.now().Add(ptResultTTL)
 	for _, item := range page.Items {
 		token, tokenErr := s.issueClaim(siteResultClaim{
+			SiteRevision:  record.Revision,
 			ActorID:       actor.User.ID,
 			SiteID:        record.ID,
 			TorrentID:     item.TorrentID,
@@ -994,7 +1042,7 @@ func (s *SiteService) searchSite(ctx context.Context, actor Actor, record models
 		if parsed, parseErr := mediarecognition.Parse(mediarecognition.InputFacts{PackageName: item.Title, SourceKind: mediarecognition.SourceDownload, MediaTypeHint: mediarecognition.MediaType(safeRecognitionMediaTypeHint(input.MediaType))}); parseErr == nil {
 			specifications = siteRecognitionSpecifications(parsed.Specifications, parsed.ReleaseGroup)
 		}
-		group.Items = append(group.Items, SiteSearchResult{Token: token, Title: item.Title, Subtitle: item.Subtitle, SizeBytes: item.SizeBytes, Published: item.Published, Seeders: item.Seeders, Leechers: item.Leechers, Completed: item.Completed, Promotion: item.Promotion, Quality: item.Quality, Tags: item.Tags, Specifications: specifications, ExpiresAt: expires})
+		group.Items = append(group.Items, SiteSearchResult{SourceKind: item.SourceKind, CloudProvider: item.CloudProvider, Channel: item.Channel, PostURL: item.PostURL, ResourceFingerprint: item.Fingerprint, Token: token, Title: item.Title, Subtitle: item.Subtitle, SizeBytes: item.SizeBytes, Published: item.Published, Seeders: item.Seeders, Leechers: item.Leechers, Completed: item.Completed, Promotion: item.Promotion, Quality: item.Quality, Tags: item.Tags, Specifications: specifications, ExpiresAt: expires})
 	}
 	serverlog.OperationDiscoverySearch.Event(s.log.Info()).Uint("site_id", record.ID).Str("site_type", group.SiteType).Int("results", len(group.Items)).Int("skipped", group.Skipped).Msg(serverlog.OperationDiscoverySearch.Message("站点种子资源搜索完成"))
 	return group
@@ -1446,7 +1494,10 @@ func (s *SiteService) Download(ctx context.Context, actor Actor, input SiteDownl
 	}
 	definition, definitionFound := builtin.DefinitionForKey(claimedSite.Kind)
 	isPluginResource := claimedSite.SourceType == "plugin" && claimedSite.Kind == pluginResourceKind
-	if selectedDownloader.Type == models.DownloaderTypePan115Offline && !isPluginResource && (!definitionFound || definition.SiteType != builtin.SiteTypeBT) {
+	if definitionFound && definition.SiteType == builtin.SiteTypeCloud && selectedDownloader.Type != models.DownloaderTypePan115Offline {
+		return DownloadTaskSummary{}, appError(CodeDownloadSourceInvalid, "网盘分享资源只能通过对应网盘转存", nil)
+	}
+	if selectedDownloader.Type == models.DownloaderTypePan115Offline && !isPluginResource && (!definitionFound || (definition.SiteType != builtin.SiteTypeBT && definition.SiteType != builtin.SiteTypeCloud)) {
 		return DownloadTaskSummary{}, appError(CodeDownloadSourceInvalid, "只有已确认的公开 BT 资源可以提交到 115 离线下载", nil)
 	}
 	record := claimedSite
@@ -1457,6 +1508,9 @@ func (s *SiteService) Download(ctx context.Context, actor Actor, input SiteDownl
 		if err != nil {
 			return DownloadTaskSummary{}, err
 		}
+	}
+	if claim.SiteRevision != 0 && claim.SiteRevision != record.Revision {
+		return DownloadTaskSummary{}, appError(CodeSiteResultExpired, "站点配置已变化，请重新搜索", nil)
 	}
 	if !record.Enabled {
 		return DownloadTaskSummary{}, appError(CodeSiteUnavailable, "站点已停用", nil)
@@ -1494,10 +1548,21 @@ func (s *SiteService) Download(ctx context.Context, actor Actor, input SiteDownl
 		}
 		hasMagnet := strings.TrimSpace(resolved.Magnet) != ""
 		hasTorrent := len(resolved.Torrent) > 0
-		if hasMagnet == hasTorrent {
+		if resolved.ShareURL == "" && hasMagnet == hasTorrent {
 			return DownloadTaskSummary{}, siteAdapterError(sitepkg.ErrInvalidReply, "下载来源响应无效")
 		}
-		if hasMagnet {
+		if resolved.ShareURL != "" {
+			if definition.SiteType != builtin.SiteTypeCloud || resolved.CloudProvider != "115" || hasMagnet || hasTorrent {
+				return DownloadTaskSummary{}, appError(CodeDownloadSourceInvalid, "网盘站点未返回有效的 115 分享", nil)
+			}
+			normalized, _, normalizeErr := pan115.NormalizeShareLink(resolved.ShareURL, "")
+			if normalizeErr != nil {
+				return DownloadTaskSummary{}, appError(CodeDownloadSourceInvalid, "115 分享地址无效", nil)
+			}
+			source = DownloadSourceInput{Kind: downloadpkg.SourcePan115Share, URL: normalized}
+		} else if definition.SiteType == builtin.SiteTypeCloud {
+			return DownloadTaskSummary{}, appError(CodeDownloadSourceInvalid, "网盘站点只允许分享转存", nil)
+		} else if hasMagnet {
 			source = DownloadSourceInput{Kind: downloadpkg.SourceURL, URL: resolved.Magnet}
 		} else {
 			source, err = siteTorrentDownloadSource(definition, definitionFound, selectedDownloader.Type, resolved.Torrent, resolved.Filename)
@@ -1506,6 +1571,9 @@ func (s *SiteService) Download(ctx context.Context, actor Actor, input SiteDownl
 			}
 		}
 	} else {
+		if definition.SiteType == builtin.SiteTypeCloud {
+			return DownloadTaskSummary{}, appError(CodeDownloadSourceInvalid, "网盘站点只允许分享转存", nil)
+		}
 		torrent, filename, downloadErr := adapter.Download(ctx, config, claim.TorrentID)
 		if downloadErr != nil {
 			return DownloadTaskSummary{}, siteAdapterError(downloadErr, "无法获取种子文件")
@@ -1529,6 +1597,26 @@ func (s *SiteService) Download(ctx context.Context, actor Actor, input SiteDownl
 		resourceClaimID = claim.PluginClaimID
 	}
 	beforePersist := input.BeforePersist
+	if definition.SiteType == builtin.SiteTypeCloud {
+		upstreamGuard := beforePersist
+		beforePersist = func(tx *gorm.DB) error {
+			if upstreamGuard != nil {
+				if err := upstreamGuard(tx); err != nil {
+					return err
+				}
+			}
+			// Configuration may change while waiting for the limiter or resolving the source.
+			// Check inside the download transaction so an obsolete claim cannot be persisted.
+			var current models.Site
+			if err := tx.Select("revision", "enabled").First(&current, record.ID).Error; err != nil {
+				return siteNotFound(err)
+			}
+			if !current.Enabled || current.Revision != claim.SiteRevision || !claim.ExpiresAt.After(s.now()) {
+				return appError(CodeSiteResultExpired, "站点配置或搜索结果已失效，请重新搜索", nil)
+			}
+			return nil
+		}
+	}
 	if resourceClaimID != "" {
 		upstreamGuard := beforePersist
 		beforePersist = func(tx *gorm.DB) error {
@@ -1595,7 +1683,7 @@ func (s *SiteService) config(record models.Site) (sitepkg.Config, error) {
 	if err != nil {
 		return sitepkg.Config{}, appError(CodeSiteCredentialInvalid, "站点凭据不可用", nil)
 	}
-	return sitepkg.Config{BaseURL: record.BaseURL, Cookie: credential.Cookie, Passkey: credential.Passkey, APIKey: credential.APIKey, UserAgent: record.UserAgent, Timeout: time.Duration(record.TimeoutSeconds) * time.Second, BrowserEmulation: record.BrowserEmulation, BrowserServiceURL: record.BrowserServiceURL, RenderedFetcher: s.renderedFetcher}, nil
+	return sitepkg.Config{Cloud: cloudSiteConfig(record), Username: credential.Username, Password: credential.Password, BaseURL: record.BaseURL, Cookie: credential.Cookie, Passkey: credential.Passkey, APIKey: credential.APIKey, UserAgent: record.UserAgent, Timeout: time.Duration(record.TimeoutSeconds) * time.Second, BrowserEmulation: record.BrowserEmulation, BrowserServiceURL: record.BrowserServiceURL, RenderedFetcher: s.renderedFetcher}, nil
 }
 func (s *SiteService) encryptCredential(id uint, kind string, value siteCredentialEnvelope) (string, error) {
 	payload, err := json.Marshal(value)
@@ -1874,7 +1962,7 @@ func (s *SiteService) siteSummary(record models.Site) SiteSummary {
 			_ = json.Unmarshal([]byte(raw), &configured)
 		}
 	}
-	return SiteSummary{ID: record.ID, Name: record.Name, Kind: record.Kind, SiteType: definition.SiteType, CredentialKind: definition.CredentialKind, Capabilities: capabilitiesForDefinition(definition), BaseURL: record.BaseURL, UserAgent: record.UserAgent, BrowserEmulation: record.BrowserEmulation, BrowserServiceConfigured: record.BrowserServiceURL != "", Enabled: record.Enabled, Priority: record.Priority, TimeoutSeconds: record.TimeoutSeconds, RateLimitPerMinute: record.RateLimitPerMinute, CredentialConfigured: definition.CredentialKind != builtin.CredentialNone && record.CredentialCiphertext != "", CookieConfigured: configured.Cookie != "", PasskeyConfigured: configured.Passkey != "", APIKeyConfigured: configured.APIKey != "", Health: SiteHealthSummary{Status: record.LastHealthStatus, ErrorCode: record.LastHealthErrorCode, Username: record.LastHealthUsername, CheckedAt: record.LastHealthCheckedAt}, Revision: record.Revision, CreatedAt: record.CreatedAt, UpdatedAt: record.UpdatedAt}
+	return SiteSummary{CloudConfig: cloudSiteConfig(record), LoginUsername: configured.Username, PasswordConfigured: configured.Password != "", ID: record.ID, Name: record.Name, Kind: record.Kind, SiteType: definition.SiteType, CredentialKind: definition.CredentialKind, Capabilities: capabilitiesForDefinition(definition), BaseURL: record.BaseURL, UserAgent: record.UserAgent, BrowserEmulation: record.BrowserEmulation, BrowserServiceConfigured: record.BrowserServiceURL != "", Enabled: record.Enabled, Priority: record.Priority, TimeoutSeconds: record.TimeoutSeconds, RateLimitPerMinute: record.RateLimitPerMinute, CredentialConfigured: (definition.CredentialKind != builtin.CredentialNone && record.CredentialCiphertext != "") || configured.Password != "", CookieConfigured: configured.Cookie != "", PasskeyConfigured: configured.Passkey != "", APIKeyConfigured: configured.APIKey != "", Health: SiteHealthSummary{Status: record.LastHealthStatus, ErrorCode: record.LastHealthErrorCode, Username: record.LastHealthUsername, CheckedAt: record.LastHealthCheckedAt}, Revision: record.Revision, CreatedAt: record.CreatedAt, UpdatedAt: record.UpdatedAt}
 }
 
 func capabilitiesForDefinition(definition builtin.Definition) SiteCapabilities {

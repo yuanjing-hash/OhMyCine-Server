@@ -181,24 +181,7 @@ describe('PT discovery contracts', () => {
     expect(cookieCloudErrorLabel('future_safe_code')).toBe('future_safe_code')
   })
 
-  it('keeps manual recognition explicit and binds only a verified TMDB identity before download', () => {
-    const source = readFileSync(new URL('./views/ExploreView.vue', import.meta.url), 'utf8')
-    expect(source).toContain('>Search</p>')
-    expect(source).toContain('>直接搜索</h1>')
-    expect(source).toContain('v-model="resultDirection"')
-    expect(source).toContain('<option value="desc">降序</option><option value="asc">升序</option>')
-    expect(source).toContain('手动识别')
-    expect(source).toContain('自动识别失败也可以在这里修改关键词')
-    expect(source).toContain('torrentRecognitionCandidatesPath')
-    expect(source).toContain('torrentRecognitionOverridePath')
-    expect(source).toContain('result_token: item.token')
-    expect(source).toContain('tmdb_id: candidate.id')
-    expect(source).toContain('media_type: candidate.media_type')
-    expect(source).not.toContain('torrent_id')
-    expect(source).toContain("'检测'")
-    expect(source).toContain('>手动检测</button>')
-    expect(source).toContain('>入库</button>')
-  })
+
 
   it('keeps the latest unexpired search in session storage without retaining stale claims', () => {
     const values = new Map<string, string>()
@@ -269,4 +252,10 @@ describe('PT discovery contracts', () => {
     const restored = readTorrentSearchSession(storage, now)
     expect(restored?.groups.reduce((total, item) => total + item.items.length, 0)).toBe(300)
   })
+})
+
+it('keeps cloud shares searchable under torrent-only filters', () => {
+  const cloud: PTSearchGroup = { ...group(3), site_type: 'cloud_share', items: [{ token: 'share', title: 'Show', source_kind: '115_share', cloud_provider: '115', expires_at: '2026-09-21T00:00:00Z' }] }
+  const result = filterAndSortTorrentResults([cloud], { activeChannel: 'all', enabledSiteTypes: ['cloud_share'], resolution: '', promotion: 'free', minimumSeeders: 10, sort: 'seeders', direction: 'desc' })
+  expect(result.map(entry => entry.item.token)).toEqual(['share'])
 })

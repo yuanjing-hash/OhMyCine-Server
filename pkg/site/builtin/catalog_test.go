@@ -16,7 +16,7 @@ func TestCatalogKeysAndAdaptersStayAligned(t *testing.T) {
 		if definition.Key == "" || definition.Name == "" || definition.Engine == "" || adapters[index].Kind() != definition.Key {
 			t.Fatalf("definition=%+v adapter=%q", definition, adapters[index].Kind())
 		}
-		if definition.SiteType != SiteTypePT && definition.SiteType != SiteTypeBT {
+		if definition.SiteType != SiteTypePT && definition.SiteType != SiteTypeBT && definition.SiteType != SiteTypeCloud {
 			t.Fatalf("invalid site type: %+v", definition)
 		}
 		if definition.CredentialKind != CredentialCookie && definition.CredentialKind != CredentialAPIKey && definition.CredentialKind != CredentialNone {

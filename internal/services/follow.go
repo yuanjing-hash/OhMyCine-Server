@@ -747,16 +747,28 @@ func (s *FollowService) validateFollowRoute(ctx context.Context, downloader mode
 	if !library.Enabled {
 		return appError(CodeFollowConfigurationInvalid, "订阅目标媒体库不存在或已停用", nil)
 	}
+	for _, record := range sites {
+		def, ok := builtin.DefinitionForKey(record.Kind)
+		if ok && def.SiteType == builtin.SiteTypeCloud && downloader.Type != models.DownloaderTypePan115Offline {
+			return appError(CodeFollowConfigurationInvalid, "网盘站点需要支持分享转存的 115 下载器", nil)
+		}
+	}
 	if downloader.Type == models.DownloaderTypePan115Offline {
 		for _, site := range sites {
 			definition, found := builtin.DefinitionForKey(site.Kind)
-			if !found || definition.SiteType != builtin.SiteTypeBT {
+			if !found || (definition.SiteType != builtin.SiteTypeBT && definition.SiteType != builtin.SiteTypeCloud) {
 				return appError(CodeFollowConfigurationInvalid, "订阅包含 PT 或未知来源站点，不能使用 115 离线下载", nil)
 			}
 		}
 	}
 	if s.downloads != nil {
-		target, _, err := s.downloads.snapshotDownloadTarget(ctx, downloader, library, downloadpkg.SourceURL)
+		sourceKind := downloadpkg.SourceURL
+		for _, record := range sites {
+			if def, ok := builtin.DefinitionForKey(record.Kind); ok && def.SiteType == builtin.SiteTypeCloud {
+				sourceKind = downloadpkg.SourcePan115Share
+			}
+		}
+		target, _, err := s.downloads.snapshotDownloadTarget(ctx, downloader, library, sourceKind)
 		if err != nil {
 			return err
 		}

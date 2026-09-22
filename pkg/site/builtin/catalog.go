@@ -10,6 +10,7 @@ import (
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/site/btapi"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/site/bthtml"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/site/btrss"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/site/pansou"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/site/pttime"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/site/torznab"
 	"golang.org/x/net/idna"
@@ -21,6 +22,7 @@ var (
 )
 
 const (
+	SiteTypeCloud    = "cloud_share"
 	SiteTypePT       = "pt"
 	SiteTypeBT       = "bt"
 	CredentialCookie = "cookie"
@@ -49,6 +51,7 @@ type Definition struct {
 }
 
 var definitions = []Definition{
+	{Key: pansou.Kind, Name: "TG 网盘资源 · PanSou", Engine: "pansou", SiteType: SiteTypeCloud, CredentialKind: CredentialNone, Search: true, Download: true},
 	nexusDefinition("pttime", "PTTime", true, "https://www.pttime.org", "https://www.pttime.me"),
 	nexusDefinition("sewerpt", "下水道 · SewerPT", true, "https://sewerpt.com"),
 	nexusDefinition("panda", "熊猫高清 · PandaPT", true, "https://pandapt.net"),
@@ -111,6 +114,8 @@ func Adapters() []site.Adapter {
 	items := make([]site.Adapter, 0, len(definitions))
 	for _, definition := range definitions {
 		switch definition.Engine {
+		case "pansou":
+			items = append(items, pansou.New())
 		case "nexusphp":
 			items = append(items, pttime.NewForProfile(definition.Key, definition.ptProfile))
 		case "rss":

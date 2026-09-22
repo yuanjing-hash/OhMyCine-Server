@@ -240,6 +240,12 @@ func (s *DownloadService) validatePreviewSource(downloader models.Downloader, so
 			return appError(CodeSiteUnavailable, "站点不存在或已停用", err)
 		}
 		definition, ok := builtin.DefinitionForKey(site.Kind)
+		if ok && definition.SiteType == builtin.SiteTypeCloud {
+			if sourceKind != downloadpkg.SourcePan115Share || downloader.Type != models.DownloaderTypePan115Offline {
+				return appError(CodeDownloadSourceInvalid, "网盘分享资源只能通过 115 分享转存", nil)
+			}
+			return nil
+		}
 		authoritativeBT = ok && definition.SiteType == builtin.SiteTypeBT
 		if downloader.Type == models.DownloaderTypePan115Offline && !authoritativeBT {
 			return appError(CodeDownloadSourceInvalid, "PT 资源不能提交到 115 离线下载", nil)
