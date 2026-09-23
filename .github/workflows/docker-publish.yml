@@ -52,6 +52,7 @@ jobs:
           fi
           git checkout --detach "$commit"
           echo "VERSION=${tag#server-v}" >> "$GITHUB_ENV"
+          echo "RELEASE_COMMIT=$commit" >> "$GITHUB_ENV"
           echo "RELEASE_CHANNEL=$channel" >> "$GITHUB_ENV"
           echo "IMAGE_OWNER=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_ENV"
       - name: Validate Docker Hub configuration
@@ -76,10 +77,29 @@ jobs:
           [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
           tag="server-v${VERSION}"
           mkdir -p build/container-assets build/container-release/{amd64,arm64}
-          gh release download "$tag" --dir build/container-assets \
-            --pattern "OhMyCine-Server-v${VERSION}-*" \
-            --pattern "OhMyCine-Node-v${VERSION}-*" \
-            --pattern "install-ohmycine-node-v${VERSION}.*"
+          # The tag response can contain stale embedded assets after publication.
+          # Enumerate the dedicated assets endpoint and download exact expected names.
+          release_id="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" --jq '.id')"
+          [[ "$release_id" =~ ^[0-9]+$ ]]
+          gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/releases/${release_id}/assets?per_page=100" > "$RUNNER_TEMP/release-assets.json"
+          assets=(
+            "OhMyCine-Server-v${VERSION}-windows-x64.zip"
+            "OhMyCine-Server-v${VERSION}-linux-x64.tar.gz"
+            "OhMyCine-Server-v${VERSION}-linux-arm64.tar.gz"
+            "OhMyCine-Server-v${VERSION}-SHA256SUMS.txt"
+            "OhMyCine-Node-v${VERSION}-windows-amd64.zip"
+            "OhMyCine-Node-v${VERSION}-linux-amd64.tar.gz"
+            "OhMyCine-Node-v${VERSION}-linux-arm64.tar.gz"
+            "OhMyCine-Node-v${VERSION}-SHA256SUMS.txt"
+            "OhMyCine-Node-v${VERSION}-SHA256SUMS.txt.sig"
+            "install-ohmycine-node-v${VERSION}.sh"
+            "install-ohmycine-node-v${VERSION}.ps1"
+          )
+          for asset in "${assets[@]}"; do
+            asset_id="$(jq -er --arg name "$asset" '[.[][] | select(.name == $name and .state == "uploaded")] | if length == 1 then .[0].id else error("Missing or duplicate Release asset: " + $name) end' "$RUNNER_TEMP/release-assets.json")"
+            [[ "$asset_id" =~ ^[0-9]+$ ]]
+            gh api -H 'Accept: application/octet-stream' "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" > "build/container-assets/${asset}"
+          done
           (cd build/container-assets && sha256sum -c "OhMyCine-Server-v${VERSION}-SHA256SUMS.txt" && sha256sum -c "OhMyCine-Node-v${VERSION}-SHA256SUMS.txt")
           for arch in amd64 arm64; do
             server_arch="$arch"
@@ -117,7 +137,9 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          labels: |
+            ${{ steps.meta.outputs.labels }}
+            org.opencontainers.image.revision=${{ env.RELEASE_COMMIT }}
           cache-from: type=gha,scope=server-release
           cache-to: type=gha,mode=max,scope=server-release
       - uses: docker/metadata-action@v5
@@ -136,7 +158,9 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.node-meta.outputs.tags }}
-          labels: ${{ steps.node-meta.outputs.labels }}
+          labels: |
+            ${{ steps.node-meta.outputs.labels }}
+            org.opencontainers.image.revision=${{ env.RELEASE_COMMIT }}
           cache-from: type=gha,scope=node-release
           cache-to: type=gha,mode=max,scope=node-release
       - name: Smoke test both architectures with isolated state
