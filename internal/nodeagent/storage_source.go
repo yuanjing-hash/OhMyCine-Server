@@ -1079,6 +1079,10 @@ func storageSourceErrorCode(err error) string {
 	switch code {
 	case cloud.CodeAuthExpired, cloud.CodeCookieInvalid:
 		return nodeprotocol.ErrorCredentialExpired
+	case cloud.CodeShareExpired:
+		return nodeprotocol.ErrorSourceShareExpired
+	case cloud.CodeSharePassword:
+		return nodeprotocol.ErrorSourceSharePassword
 	case cloud.CodeRateLimited:
 		return nodeprotocol.ErrorSourceRateLimited
 	case cloud.CodeNotFound, cloud.CodeMutationUnknown:
@@ -1106,6 +1110,10 @@ func writeStorageSourceError(w http.ResponseWriter, err error) {
 
 func storageSourceSafeMessage(code string) string {
 	switch code {
+	case nodeprotocol.ErrorSourceShareExpired:
+		return "115 分享已失效或已被取消"
+	case nodeprotocol.ErrorSourceSharePassword:
+		return "115 分享提取码有误"
 	case nodeprotocol.ErrorLeaseExpired:
 		return "任务租约已经过期"
 	case nodeprotocol.ErrorPlanConflict:

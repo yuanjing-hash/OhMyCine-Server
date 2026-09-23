@@ -57,6 +57,7 @@ type SiteService struct {
 	vaultMu           sync.Mutex
 	vault             map[string]siteResultClaim
 	sharePreviews     map[string]siteSharePreview
+	shareValidations  map[string]siteShareValidationEntry
 	sharePreviewSlots chan struct{}
 }
 
@@ -180,6 +181,7 @@ type SiteSearchOption struct {
 	Reason       string `json:"reason,omitempty"`
 }
 type SiteSearchResult struct {
+	ShareValidation     *SiteShareValidation          `json:"share_validation,omitempty"`
 	SourceKind          string                        `json:"source_kind,omitempty"`
 	CloudProvider       string                        `json:"cloud_provider,omitempty"`
 	Channel             string                        `json:"channel,omitempty"`
@@ -1046,7 +1048,7 @@ func (s *SiteService) searchSite(ctx context.Context, actor Actor, record models
 		if parsed, parseErr := mediarecognition.Parse(mediarecognition.InputFacts{PackageName: item.Title, SourceKind: mediarecognition.SourceDownload, MediaTypeHint: mediarecognition.MediaType(siteResultMediaTypeHint(definition.SiteType, item.Title, input.MediaType))}); parseErr == nil {
 			specifications = siteRecognitionSpecifications(parsed.Specifications, parsed.ReleaseGroup)
 		}
-		group.Items = append(group.Items, SiteSearchResult{SourceKind: item.SourceKind, CloudProvider: item.CloudProvider, Channel: item.Channel, PostURL: item.PostURL, ResourceFingerprint: item.Fingerprint, Token: token, Title: item.Title, Subtitle: item.Subtitle, SizeBytes: item.SizeBytes, Published: item.Published, Seeders: item.Seeders, Leechers: item.Leechers, Completed: item.Completed, Promotion: item.Promotion, Quality: item.Quality, Tags: item.Tags, Specifications: specifications, ExpiresAt: expires})
+		group.Items = append(group.Items, SiteSearchResult{ShareValidation: s.cachedShareValidation(ctx, actor, item.TorrentID), SourceKind: item.SourceKind, CloudProvider: item.CloudProvider, Channel: item.Channel, PostURL: item.PostURL, ResourceFingerprint: item.Fingerprint, Token: token, Title: item.Title, Subtitle: item.Subtitle, SizeBytes: item.SizeBytes, Published: item.Published, Seeders: item.Seeders, Leechers: item.Leechers, Completed: item.Completed, Promotion: item.Promotion, Quality: item.Quality, Tags: item.Tags, Specifications: specifications, ExpiresAt: expires})
 	}
 	serverlog.OperationDiscoverySearch.Event(s.log.Info()).Uint("site_id", record.ID).Str("site_type", group.SiteType).Int("results", len(group.Items)).Int("skipped", group.Skipped).Msg(serverlog.OperationDiscoverySearch.Message("站点种子资源搜索完成"))
 	return group
@@ -1605,6 +1607,28 @@ func (s *SiteService) Download(ctx context.Context, actor Actor, input SiteDownl
 		source.ShareSelection = &selection
 		previewGuard = guard
 	}
+
+	var shareValidation *SiteShareValidation
+	if source.Kind == downloadpkg.SourcePan115Share {
+		_, digest, validation, checkErr := s.inspectResultShare(ctx, actor, claim, source.URL, selectedDownloader.ID, false, request)
+		if checkErr != nil {
+			return DownloadTaskSummary{}, checkErr
+		}
+		shareValidation = &validation
+		upstreamGuard := previewGuard
+		previewGuard = func(tx *gorm.DB) error {
+			if upstreamGuard != nil {
+				if err := upstreamGuard(tx); err != nil {
+					return err
+				}
+			}
+			current, _, err := sharePreviewConfig(tx, selectedDownloader.ID)
+			if err != nil || current != digest {
+				return sharePreviewExpired()
+			}
+			return nil
+		}
+	}
 	var recognitionOverride *DownloadRecognitionIdentity
 	if source.ShareSelection == nil && claim.ManualTMDBID != nil && claim.ManualMediaType != "" {
 		recognitionOverride = &DownloadRecognitionIdentity{TMDBID: *claim.ManualTMDBID, MediaType: claim.ManualMediaType, Source: claim.RecognitionSource, Status: claim.RecognitionStatus, Locked: claim.RecognitionLocked, Season: cloneInt(input.Season), Episode: cloneInt(input.Episode)}
@@ -1682,6 +1706,7 @@ func (s *SiteService) Download(ctx context.Context, actor Actor, input SiteDownl
 	if err != nil {
 		return DownloadTaskSummary{}, err
 	}
+	result.ShareValidation = shareValidation
 	completed = result.SelectionPending == 0
 	_ = s.audit.Record(s.db, &actor.User.ID, "site.download", "site", uintID(record.ID), "success", map[string]any{"download_task_id": result.ID}, request)
 	serverlog.OperationDiscoverySearch.Event(s.log.Info()).Uint("site_id", record.ID).Str("download_task_id", result.ID).Msg(serverlog.OperationDiscoverySearch.Message("种子资源搜索结果已提交下载"))
@@ -1894,8 +1919,20 @@ func (s *SiteService) bindClaimRecognition(token string, actorID uint, tmdbID in
 	if !ok {
 		claim, ok = s.loadPluginResourceClaim(token, actorID)
 	}
+	s.vaultMu.Lock()
+	defer s.vaultMu.Unlock()
+	// Reload under the write lock: a concurrent manual confirmation or download
+	// reservation must win over an automatic recognition that started earlier.
+	if current, exists := s.vault[token]; exists {
+		claim, ok = current, true
+	} else if claim.PluginClaimID == "" {
+		ok = false
+	}
 	if !ok || claim.ActorID != actorID || claim.InFlight || !claim.ExpiresAt.After(s.now()) {
 		return appError(CodeSiteResultExpired, "种子资源搜索结果已过期，请重新搜索", nil)
+	}
+	if claim.RecognitionLocked && !locked {
+		return nil
 	}
 	claim.ManualTMDBID = cloneInt64(&tmdbID)
 	claim.ManualMediaType = mediaType
@@ -1903,11 +1940,10 @@ func (s *SiteService) bindClaimRecognition(token string, actorID uint, tmdbID in
 	claim.RecognitionSource = source
 	claim.RecognitionStatus = status
 	claim.RecognitionLocked = locked
-	s.vaultMu.Lock()
 	s.vault[token] = claim
-	s.vaultMu.Unlock()
 	return nil
 }
+
 func (s *SiteService) purgeClaimsLocked() {
 	now := s.now()
 	for key, item := range s.vault {

@@ -502,3 +502,12 @@ Node-bound 115 输入如果包含普通 HTTP(S) 离线链接，页面立即提�
 网盘分享搜索结果在检测按钮左侧提供「预览分享链接内部内容」。弹窗先选择 115 下载器账号，再显示完整目录、文件与目录大小；使用复选框选择内容，提供全选、清空及仅选视频，并在底部持续显示所选文件数和大小。文件夹支持展开收起与半选状态。实际文件名和父目录进入同一识别引擎，自动识别仅面向已显示的视频行，并发最多两项。
 
 确认选择后进入现有入库路线弹窗，下载器锁定为读取分享的账号，容量预览使用所选文件大小。每个视频独立入队，匹配附属文件随视频处理；合集不能被一个识别结果统一覆盖。部分提交失败保持弹窗和选择，重试复用已创建任务。关闭或切换账号会取消旧预览与识别请求，短期选择 token 仅保留于组件内存。键盘支持 Escape 关闭、Tab 焦点循环及关闭后恢复触发按钮焦点。
+
+
+### 网盘分享验证状态
+
+网盘分享结果默认“未验证”，用户点击预览或提交转存时验证。卡片显示可读取、已失效、提取码有误、暂时无法验证及检查时间；临时问题展示账号/限流/网络原因，不误报失效。状态过期后提示重新验证。预览只展示完整的实际目录与大小，失败时不呈现空内容作为成功结果。验证状态不写入浏览器持久存储；重新读取和更换账号采用取消旧请求的现有流程，关闭弹窗后迟到响应不得回写状态。
+
+### Search result automatic recognition
+
+Resource search progressively recognizes current-page PT/BT/cloud-share claims with two concurrent workers and a per-item timeout. Ordinary detection buttons are removed; manual correction remains. The existing actor-scoped media coverage endpoint supplies work-level library badges, with per-search identity deduplication and explicit unknown/permission/error states. Search changes and unmount abort old work; stale JSON/SSE results cannot repopulate a new search. Manual confirmation wins over late automatic results both in the UI and in the Server claim vault under its write lock. Library evidence is never persisted in browser search sessions. Share availability remains click-triggered.

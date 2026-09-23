@@ -494,6 +494,10 @@ func mapError(err error) error {
 		return downloader.Error("downloader_source_invalid", false, err)
 	case cloud.CodeOfflineTaskExists:
 		return downloader.Error("downloader_task_exists", false, err)
+	case cloud.CodeShareExpired:
+		return downloader.Error("downloader_share_expired", false, err)
+	case cloud.CodeSharePassword:
+		return downloader.Error("downloader_share_password_invalid", false, err)
 	case cloud.CodeShareInvalid, cloud.CodeShareEmpty, cloud.CodeShareTooLarge:
 		return downloader.Error("downloader_share_invalid", false, err)
 	case cloud.CodeShareUnknown, cloud.CodeMutationUnknown:

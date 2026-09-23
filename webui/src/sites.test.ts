@@ -193,6 +193,7 @@ describe('PT discovery contracts', () => {
     const now = Date.parse('2026-08-25T00:00:00Z')
     const fresh = group(1)
     fresh.items[0].expires_at = '2026-08-25T00:10:00Z'
+    fresh.items[0].share_validation = { status: 'valid', message: '已验证可读取', downloader_id: 'd', checked_at: '2026-08-25T00:00:00Z', expires_at: '2026-08-25T00:05:00Z' }
     const stale = group(2)
     stale.items[0].expires_at = '2026-08-24T23:59:00Z'
     saveTorrentSearchSession(storage, {
@@ -204,6 +205,8 @@ describe('PT discovery contracts', () => {
     })
     const restored = readTorrentSearchSession(storage, now)
     expect(restored?.input.keyword).toBe('迪迦奥特曼')
+    expect(restored?.groups[0].items[0]?.share_validation).toBeUndefined()
+    expect(fresh.items[0].share_validation?.status).toBe('valid')
     expect(restored?.groups[0].items).toHaveLength(1)
     expect(restored?.groups[1].items).toHaveLength(0)
     expect(restored?.recognitions[fresh.items[0].token]?.status).toBe('matched')

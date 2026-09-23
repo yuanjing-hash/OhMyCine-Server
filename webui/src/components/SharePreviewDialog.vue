@@ -1,13 +1,13 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { api } from '@/api/client'
+import { api, APIError } from '@/api/client'
 import { formatBytes } from '@/downloads'
-import { isShareVideo, shareEntryFiles, toggleShareEntry, type SharePreview, type SharePreviewEntry, type ShareSelection } from '@/share-preview'
+import { isShareVideo, shareEntryFiles, toggleShareEntry, type SharePreview, type SharePreviewEntry, type ShareSelection, type ShareValidation } from '@/share-preview'
 import type { TorrentRecognitionResult } from '@/sites'
 import type { DownloaderSummary } from '@/types/api'
 
 const props = defineProps<{ resultToken: string; title: string; downloaders: DownloaderSummary[] }>()
-const emit = defineEmits<{ close: []; select: [selection: ShareSelection] }>()
+const emit = defineEmits<{ close: []; select: [selection: ShareSelection]; validation: [resultToken: string, validation: ShareValidation] }>()
 const available = computed(() => props.downloaders.filter(item => item.enabled && item.type === 'pan115_offline' && item.capabilities.share_receive))
 const dialog = ref<HTMLElement | null>(null)
 const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null
@@ -45,7 +45,13 @@ async function load() {
   const result = await api<SharePreview>('/api/v1/discovery/share-preview', { method: 'POST', signal: controller.signal, body: JSON.stringify({ result_token: props.resultToken, downloader_id: downloaderID.value }) })
   if (controller.signal.aborted || closed) return
   preview.value = result
- } catch (reason) { if (request === controller && !closed) error.value = controller.signal.aborted ? '预览超时，请重试或选择内容更少的分享。' : message(reason) }
+  if (result.share_validation) emit('validation', props.resultToken, result.share_validation)
+ } catch (reason) {
+  if (request === controller && !closed) {
+   error.value = controller.signal.aborted ? '预览超时，请重试或选择内容更少的分享。' : message(reason)
+   if (!controller.signal.aborted && reason instanceof APIError && reason.shareValidation) emit('validation', props.resultToken, reason.shareValidation)
+  }
+ }
  finally { window.clearTimeout(timeout); if (request === controller) { request = null; loading.value = false } }
 }
 function leaves(entry: SharePreviewEntry) { return shareEntryFiles(entries.value, entry) }

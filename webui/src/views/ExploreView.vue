@@ -1,17 +1,18 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { api } from '@/api/client'
+import { api, APIError } from '@/api/client'
 import { Permissions } from '@/auth/generated-permissions'
 import SharePreviewDialog from '@/components/SharePreviewDialog.vue'
-import type { ShareSelection } from '@/share-preview'
+import { shareValidationLabel, type ShareSelection, type ShareValidation } from '@/share-preview'
 import DownloadRouteTargetPicker from '@/components/DownloadRouteTargetPicker.vue'
 import { previewDownloadRoutes, routeTargetByID, type DownloadRoutePreview } from '@/download-routes'
 import { formatBytes } from '@/downloads'
+import { useSearchResultRecognition } from '@/search-result-recognition'
 import { useAuthStore } from '@/stores/auth'
 import { notify } from '@/toast'
 import { buildDiscoveryMediaSearchPath, discoveryDetailRoute, mediaIdentitySearchURL, type DiscoveryMediaSearch, type DiscoveryMediaSearchFilter, type DiscoveryMediaType, type DiscoverySearchName, type DiscoveryWork } from '@/discovery'
-import { discoveryDownloadsPath, discoverySearchOptionsPath, filterAndSortTorrentResults, ptRecognitionEpisodeLabel, ptRecognitionErrorLabel, ptRecognitionSpecLabels, readTorrentSearchSession, readTorrentSearchSiteSelection, saveTorrentSearchSession, saveTorrentSearchSiteSelection, sitesPath, torrentRecognitionCandidatesPath, torrentRecognitionOverridePath, torrentRecognitionPath, torrentSearchPath, torrentSearchStreamPath, torrentSearchURL, upsertTorrentGroup, type PTRecognitionCandidate, type SearchSiteOption, type SiteSummary, type TorrentRecognitionResult, type TorrentResultDirection, type TorrentSearchGroup, type TorrentSearchProgress, type TorrentSearchResponse, type TorrentSearchResult, type TorrentSearchSession } from '@/sites'
+import { discoveryDownloadsPath, discoverySearchOptionsPath, filterAndSortTorrentResults, ptRecognitionEpisodeLabel, ptRecognitionErrorLabel, ptRecognitionSpecLabels, readTorrentSearchSession, readTorrentSearchSiteSelection, saveTorrentSearchSession, saveTorrentSearchSiteSelection, sitesPath, torrentRecognitionCandidatesPath, torrentRecognitionOverridePath, torrentSearchPath, torrentSearchStreamPath, torrentSearchURL, upsertTorrentGroup, type PTRecognitionCandidate, type SearchSiteOption, type SiteSummary, type TorrentRecognitionResult, type TorrentResultDirection, type TorrentSearchGroup, type TorrentSearchProgress, type TorrentSearchResponse, type TorrentSearchResult, type TorrentSearchSession } from '@/sites'
 import type { DownloaderSummary, ListResponse, MediaLibraryDetail } from '@/types/api'
 
 const route = useRoute()
@@ -53,6 +54,14 @@ const downloaders = ref<DownloaderSummary[]>([])
 const libraries = ref<MediaLibraryDetail[]>([])
 const downloadDialog = ref<TorrentSearchResult | null>(null)
 const sharePreviewDialog = ref<TorrentSearchResult | null>(null)
+const shareValidations = ref<Record<string, ShareValidation>>({})
+const validationClock = ref(Date.now())
+let validationTimer: number | undefined
+function rememberShareValidation(token: string, validation: ShareValidation) {
+ const recent = Object.entries(shareValidations.value).filter(([, v]) => Date.parse(v.expires_at) > Date.now()).slice(-999)
+ shareValidations.value = { ...Object.fromEntries(recent), [token]: validation }
+}
+function shareValidation(item: TorrentSearchResult) { return shareValidations.value[item.token] ?? item.share_validation }
 const shareSelection = ref<ShareSelection | null>(null)
 const downloadForm = ref({ downloaderID: '', mediaLibraryID: 0, priority: 0 })
 const downloadSiteID = ref<number | undefined>()
@@ -60,15 +69,22 @@ const routePreview = ref<DownloadRoutePreview | null>(null)
 const routePreviewLoading = ref(false)
 let routePreviewRequest: AbortController | null = null
 const submitting = ref(false)
-const recognitions = ref<Record<string, TorrentRecognitionResult>>({})
-const recognitionErrors = ref<Record<string, string>>({})
-const recognizingTokens = ref<string[]>([])
+const recognitionItems = computed(() => mode.value === 'resources' ? groups.value.flatMap(group => group.items) : [])
+const resultRecognition = useSearchResultRecognition(recognitionItems, () => auth.can(Permissions.MediaLibrariesRead))
+const { recognitions, recognitionErrors, recognizingTokens, libraryStates } = resultRecognition
 const manualDialog = ref<TorrentSearchResult | null>(null)
 const manualForm = ref<{ keyword: string; mediaType: '' | 'movie' | 'tv'; year?: number }>({ keyword: '', mediaType: '' })
 const manualCandidates = ref<PTRecognitionCandidate[]>([])
 const selectedManualCandidate = ref<PTRecognitionCandidate | null>(null)
 const manualSearching = ref(false)
 const manualSaving = ref(false)
+let searchGeneration = 0
+const searchRequests = new Map<number, AbortController>()
+function cancelSearchRequests() {
+  searchGeneration++
+  for (const request of searchRequests.values()) request.abort()
+  searchRequests.clear()
+}
 let source: EventSource | null = null
 let streamTimeout: number | undefined
 let mediaSearchRequest: AbortController | null = null
@@ -135,6 +151,7 @@ async function searchMedia(page = 1) {
 function openMedia(work: DiscoveryWork) { void router.push(discoveryDetailRoute(work)) }
 function switchMode(value: 'media' | 'resources') {
   if (value === 'media') {
+    cancelSearchRequests()
     stopStream()
     searching.value = false
   } else {
@@ -160,17 +177,26 @@ function stopStream() {
 }
 
 async function searchJSON(siteID?: number, page = 1) {
+  const run = searchGeneration
+  const key = lockedSiteID.value ?? siteID ?? 0
+  searchRequests.get(key)?.abort()
+  const controller = new AbortController()
+  searchRequests.set(key, controller)
   try {
     const identity = trustedIdentity.value
     const path = identity
       ? mediaIdentitySearchURL(identity.mediaType, identity.tmdbID, { page, siteID: lockedSiteID.value ?? siteID, siteIDs: lockedSiteID.value || siteID ? undefined : activeSearchSiteIDs.value })
       : torrentSearchURL(torrentSearchPath, searchInput(siteID, page))
-    const response = await api<TorrentSearchResponse & { query_names?: DiscoverySearchName[] }>(path)
+    const response = await api<TorrentSearchResponse & { query_names?: DiscoverySearchName[] }>(path, { signal: controller.signal })
+    if (controller.signal.aborted || run !== searchGeneration) return
     identityNames.value = response.query_names ?? identityNames.value
     for (const group of response.groups) groups.value = upsertTorrentGroup(groups.value, group)
     searched.value = true
-  } catch (reason) { searchError.value = message(reason) }
-  finally { searching.value = false }
+  } catch (reason) { if (!controller.signal.aborted && run === searchGeneration) searchError.value = message(reason) }
+  finally {
+    if (searchRequests.get(key) === controller) searchRequests.delete(key)
+    if (run === searchGeneration) searching.value = searchRequests.size > 0
+  }
 }
 
 async function openSiteSelector() {
@@ -208,12 +234,12 @@ function search() {
 }
 
 function executeSearch(siteIDs: number[]) {
+  cancelSearchRequests()
   activeSearchSiteIDs.value = [...siteIDs]
   stopStream()
   groups.value = []
   activeChannel.value = 'all'
-  recognitions.value = {}
-  recognitionErrors.value = {}
+  resultRecognition.reset()
   identityNames.value = []
   searchError.value = ''
   searched.value = false
@@ -240,6 +266,7 @@ function executeSearch(siteIDs: number[]) {
     : torrentSearchURL(torrentSearchStreamPath, searchInput()))
   source = eventSource
   eventSource.addEventListener('site', event => {
+    if (source !== eventSource) return
     try {
       const group = JSON.parse((event as MessageEvent<string>).data) as TorrentSearchGroup
       groups.value = upsertTorrentGroup(groups.value, group)
@@ -248,14 +275,17 @@ function executeSearch(siteIDs: number[]) {
     } catch { /* malformed events are ignored; JSON fallback remains available */ }
   })
   eventSource.addEventListener('media', event => {
+    if (source !== eventSource) return
     try { identityNames.value = (JSON.parse((event as MessageEvent<string>).data) as { query_names?: DiscoverySearchName[] }).query_names ?? [] }
     catch { /* safe metadata is optional */ }
   })
   eventSource.addEventListener('progress', event => {
+    if (source !== eventSource) return
     try { searchProgress.value = JSON.parse((event as MessageEvent<string>).data) as TorrentSearchProgress }
     catch { /* malformed progress must not discard valid site results */ }
   })
   eventSource.addEventListener('done', event => {
+    if (source !== eventSource) return
     try { searchProgress.value = JSON.parse((event as MessageEvent<string>).data) as TorrentSearchProgress }
     catch { /* the last valid progress snapshot remains visible */ }
     stopStream()
@@ -263,11 +293,13 @@ function executeSearch(siteIDs: number[]) {
     searched.value = true
   })
   eventSource.onerror = () => {
+    if (source !== eventSource) return
     stopStream()
     if (!delivered) void searchJSON()
     else { searching.value = false; notify('部分站点流式结果已返回；连接提前结束，可单独重试失败站点', 'warning') }
   }
   streamTimeout = window.setTimeout(() => {
+    if (source !== eventSource) return
     stopStream()
     if (!delivered) void searchJSON()
     else searching.value = false
@@ -355,22 +387,6 @@ async function loadRoutePreview() {
 
 watch(() => downloadForm.value.downloaderID, () => void loadRoutePreview())
 
-async function recognizeResult(item: TorrentSearchResult) {
-  if (recognizingTokens.value.includes(item.token)) return
-  recognizingTokens.value = [...recognizingTokens.value, item.token]
-  const errors = { ...recognitionErrors.value }
-  delete errors[item.token]
-  recognitionErrors.value = errors
-  try {
-    const result = await api<TorrentRecognitionResult>(torrentRecognitionPath, { method: 'POST', body: JSON.stringify({ result_token: item.token }) })
-    recognitions.value = { ...recognitions.value, [item.token]: result }
-  } catch (reason) {
-    recognitionErrors.value = { ...recognitionErrors.value, [item.token]: message(reason) }
-  } finally {
-    recognizingTokens.value = recognizingTokens.value.filter(token => token !== item.token)
-  }
-}
-
 async function submitDownload() {
   const item = downloadDialog.value
   if (!item || !downloadForm.value.downloaderID) { notify('请选择已启用的下载器', 'warning'); return }
@@ -378,11 +394,15 @@ async function submitDownload() {
   if (shareSelection.value && (shareSelection.value.downloaderID !== downloadForm.value.downloaderID || Date.parse(shareSelection.value.expiresAt) <= Date.now())) { notify('预览已过期或下载器已变化，请重新预览分享', 'warning'); return }
   submitting.value = true
   try {
-    const result = await api<{ id: string; selection_tasks?: { id: string }[]; selection_pending?: number; selection_error?: string }>(discoveryDownloadsPath, { method: 'POST', body: JSON.stringify({ preview_token: shareSelection.value?.previewToken, selected_entry_tokens: shareSelection.value?.entryTokens, result_token: item.token, downloader_id: downloadForm.value.downloaderID, media_library_id: downloadForm.value.mediaLibraryID, priority: downloadForm.value.priority }) })
+    const result = await api<{ id: string; selection_tasks?: { id: string }[]; selection_pending?: number; selection_error?: string; share_validation?: ShareValidation }>(discoveryDownloadsPath, { method: 'POST', body: JSON.stringify({ preview_token: shareSelection.value?.previewToken, selected_entry_tokens: shareSelection.value?.entryTokens, result_token: item.token, downloader_id: downloadForm.value.downloaderID, media_library_id: downloadForm.value.mediaLibraryID, priority: downloadForm.value.priority }) })
+    if (result.share_validation) rememberShareValidation(item.token, result.share_validation)
     if (result.selection_pending) { notify(result.selection_error ?? '部分任务未提交，请重试', 'warning'); return }
     notify(result.selection_tasks?.length ? `已创建 ${result.selection_tasks.length} 个入库任务，各文件独立识别和处理` : `下载任务已进入统一队列：${result.id}`, 'success')
     downloadDialog.value = null
-  } catch (reason) { notify(message(reason), 'error') }
+  } catch (reason) {
+    if (reason instanceof APIError && reason.shareValidation) rememberShareValidation(item.token, reason.shareValidation)
+    notify(message(reason), 'error')
+  }
   finally { submitting.value = false }
 }
 
@@ -435,7 +455,7 @@ async function confirmManualRecognition() {
       method: 'PUT',
       body: JSON.stringify({ result_token: item.token, tmdb_id: candidate.id, media_type: candidate.media_type }),
     })
-    recognitions.value = { ...recognitions.value, [item.token]: result }
+    resultRecognition.acceptManual(item.token, result)
     manualDialog.value = null
     notify(`已确认：${result.title}，创建下载任务时将沿用此身份`, 'success')
   } catch (reason) { notify(message(reason), 'error') }
@@ -454,6 +474,7 @@ watch([groups, recognitions, searched], () => {
 }, { deep: true })
 
 onMounted(async () => {
+  validationTimer = window.setInterval(() => { validationClock.value = Date.now() }, 15000)
   if (mode.value === 'media') {
     if (mediaQuery.value.trim()) await searchMedia()
     return
@@ -482,6 +503,9 @@ onMounted(async () => {
   if (trustedIdentity.value || keyword.value.trim() || (searchBy.value === 'tmdb_id' && tmdbID.value)) search()
 })
 onBeforeUnmount(() => {
+  cancelSearchRequests()
+  resultRecognition.dispose()
+  window.clearInterval(validationTimer)
   stopStream()
   mediaSearchRequest?.abort()
   routePreviewRequest?.abort()
@@ -561,10 +585,17 @@ onBeforeUnmount(() => {
                 <p v-if="entry.item.subtitle" class="text-subtle mb-0 mt-1 line-clamp-2 text-xs">{{ entry.item.subtitle }}</p>
                 <div class="text-subtle mt-3 flex flex-wrap gap-x-4 gap-y-1 text-xs"><span>{{ formatBytes(entry.item.size_bytes ?? null) }}</span><span>{{ formatTime(entry.item.published_at) }}</span><strong>做种 {{ count(entry.item.seeders) }}</strong><span>下载 {{ count(entry.item.leechers) }}</span><span>完成 {{ count(entry.item.completed) }}</span></div>
                 <div v-if="recognitions[entry.item.token]" class="semantic-inset mt-3 p-3 text-sm"><div class="flex flex-wrap items-center gap-2"><strong>{{ recognitions[entry.item.token].title }}</strong><span :class="recognitions[entry.item.token].status === 'matched' ? 'status-chip status-chip--ready' : 'status-chip status-chip--warning'">{{ recognitions[entry.item.token].manual_override ? '已人工确认' : recognitions[entry.item.token].status === 'matched' ? '标题预识别成功' : '标题预识别未命中' }}</span><span class="status-chip">{{ mediaTypeLabel(recognitions[entry.item.token].media_type) }}</span><span v-if="recognitions[entry.item.token].year" class="status-chip">{{ recognitions[entry.item.token].year }}</span></div><p v-if="ptRecognitionEpisodeLabel(recognitions[entry.item.token])" class="mb-0 mt-2">{{ ptRecognitionEpisodeLabel(recognitions[entry.item.token]) }}</p><p v-if="recognitions[entry.item.token].error_code" class="text-subtle mb-0 mt-2 text-xs">{{ ptRecognitionErrorLabel(recognitions[entry.item.token].error_code) }}</p></div>
+                <p v-if="!recognitions[entry.item.token] && !recognitionErrors[entry.item.token]" class="text-subtle mt-3 text-xs" role="status">{{ recognizingTokens.includes(entry.item.token) ? '正在自动识别作品…' : '等待自动识别…' }}</p>
+                <p v-if="libraryStates[entry.item.token]" class="mt-3 text-xs" role="status" :title="libraryStates[entry.item.token].detail"><span class="status-chip" :class="libraryStates[entry.item.token].present ? 'status-chip--ready' : ''">库内：{{ libraryStates[entry.item.token].label }}</span><span class="text-subtle ml-2">当前可见媒体库 · 作品级</span></p>
                 <p v-if="recognitionErrors[entry.item.token]" class="semantic-warning mb-0 mt-3 p-3 text-xs">{{ recognitionErrors[entry.item.token] }}</p>
               </div>
             </div>
-            <footer class="mt-4 flex flex-wrap justify-end gap-2 border-t border-[var(--border)] pt-4"><button v-if="entry.item.source_kind === '115_share'" class="btn-secondary" :disabled="!auth.can(Permissions.DownloadsCreate)" @click="openSharePreview(entry.item)">预览分享链接内部内容</button><button class="btn-secondary" :disabled="recognizingTokens.includes(entry.item.token)" @click="recognizeResult(entry.item)">{{ recognizingTokens.includes(entry.item.token) ? '检测中…' : '检测' }}</button><button class="btn-secondary" :disabled="!auth.can(Permissions.DownloadsCreate)" @click="openManualRecognition(entry.item)">手动检测</button><button class="btn-primary" :disabled="!auth.can(Permissions.DownloadsCreate)" @click="openDownload(entry.item)">{{ entry.item.source_kind === '115_share' ? '转存入库' : '入库' }}</button></footer>
+            <p v-if="entry.item.source_kind === '115_share'" class="text-subtle mt-3 text-xs" role="status" :title="shareValidation(entry.item)?.message">
+              {{ shareValidationLabel(shareValidation(entry.item), validationClock) }}
+              <span v-if="shareValidation(entry.item)"> · {{ formatTime(shareValidation(entry.item)?.checked_at) }}</span>
+              <span v-if="shareValidation(entry.item)?.status === 'unavailable'"> · {{ shareValidation(entry.item)?.message }}</span>
+            </p>
+            <footer class="mt-4 flex flex-wrap justify-end gap-2 border-t border-[var(--border)] pt-4"><button v-if="entry.item.source_kind === '115_share'" class="btn-secondary" :disabled="!auth.can(Permissions.DownloadsCreate)" @click="openSharePreview(entry.item)">预览分享链接内部内容</button><button class="btn-secondary" :disabled="!auth.can(Permissions.DownloadsCreate)" @click="openManualRecognition(entry.item)">手动检测</button><button class="btn-primary" :disabled="!auth.can(Permissions.DownloadsCreate)" @click="openDownload(entry.item)">{{ entry.item.source_kind === '115_share' ? '转存入库' : '入库' }}</button></footer>
           </article>
         </div>
         <footer v-if="activeGroup?.status === 'success'" class="panel flex items-center justify-center gap-3"><button class="btn-secondary" :disabled="searching || activeGroup.page <= 1" @click="previousPage(activeGroup)">上一页</button><span class="text-sm">{{ activeGroup.site_name }} · 第 {{ activeGroup.page }} 页</span><button class="btn-secondary" :disabled="searching || !activeGroup.has_next" @click="nextPage(activeGroup)">下一页</button></footer>
@@ -612,7 +643,7 @@ onBeforeUnmount(() => {
       </form>
     </div>
 
-    <SharePreviewDialog v-if="sharePreviewDialog" :result-token="sharePreviewDialog.token" :title="sharePreviewDialog.title" :downloaders="downloaders" @close="sharePreviewDialog = null" @select="acceptShareSelection" />
+    <SharePreviewDialog v-if="sharePreviewDialog" :result-token="sharePreviewDialog.token" :title="sharePreviewDialog.title" :downloaders="downloaders" @close="sharePreviewDialog = null" @select="acceptShareSelection" @validation="rememberShareValidation" />
     <div v-if="downloadDialog" class="modal-backdrop fixed inset-0 z-50 flex items-center justify-center p-4" @click.self="!submitting && (downloadDialog = null)">
       <form class="panel w-full max-w-xl" role="dialog" aria-modal="true" aria-labelledby="pt-download-title" @submit.prevent="submitDownload">
         <div class="flex items-start justify-between gap-3"><div><h2 id="pt-download-title" class="m-0 text-xl">{{ downloadDialog.source_kind === '115_share' ? '转存到媒体库' : '创建下载任务' }}</h2><p class="page-description mt-1 line-clamp-2 text-sm">{{ downloadDialog.title }}</p></div><button class="btn-secondary" type="button" :disabled="submitting" @click="downloadDialog = null">关闭</button></div>

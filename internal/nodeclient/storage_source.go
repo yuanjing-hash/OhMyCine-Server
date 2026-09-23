@@ -342,6 +342,8 @@ func storageSourceResponseError(response nodeprotocol.StorageSourceActionRespons
 		return nil
 	}
 	switch code {
+	case nodeprotocol.ErrorSourceShareExpired, nodeprotocol.ErrorSourceSharePassword:
+		return downloadpkg.Error(code, false, nil)
 	case nodeprotocol.ErrorSourceRateLimited, nodeprotocol.ErrorLeaseExpired, "node_source_unavailable":
 		return downloadpkg.Error(code, true, nil)
 	case nodeprotocol.ErrorPlanConflict, nodeprotocol.ErrorChecksumMismatch, nodeprotocol.ErrorCapabilityMissing, nodeprotocol.ErrorReconciliationNeeded, "node_source_offline_invalid", "node_source_offline_quota_exhausted", "node_source_offline_failed":

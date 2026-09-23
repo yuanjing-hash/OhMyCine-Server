@@ -26,6 +26,16 @@ func writeError(c *gin.Context, log zerolog.Logger, err error) {
 	status := http.StatusInternalServerError
 	code := services.ErrorCode(err)
 	switch code {
+	case "pan115_share_expired":
+		status = http.StatusGone
+	case "pan115_share_password_invalid", "pan115_share_invalid", "pan115_share_empty", "pan115_share_too_large":
+		status = http.StatusBadRequest
+	case "pan115_rate_limited":
+		status = http.StatusTooManyRequests
+	case "pan115_auth_expired", "pan115_unavailable":
+		status = http.StatusServiceUnavailable
+	case "pan115_response_invalid":
+		status = http.StatusBadGateway
 	case services.CodeTransferDeletionScopeInvalid, services.CodeHistoryClockAhead, services.CodeHistoryArtworkInvalid:
 		status = http.StatusBadRequest
 	case services.CodeHistoryArtworkQuota:
@@ -96,5 +106,9 @@ func writeError(c *gin.Context, log zerolog.Logger, err error) {
 	if errors.As(err, &appErr) && appErr.Code == services.CodeInvalidRequest {
 		appCode = 40001
 	}
-	c.JSON(status, response{Code: appCode, Message: services.ErrorMessage(err), Data: gin.H{"error_code": code}})
+	data := gin.H{"error_code": code}
+	if appErr != nil && appErr.ShareValidation != nil {
+		data["share_validation"] = appErr.ShareValidation
+	}
+	c.JSON(status, response{Code: appCode, Message: services.ErrorMessage(err), Data: data})
 }

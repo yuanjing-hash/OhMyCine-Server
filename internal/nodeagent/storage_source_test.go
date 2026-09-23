@@ -540,3 +540,12 @@ func (d *fakeStorageSourceDriver) Rename(context.Context, string, string) error 
 func (d *fakeStorageSourceDriver) Recycle(context.Context, string) error {
 	return errors.New("unexpected recycle")
 }
+
+func TestShareFailuresPreserveSafeNodeClassification(t *testing.T) {
+	for provider, expected := range map[string]string{cloud.CodeShareExpired: nodeprotocol.ErrorSourceShareExpired, cloud.CodeSharePassword: nodeprotocol.ErrorSourceSharePassword} {
+		got := storageSourceErrorCode(cloud.Error(provider, false, errors.New("private share URL")))
+		if got != expected || strings.Contains(storageSourceSafeMessage(got), "private") {
+			t.Fatalf("code=%s", got)
+		}
+	}
+}

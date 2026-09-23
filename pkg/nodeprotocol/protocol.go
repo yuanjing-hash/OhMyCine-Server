@@ -53,6 +53,8 @@ const (
 	ErrorDownloaderUnreachable = "node_downloader_unreachable"
 	ErrorPathMappingInvalid    = "node_path_mapping_invalid"
 	ErrorCredentialExpired     = "node_credential_expired"
+	ErrorSourceShareExpired    = "node_source_share_expired"
+	ErrorSourceSharePassword   = "node_source_share_password_invalid"
 	ErrorSourceRateLimited     = "node_source_rate_limited"
 	ErrorTargetRateLimited     = "node_target_rate_limited"
 	ErrorChecksumMismatch      = "node_checksum_mismatch"

@@ -332,3 +332,13 @@ func writeNodeError(w http.ResponseWriter, status int, code string) {
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(nodeprotocol.ErrorResponse{Code: code, Message: code})
 }
+
+func TestShareFailuresRemainTerminalAcrossNodeResponse(t *testing.T) {
+	for _, code := range []string{nodeprotocol.ErrorSourceShareExpired, nodeprotocol.ErrorSourceSharePassword} {
+		err := storageSourceResponseError(nodeprotocol.StorageSourceActionResponse{ErrorCode: code})
+		got, retryable := downloadpkg.ErrorInfo(err)
+		if got != code || retryable {
+			t.Fatalf("code=%s retryable=%t", got, retryable)
+		}
+	}
+}

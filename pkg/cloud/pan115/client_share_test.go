@@ -3,7 +3,10 @@ package pan115
 import (
 	"context"
 	"errors"
+	"io"
+	"net/http"
 	"reflect"
+	"strings"
 	"testing"
 
 	pan115sdk "github.com/SheltonZhu/115driver/pkg/driver"
@@ -14,13 +17,19 @@ type shareTestSDK struct {
 	*bulkSDK
 	snapshot       *pan115sdk.ShareSnapResp
 	snapshotErr    error
+	pages          map[string]*pan115sdk.ShareSnapResp
+	usedUA         string
 	receivedCode   string
 	receivedSecret string
 	receivedIDs    []string
 	receivedParent string
 }
 
-func (s *shareTestSDK) GetShareSnapWithUA(string, string, string, string, ...pan115sdk.Query) (*pan115sdk.ShareSnapResp, error) {
+func (s *shareTestSDK) GetShareSnapWithUA(ua string, _ string, _ string, dir string, _ ...pan115sdk.Query) (*pan115sdk.ShareSnapResp, error) {
+	s.usedUA = ua
+	if s.pages != nil {
+		return s.pages[dir], s.snapshotErr
+	}
 	return s.snapshot, s.snapshotErr
 }
 
@@ -113,5 +122,89 @@ func TestInspectShareMapsInvalidProviderResponseWithoutLeakingInput(t *testing.T
 	_, err := newOfflineTestClient(sdk).InspectShare(context.Background(), raw)
 	if err == nil || err.Error() == raw {
 		t.Fatalf("unexpected error=%v", err)
+	}
+}
+
+// Based on the real share/snap field shapes: directory cid, file fid + parent cid.
+func TestShareReadRealResponseTreeAndFailures(t *testing.T) {
+	root, err := decodeShareResponse(200, strings.NewReader(`{"state":true,"errno":0,"data":{"count":1,"list":[{"cid":"123","pid":"0","n":"Movie","s":68571790801,"fc":0,"t":"2025"}]}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	child, err := decodeShareResponse(200, strings.NewReader(`{"state":true,"errno":0,"data":{"count":2,"list":[{"fid":"456","cid":123,"n":"Movie.mkv","s":68496540644,"fc":1},{"fid":"789","cid":"123","n":"Movie.sup","s":"75250157","fc":1}]}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sdk := &shareTestSDK{bulkSDK: &bulkSDK{}, pages: map[string]*pan115sdk.ShareSnapResp{"0": root, "123": child}}
+	_, tree, err := cloud.InspectShareTree(context.Background(), newOfflineTestClient(sdk), "https://115.com/s/example?password=abcd")
+	if err != nil || len(tree) != 3 || sdk.usedUA != downloadBrowserUserAgent {
+		t.Fatalf("tree=%v err=%v ua=%q", tree, err, sdk.usedUA)
+	}
+	var total int64
+	for _, item := range tree {
+		if !item.IsDir {
+			total += item.Size
+			if item.ID == "123" {
+				t.Fatal("file used parent cid")
+			}
+		}
+	}
+	if total != 68571790801 {
+		t.Fatal(total)
+	}
+	for _, tc := range []struct {
+		status     int
+		body, code string
+		provider   int
+	}{
+		{200, `{"state":false,"errno":4100010,"error":"secret URL password must not escape"}`, cloud.CodeShareExpired, 4100010},
+		{200, `{"state":false,"errno":4100008}`, cloud.CodeSharePassword, 4100008},
+		{200, `{"state":false,"errno":99}`, cloud.CodeAuthExpired, 99},
+		{200, `{"state":false,"errno":123456}`, cloud.CodeUnavailable, 123456},
+		{405, `<html>secret</html>`, cloud.CodeRateLimited, 0},
+		{200, `<html>secret</html>`, cloud.CodeResponseInvalid, 0},
+	} {
+		_, err := decodeShareResponse(tc.status, strings.NewReader(tc.body))
+		code, _ := cloud.ErrorInfo(err)
+		status, provider, _ := ShareReadDiagnostics(err)
+		if code != tc.code || status != tc.status || provider != tc.provider || strings.Contains(err.Error(), "secret") {
+			t.Fatalf("code=%s status=%d provider=%d", code, status, provider)
+		}
+	}
+	client := newOfflineTestClient(sdk)
+	for i := 0; i < 3; i++ {
+		client.recordOutcome(cloud.Error(cloud.CodeRateLimited, true, &ShareReadFailure{HTTPStatus: 405}))
+	}
+	_, err = client.InspectShare(context.Background(), "https://115.com/s/example?password=abcd")
+	_, _, cooling := ShareReadDiagnostics(err)
+	if !cooling {
+		t.Fatalf("shared cooldown not retained: %v", err)
+	}
+	for _, raw := range []string{"https://115cdn.com/s/example?password=abcd&amp;#", "https://115cdn.com/s/example?password=abcd&amp;amp;#"} {
+		normalized, _, err := NormalizeShareLink(raw, "")
+		if err != nil || normalized != "https://115.com/s/example?password=abcd" {
+			t.Fatalf("normalization=%q err=%v", normalized, err)
+		}
+	}
+	if _, _, err := NormalizeShareLink("https://115.com.evil.test/s/example?password=abcd", ""); err == nil {
+		t.Fatal("non-115 host accepted")
+	}
+}
+
+// Test-only transport keeps the real SDK request builder without remote access.
+type shareReadTransport func(*http.Request) (*http.Response, error)
+
+func (f shareReadTransport) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+func TestShareReadAdapterUsesSafeRequestAndTypedErrors(t *testing.T) {
+	sdk := pan115sdk.New()
+	sdk.Client.SetTransport(shareReadTransport(func(r *http.Request) (*http.Response, error) {
+		if r.UserAgent() != downloadBrowserUserAgent || r.URL.Query().Get("cid") != "0" || r.URL.Query().Get("share_code") != "example" {
+			t.Error("incorrect request")
+		}
+		return &http.Response{StatusCode: 200, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{"state":false,"errno":4100010,"error":"private upstream body"}`)), Request: r}, nil
+	}))
+	_, err := (&sdkAdapter{sdk}).GetShareSnapWithUA(downloadBrowserUserAgent, "example", "abcd", "0")
+	if code, _ := cloud.ErrorInfo(err); code != cloud.CodeShareExpired {
+		t.Fatal(err)
 	}
 }

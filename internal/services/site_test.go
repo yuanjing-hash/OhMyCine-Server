@@ -886,6 +886,10 @@ func TestSiteManualRecognitionSearchesSafeCandidatesAndBindsVerifiedIdentityToDo
 	if err != nil || verified.Status != mediaRecognitionStatusMatched || !verified.ManualOverride || verified.TMDBID == nil || *verified.TMDBID != 58443 || verified.Title != "迪迦奥特曼：最终圣战" {
 		t.Fatalf("verified=%+v err=%v", verified, err)
 	}
+	// A late automatic result must not overwrite the verified manual choice.
+	if err := service.bindClaimRecognition(token, actor.User.ID, 999, "tv", "tmdb", mediaIdentityStatusVerified, false); err != nil {
+		t.Fatal(err)
+	}
 	claim, err := service.resolveClaim(token, actor.User.ID)
 	if err != nil || claim.ManualTMDBID == nil || *claim.ManualTMDBID != 58443 || claim.ManualMediaType != "movie" || claim.TorrentID != "42" {
 		t.Fatalf("claim=%+v err=%v", claim, err)

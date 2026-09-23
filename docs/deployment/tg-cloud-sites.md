@@ -71,3 +71,26 @@
 `POST /api/v1/discovery/downloads` 增加可选 `{preview_token, selected_entry_tokens}`；两者必须配合使用，空选择不会转为全量。选择目录会在 Server 展开为当次预览中的固定叶子文件。选择模式返回的正常下载摘要增加 `selection_tasks`、`selection_pending`、`selection_error`；首个任务仍保留原 `id` 字段，所有子任务遵循既有下载 API。未提供选择参数仍沿用整份分享行为。
 
 上述接口同时要求 discovery read、downloads create 及对应 Site、Downloader 资源权限，提交时另检查目标 MediaLibrary 权限。Player discovery 下提供同等接口。客户端关闭预览时取消读取与识别请求，不持久化预览 token。
+
+
+## 分享有效性与预览错误
+
+搜索只获取盘搜结果，不自动请求 115 检查每条分享。结果卡片初始显示“未验证”；点击预览会读取完整目录，提交转存前会重新读取根目录。上次验证成功不代表分享永久有效，实际执行仍会核对来源。
+
+卡片会显示“已验证可读取”“分享已失效”“提取码有误”或“暂时无法验证”及检查时间。账号失效、405/429 限流和网络错误不会被标记成分享失效；重新读取不会绕过账号冷却。预览中的文件名和大小来自当前 115 分享，可能不同于原帖。完整读取失败时不显示空目录或不完整的大小。
+
+既有搜索结果、分享预览和成功转存响应增加可选 `share_validation`：`{status, error_code?, message, checked_at, expires_at, downloader_id}`。`status` 为 `valid`、`expired`、`password_required`、`unavailable`。分享检查错误仍使用原响应 envelope，在 `data.error_code` 外可附 `data.share_validation`，不返回链接、提取码、网盘文件 ID 或 Cookie。Player 对应路由使用相同契约。
+
+分享已取消/不存在使用 `pan115_share_expired`（HTTP 410）；提取码错误使用 `pan115_share_password_invalid`（400）；账号失效为 `pan115_auth_expired`（503）；限流为 `pan115_rate_limited`（429）；响应格式异常为 `pan115_response_invalid`（502）；其他暂时不可用为 `pan115_unavailable`（503）。未知上游错误不能证明分享失效。
+
+验证结果只存于有界内存中，绑定用户、规范化分享及提取码摘要、下载器和连接配置版本。成功保留 5 分钟，确定失效/提取码错误保留 2 分钟，临时状态仅保留 15 秒用于展示；不写浏览器存储，不作为执行授权。配置变化或证据过期后需要重新验证。
+
+Node 对应的终止错误为 `node_source_share_expired` 和 `node_source_share_password_invalid`，Server 不对这些错误自动重试；Server 与 Node 后续应同步升级以获得一致的分类。
+
+### 搜索结果自动识别与库内提示
+
+搜索结果返回后自动按标题识别作品，不再需要点击“检测”；“手动检测”用于纠正作品身份。PT、BT 和网盘分享站共用该行为。每页最多同时处理两条结果，同一作品的库内查询复用，失败不会阻塞其他结果。
+
+卡片显示当前账号可见媒体库中的作品状态：已入库、部分入库、未入库或未知/待扫描。该状态依据 Server 已扫描内容，不能证明本条分享/资源的版本已经存在。未识别成功、无权限和查询失败各自显示待确认/不可用，不按未入库处理。库内状态仅保留在当前页面，重新搜索或恢复页面会重新查询。
+
+自动作品识别不会批量访问 115 分享。分享是否可读仍在预览或转存时检查。

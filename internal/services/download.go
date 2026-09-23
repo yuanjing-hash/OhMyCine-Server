@@ -303,6 +303,7 @@ type downloadJobPayload struct {
 }
 
 type DownloadTaskSummary struct {
+	ShareValidation   *SiteShareValidation  `json:"share_validation,omitempty"`
 	SelectionTasks    []DownloadTaskSummary `json:"selection_tasks,omitempty"`
 	SelectionPending  int                   `json:"selection_pending,omitempty"`
 	SelectionError    string                `json:"selection_error,omitempty"`
@@ -2879,6 +2880,10 @@ func (w *DownloadWorker) transferEnqueueFailure(task models.DownloadTask, err er
 
 func downloadFailureMessage(code string, retryable bool) string {
 	switch code {
+	case "downloader_share_expired", "node_source_share_expired":
+		return "115 分享已失效或已被取消，请重新选择资源"
+	case "downloader_share_password_invalid", "node_source_share_password_invalid":
+		return "115 分享提取码有误，请核对原帖后重新搜索"
 	case "downloader_auth_failed":
 		return "下载器认证已失效，请更新连接凭据后重试"
 	case "downloader_rate_limited":

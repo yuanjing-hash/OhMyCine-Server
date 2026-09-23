@@ -1,3 +1,5 @@
+import type { ShareValidation } from '@/share-preview'
+
 export const defaultPanSouBaseURL = 'https://so.252035.xyz'
 
 export interface SiteHealth {
@@ -106,6 +108,7 @@ export interface CookieCloudSyncIssue {
 }
 
 export interface PTSearchResult {
+  share_validation?: ShareValidation
   source_kind?: string
   cloud_provider?: string
   channel?: string
@@ -411,7 +414,11 @@ export function saveTorrentSearchSession(storage: SearchSessionStorage | undefin
     for (const rawGroup of state.groups.slice(0, 24)) {
       const group = normalizePTSearchGroup(rawGroup)
       const remaining = Math.max(0, 300 - itemCount)
-      const items = group.items.slice(0, remaining)
+      const items = group.items.slice(0, remaining).map(item => {
+        const saved = { ...item }
+        delete saved.share_validation
+        return saved
+      })
       itemCount += items.length
       groups.push({ ...group, items })
       if (itemCount >= 300) break

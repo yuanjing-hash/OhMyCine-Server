@@ -1,7 +1,9 @@
+import { parseShareValidation, type ShareValidation } from '@/share-preview'
+
 interface Envelope<T> { code: number; message: string; data: T }
 
 export class APIError extends Error {
-  constructor(public status: number, public errorCode: string, message: string) { super(message) }
+  constructor(public status: number, public errorCode: string, message: string, public shareValidation?: ShareValidation) { super(message) }
 }
 
 let csrfToken = ''
@@ -45,7 +47,8 @@ export async function api<T>(path: string, options: RequestInit = {}, config: { 
     }
     if (response.status === 401 && errorCode === 'NOT_AUTHENTICATED') { clearCSRFToken(); window.dispatchEvent(new CustomEvent('omc:unauthorized')) }
     if (response.status === 403) window.dispatchEvent(new CustomEvent('omc:forbidden'))
-    throw new APIError(response.status, errorCode, payload.message)
+    const validation = typeof data === 'object' && data !== null ? parseShareValidation(Reflect.get(data, 'share_validation')) : undefined
+    throw new APIError(response.status, errorCode, payload.message, validation)
   }
   return payload.data as T
 }

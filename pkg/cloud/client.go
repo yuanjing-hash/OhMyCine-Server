@@ -536,6 +536,8 @@ const (
 	CodeOfflineNoQuota    = "pan115_offline_quota_exhausted"
 	CodeOfflineBadLink    = "pan115_offline_source_invalid"
 	CodeOfflineTaskExists = "pan115_offline_task_exists"
+	CodeShareExpired      = "pan115_share_expired"
+	CodeSharePassword     = "pan115_share_password_invalid"
 	CodeShareInvalid      = "pan115_share_invalid"
 	CodeShareEmpty        = "pan115_share_empty"
 	CodeShareTooLarge     = "pan115_share_too_large"

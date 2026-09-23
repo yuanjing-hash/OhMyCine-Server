@@ -30,11 +30,12 @@ type SiteSharePreviewEntry struct {
 	Size  int64  `json:"size"`
 }
 type SiteSharePreviewSummary struct {
-	Token     string                  `json:"token"`
-	Entries   []SiteSharePreviewEntry `json:"entries"`
-	TotalSize int64                   `json:"total_size"`
-	FileCount int                     `json:"file_count"`
-	ExpiresAt time.Time               `json:"expires_at"`
+	ShareValidation *SiteShareValidation    `json:"share_validation,omitempty"`
+	Token           string                  `json:"token"`
+	Entries         []SiteSharePreviewEntry `json:"entries"`
+	TotalSize       int64                   `json:"total_size"`
+	FileCount       int                     `json:"file_count"`
+	ExpiresAt       time.Time               `json:"expires_at"`
 }
 type siteSharePreview struct {
 	ActorID                                      uint
@@ -107,7 +108,7 @@ func (s *SiteService) acquireSharePreview(ctx context.Context) (func(), error) {
 	}
 }
 
-func (s *SiteService) PreviewShare(ctx context.Context, actor Actor, resultToken, downloaderID string) (SiteSharePreviewSummary, error) {
+func (s *SiteService) PreviewShare(ctx context.Context, actor Actor, resultToken, downloaderID string, requests ...RequestContext) (SiteSharePreviewSummary, error) {
 	var summary SiteSharePreviewSummary
 	ctx, cancel := context.WithTimeout(ctx, 45*time.Second)
 	defer cancel()
@@ -115,36 +116,17 @@ func (s *SiteService) PreviewShare(ctx context.Context, actor Actor, resultToken
 	if err != nil {
 		return summary, err
 	}
-	if !actor.CanResource(authz.PermissionDownloadsCreate, models.AuthorizationResourceDownloader, downloaderID) {
-		return summary, appError(CodePermissionDenied, "无权使用这个下载器", nil)
-	}
-	if s.downloads == nil || s.downloads.downloader == nil || s.downloads.downloader.connections == nil {
-		return summary, appError(CodeDownloaderUnavailable, "下载服务不可用", nil)
-	}
-	digest, connectionID, err := sharePreviewConfig(s.db.WithContext(ctx), downloaderID)
-	if err != nil {
-		return summary, err
-	}
-	release, err := s.acquireSharePreview(ctx)
-	if err != nil {
-		return summary, err
-	}
-	defer release()
-	_, driver, err := s.downloads.downloader.connections.driver(connectionID)
-	if err != nil {
-		return summary, err
-	}
-	browse, ok := driver.(cloud.ShareBrowseDriver)
-	if !ok {
-		return summary, appError(CodeConnectionUnavailable, "当前连接不支持分享预览", nil)
-	}
 	raw, _, err := pan115.NormalizeShareLink(claim.TorrentID, "")
 	if err != nil {
 		return summary, appError(CodeDownloadSourceInvalid, "分享地址无效", nil)
 	}
-	_, entries, err := cloud.InspectShareTree(ctx, browse, raw)
+	request := RequestContext{}
+	if len(requests) > 0 {
+		request = requests[0]
+	}
+	entries, digest, validation, err := s.inspectResultShare(ctx, actor, claim, raw, downloaderID, true, request)
 	if err != nil {
-		return summary, sharePreviewProviderError(err)
+		return summary, err
 	}
 	if _, err = s.sharePreviewClaim(ctx, actor, resultToken); err != nil {
 		return summary, err
@@ -158,7 +140,7 @@ func (s *SiteService) PreviewShare(ctx context.Context, actor Actor, resultToken
 		expiry = claim.ExpiresAt
 	}
 	frozen := siteSharePreview{ActorID: actor.User.ID, ResultToken: strings.TrimSpace(resultToken), DownloaderID: downloaderID, ConfigDigest: digest, URL: raw, ExpiresAt: expiry, Entries: make(map[string]cloud.ShareTreeItem, len(entries))}
-	summary = SiteSharePreviewSummary{Token: uuid.NewString(), ExpiresAt: expiry, Entries: make([]SiteSharePreviewEntry, 0, len(entries))}
+	summary = SiteSharePreviewSummary{ShareValidation: &validation, Token: uuid.NewString(), ExpiresAt: expiry, Entries: make([]SiteSharePreviewEntry, 0, len(entries))}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].RelativePath < entries[j].RelativePath })
 	for _, item := range entries {
 		token := uuid.NewString()
@@ -202,13 +184,26 @@ func (s *SiteService) PreviewShare(ctx context.Context, actor Actor, resultToken
 }
 func sharePreviewProviderError(err error) error {
 	code, _ := cloud.ErrorInfo(err)
+	message := "暂时无法读取 115 分享，请稍后重试"
 	switch code {
+	case cloud.CodeShareExpired:
+		message = "分享已失效或已被取消"
+	case cloud.CodeSharePassword:
+		message = "分享提取码有误，请核对原帖后重新搜索"
+	case cloud.CodeAuthExpired, cloud.CodeCookieInvalid:
+		message = "115 账号登录已失效，请重新登录后验证分享"
+	case cloud.CodeRateLimited:
+		message = "115 请求受到限制，正在冷却，请稍后重新验证"
+	case cloud.CodeResponseInvalid:
+		message = "115 分享响应格式异常，暂时无法验证"
+	case cloud.CodeShareInvalid:
+		message = "分享地址或文件结构无效，无法安全读取"
+	case cloud.CodeShareEmpty:
+		message = "分享内没有可读取的文件"
 	case cloud.CodeShareTooLarge:
-		return appError(CodeInvalidRequest, "分享内容过多，暂时无法完整预览，请选择更小的分享", nil)
-	case cloud.CodeResponseInvalid, cloud.CodeShareInvalid:
-		return appError(CodeInvalidRequest, "分享文件结构无效，无法安全预览", nil)
+		message = "分享内容过多，暂时无法完整预览，请选择更小的分享"
 	}
-	return appError(CodeSiteUnavailable, "无法读取分享内容，请检查 115 账号、分享有效期和提取码后重试", nil)
+	return appError(code, message, nil)
 }
 func (s *SiteService) resolveSharePreview(ctx context.Context, actor Actor, token string) (siteSharePreview, error) {
 	s.vaultMu.Lock()

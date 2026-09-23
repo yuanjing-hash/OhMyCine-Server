@@ -165,9 +165,10 @@ const (
 
 // AppError is a stable, client-safe domain error.
 type AppError struct {
-	Code    string
-	Message string
-	Cause   error
+	ShareValidation *SiteShareValidation
+	Code            string
+	Message         string
+	Cause           error
 }
 
 func (e *AppError) Error() string { return e.Message }

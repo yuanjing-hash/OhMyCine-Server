@@ -521,7 +521,7 @@ func (a *API) PreviewSiteShare(c *gin.Context) {
 		writeError(c, a.log, invalid("分享预览参数无效", err))
 		return
 	}
-	item, err := a.sites.PreviewShare(c.Request.Context(), actor, payload.ResultToken, payload.DownloaderID)
+	item, err := a.sites.PreviewShare(c.Request.Context(), actor, payload.ResultToken, payload.DownloaderID, middleware.RequestContextFrom(c))
 	if err != nil {
 		writeError(c, a.log, err)
 		return

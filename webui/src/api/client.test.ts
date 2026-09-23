@@ -92,3 +92,10 @@ describe('API CSRF recovery', () => {
     expect(fetchMock).toHaveBeenCalledTimes(2)
   })
 })
+
+it('preserves safe share validation details without treating account errors as app logout', async () => {
+ const validation = { status: 'unavailable', message: '115 账号登录已失效', error_code: 'pan115_auth_expired', downloader_id: 'd', checked_at: new Date().toISOString(), expires_at: new Date(Date.now() + 15000).toISOString() }
+ vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(envelope(503, 50301, { error_code: validation.error_code, share_validation: validation }, validation.message))
+ await expect(api('/api/v1/discovery/share-preview')).rejects.toMatchObject({ errorCode: validation.error_code, shareValidation: validation })
+ expect(dispatchEvent).not.toHaveBeenCalled()
+})

@@ -1,8 +1,10 @@
 package services
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -21,6 +23,7 @@ import (
 
 func TestCloudSiteCredentialsAndSharePipeline(t *testing.T) {
 	f := newShareIngestFixture(t)
+	f.downloads.downloader.connections.drivers[*f.storage.ConnectionID] = &previewFixtureDriver{f.driver}
 	f.actor.Permissions[authz.PermissionSystemAdmin] = struct{}{}
 	f.actor.Permissions[authz.PermissionDiscoveryRead] = struct{}{}
 	adapter := &cloudFixtureAdapter{stubResolverAdapter: &stubResolverAdapter{stubSiteAdapter: &stubSiteAdapter{kind: pansou.Kind}, resolved: sitepkg.Source{ShareURL: "https://115.com/s/example?password=abcd", CloudProvider: "115"}}}
@@ -144,6 +147,7 @@ func (a *cloudFixtureAdapter) Search(_ context.Context, _ sitepkg.Config, q site
 
 func TestCloudFollowReusesShareForNewEpisodes(t *testing.T) {
 	f := newShareIngestFixture(t)
+	f.downloads.downloader.connections.drivers[*f.storage.ConnectionID] = &previewFixtureDriver{f.driver}
 	now := time.Now().UTC()
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -427,5 +431,100 @@ func TestSelectedSharePackagesKeepIndependentMoviesAndSubtitles(t *testing.T) {
 	groups := selectedSharePackages(selection)
 	if len(groups) != 2 || len(groups[0].Files) != 1 || len(groups[1].Files) != 2 || groups[1].Files[1].ID != "sub" {
 		t.Fatalf("scope merged or lost: %+v", groups)
+	}
+}
+
+type validationFixtureDriver struct {
+	*previewFixtureDriver
+	failure error
+	reads   int
+}
+
+func (d *validationFixtureDriver) InspectShare(ctx context.Context, raw string) (cloud.ShareSnapshot, error) {
+	return d.InspectShareDirectory(ctx, raw, "0")
+}
+func (d *validationFixtureDriver) InspectShareDirectory(ctx context.Context, raw, id string) (cloud.ShareSnapshot, error) {
+	d.reads++
+	if d.failure != nil {
+		return cloud.ShareSnapshot{}, d.failure
+	}
+	return d.previewFixtureDriver.InspectShareDirectory(ctx, raw, id)
+}
+
+func TestCloudShareValidationIsolationExpiryAndFailedPreflight(t *testing.T) {
+	f := newShareIngestFixture(t)
+	f.actor.Permissions[authz.PermissionSystemAdmin] = struct{}{}
+	f.actor.Permissions[authz.PermissionDiscoveryRead] = struct{}{}
+	driver := &validationFixtureDriver{previewFixtureDriver: &previewFixtureDriver{f.driver}}
+	f.downloads.downloader.connections.drivers[*f.storage.ConnectionID] = driver
+	raw := "https://115.com/s/example?password=abcd"
+	adapter := &cloudFixtureAdapter{stubResolverAdapter: &stubResolverAdapter{stubSiteAdapter: &stubSiteAdapter{kind: pansou.Kind}, resolved: sitepkg.Source{ShareURL: raw, CloudProvider: "115"}}}
+	var logs bytes.Buffer
+	service := NewSiteServiceWithAdapters(f.db, NewAuditService(f.db), f.store, f.downloads, []sitepkg.Adapter{&previewFixtureAdapter{adapter}}, zerolog.New(&logs))
+	now := time.Now().UTC()
+	service.now = func() time.Time { return now }
+	site, err := service.Create(context.Background(), f.actor, SiteInput{Name: "validation", Priority: 100, Kind: pansou.Kind, BaseURL: "https://pansou.example.test", CloudConfig: &sitepkg.CloudConfig{Provider: "115", Channels: []string{"movies"}}, Enabled: true, RateLimitPerMinute: 120, TimeoutSeconds: 30}, RequestContext{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := service.issueClaim(siteResultClaim{ActorID: f.actor.User.ID, SiteID: site.ID, SiteRevision: site.Revision, TorrentID: raw, Title: "Movie", ExpiresAt: now.Add(time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	driver.failure = cloud.Error(cloud.CodeShareExpired, false, errors.New("private upstream body password=abcd"))
+	_, err = service.PreviewShare(context.Background(), f.actor, token, f.downloader.ID, RequestContext{RequestID: "check-request"})
+	var app *AppError
+	if !errors.As(err, &app) || app.Code != cloud.CodeShareExpired || app.ShareValidation == nil || app.ShareValidation.Status != "expired" {
+		t.Fatalf("error=%v", err)
+	}
+	cached := service.cachedShareValidation(context.Background(), f.actor, raw)
+	if cached == nil || cached.ExpiresAt.Sub(cached.CheckedAt) != 2*time.Minute {
+		t.Fatal("missing invalid evidence")
+	}
+	before := driver.reads
+	if _, err = service.Download(context.Background(), f.actor, SiteDownloadInput{ResultToken: token, DownloaderID: f.downloader.ID}, RequestContext{}); ErrorCode(err) != cloud.CodeShareExpired {
+		t.Fatalf("preflight err=%v", err)
+	}
+	if driver.reads != before+1 {
+		t.Fatal("submit trusted cache")
+	}
+	var count int64
+	f.db.Model(&models.DownloadTask{}).Count(&count)
+	if count != 0 {
+		t.Fatal("failed preflight enqueued work")
+	}
+	driver.failure = cloud.Error(cloud.CodeRateLimited, true, nil)
+	_, err = service.PreviewShare(context.Background(), f.actor, token, f.downloader.ID)
+	if !errors.As(err, &app) || app.ShareValidation.Status != "unavailable" {
+		t.Fatal("risk marked invalid")
+	}
+	driver.failure = nil
+	preview, err := service.PreviewShare(context.Background(), f.actor, token, f.downloader.ID)
+	if err != nil || preview.TotalSize != 300 || preview.ShareValidation.Status != "valid" {
+		t.Fatalf("preview=%+v err=%v", preview, err)
+	}
+	if preview.ShareValidation.ExpiresAt.Sub(preview.ShareValidation.CheckedAt) != 5*time.Minute {
+		t.Fatal("wrong success ttl")
+	}
+	another := f.actor
+	another.User.ID++
+	if service.cachedShareValidation(context.Background(), another, raw) != nil || service.cachedShareValidation(context.Background(), f.actor, raw+"x") != nil {
+		t.Fatal("cross-actor/password evidence leak")
+	}
+	cached = service.cachedShareValidation(context.Background(), f.actor, raw)
+	if cached == nil || cached.Status != "valid" {
+		t.Fatal("retry did not replace invalid status")
+	}
+	now = now.Add(6 * time.Minute)
+	if service.cachedShareValidation(context.Background(), f.actor, raw) != nil {
+		t.Fatal("expired evidence retained")
+	}
+	now = now.Add(-6 * time.Minute)
+	f.db.Model(&models.Connection{}).Where("id = ?", *f.storage.ConnectionID).Update("revision", 100)
+	if service.cachedShareValidation(context.Background(), f.actor, raw) != nil {
+		t.Fatal("configuration change retained evidence")
+	}
+	if strings.Contains(logs.String(), "password") || strings.Contains(logs.String(), "private upstream") || strings.Contains(logs.String(), "example") || !strings.Contains(logs.String(), "check-request") {
+		t.Fatal("unsafe or uncorrelated diagnostic log")
 	}
 }

@@ -338,7 +338,7 @@ func (c *Client) InspectShareDirectory(ctx context.Context, raw, directoryID str
 		var page *pan115sdk.ShareSnapResp
 		callErr := c.waitAndCall(ctx, c.offlineRate, func() error {
 			var sdkErr error
-			page, sdkErr = sdk.GetShareSnapWithUA(pan115sdk.UA115Browser, shareCode, receiveCode, directoryID, pan115sdk.QueryLimit(pageLimit), pan115sdk.QueryOffset(offset))
+			page, sdkErr = sdk.GetShareSnapWithUA(downloadBrowserUserAgent, shareCode, receiveCode, directoryID, pan115sdk.QueryLimit(pageLimit), pan115sdk.QueryOffset(offset))
 			return sdkErr
 		})
 		if callErr != nil {
@@ -355,6 +355,12 @@ func (c *Client) InspectShareDirectory(ctx context.Context, raw, directoryID str
 		}
 		for _, item := range page.Data.List {
 			id, name := strings.TrimSpace(item.FileID), strings.TrimSpace(item.FileName)
+			if item.IsFile == 0 {
+				id = strings.TrimSpace(string(item.CategoryID))
+			}
+			if item.IsFile != 0 && item.IsFile != 1 {
+				return cloud.ShareSnapshot{}, cloud.Error(cloud.CodeResponseInvalid, false, nil)
+			}
 			if !shareItemIDPattern.MatchString(id) || !validShareItemName(name) || int64(item.Size) < 0 {
 				return cloud.ShareSnapshot{}, cloud.Error(cloud.CodeResponseInvalid, false, errors.New("115 returned an invalid share item"))
 			}
