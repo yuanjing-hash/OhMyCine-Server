@@ -291,7 +291,7 @@ func (s *PlayerMediaStateService) Collections(actor Actor, kind string) ([]Playe
 	result := make([]PlayerCollectionSummary, 0, len(rows))
 	imageClient := s.libraries.catalogImageClientTx(s.db)
 	for _, row := range rows {
-		result = append(result, PlayerCollectionSummary{ID: row.ID, Name: row.Name, Kind: row.Kind, Source: row.Source, ItemCount: row.ItemCount, Revision: row.Revision, PosterPath: row.PosterPath, BackdropPath: row.BackdropPath, PosterURL: catalogImageURLWithClient(imageClient, row.PosterPath, "w500"), BackdropURL: catalogImageURLWithClient(imageClient, row.BackdropPath, "w1280")})
+		result = append(result, PlayerCollectionSummary{ID: row.ID, Name: row.Name, Kind: row.Kind, Source: row.Source, ItemCount: row.ItemCount, Revision: row.Revision, PosterPath: row.PosterPath, BackdropPath: row.BackdropPath, PosterURL: playerCatalogImageURLWithClient(imageClient, row.PosterPath, "w500"), BackdropURL: playerCatalogImageURLWithClient(imageClient, row.BackdropPath, "w1280")})
 	}
 	return result, nil
 }

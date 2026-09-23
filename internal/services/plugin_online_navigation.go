@@ -66,7 +66,7 @@ func (s *PluginRepositoryService) OnlineNavigationChildren(ctx context.Context, 
 	if err != nil || claim.LibraryID != libraryID || claim.Depth < 1 || claim.Depth >= maxPluginNavigationDepth {
 		return nil, appError(CodeInvalidRequest, "在线媒体导航节点无效", err)
 	}
-	_, _, manifest, err := s.onlineLibrary(libraryID)
+	_, connection, manifest, err := s.onlineLibrary(libraryID)
 	if err != nil {
 		return nil, err
 	}
@@ -84,7 +84,7 @@ func (s *PluginRepositoryService) OnlineNavigationChildren(ctx context.Context, 
 		s.logInvalidOnlineNavigation(libraryID, manifest.ID, err)
 		return nil, err
 	}
-	return normalized, nil
+	return s.projectOnlineArtwork(ctx, connection.PluginID, connection.ID, normalized)
 }
 
 func (s *PluginRepositoryService) logInvalidOnlineNavigation(libraryID, pluginID string, err error) {

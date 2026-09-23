@@ -62,6 +62,8 @@ Emby 不作为文件数据源展示，而进入独立“播放器管理”工作
 
 Player 现已通过独立 `ServerDataSource` 接入 Server 媒体目录。用户首次在 Player 输入 Server 用户名和密码，Server 只在该次验证后签发可撤销的 `omc_player_` device token；数据库仅保存 token 与设备 ID 的不可逆摘要，Player 密码不持久化，device token 进入 Player provider-specific 安全凭据库。`/api/v1/player/*` 使用独立 Bearer 中间件并注册在浏览器 Origin/CSRF 边界之外，Bearer 不能进入 Cookie 管理 API；停用用户、重置密码、同设备重新登录、登出或显式撤销都会使对应令牌失效。Player 专用 DTO 只返回安全媒体库、作品、版本和身份投影，不返回绝对路径、115 provider ID、Cookie、Emby API Key、signed STRM URL 或上游临时地址。
 
+Player 图片契约在 `/api/v1/player` 的 device Bearer 边界内交付：catalog/详情作品沿用 `poster_url`、`backdrop_url`，新增最多八张 `still_urls`；`people[].profile_url`、`versions[].poster_url/backdrop_url/still_url/episode_still_url` 与历史 `episode_still_url` 均由当前 TMDB 快照安全图片身份生成 `/api/v1/player/discovery/images/tmdb/:token`。历史中的 Server 作品海报和背景也由 Server 当前快照重建，忽略客户端上传的外部图片；Emby/Jellyfin 自身图片仍由其服务器提供。浏览器管理端继续使用 Cookie 边界上的 `/api/v1/discovery/images/...`；媒体库及分类封面继续沿用现有受控静态资源路由。
+
 Player 的观看历史、收藏和合集现由 Server 提供可选的多设备持久层，同时保留 Player 本地数据库作为离线后备。历史增量合并和分页读取、收藏及手工合集全部按 device token 对应用户隔离；媒体操作只接受可重新解析到当前可见 catalog work 的不透明标识。电影识别快照额外保存 TMDB `belongs_to_collection` 的 ID、名称和安全图片文件标识，首次成功扫库会在同一事务内建立自动合集，后续完整扫描幂等补齐并清除已离库的 TMDB 自动成员，partial 扫描只增不删；同一作品多版本只计一次，至少两部不同电影时才对用户显示。自动对账不修改手工合集或手工成员，系统合集返回时仍按用户的媒体库权限过滤。
 
 Server 的 Notify 阶段以 `MediaLibrary.content_revision` 和持久 `media_library_changes` 为权威边界：完整扫描或人工识别修正只在真实 catalog/metadata 变化时推进一次 revision；需要 STRM/NFO/JPG 或 cleanup 的变更先保持 pending，匹配的当前 artifact generation 成功后才转为 ready。ready 变更同时、互不等待地推进所有启用 Emby/Jellyfin 目标的 desired revision，并唤醒 Player 长轮询。`media_server_refresh` Job 只保存 target ID，按目标合并并在执行时读取最新 revision、手动 generation 和加密 Connection；认证/配置错误安全失败，网络不可用/限流走有界重试，重启后恢复。Player 使用 device Bearer 请求 `GET /api/v1/player/media-changes?cursor=...&wait_seconds=12`，持久 cursor 补偿断线；历史过旧返回 `resync_required`，响应不含路径、provider/upstream ID、凭据或播放地址。
@@ -69,6 +71,8 @@ Server 的 Notify 阶段以 `MediaLibrary.content_revision` 和持久 `media_lib
 Player 通过同一个受 Bearer 保护的 entry stream endpoint 播放 Server 媒体，但 Server 按 Storage 类型安全分流：本地条目从注册 Storage 根和媒体库相对根逐段校验，拒绝越界、symlink、junction/Reparse Point 与目录后直接提供 GET/HEAD/Range 文件流，绝对路径不进入 DTO、错误或日志；已生成 STRM 的 115 条目不读取 `.strm` 文本，也不经过 Emby，而是再次校验 active managed STRM artifact，复用 `SignedProxyService.ResolveArtifactForClient` 解析当前设备的短期 115 地址并返回 302。Player Windows/Android 原生播放桥只把 Bearer 发给 Server origin，跨 origin 跳转前删除 Authorization、Cookie 和其它私有 Header，同时保留 Range。Player 媒体 DTO 还从持久化 TMDB 快照投影原始标题、评分、时长、类型、导演、编剧、演员、IMDb/TMDB ID 与有界背景图身份；旧快照没有图片数组时回退现有单张背景。Server 与 Player 直连 Emby 的聚合去重使用 TMDB 作品身份及 `MediaArtifact.OpaqueID` 精确版本身份；Emby 实例仅以规范化 `SystemId` 的不可逆指纹判断，同名、同地址或不同认证方式均不作为相等依据。配置同步和多设备设置/进度同步不属于这一接入切片，连接 Server 不会自动导入或上传 Player 数据源配置。
 
 Server 管理的本地、115 与插件在线媒体库遵循“索引所有者生成封面”。物理库从仍有当前 Entry、与页面实际 `library ID + category + media kind` 分类一致且带有效 TMDB 海报/背景快照的 distinct 识别记录选择候选；低置信结果即使在整理工作流中仍为 `unrecognized`，只要该条目已经按快照归类并有安全图片路径，也不能被封面查询错误丢弃。插件通过 `library.artwork_candidates` 只返回稳定媒体 ID 和连接绑定的 Host asset UUID。Server 最多选择 9 项并按媒体与图片去重；成功解码不足 9 张时确定性循环补齐九个槽位，再按 `315426987` 顺序、三列 `-15.8°` 旋转、410×610 单元生成 1920×1080 的风格 3 JPEG，这与参考插件先补齐 `1.jpg`～`9.jpg` 的语义一致。生成键只用于复用，Player 看到的 `artworkRevision` 和路径摘要必须是实际 JPEG bytes 的 SHA-256；候选、上游 URL、Cookie 和 asset UUID 不进入 DTO。动态封面 URL 使用 15 分钟量化时间桶的短时 HMAC，响应为 private 短缓存；恶意超大解码尺寸、签名篡改、过期或缓存缺失均安全失败并继续使用静态兜底图。
+
+在线插件 feed、search、detail、history 及导航响应中的外部图片 URL 在 Server 边界替换为 `/api/v1/player/artwork/:opaque`；注册时绑定当前启用的插件包 generation、连接和已批准的 `network.http` 域名，读取时再次验证这些状态。图片代理使用 Host 的 HTTPS、公共 IP/DNS、跳转与禁用环境代理控制，并只返回最多 5 MiB 的 JPEG/PNG/WebP/AVIF 有效图片；上游 URL、查询令牌、Cookie 和原始错误不会进入 Player DTO。图片引用在同一进程内稳定、最多存活 15 分钟；Player 图片缓存保存已获取的字节，失效引用需要刷新媒体响应。
 
 Server 同时已实现独立的 `MediaClassificationProfile`：它保存版本化的 movie/tv 逻辑分类规则，提供受控管理页、严格校验、复制、乐观 revision 和纯 Go matcher，供 `MediaLibrary` 选择。内置 `default-v1` 与 Player v1 默认分类语义一致，但 Server 不读取或执行 Player 配置。Profile 自身不选择 Storage 或执行文件写入；MediaLibrary 将 Profile 与最终存储边界、排序、转移/冲突策略及命名模板组合起来。下载任务选择媒体库后快照整套路由，先用该 Profile 给 qBittorrent 预分类，完成后再由独立 Transfer Job 入库。
 
@@ -1425,6 +1429,10 @@ POST   /api/v1/system/update/check           # system.admin；检查固定官方
 PATCH  /api/v1/system/update/settings        # system.admin；CAS 更新 beta/stable 通道
 POST   /api/v1/system/update/install         # system.admin；校验、替换、重启、健康检查与回滚
 
+# ====== Player 图片（独立 device Bearer，不能使用管理端 Cookie） ======
+GET    /api/v1/player/discovery/images/{provider}/{token} # discovery.read 或 media_libraries.read
+GET    /api/v1/player/artwork/{opaque}                    # media_libraries.read，在线插件图片
+
 # ====== 配置同步 (Player ↔ Server) ======
 POST   /api/v1/sync/push                     # Player推送数据源配置
 GET    /api/v1/sync/pull                     # Player拉取Server配置
@@ -1433,6 +1441,18 @@ GET    /api/v1/sync/status                   # 同步状态
 # ====== WebSocket ======
 WS     /ws/events                            # 实时事件推送
 ```
+
+#### Player 图片响应契约
+
+| 响应位置 | 图片字段 | 来源与访问路径 |
+| --- | --- | --- |
+| catalog 作品、手工/自动合集 | `poster_url`、`backdrop_url` | Server 根据安全 TMDB 图片身份提供 `/api/v1/player/discovery/images/tmdb/{token}` |
+| catalog 详情 | `still_urls`（最多 8 张）、`people[].profile_url` | 同上；无安全图片身份时省略或返回空值 |
+| catalog 播放版本 | `poster_url`、`backdrop_url`、`still_url`、`episode_still_url` | 同上；集剧照来自对应季集快照，版本海报/背景沿用作品图片 |
+| Server 观看历史 | `poster_url`、`backdrop_url`、`episode_still_url` | Server 使用权威图片身份重建，不信任客户端提交的图片 URL |
+| 在线插件导航、feed、搜索、详情、历史 | `posterUrl`、`backdropUrl` 等插件图片字段 | Server 将获准的 HTTPS 上游地址换成 `/api/v1/player/artwork/{opaque}`；无权限或不安全时删除该图片字段 |
+
+这些地址是相对 Server origin 的受保护引用。Player 通过原生请求带 device Bearer 获取，不向 TMDB 或插件图片域名直连；Emby/Jellyfin 的图片仍由对应媒体服务器提供。浏览器管理端继续使用 Cookie 认证的 `/api/v1/discovery/images/{provider}/{token}`。插件图片引用由当前运行时短期保管，过期或 Server 重启后客户端应刷新媒体 DTO；缓存图片副本可供离线展示。图片代理限制上游网络权限、公共 IP、跳转、MIME、魔数与 5 MiB 响应大小，不向 Player 暴露原始 URL、查询令牌或请求 Header。插件媒体库卡片的现有封面资源路径不受此 DTO 转换影响。
 
 ### 16.2 WebSocket 事件
 

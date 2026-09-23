@@ -63,6 +63,7 @@ type PlayerMediaPerson struct {
 	Role        string `json:"role,omitempty"`
 	Character   string `json:"character,omitempty"`
 	ProfilePath string `json:"profile_path,omitempty"`
+	ProfileURL  string `json:"profile_url,omitempty"`
 }
 
 type PlayerMediaItem struct {
@@ -90,6 +91,7 @@ type PlayerMediaItem struct {
 	PosterURL       string              `json:"poster_url,omitempty"`
 	BackdropURL     string              `json:"backdrop_url,omitempty"`
 	StillPaths      []string            `json:"still_paths,omitempty"`
+	StillURLs       []string            `json:"still_urls,omitempty"`
 	WorkIdentity    PlayerMediaIdentity `json:"work_identity"`
 	FileCount       int64               `json:"file_count"`
 	SeasonCount     int64               `json:"season_count"`
@@ -120,9 +122,13 @@ type PlayerMediaVersion struct {
 	Episode          *int      `json:"episode,omitempty"`
 	Overview         string    `json:"overview,omitempty"`
 	StillPath        string    `json:"still_path,omitempty"`
+	StillURL         string    `json:"still_url,omitempty"`
 	PosterPath       string    `json:"poster_path,omitempty"`
+	PosterURL        string    `json:"poster_url,omitempty"`
 	BackdropPath     string    `json:"backdrop_path,omitempty"`
+	BackdropURL      string    `json:"backdrop_url,omitempty"`
 	EpisodeStillPath string    `json:"episode_still_path,omitempty"`
+	EpisodeStillURL  string    `json:"episode_still_url,omitempty"`
 	AirDate          string    `json:"air_date,omitempty"`
 	RuntimeMinutes   int       `json:"runtime_minutes,omitempty"`
 	Rating           float64   `json:"rating,omitempty"`
@@ -378,6 +384,7 @@ func (s *MediaLibraryService) PlayerCatalogDetail(ctx context.Context, actor Act
 	if item.Kind == "series" {
 		episodeMetadata = s.playerEpisodeMetadata(ctx, source, entries)
 	}
+	imageClient := s.catalogImageClientTx(s.db)
 	versions := make([]PlayerMediaVersion, 0, len(entries))
 	versionLabels := playerVersionLabels(entries)
 	for _, entry := range entries {
@@ -435,7 +442,7 @@ func (s *MediaLibraryService) PlayerCatalogDetail(ctx context.Context, actor Act
 			episodeStillPath = safeTMDBImagePath(episodeSnapshot.StillPath)
 			displaySubtitle = playerHistoryEpisodeSubtitle(season, episode, episodeTitle)
 		}
-		versions = append(versions, PlayerMediaVersion{ID: entry.ID, ItemToken: itemToken, HistoryIdentity: historyIdentity, Title: title, DisplayTitle: displayTitle, DisplaySubtitle: displaySubtitle, SeriesTitle: seriesTitle, EpisodeTitle: episodeTitle, Season: season, Episode: episode, Overview: episodeSnapshot.Overview, StillPath: episodeStillPath, PosterPath: item.PosterPath, BackdropPath: item.BackdropPath, EpisodeStillPath: episodeStillPath, AirDate: episodeSnapshot.AirDate, RuntimeMinutes: episodeSnapshot.RuntimeMinutes, Rating: episodeSnapshot.VoteAverage, Size: entry.Size, ModifiedAt: entry.ModifiedAt, Playable: playable, StreamPath: streamPath, DeliveryKind: deliveryKind, ExactIdentity: exactIdentity})
+		versions = append(versions, PlayerMediaVersion{ID: entry.ID, ItemToken: itemToken, HistoryIdentity: historyIdentity, Title: title, DisplayTitle: displayTitle, DisplaySubtitle: displaySubtitle, SeriesTitle: seriesTitle, EpisodeTitle: episodeTitle, Season: season, Episode: episode, Overview: episodeSnapshot.Overview, StillPath: episodeStillPath, StillURL: playerCatalogImageURLWithClient(imageClient, episodeStillPath, "w780"), PosterPath: item.PosterPath, PosterURL: item.PosterURL, BackdropPath: item.BackdropPath, BackdropURL: item.BackdropURL, EpisodeStillPath: episodeStillPath, EpisodeStillURL: playerCatalogImageURLWithClient(imageClient, episodeStillPath, "w780"), AirDate: episodeSnapshot.AirDate, RuntimeMinutes: episodeSnapshot.RuntimeMinutes, Rating: episodeSnapshot.VoteAverage, Size: entry.Size, ModifiedAt: entry.ModifiedAt, Playable: playable, StreamPath: streamPath, DeliveryKind: deliveryKind, ExactIdentity: exactIdentity})
 		versions[len(versions)-1].VersionName = versionName
 	}
 	sort.SliceStable(versions, func(i, j int) bool {
@@ -615,16 +622,20 @@ func (s *MediaLibraryService) playerMediaItemTx(tx *gorm.DB, reader *CatalogRead
 		Kind: item.Kind, ReleaseYear: item.ReleaseYear, Overview: snapshot.Overview, Tagline: snapshot.Tagline,
 		Rating: snapshot.VoteAverage, RuntimeMinutes: snapshot.RuntimeMinutes, Genres: genreNames(snapshot.Genres),
 		Directors: personNames(snapshot.Directors), Writers: personNames(snapshot.Writers), Cast: personNames(snapshot.Cast),
-		People: playerMediaPeople(snapshot),
+		People: playerMediaPeople(snapshot, imageClient),
 		TMDBID: snapshot.TMDBID, IMDbID: snapshot.IMDbID, PosterPath: safeTMDBImagePath(snapshot.PosterPath), BackdropPath: safeTMDBImagePath(snapshot.BackdropPath),
-		PosterURL: catalogImageURLWithClient(imageClient, snapshot.PosterPath, "w500"), BackdropURL: catalogImageURLWithClient(imageClient, snapshot.BackdropPath, "w1280"),
-		StillPaths: snapshotStillPaths(snapshot), WorkIdentity: identity, FileCount: item.FileCount,
+		PosterURL: playerCatalogImageURLWithClient(imageClient, snapshot.PosterPath, "w500"), BackdropURL: playerCatalogImageURLWithClient(imageClient, snapshot.BackdropPath, "w1280"),
+		StillPaths: snapshotStillPaths(snapshot), StillURLs: playerStillURLs(imageClient, snapshotStillPaths(snapshot)), WorkIdentity: identity, FileCount: item.FileCount,
 		SeasonCount: item.SeasonCount, EpisodeCount: item.EpisodeCount, ModifiedAt: item.ModifiedAt,
 		CategoryName: item.CategoryName, MatchStatus: item.MatchStatus,
 	}, nil
 }
 
-func playerMediaPeople(snapshot tmdb.Snapshot) []PlayerMediaPerson {
+func playerMediaPeople(snapshot tmdb.Snapshot, imageClients ...*tmdb.Client) []PlayerMediaPerson {
+	var imageClient *tmdb.Client
+	if len(imageClients) > 0 {
+		imageClient = imageClients[0]
+	}
 	result := make([]PlayerMediaPerson, 0, len(snapshot.Directors)+len(snapshot.Writers)+len(snapshot.Cast))
 	seen := make(map[string]struct{}, cap(result))
 	appendPeople := func(people []tmdb.Person, defaultRole string) {
@@ -645,7 +656,7 @@ func playerMediaPeople(snapshot tmdb.Snapshot) []PlayerMediaPerson {
 				continue
 			}
 			seen[key] = struct{}{}
-			result = append(result, PlayerMediaPerson{TMDBID: person.TMDBID, Name: name, Role: role, Character: strings.TrimSpace(person.Character), ProfilePath: safeTMDBImagePath(person.ProfilePath)})
+			result = append(result, PlayerMediaPerson{TMDBID: person.TMDBID, Name: name, Role: role, Character: strings.TrimSpace(person.Character), ProfilePath: safeTMDBImagePath(person.ProfilePath), ProfileURL: playerCatalogImageURLWithClient(imageClient, person.ProfilePath, "w300")})
 		}
 	}
 	appendPeople(snapshot.Directors, "Director")
@@ -691,6 +702,16 @@ func personNames(people []tmdb.Person) []string {
 		result = append(result, name)
 		if len(result) == 100 {
 			break
+		}
+	}
+	return result
+}
+
+func playerStillURLs(imageClient *tmdb.Client, paths []string) []string {
+	result := make([]string, 0, len(paths))
+	for _, path := range paths {
+		if imageURL := playerCatalogImageURLWithClient(imageClient, path, "w1280"); imageURL != "" {
+			result = append(result, imageURL)
 		}
 	}
 	return result

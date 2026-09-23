@@ -50,6 +50,7 @@ type PlayerHistoryChange struct {
 	PosterPath       string   `json:"poster_path,omitempty"`
 	BackdropPath     string   `json:"backdrop_path,omitempty"`
 	EpisodeStillPath string   `json:"episode_still_path,omitempty"`
+	EpisodeStillURL  string   `json:"episode_still_url,omitempty"`
 	Position         float64  `json:"position"`
 	Duration         *float64 `json:"duration,omitempty"`
 	Completed        bool     `json:"completed"`
@@ -165,8 +166,9 @@ func (s *PlayerHistoryService) SyncContext(ctx context.Context, actor Actor, cur
 		return PlayerHistorySyncResult{}, err
 	}
 	result := PlayerHistorySyncResult{Cursor: cursor, Changes: make([]PlayerHistoryChange, 0, len(rows)), Rejected: rejected}
+	imageClient := s.playerHistoryImageClient()
 	for _, row := range rows {
-		result.Changes = append(result.Changes, playerHistoryChangeDTO(row))
+		result.Changes = append(result.Changes, playerHistoryArtworkDTO(playerHistoryChangeDTO(row), imageClient))
 		if row.ClientUpdatedAt > latestAllowed {
 			// Preserve legacy ordering/merge facts. Old clients cannot safely
 			// apply a lower timestamp as a corrective delta.
@@ -251,8 +253,9 @@ func (s *PlayerHistoryService) List(actor Actor, page, pageSize int, sourceKind 
 		return PlayerHistoryPage{}, err
 	}
 	result := PlayerHistoryPage{List: make([]PlayerHistoryChange, 0, len(rows)), Total: total, Page: page, PageSize: pageSize, HasMore: int64(offset+len(rows)) < total}
+	imageClient := s.playerHistoryImageClient()
 	for _, row := range rows {
-		result.List = append(result.List, playerHistoryChangeDTO(row))
+		result.List = append(result.List, playerHistoryArtworkDTO(playerHistoryChangeDTO(row), imageClient))
 	}
 	return result, nil
 }
@@ -260,9 +263,10 @@ func (s *PlayerHistoryService) List(actor Actor, page, pageSize int, sourceKind 
 func (s *PlayerHistoryService) listAvailableServerHistory(actor Actor, page, pageSize int) (PlayerHistoryPage, error) {
 	wantedOffset := (page - 1) * pageSize
 	result := PlayerHistoryPage{List: make([]PlayerHistoryChange, 0, pageSize), Page: page, PageSize: pageSize}
+	imageClient := s.playerHistoryImageClient()
 	err := s.visitAvailableHistory(actor, true, false, func(change PlayerHistoryChange) bool {
 		if result.Total >= int64(wantedOffset) && len(result.List) < pageSize {
-			result.List = append(result.List, change)
+			result.List = append(result.List, playerHistoryArtworkDTO(change, imageClient))
 		}
 		result.Total++
 		return true
@@ -331,10 +335,11 @@ func (s *PlayerHistoryService) ServerContinueWatching(actor Actor, limit int, li
 		return nil, false, appError(CodeInvalidRequest, "继续观看数量无效", nil)
 	}
 	items := make([]PlayerHistoryChange, 0, limit+1)
+	imageClient := s.playerHistoryImageClient()
 	err := s.visitAvailableHistory(actor, true, true, func(change PlayerHistoryChange) bool {
 		id, _ := strconv.ParseUint(change.LibraryID, 10, 32)
 		if _, allowed := libraries[uint(id)]; allowed {
-			items = append(items, change)
+			items = append(items, playerHistoryArtworkDTO(change, imageClient))
 		}
 		return len(items) <= limit
 	})
@@ -1005,6 +1010,22 @@ func normalizePlayerHistoryChange(change PlayerHistoryChange) (PlayerHistoryChan
 
 func validHistoryEpisodeFacts(season, episode *int) bool {
 	return (season == nil || *season >= 0 && *season <= 10000) && (episode == nil || *episode > 0 && *episode <= 100000)
+}
+
+func (s *PlayerHistoryService) playerHistoryImageClient() *tmdb.Client {
+	if s == nil || s.libraries == nil {
+		return nil
+	}
+	return s.libraries.catalogImageClientTx(s.db)
+}
+
+func playerHistoryArtworkDTO(change PlayerHistoryChange, imageClient *tmdb.Client) PlayerHistoryChange {
+	if change.SourceKind == "server" {
+		change.PosterURL = playerCatalogImageURLWithClient(imageClient, change.PosterPath, "w500")
+		change.BackdropURL = playerCatalogImageURLWithClient(imageClient, change.BackdropPath, "w1280")
+		change.EpisodeStillURL = playerCatalogImageURLWithClient(imageClient, change.EpisodeStillPath, "w780")
+	}
+	return change
 }
 
 func playerHistoryChangeDTO(row models.PlayerPlaybackHistory) PlayerHistoryChange {

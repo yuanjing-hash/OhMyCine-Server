@@ -83,8 +83,8 @@ type BrowserMediaOverview struct {
 func browserMediaItem(item PlayerMediaItem) BrowserMediaItem {
 	return BrowserMediaItem{
 		LibraryID: item.LibraryID, WorkID: item.ID, Title: item.Title, Kind: item.Kind,
-		ReleaseYear: item.ReleaseYear, Rating: item.Rating, PosterURL: item.PosterURL,
-		BackdropURL: item.BackdropURL, SeasonCount: item.SeasonCount,
+		ReleaseYear: item.ReleaseYear, Rating: item.Rating, PosterURL: browserArtworkURL(item.PosterURL),
+		BackdropURL: browserArtworkURL(item.BackdropURL), SeasonCount: item.SeasonCount,
 		EpisodeCount: item.EpisodeCount, CategoryName: item.CategoryName,
 		ModifiedAt: item.ModifiedAt,
 	}
@@ -102,7 +102,7 @@ func browserCollection(item PlayerCollectionSummary) BrowserCollectionSummary {
 	return BrowserCollectionSummary{
 		Revision: item.Revision,
 		ID:       item.ID, Name: item.Name, Kind: item.Kind, Source: item.Source,
-		ItemCount: item.ItemCount, PosterURL: item.PosterURL, BackdropURL: item.BackdropURL,
+		ItemCount: item.ItemCount, PosterURL: browserArtworkURL(item.PosterURL), BackdropURL: browserArtworkURL(item.BackdropURL),
 	}
 }
 

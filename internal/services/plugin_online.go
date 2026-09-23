@@ -172,7 +172,7 @@ func (s *PluginRepositoryService) OnlineLibraries(actor Actor) ([]PluginOnlineLi
 }
 
 func (s *PluginRepositoryService) OnlineNavigation(ctx context.Context, actor Actor, libraryID string) (json.RawMessage, error) {
-	_, _, manifest, err := s.onlineLibrary(libraryID)
+	_, connection, manifest, err := s.onlineLibrary(libraryID)
 	if err != nil {
 		return nil, err
 	}
@@ -185,7 +185,7 @@ func (s *PluginRepositoryService) OnlineNavigation(ctx context.Context, actor Ac
 		s.logInvalidOnlineNavigation(libraryID, manifest.ID, err)
 		return nil, err
 	}
-	return normalized, nil
+	return s.projectOnlineArtwork(ctx, connection.PluginID, connection.ID, normalized)
 }
 
 func (s *PluginRepositoryService) OnlineFeed(ctx context.Context, actor Actor, libraryID, routeKey, cursor, refreshSession string) (json.RawMessage, error) {
@@ -235,7 +235,7 @@ func (s *PluginRepositoryService) onlineFeed(ctx context.Context, actor Actor, l
 		var cached models.PluginFeedCache
 		err := s.db.Where("library_id = ? AND route_key = ? AND cursor_key = ? AND refresh_session = ? AND expires_at > ?", library.ID, routeKey, cursorKey, refreshSession, time.Now().UTC()).First(&cached).Error
 		if err == nil && json.Valid([]byte(cached.ResponseJSON)) {
-			return json.RawMessage(cached.ResponseJSON), nil
+			return s.projectOnlineArtwork(ctx, connection.PluginID, connection.ID, json.RawMessage(cached.ResponseJSON))
 		}
 		if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, err
@@ -260,7 +260,7 @@ func (s *PluginRepositoryService) onlineFeed(ctx context.Context, actor Actor, l
 	// Cleanup is bounded and best-effort; cache failure must not hide a valid
 	// provider response from the Player.
 	_ = s.db.Where("expires_at < ?", now.Add(-time.Hour)).Delete(&models.PluginFeedCache{}).Error
-	return append(json.RawMessage(nil), normalized...), nil
+	return s.projectOnlineArtwork(ctx, connection.PluginID, connection.ID, normalized)
 }
 
 func (s *PluginRepositoryService) OnlineSearch(ctx context.Context, actor Actor, libraryID, query, cursor string) (json.RawMessage, error) {
@@ -268,16 +268,24 @@ func (s *PluginRepositoryService) OnlineSearch(ctx context.Context, actor Actor,
 	if !safeOnlineText(query, maxOnlineQueryBytes) || !safeOptionalOnlineText(cursor, maxOnlineIdentifierBytes) {
 		return nil, appError(CodeInvalidRequest, "在线媒体搜索请求无效", nil)
 	}
-	return s.invokeOnline(ctx, actor, libraryID, contract.CapabilitySiteSearch, map[string]any{
+	raw, err := s.invokeOnline(ctx, actor, libraryID, contract.CapabilitySiteSearch, map[string]any{
 		"connectionId": libraryID, "query": query, "cursor": emptyAsNil(cursor),
 	})
+	if err != nil {
+		return nil, err
+	}
+	return s.projectOnlineArtworkForLibrary(ctx, libraryID, raw)
 }
 
 func (s *PluginRepositoryService) OnlineDetail(ctx context.Context, actor Actor, libraryID, itemID string) (json.RawMessage, error) {
 	if !safeOnlineText(itemID, maxOnlineIdentifierBytes) {
 		return nil, appError(CodeInvalidRequest, "在线媒体标识无效", nil)
 	}
-	return s.invokeOnline(ctx, actor, libraryID, contract.CapabilitySiteDetail, map[string]any{"connectionId": libraryID, "itemId": itemID})
+	raw, err := s.invokeOnline(ctx, actor, libraryID, contract.CapabilitySiteDetail, map[string]any{"connectionId": libraryID, "itemId": itemID})
+	if err != nil {
+		return nil, err
+	}
+	return s.projectOnlineArtworkForLibrary(ctx, libraryID, raw)
 }
 
 func (s *PluginRepositoryService) OnlinePlayback(ctx context.Context, actor Actor, libraryID, itemID, segmentID, versionID, variantID string) (json.RawMessage, error) {
@@ -403,6 +411,9 @@ func (s *PluginRepositoryService) OnlineHistory(ctx context.Context, actor Actor
 				historyLibraryID = libraryID
 			}
 			annotated, err := annotateHistoryLibrary(item, historyLibraryID)
+			if err == nil {
+				annotated, err = s.projectOnlineArtwork(ctx, connection.PluginID, connection.ID, annotated)
+			}
 			if err == nil {
 				page.List = append(page.List, annotated)
 				if len(page.List) == pageSize {

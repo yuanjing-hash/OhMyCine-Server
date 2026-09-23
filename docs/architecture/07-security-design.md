@@ -118,6 +118,8 @@ Player 首次连接 Server 时提交用户名、密码、随机设备 ID 和安�
 
 device token 只允许进入 `/api/v1/player/*` 的独立 Bearer 路由组，不能作为 Cookie session、不能获得 CSRF 豁免，也不能进入普通管理 API。每次认证重新解析当前用户和权限；默认 30 天 idle、180 天 absolute 上限，并在同设备重新登录、登出、显式设备撤销、用户停用或密码重置时立即撤销。设备列表只返回记录 ID、安全名称、客户端类型和生命周期时间，不返回 token/hash、IP、User-Agent 或原始设备 ID。
 
+Server 媒体目录的图片使用同一 device Bearer：`GET /api/v1/player/discovery/images/:provider/:token` 对 `media_libraries.read` 或 `discovery.read` 开放，服务层继续验证 TMDB/Douban 图片身份；`GET /api/v1/player/artwork/:opaque` 只对 `media_libraries.read` 开放。插件图片使用 Host 注册的短期 opaque 引用，注册和获取时都重检插件启用状态、package generation、连接与已批准网络域名；Host 校验公共 DNS/拨号 IP 和每次跳转，禁用环境代理，图片响应限制 MIME、签名和 5 MiB，图片 opaque 引用不能通过通用在线播放资产路由绕开这些检查。不得将插件上游 URL、鉴权 Header、Cookie、查询令牌或错误正文返回给 Player 或写入日志。
+
 Player 115 直连播放仍按 entry/version ID 请求 Server；Server 在每次 GET/HEAD 中重新校验媒体库权限和 active managed artifact 后才返回短期 302。Windows/Android 的 loopback 播放桥仅向 Server origin 发送 device Bearer，跨 origin 重定向必须删除 Authorization、Cookie 和 provider-private Header，禁止将 device token 转发给 115/CDN。播放 URL、Header、signed STRM URL 和上游临时地址只存在于瞬时原生播放边界，不进入路由、配置、播放历史、日志或诊断。
 
 Player 媒体变更使用同一 `/api/v1/player/*` Bearer 边界上的 12 秒有界长轮询，不使用 query token、Cookie、WebSocket subprotocol 或管理端 Job WebSocket。每次 poll 都重新认证设备/用户并按当前媒体库权限过滤；cursor 只是可持久化的断线恢复提示，不授予访问权。事件只包含逻辑媒体库 ID、content revision、受控 kind、时间和新 cursor；禁止包含绝对路径、115/provider ID、Emby/Jellyfin upstream ID/API Key、signed STRM、临时 URL 或原始错误。ready outbox 有界保留，过期 cursor 返回 `resync_required`，不为离线设备创建无界逐设备队列。

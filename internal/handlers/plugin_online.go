@@ -16,6 +16,7 @@ import (
 
 type pluginAssetGateway interface {
 	OpenAsset(context.Context, string, string, string) (*hostapi.AssetStream, error)
+	OpenArtwork(context.Context, string) ([]byte, string, error)
 }
 
 type pluginConnectionAssetGateway interface {
@@ -193,6 +194,31 @@ func (a *API) PlayerOnlineHistory(c *gin.Context) {
 		return
 	}
 	success(c, http.StatusOK, page)
+}
+
+func (a *API) PlayerArtwork(c *gin.Context) {
+	actor, _ := middleware.ActorFrom(c)
+	if !actor.Can(authz.PermissionMediaLibrariesRead) {
+		writeError(c, a.log, &services.AppError{Code: services.CodePermissionDenied, Message: "无权读取媒体图片"})
+		return
+	}
+	if a.pluginAssets == nil {
+		writeError(c, a.log, &services.AppError{Code: services.CodePluginRuntimeUnavailable, Message: "在线媒体图片服务不可用"})
+		return
+	}
+	body, contentType, err := a.pluginAssets.OpenArtwork(c.Request.Context(), c.Param("opaque"))
+	if err != nil {
+		appCode, message := services.CodePluginOnlineLibraryUnavailable, "在线媒体图片暂时不可用"
+		switch hostapi.ErrorCode(err) {
+		case "plugin_asset_reference_invalid", "plugin_asset_expired":
+			appCode, message = services.CodePluginAssetExpired, "在线媒体图片已过期，请刷新页面"
+		}
+		writeError(c, a.log, &services.AppError{Code: appCode, Message: message, Cause: err})
+		return
+	}
+	c.Header("Cache-Control", "private, max-age=600")
+	c.Header("X-Content-Type-Options", "nosniff")
+	c.Data(http.StatusOK, contentType, body)
 }
 
 func (a *API) PlayerOnlineAsset(c *gin.Context) {

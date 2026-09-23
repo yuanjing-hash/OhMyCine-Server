@@ -39,6 +39,10 @@ type PluginAssetFetcher interface {
 	FetchPackage(context.Context, contract.GitHubRepository, string) ([]byte, error)
 }
 
+type PluginArtworkGateway interface {
+	RegisterArtwork(context.Context, string, string, string) (string, error)
+}
+
 type PluginRuntimeHost interface {
 	Validate(context.Context, string) error
 	Start(context.Context, string, string, uint64) error
@@ -61,6 +65,10 @@ func WithPluginRuntimeHost(host PluginRuntimeHost) PluginServiceOption {
 	return func(service *PluginRepositoryService) { service.runtime = host }
 }
 
+func WithPluginArtworkGateway(gateway PluginArtworkGateway) PluginServiceOption {
+	return func(service *PluginRepositoryService) { service.artwork = gateway }
+}
+
 func WithPluginCredentialStore(store *credential.Store) PluginServiceOption {
 	return func(service *PluginRepositoryService) { service.credentials = store }
 }
@@ -77,6 +85,7 @@ type PluginRepositoryService struct {
 	version        string
 	assets         PluginAssetFetcher
 	runtime        PluginRuntimeHost
+	artwork        PluginArtworkGateway
 	credentials    *credential.Store
 	pluginRoot     string
 	lifecycleMu    sync.Mutex

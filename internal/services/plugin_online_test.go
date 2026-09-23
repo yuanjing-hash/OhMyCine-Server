@@ -49,14 +49,15 @@ func TestPluginOnlineLibraryPlaybackHistoryAndDisableBoundary(t *testing.T) {
 	assetID := uuid.NewString()
 	runtime := &onlinePluginRuntime{responses: map[string][]byte{
 		"site.navigation":            []byte(`[{"id":"recommended","title":"推荐","pageType":"feed","routeKey":"recommended"}]`),
-		"site.feed":                  []byte(`[{"id":"recommended","title":"推荐","layout":"hero","refreshable":true,"homeEligible":true,"items":[{"work":{"id":"video-1","title":"视频","kind":"video","identity":{"scheme":"fixture.video","value":"video-1"}},"actions":["favorite.add"]}]}]`),
+		"site.feed":                  []byte(`[{"id":"recommended","title":"推荐","layout":"hero","refreshable":true,"homeEligible":true,"items":[{"work":{"id":"video-1","title":"视频","kind":"video","identity":{"scheme":"fixture.video","value":"video-1"},"posterUrl":"https://login.example.test/poster.jpg?token=hidden"},"actions":["favorite.add"]}]}]`),
 		"media.playback":             []byte(`{"workId":"BV1234567890","segmentId":"cid:1","versionId":"v1","variantId":"qn:80","variants":[],"assets":[{"kind":"progressive","urlRef":"` + assetID + `"}],"delivery":"server-gateway","danmaku":[{"id":"dm","label":"弹幕","urlRef":"` + assetID + `"}]}`),
 		"site.interaction":           []byte(`{"accepted":true,"state":true}`),
-		"site.history":               []byte(`{"list":[{"work":{"id":"BV1234567890","title":"测试视频","kind":"video","identity":{"scheme":"bilibili.bvid","value":"BV1234567890"}}}],"cursor":"123","hasMore":true}`),
+		"site.history":               []byte(`{"list":[{"work":{"id":"BV1234567890","title":"测试视频","kind":"video","identity":{"scheme":"bilibili.bvid","value":"BV1234567890"},"backdropUrl":"https://login.example.test/backdrop.jpg?token=hidden"}}],"cursor":"123","hasMore":true}`),
 		"playback.progress_sync":     []byte(`{"accepted":true,"remote":true}`),
 		"library.artwork_candidates": []byte(`[{"id":"video-1","assetRef":"` + assetID + `"}]`),
 	}}
 	service.runtime = runtime
+	service.artwork = &testOnlineArtworkGateway{}
 
 	manifestJSON := strings.ReplaceAll(`{
       "schemaVersion":1,"id":"org.ohmycine.online-test","name":"在线测试","description":"fixture",
@@ -122,6 +123,9 @@ func TestPluginOnlineLibraryPlaybackHistoryAndDisableBoundary(t *testing.T) {
 	}
 	if err != nil || json.Unmarshal(feed, &feedSections) != nil || len(feedSections) != 1 || feedSections[0].RefreshSession == "" {
 		t.Fatalf("feed=%s parsed=%+v err=%v", feed, feedSections, err)
+	}
+	if strings.Contains(string(feed), "login.example.test") || strings.Contains(string(feed), "token=hidden") || !strings.Contains(string(feed), "/api/v1/player/artwork/") {
+		t.Fatalf("feed leaked provider artwork URL: %s", feed)
 	}
 	if _, err := service.OnlineFeed(context.Background(), actor, connection.ID, "recommended", "", feedSections[0].RefreshSession); err != nil || feedCalls != 1 {
 		t.Fatalf("feed cache calls=%d err=%v", feedCalls, err)
@@ -209,6 +213,9 @@ func TestPluginOnlineLibraryPlaybackHistoryAndDisableBoundary(t *testing.T) {
 	history, err := service.OnlineHistory(context.Background(), actor, "", "", 24)
 	if err != nil || len(history.List) != 2 || !history.HasMore || history.Cursor == "" {
 		t.Fatalf("history=%+v err=%v", history, err)
+	}
+	if strings.Contains(string(history.List[0]), "login.example.test") || !strings.Contains(string(history.List[0]), "/api/v1/player/artwork/") {
+		t.Fatalf("history leaked provider artwork URL: %s", history.List[0])
 	}
 	var item map[string]any
 	if err := json.Unmarshal(history.List[0], &item); err != nil || item["libraryId"] != connection.ID {

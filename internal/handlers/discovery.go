@@ -38,6 +38,9 @@ func (a *API) DiscoveryMediaSearch(c *gin.Context) {
 		writeError(c, a.log, err)
 		return
 	}
+	if strings.HasPrefix(c.FullPath(), "/api/v1/player/") {
+		result = services.PlayerDiscoverySearchArtwork(result)
+	}
 	success(c, http.StatusOK, result)
 }
 
@@ -47,6 +50,9 @@ func (a *API) DiscoveryDetail(c *gin.Context) {
 	if err != nil {
 		writeError(c, a.log, err)
 		return
+	}
+	if strings.HasPrefix(c.FullPath(), "/api/v1/player/") {
+		result = services.PlayerDiscoveryDetailArtwork(result)
 	}
 	success(c, http.StatusOK, result)
 }
@@ -62,6 +68,9 @@ func (a *API) DiscoveryMediaCoverage(c *gin.Context) {
 	if err != nil {
 		writeError(c, a.log, err)
 		return
+	}
+	if strings.HasPrefix(c.FullPath(), "/api/v1/player/") {
+		result = services.PlayerMediaCoverageArtwork(result)
 	}
 	success(c, http.StatusOK, result)
 }

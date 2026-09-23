@@ -71,21 +71,22 @@ func (e *Error) PermissionDenied() bool { return e.Denied }
 type Resolver func(context.Context, string) ([]net.IPAddr, error)
 
 type Host struct {
-	browserRequest func(context.Context, string, string, string, *http.Request) (*http.Response, bool, error)
-	browserCommit  func(context.Context, models.PluginConnection)
-	db             *gorm.DB
-	credentials    *credential.Store
-	log            zerolog.Logger
-	client         *http.Client
-	resolve        Resolver
-	now            func() time.Time
-	eventsMu       sync.Mutex
-	eventSeq       uint64
-	events         map[string][]eventRecord
-	assetsMu       sync.Mutex
-	assets         map[string]Asset
-	capturesMu     sync.Mutex
-	captures       map[string]credentialCapture
+	browserRequest   func(context.Context, string, string, string, *http.Request) (*http.Response, bool, error)
+	browserCommit    func(context.Context, models.PluginConnection)
+	db               *gorm.DB
+	credentials      *credential.Store
+	log              zerolog.Logger
+	client           *http.Client
+	resolve          Resolver
+	now              func() time.Time
+	eventsMu         sync.Mutex
+	eventSeq         uint64
+	events           map[string][]eventRecord
+	assetsMu         sync.Mutex
+	assets           map[string]Asset
+	artworkNamespace uuid.UUID
+	capturesMu       sync.Mutex
+	captures         map[string]credentialCapture
 }
 
 type Option func(*Host)
@@ -104,11 +105,12 @@ func WithResolver(resolver Resolver) Option     { return func(host *Host) { host
 func New(db *gorm.DB, credentials *credential.Store, log zerolog.Logger, options ...Option) *Host {
 	host := &Host{
 		db: db, credentials: credentials, log: log,
-		resolve:  net.DefaultResolver.LookupIPAddr,
-		now:      time.Now,
-		events:   make(map[string][]eventRecord),
-		assets:   make(map[string]Asset),
-		captures: make(map[string]credentialCapture),
+		resolve:          net.DefaultResolver.LookupIPAddr,
+		now:              time.Now,
+		events:           make(map[string][]eventRecord),
+		assets:           make(map[string]Asset),
+		artworkNamespace: uuid.New(),
+		captures:         make(map[string]credentialCapture),
 	}
 	for _, option := range options {
 		option(host)
@@ -244,6 +246,7 @@ type Asset struct {
 	ExpiresAt         time.Time
 	Body              []byte
 	ContentType       string
+	Artwork           bool
 }
 
 // AssetStream is the only supported bridge from a registered opaque asset to
@@ -392,6 +395,10 @@ func (host *Host) validateAssetOwner(asset Asset) error {
 // streaming and intentionally have no media-size cap; registration, caller
 // authentication and Range requests are bounded at their own boundaries.
 func (host *Host) OpenAsset(ctx context.Context, reference, method, rangeHeader string) (*AssetStream, error) {
+	return host.openAsset(ctx, reference, method, rangeHeader, false)
+}
+
+func (host *Host) openAsset(ctx context.Context, reference, method, rangeHeader string, allowArtwork bool) (*AssetStream, error) {
 	method = strings.ToUpper(strings.TrimSpace(method))
 	if method != http.MethodGet && method != http.MethodHead {
 		return nil, denied("plugin_asset_method_denied", nil)
@@ -402,6 +409,9 @@ func (host *Host) OpenAsset(ctx context.Context, reference, method, rangeHeader 
 	asset, err := host.ResolveAsset(reference)
 	if err != nil {
 		return nil, err
+	}
+	if asset.Artwork && !allowArtwork {
+		return nil, denied("plugin_artwork_reference_denied", nil)
 	}
 	authorization, err := host.authorization(asset.PluginID)
 	if err != nil {

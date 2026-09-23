@@ -74,7 +74,10 @@ func New(cfg config.Config, api *handlers.API, auth *services.AuthService, log z
 	playerProtected.HEAD("/media-entries/:id/stream", api.PlayerMediaEntryStream)
 	playerProtected.GET("/discovery/media-search", middleware.RequirePermission(authz.PermissionDiscoveryRead), api.DiscoveryMediaSearch)
 	playerProtected.GET("/discovery/details/:provider/:mediaType/:providerID", middleware.RequirePermission(authz.PermissionDiscoveryRead), api.DiscoveryDetail)
-	playerProtected.GET("/discovery/images/:provider/:token", middleware.RequirePermission(authz.PermissionDiscoveryRead), api.DiscoveryImage)
+	// Discovery.Image accepts either discovery.read or media_libraries.read;
+	// catalog artwork must remain available to read-only library devices.
+	playerProtected.GET("/discovery/images/:provider/:token", api.DiscoveryImage)
+	playerProtected.GET("/artwork/:opaque", middleware.RequirePermission(authz.PermissionMediaLibrariesRead), api.PlayerArtwork)
 	playerProtected.GET("/discovery/media/:mediaType/:tmdbID/coverage", middleware.RequirePermission(authz.PermissionDiscoveryRead), middleware.RequirePermission(authz.PermissionMediaLibrariesRead), api.DiscoveryMediaCoverage)
 	playerProtected.GET("/discovery/media/:mediaType/:tmdbID/acquisition", middleware.RequirePermission(authz.PermissionDiscoveryRead), api.MediaAcquisition)
 	playerProtected.GET("/discovery/acquisitions", middleware.RequirePermission(authz.PermissionDiscoveryRead), api.MediaAcquisitions)

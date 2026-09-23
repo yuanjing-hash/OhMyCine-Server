@@ -275,7 +275,7 @@ func main() {
 	pluginHost.SetCapabilityHost(pluginHostAPI)
 	browserManager := browsercompanion.New()
 	defer browserManager.Close()
-	pluginRepositories := services.NewPluginRepositoryService(db, audit, pluginrepository.NewGitHubClient(nil), logManager.Logger("plugin", "repository"), services.WithPluginRoot(cfg.PluginDirectory), services.WithPluginRuntimeHost(pluginHost), services.WithPluginCredentialStore(credentialStore), services.WithPluginBrowser(browserManager))
+	pluginRepositories := services.NewPluginRepositoryService(db, audit, pluginrepository.NewGitHubClient(nil), logManager.Logger("plugin", "repository"), services.WithPluginRoot(cfg.PluginDirectory), services.WithPluginRuntimeHost(pluginHost), services.WithPluginArtworkGateway(pluginHostAPI), services.WithPluginCredentialStore(credentialStore), services.WithPluginBrowser(browserManager))
 	pluginHostAPI.SetBrowserRequest(pluginRepositories.BrowserRequest)
 	pluginHostAPI.SetBrowserCommit(pluginRepositories.BrowserCredentialCommitted)
 	browserContext, stopBrowserMonitor := context.WithCancel(context.Background())

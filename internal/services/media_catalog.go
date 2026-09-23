@@ -604,6 +604,28 @@ func catalogImageURLWithClient(client *tmdb.Client, identity, size string) strin
 	return proxyDiscoveryImage("tmdb", upstream)
 }
 
+// Player device tokens are deliberately accepted only below /api/v1/player.
+// Browser artwork URLs stay on the separate cookie-authenticated route.
+func playerCatalogImageURLWithClient(client *tmdb.Client, identity, size string) string {
+	return playerArtworkURL(catalogImageURLWithClient(client, identity, size))
+}
+
+func playerArtworkURL(value string) string {
+	const browserPrefix = "/api/v1/discovery/images/"
+	if !strings.HasPrefix(value, browserPrefix) {
+		return value
+	}
+	return "/api/v1/player/discovery/images/" + strings.TrimPrefix(value, browserPrefix)
+}
+
+func browserArtworkURL(value string) string {
+	const playerPrefix = "/api/v1/player/discovery/images/"
+	if !strings.HasPrefix(value, playerPrefix) {
+		return value
+	}
+	return "/api/v1/discovery/images/" + strings.TrimPrefix(value, playerPrefix)
+}
+
 func (s *MediaLibraryService) catalogImageURL(identity, size string) string {
 	identity = safeTMDBImagePath(identity)
 	if identity == "" || s.metadata == nil {
