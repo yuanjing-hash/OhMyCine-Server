@@ -155,7 +155,7 @@ export interface PTRecognitionEpisodeFacts {
   count?: number
 }
 
-export const ptRecognitionEngineVersion = 'nextgen-domain-v11'
+export const ptRecognitionEngineVersion = 'nextgen-domain-v12'
 
 export interface PTRecognitionResult {
   engine_version: string

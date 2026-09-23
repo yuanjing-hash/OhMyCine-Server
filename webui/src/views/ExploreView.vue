@@ -3,6 +3,8 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api } from '@/api/client'
 import { Permissions } from '@/auth/generated-permissions'
+import SharePreviewDialog from '@/components/SharePreviewDialog.vue'
+import type { ShareSelection } from '@/share-preview'
 import DownloadRouteTargetPicker from '@/components/DownloadRouteTargetPicker.vue'
 import { previewDownloadRoutes, routeTargetByID, type DownloadRoutePreview } from '@/download-routes'
 import { formatBytes } from '@/downloads'
@@ -50,6 +52,8 @@ const activeSearchSiteIDs = ref<number[]>([])
 const downloaders = ref<DownloaderSummary[]>([])
 const libraries = ref<MediaLibraryDetail[]>([])
 const downloadDialog = ref<TorrentSearchResult | null>(null)
+const sharePreviewDialog = ref<TorrentSearchResult | null>(null)
+const shareSelection = ref<ShareSelection | null>(null)
 const downloadForm = ref({ downloaderID: '', mediaLibraryID: 0, priority: 0 })
 const downloadSiteID = ref<number | undefined>()
 const routePreview = ref<DownloadRoutePreview | null>(null)
@@ -307,10 +311,20 @@ async function loadDownloadOptions() {
   if (!enabledDownloaders.value.some(item => item.id === downloadForm.value.downloaderID)) downloadForm.value.downloaderID = enabledDownloaders.value[0]?.id ?? ''
 }
 
-async function openDownload(item: TorrentSearchResult) {
+async function openSharePreview(item: TorrentSearchResult) {
+ try { await loadDownloadOptions(); sharePreviewDialog.value = item } catch (reason) { notify(message(reason), 'error') }
+}
+async function acceptShareSelection(selection: ShareSelection) {
+ const item = sharePreviewDialog.value
+ if (!item) return
+ sharePreviewDialog.value = null
+ await openDownload(item, selection)
+}
+async function openDownload(item: TorrentSearchResult, selection: ShareSelection | null = null) {
+  shareSelection.value = selection
   downloadDialog.value = item
   downloadSiteID.value = groups.value.find(group => group.items.some(candidate => candidate.token === item.token))?.site_id
-  downloadForm.value = { downloaderID: '', mediaLibraryID: 0, priority: 0 }
+  downloadForm.value = { downloaderID: selection?.downloaderID ?? '', mediaLibraryID: 0, priority: 0 }
   try { await loadDownloadOptions(); await loadRoutePreview() }
   catch (reason) { notify(message(reason), 'error') }
 }
@@ -329,7 +343,7 @@ async function loadRoutePreview() {
       downloader_id: downloadForm.value.downloaderID,
       source_kind: downloadDialog.value.source_kind === '115_share' ? '115_share' : 'torrent',
       site_id: downloadSiteID.value,
-      expected_bytes: downloadDialog.value.size_bytes ?? undefined,
+      expected_bytes: shareSelection.value?.totalSize ?? downloadDialog.value.size_bytes ?? undefined,
     }, controller.signal)
     if (!controller.signal.aborted) routePreview.value = preview
   } catch (reason) {
@@ -361,10 +375,12 @@ async function submitDownload() {
   const item = downloadDialog.value
   if (!item || !downloadForm.value.downloaderID) { notify('请选择已启用的下载器', 'warning'); return }
   if (!selectedRoute.value?.enabled || !selectedLibrary.value) { notify('请选择一条 Server 已确认可执行的入库路线', 'warning'); return }
+  if (shareSelection.value && (shareSelection.value.downloaderID !== downloadForm.value.downloaderID || Date.parse(shareSelection.value.expiresAt) <= Date.now())) { notify('预览已过期或下载器已变化，请重新预览分享', 'warning'); return }
   submitting.value = true
   try {
-    const result = await api<{ id: string }>(discoveryDownloadsPath, { method: 'POST', body: JSON.stringify({ result_token: item.token, downloader_id: downloadForm.value.downloaderID, media_library_id: downloadForm.value.mediaLibraryID, priority: downloadForm.value.priority }) })
-    notify(`下载任务已进入统一队列：${result.id}`, 'success')
+    const result = await api<{ id: string; selection_tasks?: { id: string }[]; selection_pending?: number; selection_error?: string }>(discoveryDownloadsPath, { method: 'POST', body: JSON.stringify({ preview_token: shareSelection.value?.previewToken, selected_entry_tokens: shareSelection.value?.entryTokens, result_token: item.token, downloader_id: downloadForm.value.downloaderID, media_library_id: downloadForm.value.mediaLibraryID, priority: downloadForm.value.priority }) })
+    if (result.selection_pending) { notify(result.selection_error ?? '部分任务未提交，请重试', 'warning'); return }
+    notify(result.selection_tasks?.length ? `已创建 ${result.selection_tasks.length} 个入库任务，各文件独立识别和处理` : `下载任务已进入统一队列：${result.id}`, 'success')
     downloadDialog.value = null
   } catch (reason) { notify(message(reason), 'error') }
   finally { submitting.value = false }
@@ -548,7 +564,7 @@ onBeforeUnmount(() => {
                 <p v-if="recognitionErrors[entry.item.token]" class="semantic-warning mb-0 mt-3 p-3 text-xs">{{ recognitionErrors[entry.item.token] }}</p>
               </div>
             </div>
-            <footer class="mt-4 flex flex-wrap justify-end gap-2 border-t border-[var(--border)] pt-4"><button class="btn-secondary" :disabled="recognizingTokens.includes(entry.item.token)" @click="recognizeResult(entry.item)">{{ recognizingTokens.includes(entry.item.token) ? '检测中…' : '检测' }}</button><button class="btn-secondary" :disabled="!auth.can(Permissions.DownloadsCreate)" @click="openManualRecognition(entry.item)">手动检测</button><button class="btn-primary" :disabled="!auth.can(Permissions.DownloadsCreate)" @click="openDownload(entry.item)">{{ entry.item.source_kind === '115_share' ? '转存入库' : '入库' }}</button></footer>
+            <footer class="mt-4 flex flex-wrap justify-end gap-2 border-t border-[var(--border)] pt-4"><button v-if="entry.item.source_kind === '115_share'" class="btn-secondary" :disabled="!auth.can(Permissions.DownloadsCreate)" @click="openSharePreview(entry.item)">预览分享链接内部内容</button><button class="btn-secondary" :disabled="recognizingTokens.includes(entry.item.token)" @click="recognizeResult(entry.item)">{{ recognizingTokens.includes(entry.item.token) ? '检测中…' : '检测' }}</button><button class="btn-secondary" :disabled="!auth.can(Permissions.DownloadsCreate)" @click="openManualRecognition(entry.item)">手动检测</button><button class="btn-primary" :disabled="!auth.can(Permissions.DownloadsCreate)" @click="openDownload(entry.item)">{{ entry.item.source_kind === '115_share' ? '转存入库' : '入库' }}</button></footer>
           </article>
         </div>
         <footer v-if="activeGroup?.status === 'success'" class="panel flex items-center justify-center gap-3"><button class="btn-secondary" :disabled="searching || activeGroup.page <= 1" @click="previousPage(activeGroup)">上一页</button><span class="text-sm">{{ activeGroup.site_name }} · 第 {{ activeGroup.page }} 页</span><button class="btn-secondary" :disabled="searching || !activeGroup.has_next" @click="nextPage(activeGroup)">下一页</button></footer>
@@ -596,16 +612,18 @@ onBeforeUnmount(() => {
       </form>
     </div>
 
+    <SharePreviewDialog v-if="sharePreviewDialog" :result-token="sharePreviewDialog.token" :title="sharePreviewDialog.title" :downloaders="downloaders" @close="sharePreviewDialog = null" @select="acceptShareSelection" />
     <div v-if="downloadDialog" class="modal-backdrop fixed inset-0 z-50 flex items-center justify-center p-4" @click.self="!submitting && (downloadDialog = null)">
       <form class="panel w-full max-w-xl" role="dialog" aria-modal="true" aria-labelledby="pt-download-title" @submit.prevent="submitDownload">
         <div class="flex items-start justify-between gap-3"><div><h2 id="pt-download-title" class="m-0 text-xl">{{ downloadDialog.source_kind === '115_share' ? '转存到媒体库' : '创建下载任务' }}</h2><p class="page-description mt-1 line-clamp-2 text-sm">{{ downloadDialog.title }}</p></div><button class="btn-secondary" type="button" :disabled="submitting" @click="downloadDialog = null">关闭</button></div>
         <div class="mt-5 grid gap-4 sm:grid-cols-2">
-          <div><label class="label">下载器</label><select v-model="downloadForm.downloaderID" class="input" required><option value="" disabled>请选择</option><option v-for="item in enabledDownloaders" :key="item.id" :value="item.id">{{ item.name }} · {{ item.type === 'pan115_offline' ? '115 网盘' : item.type }}</option></select></div>
+          <div><label class="label">下载器</label><select v-model="downloadForm.downloaderID" class="input" required :disabled="!!shareSelection"><option value="" disabled>请选择</option><option v-for="item in enabledDownloaders" :key="item.id" :value="item.id">{{ item.name }} · {{ item.type === 'pan115_offline' ? '115 网盘' : item.type }}</option></select></div>
           <p v-if="downloadDialog.source_kind === '115_share' && !enabledDownloaders.length" class="semantic-warning sm:col-span-2">请先在下载器设置中启用支持分享转存的 115 下载器，并配置网盘账号和接收目录。</p>
           <DownloadRouteTargetPicker v-model="downloadForm.mediaLibraryID" :preview="routePreview" :loading="routePreviewLoading" />
           <div class="sm:col-span-2"><label class="label">队列优先级</label><input v-model.number="downloadForm.priority" class="input" type="number" min="-100" max="100" /></div>
         </div>
         <div v-if="selectedLibrary && selectedRoute" class="semantic-inset mt-4 grid gap-3 p-4 text-sm sm:grid-cols-2"><div><span class="text-subtle block text-xs">最终媒体库</span><strong>{{ selectedLibrary.name }}</strong></div><div><span class="text-subtle block text-xs">分类与入库</span><strong>{{ selectedRoute.route_label }} · {{ selectedLibrary.profile_name }} · {{ selectedLibrary.transfer_mode }}</strong></div></div>
+        <p v-if="shareSelection" class="semantic-inset mt-4 p-3 text-sm">本次仅转存所选 {{ shareSelection.fileCount }} 个文件 · {{ formatBytes(shareSelection.totalSize) }}。更换账号或文件范围请重新预览。</p>
         <p class="text-subtle mt-4 text-xs">{{ downloadDialog.source_kind === '115_share' ? '分享内容将转存到 115 下载器目录，随后自动识别、整理并入库。' : '确认后获取资源，自动识别、整理并入库。' }}</p>
         <div class="mt-5 flex justify-end gap-3"><button class="btn-secondary" type="button" :disabled="submitting" @click="downloadDialog = null">取消</button><button class="btn-primary" :disabled="submitting || routePreviewLoading || !downloadForm.downloaderID || !selectedRoute?.enabled || !selectedLibrary">{{ submitting ? '正在提交…' : downloadDialog.source_kind === '115_share' ? '确认转存' : '确认并入队' }}</button></div>
       </form>

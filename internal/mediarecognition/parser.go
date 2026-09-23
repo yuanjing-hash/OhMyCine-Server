@@ -15,6 +15,7 @@ import (
 )
 
 var (
+	postTitlePrefixPattern          = regexp.MustCompile(`^(?:名称|名稱|资源名称|資源名稱|影片名称|片名)\s*[:：]\s*([\[【])`)
 	videoExtensionPattern           = regexp.MustCompile(`(?i)\.(mkv|mp4|m4v|avi|mov|wmv|ts|m2ts|mts|webm|flv|iso|vob)$`)
 	episodePattern                  = regexp.MustCompile(`(?i)(?:^|[^[:alnum:]])S\s*0*([0-9]{1,2})\s*E\s*0*([0-9]{1,5})(?:[^[:alnum:]]|$)|(?:^|[^[:alnum:]])0*([0-9]{1,2})x0*([0-9]{1,5})(?:[^[:alnum:]]|$)`)
 	standaloneEpisodePattern        = regexp.MustCompile(`(?i)(?:^|[^[:alnum:]])(?:e|ep|episode)\s*0*([0-9]{1,5})(?:[^[:alnum:]]|$)`)
@@ -277,6 +278,13 @@ func collectNamedSources(input InputFacts) []namedSource {
 		add(prepared.Value, "profile:"+boundedCode(prepared.Source))
 	}
 	add(input.PackageName, "package")
+	// TG posts may carry an independent original release name in a bracket.
+	for _, segment := range bracketSegmentPattern.FindAllStringSubmatch(input.PackageName, -1) {
+		value := firstNonEmptyDomain(segment[1], segment[2])
+		if yearTokenPattern.MatchString(value) && techTokenPattern.MatchString(value) && strings.Contains(value, ".") && !strings.ContainsFunc(value, func(r rune) bool { return unicode.Is(unicode.Han, r) }) {
+			add(value, "release_alias")
+		}
+	}
 
 	type sizedFile struct {
 		path string
@@ -402,6 +410,7 @@ func analyzeName(source namedSource, now time.Time) parsedName {
 
 func normalizeFilename(value string) string {
 	value = norm.NFC.String(strings.TrimSpace(value))
+	value = postTitlePrefixPattern.ReplaceAllString(value, "$1")
 	value = strings.Map(func(r rune) rune {
 		if unicode.IsControl(r) {
 			return ' '

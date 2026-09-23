@@ -312,6 +312,13 @@ func validShareItemName(name string) bool {
 }
 
 func (c *Client) InspectShare(ctx context.Context, raw string) (cloud.ShareSnapshot, error) {
+	return c.InspectShareDirectory(ctx, raw, "0")
+}
+
+func (c *Client) InspectShareDirectory(ctx context.Context, raw, directoryID string) (cloud.ShareSnapshot, error) {
+	if !shareItemIDPattern.MatchString(directoryID) {
+		return cloud.ShareSnapshot{}, cloud.Error(cloud.CodeShareInvalid, false, errors.New("invalid share directory"))
+	}
 	shareCode, receiveCode, err := parseShareLink(raw)
 	if err != nil {
 		return cloud.ShareSnapshot{}, err
@@ -326,11 +333,12 @@ func (c *Client) InspectShare(ctx context.Context, raw string) (cloud.ShareSnaps
 	if pageLimit > maxShareTopLevelItems {
 		pageLimit = maxShareTopLevelItems
 	}
+	complete := false
 	for offset := 0; offset < maxShareTopLevelItems; {
 		var page *pan115sdk.ShareSnapResp
 		callErr := c.waitAndCall(ctx, c.offlineRate, func() error {
 			var sdkErr error
-			page, sdkErr = sdk.GetShareSnapWithUA(pan115sdk.UA115Browser, shareCode, receiveCode, "0", pan115sdk.QueryLimit(pageLimit), pan115sdk.QueryOffset(offset))
+			page, sdkErr = sdk.GetShareSnapWithUA(pan115sdk.UA115Browser, shareCode, receiveCode, directoryID, pan115sdk.QueryLimit(pageLimit), pan115sdk.QueryOffset(offset))
 			return sdkErr
 		})
 		if callErr != nil {
@@ -347,7 +355,7 @@ func (c *Client) InspectShare(ctx context.Context, raw string) (cloud.ShareSnaps
 		}
 		for _, item := range page.Data.List {
 			id, name := strings.TrimSpace(item.FileID), strings.TrimSpace(item.FileName)
-			if !shareItemIDPattern.MatchString(id) || !validShareItemName(name) {
+			if !shareItemIDPattern.MatchString(id) || !validShareItemName(name) || int64(item.Size) < 0 {
 				return cloud.ShareSnapshot{}, cloud.Error(cloud.CodeResponseInvalid, false, errors.New("115 returned an invalid share item"))
 			}
 			if _, exists := seenItemIDs[id]; exists {
@@ -360,12 +368,29 @@ func (c *Client) InspectShare(ctx context.Context, raw string) (cloud.ShareSnaps
 			}
 		}
 		pageItems := len(page.Data.List)
-		if pageItems == 0 || pageItems < pageLimit || (page.Data.Count > 0 && len(result.Items) >= page.Data.Count) {
+
+		if page.Data.Count < 0 || (page.Data.Count > 0 && len(result.Items) > page.Data.Count) {
+			return cloud.ShareSnapshot{}, cloud.Error(cloud.CodeResponseInvalid, false, nil)
+		}
+		if page.Data.Count > 0 {
+			if len(result.Items) == page.Data.Count {
+				complete = true
+				break
+			}
+			if pageItems == 0 {
+				return cloud.ShareSnapshot{}, cloud.Error(cloud.CodeResponseInvalid, false, nil)
+			}
+		} else if pageItems < pageLimit {
+			complete = true
 			break
 		}
+
 		offset += pageItems
 	}
-	if len(result.Items) == 0 {
+	if !complete {
+		return cloud.ShareSnapshot{}, cloud.Error(cloud.CodeShareTooLarge, false, nil)
+	}
+	if len(result.Items) == 0 && directoryID == "0" {
 		return cloud.ShareSnapshot{}, cloud.Error(cloud.CodeShareEmpty, false, errors.New("share is empty"))
 	}
 	return result, nil

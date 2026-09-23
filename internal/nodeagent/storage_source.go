@@ -187,7 +187,7 @@ func (a *Agent) storageSourceCredential(ctx context.Context, serverID string, in
 	if grant.NodeID != a.config.NodeID || grant.TaskID != input.TaskID || grant.OperationKey != input.OperationKey || grant.ResourceKind != nodeprotocol.ResourceKindStorage || grant.ResourceID != input.StorageID {
 		return nodeprotocol.CredentialGrant{}, nodeprotocol.StorageSourceCredential{}, errors.New("node_credential_binding_mismatch")
 	}
-	requireURI := run.OutputRootID == "" && (plan.SourceKind == nodeprotocol.StorageSourceKindPan115Share || run.ProviderTaskID == "")
+	requireURI := run.OutputRootID == "" && (nodeprotocol.StorageSourceIsShare(plan.SourceKind) || run.ProviderTaskID == "")
 	var requiredActions []string
 	switch plan.SourceKind {
 	case nodeprotocol.StorageSourceKindPan115OfflineMagnet:
@@ -198,7 +198,7 @@ func (a *Agent) storageSourceCredential(ctx context.Context, serverID string, in
 		if run.OutputRootID != "" {
 			requiredActions = []string{nodeprotocol.StorageSourceGrantRead}
 		}
-	case nodeprotocol.StorageSourceKindPan115Share:
+	case nodeprotocol.StorageSourceKindPan115Share, nodeprotocol.StorageSourceKindPan115ShareSelected:
 		if run.OutputRootID == "" {
 			requiredActions = []string{nodeprotocol.StorageSourceGrantShareInspect, nodeprotocol.StorageSourceGrantShareReceive, nodeprotocol.StorageSourceGrantRead}
 		} else {
@@ -280,7 +280,7 @@ func (a *Agent) runStorageSource(ctx context.Context, serverID string, input nod
 		a.pauseStorageSource(ctx, serverID, input, response, errors.New(nodeprotocol.ErrorCapabilityMissing))
 		return
 	}
-	if plan.SourceKind == nodeprotocol.StorageSourceKindPan115Share {
+	if nodeprotocol.StorageSourceIsShare(plan.SourceKind) {
 		if run.OutputRootID == "" {
 			if err := a.materializeStorageSourceShare(ctx, serverID, input, plan, run, credential, driver, guard); err != nil {
 				a.pauseStorageSource(ctx, serverID, input, response, err)
@@ -425,6 +425,25 @@ func (a *Agent) runStorageSource(ctx context.Context, serverID string, input nod
 const storageSourceShareItemLimit = 1000
 
 func (a *Agent) materializeStorageSourceShare(ctx context.Context, serverID string, input nodeprotocol.StorageSourceActionRequest, plan nodeprotocol.StorageSourcePlan, run StorageSourceRun, credential nodeprotocol.StorageSourceCredential, driver storageSourceDriver, guard func(context.Context, string) error) error {
+	if plan.SourceKind == nodeprotocol.StorageSourceKindPan115ShareSelected {
+		for _, action := range []string{nodeprotocol.StorageSourceGrantShareInspect, nodeprotocol.StorageSourceGrantShareReceive, nodeprotocol.StorageSourceGrantRead} {
+			if err := guard(ctx, action); err != nil {
+				return err
+			}
+		}
+		browse, ok := driver.(cloud.ShareBrowseDriver)
+		if !ok {
+			return errors.New(nodeprotocol.ErrorCapabilityMissing)
+		}
+		source, err := cloud.DecodeSelectedShareSource(credential.SourceURI)
+		if err != nil {
+			return err
+		}
+		if err := cloud.ReceiveSelectedShare(ctx, browse, source.URL, source.Selection, plan.OfflineDestinationID); err != nil {
+			return err
+		}
+		return a.store.UpdateStorageSourceRun(ctx, serverID, input.OperationKey, input.PlanDigest, nodeprotocol.StorageSourceEnumerating, "", plan.OfflineDestinationID, a.now())
+	}
 	if err := guard(ctx, nodeprotocol.StorageSourceGrantShareInspect); err != nil {
 		return err
 	}
@@ -632,7 +651,7 @@ func validateStorageSourceRoot(plan nodeprotocol.StorageSourcePlan, run StorageS
 	if root.ID != run.OutputRootID || root.Name == "" {
 		return errors.New(nodeprotocol.ErrorReconciliationNeeded)
 	}
-	if plan.SourceKind == nodeprotocol.StorageSourceKindPan115Share {
+	if nodeprotocol.StorageSourceIsShare(plan.SourceKind) {
 		if !root.IsDir || root.ID != plan.OfflineDestinationID {
 			return errors.New(nodeprotocol.ErrorReconciliationNeeded)
 		}

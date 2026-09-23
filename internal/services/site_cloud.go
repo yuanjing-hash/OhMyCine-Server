@@ -2,6 +2,8 @@ package services
 
 import (
 	"encoding/json"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/mediarecognition"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/site/builtin"
 	"strings"
 
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
@@ -52,4 +54,19 @@ func cloudConfigJSON(cfg *sitepkg.CloudConfig) string {
 	}
 	raw, _ := json.Marshal(cfg)
 	return string(raw)
+}
+
+// Search context does not override explicit theatrical release evidence in a share.
+func siteResultMediaTypeHint(siteType, title, hint string) string {
+	hint = safeRecognitionMediaTypeHint(hint)
+	if siteType == builtin.SiteTypeCloud {
+		if parsed, err := mediarecognition.Parse(mediarecognition.InputFacts{PackageName: title, SourceKind: mediarecognition.SourceDownload}); err == nil {
+			for _, evidence := range parsed.TypeEvidence {
+				if evidence.Code == "franchise_movie_index" {
+					return "movie"
+				}
+			}
+		}
+	}
+	return hint
 }

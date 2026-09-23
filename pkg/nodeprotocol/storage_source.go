@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud"
 	"net/url"
 	"regexp"
 	"strings"
@@ -15,6 +16,7 @@ const (
 	OperationKindStorageSourceMaterialize = "storage_source_materialize"
 	StorageSourceKindPan115OfflineMagnet  = "pan115_offline_magnet"
 	StorageSourceKindPan115Share          = "pan115_share"
+	StorageSourceKindPan115ShareSelected  = "pan115_share_selected_v1"
 	// StorageSourceKindPan115OfflineURL is a route-preview value only in v1.
 	// A plain URL has no stable provider task identity, so Node plans reject it
 	// instead of discovering the idempotency gap after an external mutation.
@@ -124,7 +126,11 @@ func (plan StorageSourcePlan) Validate() error {
 // exist in the protocol before they are safe to execute, but only true values
 // may be frozen into a Node operation plan.
 func StorageSourceKindSupported(kind string) bool {
-	return kind == StorageSourceKindPan115OfflineMagnet || kind == StorageSourceKindPan115Share
+	return kind == StorageSourceKindPan115OfflineMagnet || StorageSourceIsShare(kind)
+}
+
+func StorageSourceIsShare(kind string) bool {
+	return kind == StorageSourceKindPan115Share || kind == StorageSourceKindPan115ShareSelected
 }
 
 var storageShareCodePattern = regexp.MustCompile(`^[A-Za-z0-9_-]{4,128}$`)
@@ -133,6 +139,18 @@ var storageShareCodePattern = regexp.MustCompile(`^[A-Za-z0-9_-]{4,128}$`)
 // used to make a provider submission recoverable. Display names, trackers and
 // a rotated 115 receive code do not change the underlying source identity.
 func CanonicalStorageSourceIdentity(kind, rawURI string) (string, error) {
+	if kind == StorageSourceKindPan115ShareSelected {
+		source, err := cloud.DecodeSelectedShareSource(rawURI)
+		if err != nil {
+			return "", err
+		}
+		identity, err := CanonicalStorageSourceIdentity(StorageSourceKindPan115Share, source.URL)
+		if err != nil {
+			return "", err
+		}
+		digest, err := source.Selection.Digest()
+		return identity + ":" + digest, err
+	}
 	rawURI = strings.TrimSpace(rawURI)
 	if rawURI == "" || len(rawURI) > 8192 || strings.ContainsAny(rawURI, "\x00\r\n") {
 		return "", errors.New("node_storage_source_uri_not_idempotent")
@@ -259,10 +277,10 @@ func ValidateStorageSourceCredential(credential StorageSourceCredential, require
 		return errors.New("node_storage_source_credential_invalid")
 	}
 	uri := strings.TrimSpace(credential.SourceURI)
-	if requireURI && (uri == "" || len(uri) > 8192 || strings.ContainsAny(uri, "\x00\r\n")) {
+	if requireURI && (uri == "" || len(uri) > cloud.MaxSelectedShareSourceBytes || strings.ContainsAny(uri, "\x00\r\n")) {
 		return errors.New("node_storage_source_credential_invalid")
 	}
-	if !requireURI && uri != "" && (len(uri) > 8192 || strings.ContainsAny(uri, "\x00\r\n")) {
+	if !requireURI && uri != "" && (len(uri) > cloud.MaxSelectedShareSourceBytes || strings.ContainsAny(uri, "\x00\r\n")) {
 		return errors.New("node_storage_source_credential_invalid")
 	}
 	return nil

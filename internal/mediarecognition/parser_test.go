@@ -663,3 +663,16 @@ func sameOptionalInt(left, right *int) bool {
 	}
 	return *left == *right
 }
+
+func TestParseTGTheatricalPostPreservesTitleYearAndAlias(t *testing.T) {
+	parsed, err := Parse(InputFacts{PackageName: "名称: [LGNB全球顶级封装][名侦探柯南剧场版M13：漆黑的追踪者][BD-REMUX][日语国版7.1源码+台配国语][中日特效字幕+官方中文字幕][MKV][29.50GB][Detective.Conan.The.Raven.Chaser.2009.Bluray.REMUX.1080p.AVC.TrueHD.5.1.17Audio-LGNB@oSpecialCN]"})
+	if err != nil || parsed.SuggestedType != MediaTypeMovie || parsed.Year == nil || *parsed.Year != 2009 {
+		t.Fatalf("parse: %+v %v", parsed, err)
+	}
+	if !strings.Contains(parsed.CanonicalTitle, "漆黑的追踪者") || strings.ContainsAny(parsed.CanonicalTitle, "[]") || strings.Contains(parsed.CanonicalTitle, "名称") {
+		t.Fatalf("dirty title: %s", parsed.CanonicalTitle)
+	}
+	if !queryContains(parsed.Queries, "Detective Conan The Raven Chaser") {
+		t.Fatalf("missing alias: %+v", parsed.Queries)
+	}
+}

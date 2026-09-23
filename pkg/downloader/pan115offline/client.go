@@ -110,6 +110,16 @@ func (c *Client) submitShare(ctx context.Context, request downloader.SubmitReque
 	if err != nil {
 		return downloader.Task{}, err
 	}
+	if request.Source.ShareSelection != nil {
+		browse, ok := c.driver.(cloud.ShareBrowseDriver)
+		if !ok {
+			return downloader.Task{}, downloader.Error("downloader_share_selection_unsupported", false, nil)
+		}
+		if err := cloud.ReceiveSelectedShare(ctx, browse, request.Source.URL, *request.Source.ShareSelection, taskRoot.ID); err != nil {
+			return downloader.Task{}, mapError(err)
+		}
+		return completedDirectoryTask(shareTaskPrefix, taskRoot), nil
+	}
 	hasOutput, err := c.directoryHasChildren(ctx, taskRoot.ID)
 	if err != nil {
 		return downloader.Task{}, err

@@ -128,6 +128,10 @@ func nodeStorageSourceInput(source downloadSourceEnvelope) (string, string, erro
 	case source.Kind == downloadpkg.SourceURL:
 		return "", "", appError(CodeTransferRouteUnsupported, "传输节点首版只支持可稳定恢复的磁力离线任务，不支持普通 HTTP(S) 离线 URL", nil)
 	case source.Kind == downloadpkg.SourcePan115Share:
+		if source.ShareSelection != nil {
+			raw, err := cloudpkg.EncodeSelectedShareSource(uri, *source.ShareSelection)
+			return nodeprotocol.StorageSourceKindPan115ShareSelected, raw, err
+		}
 		return nodeprotocol.StorageSourceKindPan115Share, uri, nil
 	default:
 		return "", "", appError(CodeTransferRouteUnsupported, "当前下载来源不能交给传输节点的 115 下载器", nil)

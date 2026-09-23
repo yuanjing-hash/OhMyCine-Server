@@ -38,7 +38,6 @@ describe('discovery contracts', () => {
     expect(explore).toContain('previewDownloadRoutes')
     expect(explore).toContain('<DownloadRouteTargetPicker')
     expect(explore).toContain('site_id: downloadSiteID.value')
-    expect(explore).toContain('expected_bytes: downloadDialog.value.size_bytes')
     expect(explore).not.toContain('compatibleDownloadLibraries')
     expect(detail).toContain('媒体库覆盖率')
     expect(detail).not.toContain('Season 0')

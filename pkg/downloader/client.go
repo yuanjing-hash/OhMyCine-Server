@@ -45,10 +45,12 @@ type Config struct {
 }
 
 type Source struct {
-	Kind     string
-	URL      string
-	Torrent  []byte
-	Filename string
+	// ShareSelection is internal-only and persisted encrypted by Server.
+	ShareSelection *cloud.ShareSelection
+	Kind           string
+	URL            string
+	Torrent        []byte
+	Filename       string
 	// ProviderItemID is an internal-only adoption source. HTTP input must never
 	// accept it and public DTOs must never expose it.
 	ProviderItemID string

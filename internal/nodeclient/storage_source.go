@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud"
 	"strings"
 	"sync"
 	"time"
@@ -57,7 +58,7 @@ func (c *StorageSourceClient) Test(ctx context.Context) (downloadpkg.Health, err
 	if err != nil {
 		return downloadpkg.Health{}, remoteDownloaderError(err, nodeprotocol.ErrorNodeOffline)
 	}
-	if !health.Capabilities.Has(nodeprotocol.CapabilityPan115Offline) || !health.Capabilities.Has(nodeprotocol.CapabilityPan115Read) || !health.Capabilities.Has(nodeprotocol.CapabilityRangeExport) || c.sourceKind == nodeprotocol.StorageSourceKindPan115Share && !health.Capabilities.Has(nodeprotocol.CapabilityPan115ShareReceive) {
+	if !health.Capabilities.Has(nodeprotocol.CapabilityPan115Offline) || !health.Capabilities.Has(nodeprotocol.CapabilityPan115Read) || !health.Capabilities.Has(nodeprotocol.CapabilityRangeExport) || nodeprotocol.StorageSourceIsShare(c.sourceKind) && !health.Capabilities.Has(nodeprotocol.CapabilityPan115ShareReceive) {
 		return downloadpkg.Health{}, downloadpkg.Error(nodeprotocol.ErrorCapabilityMissing, false, nil)
 	}
 	return downloadpkg.Health{Version: health.AgentVersion}, nil
@@ -295,7 +296,19 @@ func (c *StorageSourceClient) matchesSource(source downloadpkg.Source) bool {
 	if c.sourceKind == nodeprotocol.StorageSourceKindPan115OfflineMagnet {
 		return source.Kind == downloadpkg.SourceURL && strings.TrimSpace(source.URL) == c.sourceURI
 	}
-	return source.Kind == downloadpkg.SourcePan115Share && strings.TrimSpace(source.URL) == c.sourceURI
+	if c.sourceKind == nodeprotocol.StorageSourceKindPan115ShareSelected {
+		if source.Kind != downloadpkg.SourcePan115Share || source.ShareSelection == nil {
+			return false
+		}
+		raw, err := cloud.EncodeSelectedShareSource(source.URL, *source.ShareSelection)
+		if err != nil {
+			return false
+		}
+		a, err := nodeprotocol.StorageSourceContentDigest(c.sourceKind, raw)
+		b, otherErr := nodeprotocol.StorageSourceContentDigest(c.sourceKind, c.sourceURI)
+		return err == nil && otherErr == nil && a == b
+	}
+	return source.ShareSelection == nil && source.Kind == downloadpkg.SourcePan115Share && strings.TrimSpace(source.URL) == c.sourceURI
 }
 
 func (c *StorageSourceClient) storageSourceTask(response nodeprotocol.StorageSourceActionResponse) downloadpkg.Task {

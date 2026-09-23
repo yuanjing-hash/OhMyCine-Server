@@ -401,15 +401,17 @@ func (a *API) TorrentSearchStream(c *gin.Context) { a.PTSearchStream(c) }
 
 func (a *API) CreateDiscoveryDownload(c *gin.Context) {
 	actor, _ := middleware.ActorFrom(c)
-	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 16<<10)
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 128<<10)
 	var payload struct {
-		ResultToken       string `json:"result_token"`
-		DownloaderID      string `json:"downloader_id"`
-		MediaLibraryID    *uint  `json:"media_library_id"`
-		ProfileID         uint   `json:"profile_id"`
-		Priority          int    `json:"priority"`
-		ExpectedTMDBID    *int64 `json:"expected_tmdb_id"`
-		ExpectedMediaType string `json:"expected_media_type"`
+		PreviewToken        string   `json:"preview_token"`
+		SelectedEntryTokens []string `json:"selected_entry_tokens"`
+		ResultToken         string   `json:"result_token"`
+		DownloaderID        string   `json:"downloader_id"`
+		MediaLibraryID      *uint    `json:"media_library_id"`
+		ProfileID           uint     `json:"profile_id"`
+		Priority            int      `json:"priority"`
+		ExpectedTMDBID      *int64   `json:"expected_tmdb_id"`
+		ExpectedMediaType   string   `json:"expected_media_type"`
 	}
 	if err := strictJSON(c, &payload); err != nil {
 		writeError(c, a.log, invalid("种子资源下载参数无效", err))
@@ -425,16 +427,24 @@ func (a *API) CreateDiscoveryDownload(c *gin.Context) {
 			return
 		}
 	}
-	item, err := a.sites.Download(c.Request.Context(), actor, services.SiteDownloadInput{ResultToken: payload.ResultToken, DownloaderID: payload.DownloaderID, MediaLibraryID: payload.MediaLibraryID, ProfileID: payload.ProfileID, Priority: payload.Priority}, middleware.RequestContextFrom(c))
+	item, err := a.sites.Download(c.Request.Context(), actor, services.SiteDownloadInput{PreviewToken: payload.PreviewToken, SelectedEntryTokens: payload.SelectedEntryTokens, ResultToken: payload.ResultToken, DownloaderID: payload.DownloaderID, MediaLibraryID: payload.MediaLibraryID, ProfileID: payload.ProfileID, Priority: payload.Priority}, middleware.RequestContextFrom(c))
 	if err != nil {
 		writeError(c, a.log, err)
 		return
 	}
 	if a.acquisition != nil {
-		if err := a.acquisition.RecordDownload(actor.User.ID, item); err != nil {
-			writeError(c, a.log, err)
-			return
+
+		items := item.SelectionTasks
+		if len(items) == 0 {
+			items = []services.DownloadTaskSummary{item}
 		}
+		for _, task := range items {
+			if err := a.acquisition.RecordDownload(actor.User.ID, task); err != nil {
+				writeError(c, a.log, err)
+				return
+			}
+		}
+
 	}
 	success(c, http.StatusCreated, item)
 }
@@ -497,5 +507,44 @@ func (a *API) OverridePTResultRecognition(c *gin.Context) {
 		writeError(c, a.log, err)
 		return
 	}
+	success(c, http.StatusOK, item)
+}
+
+func (a *API) PreviewSiteShare(c *gin.Context) {
+	actor, _ := middleware.ActorFrom(c)
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 4<<10)
+	var payload struct {
+		ResultToken  string `json:"result_token"`
+		DownloaderID string `json:"downloader_id"`
+	}
+	if err := strictJSON(c, &payload); err != nil {
+		writeError(c, a.log, invalid("分享预览参数无效", err))
+		return
+	}
+	item, err := a.sites.PreviewShare(c.Request.Context(), actor, payload.ResultToken, payload.DownloaderID)
+	if err != nil {
+		writeError(c, a.log, err)
+		return
+	}
+	c.Header("Cache-Control", "no-store")
+	success(c, http.StatusOK, item)
+}
+func (a *API) RecognizeSiteShareEntry(c *gin.Context) {
+	actor, _ := middleware.ActorFrom(c)
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 4<<10)
+	var payload struct {
+		PreviewToken string `json:"preview_token"`
+		EntryToken   string `json:"entry_token"`
+	}
+	if err := strictJSON(c, &payload); err != nil {
+		writeError(c, a.log, invalid("分享文件识别参数无效", err))
+		return
+	}
+	item, err := a.sites.RecognizeShareEntry(c.Request.Context(), actor, payload.PreviewToken, payload.EntryToken)
+	if err != nil {
+		writeError(c, a.log, err)
+		return
+	}
+	c.Header("Cache-Control", "no-store")
 	success(c, http.StatusOK, item)
 }

@@ -12,6 +12,7 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/authz"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud"
 	downloadpkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/downloader"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/metadata/tmdb"
 	sitepkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/site"
@@ -260,5 +261,171 @@ func TestCloudFollowReusesShareForNewEpisodes(t *testing.T) {
 	f.db.Model(&models.DownloadTask{}).Where("follow_subscription_id = ?", subscription.ID).Count(&count)
 	if count != 2 {
 		t.Fatalf("active episodes duplicated: %d", count)
+	}
+}
+
+type previewFixtureDriver struct{ *shareIngestDriver }
+
+func (d *previewFixtureDriver) InspectShare(ctx context.Context, raw string) (cloud.ShareSnapshot, error) {
+	return d.InspectShareDirectory(ctx, raw, "0")
+}
+func (d *previewFixtureDriver) InspectShareDirectory(_ context.Context, _ string, id string) (cloud.ShareSnapshot, error) {
+	snapshot := cloud.ShareSnapshot{ShareCode: "example", ReceiveCode: "abcd"}
+	if id == "0" {
+		snapshot.Items = []cloud.ShareItem{{ID: "private-dir", Name: "Movies", IsDir: true}}
+	} else {
+		snapshot.Items = []cloud.ShareItem{{ID: "private-one", Name: "Seven.Samurai.1954.mkv", Size: 100}, {ID: "private-two", Name: "Other.mkv", Size: 200}}
+	}
+	return snapshot, nil
+}
+func (d *previewFixtureDriver) ReceiveShare(context.Context, cloud.ShareSnapshot, string) error {
+	panic("preview must never receive files")
+}
+
+type previewFixtureAdapter struct{ *cloudFixtureAdapter }
+
+func (a *previewFixtureAdapter) ResolveSource(context.Context, sitepkg.Config, string) (sitepkg.Source, error) {
+	return a.resolved, nil
+}
+func TestCloudSharePreviewSelectionAuthorizationAndPersistence(t *testing.T) {
+	f := newShareIngestFixture(t)
+	f.actor.Permissions[authz.PermissionSystemAdmin] = struct{}{}
+	f.actor.Permissions[authz.PermissionDiscoveryRead] = struct{}{}
+	driver := &previewFixtureDriver{f.driver}
+	connections := f.downloads.downloader.connections
+	connections.drivers[*f.storage.ConnectionID] = driver
+	adapter := &cloudFixtureAdapter{stubResolverAdapter: &stubResolverAdapter{stubSiteAdapter: &stubSiteAdapter{kind: pansou.Kind}, resolved: sitepkg.Source{ShareURL: "https://115.com/s/example?password=abcd", CloudProvider: "115"}}}
+	service := NewSiteServiceWithAdapters(f.db, NewAuditService(f.db), f.store, f.downloads, []sitepkg.Adapter{&previewFixtureAdapter{adapter}}, zerolog.Nop())
+	site, err := service.Create(context.Background(), f.actor, SiteInput{Name: "Preview", Kind: pansou.Kind, BaseURL: "https://pansou.example.test", CloudConfig: &sitepkg.CloudConfig{Provider: "115", Channels: []string{"movies"}}, Enabled: true, Priority: 100, TimeoutSeconds: 30, RateLimitPerMinute: 120}, RequestContext{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim := siteResultClaim{ActorID: f.actor.User.ID, SiteID: site.ID, SiteRevision: site.Revision, TorrentID: "https://115.com/s/example?password=abcd", Title: "Collection", ExpiresAt: time.Now().Add(10 * time.Minute)}
+	token, err := service.issueClaim(claim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	preview, err := service.PreviewShare(context.Background(), f.actor, token, f.downloader.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if preview.TotalSize != 300 || preview.FileCount != 2 || len(preview.Entries) != 3 {
+		t.Fatalf("preview=%+v", preview)
+	}
+	raw, _ := json.Marshal(preview)
+	if strings.Contains(string(raw), "private-") || strings.Contains(string(raw), "abcd") || strings.Contains(string(raw), "115.com") {
+		t.Fatal("private source exposed")
+	}
+	stranger := f.actor
+	stranger.User.ID++
+	if _, err := service.RecognizeShareEntry(context.Background(), stranger, preview.Token, preview.Entries[1].Token); err == nil {
+		t.Fatal("other actor used preview")
+	}
+	var selected string
+	for _, entry := range preview.Entries {
+		if entry.Name == "Seven.Samurai.1954.mkv" {
+			selected = entry.Token
+		}
+	}
+	if result, err := service.RecognizeShareEntry(context.Background(), f.actor, preview.Token, selected); err != nil || result.Year == nil || *result.Year != 1954 {
+		t.Fatalf("file recognition=%+v err=%v", result, err)
+	}
+	input := SiteDownloadInput{ResultToken: token, DownloaderID: f.downloader.ID, PreviewToken: preview.Token, SelectedEntryTokens: []string{selected}}
+	src := DownloadSourceInput{Kind: downloadpkg.SourcePan115Share, URL: claim.TorrentID}
+	invalid := input
+	invalid.SelectedEntryTokens = nil
+	if _, _, err := service.resolveShareSelection(context.Background(), f.actor, invalid, claim, src); err == nil {
+		t.Fatal("empty selection became full share")
+	}
+	invalid.SelectedEntryTokens = []string{"forged"}
+	if _, _, err := service.resolveShareSelection(context.Background(), f.actor, invalid, claim, src); err == nil {
+		t.Fatal("forged entry accepted")
+	}
+	folder := input
+	folder.SelectedEntryTokens = []string{preview.Entries[0].Token}
+	expanded, _, err := service.resolveShareSelection(context.Background(), f.actor, folder, claim, src)
+	if err != nil || len(expanded.Files) != 2 {
+		t.Fatalf("folder not frozen: %+v %v", expanded, err)
+	}
+	library := f.createLibrary(t, "Selected Movies", "library", "intake", "/中转")
+	f.db.Model(&models.MediaLibrary{}).Where("id = ?", library.ID).Update("enabled", true)
+	input.MediaLibraryID = &library.ID
+	// Fail configuration races within the actual download transaction.
+	input.BeforeSubmit = func() error {
+		return f.db.Model(&models.Downloader{}).Where("id = ?", f.downloader.ID).Update("provider_directory_id", "nested").Error
+	}
+	if _, err := service.Download(context.Background(), f.actor, input, RequestContext{}); ErrorCode(err) != CodeSiteResultExpired {
+		t.Fatalf("config race accepted: %v", err)
+	}
+	f.db.Model(&models.Downloader{}).Where("id = ?", f.downloader.ID).Update("provider_directory_id", "intake")
+	input.BeforeSubmit = nil
+	task, err := service.Download(context.Background(), f.actor, input, RequestContext{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stored models.DownloadTask
+	f.db.First(&stored, "id = ?", task.ID)
+	plaintext, err := f.store.Decrypt(downloadSourcePurpose(task.ID), stored.SourceCiphertext)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var envelope downloadSourceEnvelope
+	if err := json.Unmarshal([]byte(plaintext), &envelope); err != nil {
+		t.Fatal(err)
+	}
+	if envelope.ShareSelection == nil || len(envelope.ShareSelection.Files) != 1 || envelope.ShareSelection.Files[0].ID != "private-one" {
+		t.Fatalf("wrong scope: %+v", envelope.ShareSelection)
+	}
+	worker := NewDownloadWorker(f.downloads)
+	goodManifest := downloadpkg.Manifest{Complete: true, Files: []downloadpkg.File{{RelativePath: "Movies/Seven.Samurai.1954.mkv", Size: 100}}}
+	if err := worker.validateSelectedShareManifest(stored, goodManifest); err != nil {
+		t.Fatal(err)
+	}
+	goodManifest.Files = append(goodManifest.Files, downloadpkg.File{RelativePath: "Movies/Other.mkv", Size: 200})
+	if err := worker.validateSelectedShareManifest(stored, goodManifest); err == nil {
+		t.Fatal("unselected file entered import manifest")
+	}
+	if strings.Contains(stored.SourceCiphertext, "private-one") {
+		t.Fatal("selection not encrypted")
+	}
+
+	// A collection creates independent pipelines and retry resolves their persisted keys.
+	batchToken, _ := service.issueClaim(claim)
+	batchPreview, err := service.PreviewShare(context.Background(), f.actor, batchToken, f.downloader.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	batchInput := SiteDownloadInput{ResultToken: batchToken, DownloaderID: f.downloader.ID, MediaLibraryID: &library.ID, PreviewToken: batchPreview.Token, SelectedEntryTokens: []string{batchPreview.Entries[0].Token}}
+	batch, err := service.Download(context.Background(), f.actor, batchInput, RequestContext{})
+	if err != nil || len(batch.SelectionTasks) != 2 {
+		t.Fatalf("collection not split: %+v %v", batch, err)
+	}
+	selection, _, err := service.resolveShareSelection(context.Background(), f.actor, batchInput, claim, src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	retrySource := src
+	retrySource.ShareSelection = &selection
+	retry, err := service.submitShareSelection(context.Background(), f.actor, batchPreview.Token, SubmitDownloadInput{DownloaderID: f.downloader.ID, MediaLibraryID: &library.ID, Source: retrySource}, RequestContext{})
+	if err != nil || len(retry.SelectionTasks) != 2 || retry.SelectionTasks[0].ID != batch.SelectionTasks[0].ID || retry.SelectionTasks[1].ID != batch.SelectionTasks[1].ID {
+		t.Fatalf("retry duplicated batch: %+v %v", retry, err)
+	}
+	if _, err := service.PreviewShare(context.Background(), f.actor, token, f.downloader.ID); err == nil {
+		t.Fatal("consumed claim replayed")
+	}
+}
+
+func TestSelectedSharePackagesKeepIndependentMoviesAndSubtitles(t *testing.T) {
+	if got := siteResultMediaTypeHint("cloud_share", "名称: [LGNB全球顶级封装][名侦探柯南剧场版M11：绀碧之棺][BD-REMUX][Detective.Conan.Jolly.Roger.in.the.Deep.Azure.2007.Bluray.REMUX.1080p]", "tv"); got != "movie" {
+		t.Fatalf("search TV hint overrode theatrical evidence: %s", got)
+	}
+	if got := siteResultMediaTypeHint("cloud_share", "Detective.Conan.S01E01.1080p", "tv"); got != "tv" {
+		t.Fatalf("ordinary TV changed: %s", got)
+	}
+
+	selection := cloud.ShareSelection{Version: 1, Files: []cloud.ShareTreeItem{{ID: "a", RelativePath: "Movies/A.2000.mkv", Size: 10}, {ID: "b", RelativePath: "Movies/B.2001.mkv", Size: 20}, {ID: "sub", RelativePath: "Movies/B.2001.zh.ass", Size: 1}}}
+	groups := selectedSharePackages(selection)
+	if len(groups) != 2 || len(groups[0].Files) != 1 || len(groups[1].Files) != 2 || groups[1].Files[1].ID != "sub" {
+		t.Fatalf("scope merged or lost: %+v", groups)
 	}
 }

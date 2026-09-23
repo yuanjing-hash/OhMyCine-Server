@@ -2,6 +2,7 @@ package nodeprotocol
 
 import (
 	"encoding/json"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud"
 	"strings"
 	"testing"
 	"time"
@@ -112,5 +113,32 @@ func TestStorageSourceCleanupDigestBindsOperationAndTask(t *testing.T) {
 	second, err := request.Digest()
 	if err != nil || first == second {
 		t.Fatalf("cleanup digest did not bind task: %s %s %v", first, second, err)
+	}
+}
+
+func TestSelectedShareDigestBindsFrozenFiles(t *testing.T) {
+	selection := cloud.ShareSelection{Version: 1, Files: []cloud.ShareTreeItem{{ID: "1", RelativePath: "A.mkv", Size: 10}, {ID: "2", RelativePath: "B.mkv", Size: 20}}}
+	raw, err := cloud.EncodeSelectedShareSource("https://115.com/s/share-code?password=abcd", selection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest, err := StorageSourceContentDigest(StorageSourceKindPan115ShareSelected, raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	selection.Files[0], selection.Files[1] = selection.Files[1], selection.Files[0]
+	reordered, _ := cloud.EncodeSelectedShareSource("https://115.com/s/share-code?password=efgh", selection)
+	same, err := StorageSourceContentDigest(StorageSourceKindPan115ShareSelected, reordered)
+	if err != nil || same != digest {
+		t.Fatal("order or rotated secret changed identity")
+	}
+	selection.Files = selection.Files[:1]
+	subset, _ := cloud.EncodeSelectedShareSource("https://115.com/s/share-code?password=abcd", selection)
+	changed, _ := StorageSourceContentDigest(StorageSourceKindPan115ShareSelected, subset)
+	if changed == digest {
+		t.Fatal("selection not bound")
+	}
+	if _, err := StorageSourceContentDigest(StorageSourceKindPan115Share, raw); err == nil {
+		t.Fatal("old source kind accepted selected payload")
 	}
 }

@@ -337,10 +337,13 @@ func waitStorageSourceIdle(t *testing.T, agent *Agent, operationKey string) {
 func TestStorageSourceShareReconcilesBeforeAndAfterReceive(t *testing.T) {
 	for _, test := range []struct {
 		name         string
+		selected     bool
 		existing     bool
 		receiveErr   error
 		wantReceives int
 	}{
+		{name: "selected file only", selected: true, wantReceives: 1},
+		{name: "selected restart", selected: true, existing: true, wantReceives: 0},
 		{name: "restart after receive", existing: true, wantReceives: 0},
 		{name: "lost receive acknowledgement", receiveErr: cloud.Error(cloud.CodeUnavailable, true, errors.New("lost acknowledgement")), wantReceives: 1},
 	} {
@@ -364,11 +367,19 @@ func TestStorageSourceShareReconcilesBeforeAndAfterReceive(t *testing.T) {
 				t.Fatal(err)
 			}
 			shareURI := "https://115.com/s/share-code?password=private"
-			contentDigest, err := nodeprotocol.StorageSourceContentDigest(nodeprotocol.StorageSourceKindPan115Share, shareURI)
+			kind := nodeprotocol.StorageSourceKindPan115Share
+			if test.selected {
+				kind = nodeprotocol.StorageSourceKindPan115ShareSelected
+				shareURI, err = cloud.EncodeSelectedShareSource(shareURI, cloud.ShareSelection{Version: 1, Files: []cloud.ShareTreeItem{{ID: "shared-file", RelativePath: "Movie.mkv", Size: 5}}})
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			contentDigest, err := nodeprotocol.StorageSourceContentDigest(kind, shareURI)
 			if err != nil {
 				t.Fatal(err)
 			}
-			plan := nodeprotocol.StorageSourcePlan{StorageID: "storage-a", ProviderType: nodeprotocol.StorageProviderPan115, SourceKind: nodeprotocol.StorageSourceKindPan115Share, TargetKind: nodeprotocol.StorageSourceTargetPan115, SourceIdentityDigest: strings.Repeat("1", 64), TargetIdentityDigest: strings.Repeat("2", 64), SourceContentDigest: contentDigest, OfflineDestinationID: "share-root"}
+			plan := nodeprotocol.StorageSourcePlan{StorageID: "storage-a", ProviderType: nodeprotocol.StorageProviderPan115, SourceKind: kind, TargetKind: nodeprotocol.StorageSourceTargetPan115, SourceIdentityDigest: strings.Repeat("1", 64), TargetIdentityDigest: strings.Repeat("2", 64), SourceContentDigest: contentDigest, OfflineDestinationID: "share-root"}
 			payload, _ := json.Marshal(plan)
 			now := time.Now().UTC()
 			operation := nodeprotocol.OperationPlan{ProtocolVersion: nodeprotocol.VersionV1, OperationKey: "share-source-1", TaskID: "task-1", NodeID: "node-1", Kind: nodeprotocol.OperationKindStorageSourceMaterialize, PlanRevision: 1, LeaseEpoch: 1, LeaseExpiresAt: now.Add(10 * time.Minute), Payload: payload}
@@ -385,6 +396,9 @@ func TestStorageSourceShareReconcilesBeforeAndAfterReceive(t *testing.T) {
 				share:      cloud.ShareSnapshot{ShareCode: "share-code", ReceiveCode: "private", Items: []cloud.ShareItem{{ID: "shared-file", Name: "Movie.mkv", Size: 5}}},
 				receiveErr: test.receiveErr,
 			}
+			if test.selected {
+				fake.share.Items = append(fake.share.Items, cloud.ShareItem{ID: "unselected", Name: "Other.mkv", Size: 20})
+			}
 			if test.existing {
 				fake.shareItems = []cloud.Item{{ID: "received-existing", ParentID: "share-root", Name: "Movie.mkv", Size: 5}}
 			}
@@ -393,8 +407,11 @@ func TestStorageSourceShareReconcilesBeforeAndAfterReceive(t *testing.T) {
 				t.Fatal(err)
 			}
 			persisted, err := store.StorageSourceRun(context.Background(), "server-1", input.OperationKey)
-			if err != nil || persisted.OutputRootID != "share-root" || !strings.HasPrefix(persisted.ProviderTaskID, "share:") {
+			if err != nil || persisted.OutputRootID != "share-root" || (!test.selected && !strings.HasPrefix(persisted.ProviderTaskID, "share:")) {
 				t.Fatalf("persisted=%+v err=%v", persisted, err)
+			}
+			if test.selected && len(fake.shareItems) != 1 {
+				t.Fatal("Node received unselected files")
 			}
 			if fake.receiveCalls != test.wantReceives {
 				t.Fatalf("receive calls=%d want=%d", fake.receiveCalls, test.wantReceives)
@@ -500,4 +517,26 @@ func waitStorageSourceStatus(t *testing.T, store *Store, requestID, status strin
 	}
 	t.Fatalf("source action did not reach %s", status)
 	return nodeprotocol.StorageSourceActionResponse{}
+}
+
+func (d *fakeStorageSourceDriver) InspectShareDirectory(ctx context.Context, raw, id string) (cloud.ShareSnapshot, error) {
+	if id != "0" {
+		return cloud.ShareSnapshot{}, errors.New("unexpected directory")
+	}
+	return d.InspectShare(ctx, raw)
+}
+func (d *fakeStorageSourceDriver) CreateDirectory(context.Context, string, string) (cloud.Item, error) {
+	return cloud.Item{}, errors.New("unexpected mkdir")
+}
+func (d *fakeStorageSourceDriver) Move(context.Context, string, string) error {
+	return errors.New("unexpected move")
+}
+func (d *fakeStorageSourceDriver) Copy(context.Context, string, string) error {
+	return errors.New("unexpected copy")
+}
+func (d *fakeStorageSourceDriver) Rename(context.Context, string, string) error {
+	return errors.New("unexpected rename")
+}
+func (d *fakeStorageSourceDriver) Recycle(context.Context, string) error {
+	return errors.New("unexpected recycle")
 }

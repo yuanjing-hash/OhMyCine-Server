@@ -52,10 +52,12 @@ type SiteService struct {
 	searchSlots     chan struct{}
 	pluginResources PluginResourceBridge
 
-	limitMu sync.Mutex
-	limits  map[uint]*siteLimiter
-	vaultMu sync.Mutex
-	vault   map[string]siteResultClaim
+	limitMu           sync.Mutex
+	limits            map[uint]*siteLimiter
+	vaultMu           sync.Mutex
+	vault             map[string]siteResultClaim
+	sharePreviews     map[string]siteSharePreview
+	sharePreviewSlots chan struct{}
 }
 
 type siteLimiter struct {
@@ -224,6 +226,8 @@ type SiteSearchProgress struct {
 	ErrorCode   string `json:"error_code,omitempty"`
 }
 type SiteDownloadInput struct {
+	PreviewToken              string
+	SelectedEntryTokens       []string
 	ResultToken, DownloaderID string
 	MediaLibraryID            *uint
 	ProfileID                 uint
@@ -1032,14 +1036,14 @@ func (s *SiteService) searchSite(ctx context.Context, actor Actor, record models
 			TorrentID:     item.TorrentID,
 			Title:         item.Title,
 			Subtitle:      safeRecognitionClaimSubtitle(item.Subtitle),
-			MediaTypeHint: safeRecognitionMediaTypeHint(input.MediaType),
+			MediaTypeHint: siteResultMediaTypeHint(definition.SiteType, item.Title, input.MediaType),
 			ExpiresAt:     expires,
 		})
 		if tokenErr != nil {
 			continue
 		}
 		specifications := SiteRecognitionSpecifications{}
-		if parsed, parseErr := mediarecognition.Parse(mediarecognition.InputFacts{PackageName: item.Title, SourceKind: mediarecognition.SourceDownload, MediaTypeHint: mediarecognition.MediaType(safeRecognitionMediaTypeHint(input.MediaType))}); parseErr == nil {
+		if parsed, parseErr := mediarecognition.Parse(mediarecognition.InputFacts{PackageName: item.Title, SourceKind: mediarecognition.SourceDownload, MediaTypeHint: mediarecognition.MediaType(siteResultMediaTypeHint(definition.SiteType, item.Title, input.MediaType))}); parseErr == nil {
 			specifications = siteRecognitionSpecifications(parsed.Specifications, parsed.ReleaseGroup)
 		}
 		group.Items = append(group.Items, SiteSearchResult{SourceKind: item.SourceKind, CloudProvider: item.CloudProvider, Channel: item.Channel, PostURL: item.PostURL, ResourceFingerprint: item.Fingerprint, Token: token, Title: item.Title, Subtitle: item.Subtitle, SizeBytes: item.SizeBytes, Published: item.Published, Seeders: item.Seeders, Leechers: item.Leechers, Completed: item.Completed, Promotion: item.Promotion, Quality: item.Quality, Tags: item.Tags, Specifications: specifications, ExpiresAt: expires})
@@ -1135,7 +1139,14 @@ func (s *SiteService) RecognizeResult(ctx context.Context, actor Actor, resultTo
 	if !actor.CanResource(authz.PermissionDiscoveryRead, models.AuthorizationResourceSite, uintID(claim.SiteID)) {
 		return SiteRecognitionSummary{}, appError(CodePermissionDenied, "无权识别这个站点的搜索结果", nil)
 	}
+	return s.recognizeSiteClaim(ctx, actor, claim, resultToken, nil)
+}
+
+func (s *SiteService) recognizeSiteClaim(ctx context.Context, actor Actor, claim siteResultClaim, resultToken string, files []recognitionSourceFile) (SiteRecognitionSummary, error) {
 	input := mediarecognition.InputFacts{PackageName: claim.Title, SourceKind: mediarecognition.SourceDownload, MediaTypeHint: mediarecognition.MediaType(claim.MediaTypeHint)}
+	for _, file := range files {
+		input.Files = append(input.Files, mediarecognition.FileFact{RelativePath: file.RelativePath, Size: file.Size})
+	}
 	parsed, parseErr := mediarecognition.Parse(input)
 	summary := SiteRecognitionSummary{EngineVersion: mediarecognition.EngineVersion, Status: mediaRecognitionStatusUnrecognized, Title: claim.Title}
 	if parseErr == nil {
@@ -1159,6 +1170,7 @@ func (s *SiteService) RecognizeResult(ctx context.Context, actor Actor, resultTo
 
 	result := recognizeMedia(ctx, client, MediaRecognitionRequest{
 		PackageName:      claim.Title,
+		Files:            files,
 		AuxiliaryNames:   []string{claim.Subtitle},
 		SourceKind:       mediarecognition.SourceDownload,
 		MediaTypeHint:    claim.MediaTypeHint,
@@ -1208,7 +1220,7 @@ func (s *SiteService) RecognizeResult(ctx context.Context, actor Actor, resultTo
 		// A successful automatic preview has already passed the shared ranker and
 		// GetByID verification. Bind that verified identity to the opaque claim so
 		// the eventual download cannot regress to a weaker title-only decision.
-		if result.TMDBID != nil && result.MediaType != "" {
+		if resultToken != "" && result.TMDBID != nil && result.MediaType != "" {
 			if bindErr := s.bindClaimRecognition(strings.TrimSpace(resultToken), actor.User.ID, *result.TMDBID, result.MediaType, result.IdentitySource, result.IdentityStatus, false); bindErr != nil {
 				return SiteRecognitionSummary{}, bindErr
 			}
@@ -1583,8 +1595,18 @@ func (s *SiteService) Download(ctx context.Context, actor Actor, input SiteDownl
 			return DownloadTaskSummary{}, err
 		}
 	}
+
+	var previewGuard func(*gorm.DB) error
+	if input.PreviewToken != "" || len(input.SelectedEntryTokens) > 0 {
+		selection, guard, selectionErr := s.resolveShareSelection(ctx, actor, input, claim, source)
+		if selectionErr != nil {
+			return DownloadTaskSummary{}, selectionErr
+		}
+		source.ShareSelection = &selection
+		previewGuard = guard
+	}
 	var recognitionOverride *DownloadRecognitionIdentity
-	if claim.ManualTMDBID != nil && claim.ManualMediaType != "" {
+	if source.ShareSelection == nil && claim.ManualTMDBID != nil && claim.ManualMediaType != "" {
 		recognitionOverride = &DownloadRecognitionIdentity{TMDBID: *claim.ManualTMDBID, MediaType: claim.ManualMediaType, Source: claim.RecognitionSource, Status: claim.RecognitionStatus, Locked: claim.RecognitionLocked, Season: cloneInt(input.Season), Episode: cloneInt(input.Episode)}
 	}
 	if input.BeforeSubmit != nil {
@@ -1597,6 +1619,18 @@ func (s *SiteService) Download(ctx context.Context, actor Actor, input SiteDownl
 		resourceClaimID = claim.PluginClaimID
 	}
 	beforePersist := input.BeforePersist
+	if previewGuard != nil {
+		upstream := beforePersist
+		beforePersist = func(tx *gorm.DB) error {
+			if upstream != nil {
+				if err := upstream(tx); err != nil {
+					return err
+				}
+			}
+			return previewGuard(tx)
+		}
+	}
+
 	if definition.SiteType == builtin.SiteTypeCloud {
 		upstreamGuard := beforePersist
 		beforePersist = func(tx *gorm.DB) error {
@@ -1638,11 +1672,17 @@ func (s *SiteService) Download(ctx context.Context, actor Actor, input SiteDownl
 			return nil
 		}
 	}
-	result, err := s.downloads.Submit(ctx, actor, SubmitDownloadInput{DownloaderID: input.DownloaderID, MediaLibraryID: input.MediaLibraryID, ProfileID: input.ProfileID, DisplayName: claim.Title, Priority: input.Priority, Source: source, PluginID: pluginID, PluginVersion: pluginVersion, PluginConnectionID: pluginConnectionID, PluginResourceClaimID: resourceClaimID, RecognitionOverride: recognitionOverride, FollowSubscriptionID: input.FollowSubscriptionID, FollowResourceFingerprint: input.FollowResourceFingerprint, ForceRecognitionOverride: input.FollowSubscriptionID != "", BeforePersist: beforePersist}, request)
+	submitInput := SubmitDownloadInput{DownloaderID: input.DownloaderID, MediaLibraryID: input.MediaLibraryID, ProfileID: input.ProfileID, DisplayName: claim.Title, Priority: input.Priority, Source: source, PluginID: pluginID, PluginVersion: pluginVersion, PluginConnectionID: pluginConnectionID, PluginResourceClaimID: resourceClaimID, RecognitionOverride: recognitionOverride, FollowSubscriptionID: input.FollowSubscriptionID, FollowResourceFingerprint: input.FollowResourceFingerprint, ForceRecognitionOverride: input.FollowSubscriptionID != "", BeforePersist: beforePersist}
+	var result DownloadTaskSummary
+	if source.ShareSelection != nil {
+		result, err = s.submitShareSelection(ctx, actor, input.PreviewToken, submitInput, request)
+	} else {
+		result, err = s.downloads.Submit(ctx, actor, submitInput, request)
+	}
 	if err != nil {
 		return DownloadTaskSummary{}, err
 	}
-	completed = true
+	completed = result.SelectionPending == 0
 	_ = s.audit.Record(s.db, &actor.User.ID, "site.download", "site", uintID(record.ID), "success", map[string]any{"download_task_id": result.ID}, request)
 	serverlog.OperationDiscoverySearch.Event(s.log.Info()).Uint("site_id", record.ID).Str("download_task_id", result.ID).Msg(serverlog.OperationDiscoverySearch.Message("种子资源搜索结果已提交下载"))
 	return result, nil

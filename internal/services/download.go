@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud"
 	"net/url"
 	"os"
 	"path"
@@ -173,10 +174,11 @@ func (s *DownloadService) ProviderEventsChanged(_ context.Context, connectionID 
 }
 
 type DownloadSourceInput struct {
-	Kind     string
-	URL      string
-	Torrent  []byte
-	Filename string
+	ShareSelection *cloud.ShareSelection
+	Kind           string
+	URL            string
+	Torrent        []byte
+	Filename       string
 }
 
 type SubmitDownloadInput struct {
@@ -283,16 +285,17 @@ type DownloadRecognitionIdentity struct {
 }
 
 type downloadSourceEnvelope struct {
-	Kind               string `json:"kind"`
-	URL                string `json:"url,omitempty"`
-	Torrent            []byte `json:"torrent,omitempty"`
-	Filename           string `json:"filename,omitempty"`
-	ProviderItemID     string `json:"provider_item_id,omitempty"`
-	PluginConnectionID string `json:"plugin_connection_id,omitempty"`
-	PluginItemID       string `json:"plugin_item_id,omitempty"`
-	PluginSegmentID    string `json:"plugin_segment_id,omitempty"`
-	PluginVersionID    string `json:"plugin_version_id,omitempty"`
-	PluginVariantID    string `json:"plugin_variant_id,omitempty"`
+	ShareSelection     *cloud.ShareSelection `json:"share_selection,omitempty"`
+	Kind               string                `json:"kind"`
+	URL                string                `json:"url,omitempty"`
+	Torrent            []byte                `json:"torrent,omitempty"`
+	Filename           string                `json:"filename,omitempty"`
+	ProviderItemID     string                `json:"provider_item_id,omitempty"`
+	PluginConnectionID string                `json:"plugin_connection_id,omitempty"`
+	PluginItemID       string                `json:"plugin_item_id,omitempty"`
+	PluginSegmentID    string                `json:"plugin_segment_id,omitempty"`
+	PluginVersionID    string                `json:"plugin_version_id,omitempty"`
+	PluginVariantID    string                `json:"plugin_variant_id,omitempty"`
 }
 
 type downloadJobPayload struct {
@@ -300,61 +303,64 @@ type downloadJobPayload struct {
 }
 
 type DownloadTaskSummary struct {
-	ID                string            `json:"id"`
-	JobID             string            `json:"job_id"`
-	OwnerID           uint              `json:"owner_id"`
-	DownloaderID      *string           `json:"downloader_id"`
-	DownloaderName    string            `json:"downloader_name"`
-	ProviderType      string            `json:"provider_type"`
-	DisplayName       string            `json:"display_name"`
-	JobStatus         string            `json:"job_status"`
-	ProviderStatus    string            `json:"provider_status"`
-	Phase             string            `json:"phase"`
-	Progress          *float64          `json:"progress"`
-	BytesCompleted    *int64            `json:"bytes_completed"`
-	BytesTotal        *int64            `json:"bytes_total"`
-	DownloadSpeed     *int64            `json:"download_speed"`
-	UploadSpeed       *int64            `json:"upload_speed"`
-	ETASeconds        *int64            `json:"eta_seconds"`
-	LastSampledAt     *time.Time        `json:"last_sampled_at"`
-	LastErrorCode     string            `json:"last_error_code"`
-	LastErrorMessage  string            `json:"last_error_message"`
-	CreatedAt         time.Time         `json:"created_at"`
-	UpdatedAt         time.Time         `json:"updated_at"`
-	FinishedAt        *time.Time        `json:"finished_at"`
-	ProfileID         uint              `json:"profile_id"`
-	ProfileRevision   uint64            `json:"profile_revision"`
-	ScrapeStatus      string            `json:"scrape_status"`
-	ScrapeTitle       string            `json:"scrape_title"`
-	ScrapeMediaType   string            `json:"scrape_media_type"`
-	ScrapeCategory    string            `json:"scrape_category"`
-	ScrapeTMDBID      *int64            `json:"scrape_tmdb_id"`
-	ScrapeConfidence  *float64          `json:"scrape_confidence"`
-	ScrapeSeason      *int              `json:"scrape_season"`
-	ScrapeEpisode     *int              `json:"scrape_episode"`
-	IdentitySource    string            `json:"identity_source"`
-	IdentityStatus    string            `json:"identity_status"`
-	IdentityLocked    bool              `json:"identity_locked"`
-	IdentityRevision  uint64            `json:"identity_revision"`
-	ManifestFiles     int               `json:"manifest_file_count"`
-	TargetLibraryID   *uint             `json:"target_library_id"`
-	TargetLibraryName string            `json:"target_library_name"`
-	WaitReason        *JobWaitReasonDTO `json:"wait_reason,omitempty"`
-	TransferMode      string            `json:"transfer_mode"`
-	ConflictPolicy    string            `json:"conflict_policy"`
-	RouteKind         string            `json:"route_kind"`
-	TransferPhase     string            `json:"transfer_phase"`
-	TransferTaskID    string            `json:"transfer_task_id"`
-	TransferJobID     string            `json:"transfer_job_id"`
-	TransferJobStatus string            `json:"transfer_job_status"`
-	SeedingTaskID     string            `json:"seeding_task_id"`
-	SeedingJobID      string            `json:"seeding_job_id"`
-	SeedingJobStatus  string            `json:"seeding_job_status"`
-	SeedingPhase      string            `json:"seeding_phase"`
-	LifecycleScope    string            `json:"lifecycle_scope"`
-	ExecutionLocation string            `json:"execution_location"`
-	NodeID            *string           `json:"node_id,omitempty"`
-	NodeName          string            `json:"node_name,omitempty"`
+	SelectionTasks    []DownloadTaskSummary `json:"selection_tasks,omitempty"`
+	SelectionPending  int                   `json:"selection_pending,omitempty"`
+	SelectionError    string                `json:"selection_error,omitempty"`
+	ID                string                `json:"id"`
+	JobID             string                `json:"job_id"`
+	OwnerID           uint                  `json:"owner_id"`
+	DownloaderID      *string               `json:"downloader_id"`
+	DownloaderName    string                `json:"downloader_name"`
+	ProviderType      string                `json:"provider_type"`
+	DisplayName       string                `json:"display_name"`
+	JobStatus         string                `json:"job_status"`
+	ProviderStatus    string                `json:"provider_status"`
+	Phase             string                `json:"phase"`
+	Progress          *float64              `json:"progress"`
+	BytesCompleted    *int64                `json:"bytes_completed"`
+	BytesTotal        *int64                `json:"bytes_total"`
+	DownloadSpeed     *int64                `json:"download_speed"`
+	UploadSpeed       *int64                `json:"upload_speed"`
+	ETASeconds        *int64                `json:"eta_seconds"`
+	LastSampledAt     *time.Time            `json:"last_sampled_at"`
+	LastErrorCode     string                `json:"last_error_code"`
+	LastErrorMessage  string                `json:"last_error_message"`
+	CreatedAt         time.Time             `json:"created_at"`
+	UpdatedAt         time.Time             `json:"updated_at"`
+	FinishedAt        *time.Time            `json:"finished_at"`
+	ProfileID         uint                  `json:"profile_id"`
+	ProfileRevision   uint64                `json:"profile_revision"`
+	ScrapeStatus      string                `json:"scrape_status"`
+	ScrapeTitle       string                `json:"scrape_title"`
+	ScrapeMediaType   string                `json:"scrape_media_type"`
+	ScrapeCategory    string                `json:"scrape_category"`
+	ScrapeTMDBID      *int64                `json:"scrape_tmdb_id"`
+	ScrapeConfidence  *float64              `json:"scrape_confidence"`
+	ScrapeSeason      *int                  `json:"scrape_season"`
+	ScrapeEpisode     *int                  `json:"scrape_episode"`
+	IdentitySource    string                `json:"identity_source"`
+	IdentityStatus    string                `json:"identity_status"`
+	IdentityLocked    bool                  `json:"identity_locked"`
+	IdentityRevision  uint64                `json:"identity_revision"`
+	ManifestFiles     int                   `json:"manifest_file_count"`
+	TargetLibraryID   *uint                 `json:"target_library_id"`
+	TargetLibraryName string                `json:"target_library_name"`
+	WaitReason        *JobWaitReasonDTO     `json:"wait_reason,omitempty"`
+	TransferMode      string                `json:"transfer_mode"`
+	ConflictPolicy    string                `json:"conflict_policy"`
+	RouteKind         string                `json:"route_kind"`
+	TransferPhase     string                `json:"transfer_phase"`
+	TransferTaskID    string                `json:"transfer_task_id"`
+	TransferJobID     string                `json:"transfer_job_id"`
+	TransferJobStatus string                `json:"transfer_job_status"`
+	SeedingTaskID     string                `json:"seeding_task_id"`
+	SeedingJobID      string                `json:"seeding_job_id"`
+	SeedingJobStatus  string                `json:"seeding_job_status"`
+	SeedingPhase      string                `json:"seeding_phase"`
+	LifecycleScope    string                `json:"lifecycle_scope"`
+	ExecutionLocation string                `json:"execution_location"`
+	NodeID            *string               `json:"node_id,omitempty"`
+	NodeName          string                `json:"node_name,omitempty"`
 }
 
 const (
@@ -1459,6 +1465,20 @@ func downloadTaskNotFound(err error) error {
 func normalizeDownloadSource(input DownloadSourceInput, requestedName string) (downloadSourceEnvelope, string, error) {
 	kind := strings.ToLower(strings.TrimSpace(input.Kind))
 	source := downloadSourceEnvelope{Kind: kind}
+	if input.ShareSelection != nil {
+		if kind != downloadpkg.SourcePan115Share {
+			return source, "", appError(CodeDownloadSourceInvalid, "文件选择只适用于分享转存", nil)
+		}
+		raw, err := cloud.EncodeSelectedShareSource(input.URL, *input.ShareSelection)
+		if err != nil {
+			return source, "", appError(CodeDownloadSourceInvalid, "所选文件清单过大或无效，请减少选择", err)
+		}
+		frozen, err := cloud.DecodeSelectedShareSource(raw)
+		if err != nil {
+			return source, "", err
+		}
+		source.ShareSelection = &frozen.Selection
+	}
 	switch kind {
 	case downloadpkg.SourceURL:
 		raw := strings.TrimSpace(input.URL)
@@ -1926,6 +1946,9 @@ func (w *DownloadWorker) runCompletedRecognitionRecovery(ctx context.Context, ru
 }
 
 func (w *DownloadWorker) persistCompletedManifest(task *models.DownloadTask, manifest downloadpkg.Manifest) error {
+	if err := w.validateSelectedShareManifest(*task, manifest); err != nil {
+		return err
+	}
 	raw, err := encodeCompletedDownloadManifest(manifest)
 	if err != nil {
 		return err
@@ -2499,6 +2522,9 @@ func normalizeProviderPath(value string) (string, string, bool) {
 }
 
 func (w *DownloadWorker) verifyCompleted(ctx context.Context, task *models.DownloadTask, manifest downloadpkg.Manifest) (downloadpkg.Manifest, error) {
+	if err := w.validateSelectedShareManifest(*task, manifest); err != nil {
+		return downloadpkg.Manifest{}, err
+	}
 	match, err := w.classify(ctx, *task, manifest)
 	if err != nil || !match.Confident {
 		code := classificationFallbackCode(err, match)
@@ -2612,7 +2638,7 @@ func (w *DownloadWorker) load(ctx context.Context, job ClaimedJob) (models.Downl
 	if err := json.Unmarshal([]byte(plaintext), &source); err != nil {
 		return task, record, nil, downloadpkg.Source{}, "", err
 	}
-	return task, record, client, downloadpkg.Source{Kind: source.Kind, URL: source.URL, Torrent: source.Torrent, Filename: source.Filename, ProviderItemID: source.ProviderItemID}, savePath, nil
+	return task, record, client, downloadpkg.Source{Kind: source.Kind, URL: source.URL, Torrent: source.Torrent, Filename: source.Filename, ProviderItemID: source.ProviderItemID, ShareSelection: source.ShareSelection}, savePath, nil
 }
 
 func (w *DownloadWorker) taskDownloaderClient(ctx context.Context, task *models.DownloadTask) (models.Downloader, downloadpkg.Client, string, error) {
@@ -2933,4 +2959,44 @@ func syncFailedFollowClaims(tx *gorm.DB, downloadTaskID string, now time.Time) e
 	return tx.Model(&models.FollowEpisodeClaim{}).
 		Where("download_task_id = ?", downloadTaskID).
 		Updates(map[string]any{"state": "failed", "download_task_id": nil, "updated_at": now}).Error
+}
+
+// Enforce the original user scope again at the provider-to-import boundary.
+func (w *DownloadWorker) validateSelectedShareManifest(task models.DownloadTask, manifest downloadpkg.Manifest) error {
+	if task.SourceOrigin != models.DownloadSourceOriginShare {
+		return nil
+	}
+	raw, err := w.service.credentials.Decrypt(downloadSourcePurpose(task.ID), task.SourceCiphertext)
+	if err != nil {
+		return err
+	}
+	var source downloadSourceEnvelope
+	if err := json.Unmarshal([]byte(raw), &source); err != nil {
+		return err
+	}
+	if source.ShareSelection == nil {
+		return nil
+	}
+	selection := source.ShareSelection
+	invalid := func() error {
+		return appError("download_share_selection_mismatch", "实际文件与所选分享内容不一致，已停止入库，请核对任务目录", nil)
+	}
+	if selection.Validate() != nil || !manifest.Complete || len(manifest.Files) != len(selection.Files) {
+		return invalid()
+	}
+	expected := map[string]int64{}
+	for _, file := range selection.Files {
+		expected[file.RelativePath] = file.Size
+	}
+	for _, file := range manifest.Files {
+		size, ok := expected[file.RelativePath]
+		if !ok || size != file.Size {
+			return invalid()
+		}
+		delete(expected, file.RelativePath)
+	}
+	if len(expected) != 0 {
+		return invalid()
+	}
+	return nil
 }
