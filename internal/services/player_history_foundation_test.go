@@ -23,7 +23,7 @@ func TestPlayerOverviewContinueWatchingFindsOlderServerHistory(t *testing.T) {
 		rows = append(rows, models.PlayerPlaybackHistory{
 			UserID: f.actor.User.ID, SyncKey: playerHistoryCanonicalSyncKey(identity), HistoryIdentity: identity,
 			SourceKind: "server", SourceID: "server", LibraryID: uintID(f.libraryID),
-			MediaIdentity: work, Title: fmt.Sprintf("Movie %d", i), Completed: i < 100,
+			MediaIdentity: work, Title: fmt.Sprintf("Movie %d", i), DisplayTitle: fmt.Sprintf("Movie %d", i), Completed: i < 100,
 			Position: 100, Duration: floatPointer(1000), ClientUpdatedAt: now.Add(-time.Duration(i) * time.Second).UnixMilli(), CreatedAt: now, UpdatedAt: now,
 		})
 	}
@@ -38,6 +38,11 @@ func TestPlayerOverviewContinueWatchingFindsOlderServerHistory(t *testing.T) {
 	if got.Status != "ok" || len(got.List) != 2 || got.List[0].SyncKey != rows[100].SyncKey || got.HasMore {
 		t.Fatalf("older server continue section=%+v", got)
 	}
+	browserItems, _, err := f.history.BrowserContinueWatching(f.actor, 12)
+	if err != nil || len(browserItems) != 2 || browserItems[0].HistoryID != rows[100].SyncKey || browserItems[0].WorkID != encodeCatalogToken(entries[100].WorkKey) {
+		t.Fatalf("browser dropped valid canonical history with stale item token: items=%+v err=%v", browserItems, err)
+	}
+
 	// A missing catalog item is hidden without deleting the sync row.
 	if err := f.libraries.db.Delete(&entries[100]).Error; err != nil {
 		t.Fatal(err)

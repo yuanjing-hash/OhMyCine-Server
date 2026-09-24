@@ -147,11 +147,11 @@ func browserHistoryItem(item PlayerHistoryChange, libraries *MediaLibraryService
 		}
 		return result, result.WorkID != ""
 	}
-	parsed, err := parseServerHistoryToken(item.ItemToken)
-	if err != nil {
+	identity, ok := parseCanonicalServerHistoryIdentity(item.HistoryIdentity)
+	if !ok || item.LibraryID != uintID(identity.libraryID) {
 		return BrowserHistoryItem{}, false
 	}
-	result.LibraryID, result.WorkID, result.Playable = parsed.libraryID, parsed.workToken, true
+	result.LibraryID, result.WorkID, result.Playable = identity.libraryID, identity.workToken, true
 	if libraries != nil {
 		result.PosterURL = libraries.catalogImageURL(item.PosterPath, "w500")
 		result.BackdropURL = libraries.catalogImageURL(item.BackdropPath, "w1280")

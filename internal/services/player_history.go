@@ -484,6 +484,7 @@ type parsedCanonicalServerHistoryIdentity struct {
 	kind          string
 	libraryID     uint
 	workKey       string
+	workToken     string
 	seasonNumber  *int
 	episodeNumber *int
 	entryID       uint
@@ -502,7 +503,7 @@ func parseCanonicalServerHistoryIdentity(value string) (parsedCanonicalServerHis
 	if err != nil {
 		return parsedCanonicalServerHistoryIdentity{}, false
 	}
-	result := parsedCanonicalServerHistoryIdentity{kind: parts[2], libraryID: uint(libraryID), workKey: workKey}
+	result := parsedCanonicalServerHistoryIdentity{kind: parts[2], libraryID: uint(libraryID), workKey: workKey, workToken: parts[4]}
 	switch result.kind {
 	case "movie":
 		return result, len(parts) == 5
