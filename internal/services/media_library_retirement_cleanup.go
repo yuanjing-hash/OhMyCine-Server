@@ -66,6 +66,8 @@ var libraryRetirementCleanup = []libraryRetirementCleanupStep{
 	// the target-library execution row can now be removed without touching its
 	// upstream Download or any source/provider files.
 	{"transfer_tasks", "library_id=?", "", false},
+	{"media_catalog_exclusion_members", "exclusion_id IN (SELECT id FROM media_catalog_exclusions WHERE library_id=?)", "", false},
+	{"media_catalog_exclusions", "library_id=?", "", false},
 	{"player_media_favorites", "library_id=?", "", false},
 	{"player_media_collection_items", "library_id=?", "", false},
 	{"media_acquisitions", "target_library_id=?", "target_library_id=NULL", false},

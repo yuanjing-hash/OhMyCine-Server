@@ -150,7 +150,7 @@ func (s *MediaLibraryService) entryPageTx(tx *gorm.DB, reader *CatalogReader, ac
 	if err := s.ensureMediaLibraryReadableTx(tx, actor, libraryID); err != nil {
 		return MediaLibraryEntryPage{}, err
 	}
-	db := applyEntryFilters(reader.Entries().Where("library_id = ?", libraryID), query)
+	db := applyEntryFilters(reader.VisibleEntries().Where("library_id = ?", libraryID), query)
 	var total int64
 	if err := db.Count(&total).Error; err != nil {
 		return MediaLibraryEntryPage{}, err
@@ -180,17 +180,17 @@ func (s *MediaLibraryService) catalogTx(tx *gorm.DB, reader *CatalogReader, acto
 	if err := s.ensureMediaLibraryReadableTx(tx, actor, libraryID); err != nil {
 		return MediaCatalogPage{}, err
 	}
-	categories, err := catalogCategories(reader.Entries().Where("library_id = ?", libraryID))
+	categories, err := catalogCategories(reader.VisibleEntries().Where("library_id = ?", libraryID))
 	if err != nil {
 		return MediaCatalogPage{}, err
 	}
-	grouped := applyCatalogFilters(reader.Entries().Where("library_id = ? AND work_key <> ''", libraryID), query).Select("work_key").Group("work_key")
+	grouped := applyCatalogFilters(reader.VisibleEntries().Where("library_id = ? AND work_key <> ''", libraryID), query).Select("work_key").Group("work_key")
 	var total int64
 	if err := tx.Table("(?) AS media_catalog", grouped).Count(&total).Error; err != nil {
 		return MediaCatalogPage{}, err
 	}
 	rows := make([]mediaCatalogRow, 0)
-	rowsQuery := applyCatalogFilters(reader.Entries().Where("library_id = ? AND work_key <> ''", libraryID), query)
+	rowsQuery := applyCatalogFilters(reader.VisibleEntries().Where("library_id = ? AND work_key <> ''", libraryID), query)
 	if err := selectCatalogRows(rowsQuery).
 		Offset((query.Page - 1) * query.PageSize).
 		Limit(query.PageSize).
@@ -242,7 +242,7 @@ func (s *MediaLibraryService) aggregateCatalogTx(tx *gorm.DB, reader *CatalogRea
 	if len(libraryIDs) == 0 {
 		return MediaCatalogPage{List: []MediaCatalogItem{}, Page: query.Page, PageSize: query.PageSize, Categories: []string{}}, nil
 	}
-	base := reader.Entries().
+	base := reader.VisibleEntries().
 		Joins("JOIN media_libraries ON media_libraries.id = media_library_entries.library_id").
 		Joins("JOIN storages ON storages.id = media_libraries.storage_id").
 		Where("media_library_entries.work_key <> '' AND media_libraries.enabled = ? AND storages.enabled = ? AND media_libraries.id IN ?", true, true, libraryIDs)
@@ -345,7 +345,7 @@ func (s *MediaLibraryService) catalogDetailTx(tx *gorm.DB, reader *CatalogReader
 	if err != nil {
 		return MediaCatalogDetail{}, err
 	}
-	filtered := reader.Entries().Where("library_id = ? AND work_key = ?", libraryID, workKey)
+	filtered := reader.VisibleEntries().Where("library_id = ? AND work_key = ?", libraryID, workKey)
 	var row mediaCatalogRow
 	if err := selectCatalogRows(filtered).Scan(&row).Error; err != nil {
 		return MediaCatalogDetail{}, err
@@ -354,7 +354,7 @@ func (s *MediaLibraryService) catalogDetailTx(tx *gorm.DB, reader *CatalogReader
 		return MediaCatalogDetail{}, appError(CodeNotFound, "媒体作品不存在", gorm.ErrRecordNotFound)
 	}
 	var entries []models.MediaLibraryEntry
-	if err := reader.Entries().Where("library_id = ? AND work_key = ?", libraryID, workKey).Order("COALESCE(season, 0), COALESCE(episode, 0), relative_path").Find(&entries).Error; err != nil {
+	if err := reader.VisibleEntries().Where("library_id = ? AND work_key = ?", libraryID, workKey).Order("COALESCE(season, 0), COALESCE(episode, 0), relative_path").Find(&entries).Error; err != nil {
 		return MediaCatalogDetail{}, err
 	}
 	items, err := s.catalogItemsTx(tx, reader, []mediaCatalogRow{row})
@@ -664,7 +664,7 @@ func (s *MediaLibraryService) catalogRecognitionTokensTx(tx *gorm.DB, reader *Ca
 		return nil, err
 	}
 	var ids []uint
-	if err := reader.Entries().Where("library_id = ? AND work_key = ? AND recognition_id IS NOT NULL", libraryID, workKey).Distinct().Order("recognition_id").Pluck("recognition_id", &ids).Error; err != nil {
+	if err := reader.VisibleEntries().Where("library_id = ? AND work_key = ? AND recognition_id IS NOT NULL", libraryID, workKey).Distinct().Order("recognition_id").Pluck("recognition_id", &ids).Error; err != nil {
 		return nil, err
 	}
 	if len(ids) == 0 {

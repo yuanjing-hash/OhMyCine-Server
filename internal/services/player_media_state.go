@@ -64,7 +64,7 @@ func validateMediaStateWorkTx(tx *gorm.DB, actor Actor, libraryID uint, workKey 
 		return err
 	}
 	var entryID uint
-	if err := reader.Entries().Select("id").Where("library_id = ? AND work_key = ?", libraryID, workKey).Limit(1).Scan(&entryID).Error; err != nil {
+	if err := reader.VisibleEntries().Select("id").Where("library_id = ? AND work_key = ?", libraryID, workKey).Limit(1).Scan(&entryID).Error; err != nil {
 		return err
 	}
 	if entryID == 0 {

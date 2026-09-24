@@ -189,8 +189,8 @@ func TestBrowserOverviewContinueWatchingIncludesSyncedExternalSources(t *testing
 	state := NewPlayerMediaStateService(fixture.libraries.db, fixture.libraries)
 	overview := NewPlayerOverviewService(fixture.history, state, fixture.libraries).BrowserOverview(fixture.actor)
 	items := overview.Sections.ContinueWatching.List
-	if len(items) != 1 || items[0].SourceName != "卧室 Emby" || items[0].Playable || items[0].PosterURL != external.PosterURL {
-		t.Fatalf("browser continue watching=%+v", overview.Sections.ContinueWatching)
+	if len(items) != 0 {
+		t.Fatalf("external relay must stay out of browser continue watching=%+v", overview.Sections.ContinueWatching)
 	}
 }
 
@@ -218,12 +218,12 @@ func TestBrowserOverviewContinueWatchingScansPastCompletedRowsAndReportsExactHas
 	}
 	state := NewPlayerMediaStateService(fixture.libraries.db, fixture.libraries)
 	overview := NewPlayerOverviewService(fixture.history, state, fixture.libraries).BrowserOverview(fixture.actor)
-	if len(overview.Sections.ContinueWatching.List) != playerOverviewContinueLimit || overview.Sections.ContinueWatching.HasMore {
+	if len(overview.Sections.ContinueWatching.List) != 0 || overview.Sections.ContinueWatching.HasMore {
 		t.Fatalf("exact continue section=%+v", overview.Sections.ContinueWatching)
 	}
 
 	extra := models.PlayerPlaybackHistory{
-		UserID: fixture.actor.User.ID, SyncKey: fmt.Sprintf("%064x", 2_000), SourceKind: "jellyfin", SourceID: "jellyfin-study",
+		UserID: fixture.actor.User.ID, SyncKey: fmt.Sprintf("%064x", 2_000), SourceKind: "emby", SourceID: "emby-bedroom",
 		MediaIdentity: "unfinished:extra", Title: "额外未看完", DisplayTitle: "额外未看完", Position: 100,
 		Duration: &duration, ClientUpdatedAt: now.Add(-time.Hour).UnixMilli(), CreatedAt: now, UpdatedAt: now,
 	}
@@ -231,7 +231,7 @@ func TestBrowserOverviewContinueWatchingScansPastCompletedRowsAndReportsExactHas
 		t.Fatal(err)
 	}
 	overview = NewPlayerOverviewService(fixture.history, state, fixture.libraries).BrowserOverview(fixture.actor)
-	if len(overview.Sections.ContinueWatching.List) != playerOverviewContinueLimit || !overview.Sections.ContinueWatching.HasMore {
+	if len(overview.Sections.ContinueWatching.List) != 0 || overview.Sections.ContinueWatching.HasMore {
 		t.Fatalf("overflow continue section=%+v", overview.Sections.ContinueWatching)
 	}
 }

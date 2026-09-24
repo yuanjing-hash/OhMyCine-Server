@@ -340,7 +340,7 @@ func (s *MediaCoverageService) coverageLibrariesTx(tx *gorm.DB, actor Actor) ([]
 
 func coverageEntries(reader *CatalogReader, mediaType string, tmdbID int64) ([]models.MediaLibraryEntry, error) {
 	var entries []models.MediaLibraryEntry
-	err := reader.Entries().Where("media_type = ? AND tmdb_id = ? AND match_status = ?", mediaType, tmdbID, mediaRecognitionStatusMatched).Find(&entries).Error
+	err := reader.VisibleEntries().Where("media_type = ? AND tmdb_id = ? AND match_status = ?", mediaType, tmdbID, mediaRecognitionStatusMatched).Find(&entries).Error
 	return entries, err
 }
 

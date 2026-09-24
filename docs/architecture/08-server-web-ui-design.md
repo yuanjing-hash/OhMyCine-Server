@@ -404,9 +404,11 @@ Server 更新是系统设置页中的管理员专属面板，不进入普通用�
 
 `/discovery/library` 默认展示当前登录用户可访问的 Server 媒体总览：继续观看、我的收藏、TMDB 自动合集、我的合集、最近入库和媒体库。完整播放历史、收藏、两类合集及原有全部作品海报墙通过同页标签或“查看全部”按需加载；首屏不预取完整 catalog，也不再并列显示语义重复的“最近历史”摘要栏。
 
-管理端使用浏览器 Session 专用的 `/api/v1/media-libraries/overview|history|favorites|collections` 读取接口，均要求 `media_libraries.read` 且返回 `Cache-Control: no-store`。账号历史可以显示 Emby/Jellyfin 和其他 Player 来源的安全标题、来源名和受控图片，但不能作为 Server 库内作品播放；Server 来源目录及 Player Server 总览仍只展示本库内容。已删除、禁用、无权或无法定位到当前 catalog 的 Server 历史/收藏/合集成员不展示，浏览器响应不包含来源地址、来源 ID、Player item token、provider ID、物理路径、凭据或播放流地址。
+管理端使用浏览器 Session 专用的 `/api/v1/media-libraries/overview|history|favorites|collections` 读取接口，均要求 `media_libraries.read` 且返回 `Cache-Control: no-store`。网页历史及继续观看只显示当前账号有权访问的 Server 媒体库记录；Emby/Jellyfin 的记录仅供 Player 设备间同步，不进入网页卡片与计数。网页删除单条历史通过独立 history_id 写入同步删除标记。已删除、禁用、无权或无法定位到当前 catalog 的 Server 历史/收藏/合集成员不展示，浏览器响应不包含来源地址、来源 ID、Player item token、provider ID、物理路径、凭据或播放流地址。
 
 同页收藏/合集标签支持完整分页、添加/移除作品，手工合集可创建、重命名、删除和按 revision 排序；所有写入使用 Session + CSRF，不删除媒体文件。自动合集只读。通知下拉从任务事实去重并持久化已读状态，跳转准确任务详情，已读不等于已处理。仪表盘真实分区、接口及尚未接入能力见 [可靠性与管理闭环](09-server-reliability.md)。
+
+发现页的总览、历史、收藏、合集内作品和全部作品卡片提供鼠标右键及 ContextMenu/Shift-F10 操作；菜单可用 Esc 关闭并将焦点返回原卡片。电影的 Player 深链自动播放，剧集先进入选集；跨媒体库作品先选目标库。修改元数据、识别和重新刮削复用详情操作。作品“移出媒体库”保留来源文件，将作品身份与准确源条目保存在独立排除记录中；完整/增量扫描及新增剧集都保持隐藏。分页“已移出”列表可恢复并重新扫描。它与“删除源文件”明确区分，后者仍经预览和输入标题确认。服务端按资源权限再次校验，响应不暴露物理路径或提供方凭据。
 
 ### 媒体库索引后台移除
 

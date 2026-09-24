@@ -127,7 +127,14 @@ func applyCatalogLibraryChangeTx(tx *gorm.DB, before models.MediaLibrary, after 
 	if err := requireCatalogTransaction(tx); err != nil {
 		return false, err
 	}
-	if catalogSourceFingerprint(before, oldStorage) != catalogSourceFingerprint(*after, nextStorage) || catalogConfigFingerprint(before, oldStorage, profile) != catalogConfigFingerprint(*after, nextStorage, profile) {
+	exclusionSourceChanged := catalogSourceFingerprint(before, oldStorage) != catalogSourceFingerprint(*after, nextStorage)
+	if exclusionSourceChanged {
+		if before.ExclusionEpoch == math.MaxUint64 {
+			return false, ErrCatalogBudget
+		}
+		after.ExclusionEpoch = before.ExclusionEpoch + 1
+	}
+	if exclusionSourceChanged || catalogConfigFingerprint(before, oldStorage, profile) != catalogConfigFingerprint(*after, nextStorage, profile) {
 		if err := requireMediaLibraryNotRetiringTx(tx, before.ID); err != nil {
 			return false, err
 		}
@@ -265,7 +272,7 @@ func applyCatalogStorageChangeTx(tx *gorm.DB, expected, next models.Storage, cha
 		if _, err := applyCatalogLibraryChangeTx(tx, library, &replacement, previous, next, profile); err != nil {
 			return err
 		}
-		if err := tx.Model(&models.MediaLibrary{}).Where("id=?", library.ID).Updates(map[string]any{"baseline_generation": replacement.BaselineGeneration, "dirty_generation": replacement.DirtyGeneration, "last_scan_at": replacement.LastScanAt, "last_successful_scan_at": replacement.LastSuccessfulScanAt, "structure_status": replacement.StructureStatus, "structure_issue_count": replacement.StructureIssueCount, "structure_error_code": replacement.StructureErrorCode, "structure_checked_at": replacement.StructureCheckedAt}).Error; err != nil {
+		if err := tx.Model(&models.MediaLibrary{}).Where("id=?", library.ID).Updates(map[string]any{"baseline_generation": replacement.BaselineGeneration, "dirty_generation": replacement.DirtyGeneration, "exclusion_epoch": replacement.ExclusionEpoch, "last_scan_at": replacement.LastScanAt, "last_successful_scan_at": replacement.LastSuccessfulScanAt, "structure_status": replacement.StructureStatus, "structure_issue_count": replacement.StructureIssueCount, "structure_error_code": replacement.StructureErrorCode, "structure_checked_at": replacement.StructureCheckedAt}).Error; err != nil {
 			return err
 		}
 		if catalogSourceFingerprint(library, previous) != catalogSourceFingerprint(replacement, next) {
@@ -275,6 +282,13 @@ func applyCatalogStorageChangeTx(tx *gorm.DB, expected, next models.Storage, cha
 			if _, err := changes[0].RecordTx(tx, library.ID, replacement.DirtyGeneration, models.MediaLibraryChangeRemoval, true); err != nil {
 				return err
 			}
+		}
+	}
+	// Legacy libraries have no catalog head to update, but their logical
+	// exclusion lifetime must still advance when the storage source changes.
+	if catalogSourceFingerprint(models.MediaLibrary{}, previous) != catalogSourceFingerprint(models.MediaLibrary{}, next) {
+		if err := tx.Model(&models.MediaLibrary{}).Where("storage_id=? AND id NOT IN (SELECT library_id FROM catalog_heads WHERE mode IN ('versioned','converting'))", next.ID).UpdateColumn("exclusion_epoch", gorm.Expr("exclusion_epoch + 1")).Error; err != nil {
+			return err
 		}
 	}
 	return nil

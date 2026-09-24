@@ -2,6 +2,7 @@
 import { computed, onUnmounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { api } from '@/api/client'
+import MediaWorkContextMenu, { type WorkMenuTarget } from '@/components/MediaWorkContextMenu.vue'
 import { createLatestRequest } from '@/latest-request'
 import { mediaCatalogEndpoint, mediaCatalogOpenTargets } from '@/media-catalog'
 import { normalizeUserCollections, normalizeUserMediaItems, normalizeUserMediaPage, type UserCollectionSummary, type UserMediaItem, type UserMediaPage } from '@/user-media-overview'
@@ -10,6 +11,7 @@ import type { MediaCatalogPage } from '@/types/api'
 const props = defineProps<{ mode: 'favorites' | 'automatic' | 'manual'; initialCollection?: UserCollectionSummary | null }>()
 const emit = defineEmits<{ changed: [] }>()
 const router = useRouter()
+const workMenu = ref<InstanceType<typeof MediaWorkContextMenu> | null>(null)
 const selected = ref<UserCollectionSummary | null>(null)
 const items = ref<UserMediaPage<UserMediaItem>>({ list: [], total: 0, page: 1, page_size: 24, has_more: false })
 const collections = ref<UserMediaPage<UserCollectionSummary>>({ list: [], total: 0, page: 1, page_size: 24, has_more: false })
@@ -38,6 +40,15 @@ async function load(requestedPage = 1) {
   } catch (reason) { if (request.isCurrent()) error.value = reason instanceof Error ? reason.message : '读取失败，请重试' }
   finally { if (request.isCurrent()) loading.value = false; request.finish() }
 }
+function menuTarget(item: UserMediaItem): WorkMenuTarget {
+  return { title: item.title, kind: item.kind, favorite: props.mode === 'favorites', collectionId: selected.value?.source === 'manual' ? selected.value.id : undefined,
+    works: [{ library_id: item.library_id, work_id: item.work_id, library_name: `媒体库 ${item.library_id}`, file_count: 0 }] }
+}
+function openMenu(event: MouseEvent | KeyboardEvent, item: UserMediaItem) { void workMenu.value?.open(event, menuTarget(item)) }
+function menuKey(event: KeyboardEvent, item: UserMediaItem) {
+  if (event.key === 'ContextMenu' || (event.shiftKey && event.key === 'F10')) openMenu(event, item)
+}
+function menuChanged() { emit('changed'); void load(page.value.page) }
 function openCollection(item: UserCollectionSummary) { selected.value = item; rename.value = item.name; clearSearch(); void load() }
 function back() { selected.value = null; clearSearch(); void load(collections.value.page) }
 function clearSearch() { searches.cancel(); searching.value = false; candidates.value = []; search.value = ''; searchMore.value = false; searchError.value = '' }
@@ -130,7 +141,7 @@ onUnmounted(() => { alive = false; reads.cancel(); searches.cancel() })
     <template v-else>
       <div v-if="selected || mode === 'favorites'" class="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-5">
         <article v-for="(item, index) in items.list" :key="itemID(item)" class="panel p-3">
-          <button class="discovery-poster w-full" @click="router.push({ name: 'library-catalog-detail', params: { libraryID: String(item.library_id), workID: item.work_id } })"><div class="discovery-poster__image"><img v-if="item.poster_url" :src="item.poster_url" :alt="`${item.title} 海报`" loading="lazy"><span v-else>暂无海报</span></div><strong>{{ item.title }}</strong></button>
+          <button class="discovery-poster w-full" @contextmenu.prevent="openMenu($event, item)" @keydown="menuKey($event, item)" @click="router.push({ name: 'library-catalog-detail', params: { libraryID: String(item.library_id), workID: item.work_id } })"><div class="discovery-poster__image"><img v-if="item.poster_url" :src="item.poster_url" :alt="`${item.title} 海报`" loading="lazy"><span v-else>暂无海报</span></div><strong>{{ item.title }}</strong></button>
           <div v-if="canEdit" class="mt-3 flex flex-wrap gap-2"><button class="btn-secondary" :disabled="busy" @click="remove(item)">{{ selected ? '移出合集' : '取消收藏' }}</button><button v-if="selected && index > 0" class="btn-secondary" :disabled="busy" @click="moveUp(item, index)">上移</button></div>
         </article>
       </div>
@@ -138,5 +149,6 @@ onUnmounted(() => { alive = false; reads.cancel(); searches.cancel() })
       <p v-if="!page.list.length" class="panel p-8 text-center text-muted">当前页没有内容。</p>
       <footer class="panel flex flex-wrap items-center justify-between gap-3"><span>共 {{ page.total }} 项 · 第 {{ page.page }} 页</span><div class="flex gap-2"><button class="btn-secondary" :disabled="busy || page.page <= 1" @click="load(page.page - 1)">上一页</button><button class="btn-secondary" :disabled="busy || !page.has_more" @click="load(page.page + 1)">下一页</button></div></footer>
     </template>
+    <MediaWorkContextMenu ref="workMenu" @changed="menuChanged" />
   </section>
 </template>

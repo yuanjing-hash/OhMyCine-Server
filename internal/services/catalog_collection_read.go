@@ -28,7 +28,7 @@ func catalogCollectionMembers(reader *CatalogReader) (*gorm.DB, error) {
 	legacy := reader.tx.Table("player_media_collection_items item").Select("c.id AS collection_id,item.library_id,item.work_key,c.tmdb_collection_id,COALESCE(item.tmdb_movie_id,0) AS tmdb_movie_id,c.name,c.poster_path,c.backdrop_path,c.updated_at").Joins("JOIN player_media_collections c ON c.id=item.collection_id").Where("item.library_id IN ? AND item.origin=? AND c.source=?", reader.legacy, models.PlayerMediaCollectionItemOriginTMDB, models.PlayerMediaCollectionSourceTMDB)
 	union := reader.tx.Raw("SELECT * FROM (?) AS legacy_members UNION ALL SELECT * FROM (?) AS versioned_members", legacy, reader.tx.Raw(versioned, args...))
 	// A stale manual/legacy row can never provide global visibility by itself.
-	exists := reader.Entries().Select("1").Where("media_library_entries.library_id=members.library_id AND media_library_entries.work_key=members.work_key")
+	exists := reader.VisibleEntries().Select("1").Where("media_library_entries.library_id=members.library_id AND media_library_entries.work_key=members.work_key")
 	return reader.tx.Table("(?) AS members", union).Where("EXISTS (?)", exists), nil
 }
 

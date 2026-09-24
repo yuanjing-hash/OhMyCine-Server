@@ -538,6 +538,57 @@ func (a *API) ClearMediaLibraryCatalogRecognition(c *gin.Context) {
 	}
 	success(c, http.StatusOK, gin.H{"list": items, "total": len(items)})
 }
+func (a *API) MediaLibraryCatalogExclusions(c *gin.Context) {
+	actor, _ := middleware.ActorFrom(c)
+	page, pageSize, err := historyPageParameters(c)
+	if err != nil {
+		writeError(c, a.log, err)
+		return
+	}
+	var libraryID uint
+	if raw := c.Query("library_id"); raw != "" {
+		parsed, parseErr := strconv.ParseUint(raw, 10, 32)
+		if parseErr != nil || parsed == 0 {
+			writeError(c, a.log, invalid("媒体库标识无效", parseErr))
+			return
+		}
+		libraryID = uint(parsed)
+	}
+	result, err := a.libraries.CatalogExclusions(c.Request.Context(), actor, libraryID, page, pageSize)
+	if err != nil {
+		writeError(c, a.log, err)
+		return
+	}
+	success(c, http.StatusOK, result)
+}
+
+func (a *API) ExcludeMediaLibraryCatalogWork(c *gin.Context) {
+	actor, _ := middleware.ActorFrom(c)
+	id, ok := pathID(c)
+	if !ok {
+		return
+	}
+	result, err := a.libraries.ExcludeCatalogWork(c.Request.Context(), actor, id, c.Param("work"), middleware.RequestContextFrom(c))
+	if err != nil {
+		writeError(c, a.log, err)
+		return
+	}
+	success(c, http.StatusOK, result)
+}
+
+func (a *API) RestoreMediaLibraryCatalogExclusion(c *gin.Context) {
+	actor, _ := middleware.ActorFrom(c)
+	id, ok := pathID(c)
+	if !ok {
+		return
+	}
+	if err := a.libraries.RestoreCatalogExclusion(c.Request.Context(), actor, id, c.Param("exclusionId"), middleware.RequestContextFrom(c)); err != nil {
+		writeError(c, a.log, err)
+		return
+	}
+	success(c, http.StatusOK, gin.H{"restored": true, "rescan_required": true})
+}
+
 func (a *API) PreviewMediaLibraryCatalogDeletion(c *gin.Context) {
 	actor, _ := middleware.ActorFrom(c)
 	id, ok := pathID(c)

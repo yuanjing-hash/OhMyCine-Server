@@ -51,10 +51,10 @@ func (s *AdminService) DashboardOperations(ctx context.Context, actor Actor) map
 					return err
 				}
 				var entries, works int64
-				if err := reader.Entries().Count(&entries).Error; err != nil {
+				if err := reader.VisibleEntries().Count(&entries).Error; err != nil {
 					return err
 				}
-				if err := tx.Table("(?) AS works", reader.Entries().Select("library_id,work_key").Group("library_id,work_key")).Count(&works).Error; err != nil {
+				if err := tx.Table("(?) AS works", reader.VisibleEntries().Select("library_id,work_key").Group("library_id,work_key")).Count(&works).Error; err != nil {
 					return err
 				}
 				facts = []DashboardFact{fact("可见媒体库", int64(len(visible)), "/discovery/library"), fact("库内作品（按库计数）", works, "/discovery/library"), fact("媒体文件", entries, "/discovery/library")}

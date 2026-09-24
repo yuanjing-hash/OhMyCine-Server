@@ -23,6 +23,7 @@ export interface UserMediaItem {
 }
 
 export interface UserHistoryItem {
+  history_id?: string
   library_id: number
   work_id: string
   source_kind: string
@@ -174,6 +175,7 @@ function normalizeHistoryItem(value: unknown): UserHistoryItem {
   const source = record(value)
   const libraryId = positiveNumber(source.library_id, 0)
   return {
+    ...(text(source.history_id) ? { history_id: text(source.history_id) } : {}),
     library_id: libraryId, work_id: text(source.work_id),
     source_kind: text(source.source_kind) || (libraryId > 0 ? 'server' : ''),
     source_name: text(source.source_name) || (libraryId > 0 ? 'OhMyCine Server' : ''),

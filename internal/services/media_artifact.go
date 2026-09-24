@@ -628,7 +628,7 @@ func (s *MediaArtifactService) generateArtifacts(ctx context.Context, runtime Jo
 		manifest.rows[artifactManifestKey(artifact.TargetKind, artifact.RelativePath)] = artifact
 	}
 	var entries []models.MediaLibraryEntry
-	entryQuery := s.db.Where("library_id = ?", run.LibraryID)
+	entryQuery := s.db.Where("library_id = ?", run.LibraryID).Where(catalogVisibleEntryPredicate)
 	if policy.ScopeVersion == 1 {
 		entryQuery = entryQuery.Where("id IN ?", policy.EntryIDs)
 	}
@@ -657,7 +657,8 @@ func (s *MediaArtifactService) generateArtifacts(ctx context.Context, runtime Jo
 	}
 	var recognitions []models.MediaLibraryRecognition
 	if policy.Metadata {
-		recognitionQuery := s.db.Where("library_id = ? AND status = ?", run.LibraryID, mediaRecognitionStatusMatched)
+		recognitionQuery := s.db.Where("library_id = ? AND status = ?", run.LibraryID, mediaRecognitionStatusMatched).
+			Where("EXISTS (SELECT 1 FROM media_library_entries WHERE media_library_entries.recognition_id=media_library_recognitions.id AND " + catalogVisibleEntryPredicate + ")")
 		if policy.ScopeVersion == 1 {
 			recognitionQuery = recognitionQuery.Where("id IN ?", policy.RecognitionIDs)
 		} else if !policy.ScanPartial {

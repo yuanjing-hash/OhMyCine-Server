@@ -39,6 +39,13 @@ func TestCatalogSourceActualLibraryUpdateRetainsAnchorsAndRecordsRemoval(t *test
 	if updated.BaselineGeneration != 0 || updated.DirtyGeneration != library.DirtyGeneration+1 {
 		t.Fatal("source counters not replaced")
 	}
+	var persisted models.MediaLibrary
+	if err := s.writeDB.First(&persisted, library.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if persisted.ExclusionEpoch != library.ExclusionEpoch+1 {
+		t.Fatalf("source exclusion epoch=%d want=%d", persisted.ExclusionEpoch, library.ExclusionEpoch+1)
+	}
 	var count int64
 	if err := s.writeDB.Model(&models.MediaLibraryEntry{}).Where("library_id=?", library.ID).Count(&count).Error; err != nil {
 		t.Fatal(err)

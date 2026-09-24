@@ -95,8 +95,12 @@ func TestHistoryArtworkOwnershipReplacementSyncAndCleanup(t *testing.T) {
 		t.Fatalf("asset lost: %+v %v", result, err)
 	}
 	browser, err := s.BrowserList(actor, 1, 10)
-	if err != nil || len(browser.List) != 1 || browser.List[0].PosterURL != browserHistoryArtworkURL(first.AssetID) {
-		t.Fatalf("browser=%+v %v", browser, err)
+	if err != nil || len(browser.List) != 0 {
+		t.Fatalf("external-source history must stay out of browser=%+v %v", browser, err)
+	}
+	relay, err := s.List(actor, 1, 10, "emby")
+	if err != nil || len(relay.List) != 1 || relay.List[0].PosterAssetID != first.AssetID {
+		t.Fatalf("player relay=%+v %v", relay, err)
 	}
 	second, err := s.PutArtwork(ctx, actor, change.SyncKey, "poster", "image/png", bytes.NewReader(data))
 	if err != nil || second.AssetID == first.AssetID {

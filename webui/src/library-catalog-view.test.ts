@@ -6,6 +6,7 @@ import LibraryCatalogView from './views/LibraryCatalogView.vue'
 
 const push = vi.fn()
 vi.mock('vue-router', () => ({ useRouter: () => ({ push }) }))
+vi.mock('@/stores/auth', () => ({ useAuthStore: () => ({ can: () => false }) }))
 
 function envelope(data: unknown) {
   return { ok: true, status: 200, json: async () => ({ code: 0, message: 'success', data }) }
@@ -43,7 +44,7 @@ describe('LibraryCatalogView overview', () => {
     wrapper.unmount()
   })
 
-  it('loads unified account history with external source labels after the history tab is selected', async () => {
+  it('loads Server-only account history after the history tab is selected', async () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const path = String(input)
       if (path === '/api/v1/media-libraries/overview') return envelope({ version: 'v1', sections: {
@@ -51,7 +52,7 @@ describe('LibraryCatalogView overview', () => {
         favorites: { status: 'ok', list: [], has_more: false }, automatic_collections: { status: 'ok', list: [], has_more: false },
         manual_collections: { status: 'ok', list: [], has_more: false }, media_libraries: { status: 'ok', list: [], has_more: false },
       } })
-      if (path === '/api/v1/media-libraries/history?page=1&page_size=24') return envelope({ list: [{ library_id: 0, work_id: 'emby:item:42', source_kind: 'emby', source_name: '客厅 Emby', playable: false, title: '历史电影', poster_url: 'https://image.example.test/poster.jpg', position: 60, duration: 90, updated_at: 1 }], total: 1, page: 1, page_size: 24, has_more: false })
+      if (path === '/api/v1/media-libraries/history?page=1&page_size=24') return envelope({ list: [{ history_id: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', library_id: 1, work_id: 'movie-work', source_kind: 'server', source_name: 'OhMyCine Server', playable: true, title: '历史电影', position: 60, duration: 90, updated_at: 1 }], total: 1, page: 1, page_size: 24, has_more: false })
       throw new Error(`unexpected request ${path}`)
     })
     vi.stubGlobal('fetch', fetchMock)
@@ -61,7 +62,7 @@ describe('LibraryCatalogView overview', () => {
     await flushPromises()
 
     expect(wrapper.text()).toContain('历史电影')
-    expect(wrapper.text()).toContain('客厅 Emby')
+    expect(wrapper.text()).toContain('OhMyCine Server')
     expect(fetchMock).toHaveBeenCalledTimes(2)
     wrapper.unmount()
   })

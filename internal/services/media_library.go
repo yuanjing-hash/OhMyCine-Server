@@ -689,10 +689,10 @@ func (s *MediaLibraryService) Entries(actor Actor, id uint, limit int) ([]models
 		limit = 200
 	}
 	var items []models.MediaLibraryEntry
-	if err := s.db.Where("library_id = ?", id).Order("relative_path").Limit(limit).Find(&items).Error; err != nil {
-		return nil, err
-	}
-	return items, nil
+	err := s.withCatalogRead(context.Background(), []uint{id}, func(_ *gorm.DB, reader *CatalogReader) error {
+		return reader.VisibleEntries().Where("library_id = ?", id).Order("relative_path").Limit(limit).Find(&items).Error
+	})
+	return items, err
 }
 func (s *MediaLibraryService) Runs(actor Actor, id uint, limit int) ([]models.MediaLibraryScanRun, error) {
 	if !actor.CanResource(authz.PermissionMediaLibrariesRead, models.AuthorizationResourceMediaLibrary, uintID(id)) {

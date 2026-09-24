@@ -266,6 +266,26 @@ func (r *CatalogReader) entryIdentities() *gorm.DB {
 	return r.unionQuery("media_library_entries", columns, "SELECT "+prefixCatalogColumns(columns, "e")+" FROM ("+effective+") e WHERE e.tombstone=0", args)
 }
 
+// VisibleEntries applies library-scoped, source-lifetime catalog exclusions
+// after effective fact resolution. Internal scans and physical writers continue
+// to use Entries so the source facts remain available for restoration.
+const catalogVisibleEntryPredicate = `NOT EXISTS (
+	SELECT 1 FROM media_catalog_exclusions excluded
+	JOIN media_libraries scope ON scope.id=excluded.library_id AND scope.exclusion_epoch=excluded.source_epoch
+	WHERE excluded.library_id=media_library_entries.library_id
+	AND (excluded.work_key=media_library_entries.work_key OR EXISTS (
+		SELECT 1 FROM media_catalog_exclusion_members member
+		WHERE member.exclusion_id=excluded.id AND (
+			(member.provider_id<>'' AND member.provider_id=media_library_entries.provider_id)
+			OR member.relative_path=media_library_entries.relative_path
+		)
+	))
+)`
+
+func (r *CatalogReader) VisibleEntries() *gorm.DB {
+	return r.Entries().Where(catalogVisibleEntryPredicate)
+}
+
 func (r *CatalogReader) Entries() *gorm.DB {
 	entries, args := r.effectiveSQL("catalog_entry_facts")
 	layers, rargs := r.layerSQL()

@@ -143,6 +143,35 @@ func TestManagementHistoryRoutesRequireSessionCSRFAndNoStore(t *testing.T) {
 	}
 }
 
+func TestCatalogExclusionRoutesRequireSessionAndCSRF(t *testing.T) {
+	client := newTestClient(t)
+	paths := []string{
+		"/api/v1/media-libraries/1/catalog/bW92aWU/exclude",
+		"/api/v1/media-libraries/1/exclusions/11111111-1111-4111-8111-111111111111/restore",
+	}
+	for _, path := range paths {
+		request := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{}`))
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("Origin", "http://localhost:3000")
+		response := httptest.NewRecorder()
+		client.router.ServeHTTP(response, request)
+		if response.Code != http.StatusUnauthorized || response.Header().Get("Cache-Control") != "no-store" {
+			t.Fatalf("anonymous exclusion path=%s status=%d cache=%q", path, response.Code, response.Header().Get("Cache-Control"))
+		}
+	}
+	client.setup(t)
+	for _, path := range paths {
+		status, _ := client.request(t, http.MethodPost, path, map[string]any{}, false)
+		if status != http.StatusForbidden || client.lastHeader.Get("Cache-Control") != "no-store" {
+			t.Fatalf("exclusion without csrf path=%s status=%d cache=%q", path, status, client.lastHeader.Get("Cache-Control"))
+		}
+	}
+	status, _ := client.request(t, http.MethodGet, "/api/v1/media-libraries/exclusions?page=1&page_size=24", nil, false)
+	if status != http.StatusOK || client.lastHeader.Get("Cache-Control") != "no-store" {
+		t.Fatalf("exclusion page status=%d cache=%q", status, client.lastHeader.Get("Cache-Control"))
+	}
+}
+
 func TestBuiltInLibraryArtworkIsPublicInertRaster(t *testing.T) {
 	client := newTestClient(t)
 	request := httptest.NewRequest(http.MethodGet, "/api/v1/assets/library-covers/library-local.png", nil)

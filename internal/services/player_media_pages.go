@@ -40,7 +40,7 @@ func (s *PlayerMediaStateService) readableStateQuery(actor Actor, table string) 
 		return nil, err
 	}
 	active := s.db.Table("media_libraries l").Select("l.id").Joins("JOIN storages st ON st.id = l.storage_id").Where("l.id IN ? AND l.enabled = ? AND st.enabled = ?", ids, true, true)
-	exists := s.reader.Entries().Select("1").Where("media_library_entries.library_id = " + table + ".library_id AND media_library_entries.work_key = " + table + ".work_key")
+	exists := s.reader.VisibleEntries().Select("1").Where("media_library_entries.library_id = " + table + ".library_id AND media_library_entries.work_key = " + table + ".work_key")
 	return s.db.Table(table).Where(table+".library_id IN (?)", active).Where("EXISTS (?)", exists), nil
 }
 
@@ -152,7 +152,7 @@ func (s *PlayerMediaStateService) browserStateItems(keys []mediaStateWork) ([]Br
 		pairs = append(pairs, []any{key.libraryID, key.workKey})
 	}
 	var rows []mediaCatalogRow
-	if err := selectCatalogRows(s.reader.Entries().Where("(library_id, work_key) IN ?", pairs)).Scan(&rows).Error; err != nil {
+	if err := selectCatalogRows(s.reader.VisibleEntries().Where("(library_id, work_key) IN ?", pairs)).Scan(&rows).Error; err != nil {
 		return nil, err
 	}
 	byKey := make(map[mediaStateWork]mediaCatalogRow, len(rows))
@@ -160,7 +160,7 @@ func (s *PlayerMediaStateService) browserStateItems(keys []mediaStateWork) ([]Br
 		byKey[mediaStateWork{row.LibraryID, row.WorkKey}] = row
 	}
 	// DISTINCT avoids ranking the same recognition once per episode/version.
-	unique := s.db.Table("(?) AS e", s.reader.Entries()).Select("DISTINCT e.library_id,e.work_key,r.id,r.updated_at,r.metadata_json").Joins("JOIN (?) AS r ON r.id = e.recognition_id AND r.library_id = e.library_id", s.reader.Recognitions()).Where("(e.library_id,e.work_key) IN ?", pairs)
+	unique := s.db.Table("(?) AS e", s.reader.VisibleEntries()).Select("DISTINCT e.library_id,e.work_key,r.id,r.updated_at,r.metadata_json").Joins("JOIN (?) AS r ON r.id = e.recognition_id AND r.library_id = e.library_id", s.reader.Recognitions()).Where("(e.library_id,e.work_key) IN ?", pairs)
 	ranked := s.db.Table("(?) AS recognition", unique).Select("*, ROW_NUMBER() OVER (PARTITION BY library_id,work_key ORDER BY updated_at DESC,id DESC) AS rank")
 	var metadata []struct {
 		LibraryID    uint

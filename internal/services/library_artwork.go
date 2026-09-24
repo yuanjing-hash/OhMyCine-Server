@@ -252,7 +252,7 @@ func (s *LibraryArtworkService) ReconcileMediaLibrary(ctx context.Context, libra
 		if !source.Library.Enabled || !source.Storage.Enabled {
 			return ErrCatalogFence
 		}
-		if err := reader.Entries().Select("category_name, CASE WHEN media_type = 'tv' THEN 'series' ELSE 'movie' END AS media_type").Where("library_id = ? AND work_key <> '' AND category_name <> ''", libraryID).Group("category_name, CASE WHEN media_type = 'tv' THEN 'series' ELSE 'movie' END").Order("media_type, category_name").Scan(&rows).Error; err != nil {
+		if err := reader.VisibleEntries().Select("category_name, CASE WHEN media_type = 'tv' THEN 'series' ELSE 'movie' END AS media_type").Where("library_id = ? AND work_key <> '' AND category_name <> ''", libraryID).Group("category_name, CASE WHEN media_type = 'tv' THEN 'series' ELSE 'movie' END").Order("media_type, category_name").Scan(&rows).Error; err != nil {
 			return err
 		}
 		if s.categoryCandidates == nil {
@@ -632,7 +632,7 @@ func mediaCategoryCandidatesTx(reader *CatalogReader, client *tmdb.Client, libra
 	var rows []models.MediaLibraryRecognition
 	err := reader.Recognitions().
 		Where("media_library_recognitions.library_id = ?", libraryID).
-		Where("EXISTS (?)", reader.Entries().Select("1").Where("media_library_entries.library_id = ? AND media_library_entries.recognition_id = media_library_recognitions.id AND media_library_entries.category_name = ? AND media_library_entries.media_type = ?", libraryID, categoryName, entryMediaType)).
+		Where("EXISTS (?)", reader.VisibleEntries().Select("1").Where("media_library_entries.library_id = ? AND media_library_entries.recognition_id = media_library_recognitions.id AND media_library_entries.category_name = ? AND media_library_entries.media_type = ?", libraryID, categoryName, entryMediaType)).
 		Order("media_library_recognitions.updated_at DESC, media_library_recognitions.id DESC").
 		Limit(64).Find(&rows).Error
 	if err != nil {

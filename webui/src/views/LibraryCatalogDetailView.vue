@@ -19,9 +19,26 @@ const deletion = ref<MediaCatalogDeletionPreview | null>(null); const deletionPh
 const reorganizing = ref<MediaCatalogManagedTransfer | null>(null)
 const libraryID = computed(() => Number(route.params.libraryID)); const workID = computed(() => String(route.params.workID))
 
+let handledPanelPath = ''
 async function load() {
   loading.value = true; error.value = ''; expanded.value = []
-  try { detail.value = normalizeMediaCatalogDetail(await api<unknown>(mediaCatalogDetailEndpoint(libraryID.value, workID.value))) }
+  try {
+    detail.value = normalizeMediaCatalogDetail(await api<unknown>(mediaCatalogDetailEndpoint(libraryID.value, workID.value)))
+    const panel = route.query.panel
+    if (typeof panel === 'string' && handledPanelPath !== route.fullPath) {
+      handledPanelPath = route.fullPath
+      if (auth.can(Permissions.MediaLibrariesScan) && panel === 'metadata') {
+        if (detail.value.work.match_status === 'matched') fullMetadataOpen.value = true
+        else void loadCandidates()
+      }
+      if (auth.can(Permissions.MediaLibrariesScan) && panel === 'recognize') void loadCandidates()
+      if (auth.can(Permissions.MediaLibrariesScan) && panel === 'rescrape') {
+        if (detail.value.work.manual_override) notify('请先清除人工匹配，再重新刮削。', 'error')
+        else if (window.confirm(`重新刮削《${detail.value.work.title}》？`)) void rescrape()
+      }
+      if (auth.can(Permissions.MediaLibrariesMediaDelete) && panel === 'delete-source') void previewDeletion()
+    }
+  }
   catch (reason) { error.value = message(reason) }
   finally { loading.value = false }
 }

@@ -36,6 +36,19 @@ func (a *API) MediaLibraryHistory(c *gin.Context) {
 	success(c, http.StatusOK, result)
 }
 
+func (a *API) DeleteMediaLibraryHistory(c *gin.Context) {
+	if a.playerHistory == nil {
+		writeError(c, a.log, invalid("Server 暂不支持播放历史", nil))
+		return
+	}
+	actor, _ := middleware.ActorFrom(c)
+	if err := a.playerHistory.DeleteBrowserHistory(c.Request.Context(), actor, c.Param("historyId")); err != nil {
+		writeError(c, a.log, err)
+		return
+	}
+	success(c, http.StatusOK, gin.H{"deleted": true})
+}
+
 func (a *API) MediaLibraryFavorites(c *gin.Context) {
 	if a.playerMediaState == nil {
 		writeError(c, a.log, invalid("Server 暂不支持收藏", nil))

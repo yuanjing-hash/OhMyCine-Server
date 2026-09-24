@@ -6,6 +6,7 @@ import UserMediaManager from './components/UserMediaManager.vue'
 const request = vi.hoisted(() => vi.fn())
 vi.mock('@/api/client', () => ({ api: request }))
 vi.mock('vue-router', () => ({ useRouter: () => ({ push: vi.fn() }) }))
+vi.mock('@/stores/auth', () => ({ useAuthStore: () => ({ can: () => false }) }))
 afterEach(() => { request.mockReset(); vi.unstubAllGlobals() })
 const item = (title: string) => ({ library_id: 1, work_id: title, title, kind: 'movie' })
 const page = (list: unknown[], number = 1, total = list.length) => ({ list, total, page: number, page_size: 24, has_more: number * 24 < total, revision: 8 })

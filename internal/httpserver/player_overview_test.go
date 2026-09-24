@@ -143,7 +143,7 @@ func TestBrowserMediaLibraryOverviewUsesSessionFiltersSourcesAndReturnsSafeDTOs(
 	if err := json.Unmarshal(envelope.Data, &overview); err != nil {
 		t.Fatal(err)
 	}
-	if len(overview.Sections["continue_watching"].List) != 2 {
+	if len(overview.Sections["continue_watching"].List) != 1 || strings.Contains(string(envelope.Data), "外部 Emby 作品") {
 		t.Fatalf("continue watching=%s", envelope.Data)
 	}
 	if _, duplicated := overview.Sections["recent_history"]; duplicated {
@@ -159,10 +159,10 @@ func TestBrowserMediaLibraryOverviewUsesSessionFiltersSourcesAndReturnsSafeDTOs(
 	var page struct {
 		List []json.RawMessage `json:"list"`
 	}
-	if err := json.Unmarshal(envelope.Data, &page); status != http.StatusOK || err != nil || len(page.List) != 2 {
+	if err := json.Unmarshal(envelope.Data, &page); status != http.StatusOK || err != nil || len(page.List) != 1 {
 		t.Fatalf("history status=%d err=%v data=%s", status, err, envelope.Data)
 	}
-	if bytes := string(envelope.Data); !strings.Contains(bytes, "外部 Emby 作品") || !strings.Contains(bytes, "客厅 Emby") || !strings.Contains(bytes, "https://image.example.test/emby.jpg") || strings.Contains(bytes, "emby-private-id") || strings.Contains(bytes, "emby-item") || strings.Contains(bytes, "server-private-id") || strings.Contains(bytes, "poster-secret-path") {
+	if bytes := string(envelope.Data); strings.Contains(bytes, "外部 Emby 作品") || strings.Contains(bytes, "客厅 Emby") || strings.Contains(bytes, "https://image.example.test/emby.jpg") || strings.Contains(bytes, "emby-private-id") || strings.Contains(bytes, "emby-item") || strings.Contains(bytes, "server-private-id") || strings.Contains(bytes, "poster-secret-path") {
 		t.Fatalf("history leaked foreign/private data: %s", bytes)
 	}
 	for _, path := range []string{
@@ -181,12 +181,28 @@ func TestBrowserMediaLibraryOverviewUsesSessionFiltersSourcesAndReturnsSafeDTOs(
 		}
 	}
 
-	if err := client.db.Delete(&entry).Error; err != nil {
-		t.Fatal(err)
+	deletePath := "/api/v1/media-libraries/history/" + strings.Repeat("a", 64)
+	status, _ = client.request(t, http.MethodDelete, deletePath, map[string]any{}, false)
+	if status != http.StatusForbidden || client.lastHeader.Get("Cache-Control") != "no-store" {
+		t.Fatalf("history deletion without csrf status=%d", status)
+	}
+	status, envelope = client.request(t, http.MethodDelete, deletePath, map[string]any{}, true)
+	if status != http.StatusOK {
+		t.Fatalf("history deletion status=%d data=%s", status, envelope.Data)
+	}
+	var serverHistory, externalHistory models.PlayerPlaybackHistory
+	if err := client.db.Where("sync_key=?", strings.Repeat("a", 64)).First(&serverHistory).Error; err != nil || !serverHistory.Deleted {
+		t.Fatalf("server history tombstone=%+v err=%v", serverHistory, err)
+	}
+	if err := client.db.Where("sync_key=?", strings.Repeat("b", 64)).First(&externalHistory).Error; err != nil || externalHistory.Deleted {
+		t.Fatalf("external relay affected=%+v err=%v", externalHistory, err)
 	}
 	status, envelope = client.request(t, http.MethodGet, "/api/v1/media-libraries/history?page=1&page_size=24", nil, false)
-	if err := json.Unmarshal(envelope.Data, &page); status != http.StatusOK || err != nil || len(page.List) != 1 || !strings.Contains(string(page.List[0]), "外部 Emby 作品") {
-		t.Fatalf("deleted catalog history status=%d err=%v data=%s", status, err, envelope.Data)
+	if err := json.Unmarshal(envelope.Data, &page); status != http.StatusOK || err != nil || len(page.List) != 0 {
+		t.Fatalf("deleted browser history status=%d err=%v data=%s", status, err, envelope.Data)
+	}
+	if err := client.db.Delete(&entry).Error; err != nil {
+		t.Fatal(err)
 	}
 }
 

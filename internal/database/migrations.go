@@ -99,7 +99,7 @@ func schemaMigrationsThrough109() []migration {
 }
 
 func schemaMigrations() []migration {
-	return append(schemaMigrationsThrough109(), migration{Version: 110, Apply: migrateProviderDeletion}, migration{Version: 111, Apply: migrateCloudEmptyCleanup}, migration{Version: 112, Apply: migrateTGCloudSites})
+	return append(schemaMigrationsThrough109(), migration{Version: 110, Apply: migrateProviderDeletion}, migration{Version: 111, Apply: migrateCloudEmptyCleanup}, migration{Version: 112, Apply: migrateTGCloudSites}, migration{Version: 113, Apply: migrateMediaCatalogExclusions})
 }
 
 func migrateStructureDraftPreviewRows(db *gorm.DB) error {
@@ -2212,4 +2212,20 @@ func seedAuthorization(db *gorm.DB) error {
 		}
 		return nil
 	})
+}
+
+func migrateMediaCatalogExclusions(db *gorm.DB) error {
+	statements := []string{
+		`ALTER TABLE media_libraries ADD COLUMN exclusion_epoch INTEGER NOT NULL DEFAULT 1`,
+		`CREATE TABLE media_catalog_exclusions (id TEXT PRIMARY KEY, library_id INTEGER NOT NULL, source_epoch INTEGER NOT NULL, source_fingerprint TEXT NOT NULL, work_key TEXT NOT NULL, title TEXT NOT NULL, kind TEXT NOT NULL, entry_count INTEGER NOT NULL, created_at DATETIME NOT NULL, UNIQUE(library_id,source_epoch,work_key), FOREIGN KEY(library_id) REFERENCES media_libraries(id) ON DELETE CASCADE)`,
+		`CREATE INDEX idx_media_catalog_exclusions_library_epoch ON media_catalog_exclusions(library_id,source_epoch,created_at DESC)`,
+		`CREATE TABLE media_catalog_exclusion_members (exclusion_id TEXT NOT NULL, relative_path TEXT NOT NULL, provider_id TEXT NOT NULL DEFAULT '', PRIMARY KEY(exclusion_id,relative_path), FOREIGN KEY(exclusion_id) REFERENCES media_catalog_exclusions(id) ON DELETE CASCADE)`,
+		`CREATE INDEX idx_media_catalog_exclusion_members_provider ON media_catalog_exclusion_members(exclusion_id,provider_id)`,
+	}
+	for _, statement := range statements {
+		if err := db.Exec(statement).Error; err != nil {
+			return err
+		}
+	}
+	return nil
 }

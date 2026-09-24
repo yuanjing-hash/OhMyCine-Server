@@ -936,6 +936,7 @@ type MediaLibrary struct {
 	DirtyGeneration           uint64     `gorm:"not null;default:0" json:"dirty_generation"`
 	ReclassificationDue       bool       `gorm:"not null;default:false" json:"reclassification_due"`
 	ContentRevision           uint64     `gorm:"not null;default:0" json:"content_revision"`
+	ExclusionEpoch            uint64     `gorm:"<-:update;not null;default:1" json:"-"`
 	StructureStatus           string     `gorm:"size:32;not null;default:'pending';index" json:"structure_status"`
 	StructureIssueCount       int        `gorm:"not null;default:0" json:"structure_issue_count"`
 	StructureErrorCode        string     `gorm:"size:96;not null;default:''" json:"structure_error_code"`

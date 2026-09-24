@@ -21,6 +21,7 @@ type BrowserMediaItem struct {
 }
 
 type BrowserHistoryItem struct {
+	HistoryID   string   `json:"history_id"`
 	LibraryID   uint     `json:"library_id"`
 	WorkID      string   `json:"work_id"`
 	SourceKind  string   `json:"source_kind"`
@@ -131,7 +132,7 @@ func browserLibraries(items []PlayerMediaLibrary) []BrowserMediaLibrary {
 
 func browserHistoryItem(item PlayerHistoryChange, libraries *MediaLibraryService) (BrowserHistoryItem, bool) {
 	result := BrowserHistoryItem{
-		WorkID: item.SyncKey, SourceKind: item.SourceKind,
+		HistoryID: item.SyncKey, WorkID: item.SyncKey, SourceKind: item.SourceKind,
 		SourceName: browserHistorySourceName(item), Title: item.DisplayTitle,
 		Subtitle: item.DisplaySubtitle, MediaType: item.MediaType,
 		PosterURL: safeHistoryArtwork(item.PosterURL), BackdropURL: safeHistoryArtwork(item.BackdropURL), Position: item.Position,

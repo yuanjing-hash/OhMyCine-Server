@@ -46,7 +46,7 @@ func playerEpisodeMetadataSourceTx(tx *gorm.DB, reader *CatalogReader, libraryID
 	}
 	source.Head, _ = reader.Head(libraryID)
 	source.SourceFingerprint = mediaLibraryScanSourceFingerprint(source.Library, source.Storage, source.Profile)
-	err := reader.Recognitions().Joins("JOIN (?) AS media_library_entries ON media_library_entries.recognition_id=media_library_recognitions.id", reader.Entries()).Where("media_library_entries.library_id=? AND media_library_entries.work_key=?", libraryID, workKey).Order("media_library_recognitions.updated_at DESC,media_library_recognitions.id").First(&source.Recognition).Error
+	err := reader.Recognitions().Joins("JOIN (?) AS media_library_entries ON media_library_entries.recognition_id=media_library_recognitions.id", reader.VisibleEntries()).Where("media_library_entries.library_id=? AND media_library_entries.work_key=?", libraryID, workKey).Order("media_library_recognitions.updated_at DESC,media_library_recognitions.id").First(&source.Recognition).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return source, nil
 	}

@@ -88,7 +88,7 @@ func TestHistoryArtworkHTTPAuthenticationSyncAndSafeProjection(t *testing.T) {
 		}
 	}
 	status, envelope = client.request(t, http.MethodGet, "/api/v1/media-libraries/history", nil, false)
-	if status != 200 || !bytes.Contains(envelope.Data, []byte(browserPath)) || bytes.Contains(envelope.Data, []byte("private-source")) || bytes.Contains(envelope.Data, []byte("example.test")) {
+	if status != 200 || !bytes.Contains(envelope.Data, []byte(`"total":0`)) || bytes.Contains(envelope.Data, []byte(browserPath)) || bytes.Contains(envelope.Data, []byte("private-source")) || bytes.Contains(envelope.Data, []byte("example.test")) {
 		t.Fatalf("browser %d %s", status, envelope.Data)
 	}
 	status, envelope, _ = client.playerRequest(t, http.MethodGet, "/api/v1/player/history", login.Token, nil)

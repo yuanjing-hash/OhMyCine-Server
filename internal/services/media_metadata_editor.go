@@ -541,7 +541,7 @@ func (s *MediaLibraryService) catalogMetadataContext(ctx context.Context, librar
 			return err
 		}
 		var ids []uint
-		if err := reader.Entries().Where("library_id = ? AND work_key = ? AND recognition_id IS NOT NULL", libraryID, workKey).Distinct().Order("recognition_id").Limit(CatalogMaxDeltaRows+1).Pluck("recognition_id", &ids).Error; err != nil {
+		if err := reader.VisibleEntries().Where("library_id = ? AND work_key = ? AND recognition_id IS NOT NULL", libraryID, workKey).Distinct().Order("recognition_id").Limit(CatalogMaxDeltaRows+1).Pluck("recognition_id", &ids).Error; err != nil {
 			return err
 		}
 		if len(ids) == 0 {

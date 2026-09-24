@@ -215,7 +215,7 @@ func (s *MediaLibraryService) playerLibrariesTx(tx *gorm.DB, actor Actor) ([]Pla
 	err = tx.Table("media_libraries").
 		Select("media_libraries.id, media_libraries.name, storages.type AS storage_type, media_libraries.sort_order, media_libraries.status, media_libraries.strm_enabled, media_libraries.signed_proxy_enabled, media_libraries.last_successful_scan_at, COUNT(media_library_entries.id) AS entry_count, COUNT(DISTINCT CASE WHEN media_library_entries.work_key <> '' THEN media_library_entries.work_key END) AS work_count").
 		Joins("JOIN storages ON storages.id = media_libraries.storage_id").
-		Joins("LEFT JOIN (?) AS media_library_entries ON media_library_entries.library_id = media_libraries.id", reader.Entries()).
+		Joins("LEFT JOIN (?) AS media_library_entries ON media_library_entries.library_id = media_libraries.id", reader.VisibleEntries()).
 		Where("media_libraries.enabled = ? AND storages.enabled = ? AND media_libraries.id IN ?", true, true, libraryIDs).
 		Group("media_libraries.id").Order("media_libraries.sort_order, media_libraries.id").Scan(&rows).Error
 	if err != nil {
@@ -262,7 +262,7 @@ func (s *MediaLibraryService) playerCategoriesTx(tx *gorm.DB, reader *CatalogRea
 		ItemCount    int64
 	}
 	var rows []countRow
-	if err := reader.Entries().
+	if err := reader.VisibleEntries().
 		Select("category_name, CASE WHEN media_type = 'tv' THEN 'series' ELSE 'movie' END AS media_type, COUNT(DISTINCT work_key) AS item_count").
 		Where("library_id = ? AND work_key <> '' AND category_name <> ''", libraryID).
 		Group("category_name, CASE WHEN media_type = 'tv' THEN 'series' ELSE 'movie' END").
@@ -371,7 +371,7 @@ func (s *MediaLibraryService) PlayerCatalogDetail(ctx context.Context, actor Act
 		if err != nil {
 			return err
 		}
-		if err := reader.Entries().Where("library_id = ? AND work_key = ?", libraryID, workKey).Order("COALESCE(season,0),COALESCE(episode,0),relative_path").Find(&entries).Error; err != nil {
+		if err := reader.VisibleEntries().Where("library_id = ? AND work_key = ?", libraryID, workKey).Order("COALESCE(season,0),COALESCE(episode,0),relative_path").Find(&entries).Error; err != nil {
 			return err
 		}
 		source, err = playerEpisodeMetadataSourceTx(tx, reader, libraryID, workKey)
@@ -596,7 +596,7 @@ func (s *MediaLibraryService) playerMediaItemTx(tx *gorm.DB, reader *CatalogRead
 	}
 	var recognition models.MediaLibraryRecognition
 	err = reader.Recognitions().
-		Joins("JOIN (?) AS media_library_entries ON media_library_entries.recognition_id = media_library_recognitions.id", reader.Entries()).
+		Joins("JOIN (?) AS media_library_entries ON media_library_entries.recognition_id = media_library_recognitions.id", reader.VisibleEntries()).
 		Where("media_library_entries.library_id = ? AND media_library_entries.work_key = ?", libraryID, workKey).
 		Order("media_library_recognitions.updated_at DESC").First(&recognition).Error
 	var snapshot tmdb.Snapshot
@@ -802,7 +802,7 @@ func (s *SignedProxyService) playerStreamSource(ctx context.Context, actor Actor
 			return err
 		}
 		source.Head, _ = reader.Head(anchor.LibraryID)
-		if err := reader.Entries().Where("id=? AND library_id=?", entryID, anchor.LibraryID).First(&source.Entry).Error; err != nil {
+		if err := reader.VisibleEntries().Where("id=? AND library_id=?", entryID, anchor.LibraryID).First(&source.Entry).Error; err != nil {
 			return appError(CodeNotFound, "媒体文件不存在", err)
 		}
 		if err := tx.First(&source.Library, anchor.LibraryID).Error; err != nil {

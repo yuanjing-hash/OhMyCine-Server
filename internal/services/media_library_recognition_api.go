@@ -338,7 +338,7 @@ func (s *MediaLibraryService) recognitionContext(ctx context.Context, libraryID 
 		if loadEntries {
 			limit = CatalogMaxDeltaRows + 1
 		}
-		if err := reader.Entries().Where("library_id = ? AND recognition_id = ?", libraryID, record.ID).Order("relative_path").Limit(limit).Find(&entries).Error; err != nil {
+		if err := reader.VisibleEntries().Where("library_id = ? AND recognition_id = ?", libraryID, record.ID).Order("relative_path").Limit(limit).Find(&entries).Error; err != nil {
 			return err
 		}
 		if len(entries) == 0 {
@@ -530,11 +530,11 @@ func (s *MediaLibraryService) recognitionSummaryByID(ctx context.Context, librar
 
 func recognitionSummaryTx(reader *CatalogReader, record models.MediaLibraryRecognition) (MediaRecognitionSummary, error) {
 	var count int64
-	if err := reader.Entries().Where("library_id = ? AND recognition_id = ?", record.LibraryID, record.ID).Count(&count).Error; err != nil {
+	if err := reader.VisibleEntries().Where("library_id = ? AND recognition_id = ?", record.LibraryID, record.ID).Count(&count).Error; err != nil {
 		return MediaRecognitionSummary{}, err
 	}
 	var first models.MediaLibraryEntry
-	if err := reader.Entries().Where("library_id = ? AND recognition_id = ?", record.LibraryID, record.ID).Order("relative_path").First(&first).Error; err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+	if err := reader.VisibleEntries().Where("library_id = ? AND recognition_id = ?", record.LibraryID, record.ID).Order("relative_path").First(&first).Error; err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
 		return MediaRecognitionSummary{}, err
 	}
 	return MediaRecognitionSummary{Token: encodeRecognitionToken(record.ID), Status: record.Status, ErrorCode: record.ErrorCode, Title: record.Title, MediaType: record.MediaType, ReleaseYear: cloneInt(record.ReleaseYear), TMDBID: cloneInt64(record.TMDBID), Confidence: cloneFloat64(record.Confidence), CategoryName: record.CategoryName, ManualOverride: record.ManualOverride, FileCount: count, SourceSummary: safeMediaDisplayName(path.Base(first.RelativePath)), SourceDirectory: recognitionSourceDirectory(first.RelativePath), UpdatedAt: record.UpdatedAt}, nil

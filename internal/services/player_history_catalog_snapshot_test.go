@@ -166,8 +166,8 @@ func TestPlayerHistoryCatalogSnapshotTombstonesMixedSourcesAndAvailability(t *te
 		t.Fatalf("deleted version not hidden=%+v err=%v", page, err)
 	}
 	browser, err := f.history.BrowserList(f.actor, 1, 10)
-	if err != nil || browser.Total != 2 || browser.List[0].SourceKind != "emby" {
-		t.Fatalf("external relay=%+v err=%v", browser, err)
+	if err != nil || browser.Total != 1 || browser.List[0].SourceKind != "server" {
+		t.Fatalf("browser must show only Server history=%+v err=%v", browser, err)
 	}
 	items, more, err := f.history.ServerContinueWatching(f.actor, 1, map[uint]struct{}{library.ID: {}, other.ID: {}})
 	if err != nil || more || len(items) != 1 || items[0].LibraryID != fmt.Sprint(other.ID) {

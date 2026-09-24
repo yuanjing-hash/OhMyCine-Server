@@ -175,6 +175,15 @@ func TestLibraryRetirementPreservesFilesHistoryAndOtherLibraryAcrossRestart(t *t
 		t.Fatal(err)
 	}
 	for _, id := range []uint{library.ID, other.ID} {
+		exclusion := models.MediaCatalogExclusion{ID: fmt.Sprintf("retirement-exclusion-%d", id), LibraryID: id, SourceEpoch: 1, SourceFingerprint: "test", WorkKey: "work", Title: "Test work", Kind: "movie", EntryCount: 1, CreatedAt: time.Now().UTC()}
+		if err := s.db.Create(&exclusion).Error; err != nil {
+			t.Fatal(err)
+		}
+		if err := s.db.Create(&models.MediaCatalogExclusionMember{ExclusionID: exclusion.ID, RelativePath: "source.mkv"}).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, id := range []uint{library.ID, other.ID} {
 		if err := s.db.Create(&models.PlayerMediaFavorite{UserID: actor.User.ID, LibraryID: id, WorkKey: "work"}).Error; err != nil {
 			t.Fatal(err)
 		}
@@ -226,6 +235,12 @@ func TestLibraryRetirementPreservesFilesHistoryAndOtherLibraryAcrossRestart(t *t
 		var n int64
 		if err := s.db.Table(table).Count(&n).Error; err != nil || n != 1 {
 			t.Fatalf("%s=%d %v", table, n, err)
+		}
+	}
+	for _, table := range []string{"media_catalog_exclusions", "media_catalog_exclusion_members"} {
+		var remaining int64
+		if err := s.db.Table(table).Count(&remaining).Error; err != nil || remaining != 1 {
+			t.Fatalf("%s after retirement=%d err=%v", table, remaining, err)
 		}
 	}
 	var n int64

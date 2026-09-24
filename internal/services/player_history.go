@@ -285,7 +285,7 @@ func (s *PlayerHistoryService) BrowserList(actor Actor, page, pageSize int) (Bro
 	wantedOffset := (page - 1) * pageSize
 	result := BrowserHistoryPage{List: make([]BrowserHistoryItem, 0, pageSize), Page: page, PageSize: pageSize}
 	selected := make([]PlayerHistoryChange, 0, pageSize)
-	err := s.visitAvailableHistory(actor, false, false, func(change PlayerHistoryChange) bool {
+	err := s.visitAvailableHistory(actor, true, false, func(change PlayerHistoryChange) bool {
 		_, ok := browserHistoryItem(change, nil)
 		if !ok {
 			return true
@@ -316,7 +316,7 @@ func (s *PlayerHistoryService) BrowserContinueWatching(actor Actor, limit int) (
 		return nil, false, appError(CodeInvalidRequest, "继续观看数量无效", nil)
 	}
 	selected := make([]PlayerHistoryChange, 0, limit+1)
-	err := s.visitAvailableHistory(actor, false, true, func(change PlayerHistoryChange) bool {
+	err := s.visitAvailableHistory(actor, true, true, func(change PlayerHistoryChange) bool {
 		if _, ok := browserHistoryItem(change, nil); ok {
 			selected = append(selected, change)
 		}
@@ -326,6 +326,45 @@ func (s *PlayerHistoryService) BrowserContinueWatching(actor Actor, limit int) (
 		return nil, false, err
 	}
 	return boundedOverviewList(browserHistoryItems(selected, s.libraries), limit, false)
+}
+
+// DeleteBrowserHistory writes a user-scoped tombstone so every Player device
+// receives the removal through the existing history cursor. Browser actions may
+// only target Server catalog history, never the private external-source relay.
+func (s *PlayerHistoryService) DeleteBrowserHistory(ctx context.Context, actor Actor, historyID string) error {
+	historyID = strings.ToLower(strings.TrimSpace(historyID))
+	if len(historyID) != 64 || !isHex(historyID) {
+		return appError(CodeInvalidRequest, "播放历史标识无效", nil)
+	}
+	return withForegroundTransaction(ctx, s.db, s.writeAdmission, func(tx *gorm.DB) error {
+		var row models.PlayerPlaybackHistory
+		err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where(
+			"user_id = ? AND sync_key = ? AND source_kind = ? AND deleted = ?",
+			actor.User.ID, historyID, "server", false,
+		).First(&row).Error
+		if err == gorm.ErrRecordNotFound {
+			return appError(CodeNotFound, "播放历史不存在", nil)
+		}
+		if err != nil {
+			return err
+		}
+		now := time.Now()
+		if s.now != nil {
+			now = s.now()
+		}
+		if row.ClientUpdatedAt > now.Add(playerHistoryFutureTolerance).UnixMilli() {
+			return appError(CodeHistoryClockAhead, "播放历史时间明显超前，请校准设备时间后重试", nil)
+		}
+		updatedAt := now.UnixMilli()
+		if updatedAt <= row.ClientUpdatedAt {
+			updatedAt = row.ClientUpdatedAt + 1
+		}
+		change := playerHistoryChangeDTO(row)
+		change.Position, change.Completed, change.Deleted = 0, false, true
+		change.UpdatedAt = updatedAt
+		_, err = writePlayerHistoryChange(tx, actor.User.ID, change)
+		return err
+	})
 }
 
 // ServerContinueWatching applies catalog authorization before taking limit+1;
@@ -536,7 +575,7 @@ func (s *PlayerHistoryService) availableServerHistoryRows(tx *gorm.DB, actor Act
 			workKeys = append(workKeys, workKey)
 		}
 		var entries []models.MediaLibraryEntry
-		if err := reader.Entries().Where("library_id = ? AND work_key IN ?", libraryID, workKeys).Find(&entries).Error; err != nil {
+		if err := reader.VisibleEntries().Where("library_id = ? AND work_key IN ?", libraryID, workKeys).Find(&entries).Error; err != nil {
 			return nil, err
 		}
 		entriesByWork := make(map[string][]models.MediaLibraryEntry)
@@ -655,7 +694,7 @@ func (s *PlayerHistoryService) resolveServerHistoryAuthority(tx *gorm.DB, actor 
 	if err != nil {
 		return serverHistoryAuthority{}, err
 	}
-	entryQuery := reader.Entries().Where("library_id = ? AND work_key = ?", parsed.libraryID, parsed.workKey)
+	entryQuery := reader.VisibleEntries().Where("library_id = ? AND work_key = ?", parsed.libraryID, parsed.workKey)
 	if parsed.entryID != 0 {
 		entryQuery = entryQuery.Where("id = ?", parsed.entryID)
 	}
@@ -676,7 +715,7 @@ func (s *PlayerHistoryService) resolveServerHistoryAuthority(tx *gorm.DB, actor 
 	if entry.RecognitionID != nil {
 		recognitionErr = reader.Recognitions().Where("library_id = ?", parsed.libraryID).First(&recognition, *entry.RecognitionID).Error
 	} else {
-		recognitionIDs := reader.Entries().Select("recognition_id").Where("library_id = ? AND work_key = ? AND recognition_id IS NOT NULL", parsed.libraryID, parsed.workKey)
+		recognitionIDs := reader.VisibleEntries().Select("recognition_id").Where("library_id = ? AND work_key = ? AND recognition_id IS NOT NULL", parsed.libraryID, parsed.workKey)
 		recognitionErr = reader.Recognitions().Where("library_id = ? AND id IN (?)", parsed.libraryID, recognitionIDs).Order("updated_at DESC, id DESC").First(&recognition).Error
 	}
 	var snapshot tmdb.Snapshot

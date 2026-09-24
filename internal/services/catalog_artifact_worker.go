@@ -473,13 +473,13 @@ func (s *MediaArtifactService) prepareCatalogArtifactScope(ctx context.Context, 
 			}
 			var entries []models.MediaLibraryEntry
 			if err := read(func(r *CatalogReader) error {
-				query := r.Entries().Where("library_id = ? AND id > ?", run.LibraryID, after)
+				query := r.VisibleEntries().Where("library_id = ? AND id > ?", run.LibraryID, after)
 				if row.ScopeMode == catalogArtifactScopeIncremental {
 					ids := make([]uint, 0, len(sourceItems))
 					for _, item := range sourceItems {
 						ids = append(ids, item.EntityID)
 					}
-					query = r.Entries().Where("library_id = ? AND id IN ?", run.LibraryID, ids)
+					query = r.VisibleEntries().Where("library_id = ? AND id IN ?", run.LibraryID, ids)
 				}
 				return query.Order("id").Limit(CatalogBatchRows).Find(&entries).Error
 			}); err != nil {
@@ -683,7 +683,7 @@ func (s *MediaArtifactService) prepareCatalogArtifactScope(ctx context.Context, 
 			var entries []models.MediaLibraryEntry
 			if len(ids) > 0 {
 				if err := read(func(r *CatalogReader) error {
-					return r.Entries().Where("library_id = ? AND recognition_id IN ?", run.LibraryID, ids).Order("recognition_id,relative_path").Find(&entries).Error
+					return r.VisibleEntries().Where("library_id = ? AND recognition_id IN ?", run.LibraryID, ids).Order("recognition_id,relative_path").Find(&entries).Error
 				}); err != nil {
 					return err
 				}
@@ -1056,7 +1056,7 @@ func (s *MediaArtifactService) generateBoundArtifacts(ctx context.Context, runti
 			case kind == "entry":
 				var rows []models.MediaLibraryEntry
 				if err := read(func(r *CatalogReader) error {
-					return r.Entries().Where("library_id = ? AND id IN ?", run.LibraryID, ids).Find(&rows).Error
+					return r.VisibleEntries().Where("library_id = ? AND id IN ?", run.LibraryID, ids).Find(&rows).Error
 				}); err != nil {
 					return fail(err)
 				}
@@ -1115,7 +1115,7 @@ func (s *MediaArtifactService) generateBoundArtifacts(ctx context.Context, runti
 				}
 				var entryRows []models.MediaLibraryEntry
 				if err := read(func(r *CatalogReader) error {
-					return r.Entries().Where("library_id = ? AND recognition_id IN ?", run.LibraryID, ids).Order("recognition_id,relative_path").Find(&entryRows).Error
+					return r.VisibleEntries().Where("library_id = ? AND recognition_id IN ?", run.LibraryID, ids).Order("recognition_id,relative_path").Find(&entryRows).Error
 				}); err != nil {
 					return fail(err)
 				}
