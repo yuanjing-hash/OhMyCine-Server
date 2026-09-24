@@ -136,7 +136,7 @@ func TestPlayerHistoryCanonicalizesMovieAcrossOriginEntryAndPhysicalVersions(t *
 			canonical = &result.Changes[index]
 		}
 	}
-	if canonical == nil || canonical.HistoryIdentity != wantIdentity || canonical.Position != 360 || canonical.Title != "权威电影" || canonical.DisplayTitle != "权威电影" || canonical.PosterPath != "/movie-poster.jpg" || canonical.BackdropPath != "/movie-backdrop.jpg" || canonical.PosterURL != "" || canonical.MediaIdentity != wantIdentity {
+	if len(result.Changes) != 1 || canonical == nil || canonical.HistoryIdentity != wantIdentity || canonical.Position != 360 || canonical.Title != "权威电影" || canonical.DisplayTitle != "权威电影" || canonical.PosterPath != "/movie-poster.jpg" || canonical.BackdropPath != "/movie-backdrop.jpg" || canonical.PosterURL != "" || canonical.MediaIdentity != wantIdentity {
 		t.Fatalf("canonical=%+v changes=%+v", canonical, result.Changes)
 	}
 	page, err := fixture.history.List(fixture.actor, 1, 100, "server")
@@ -173,7 +173,7 @@ func TestPlayerHistoryReconcilesLegacyMovieRowsWithoutIncomingChanges(t *testing
 	if page.List[0].SyncKey != wantKey || page.List[0].HistoryIdentity != wantIdentity || page.List[0].Position != 360 {
 		t.Fatalf("canonical page=%+v", page)
 	}
-	if len(result.Changes) != 3 {
+	if len(result.Changes) != 1 {
 		t.Fatalf("sync changes=%+v", result.Changes)
 	}
 	var activeLegacy int64

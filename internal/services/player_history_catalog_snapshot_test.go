@@ -82,7 +82,7 @@ func TestPlayerHistoryCatalogSnapshotSyncReconcileAndRecognitionDelta(t *testing
 		t.Fatal(err)
 	}
 	result, err := f.history.Sync(f.actor, 0, nil)
-	if err != nil || len(result.Changes) != 3 {
+	if err != nil || len(result.Changes) != 1 {
 		t.Fatalf("reconcile=%+v err=%v", result, err)
 	}
 	page, err := f.history.List(f.actor, 1, 10, "server")

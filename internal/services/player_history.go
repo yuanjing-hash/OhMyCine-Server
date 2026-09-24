@@ -168,14 +168,20 @@ func (s *PlayerHistoryService) SyncContext(ctx context.Context, actor Actor, cur
 	result := PlayerHistorySyncResult{Cursor: cursor, Changes: make([]PlayerHistoryChange, 0, len(rows)), Rejected: rejected}
 	imageClient := s.playerHistoryImageClient()
 	for _, row := range rows {
+		if row.Revision > result.Cursor {
+			result.Cursor = row.Revision
+		}
+		// A retired Server sync key is not a deletion of its canonical work.
+		// Returning it would make older Players tombstone fresh playback at
+		// the same timestamp and upload that false deletion back to Server.
+		if row.SourceKind == "server" && row.Deleted && row.HistoryIdentity != "" && row.SyncKey != playerHistoryCanonicalSyncKey(row.HistoryIdentity) {
+			continue
+		}
 		result.Changes = append(result.Changes, playerHistoryArtworkDTO(playerHistoryChangeDTO(row), imageClient))
 		if row.ClientUpdatedAt > latestAllowed {
 			// Preserve legacy ordering/merge facts. Old clients cannot safely
 			// apply a lower timestamp as a corrective delta.
 			result.Warnings = append(result.Warnings, PlayerHistoryRejection{SyncKey: row.SyncKey, Code: CodeHistoryClockAhead})
-		}
-		if row.Revision > result.Cursor {
-			result.Cursor = row.Revision
 		}
 	}
 	return result, nil
