@@ -44,7 +44,7 @@ jobs:
           channel=stable
           branch=main
           if [[ "$(jq -r '.isPrerelease' "$RUNNER_TEMP/docker-release.json")" == true ]]; then channel=beta; branch=develop; fi
-          git fetch origin "refs/tags/${tag}:refs/tags/${tag}" "+refs/heads/${branch}:refs/remotes/origin/${branch}"
+          git fetch --force origin "+refs/tags/${tag}:refs/tags/${tag}" "+refs/heads/${branch}:refs/remotes/origin/${branch}"
           commit="$(git rev-parse "refs/tags/${tag}^{commit}")"
           git merge-base --is-ancestor "$commit" "refs/remotes/origin/${branch}"
           if [[ -n "$CALL_VERSION" ]]; then
