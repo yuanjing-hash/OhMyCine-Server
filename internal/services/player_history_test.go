@@ -361,14 +361,14 @@ func TestPlayerHistoryBatchKeepsValidExternalRowsWhenOneServerRowIsStale(t *test
 	if len(result.Rejected) != 1 || result.Rejected[0].SyncKey != stale.SyncKey || len(result.Changes) != 1 {
 		t.Fatalf("partial sync result=%+v", result)
 	}
+	if item := result.Changes[0]; item.SyncKey != external.SyncKey || item.SourceKind != "emby" || item.SourceName != "客厅 Emby" || item.PosterURL != external.PosterURL {
+		t.Fatalf("external history sync=%+v", item)
+	}
 	page, err := fixture.history.BrowserList(fixture.actor, 1, 24)
-	if err != nil || page.Total != 1 || len(page.List) != 1 {
-		t.Fatalf("browser history=%+v err=%v", page, err)
+	if err != nil || page.Total != 0 || len(page.List) != 0 {
+		t.Fatalf("external history leaked into browser history: page=%+v err=%v", page, err)
 	}
-	item := page.List[0]
-	if item.SourceKind != "emby" || item.SourceName != "客厅 Emby" || item.Playable || item.PosterURL != external.PosterURL {
-		t.Fatalf("external history projection=%+v", item)
-	}
+
 	legacyUnsafe := external
 	legacyUnsafe.PosterURL = "https://image.example.test/poster.jpg?password=secret"
 	projected, ok := browserHistoryItem(legacyUnsafe, fixture.libraries)

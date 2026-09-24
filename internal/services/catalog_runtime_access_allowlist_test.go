@@ -138,7 +138,7 @@ var catalogRuntimeAccessAllowlist = map[string]string{
 	"internal/services/media_library_recognition_api.go:MediaLibraryService.recognizeStoredUnit":             "model:E=1|8a687a8fd5310d81",
 	"internal/services/media_library_recognition_api.go:recognitionPackageName":                              "model:E=1|a08ed012745b7140",
 	"internal/services/media_library_recognition_api.go:recognitionSummaryTx":                                "model:E=1,model:R=1,query:First:E=1,query:Where:R=2|b10dcfc82679876c",
-	"internal/services/media_library_retirement_cleanup.go:declaration(libraryRetirementCleanup)":            "sql:A=1,sql:E=1,sql:R=1|e2af2d48fdc99428",
+	"internal/services/media_library_retirement_cleanup.go:declaration(libraryRetirementCleanup)":            "sql:A=1,sql:E=1,sql:R=1|228465b2bde5f08f",
 	"internal/services/media_library_structure.go:MediaLibraryStructureService.EnsureWorkLayout":             "call:updateStructureCatalogPaths=1|94f5003109ac2185",
 	"internal/services/media_library_structure.go:MediaLibraryStructureService.RefreshRecognitionProjection": "model:E=1,model:R=1,query:First:R=1|b8c9c06a6d6b0789",
 	// Cancellation/partial-result audit (2026-09-08): runRepair dispatches any
