@@ -51,8 +51,9 @@ def verify_workflow(path: Path = DEFAULT_WORKFLOW) -> list[str]:
         "node signing secret is isolated to trust derivation and signing steps": (
             text.find("Derive Node release trust root")
             < text.find("secrets.OHMYCINE_NODE_MANIFEST_SIGNING_PRIVATE_KEY")
+            < text.find("Render and fingerprint versioned Node installers")
             < text.find("Build and package embedded-WebUI Server archives")
-            < text.find("Sign Node manifest and render versioned installers")
+            < text.find("Sign Node manifest and verify versioned installers")
             < text.rfind("secrets.OHMYCINE_NODE_MANIFEST_SIGNING_PRIVATE_KEY")
             < text.find("Revalidate latest develop and publish Server-only prerelease")
         ),
@@ -95,6 +96,18 @@ def verify_workflow(path: Path = DEFAULT_WORKFLOW) -> list[str]:
         "versioned node installers are rendered": "install-ohmycine-node-v${VERSION}.sh" in text
         and "install-ohmycine-node-v${VERSION}.ps1" in text
         and "__OHMYCINE_NODE_RELEASE_PUBLIC_KEY_BASE64__" in text,
+        "node installer fingerprints precede Server build": (
+            text.find("Render and fingerprint versioned Node installers")
+            < text.find("Build and package embedded-WebUI Server archives")
+            and "NodeInstallerShellSHA256=${NODE_INSTALLER_SH_SHA256}" in text
+            and "NodeInstallerPowerShellSHA256=${NODE_INSTALLER_PS1_SHA256}" in text
+            and "NodeDockerHubNamespace=${NODE_DOCKERHUB_NAMESPACE}" in text
+        ),
+        "signed installers match embedded fingerprints": (
+            '"$NODE_INSTALLER_SH_SHA256"' in text
+            and '"$NODE_INSTALLER_PS1_SHA256"' in text
+            and "Node installer bytes changed after Server binary fingerprint injection" in text
+        ),
         "webui release build runs": "npm run build" in text,
         "release regression gates run": all(
             command in text for command in (

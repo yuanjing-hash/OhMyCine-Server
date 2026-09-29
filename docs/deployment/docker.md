@@ -39,14 +39,14 @@ docker compose -f compose.server.yml up -d
 
 主 Server 的受管浏览器组件、许可确认及缓存说明见 [浏览器组件部署](browser-companion.md)。Node 子系统镜像不捆绑该组件。
 
-1. 在主 Server 的传输节点管理创建节点，填写公网 API 地址及对应 Linux 架构。取得返回的节点 ID 和一次性令牌；复制的安装命令中也包含这些值。
-2. 在公网机器保存 `deploy/compose.node.yml`，同目录建立仅管理员可读的 `.env`，填写上述 `OMC_NODE_ID`、`OMC_NODE_ENROLLMENT_TOKEN`。不能自行编造。令牌有效期 10 分钟，超时需在主 Server 重新生成并更新容器环境。
-3. 执行 `docker compose -f compose.node.yml up -d`，放行主 Server 到 Node 的公网 4433 端口。
-4. 在主 Server 点击“完成配对”，然后“测试”。添加下载器时选择该子节点，填写 Node 容器能访问的下载器地址。
+1. 在主 Server 的传输节点管理创建 Linux 节点，填写主 Server 能访问的公网 HTTP/HTTPS 地址。页面会显示一次性的一行安装命令和完整 Docker Compose；两种方式选一种即可。
+2. 选择 Docker 时，直接复制页面显示的 Compose 保存为公网机器上的 `compose.yml`，限制该文件的读取权限，再运行 `docker compose up -d`。Node ID、十分钟有效的配对令牌、Docker Hub 镜像版本和 HTTP/HTTPS 模式已经写入示例，无需另建 `.env` 或手工填写 `OMC_IMAGE_TAG`。令牌过期后须在主 Server 重新生成并复制新配置。不要在日志、工单或公开仓库中粘贴含令牌的配置。
+3. 确认主 Server 能访问所填地址和容器的 4433 端口；若公网地址未显式指定端口，则需让反向代理把该地址的 80/443 转到 Node 的 4433 端口。然后在主 Server 点击“完成配对”和“测试”。
+4. 添加下载器时选择该子节点，填写 Node 容器能够访问的下载器地址。Docker Compose 只部署 OhMyCine Node，不安装下载器。
 
-默认 `OMC_NODE_TRANSPORT=https`，主 Server 填 `https://节点地址:4433`。需要 HTTP 时在 `.env` 设置 `OMC_NODE_TRANSPORT=http`，主 Server 改用 `http://节点地址:4433`。正式 HTTP 保留节点配对与业务授权，但不提供传输加密。无需设置开发绕过开关。
+页面从保存的节点地址生成传输模式：`https://` 使用镜像默认 HTTPS，`http://` 自动写入 `OMC_NODE_TRANSPORT=http`。正式 HTTP 保留节点配对与业务授权，但不提供传输加密。使用仓库中的通用 `deploy/compose.node.yml` 而非页面生成示例时，仍需自行填写 ID、令牌，并在选择 HTTP 地址时设置对应传输模式。
 
-首次启动自动生成身份证书和密钥；`node-state` 卷保存节点数据库、证书、封装密钥及受管文件，升级必须保留。默认无需手动申请域名证书。使用自有证书时，只读挂载证书目录并设置 `OMC_NODE_TLS_CERT`、`OMC_NODE_TLS_KEY` 为容器内路径；更换身份后需重新配对。
+首次启动自动生成身份证书和密钥；页面生成的 `node-state` 命名卷保存节点数据库、证书、封装密钥及受管文件，升级必须保留。命名卷避免新建 `./data` 绑定目录因宿主机 root 所有权导致 Node UID/GID `65532:65532` 无法写入身份文件。已有节点不能直接换卷而不迁移身份数据。默认无需手动申请域名证书。使用自有证书时，只读挂载证书目录并设置 `OMC_NODE_TLS_CERT`、`OMC_NODE_TLS_KEY` 为容器内路径；更换身份后需重新配对。
 
 下载器与 Node 分属容器时，`localhost` 指 Node 自己。可以加入同一 Docker 网络并使用下载器服务名；不要公开下载器管理端口。下载器保存目录必须能从 Node 受管根访问，例如将同一目录挂载到二者的 `/downloads`，并设置 Node 的 `OMC_NODE_MANAGED_ROOT=/downloads`，授予 UID 65532 读写权限。做种仍由原下载器执行。
 

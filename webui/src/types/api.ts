@@ -342,7 +342,13 @@ export interface TransferNodeSummary {
   created_at: string; updated_at: string
 }
 export interface TransferNodeSettings { default_node_id?: string; revision: number }
-export interface TransferNodeInstallation { available: boolean; shell?: 'bash' | 'powershell'; command?: string }
+export interface TransferNodeInstallation {
+  available: boolean
+  shell?: 'bash' | 'powershell'
+  command?: string
+  version?: string
+  docker_hub_namespace?: string
+}
 export interface CreateTransferNodeResult { node: TransferNodeSummary; enrollment_token: string; expires_in_seconds: number; installation: TransferNodeInstallation }
 export interface DownloadSettings {
   configured: boolean; absolute_path: string; revision: number; updated_at: string

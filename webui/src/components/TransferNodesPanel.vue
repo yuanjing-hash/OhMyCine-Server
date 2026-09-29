@@ -4,7 +4,7 @@ import { api } from '@/api/client'
 import { Permissions } from '@/auth/generated-permissions'
 import { useAuthStore } from '@/stores/auth'
 import { notify } from '@/toast'
-import { transferNodeDockerEnvironment, transferNodeTransport } from '@/transfer-node-installation'
+import { transferNodeDockerConfiguration } from '@/transfer-node-installation'
 import type { CreateTransferNodeResult, ListResponse, TransferNodeInstallation, TransferNodeSettings, TransferNodeSummary } from '@/types/api'
 
 const auth = useAuthStore()
@@ -13,9 +13,24 @@ const settings = ref<TransferNodeSettings | null>(null)
 const loading = ref(true)
 const saving = ref(false)
 const createOpen = ref(false)
-const createdSecret = ref<{ nodeID: string; token: string; transport: 'http' | 'https'; expiresIn: number; installation: TransferNodeInstallation } | null>(null)
+const createdSecret = ref<{ nodeID: string; token: string; apiURL: string; platform: 'linux' | 'windows'; expiresIn: number; installation: TransferNodeInstallation } | null>(null)
 const form = ref({ name: '', apiURL: '', platform: 'linux' as 'linux' | 'windows', architecture: 'amd64' as 'amd64' | 'arm64' })
 const onlineNodes = computed(() => nodes.value.filter(node => node.status === 'online'))
+const dockerConfiguration = computed(() => {
+  const secret = createdSecret.value
+  if (!secret || secret.platform !== 'linux' || !secret.installation.available) return null
+  try {
+    return transferNodeDockerConfiguration({
+      nodeID: secret.nodeID,
+      token: secret.token,
+      apiURL: secret.apiURL,
+      version: secret.installation.version,
+      dockerHubNamespace: secret.installation.docker_hub_namespace,
+    })
+  } catch {
+    return null
+  }
+})
 
 function errorMessage(reason: unknown) { return reason instanceof Error ? reason.message : '操作失败，请查看 Server 日志' }
 function statusLabel(status: TransferNodeSummary['status']) { return ({ pending: '等待安装', online: '在线', offline: '离线', disabled: '已停用', revoked: '已撤销' } as const)[status] }
@@ -38,18 +53,19 @@ async function createNode() {
   saving.value = true
   try {
     const result = await api<CreateTransferNodeResult>('/api/v1/transfer-nodes', { method: 'POST', body: JSON.stringify({ name: form.value.name, api_url: form.value.apiURL, platform: form.value.platform, architecture: form.value.architecture }) })
-    createdSecret.value = { nodeID: result.node.id, token: result.enrollment_token, transport: transferNodeTransport(result.node.api_url), expiresIn: result.expires_in_seconds, installation: result.installation }
+    createdSecret.value = { nodeID: result.node.id, token: result.enrollment_token, apiURL: result.node.api_url, platform: result.node.platform, expiresIn: result.expires_in_seconds, installation: result.installation }
     form.value = { name: '', apiURL: '', platform: 'linux', architecture: 'amd64' }
     createOpen.value = false
-    notify('节点已预创建。完整安装命令只显示这一次，请立即复制。', 'success')
+    notify('节点已预创建。一次性安装信息只显示这一次，请立即复制。', 'success')
     await load()
   } catch (reason) { notify(errorMessage(reason), 'error') } finally { saving.value = false }
 }
 
 async function copyInstallation() {
   if (!createdSecret.value) return
-  await navigator.clipboard.writeText(createdSecret.value.installation.command || createdSecret.value.token)
-  notify(createdSecret.value.installation.available ? '完整安装命令已复制' : '一次性安装令牌已复制', 'success')
+  const command = createdSecret.value.installation.available && createdSecret.value.installation.command
+  await navigator.clipboard.writeText(command || createdSecret.value.token)
+  notify(command ? '安装命令已复制' : '一次性安装令牌已复制', 'success')
 }
 async function copyNodeID() {
   if (!createdSecret.value) return
@@ -57,18 +73,17 @@ async function copyNodeID() {
   notify('Node ID 已复制', 'success')
 }
 async function copyDockerConfig() {
-  if (!createdSecret.value) return
-  const env = transferNodeDockerEnvironment(createdSecret.value)
-  await navigator.clipboard.writeText(env)
-  notify('Docker 配置参数已复制（仅显示本次令牌）', 'success')
+  if (!dockerConfiguration.value) return
+  await navigator.clipboard.writeText(dockerConfiguration.value.compose)
+  notify('Docker Compose 已复制', 'success')
 }
 
 async function regenerate(node: TransferNodeSummary) {
   saving.value = true
   try {
     const result = await api<{ enrollment_token: string; expires_at: string; installation: TransferNodeInstallation }>(`/api/v1/transfer-nodes/${node.id}/enrollment`, { method: 'POST', body: '{}' })
-    createdSecret.value = { nodeID: node.id, token: result.enrollment_token, transport: transferNodeTransport(node.api_url), expiresIn: Math.max(0, Math.round((Date.parse(result.expires_at) - Date.now()) / 1000)), installation: result.installation }
-    notify('旧安装令牌已作废，新的完整安装命令只显示这一次。', 'success')
+    createdSecret.value = { nodeID: node.id, token: result.enrollment_token, apiURL: node.api_url, platform: node.platform, expiresIn: Math.max(0, Math.round((Date.parse(result.expires_at) - Date.now()) / 1000)), installation: result.installation }
+    notify('旧安装令牌已作废，新的安装信息只显示这一次。', 'success')
   } catch (reason) { notify(errorMessage(reason), 'error') } finally { saving.value = false }
 }
 
@@ -129,9 +144,38 @@ onMounted(load)
   <section id="download-panel-nodes" role="tabpanel" aria-labelledby="download-tab-nodes">
     <div class="flex flex-wrap items-end justify-between gap-4"><div><h2 class="m-0 text-xl">传输节点</h2><p class="text-subtle mb-0 mt-1 text-xs">主 Server 负责识别和任务决策；公网节点只执行冻结的下载、回传与跨库上传计划，不会自动安装下载器。</p></div><button v-if="auth.can(Permissions.TransferNodesCreate)" class="btn-primary" type="button" @click="createOpen = !createOpen">{{ createOpen ? '取消添加' : '添加传输节点' }}</button></div>
 
-    <form v-if="createOpen" class="panel mt-5 grid gap-4 md:grid-cols-2" @submit.prevent="createNode"><div><label class="label">节点名称</label><input v-model="form.name" class="input" required maxlength="128" /></div><div><label class="label">公网 HTTP / HTTPS 地址</label><input v-model="form.apiURL" class="input" required placeholder="https://node.example.com:4433" /><p class="text-subtle mb-0 mt-2 text-xs">必须能由主 Server 主动访问；支持 HTTP 和 HTTPS，内网及 localhost 地址不可用。</p><p v-if="form.apiURL.trim().toLowerCase().startsWith('http://')" class="semantic-warning-text mb-0 mt-2 text-xs">HTTP 传输不加密；节点仍会验证身份和请求签名。</p></div><div><label class="label">平台</label><select v-model="form.platform" class="input"><option value="linux">Linux</option><option value="windows">Windows</option></select></div><div><label class="label">架构</label><select v-model="form.architecture" class="input"><option value="amd64">amd64</option><option v-if="form.platform === 'linux'" value="arm64">arm64</option></select></div><button class="btn-primary md:col-span-2" :disabled="saving">{{ saving ? '正在创建…' : '生成完整安装命令' }}</button></form>
+    <form v-if="createOpen" class="panel mt-5 grid gap-4 md:grid-cols-2" @submit.prevent="createNode"><div><label class="label">节点名称</label><input v-model="form.name" class="input" required maxlength="128" /></div><div><label class="label">公网 HTTP / HTTPS 地址</label><input v-model="form.apiURL" class="input" required placeholder="https://node.example.com:4433" /><p class="text-subtle mb-0 mt-2 text-xs">必须能由主 Server 主动访问；支持 HTTP 和 HTTPS，内网及 localhost 地址不可用。</p><p v-if="form.apiURL.trim().toLowerCase().startsWith('http://')" class="semantic-warning-text mb-0 mt-2 text-xs">HTTP 传输不加密；节点仍会验证身份和请求签名。</p></div><div><label class="label">平台</label><select v-model="form.platform" class="input"><option value="linux">Linux</option><option value="windows">Windows</option></select></div><div><label class="label">架构</label><select v-model="form.architecture" class="input"><option value="amd64">amd64</option><option v-if="form.platform === 'linux'" value="arm64">arm64</option></select></div><button class="btn-primary md:col-span-2" :disabled="saving">{{ saving ? '正在创建…' : '生成安装配置' }}</button></form>
 
-    <div v-if="createdSecret" class="semantic-warning mt-5 p-4"><div class="flex flex-wrap items-center justify-between gap-3"><div><strong>{{ createdSecret.installation.available ? `完整 ${createdSecret.installation.shell} 安装命令` : '一次性安装令牌' }}</strong><p class="mb-0 mt-1 text-xs">约 {{ Math.ceil(createdSecret.expiresIn / 60) }} 分钟后失效；执行安装后还需回到这里完成配对。命令会先验证 Release 签名和 SHA-256，再修改系统；只安装 OhMyCine Node。</p></div><div class="flex gap-2"><button class="btn-secondary" type="button" @click="copyInstallation">{{ createdSecret.installation.available ? '复制完整命令' : '复制令牌' }}</button><button class="btn-secondary" type="button" @click="copyDockerConfig">复制 Docker 配置</button></div></div><div class="mt-3 flex items-center gap-2 text-xs"><span>Node ID：<code>{{ createdSecret.nodeID }}</code></span><button class="btn-secondary" type="button" @click="copyNodeID">复制 ID</button></div><pre v-if="createdSecret.installation.available" class="mt-3 max-h-72 overflow-auto whitespace-pre-wrap rounded bg-black/10 p-3 text-xs">{{ createdSecret.installation.command }}</pre><div v-else class="semantic-inset mt-3 p-3 text-xs">当前是开发构建，没有注入官方 Node Release 信任根；正式 Beta 会在这里显示完整安装命令。</div></div>
+    <div v-if="createdSecret" class="semantic-warning mt-5 p-4">
+      <div class="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <strong>一次性安装信息</strong>
+          <p class="mb-0 mt-1 text-xs">约 {{ Math.ceil(createdSecret.expiresIn / 60) }} 分钟后失效；启动 Node 后回到这里完成配对。</p>
+        </div>
+        <button class="btn-secondary" type="button" @click="createdSecret = null">关闭并清除</button>
+      </div>
+      <div class="mt-3 flex flex-wrap items-center gap-2 text-xs"><span>Node ID：<code>{{ createdSecret.nodeID }}</code></span><button class="btn-secondary" type="button" @click="copyNodeID">复制 ID</button></div>
+      <div class="mt-4 grid gap-4 lg:grid-cols-2">
+        <section class="semantic-inset min-w-0 p-3">
+          <div class="flex flex-wrap items-center justify-between gap-2"><h3 class="m-0 text-sm font-semibold">一行安装 · {{ createdSecret.platform === 'windows' ? 'PowerShell' : 'bash' }}</h3><button class="btn-secondary" type="button" @click="copyInstallation">{{ createdSecret.installation.available && createdSecret.installation.command ? '复制命令' : '复制令牌' }}</button></div>
+          <template v-if="createdSecret.installation.available && createdSecret.installation.command">
+            <p class="text-subtle mb-0 mt-2 text-xs">在目标节点终端执行。下载安装器后先校验固定 SHA-256；安装器再验证签名和 Node 文件。</p>
+            <pre class="mt-3 overflow-auto whitespace-pre rounded bg-black/10 p-3 text-xs">{{ createdSecret.installation.command }}</pre>
+          </template>
+          <p v-else class="text-subtle mb-0 mt-2 text-xs">当前构建缺少官方发行版信任材料，无法生成可执行的一行安装命令。</p>
+        </section>
+        <section v-if="createdSecret.platform === 'linux'" class="semantic-inset min-w-0 p-3">
+          <div class="flex flex-wrap items-center justify-between gap-2"><h3 class="m-0 text-sm font-semibold">Docker Compose</h3><button v-if="dockerConfiguration" class="btn-secondary" type="button" @click="copyDockerConfig">复制完整配置</button></div>
+          <template v-if="dockerConfiguration">
+            <p class="text-subtle mb-0 mt-2 text-xs">保存为 <code>compose.yml</code> 后运行 <code>docker compose up -d</code>。状态保存在 Docker 命名卷中。</p>
+            <pre class="mt-3 max-h-80 overflow-auto whitespace-pre rounded bg-black/10 p-3 text-xs">{{ dockerConfiguration.compose }}</pre>
+            <p v-if="dockerConfiguration.reverseProxyRequired" class="semantic-warning-text mb-0 mt-2 text-xs">节点地址未写端口：请让该地址的反向代理将 {{ createdSecret.apiURL.startsWith('https:') ? '443' : '80' }} 端口转发到容器的 4433 端口。</p>
+            <p class="text-subtle mb-0 mt-2 text-xs">如需访问媒体库或下载器文件，请按目标主机的真实路径另加目录映射。配置含一次性令牌，请限制文件读取权限。</p>
+          </template>
+          <p v-else class="text-subtle mb-0 mt-2 text-xs">当前构建缺少可验证的发行版本或 Docker Hub 镜像信息，无法生成可用的 Compose。</p>
+        </section>
+      </div>
+    </div>
 
     <div v-if="settings" class="panel mt-5"><label class="label" for="default-transfer-node">默认跨库传输节点</label><select id="default-transfer-node" class="input mt-2" :value="settings.default_node_id || ''" :disabled="saving || !auth.can(Permissions.TransferNodesUpdate)" @change="updateDefault"><option value="">不自动选择</option><option v-for="node in onlineNodes" :key="node.id" :value="node.id">{{ node.name }} · {{ capacity(node) }}</option></select><p class="text-subtle mb-0 mt-2 text-xs">这里只影响新任务的默认选择；任务提交后节点和最终媒体库会被冻结，不会自动漂移或回退主 Server。</p></div>
 

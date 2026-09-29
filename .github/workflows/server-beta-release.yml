@@ -159,6 +159,50 @@ jobs:
           openssl rsa -in "$signing_key" -passin pass: -pubout -out "$public_key" 2>/dev/null
           echo "NODE_RELEASE_PUBLIC_KEY_B64=$(base64 -w 0 "$public_key")" >> "$GITHUB_ENV"
 
+      - name: Render and fingerprint versioned Node installers
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          namespace="${DOCKERHUB_USERNAME,,}"
+          if [[ ! "$namespace" =~ ^[a-z0-9][a-z0-9_-]{0,127}$ ]]; then
+            echo '::error::A valid Docker Hub namespace is required for official Node deployment instructions.'
+            exit 1
+          fi
+          node_installer_sh="install-ohmycine-node-v${VERSION}.sh"
+          node_installer_ps1="install-ohmycine-node-v${VERSION}.ps1"
+          installer_root="dist/server-beta/${TAG_NAME}"
+          mkdir -p "$installer_root"
+          export VERSION NODE_RELEASE_PUBLIC_KEY_B64 installer_root node_installer_sh node_installer_ps1
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          root = Path(os.environ["installer_root"])
+          replacements = {
+              "__OHMYCINE_NODE_RELEASE_PUBLIC_KEY_BASE64__": os.environ["NODE_RELEASE_PUBLIC_KEY_B64"],
+              "__OHMYCINE_NODE_RELEASE_VERSION__": os.environ["VERSION"],
+          }
+          for source_name, output_name in (
+              ("scripts/install-node.sh", os.environ["node_installer_sh"]),
+              ("scripts/install-node.ps1", os.environ["node_installer_ps1"]),
+          ):
+              source = Path(source_name).read_text(encoding="utf-8")
+              for marker, value in replacements.items():
+                  if source.count(marker) < 1:
+                      raise SystemExit(f"::error::Missing installer marker {marker} in {source_name}")
+                  source = source.replace(marker, value)
+              if "__OHMYCINE_NODE_RELEASE_" in source:
+                  raise SystemExit(f"::error::Unrendered installer marker in {source_name}")
+              target = root / output_name
+              target.write_text(source, encoding="utf-8", newline="\n")
+              target.chmod(0o755 if target.suffix == ".sh" else 0o644)
+          PY
+          echo "NODE_INSTALLER_SH_SHA256=$(sha256sum "$installer_root/$node_installer_sh" | awk '{print $1}')" >> "$GITHUB_ENV"
+          echo "NODE_INSTALLER_PS1_SHA256=$(sha256sum "$installer_root/$node_installer_ps1" | awk '{print $1}')" >> "$GITHUB_ENV"
+          echo "NODE_DOCKERHUB_NAMESPACE=$namespace" >> "$GITHUB_ENV"
+
       - name: Build and package embedded-WebUI Server archives
         env:
           OHMYCINE_TMDB_READ_ACCESS_TOKEN: ${{ secrets.OHMYCINE_TMDB_READ_ACCESS_TOKEN }}
@@ -179,7 +223,13 @@ jobs:
             echo "::error::Node release public trust root is unavailable."
             exit 1
           fi
-          build_ldflags="-X=github.com/yuanjing-hash/OhMyCine-Server/internal/buildinfo.Version=${VERSION} -X=github.com/yuanjing-hash/OhMyCine-Server/internal/buildinfo.Commit=${GITHUB_SHA} -X=github.com/yuanjing-hash/OhMyCine-Server/internal/buildinfo.NodeReleasePublicKeyBase64=${NODE_RELEASE_PUBLIC_KEY_B64}"
+          if [[ ! "${NODE_INSTALLER_SH_SHA256:-}" =~ ^[0-9a-f]{64}$ ]] ||
+             [[ ! "${NODE_INSTALLER_PS1_SHA256:-}" =~ ^[0-9a-f]{64}$ ]] ||
+             [[ ! "${NODE_DOCKERHUB_NAMESPACE:-}" =~ ^[a-z0-9][a-z0-9_-]{0,127}$ ]]; then
+            echo "::error::Node installer fingerprints or Docker Hub namespace are unavailable."
+            exit 1
+          fi
+          build_ldflags="-X=github.com/yuanjing-hash/OhMyCine-Server/internal/buildinfo.Version=${VERSION} -X=github.com/yuanjing-hash/OhMyCine-Server/internal/buildinfo.Commit=${GITHUB_SHA} -X=github.com/yuanjing-hash/OhMyCine-Server/internal/buildinfo.NodeReleasePublicKeyBase64=${NODE_RELEASE_PUBLIC_KEY_B64} -X=github.com/yuanjing-hash/OhMyCine-Server/internal/buildinfo.NodeInstallerShellSHA256=${NODE_INSTALLER_SH_SHA256} -X=github.com/yuanjing-hash/OhMyCine-Server/internal/buildinfo.NodeInstallerPowerShellSHA256=${NODE_INSTALLER_PS1_SHA256} -X=github.com/yuanjing-hash/OhMyCine-Server/internal/buildinfo.NodeDockerHubNamespace=${NODE_DOCKERHUB_NAMESPACE}"
           release_root="dist/server-beta/${TAG_NAME}"
           windows_dir="${release_root}/OhMyCine-Server-v${VERSION}-windows-x64"
           linux_dir="${release_root}/OhMyCine-Server-v${VERSION}-linux-x64"
@@ -260,7 +310,7 @@ jobs:
           echo "NODE_LINUX_AMD64_ASSET=${release_root}/${node_linux_amd64_asset}" >> "$GITHUB_ENV"
           echo "NODE_LINUX_ARM64_ASSET=${release_root}/${node_linux_arm64_asset}" >> "$GITHUB_ENV"
 
-      - name: Sign Node manifest and render versioned installers
+      - name: Sign Node manifest and verify versioned installers
         env:
           OHMYCINE_NODE_MANIFEST_SIGNING_PRIVATE_KEY: ${{ secrets.OHMYCINE_NODE_MANIFEST_SIGNING_PRIVATE_KEY }}
         shell: bash
@@ -296,31 +346,11 @@ jobs:
             echo "::error::Node signing key changed between Server build and release signing."
             exit 1
           fi
-          export public_key_b64 VERSION node_installer_sh node_installer_ps1
-          python3 - <<'PY'
-          import os
-          from pathlib import Path
-
-          root = Path(os.environ["RELEASE_ROOT"])
-          replacements = {
-              "__OHMYCINE_NODE_RELEASE_PUBLIC_KEY_BASE64__": os.environ["public_key_b64"],
-              "__OHMYCINE_NODE_RELEASE_VERSION__": os.environ["VERSION"],
-          }
-          for source_name, output_name in (
-              ("scripts/install-node.sh", os.environ["node_installer_sh"]),
-              ("scripts/install-node.ps1", os.environ["node_installer_ps1"]),
-          ):
-              text = Path(source_name).read_text(encoding="utf-8")
-              for marker, value in replacements.items():
-                  if text.count(marker) < 1:
-                      raise SystemExit(f"::error::Missing installer marker {marker} in {source_name}")
-                  text = text.replace(marker, value)
-              if "__OHMYCINE_NODE_RELEASE_" in text:
-                  raise SystemExit(f"::error::Unrendered installer marker in {source_name}")
-              target = root / output_name
-              target.write_text(text, encoding="utf-8", newline="\n")
-              target.chmod(0o755 if target.suffix == ".sh" else 0o644)
-          PY
+          if [[ "$(sha256sum "$RELEASE_ROOT/$node_installer_sh" | awk '{print $1}')" != "$NODE_INSTALLER_SH_SHA256" ]] ||
+             [[ "$(sha256sum "$RELEASE_ROOT/$node_installer_ps1" | awk '{print $1}')" != "$NODE_INSTALLER_PS1_SHA256" ]]; then
+            echo "::error::Node installer bytes changed after Server binary fingerprint injection."
+            exit 1
+          fi
           (
             cd "$RELEASE_ROOT"
             sha256sum "$node_windows_asset" "$node_linux_amd64_asset" "$node_linux_arm64_asset" "$node_installer_sh" "$node_installer_ps1" > "$node_manifest"
