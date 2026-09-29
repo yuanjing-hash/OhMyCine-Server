@@ -679,6 +679,8 @@ func downloaderTestMessage(providerType, code string) string {
 	switch code {
 	case "downloader_auth_failed":
 		return "qBittorrent 认证失败，请检查 Web UI 用户名和密码"
+	case "node_path_mapping_invalid":
+		return "节点无法读取下载目录，请检查 qB 保存根与节点挂载根是否指向同一目录，以及 Node 容器的挂载和读取权限"
 	case "downloader_response_invalid":
 		return "下载器响应不兼容，请确认填写的是 qBittorrent Web UI 地址"
 	case "downloader_request_failed":

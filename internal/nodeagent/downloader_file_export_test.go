@@ -20,11 +20,17 @@ import (
 func TestCompletedQBittorrentManifestPublishesPersistentPagedExport(t *testing.T) {
 	root := t.TempDir()
 	managedRoot := filepath.Join(root, "managed")
-	mountRoot := filepath.Join(managedRoot, "downloads")
+	mountRoot := filepath.Join(root, "downloads")
 	downloadRoot := filepath.Join(mountRoot, "task-1")
 	if err := os.MkdirAll(filepath.Join(downloadRoot, "Movie"), 0o700); err != nil {
 		t.Fatal(err)
 	}
+	// A real grant canonicalizes the Node mount before recording task paths.
+	canonicalMount, err := filepath.EvalSymlinks(mountRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mountRoot, downloadRoot = canonicalMount, filepath.Join(canonicalMount, "task-1")
 	files := map[string][]byte{
 		"Movie/Movie.mkv": []byte("video-payload"),
 		"Movie/Movie.srt": []byte("subtitle-payload"),
@@ -76,7 +82,7 @@ func TestCompletedQBittorrentManifestPublishesPersistentPagedExport(t *testing.T
 		TaskID:             "task-1",
 		ProviderTaskID:     "hash-1",
 		Tag:                "omc-task-1",
-		DownloaderSavePath: "/downloads/task-1",
+		DownloaderSavePath: downloadRoot,
 		NodeLocalRoot:      downloadRoot,
 	}, now); err != nil {
 		t.Fatal(err)
@@ -142,7 +148,7 @@ func TestCompletedQBittorrentManifestPublishesPersistentPagedExport(t *testing.T
 	}
 
 	firstToken := firstPage.Files[0].FileToken
-	agent.startFileExport("server-1", operationKey, ManagedDownload{TaskID: "task-1", NodeLocalRoot: downloadRoot}, downloadpkg.Manifest{Complete: true, Name: "Movie", Files: []downloadpkg.File{{RelativePath: "missing-after-export.mkv", Size: 1}}})
+	agent.startFileExport("server-1", operationKey, mountRoot, ManagedDownload{TaskID: "task-1", NodeLocalRoot: downloadRoot}, downloadpkg.Manifest{Complete: true, Name: "Movie", Files: []downloadpkg.File{{RelativePath: "missing-after-export.mkv", Size: 1}}})
 	agent.exportMu.Lock()
 	runningAfterPersist := len(agent.exports)
 	agent.exportMu.Unlock()
@@ -207,7 +213,7 @@ func TestFileExportHashFailureCanRetryWithoutPublishingPartialState(t *testing.T
 	agent.now = func() time.Time { return now }
 	manifest := downloadpkg.Manifest{Name: "Movie", Complete: true, Files: []downloadpkg.File{{RelativePath: "movie.mkv", Size: 6}}}
 	download := ManagedDownload{TaskID: "task-1", NodeLocalRoot: downloadRoot}
-	agent.startFileExport("server-1", "export:retry", download, manifest)
+	agent.startFileExport("server-1", "export:retry", managedRoot, download, manifest)
 	waitForExportIdle(t, agent, "export:retry")
 	if _, err := store.FileExportManifest(context.Background(), "server-1", "export:retry", 1, 10, now); !errors.Is(err, ErrOperationNotFound) {
 		t.Fatalf("failed hash published partial export: %v", err)
@@ -220,7 +226,7 @@ func TestFileExportHashFailureCanRetryWithoutPublishingPartialState(t *testing.T
 	if err := os.WriteFile(filename, []byte("fixed!"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	agent.startFileExport("server-1", "export:retry", download, manifest)
+	agent.startFileExport("server-1", "export:retry", managedRoot, download, manifest)
 	page := waitForFileExport(t, store, "export:retry", now)
 	if page.Summary.TotalFiles != 1 || page.Summary.TotalBytes != 6 || page.Files[0].SHA256 == "" {
 		t.Fatalf("retry export=%+v", page)
@@ -229,7 +235,7 @@ func TestFileExportHashFailureCanRetryWithoutPublishingPartialState(t *testing.T
 
 func putManifestGrant(t *testing.T, nodeURL string, agent *Agent, now time.Time, qbitURL, mountRoot, grantID, operationKey string) nodeprotocol.DownloaderActionRequest {
 	t.Helper()
-	credential, err := json.Marshal(nodeprotocol.DownloaderCredential{ProviderType: "qbittorrent", BaseURL: qbitURL, DownloaderSaveRoot: "/downloads", NodeMountRoot: mountRoot})
+	credential, err := json.Marshal(nodeprotocol.DownloaderCredential{ProviderType: "qbittorrent", BaseURL: qbitURL, DownloaderSaveRoot: mountRoot, NodeMountRoot: mountRoot})
 	if err != nil {
 		t.Fatal(err)
 	}

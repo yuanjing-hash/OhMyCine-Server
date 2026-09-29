@@ -30,6 +30,7 @@ func TestDownloaderActionUsesSealedGrantWithoutPersistingPlaintext(t *testing.T)
 	defer qbit.Close()
 	root := t.TempDir()
 	mount := filepath.Join(root, "downloads")
+	managed := filepath.Join(root, "managed")
 	if err := os.MkdirAll(mount, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -38,12 +39,12 @@ func TestDownloaderActionUsesSealedGrantWithoutPersistingPlaintext(t *testing.T)
 		t.Fatal(err)
 	}
 	defer func() { _ = store.Close() }()
-	agent, err := New(Config{NodeID: "node-1", ListenAddress: "127.0.0.1:0", DataDirectory: root, ManagedRoot: root, SealingPrivateKeyFile: filepath.Join(root, "missing.key"), MaxConcurrentOperations: 1, AllowInsecureDevelopment: true}, store)
+	agent, err := New(Config{NodeID: "node-1", ListenAddress: "127.0.0.1:0", DataDirectory: root, ManagedRoot: managed, SealingPrivateKeyFile: filepath.Join(root, "missing.key"), MaxConcurrentOperations: 1, AllowInsecureDevelopment: true}, store)
 	if err != nil {
 		t.Fatal(err)
 	}
 	now := time.Now().UTC()
-	credential, _ := json.Marshal(nodeprotocol.DownloaderCredential{ProviderType: "qbittorrent", BaseURL: qbit.URL, Username: "admin", Password: "very-secret-password", DownloaderSaveRoot: "/downloads", NodeMountRoot: mount})
+	credential, _ := json.Marshal(nodeprotocol.DownloaderCredential{ProviderType: "qbittorrent", BaseURL: qbit.URL, Username: "admin", Password: "very-secret-password", DownloaderSaveRoot: mount, NodeMountRoot: mount})
 	grant := nodeprotocol.CredentialGrant{GrantID: "grant-1", NodeID: "node-1", TaskID: "task-1", OperationKey: "operation-1", ResourceKind: nodeprotocol.ResourceKindDownloader, ResourceID: "downloader-1", CredentialRevision: 1, AllowedActions: []string{nodeprotocol.DownloaderActionTest}, ExpiresAt: now.Add(5 * time.Minute), Credential: credential}
 	envelope, err := nodeprotocol.SealCredentialGrant(agent.sealingPublicKey, grant, now)
 	if err != nil {
@@ -64,6 +65,9 @@ func TestDownloaderActionUsesSealedGrantWithoutPersistingPlaintext(t *testing.T)
 	}
 	if bytes.Contains([]byte(persisted), []byte("very-secret-password")) || bytes.Contains([]byte(persisted), []byte(qbit.URL)) {
 		t.Fatal("node database persisted decrypted downloader credential")
+	}
+	if _, err := validateDownloaderRoots(nodeprotocol.DownloaderCredential{BaseURL: qbit.URL, DownloaderSaveRoot: mount, NodeMountRoot: filepath.Join(root, "missing")}); err == nil || err.Error() != nodeprotocol.ErrorPathMappingInvalid {
+		t.Fatalf("missing Node mount returned %v", err)
 	}
 }
 

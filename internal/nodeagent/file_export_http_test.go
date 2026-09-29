@@ -19,7 +19,7 @@ import (
 func TestFileExportHTTPRequiresTaskBoundExactVerifiedRanges(t *testing.T) {
 	dir := t.TempDir()
 	managed := filepath.Join(dir, "managed")
-	downloadRoot := filepath.Join(managed, "downloads", "task-1")
+	downloadRoot := filepath.Join(dir, "downloads", "task-1")
 	if err := os.MkdirAll(downloadRoot, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -33,7 +33,7 @@ func TestFileExportHTTPRequiresTaskBoundExactVerifiedRanges(t *testing.T) {
 	}
 	defer func() { _ = store.Close() }()
 	now := time.Now().UTC().Truncate(time.Millisecond)
-	record, err := buildFileExport(context.Background(), managed, "server-1", "export:task-1", ManagedDownload{TaskID: "task-1", NodeLocalRoot: downloadRoot}, downloadpkg.Manifest{Complete: true, Files: []downloadpkg.File{{RelativePath: "movie.mkv", Size: 6}}}, now, now.Add(time.Hour))
+	record, err := buildFileExport(context.Background(), filepath.Join(dir, "downloads"), "server-1", "export:task-1", ManagedDownload{TaskID: "task-1", NodeLocalRoot: downloadRoot}, downloadpkg.Manifest{Complete: true, Files: []downloadpkg.File{{RelativePath: "movie.mkv", Size: 6}}}, now, now.Add(time.Hour))
 	if err != nil {
 		t.Fatal(err)
 	}

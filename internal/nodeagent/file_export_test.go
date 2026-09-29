@@ -55,6 +55,16 @@ func TestBuildFileExportRejectsTraversalAndSymlinkEscape(t *testing.T) {
 			t.Fatalf("unsafe relative path %q was accepted", relative)
 		}
 	}
+	outsideRoot := filepath.Join(t.TempDir(), "downloads")
+	if err := os.MkdirAll(outsideRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(outsideRoot, "outside.mkv"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := buildFileExport(context.Background(), managed, "server-1", "export:outside", ManagedDownload{TaskID: "task-1", NodeLocalRoot: outsideRoot}, downloadpkg.Manifest{Complete: true, Files: []downloadpkg.File{{RelativePath: "outside.mkv", Size: 1}}}, now, now.Add(time.Hour)); err == nil {
+		t.Fatal("task directory outside the signed mount was accepted")
+	}
 	if runtime.GOOS == "windows" {
 		t.Skip("ordinary Windows users may not have symlink permission")
 	}

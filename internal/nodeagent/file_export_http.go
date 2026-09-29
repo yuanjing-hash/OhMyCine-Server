@@ -162,12 +162,13 @@ func explicitFileRange(value string, size int64) (int64, int64, error) {
 }
 
 func (a *Agent) openManagedExportFile(file FileExportRangeFile) (*os.File, error) {
-	managedRoot, err := filepath.EvalSymlinks(filepath.Clean(a.config.ManagedRoot))
-	if err != nil || requirePathWithin(managedRoot, file.NodePath) != nil {
-		return nil, errors.New("managed root invalid")
+	// The opaque file token resolves only to a path verified when this export
+	// was created. Recheck it without restricting qB files to Node's own state root.
+	if !filepath.IsAbs(file.NodePath) {
+		return nil, errors.New("managed file changed")
 	}
 	resolved, err := filepath.EvalSymlinks(file.NodePath)
-	if err != nil || requirePathWithin(managedRoot, resolved) != nil || !sameCleanPath(resolved, file.NodePath) {
+	if err != nil || !sameCleanPath(resolved, file.NodePath) {
 		return nil, errors.New("managed file changed")
 	}
 	handle, err := os.Open(resolved)

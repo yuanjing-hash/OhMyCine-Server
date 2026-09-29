@@ -48,7 +48,7 @@ docker compose -f compose.server.yml up -d
 
 首次启动自动生成身份证书和密钥；页面生成的 `node-state` 命名卷保存节点数据库、证书、封装密钥及受管文件，升级必须保留。命名卷避免新建 `./data` 绑定目录因宿主机 root 所有权导致 Node UID/GID `65532:65532` 无法写入身份文件。已有节点不能直接换卷而不迁移身份数据。默认无需手动申请域名证书。使用自有证书时，只读挂载证书目录并设置 `OMC_NODE_TLS_CERT`、`OMC_NODE_TLS_KEY` 为容器内路径；更换身份后需重新配对。
 
-下载器与 Node 分属容器时，`localhost` 指 Node 自己。可以加入同一 Docker 网络并使用下载器服务名；不要公开下载器管理端口。下载器保存目录必须能从 Node 受管根访问，例如将同一目录挂载到二者的 `/downloads`，并设置 Node 的 `OMC_NODE_MANAGED_ROOT=/downloads`，授予 UID 65532 读写权限。做种仍由原下载器执行。
+下载器与 Node 分属容器时，`localhost` 指 Node 自己。可以加入同一 Docker 网络并使用下载器服务名；不要公开下载器管理端口。将宿主机上的同一下载目录分别挂载进 qBittorrent 与 Node 容器，并在下载器配置中填写各容器看到的路径。两边可以使用相同路径，例如都挂载到 `/mnt/media/omc/downloads`，也可以使用不同路径；`OMC_NODE_MANAGED_ROOT` 仍保留给 Node 自己的受管文件，不限制 qBittorrent 的挂载位置。qBittorrent 负责写入下载文件，Node 需要对该目录及文件有读取权限以校验和导出；Docker 挂载与宿主机权限须实际允许访问。做种仍由原下载器执行。
 
 ## 更新与源码构建
 

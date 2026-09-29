@@ -121,9 +121,11 @@ func (a *Agent) downloaderCredential(ctx context.Context, serverID string, input
 	if err := decoder.Decode(&credential); err != nil || credential.ProviderType != "qbittorrent" {
 		return nodeprotocol.CredentialGrant{}, nodeprotocol.DownloaderCredential{}, errors.New("node_credential_payload_invalid")
 	}
-	if _, err := validateDownloaderRoots(a.config.ManagedRoot, credential); err != nil {
+	root, err := validateDownloaderRoots(credential)
+	if err != nil {
 		return nodeprotocol.CredentialGrant{}, nodeprotocol.DownloaderCredential{}, err
 	}
+	credential.NodeMountRoot = root
 	return grant, credential, nil
 }
 
@@ -190,14 +192,14 @@ func (a *Agent) executeDownloaderAction(ctx context.Context, serverID string, in
 			return response, err
 		}
 		if task, getErr := client.Get(ctx, input.ProviderTaskID); getErr == nil && task.Completed {
-			if err := a.verifyManagedManifest(ctx, serverID, input.DownloaderID, input.ProviderTaskID, manifest); err != nil {
+			if err := a.verifyManagedManifest(ctx, serverID, input.DownloaderID, input.ProviderTaskID, credential.NodeMountRoot, manifest); err != nil {
 				return response, downloadpkg.Error(nodeprotocol.ErrorPathMappingInvalid, false, err)
 			}
 			download, err := a.store.ManagedDownload(ctx, serverID, input.DownloaderID, input.ProviderTaskID)
 			if err != nil || download.TaskID != input.TaskID {
 				return response, downloadpkg.Error(nodeprotocol.ErrorPlanConflict, false, err)
 			}
-			a.startFileExport(serverID, input.OperationKey, download, manifest)
+			a.startFileExport(serverID, input.OperationKey, credential.NodeMountRoot, download, manifest)
 			return response, downloadpkg.Error(nodeprotocol.ErrorExportPreparing, true, nil)
 		}
 		response.Manifest = protocolDownloaderManifest(manifest)
@@ -232,29 +234,36 @@ func (a *Agent) executeDownloaderAction(ctx context.Context, serverID string, in
 	}
 }
 
-func (a *Agent) verifyManagedManifest(ctx context.Context, serverID, downloaderID, providerTaskID string, manifest downloadpkg.Manifest) error {
+func (a *Agent) verifyManagedManifest(ctx context.Context, serverID, downloaderID, providerTaskID, mountRoot string, manifest downloadpkg.Manifest) error {
 	download, err := a.store.ManagedDownload(ctx, serverID, downloaderID, providerTaskID)
 	if err != nil {
 		return errors.New("node_managed_download_not_found")
 	}
+	root, err := secureExportRoot(mountRoot, download.NodeLocalRoot)
+	if err != nil {
+		return err
+	}
 	for _, file := range manifest.Files {
-		candidate := filepath.Join(download.NodeLocalRoot, filepath.FromSlash(file.RelativePath))
-		if err := requirePathWithin(download.NodeLocalRoot, candidate); err != nil {
-			return err
+		relative := normalizedExportPath(file.RelativePath)
+		if relative == "" || file.Size < 0 {
+			return errors.New("node_managed_file_invalid")
 		}
-		info, err := os.Lstat(candidate)
-		if err != nil || !info.Mode().IsRegular() || info.Size() != file.Size {
+		if _, err := secureExportFile(root, relative, file.Size); err != nil {
 			return errors.New("node_managed_file_invalid")
 		}
 	}
 	return nil
 }
 
-func validateDownloaderRoots(managedRoot string, credential nodeprotocol.DownloaderCredential) (string, error) {
+func validateDownloaderRoots(credential nodeprotocol.DownloaderCredential) (string, error) {
 	if strings.TrimSpace(credential.BaseURL) == "" || strings.TrimSpace(credential.DownloaderSaveRoot) == "" || strings.TrimSpace(credential.NodeMountRoot) == "" {
 		return "", errors.New(nodeprotocol.ErrorPathMappingInvalid)
 	}
-	root, err := filepath.Abs(filepath.Clean(credential.NodeMountRoot))
+	root := filepath.Clean(credential.NodeMountRoot)
+	if !filepath.IsAbs(root) {
+		return "", errors.New(nodeprotocol.ErrorPathMappingInvalid)
+	}
+	root, err := filepath.EvalSymlinks(root)
 	if err != nil {
 		return "", errors.New(nodeprotocol.ErrorPathMappingInvalid)
 	}
@@ -262,9 +271,11 @@ func validateDownloaderRoots(managedRoot string, credential nodeprotocol.Downloa
 	if err != nil || !info.IsDir() {
 		return "", errors.New(nodeprotocol.ErrorPathMappingInvalid)
 	}
-	if err := requirePathWithin(managedRoot, root); err != nil {
+	handle, err := os.Open(root)
+	if err != nil {
 		return "", errors.New(nodeprotocol.ErrorPathMappingInvalid)
 	}
+	_ = handle.Close()
 	return root, nil
 }
 
@@ -300,7 +311,7 @@ func requirePathWithin(root, candidate string) error {
 	}
 	relative, err := filepath.Rel(rootAbs, candidateAbs)
 	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) || filepath.IsAbs(relative) {
-		return errors.New("path outside managed root")
+		return errors.New("path outside configured root")
 	}
 	return nil
 }

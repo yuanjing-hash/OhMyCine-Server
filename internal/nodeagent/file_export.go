@@ -30,11 +30,11 @@ type fileExportDigestFile struct {
 	Chunks       []nodeprotocol.FileChunkDigest `json:"chunks"`
 }
 
-func buildFileExport(ctx context.Context, managedRoot, serverID, operationKey string, download ManagedDownload, manifest downloadpkg.Manifest, now, expiresAt time.Time) (FileExportRecord, error) {
+func buildFileExport(ctx context.Context, mountRoot, serverID, operationKey string, download ManagedDownload, manifest downloadpkg.Manifest, now, expiresAt time.Time) (FileExportRecord, error) {
 	if !manifest.Complete || len(manifest.Files) == 0 || len(manifest.Files) > maxFileExportFiles || serverID == "" || operationKey == "" || download.TaskID == "" || !expiresAt.After(now) {
 		return FileExportRecord{}, errors.New("node_file_export_invalid")
 	}
-	root, err := secureExportRoot(managedRoot, download.NodeLocalRoot)
+	root, err := secureExportRoot(mountRoot, download.NodeLocalRoot)
 	if err != nil {
 		return FileExportRecord{}, err
 	}
@@ -100,20 +100,28 @@ func normalizedExportPath(value string) string {
 	return value
 }
 
-func secureExportRoot(managedRoot, downloadRoot string) (string, error) {
-	managed, err := filepath.EvalSymlinks(filepath.Clean(managedRoot))
-	if err != nil {
-		return "", errors.New("node_managed_root_invalid")
-	}
-	root, err := filepath.EvalSymlinks(filepath.Clean(downloadRoot))
-	if err != nil || requirePathWithin(managed, root) != nil {
+func secureExportRoot(mountRoot, downloadRoot string) (string, error) {
+	mount, root := filepath.Clean(mountRoot), filepath.Clean(downloadRoot)
+	if !filepath.IsAbs(mount) || !filepath.IsAbs(root) || requirePathWithin(mount, root) != nil {
 		return "", errors.New(nodeprotocol.ErrorPathMappingInvalid)
 	}
-	info, err := os.Stat(root)
+	relative, err := filepath.Rel(mount, root)
+	if err != nil {
+		return "", errors.New(nodeprotocol.ErrorPathMappingInvalid)
+	}
+	resolvedMount, err := filepath.EvalSymlinks(mount)
+	if err != nil {
+		return "", errors.New(nodeprotocol.ErrorPathMappingInvalid)
+	}
+	resolved, err := filepath.EvalSymlinks(root)
+	if err != nil || !sameCleanPath(resolved, filepath.Join(resolvedMount, relative)) {
+		return "", errors.New(nodeprotocol.ErrorPathMappingInvalid)
+	}
+	info, err := os.Stat(resolved)
 	if err != nil || !info.IsDir() {
 		return "", errors.New(nodeprotocol.ErrorPathMappingInvalid)
 	}
-	return root, nil
+	return resolved, nil
 }
 
 func secureExportFile(root, relative string, expectedSize int64) (string, error) {
@@ -122,7 +130,7 @@ func secureExportFile(root, relative string, expectedSize int64) (string, error)
 		return "", errors.New("node_managed_file_invalid")
 	}
 	resolved, err := filepath.EvalSymlinks(candidate)
-	if err != nil || requirePathWithin(root, resolved) != nil {
+	if err != nil || requirePathWithin(root, resolved) != nil || !sameCleanPath(resolved, candidate) {
 		return "", errors.New("node_managed_file_invalid")
 	}
 	info, err := os.Lstat(resolved)
@@ -181,7 +189,7 @@ func randomFileToken() (string, error) {
 	return "file:" + base64.RawURLEncoding.EncodeToString(value), nil
 }
 
-func (a *Agent) startFileExport(serverID, operationKey string, download ManagedDownload, manifest downloadpkg.Manifest) {
+func (a *Agent) startFileExport(serverID, operationKey, mountRoot string, download ManagedDownload, manifest downloadpkg.Manifest) {
 	a.exportMu.Lock()
 	if _, running := a.exports[operationKey]; running {
 		a.exportMu.Unlock()
@@ -205,7 +213,7 @@ func (a *Agent) startFileExport(serverID, operationKey string, download ManagedD
 		ctx, cancel := context.WithTimeout(context.Background(), 6*time.Hour)
 		defer cancel()
 		now := a.now()
-		record, err := buildFileExport(ctx, a.config.ManagedRoot, serverID, operationKey, download, manifest, now, now.Add(fileExportLifetime))
+		record, err := buildFileExport(ctx, mountRoot, serverID, operationKey, download, manifest, now, now.Add(fileExportLifetime))
 		if err != nil {
 			return
 		}
