@@ -15,7 +15,7 @@ const matched = (id = 1): TorrentRecognitionResult => ({ engine_version: 'nextge
 const present = { media_type: 'movie', tmdb_id: 1, status: 'present', movie: { present: true }, freshness: {}, libraries: [] }
 function deferred<T>() { let resolve!: (value: T) => void; const promise = new Promise<T>(done => { resolve = done }); return { promise, resolve } }
 const cleanup: (() => void)[] = []
-afterEach(() => { cleanup.splice(0).forEach(stop => stop()); sessionStorage.clear(); vi.clearAllMocks() })
+afterEach(() => { cleanup.splice(0).forEach(stop => stop()); sessionStorage.clear(); vi.clearAllMocks(); vi.useRealTimers() })
 function setup(canRead = true) {
   const items = ref<TorrentSearchResult[]>([])
   const scope = effectScope()
@@ -76,6 +76,104 @@ describe('automatic result recognition', () => {
     vi.mocked(api).mockResolvedValue({ ...matched(), status: 'unrecognized', tmdb_id: undefined })
     items.value = [item('unknown')]; await flushPromises()
     expect(queue.libraryStates.value.unknown?.label).toBe('库内状态待确认')
+  })
+
+  it('retries ahead of pending cards, ignores the old response, and refreshes coverage', async () => {
+    const slowA = deferred<TorrentRecognitionResult>()
+    const oldB = deferred<TorrentRecognitionResult>()
+    const retryB = deferred<TorrentRecognitionResult>()
+    let bCalls = 0
+    let coverageCalls = 0
+    vi.mocked(api).mockImplementation((path, options) => {
+      if (path === torrentRecognitionPath) {
+        const token = JSON.parse(String(options?.body)).result_token as string
+        if (token === 'a') return slowA.promise
+        if (token === 'b') return ++bCalls === 1 ? oldB.promise : bCalls === 2 ? retryB.promise : Promise.resolve(matched(2))
+        return Promise.resolve(matched(3))
+      }
+      coverageCalls++
+      return Promise.resolve(present)
+    })
+    const { items, queue } = setup()
+    items.value = [item('a'), item('b'), item('c')]
+    await nextTick()
+    expect(queue.retry('b')).toBe(true)
+    expect(bCalls).toBe(2)
+    expect(queue.recognizingTokens.value).toContain('b')
+    expect(vi.mocked(api).mock.calls.filter(([path]) => path === torrentRecognitionPath)).toHaveLength(3)
+    oldB.resolve(matched(999))
+    await nextTick()
+    expect(queue.recognitions.value.b).toBeUndefined()
+    retryB.resolve(matched(2))
+    await flushPromises()
+    expect(queue.recognitions.value.b?.tmdb_id).toBe(2)
+    expect(queue.recognitions.value.c?.tmdb_id).toBe(3)
+    expect(coverageCalls).toBe(2)
+    expect(queue.retry('b')).toBe(true)
+    await flushPromises()
+    expect(coverageCalls).toBe(3)
+  })
+
+  it('releases both slots after the deadline even when recognition ignores abort', async () => {
+    vi.useFakeTimers()
+    const never = deferred<TorrentRecognitionResult>()
+    vi.mocked(api).mockImplementation(() => never.promise)
+    const { items, queue } = setup()
+    items.value = [item('a'), item('b'), item('c')]
+    await nextTick()
+    expect(queue.recognizingTokens.value).toEqual(['a', 'b'])
+    await vi.advanceTimersByTimeAsync(30000)
+    expect(queue.recognitionErrors.value.a).toContain('超时')
+    expect(queue.recognitionErrors.value.b).toContain('超时')
+    expect(queue.recognizingTokens.value).toEqual(['c'])
+    never.resolve(matched(999))
+    await nextTick()
+    expect(queue.recognitions.value.a).toBeUndefined()
+    expect(queue.recognitions.value.b).toBeUndefined()
+  })
+
+  it('labels a stalled coverage query without discarding the recognized work', async () => {
+    vi.useFakeTimers()
+    const never = deferred<typeof present>()
+    vi.mocked(api).mockImplementation(path => path === torrentRecognitionPath ? Promise.resolve(matched()) : never.promise)
+    const { items, queue } = setup()
+    items.value = [item('a')]
+    await nextTick()
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(queue.recognitions.value.a?.tmdb_id).toBe(1)
+    await vi.advanceTimersByTimeAsync(30000)
+    expect(queue.recognitionErrors.value.a).toContain('库内状态查询超时')
+    expect(queue.libraryStates.value.a?.label).toBe('库内状态暂不可用')
+    expect(queue.recognizingTokens.value).toEqual([])
+  })
+
+  it('requires a new search for an expired result instead of retrying its claim', async () => {
+    const { items, queue } = setup()
+    items.value = [{ ...item('expired'), expires_at: new Date(Date.now() - 1000).toISOString() }]
+    await nextTick()
+    expect(queue.recognitionErrors.value.expired).toContain('请重新搜索')
+    expect(queue.retry('expired')).toBe(false)
+    expect(api).not.toHaveBeenCalled()
+  })
+
+  it('starts restored cards in visible sort order and offers retry on every card', async () => {
+    const state = { input: { keyword: '作品', mediaType: '', siteIDs: [1], searchBy: 'title' as const }, groups: [{ site_id: 1, site_name: 'Jackett', site_type: 'bt' as const, status: 'success' as const, page: 1, has_next: false, skipped: 0, items: [{ ...item('low'), seeders: 1 }, { ...item('high'), seeders: 9 }, { ...item('middle'), seeders: 5 }] }], recognitions: {}, searched: true, savedAt: Date.now() }
+    saveTorrentSearchSession(sessionStorage, state)
+    const pending = deferred<TorrentRecognitionResult>()
+    vi.mocked(api).mockImplementation(path => path === torrentRecognitionPath ? pending.promise : Promise.resolve(present))
+    const wrapper = mount(ExploreView, { global: { stubs: { RouterLink: true } } })
+    cleanup.push(() => wrapper.unmount())
+    await flushPromises()
+    const requested = () => vi.mocked(api).mock.calls.filter(([path]) => path === torrentRecognitionPath).map(([, options]) => JSON.parse(String(options?.body)).result_token as string)
+    expect(requested()).toEqual(['high', 'middle'])
+    const retryButtons = wrapper.findAll('button').filter(button => button.text() === '重新检测')
+    expect(retryButtons).toHaveLength(3)
+    await retryButtons[0]!.trigger('click')
+    expect(requested()).toEqual(['high', 'middle', 'high'])
+    pending.resolve(matched())
+    await flushPromises()
+    expect(requested()).toEqual(['high', 'middle', 'high', 'low'])
   })
 
   it('automatically enriches restored cards without a detect button or share requests', async () => {

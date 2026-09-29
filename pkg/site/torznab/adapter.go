@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/site"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/site/btrss"
@@ -85,8 +86,23 @@ func (a *Adapter) Search(ctx context.Context, config site.Config, query site.Que
 	if err != nil {
 		return site.Page{}, err
 	}
-	result := site.Page{Page: query.Page, HasNext: len(parsed) >= 100, Items: make([]site.Result, 0, len(parsed))}
+	// rssfeed.Parse omits malformed rows. Pagination and the skipped count
+	// must still reflect the upstream page, not just its usable entries.
+	var rawPage struct {
+		Channel struct {
+			Items []struct{} `xml:"item"`
+		} `xml:"channel"`
+	}
+	if err := xml.Unmarshal(body, &rawPage); err != nil {
+		return site.Page{}, site.ErrInvalidReply
+	}
+	rawCount := len(rawPage.Channel.Items)
+	result := site.Page{Page: query.Page, HasNext: query.Page < 20 && rawCount >= 100, Items: make([]site.Result, 0, len(parsed)), Skipped: rawCount - len(parsed)}
 	for _, item := range parsed {
+		if !titleMatchesKeyword(query.Keyword, item.Title) {
+			result.Skipped++
+			continue
+		}
 		identity := ""
 		for _, candidate := range item.Sources {
 			if magnet, ok := btrss.NormalizeMagnet(candidate); ok {
@@ -105,6 +121,73 @@ func (a *Adapter) Search(ctx context.Context, config site.Config, query site.Que
 		result.Items = append(result.Items, site.Result{TorrentID: identity, Title: item.Title, Subtitle: item.Subtitle, SizeBytes: item.SizeBytes, Published: item.Published, Seeders: item.Seeders, Leechers: item.Leechers, Completed: item.Completed})
 	}
 	return result, nil
+}
+
+// Torznab/Jackett may return cached or broadly matched entries unrelated to
+// the requested title. Keep only releases whose title contains the normalized
+// CJK query and every non-CJK query term as a separate release-name token.
+// Year from Query.Year is deliberately not required: it is an upstream search
+// hint, while releases may omit a year from their name.
+func titleMatchesKeyword(keyword, title string) bool {
+	var cjkQuery, term strings.Builder
+	terms := make([]string, 0, 4)
+	flushTerm := func() {
+		if term.Len() > 0 {
+			terms = append(terms, term.String())
+			term.Reset()
+		}
+	}
+	for _, r := range keyword {
+		switch {
+		case isCJK(r):
+			flushTerm()
+			cjkQuery.WriteRune(unicode.ToLower(r))
+		case unicode.IsLetter(r) || unicode.IsDigit(r):
+			term.WriteRune(unicode.ToLower(r))
+		default:
+			flushTerm()
+		}
+	}
+	flushTerm()
+	if cjkQuery.Len() == 0 && len(terms) == 0 {
+		return false
+	}
+
+	var compactTitle, titleTerm strings.Builder
+	titleTerms := make(map[string]struct{}, 12)
+	flushTitleTerm := func() {
+		if titleTerm.Len() > 0 {
+			titleTerms[titleTerm.String()] = struct{}{}
+			titleTerm.Reset()
+		}
+	}
+	for _, r := range title {
+		switch {
+		case isCJK(r):
+			flushTitleTerm()
+			compactTitle.WriteRune(unicode.ToLower(r))
+		case unicode.IsLetter(r) || unicode.IsDigit(r):
+			lower := unicode.ToLower(r)
+			compactTitle.WriteRune(lower)
+			titleTerm.WriteRune(lower)
+		default:
+			flushTitleTerm()
+		}
+	}
+	flushTitleTerm()
+	if cjkQuery.Len() > 0 && !strings.Contains(compactTitle.String(), cjkQuery.String()) {
+		return false
+	}
+	for _, term := range terms {
+		if _, ok := titleTerms[term]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func isCJK(r rune) bool {
+	return unicode.In(r, unicode.Han, unicode.Hiragana, unicode.Katakana, unicode.Hangul)
 }
 
 func (a *Adapter) Download(context.Context, site.Config, string) ([]byte, string, error) {

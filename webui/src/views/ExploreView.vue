@@ -72,9 +72,6 @@ const routeChoices = ref<DownloadRouteChoice[]>([])
 const routeRecommendationLoading = ref(false)
 let routeRecommendationRequest: AbortController | null = null
 const submitting = ref(false)
-const recognitionItems = computed(() => mode.value === 'resources' ? groups.value.flatMap(group => group.items) : [])
-const resultRecognition = useSearchResultRecognition(recognitionItems, () => auth.can(Permissions.MediaLibrariesRead))
-const { recognitions, recognitionErrors, recognizingTokens, libraryStates } = resultRecognition
 const manualDialog = ref<TorrentSearchResult | null>(null)
 const manualForm = ref<{ keyword: string; mediaType: '' | 'movie' | 'tv'; year?: number }>({ keyword: '', mediaType: '' })
 const manualCandidates = ref<PTRecognitionCandidate[]>([])
@@ -143,6 +140,14 @@ const visibleResults = computed(() => filterAndSortTorrentResults(groups.value, 
   sort: resultSort.value,
   direction: resultDirection.value,
 }))
+const recognitionItems = computed(() => {
+  if (mode.value !== 'resources') return []
+  const visible = visibleResults.value.map(entry => entry.item)
+  const visibleTokens = new Set(visible.map(item => item.token))
+  return [...visible, ...groups.value.flatMap(group => group.items).filter(item => !visibleTokens.has(item.token))]
+})
+const resultRecognition = useSearchResultRecognition(recognitionItems, () => auth.can(Permissions.MediaLibrariesRead))
+const { recognitions, recognitionErrors, recognizingTokens, libraryStates } = resultRecognition
 const trustedIdentity = computed(() => mode.value === 'resources' && route.query.identity === 'tmdb' && (mediaType.value === 'movie' || mediaType.value === 'tv') && tmdbID.value != null && tmdbID.value > 0
   ? { mediaType: mediaType.value as DiscoveryMediaType, tmdbID: tmdbID.value }
   : null)
@@ -475,6 +480,7 @@ async function submitDownload() {
 
 function formatTime(value?: string) { return value ? new Date(value).toLocaleString() : '未知' }
 function count(value?: number) { return value == null ? '—' : String(value) }
+function resultExpired(item: TorrentSearchResult) { return !(Date.parse(item.expires_at) > validationClock.value) }
 function mediaTypeLabel(value?: string) { return value === 'movie' ? '电影' : value === 'tv' ? '剧集' : '类型待定' }
 function message(reason: unknown) { return reason instanceof Error ? reason.message : '种子搜索暂时不可用' }
 
@@ -656,6 +662,7 @@ onBeforeUnmount(() => {
                 <p v-if="!recognitions[entry.item.token] && !recognitionErrors[entry.item.token]" class="text-subtle mt-3 text-xs" role="status">{{ recognizingTokens.includes(entry.item.token) ? '正在自动识别作品…' : '等待自动识别…' }}</p>
                 <p v-if="libraryStates[entry.item.token]" class="mt-3 text-xs" role="status" :title="libraryStates[entry.item.token].detail"><span class="status-chip" :class="libraryStates[entry.item.token].present ? 'status-chip--ready' : ''">库内：{{ libraryStates[entry.item.token].label }}</span><span class="text-subtle ml-2">当前可见媒体库 · 作品级</span></p>
                 <p v-if="recognitionErrors[entry.item.token]" class="semantic-warning mb-0 mt-3 p-3 text-xs">{{ recognitionErrors[entry.item.token] }}</p>
+                <p v-if="resultExpired(entry.item) && recognitionErrors[entry.item.token] !== '搜索结果已过期，请重新搜索'" class="semantic-warning mb-0 mt-3 p-3 text-xs">搜索结果已过期，请重新搜索</p>
               </div>
             </div>
             <p v-if="entry.item.source_kind === '115_share'" class="text-subtle mt-3 text-xs" role="status" :title="shareValidation(entry.item)?.message">
@@ -663,7 +670,7 @@ onBeforeUnmount(() => {
               <span v-if="shareValidation(entry.item)"> · {{ formatTime(shareValidation(entry.item)?.checked_at) }}</span>
               <span v-if="shareValidation(entry.item)?.status === 'unavailable'"> · {{ shareValidation(entry.item)?.message }}</span>
             </p>
-            <footer class="mt-4 flex flex-wrap justify-end gap-2 border-t border-[var(--border)] pt-4"><button v-if="entry.item.source_kind === '115_share'" class="btn-secondary" :disabled="!auth.can(Permissions.DownloadsCreate)" @click="openSharePreview(entry.item)">预览分享链接内部内容</button><button class="btn-secondary" :disabled="!auth.can(Permissions.DownloadsCreate)" @click="openManualRecognition(entry.item)">手动检测</button><button class="btn-primary" :disabled="!auth.can(Permissions.DownloadsCreate)" @click="openDownload(entry.item)">{{ entry.item.source_kind === '115_share' ? '转存入库' : '入库' }}</button></footer>
+            <footer class="mt-4 flex flex-wrap justify-end gap-2 border-t border-[var(--border)] pt-4"><button v-if="entry.item.source_kind === '115_share'" class="btn-secondary" :disabled="!auth.can(Permissions.DownloadsCreate)" @click="openSharePreview(entry.item)">预览分享链接内部内容</button><button class="btn-secondary" :disabled="!auth.can(Permissions.DiscoveryRead) || resultExpired(entry.item)" :title="resultExpired(entry.item) ? '搜索结果已过期，请重新搜索' : '重新读取作品识别及库内状态'" @click="resultRecognition.retry(entry.item.token)">重新检测</button><button class="btn-secondary" :disabled="!auth.can(Permissions.DownloadsCreate)" @click="openManualRecognition(entry.item)">手动检测</button><button class="btn-primary" :disabled="!auth.can(Permissions.DownloadsCreate)" @click="openDownload(entry.item)">{{ entry.item.source_kind === '115_share' ? '转存入库' : '入库' }}</button></footer>
           </article>
         </div>
         <footer v-if="activeGroup?.status === 'success'" class="panel flex items-center justify-center gap-3"><button class="btn-secondary" :disabled="searching || activeGroup.page <= 1" @click="previousPage(activeGroup)">上一页</button><span class="text-sm">{{ activeGroup.site_name }} · 第 {{ activeGroup.page }} 页</span><button class="btn-secondary" :disabled="searching || !activeGroup.has_next" @click="nextPage(activeGroup)">下一页</button></footer>

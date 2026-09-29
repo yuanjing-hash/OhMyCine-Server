@@ -126,3 +126,77 @@ func TestTorznabHTTPJackettEndToEnd(t *testing.T) {
 		t.Fatalf("cross-scheme redirect was not stopped: %v", err)
 	}
 }
+
+func TestTorznabSearchKeepsOnlyRelatedReleaseTitles(t *testing.T) {
+	const apiKey = "private-jackett-key"
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		values := request.URL.Query()
+		if request.URL.Path != "/api" || values.Get("t") != "search" || values.Get("q") != "名侦探柯南 2025" || values.Get("cat") != "5000" || values.Get("apikey") != apiKey {
+			t.Errorf("unexpected Torznab search request: path=%q t=%q q=%q cat=%q", request.URL.Path, values.Get("t"), values.Get("q"), values.Get("cat"))
+			http.Error(writer, "unexpected request", http.StatusBadRequest)
+			return
+		}
+		_, _ = writer.Write([]byte(`<rss><channel>`))
+		if values.Get("offset") == "100" {
+			_, _ = fmt.Fprintf(writer, `<item><title>名侦探柯南.剧场版</title><enclosure url="%s/api?t=download&amp;id=101" /></item>`, server.URL)
+		} else {
+			if values.Get("offset") != "0" {
+				t.Errorf("unexpected Torznab offset: %q", values.Get("offset"))
+			}
+			titles := []string{
+				"[银色子弹字幕组][名侦探柯南]特别篇.1080p",
+				"名侦探·柯南.剧场版.1080p",
+				"Lanterns.S01E07.1080p.HEVC",
+				"Spider-Man.Brand.New.Day.2026",
+				"Coyote.vs.Acme.2026",
+			}
+			for len(titles) < 99 {
+				titles = append(titles, fmt.Sprintf("Unrelated.Show.%d", len(titles)))
+			}
+			for index, title := range titles {
+				_, _ = fmt.Fprintf(writer, `<item><title>%s</title><enclosure url="%s/api?t=download&amp;id=%d" /></item>`, title, server.URL, index)
+			}
+			// The raw page is full even though rssfeed.Parse omits this row.
+			_, _ = fmt.Fprintf(writer, `<item><title></title><enclosure url="%s/api?t=download&amp;id=100" /></item>`, server.URL)
+		}
+		_, _ = writer.Write([]byte(`</channel></rss>`))
+	}))
+	defer server.Close()
+	adapter := NewForTest(server.Client(), server.URL)
+	config := site.Config{BaseURL: server.URL, APIKey: apiKey}
+	year := 2025
+	query := site.Query{Keyword: "名侦探柯南", MediaType: "tv", Year: &year, Page: 1}
+	page, err := adapter.Search(context.Background(), config, query)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Items) != 2 || page.Skipped != 98 || !page.HasNext {
+		t.Fatalf("mixed Jackett page = %+v", page)
+	}
+	for _, item := range page.Items {
+		if !titleMatchesKeyword(query.Keyword, item.Title) {
+			t.Fatalf("unrelated release escaped filtering: %q", item.Title)
+		}
+	}
+	query.Page = 2
+	second, err := adapter.Search(context.Background(), config, query)
+	if err != nil || len(second.Items) != 1 || second.HasNext || second.Skipped != 0 {
+		t.Fatalf("second Jackett page = %+v, err=%v", second, err)
+	}
+
+	for _, test := range []struct {
+		keyword, title string
+		want           bool
+	}{
+		{"Seven Samurai", "Seven.Samurai.1954.1080p", true},
+		{"Spider Man", "Spider-Man.Brand.New.Day", true},
+		{"Spider Man", "Spiderish.Man.Brand.New.Day", false},
+		{"名侦探柯南", "名侦探·柯南：独眼的残像", true},
+		{"名侦探柯南", "Lanterns.S01E07.1080p", false},
+	} {
+		if got := titleMatchesKeyword(test.keyword, test.title); got != test.want {
+			t.Errorf("titleMatchesKeyword(%q, %q) = %v, want %v", test.keyword, test.title, got, test.want)
+		}
+	}
+}
