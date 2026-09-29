@@ -96,7 +96,7 @@ func TestPluginBrowserSnapshotProjectsOnlySafeResourceDiagnostics(t *testing.T) 
 	if _, err := s.ResourceBrowser(context.Background(), actor, connection.PluginID, connection.ID, "start", BrowserInput{}); err != nil {
 		t.Fatal(err)
 	}
-	for _, code := range []string{"", "resource_network_denied", "resource_network_timeout", "resource_network_failed", "resource_limit_exceeded", "tun_fake_ip_requires_opt_in"} {
+	for _, code := range []string{"", "resource_network_denied", "resource_network_timeout", "resource_network_failed", "resource_limit_exceeded"} {
 		browser.code, browser.count = code, 3
 		output, err := s.ResourceBrowser(context.Background(), actor, connection.PluginID, connection.ID, "snapshot", BrowserInput{SessionID: s.browserSession.ID})
 		if err != nil {
@@ -118,28 +118,6 @@ func TestPluginBrowserSnapshotProjectsOnlySafeResourceDiagnostics(t *testing.T) 
 		browser.code, browser.count = invalid.code, invalid.count
 		if _, err := s.ResourceBrowser(context.Background(), actor, connection.PluginID, connection.ID, "snapshot", BrowserInput{SessionID: s.browserSession.ID}); err == nil {
 			t.Fatal("invalid diagnostics accepted")
-		}
-	}
-}
-
-type tunStatusBrowserFixture struct{ enabled bool }
-
-func (b tunStatusBrowserFixture) Call(_ context.Context, _ string, _, output any) error {
-	raw, _ := json.Marshal(map[string]any{"state": "ready", "installed": true, "protocolVersion": 1, "tunFakeIPEnabled": b.enabled})
-	return json.Unmarshal(raw, output)
-}
-
-func TestBrowserComponentProjectsDeploymentTUNStatus(t *testing.T) {
-	s, actor, _, _, _, _ := resourcePluginServiceFixture(t, "org.ohmycine.browser-tun-status")
-	actor.Permissions["settings.read"] = struct{}{}
-	for _, enabled := range []bool{false, true} {
-		s.browser = tunStatusBrowserFixture{enabled: enabled}
-		output, err := s.BrowserComponent(context.Background(), actor, "status", BrowserInput{})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if output.(map[string]any)["tun_fake_ip_enabled"] != enabled {
-			t.Fatal("effective network mode missing from settings")
 		}
 	}
 }

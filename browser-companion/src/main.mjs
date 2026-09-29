@@ -2,8 +2,7 @@ import { Runtime } from './runtime.mjs';
 import { createServer } from './server.mjs';
 
 try {
-  const runtime = new Runtime({ stateDir: process.env.OMC_CLOAK_DATA_DIR,
-    allowTUNFakeIP: process.env.OMC_CLOAK_TUN_FAKE_IP === 'true' });
+  const runtime = new Runtime({ stateDir: process.env.OMC_CLOAK_DATA_DIR });
   const server = createServer(runtime, process.env.OMC_CLOAK_TOKEN);
   const port = Number(process.env.OMC_CLOAK_PORT || 19876);
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('invalid_port');

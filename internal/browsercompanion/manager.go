@@ -148,9 +148,6 @@ func browserEnvironment() []string {
 			result = append(result, entry)
 		}
 	}
-	// This single deployment-admin flag does not authorize ambient proxy URLs,
-	// arbitrary private ranges or guest-provided routing configuration.
-	result = append(result, "OMC_CLOAK_TUN_FAKE_IP="+strconv.FormatBool(os.Getenv("OMC_CLOAK_TUN_FAKE_IP") == "true"))
 	return result
 }
 
@@ -203,7 +200,7 @@ func (m *Manager) call(ctx context.Context, operation string, input, output any)
 		}
 		if json.Unmarshal(body, &failure) == nil {
 			switch failure.Error {
-			case "browser_request_failed", "browser_request_timeout", "browser_not_installed", "license_required", "browser_launch_failed", "browser_navigation_failed", "browser_reload_post_denied", "network_denied", "network_timeout", "resource_network_denied", "resource_network_timeout", "resource_network_failed", "resource_limit_exceeded", "tun_fake_ip_requires_opt_in", "session_expired":
+			case "browser_request_failed", "browser_request_timeout", "browser_not_installed", "license_required", "browser_launch_failed", "browser_navigation_failed", "browser_reload_post_denied", "network_denied", "network_timeout", "resource_network_denied", "resource_network_timeout", "resource_network_failed", "resource_limit_exceeded", "session_expired":
 				return &Failure{Code: failure.Error}
 			}
 		}

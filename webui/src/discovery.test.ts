@@ -36,7 +36,6 @@ describe('discovery contracts', () => {
     expect(explore).toContain('new AbortController()')
     expect(explore).toContain('{ signal: controller.signal }')
     expect(explore).toContain('previewDownloadRoutes')
-    expect(explore).toContain('<DownloadRouteTargetPicker')
     expect(explore).toContain('site_id: downloadSiteID.value')
     expect(explore).not.toContain('compatibleDownloadLibraries')
     expect(detail).toContain('媒体库覆盖率')

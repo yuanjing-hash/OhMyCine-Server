@@ -320,6 +320,7 @@ export interface DownloaderCapabilities {
 }
 export interface DownloaderSummary {
   id: string; name: string; type: 'fake' | 'qbittorrent' | 'pan115_offline'; base_url: string; enabled: boolean
+  sort_order: number
   execution_location: 'server' | 'node'; node_id?: string; node_name?: string
   downloader_save_root?: string; node_mount_root?: string
   storage_id: number | null; storage_name: string; provider_directory_path: string

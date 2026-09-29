@@ -455,7 +455,7 @@ onMounted(loadSites)
         </button>
         <button class="type-card mt-3 w-full text-left" type="button" @click="selectSiteType('bt')">
           <span class="type-card__icon">BT</span>
-          <span><strong class="block">公开 BT / Torznab</strong><span class="text-subtle mt-1 block text-sm">输入受支持站点的 HTTPS 官网，或连接 Jackett/Prowlarr；未添加的站点不会被访问。</span></span>
+          <span><strong class="block">公开 BT / Torznab</strong><span class="text-subtle mt-1 block text-sm">公开 BT 官网使用 HTTPS；Jackett/Prowlarr 的 Torznab API 可使用 HTTP 或 HTTPS。未添加的站点不会被访问。</span></span>
           <span class="ml-auto text-subtle">下一步 →</span>
         </button>
         <button class="type-card mt-3 w-full text-left" type="button" @click="selectSiteType('cloud_share')">
@@ -476,7 +476,7 @@ onMounted(loadSites)
           <div v-else-if="selectedType === 'bt'" class="sm:col-span-2"><label class="label" for="site-bt-mode">BT 接入方式</label><select id="site-bt-mode" v-model="form.kind" class="input" @change="applyCatalogSelection"><option value="auto_bt">输入官网自动识别</option><option value="torznab">Torznab · Jackett/Prowlarr</option></select><p class="text-subtle mb-0 mt-1 text-xs">Server 内置适配器，但不会列出、探测或访问尚未由你添加的公共 BT 站点。</p></div>
           <div v-else-if="selectedType === 'cloud_share'" class="sm:col-span-2"><label class="label" for="site-share-kind">站点分类</label><select id="site-share-kind" v-model="form.kind" class="input" :disabled="Boolean(editing)"><option value="pansou_tg">盘搜（PanSou）</option></select></div>
           <div v-if="selectedType !== 'cloud_share'"><label class="label" for="site-name">显示名称</label><input id="site-name" v-model="form.name" class="input" maxlength="128" required /></div>
-          <div :class="{ 'sm:col-span-2': selectedType === 'cloud_share' }"><label class="label" for="site-url">{{ selectedType === 'cloud_share' ? 'PanSou 服务地址（HTTPS）' : 'HTTPS 根地址' }}</label><input id="site-url" v-model="form.baseURL" class="input font-mono" type="url" placeholder="https://example.test" required autocomplete="off" :readonly="Boolean(editing && selectedCatalog?.engine === 'rss')" @input="btResolution = null" /><p v-if="selectedType === 'cloud_share'" class="text-subtle mb-0 mt-1 text-xs">已预填默认盘搜服务，可修改为其他 PanSou 服务的 HTTPS 根地址，无需添加 /api/search。</p></div>
+          <div :class="{ 'sm:col-span-2': selectedType === 'cloud_share' }"><label class="label" for="site-url">{{ selectedType === 'cloud_share' ? 'PanSou 服务地址（HTTPS）' : form.kind === 'torznab' ? 'Jackett 根地址或 Torznab API 地址（HTTP / HTTPS）' : 'HTTPS 根地址' }}</label><input id="site-url" v-model="form.baseURL" class="input font-mono" type="url" :placeholder="form.kind === 'torznab' ? 'http://jackett:9117' : 'https://example.test'" required autocomplete="off" :readonly="Boolean(editing && selectedCatalog?.engine === 'rss')" @input="btResolution = null" /><p v-if="selectedType === 'cloud_share'" class="text-subtle mb-0 mt-1 text-xs">已预填默认盘搜服务，可修改为其他 PanSou 服务的 HTTPS 根地址，无需添加 /api/search。</p><p v-else-if="form.kind === 'torznab'" class="text-subtle mb-0 mt-1 text-xs">Jackett 根地址会自动使用全部索引器 API；Prowlarr 或单个索引器请填写完整 Torznab API URL，不要附加 apikey 查询参数。地址须由 Server 容器访问，localhost 指的是 Server 容器自身。</p><p v-if="form.kind === 'torznab' && /^http:\/\//i.test(form.baseURL.trim())" class="semantic-warning mb-0 mt-2 p-3 text-xs">HTTP 会明文传输 Torznab API Key。仅在可信网络中使用。</p></div>
           <template v-if="selectedType === 'cloud_share'">
             <div class="sm:col-span-2">
               <label class="label" for="site-channels">TG 频道</label>

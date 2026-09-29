@@ -3,64 +3,44 @@ import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { Fault, publicIP, originURL, sameOrigin, resolvePublic } from '../src/policy.mjs';
+import { Fault, numericIP, originURL, sameOrigin, resolvePinnedAddress } from '../src/policy.mjs';
 import { Runtime, SESSION_TTL, supportedPlatform } from '../src/runtime.mjs';
 import { createServer } from '../src/server.mjs';
 
-test('canonical origin and all public address policy', async () => {
+test('canonical HTTPS origin and numeric DNS address pinning', async () => {
   assert.equal(originURL('https://星际穿越.com'), 'https://xn--kivn76b41nnhi.com');
   for (const value of ['http://example.com', 'https://u:p@example.com', 'https://example.com:444',
     'https://example.com/path', 'https://example.com?x=y', 'https://example.com.']) assert.throws(() => originURL(value));
-  for (const ip of ['127.0.0.1', '10.1.1.1', '192.168.1.1', '169.254.169.254', '100.64.0.1',
-    '::1', '::ffff:127.0.0.1', 'fc00::1', 'fe80::1', '192.0.2.1']) assert.equal(publicIP(ip), false, ip);
-  assert.equal(publicIP('8.8.8.8'), true);
+  for (const ip of ['127.0.0.1', '10.1.1.1', '169.254.169.254', '198.18.7.137',
+    '8.8.8.8', '::1', '::ffff:127.0.0.1', 'fdfe:dcba:9876::89']) assert.equal(numericIP(ip), true, ip);
+  for (const value of ['', 'not-an-address', '127.0.0.1.evil.test', 'fe80::1%eth0'])
+    assert.equal(numericIP(value), false, value);
   assert.equal(sameOrigin('https://other.example/', 'https://example.com'), false);
   assert.equal(sameOrigin('https://u:p@example.com/', 'https://example.com'), false);
-  await assert.rejects(resolvePublic('https://example.com', async () => [{ address: '8.8.8.8' }, { address: '127.0.0.1' }]));
+  assert.equal(await resolvePinnedAddress('https://example.com', async () => [
+    { address: '198.18.7.137' }, { address: 'fdfe:dcba:9876::89' }]), '198.18.7.137');
+  assert.equal(await resolvePinnedAddress('https://example.com', async () => [
+    { address: 'fdfe:dcba:9876::89' }, { address: '10.0.0.1' }]), 'fdfe:dcba:9876::89');
+  await assert.rejects(resolvePinnedAddress('https://example.com', async () => [{ address: 'bad-ip' }]), /network_denied/);
+  await assert.rejects(resolvePinnedAddress('https://example.com', async () => []), /network_denied/);
 });
 
-test('Fake-IP exception is explicit, DNS-only and never expands the public IP policy', async () => {
-  const origin = 'https://example.com';
-  for (const address of ['198.18.0.0', '198.18.7.137', '198.19.255.255']) {
-    assert.equal(publicIP(address), false);
-    const resolver = async () => [{ address }];
-    await assert.rejects(resolvePublic(origin, resolver), /tun_fake_ip_requires_opt_in/);
-    await assert.rejects(resolvePublic(origin, resolver, 'true'), /tun_fake_ip_requires_opt_in/);
-    assert.equal(await resolvePublic(origin, resolver, true), address);
-    await assert.rejects(resolvePublic(`https://${address}`, resolver, true), /invalid_origin/);
-  }
-  for (const address of ['127.0.0.1', '10.0.0.1', '172.16.0.1', '192.168.1.1', '169.254.169.254',
-    '100.64.0.1', '198.17.255.255', '198.20.0.0', '::1', 'fc00::1', 'fe80::1', '::ffff:198.18.7.137']) {
-    // Adjacent public ranges stay public, not a Fake-IP exception.
-    if (publicIP(address)) continue;
-    await assert.rejects(resolvePublic(origin, async () => [{ address: '198.18.7.137' }, { address }], true), /network_denied/);
-  }
+test('address-range allowance does not allow direct IP origins or malformed DNS answers', async () => {
   let lookups = 0;
-  assert.equal(await resolvePublic(origin, async () => { lookups++; return [{ address: '8.8.8.8' }]; }, true), '8.8.8.8');
+  assert.equal(await resolvePinnedAddress('https://example.com', async () => { lookups++; return [{ address: '127.0.0.1' }]; }), '127.0.0.1');
   assert.equal(lookups, 1);
   for (const value of ['https://8.8.8.8', 'https://[::1]', 'https://0xc6120789'])
     assert.throws(() => originURL(value), /invalid_origin/);
+  await assert.rejects(resolvePinnedAddress('https://example.com', async () => [{ address: '10.0.0.1' }, { address: 'evil.test' }]), /network_denied/);
 });
 
-test('TUN policy is runtime-owned and request fields cannot enable it', async t => {
-  for (const enabled of [false, true]) {
-    let options;
-    const runtime = await fixture(t, { allowTUNFakeIP: enabled, opener: async (_, __, value) => {
-      options = value; return { close: async () => {} };
-    } });
-    runtime.state = 'ready';
-    await runtime.dispatch('/v1/session/create', { identity: 'owner', origin: 'https://example.com', allowTUNFakeIP: !enabled });
-    assert.equal(options.allowTUNFakeIP, enabled);
-    assert.equal(runtime.status().tunFakeIPEnabled, enabled);
-  }
-});
-
-test('TUN opt-in failure survives safe runtime status without false password or permission diagnosis', async t => {
-  const runtime = await fixture(t, { opener: async () => { throw new Fault('tun_fake_ip_requires_opt_in'); } });
+test('network failure remains distinct from a credential failure', async t => {
+  const runtime = await fixture(t, { opener: async () => { throw new Fault('network_denied'); } });
   runtime.state = 'ready'; runtime.executablePath = '/synthetic';
-  await assert.rejects(runtime.dispatch('/v1/session/create', { identity: 'owner', origin: 'https://example.com' }), /tun_fake_ip_requires_opt_in/);
+  await assert.rejects(runtime.dispatch('/v1/session/create', { identity: 'owner', origin: 'https://example.com' }), /network_denied/);
   assert.equal(runtime.status().installed, true);
-  assert.equal(runtime.status().runtimeError, 'tun_fake_ip_requires_opt_in');
+  assert.equal(runtime.status().runtimeError, 'network_denied');
+  assert.equal('tunFakeIPEnabled' in runtime.status(), false);
 });
 
 async function fixture(t, extras = {}) {

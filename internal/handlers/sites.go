@@ -399,6 +399,22 @@ func (a *API) PTSearchStream(c *gin.Context) {
 
 func (a *API) TorrentSearchStream(c *gin.Context) { a.PTSearchStream(c) }
 
+func (a *API) RecommendDiscoveryRoute(c *gin.Context) {
+	actor, _ := middleware.ActorFrom(c)
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 64<<10)
+	var payload services.SourceRouteRecommendationInput
+	if err := strictJSON(c, &payload); err != nil {
+		writeError(c, a.log, invalid("下载路由推荐参数无效", err))
+		return
+	}
+	item, err := a.sites.RecommendSiteRoute(c.Request.Context(), actor, payload)
+	if err != nil {
+		writeError(c, a.log, err)
+		return
+	}
+	success(c, http.StatusOK, item)
+}
+
 func (a *API) CreateDiscoveryDownload(c *gin.Context) {
 	actor, _ := middleware.ActorFrom(c)
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 128<<10)

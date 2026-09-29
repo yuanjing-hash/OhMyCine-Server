@@ -49,6 +49,7 @@ const (
 	CodeDownloaderStorageUnavailable          = "downloader_storage_unavailable"
 	CodeDownloaderInUse                       = "downloader_in_use"
 	CodeDownloaderUnavailable                 = "downloader_unavailable"
+	CodePlayerUpdateRequired                  = "player_update_required"
 	CodeDownloadStagingRequired               = "download_staging_required"
 	CodeDownloadStagingUnavailable            = "download_staging_unavailable"
 	CodeDownloadSourceInvalid                 = "download_source_invalid"

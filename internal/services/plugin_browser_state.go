@@ -303,7 +303,6 @@ func (s *PluginRepositoryService) BrowserComponent(ctx context.Context, actor Ac
 		Supported        *bool  `json:"supported"`
 		Installed        bool   `json:"installed"`
 		RuntimeError     string `json:"runtimeError"`
-		TUNFakeIPEnabled bool   `json:"tunFakeIPEnabled"`
 		ProtocolVersion  int    `json:"protocolVersion"`
 	}
 	if err := s.browser.Call(ctx, operation, map[string]bool{"licenseAccepted": input.LicenseAccepted}, &result); err != nil {
@@ -315,5 +314,5 @@ func (s *PluginRepositoryService) BrowserComponent(ctx context.Context, actor Ac
 	if result.Supported != nil && !*result.Supported {
 		result.State = "platform_unsupported"
 	}
-	return map[string]any{"state": result.State, "installed": result.Installed, "runtime_error": result.RuntimeError, "protocol_version": result.ProtocolVersion, "supported": result.Supported, "tun_fake_ip_enabled": result.TUNFakeIPEnabled}, nil
+	return map[string]any{"state": result.State, "installed": result.Installed, "runtime_error": result.RuntimeError, "protocol_version": result.ProtocolVersion, "supported": result.Supported}, nil
 }

@@ -42,7 +42,7 @@ test('public page loads external resources in isolated installed browser', {
   const deadline = setTimeout(() => { realBrowser?.close().catch(() => {}); }, 60_000);
   try {
     adapter = await openBrowser(executablePath, origin, {
-      chromium: wrapper, cookies: [], allowTUNFakeIP: process.env.OMC_PUBLIC_BROWSER_TUN === '1',
+      chromium: wrapper, cookies: [],
     });
     assert.equal(new URL(page.url()).origin, origin);
     await page.waitForTimeout(8_000);

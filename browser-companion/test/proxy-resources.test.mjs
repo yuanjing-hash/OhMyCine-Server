@@ -36,11 +36,11 @@ test('each public hostname pins once; DNS changes never retarget an existing con
     assert.equal(calls.every(v => v.port === 443), true);
   } finally { await proxy.close(); }
 });
-test('proxy rejects literals, unsafe ports/schemes, mixed private answers and caches denials', async () => {
+test('proxy rejects literal hosts and unsafe ports, and caches malformed DNS answers', async () => {
   const calls = [], denied = []; let lookups = 0;
   const proxy = await pinnedProxy('https://example.com', '8.8.8.8', {
     connect: connector(calls), onBlocked: code => denied.push(code),
-    resolver: async () => { lookups++; return [{ address: '1.1.1.1' }, { address: '169.254.169.254' }]; },
+    resolver: async () => { lookups++; return [{ address: '1.1.1.1' }, { address: 'invalid-address' }]; },
   });
   try {
     for (const authority of ['127.0.0.1:443', '[::1]:443', '0x7f000001:443', 'cdn.example:80',
@@ -49,20 +49,20 @@ test('proxy rejects literals, unsafe ports/schemes, mixed private answers and ca
     assert.equal(lookups, 1); assert.equal(calls.length, 0); assert.equal(denied.length, 9);
   } finally { await proxy.close(); }
 });
-test('third-party Fake-IP requires deployment opt-in and mixed private DNS still fails', async () => {
-  for (const enabled of [false, true]) {
-    const calls = [];
-    const proxy = await pinnedProxy('https://example.com', '8.8.8.8', {
-      connect: connector(calls), allowTUNFakeIP: enabled,
-      resolver: async host => host === 'mixed.example' ? [{ address: '198.18.7.1' }, { address: '10.0.0.1' }] : [{ address: '198.18.7.1' }],
-    });
-    try {
-      assert.equal(await tunnel(proxy, 'cdn.example:443'), enabled);
-      assert.equal(await tunnel(proxy, 'mixed.example:443'), false);
-      assert.equal(await tunnel(proxy, '198.18.7.1:443'), false);
-      if (enabled) assert.deepEqual(calls, [{ host: '198.18.7.1', port: 443 }]);
-    } finally { await proxy.close(); }
-  }
+test('third-party Fake-IP, private and loopback DNS targets use numeric pins', async () => {
+  const calls = [];
+  const proxy = await pinnedProxy('https://example.com', 'fdfe:dcba:9876::89', {
+    connect: connector(calls),
+    resolver: async host => host === 'mixed.example'
+      ? [{ address: '198.18.7.1' }, { address: 'fdfe:dcba:9876::88' }]
+      : host === 'private.example' ? [{ address: '10.0.0.1' }] : [{ address: '::1' }],
+  });
+  try {
+    for (const host of ['example.com', 'mixed.example', 'private.example', 'loopback.example'])
+      assert.equal(await tunnel(proxy, `${host}:443`), true, host);
+    assert.equal(await tunnel(proxy, '198.18.7.1:443'), false);
+    assert.deepEqual(calls.map(value => value.host), ['fdfe:dcba:9876::89', '198.18.7.1', '10.0.0.1', '::1']);
+  } finally { await proxy.close(); }
 });
 
 test('explicit reload retries failed DNS but preserves successful pins', async () => {

@@ -1927,3 +1927,11 @@ Server 可生成 Linux bash 或 Windows PowerShell 完整命令；命令先校�
 ## TG 网盘站点
 
 新增原生 `pansou_tg` 适配器，站点类型为 `cloud_share`。一个站点保存一种网盘类型和多个公开 TG 频道；当前通过 PanSou 搜索 115 分享，统一进入搜索、订阅和现有分享转存入库链路。网盘账号、接收目录、执行位置沿用 115 下载器，协议和配置方式见 [TG 网盘站点](../deployment/tg-cloud-sites.md)。
+
+## 来源感知下载路由
+
+下载器通过 `sort_order,id` 形成管理员可调整的全局顺序。站点搜索结果的来源由 Server 保存的站点和用户绑定结果令牌决定：PT 固定首个可用 qBittorrent，115 分享固定首个可转存的 115 下载器；公开 BT 在所选目标库上按顺序检查兼容下载器，只有明确未创建任务的提交拒绝才尝试下一个。任务建立后不换下载器。手动入库优先选媒体库列表中排序最靠前且可路由的库，切换目标库会重新计算。订阅从下一次运行起按每条结果选路，旧版固定下载器快照会读取为来源优先策略，已有任务的路线保持冻结。
+
+Server 管理网页调用 `POST /api/v1/sites/routes/recommend` 和 `POST /api/v1/follows/routes/preview`；Player 使用 `POST /api/v1/player/discovery/routes/recommend` 和 `POST /api/v1/player/discovery/follows/routes/preview`。推荐只返回当前用户可见的安全路线信息，不返回站点凭据或下载来源；最终提交再次校验。管理员可通过 `PUT /api/v1/downloaders/order` 提交完整下载器顺序。新的订阅写入使用版本 2 的 `routing_policy=source_priority`，旧版固定 `downloader_id` 写入收到明确的升级错误。
+
+Torznab 站点可单独使用 HTTP 或 HTTPS，其他站点仍按原有 HTTPS 规则。Jackett 根地址先探测 `/api`；仅在返回 404 时尝试同协议、同主机的 `/api/v2.0/indexers/all/results/torznab/api`。指定完整 Torznab API 路径时不会改写。HTTP 的 API Key 会明文传输，站点表单向管理员提示这一点。

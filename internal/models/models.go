@@ -1621,6 +1621,7 @@ type Downloader struct {
 	Name                  string     `gorm:"size:128;not null" json:"name"`
 	NameNormalized        string     `gorm:"size:128;not null;uniqueIndex" json:"-"`
 	Type                  string     `gorm:"size:32;not null;index" json:"type"`
+	SortOrder             int        `gorm:"not null;default:0;index" json:"sort_order"`
 	ExecutionLocation     string     `gorm:"size:16;not null;default:'server';index" json:"execution_location"`
 	NodeID                *string    `gorm:"size:36;index" json:"node_id,omitempty"`
 	NodeName              string     `gorm:"size:128;not null;default:''" json:"node_name,omitempty"`

@@ -224,7 +224,7 @@ func (s *PluginRepositoryService) ResourceBrowser(ctx context.Context, actor Act
 			return nil, browserFailure()
 		}
 		switch output.NetworkErrorCode {
-		case "", "resource_network_denied", "resource_network_timeout", "resource_network_failed", "resource_limit_exceeded", "tun_fake_ip_requires_opt_in":
+		case "", "resource_network_denied", "resource_network_timeout", "resource_network_failed", "resource_limit_exceeded":
 		default:
 			return nil, browserFailure()
 		}
@@ -315,7 +315,7 @@ func (s *PluginRepositoryService) BrowserRequest(ctx context.Context, pluginID, 
 		if diagnostic, ok := ctx.Value(browserDiagnosticKey{}).(*browserDiagnostic); ok && resultErr != nil {
 			var safe error
 			switch ErrorCode(resultErr) {
-			case "resource_browser_request_failed", "resource_browser_request_timeout", "resource_browser_request_denied", "resource_browser_tun_required":
+			case "resource_browser_request_failed", "resource_browser_request_timeout", "resource_browser_request_denied":
 				safe = resultErr // Created below without an upstream cause.
 			default:
 				safe = browserFailure()
@@ -380,8 +380,6 @@ func (s *PluginRepositoryService) BrowserRequest(ctx context.Context, pluginID, 
 			return nil, true, appError("resource_browser_request_timeout", "浏览器中的站点请求超时；未确认登录状态，请稍后重试", nil)
 		case "network_denied", "resource_network_denied":
 			return nil, true, appError("resource_browser_request_denied", "浏览器站点请求被网络安全策略拒绝；不代表密码错误", nil)
-		case "tun_fake_ip_requires_opt_in":
-			return nil, true, appError("resource_browser_tun_required", "浏览器检测到 TUN Fake-IP，请在 Server 部署设置中显式启用兼容选项", nil)
 		}
 		return nil, true, appError("resource_browser_request_failed", "浏览器中的站点请求失败（可能是网络或不支持的跳转）；不代表账号密码错误", nil)
 	}

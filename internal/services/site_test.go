@@ -98,6 +98,24 @@ func (a *stubSiteAdapter) Test(_ context.Context, config sitepkg.Config) (sitepk
 	return sitepkg.Health{Status: "online", Username: "fixture-user"}, nil
 }
 
+func TestTorznabHTTPBaseURLIsKindScoped(t *testing.T) {
+	const jackett = "http://127.0.0.1:9117/api/v2.0/indexers/all/results/torznab/"
+	got, err := normalizeSiteBaseURL("torznab", jackett)
+	if err != nil || got != strings.TrimSuffix(jackett, "/") {
+		t.Fatalf("Torznab HTTP URL = %q, %v", got, err)
+	}
+	for _, kind := range []string{"auto_bt", "nexusphp", "pansou_tg"} {
+		if _, err := normalizeSiteBaseURL(kind, jackett); err == nil {
+			t.Fatalf("%s unexpectedly accepted HTTP", kind)
+		}
+	}
+	for _, invalid := range []string{"http://user@127.0.0.1:9117/api", "http://127.0.0.1:9117/api?apikey=secret", "http://127.0.0.1:9117/api#fragment"} {
+		if _, err := normalizeSiteBaseURL("torznab", invalid); err == nil {
+			t.Fatalf("Torznab accepted invalid URL %q", invalid)
+		}
+	}
+}
+
 func TestPublicBTAndTorznabCredentialContracts(t *testing.T) {
 	service, _, actor, _, _, _ := siteFixture(t)
 	publicAdapter := &stubSiteAdapter{kind: "nyaa", testErr: map[string]error{}, searchErr: map[string]error{}}
@@ -126,6 +144,10 @@ func TestPublicBTAndTorznabCredentialContracts(t *testing.T) {
 	}
 	if torznabAdapter.lastConfig.APIKey != secret {
 		t.Fatal("adapter did not receive API key")
+	}
+	httpSite, err := service.Create(context.Background(), actor, SiteInput{Name: "Local Jackett", Kind: "torznab", BaseURL: "http://127.0.0.1:9117", APIKey: secret, Enabled: true, Priority: 110, TimeoutSeconds: 12, RateLimitPerMinute: 12}, RequestContext{})
+	if err != nil || httpSite.BaseURL != "http://127.0.0.1:9117" || torznabAdapter.lastConfig.BaseURL != httpSite.BaseURL {
+		t.Fatalf("HTTP Jackett create/test did not use the configured root: %+v, %v", httpSite, err)
 	}
 	var record models.Site
 	if err := service.db.First(&record, torznab.ID).Error; err != nil {

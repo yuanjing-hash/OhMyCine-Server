@@ -1,4 +1,4 @@
-import { Fault, requireThat, sameOrigin, resolvePublic, resourceURL } from './policy.mjs';
+import { Fault, requireThat, sameOrigin, resolvePinnedAddress, resourceURL } from './policy.mjs';
 import { pinnedProxy } from './proxy.mjs';
 import { validateCookies, exportCookies } from './cookies.mjs';
 
@@ -11,17 +11,15 @@ function samePageOrigin(value, origin) {
 
 export async function openBrowser(executablePath, origin, dependencies = {}) {
   const cookies = validateCookies(dependencies.cookies ?? [], origin);
-  const address = await (dependencies.resolvePublic || resolvePublic)(origin, undefined, dependencies.allowTUNFakeIP === true);
+  const address = await (dependencies.resolvePinnedAddress || resolvePinnedAddress)(origin);
   let networkErrorCode = '', blockedResourceCount = 0, mainDocumentMethod = 'GET';
   const blocked = code => {
     blockedResourceCount = Math.min(blockedResourceCount + 1, 10000);
-    networkErrorCode = code === 'tun_fake_ip_requires_opt_in' || code === 'resource_limit_exceeded' ? code
+    networkErrorCode = code === 'resource_limit_exceeded' ? code
       : code === 'network_timeout' ? 'resource_network_timeout'
       : code === 'resource_network_failed' ? code : 'resource_network_denied';
   };
-  const proxy = await (dependencies.pinnedProxy || pinnedProxy)(origin, address, {
-    allowTUNFakeIP: dependencies.allowTUNFakeIP === true, onBlocked: blocked,
-  });
+  const proxy = await (dependencies.pinnedProxy || pinnedProxy)(origin, address, { onBlocked: blocked });
   let browser;
   try {
     const chromium = dependencies.chromium || (await import('playwright-core')).chromium;

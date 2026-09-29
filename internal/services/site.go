@@ -387,7 +387,7 @@ func (s *SiteService) Create(ctx context.Context, actor Actor, input SiteInput, 
 	if adapter == nil {
 		return SiteSummary{}, appError(CodeSiteKindUnsupported, "当前 Server 不支持该站点类型", nil)
 	}
-	baseURL, err := normalizeSiteBaseURL(input.BaseURL)
+	baseURL, err := normalizeSiteBaseURL(kind, input.BaseURL)
 	if err != nil {
 		return SiteSummary{}, err
 	}
@@ -463,7 +463,7 @@ func (s *SiteService) createFromCookieCloud(ctx context.Context, name, kind, bas
 	if adapter == nil {
 		return SiteSummary{}, appError(CodeSiteKindUnsupported, "当前 Server 不支持该站点类型", nil)
 	}
-	baseURL, err := normalizeSiteBaseURL(baseURL)
+	baseURL, err := normalizeSiteBaseURL(kind, baseURL)
 	if err != nil {
 		return SiteSummary{}, err
 	}
@@ -566,7 +566,7 @@ func (s *SiteService) Update(ctx context.Context, actor Actor, id uint, input Si
 		}
 	}
 	if input.BaseURL != nil {
-		record.BaseURL, err = normalizeSiteBaseURL(*input.BaseURL)
+		record.BaseURL, err = normalizeSiteBaseURL(record.Kind, *input.BaseURL)
 		if err != nil {
 			return SiteSummary{}, err
 		}
@@ -1972,9 +1972,13 @@ func normalizeSiteName(value string) (string, string, error) {
 	}
 	return name, strings.ToLower(name), nil
 }
-func normalizeSiteBaseURL(value string) (string, error) {
+func normalizeSiteBaseURL(kind, value string) (string, error) {
 	parsed, err := url.Parse(strings.TrimRight(strings.TrimSpace(value), "/"))
-	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+	allowedScheme := parsed != nil && (parsed.Scheme == "https" || kind == "torznab" && parsed.Scheme == "http")
+	if err != nil || !allowedScheme || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		if kind == "torznab" {
+			return "", appError(CodeSiteURLInvalid, "Torznab 地址必须是 HTTP 或 HTTPS 的 Jackett 根地址或 API 地址", nil)
+		}
 		return "", appError(CodeSiteURLInvalid, "站点地址必须是 HTTPS 根地址", nil)
 	}
 	return parsed.String(), nil

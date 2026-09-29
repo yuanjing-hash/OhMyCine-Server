@@ -12,11 +12,10 @@ export function supportedPlatform(platform = process.platform, arch = process.ar
   return (platform === 'win32' && arch === 'x64') || (platform === 'linux' && ['x64', 'arm64'].includes(arch));
 }
 export class Runtime {
-  constructor({ stateDir, opener = openBrowser, clock = Date.now, installer, allowTUNFakeIP = false } = {}) {
+  constructor({ stateDir, opener = openBrowser, clock = Date.now, installer } = {}) {
     requireThat(typeof stateDir === 'string' && path.isAbsolute(stateDir), 'state_directory_required');
     this.stateDir = stateDir; this.opener = opener; this.clock = clock;
     this.installer = installer || (() => this.acquire());
-    this.allowTUNFakeIP = allowTUNFakeIP === true;
     this.state = 'not_installed'; this.session = null; this.busy = false; this.stopping = false;
   }
   async initialize() {
@@ -37,7 +36,7 @@ export class Runtime {
     return actual;
   }
   status() { return { protocolVersion: 1, state: this.state, supported: supportedPlatform(),
-    installed: !!this.executablePath, runtimeError: this.runtimeError || '', tunFakeIPEnabled: this.allowTUNFakeIP }; }
+    installed: !!this.executablePath, runtimeError: this.runtimeError || '' }; }
   install(input) {
     requireThat(input.licenseAccepted === true, 'license_acceptance_required');
     requireThat(supportedPlatform(), 'platform_unsupported');
@@ -101,9 +100,9 @@ export class Runtime {
         const origin = originURL(input.origin);
         const cookies = validateCookies(input.cookies ?? [], origin);
         let browser;
-        try { browser = await this.opener(this.executablePath, origin, { cookies, allowTUNFakeIP: this.allowTUNFakeIP }); }
+        try { browser = await this.opener(this.executablePath, origin, { cookies }); }
         catch (error) {
-          const codes = ['browser_launch_failed', 'browser_navigation_failed', 'network_denied', 'network_timeout', 'tun_fake_ip_requires_opt_in'];
+          const codes = ['browser_launch_failed', 'browser_navigation_failed', 'network_denied', 'network_timeout'];
           this.runtimeError = error instanceof Fault && codes.includes(error.code) ? error.code : 'browser_launch_failed';
           this.state = 'launch_failed';
           throw new Fault(this.runtimeError, 503);

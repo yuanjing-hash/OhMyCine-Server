@@ -80,7 +80,7 @@ func (w *FollowSearchWorker) Run(ctx context.Context, runtime JobRuntime, job Cl
 	if err := json.Unmarshal([]byte(run.ExecutionSnapshotJSON), &snapshot); err != nil {
 		return w.block(run, subscription, CodeFollowConfigurationInvalid, "订阅执行快照无效")
 	}
-	if _, _, err := w.follows.validateSnapshot(actor, subscription.TMDBID, snapshot); err != nil {
+	if snapshot, _, err = w.follows.validateSnapshotWithRoutes(actor, subscription.TMDBID, snapshot, false); err != nil {
 		return w.block(run, subscription, CodeFollowConfigurationInvalid, ErrorMessage(err))
 	}
 	coverage, err := w.follows.coverage.Coverage(ctx, actor, "tv", subscription.TMDBID)
@@ -172,6 +172,8 @@ func (w *FollowSearchWorker) Run(ctx context.Context, runtime JobRuntime, job Cl
 	_ = runtime.Heartbeat(&progress, &processed, &total, nil, nil)
 	_ = runtime.Checkpoint(map[string]any{"stage": "submit", "missing": missingCoordinates, "selected": candidateFingerprints(selected)})
 	submitted := 0
+	submitFailures := 0
+	lastSubmitMessage := ""
 	for _, candidate := range selected {
 		blocked, gateErr := followReadinessBlocked(w.follows.db, subscription.ID)
 		if gateErr != nil {
@@ -197,6 +199,17 @@ func (w *FollowSearchWorker) Run(ctx context.Context, runtime JobRuntime, job Cl
 		if candidate.Item.SourceKind == "115_share" {
 			candidate.Fingerprint = followFingerprint(candidate.SiteID, fmt.Sprintf("%s:%d:%v", candidate.Fingerprint, candidate.Season, episodes), 0, nil)
 		}
+		libraryID := snapshot.MediaLibraryID
+		recommendation, routeErr := w.follows.downloads.RecommendSourceRoute(ctx, actor, candidate.SiteID, &libraryID)
+		if routeErr != nil || recommendation.Recommended == nil {
+			submitFailures++
+			filterSummary["submit_failed"]++
+			lastSubmitMessage = "没有可用的下载器与目标媒体库路线"
+			if routeErr != nil {
+				lastSubmitMessage = safeErrorMessage(routeErr, lastSubmitMessage)
+			}
+			continue
+		}
 		claimed, err := w.reserveEpisodes(run, subscription.ID, candidate, episodes)
 		if err != nil || !claimed {
 			continue
@@ -207,20 +220,33 @@ func (w *FollowSearchWorker) Run(ctx context.Context, runtime JobRuntime, job Cl
 			value := episodes[0]
 			singleEpisode = &value
 		}
-		libraryID := snapshot.MediaLibraryID
-		download, err := w.sites.Download(ctx, actor, SiteDownloadInput{ResultToken: candidate.Item.Token, DownloaderID: snapshot.DownloaderID, MediaLibraryID: &libraryID, Priority: snapshot.DownloadPriority, FollowSubscriptionID: subscription.ID, FollowResourceFingerprint: candidate.Fingerprint, Season: &season, Episode: singleEpisode, BeforeSubmit: func() error {
-			current, currentErr := w.currentSubscription(subscription.ID)
-			if currentErr != nil || !followRunExecutable(current, run.LifecycleRevision) {
-				return appError(CodeConflict, "订阅已暂停或删除", currentErr)
+		downloaders := []string{recommendation.Recommended.DownloaderID}
+		if recommendation.SourceKind == RouteSourceBT {
+			for _, choice := range recommendation.Choices {
+				if choice.Enabled && choice.MediaLibraryID == libraryID && choice.DownloaderID != downloaders[0] {
+					downloaders = append(downloaders, choice.DownloaderID)
+				}
 			}
-			return nil
-		}, BeforePersist: func(tx *gorm.DB) error {
-			current, currentErr := w.follows.LockCurrentSubscription(tx, subscription.ID)
-			if currentErr != nil || !followRunExecutable(current, run.LifecycleRevision) {
-				return appError(CodeConflict, "订阅已暂停或删除", currentErr)
+		}
+		var download DownloadTaskSummary
+		for index, downloaderID := range downloaders {
+			download, err = w.sites.Download(ctx, actor, SiteDownloadInput{ResultToken: candidate.Item.Token, DownloaderID: downloaderID, MediaLibraryID: &libraryID, Priority: snapshot.DownloadPriority, FollowSubscriptionID: subscription.ID, FollowResourceFingerprint: candidate.Fingerprint, Season: &season, Episode: singleEpisode, BeforeSubmit: func() error {
+				current, currentErr := w.currentSubscription(subscription.ID)
+				if currentErr != nil || !followRunExecutable(current, run.LifecycleRevision) {
+					return appError(CodeConflict, "订阅已暂停或删除", currentErr)
+				}
+				return nil
+			}, BeforePersist: func(tx *gorm.DB) error {
+				current, currentErr := w.follows.LockCurrentSubscription(tx, subscription.ID)
+				if currentErr != nil || !followRunExecutable(current, run.LifecycleRevision) {
+					return appError(CodeConflict, "订阅已暂停或删除", currentErr)
+				}
+				return nil
+			}}, RequestContext{})
+			if err == nil || index+1 == len(downloaders) || !isDefinitiveNoTaskRouteError(ErrorCode(err)) {
+				break
 			}
-			return nil
-		}}, RequestContext{})
+		}
 		if err != nil {
 			w.releaseEpisodes(subscription.ID, run.ID, candidate.Fingerprint)
 			current, currentErr := w.currentSubscription(subscription.ID)
@@ -230,10 +256,9 @@ func (w *FollowSearchWorker) Run(ctx context.Context, runtime JobRuntime, job Cl
 			if ctx.Err() != nil {
 				return w.stopRun(run, models.FollowRunCancelled, "follow_cancelled", "追更任务已取消")
 			}
-			if isFollowConfigurationError(ErrorCode(err)) {
-				return w.block(run, subscription, CodeFollowConfigurationInvalid, "订阅下载器或目标媒体库配置不可用")
-			}
 			filterSummary["submit_failed"]++
+			submitFailures++
+			lastSubmitMessage = safeErrorMessage(err, "资源提交失败")
 			continue
 		}
 		if err := w.attachDownload(subscription.ID, run.ID, candidate.Fingerprint, download.ID); err != nil {
@@ -243,12 +268,27 @@ func (w *FollowSearchWorker) Run(ctx context.Context, runtime JobRuntime, job Cl
 		submitted++
 	}
 	if submitted == 0 {
+		if submitFailures > 0 {
+			return w.finish(run, subscription, models.FollowRunFailed, models.FollowStatusActive, "follow_submit_failed", lastSubmitMessage, snapshot, queryNames, len(candidates), filterSummary)
+		}
 		return w.finish(run, subscription, models.FollowRunNoMatch, models.FollowStatusActive, "", "", snapshot, queryNames, len(candidates), filterSummary)
 	}
 	progress = 100
 	processed = 4
 	_ = runtime.Heartbeat(&progress, &processed, &total, nil, nil)
+	if submitFailures > 0 {
+		return w.finish(run, subscription, models.FollowRunSubmitted, models.FollowStatusActive, "follow_submit_partial", lastSubmitMessage, snapshot, queryNames, len(candidates), filterSummary, submitted)
+	}
 	return w.finish(run, subscription, models.FollowRunSubmitted, models.FollowStatusActive, "", "", snapshot, queryNames, len(candidates), filterSummary, submitted)
+}
+
+func isDefinitiveNoTaskRouteError(code string) bool {
+	switch code {
+	case CodeDownloaderUnavailable, CodeDownloaderStorageUnavailable, CodeDownloadSourceInvalid, CodeDownloadStagingRequired, CodeDownloadStagingUnavailable, CodeMediaLibraryStorageUnavailable, CodeMediaLibraryProfileUnavailable, CodeMediaLibraryPathInvalid, CodeTransferRouteUnsupported:
+		return true
+	default:
+		return false
+	}
 }
 
 func (w *FollowSearchWorker) searchCandidates(ctx context.Context, actor Actor, subscription models.FollowSubscription, snapshot FollowExecutionSnapshot, missing map[[2]int]struct{}) ([]followCandidate, int, map[string]int) {
@@ -572,6 +612,9 @@ func (w *FollowSearchWorker) finish(run models.FollowRun, subscription models.Fo
 		return followPersistFailure()
 	}
 	eventType := map[string]string{models.FollowRunNoMatch: "follow.no_match", models.FollowRunCompleted: "follow.completed", models.FollowRunFailed: "follow.blocked"}[runStatus]
+	if runStatus == models.FollowRunFailed && subscriptionStatus == models.FollowStatusActive {
+		eventType = "follow.submit_failed"
+	}
 	if eventType != "" {
 		w.follows.publish(eventType, run.OwnerID, run.JobID, runStatus)
 	}
@@ -687,15 +730,6 @@ func candidateFingerprints(candidates []followCandidate) []string {
 
 func followRunExecutable(subscription models.FollowSubscription, lifecycleRevision uint64) bool {
 	return subscription.Status != models.FollowStatusPaused && subscription.LifecycleRevision == lifecycleRevision
-}
-
-func isFollowConfigurationError(code string) bool {
-	switch code {
-	case CodePermissionDenied, CodeDownloaderUnavailable, CodeDownloaderStorageRequired, CodeDownloaderStorageUnavailable, CodeDownloadStagingRequired, CodeDownloadStagingUnavailable, CodeMediaLibraryStorageUnavailable, CodeMediaLibraryProfileUnavailable, CodeMediaLibraryPathInvalid:
-		return true
-	default:
-		return false
-	}
 }
 
 func followPersistFailure() WorkerResult {

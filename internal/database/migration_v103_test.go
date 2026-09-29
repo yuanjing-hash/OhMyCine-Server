@@ -43,7 +43,7 @@ func TestMigrationV103AddsRemoteNodeStateWithoutMovingLocalDownloaders(t *testin
 		CreatedAt:        now,
 		UpdatedAt:        now,
 	}
-	if err := db.Omit("ExecutionLocation", "NodeID", "NodeName").Create(&downloader).Error; err != nil {
+	if err := db.Omit("SortOrder", "ExecutionLocation", "NodeID", "NodeName").Create(&downloader).Error; err != nil {
 		t.Fatal(err)
 	}
 

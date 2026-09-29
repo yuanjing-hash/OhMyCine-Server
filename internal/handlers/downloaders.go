@@ -40,6 +40,24 @@ func (a *API) Downloaders(c *gin.Context) {
 	success(c, http.StatusOK, gin.H{"list": items, "total": len(items)})
 }
 
+func (a *API) ReorderDownloaders(c *gin.Context) {
+	actor, _ := middleware.ActorFrom(c)
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 64<<10)
+	var payload struct {
+		IDs []string `json:"ids"`
+	}
+	if err := strictJSON(c, &payload); err != nil {
+		writeError(c, a.log, invalid("下载器顺序无效", err))
+		return
+	}
+	items, err := a.downloaders.Reorder(actor, payload.IDs, middleware.RequestContextFrom(c))
+	if err != nil {
+		writeError(c, a.log, err)
+		return
+	}
+	success(c, http.StatusOK, gin.H{"list": items, "total": len(items)})
+}
+
 func (a *API) CreateDownloader(c *gin.Context) {
 	actor, _ := middleware.ActorFrom(c)
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 64<<10)

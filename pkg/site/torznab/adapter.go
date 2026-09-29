@@ -175,46 +175,58 @@ func (a *Adapter) request(ctx context.Context, config site.Config, query url.Val
 		return nil, site.ErrUnavailable
 	}
 	target := *base
+	rootAddress := target.Path == "" || target.Path == "/"
 	if !strings.HasSuffix(strings.TrimRight(target.Path, "/"), "/api") {
 		target.Path = strings.TrimRight(target.Path, "/") + "/api"
 	}
 	query.Set("apikey", config.APIKey)
 	target.RawQuery = query.Encode()
+	body, status, err := requestTorznabTarget(ctx, client, &target)
+	if rootAddress && status == http.StatusNotFound {
+		// Jackett's root is not itself a Torznab endpoint. Only a 404 from
+		// the generic /api path permits the same-origin all-indexer fallback.
+		target.Path = "/api/v2.0/indexers/all/results/torznab/api"
+		body, _, err = requestTorznabTarget(ctx, client, &target)
+	}
+	return body, err
+}
+
+func requestTorznabTarget(ctx context.Context, client *http.Client, target *url.URL) ([]byte, int, error) {
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), nil)
 	if err != nil {
-		return nil, site.ErrUnavailable
+		return nil, 0, site.ErrUnavailable
 	}
 	request.Header.Set("Accept", "application/xml,application/rss+xml;q=0.9")
 	response, err := client.Do(request)
 	if err != nil {
-		return nil, site.ErrUnavailable
+		return nil, 0, site.ErrUnavailable
 	}
 	defer func() { _ = response.Body.Close() }()
 	if response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden {
-		return nil, site.ErrAuthentication
+		return nil, response.StatusCode, site.ErrAuthentication
 	}
 	if response.StatusCode == http.StatusTooManyRequests {
-		return nil, site.ErrRateLimited
+		return nil, response.StatusCode, site.ErrRateLimited
 	}
 	if response.StatusCode != http.StatusOK {
-		return nil, site.ErrUnavailable
+		return nil, response.StatusCode, site.ErrUnavailable
 	}
 	body, err := io.ReadAll(io.LimitReader(response.Body, maxXMLBytes+1))
 	if err != nil || len(body) > maxXMLBytes {
-		return nil, site.ErrInvalidReply
+		return nil, response.StatusCode, site.ErrInvalidReply
 	}
-	return body, nil
+	return body, response.StatusCode, nil
 }
 
 func safeTorznabURL(baseURL, raw string) bool {
 	base, baseErr := url.Parse(strings.TrimRight(strings.TrimSpace(baseURL), "/"))
 	target, targetErr := url.Parse(strings.TrimSpace(raw))
-	return baseErr == nil && targetErr == nil && base.Scheme == "https" && target.Scheme == "https" && base.Host != "" && strings.EqualFold(base.Host, target.Host) && target.User == nil && target.Fragment == "" && len(raw) <= 8192
+	return baseErr == nil && targetErr == nil && (base.Scheme == "http" || base.Scheme == "https") && target.Scheme == base.Scheme && base.Host != "" && strings.EqualFold(base.Host, target.Host) && target.User == nil && target.Fragment == "" && len(raw) <= 8192
 }
 
 func controlledClient(config site.Config) (*http.Client, *url.URL, error) {
 	base, err := url.Parse(strings.TrimRight(strings.TrimSpace(config.BaseURL), "/"))
-	if err != nil || base.Scheme != "https" || base.Host == "" || base.User != nil || base.RawQuery != "" || base.Fragment != "" {
+	if err != nil || (base.Scheme != "http" && base.Scheme != "https") || base.Host == "" || base.User != nil || base.RawQuery != "" || base.Fragment != "" {
 		return nil, nil, site.ErrUnavailable
 	}
 	timeout := config.Timeout
@@ -222,7 +234,7 @@ func controlledClient(config site.Config) (*http.Client, *url.URL, error) {
 		timeout = 12 * time.Second
 	}
 	client := &http.Client{Timeout: timeout, CheckRedirect: func(next *http.Request, via []*http.Request) error {
-		if len(via) >= 2 || next.URL.Scheme != "https" || !strings.EqualFold(next.URL.Host, base.Host) {
+		if len(via) >= 2 || next.URL.Scheme != base.Scheme || !strings.EqualFold(next.URL.Host, base.Host) {
 			return http.ErrUseLastResponse
 		}
 		return nil

@@ -86,9 +86,8 @@ async function run(operation: string, payload: Record<string, unknown> = {}) {
       const resourceMessages: Record<string, string> = {
         resource_network_denied: '部分网页资源被网络安全检查阻止，页面样式或验证可能不完整。',
         resource_network_timeout: '部分网页资源连接超时，页面样式或验证可能尚未加载。',
-        resource_network_failed: '部分公网资源连接失败，页面样式或验证可能不完整。',
+        resource_network_failed: '部分网页资源连接失败，页面样式或验证可能不完整。',
         resource_limit_exceeded: '网页资源请求达到本次安全限制，部分内容未加载。',
-        tun_fake_ip_requires_opt_in: '网页资源使用 TUN 虚拟地址，请在 Server 系统设置查看 TUN 兼容配置。',
       }
       const warning = typeof result.network_error_code === 'string' ? resourceMessages[result.network_error_code] : undefined
       const count = typeof result.blocked_resource_count === 'number' && Number.isSafeInteger(result.blocked_resource_count) && result.blocked_resource_count >= 0 && result.blocked_resource_count <= 10000 ? result.blocked_resource_count : undefined
@@ -108,7 +107,6 @@ async function run(operation: string, payload: Record<string, unknown> = {}) {
       : code === 'resource_browser_request_failed' ? '浏览器中的站点请求失败，可能是网络或不支持的跳转；不是密码错误。网页已保留，可稍后再次确认。'
       : code === 'resource_browser_request_timeout' ? '浏览器中的站点请求超时；网页已保留，请稍后再次确认。'
       : code === 'resource_browser_request_denied' ? '站点请求被浏览器网络安全策略拒绝，不代表密码错误；请检查 Server 网络配置。'
-      : code === 'resource_browser_tun_required' ? '浏览器检测到 TUN Fake-IP；请在 Server 部署中启用 OMC_CLOAK_TUN_FAKE_IP=true 并重启 Server，无需反复输入密码。'
       : code === 'resource_browser_unavailable' || code === 'resource_browser_start_failed' ? 'Server 浏览器启动失败，请到系统设置的内置浏览器中检查运行状态。'
       : code === 'resource_browser_reload_failed' ? '网页重新加载未完成，请检查网络或更新画面查看状态；不代表登录失效。'
       : code === 'resource_browser_reload_post_denied' ? '当前页面来自表单提交，为避免重复提交，不能直接重新加载。可更新画面或继续手动验证。'

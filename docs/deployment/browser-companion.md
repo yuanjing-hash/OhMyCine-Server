@@ -39,39 +39,18 @@ Linux 还需要与 Dockerfile 一致的 Chromium 共享库和字体。此步骤�
 | `OMC_CLOAK_NODE` | Node 可执行文件路径，默认从 PATH 查找 |
 | `OMC_CLOAK_COMPANION` | companion `src/main.mjs` 的绝对路径 |
 | `OMC_CLOAK_DATA_DIR` | 私有可写的浏览器组件数据目录 |
-| `OMC_CLOAK_TUN_FAKE_IP` | 部署管理员明确设置为 `true`，允许受管浏览器通过可信 TUN 的 IPv4 Fake-IP 联网；默认关闭 |
 
 不要对外暴露 companion 端口或 CDP。其认证凭据由 Server 管理，不能填到第三方 FlareSolverr 设置中。
 
 ## TUN / Fake-IP 网络
 
-某些 TUN 客户端将站点域名解析为 `198.18.0.0/15` 范围内的虚拟地址，再由 TUN 转发到实际站点。旧的浏览器检查把这类地址当作受限地址，导致组件已安装却打不开站点，不代表账号密码错误或镜像权限错误。
+某些 TUN 客户端会把域名解析成虚拟 IPv4/IPv6 地址，再由 TUN 转发。受管浏览器现在接受 Server DNS 返回的有效数字地址，包括 Fake-IP、内网和回环地址，无需另设开关；原来的 `OMC_CLOAK_TUN_FAKE_IP` 已移除。只有 **Server 所在机器或容器** 的 DNS 与路由生效，管理页面所在电脑开启 TUN 不会改变 Server 的网络。
 
-仅在 **Server 所在机器或容器的网络确实经过你信任的 TUN** 时启用此选项。不是仅在访问管理页面的电脑上打开代理就有效。系统设置中的内置浏览器会显示当前生效状态；插件或网页不能修改这一部署信任选项。
-
-Windows 源码部署，在启动 Server 的同一个 PowerShell 中设置：
-
-```powershell
-$env:OMC_CLOAK_TUN_FAKE_IP = 'true'
-.\start.ps1
-```
-
-使用发行目录时，同样先设置变量，再运行该目录的 Server 可执行文件。若 Server 已运行，需由管理员正常停止并重新启动才生效；本选项不会自动重启服务。
-
-Docker 在 Server 服务的 `environment` 中添加：
-
-```yaml
-environment:
-  OMC_CLOAK_TUN_FAKE_IP: "true"
-```
-
-然后使用原部署命令重建该服务容器（例如 `docker compose -f compose.server.yml up -d`）；仅 `docker restart` 不会更新容器环境变量。容器本身的 DNS 与路由也必须经过该 TUN，设置变量不会替你安装或配置代理。
-
-只有精确字符串 `true` 开启兼容，其他值保持关闭。兼容只允许固定站点域名的 DNS 结果位于上述 IPv4 范围，不允许用 IP 直接作为站点，不允许内网、回环、链路本地、IPv6 映射地址，混有这些地址的 DNS 回答仍被拒绝。仍固定数字地址连接，并校验原站点的 HTTPS 证书与域名；不查询外部公共 DNS 绕过 TUN、不自动切换镜像、不放宽插件白名单。关闭 TUN 后也应关闭此选项；开启但没有可信 TUN 接管时可能连接失败，不能将此选项当成通用解除网络限制按钮。
+域名连接仍固定解析到的数字地址并校验原域名的 HTTPS 证书；主页面仍限定当前镜像，不能以 IP 字面量配置镜像，也不会切换公共 DNS 或自动切换镜像。页面第三方资源可按浏览器规则访问 Server 网络中的 HTTPS 服务，因此管理员应只配置可信的镜像和插件。
 
 ## 页面资源与重新加载
 
-登录页面的公开脚本、样式、字体、图片、验证框架和 Worker 可以按正常浏览器规则加载，不需要为每个 CDN 单独维护插件白名单。每个网络目标仍使用受控 DNS 与地址固定连接，拒绝内网、回环、元数据地址和不安全端口；不会关闭浏览器沙箱或 TLS 验证。
+登录页面的脚本、样式、字体、图片、验证框架和 Worker 可以按正常浏览器规则加载，不需要为每个 CDN 单独维护插件白名单。每个网络目标仍使用受控 DNS 与地址固定连接，并拒绝不安全端口；不会关闭浏览器沙箱或 TLS 验证。
 
 这不意味着允许跨站登录：主页面和插件请求仍限定当前镜像，Server 不向其他域名注入镜像 Cookie，也不导出第三方 Cookie。第三方资源遵循浏览器自己的 Cookie、CORS 和 TLS 规则；FlareSolverr 不会自动收到登录凭据。
 

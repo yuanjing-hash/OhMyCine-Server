@@ -28,8 +28,7 @@ async function fixture(cookies = [], network = {}) {
   const browser = { newContext: async options => { calls.context = options; return context; }, close: async () => {} };
   const adapter = await openBrowser('/synthetic', 'https://example.com', {
     cookies,
-    allowTUNFakeIP: network.allowTUNFakeIP,
-    resolvePublic: async (origin, resolver, allowed) => { calls.resolution = { origin, allowed }; return network.address || '8.8.8.8'; },
+    resolvePinnedAddress: async origin => { calls.resolution = { origin }; return network.address || '8.8.8.8'; },
     pinnedProxy: async (origin, address) => { calls.pinned = { origin, address }; return { url: 'http://127.0.0.1:12345', close: async () => {} }; },
     chromium: { launch: async options => { calls.launch = options; return browser; } },
   });
@@ -51,9 +50,9 @@ test('browser retains sandbox, constrained proxy, no downloads/SW/WebSockets', a
 });
 
 test('TUN routing retains numeric pinning, original HTTPS origin and certificate checks', async () => {
-  const { calls, adapter } = await fixture([], { allowTUNFakeIP: true, address: '198.18.7.137' });
-  assert.deepEqual(calls.resolution, { origin: 'https://example.com', allowed: true });
-  assert.deepEqual(calls.pinned, { origin: 'https://example.com', address: '198.18.7.137' });
+  const { calls, adapter } = await fixture([], { address: 'fdfe:dcba:9876::89' });
+  assert.deepEqual(calls.resolution, { origin: 'https://example.com' });
+  assert.deepEqual(calls.pinned, { origin: 'https://example.com', address: 'fdfe:dcba:9876::89' });
   assert.equal(calls.navigation, 'https://example.com');
   assert.equal(calls.context.ignoreHTTPSErrors, false);
   assert.equal(calls.launch.args.some(arg => arg.includes('ignore-certificate-errors')), false);

@@ -31,44 +31,23 @@ func TestBrowserEnvironmentDoesNotInheritServerSecrets(t *testing.T) {
 	t.Setenv("OMC_TEST_SECRET", "synthetic")
 	t.Setenv("NODE_OPTIONS", "--inspect")
 	t.Setenv("HTTPS_PROXY", "http://proxy.invalid")
+	t.Setenv("OMC_CLOAK_TUN_FAKE_IP", "true")
 	for _, entry := range browserEnvironment() {
-		if strings.HasPrefix(entry, "OMC_TEST_SECRET=") || strings.HasPrefix(entry, "NODE_OPTIONS=") || strings.HasPrefix(entry, "HTTPS_PROXY=") {
+		if strings.HasPrefix(entry, "OMC_TEST_SECRET=") || strings.HasPrefix(entry, "NODE_OPTIONS=") || strings.HasPrefix(entry, "HTTPS_PROXY=") || strings.HasPrefix(entry, "OMC_CLOAK_TUN_FAKE_IP=") {
 			t.Fatal("privileged environment inherited")
 		}
 	}
 }
 
-func TestTUNEnvironmentRequiresExactDeploymentOptIn(t *testing.T) {
-	for _, value := range []string{"", "false", "1", "TRUE", "true ", "true"} {
-		t.Setenv("OMC_CLOAK_TUN_FAKE_IP", value)
-		expected := "OMC_CLOAK_TUN_FAKE_IP=false"
-		if value == "true" {
-			expected = "OMC_CLOAK_TUN_FAKE_IP=true"
-		}
-		count := 0
-		for _, entry := range browserEnvironment() {
-			if strings.HasPrefix(entry, "OMC_CLOAK_TUN_FAKE_IP=") {
-				count++
-				if entry != expected {
-					t.Fatalf("unsafe flag normalization: %q", entry)
-				}
-			}
-		}
-		if count != 1 {
-			t.Fatal("missing or duplicated flag")
-		}
-	}
-}
-
-func TestCompanionPreservesSafeTUNFailure(t *testing.T) {
+func TestCompanionPreservesSafeNetworkFailure(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusServiceUnavailable)
-		_, _ = w.Write([]byte(`{"error":"tun_fake_ip_requires_opt_in"}`))
+		_, _ = w.Write([]byte(`{"error":"network_denied"}`))
 	}))
 	defer server.Close()
 	manager := &Manager{address: server.URL, token: "synthetic"}
-	if ErrorCode(manager.call(context.Background(), "session/create", nil, nil)) != "tun_fake_ip_requires_opt_in" {
-		t.Fatal("TUN diagnosis lost at IPC boundary")
+	if ErrorCode(manager.call(context.Background(), "session/create", nil, nil)) != "network_denied" {
+		t.Fatal("network diagnosis lost at IPC boundary")
 	}
 }
 

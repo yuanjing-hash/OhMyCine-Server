@@ -37,6 +37,31 @@ export interface DownloadRoutePreviewInput {
   expected_bytes?: number
 }
 
+export interface RecommendedDownloadPair { downloader_id: string; media_library_id: number }
+export interface DownloadRouteChoice extends RecommendedDownloadPair {
+  downloader_name: string
+  downloader_type: string
+  library_name: string
+  enabled: boolean
+  reason_code: string
+  reason_message: string
+  route_kind: string
+  route_label: string
+}
+export interface DownloadRouteRecommendation {
+  source_kind: 'pt' | 'bt' | '115_share'
+  recommended: RecommendedDownloadPair | null
+  choices: DownloadRouteChoice[]
+}
+
+export function recommendDownloadRoute(resultToken: string, mediaLibraryID?: number, expectedBytes?: number, signal?: AbortSignal) {
+  return api<DownloadRouteRecommendation>('/api/v1/sites/routes/recommend', {
+    method: 'POST',
+    body: JSON.stringify({ result_token: resultToken, media_library_id: mediaLibraryID || undefined, expected_bytes: expectedBytes }),
+    signal,
+  })
+}
+
 export async function previewDownloadRoutes(input: DownloadRoutePreviewInput, signal?: AbortSignal) {
   return api<DownloadRoutePreview>('/api/v1/download-routes/preview', {
     method: 'POST',

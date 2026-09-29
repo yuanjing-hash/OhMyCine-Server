@@ -1,12 +1,12 @@
 import http from 'node:http';
 import net from 'node:net';
-import { Fault, requireThat, resourceURL, resolvePublic, publicIP, tunFakeIP } from './policy.mjs';
+import { Fault, requireThat, resourceURL, resolvePinnedAddress, numericIP } from './policy.mjs';
 
 // Context-private HTTPS egress. Every destination is resolved once, checked in
 // full and pinned numerically, including Worker requests outside page routing.
 export async function pinnedProxy(origin, address, options = {}) {
-  const { allowTUNFakeIP = false, onBlocked = () => {}, resolver, connect = net.connect } = options;
-  requireThat(publicIP(address) || (allowTUNFakeIP === true && tunFakeIP(address)), 'network_denied');
+  const { onBlocked = () => {}, resolver, connect = net.connect } = options;
+  requireThat(numericIP(address), 'network_denied');
   const pins = new Map([[resourceURL(origin).hostname, Promise.resolve(address)]]);
   const failedPins = new Set();
   const sockets = new Set();
@@ -28,7 +28,7 @@ export async function pinnedProxy(origin, address, options = {}) {
   }
   async function resolveHost(host) {
     await acquireDNS();
-    try { return await resolvePublic(`https://${host}`, resolver, allowTUNFakeIP); }
+    try { return await resolvePinnedAddress(`https://${host}`, resolver); }
     finally {
       resolving--;
       const waiter = dnsQueue.shift();

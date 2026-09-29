@@ -30,7 +30,7 @@ All responses are `no-store`; Server must authenticate/authorize its own UI rout
 
 | Path | Request | Response |
 |---|---|---|
-| `/v1/status` | `{}` | `{protocolVersion:1,state,supported,installed,runtimeError,tunFakeIPEnabled}` |
+| `/v1/status` | `{}` | `{protocolVersion:1,state,supported,installed,runtimeError}` |
 | `/v1/install` | `{licenseAccepted:true}` | status (`installing`); poll status |
 | `/v1/shutdown` | `{}` | `{}` after closing browser, then listener exits |
 | `/v1/session/create` | `{identity,origin,cookies?}` | `{sessionId,expiresAt}` ISO time |
@@ -63,13 +63,14 @@ busy requests fail instead of building an unbounded queue. Text/password values
 exist transiently in requests/browser memory only; there is no history or logging.
 Snapshot is a private authenticated manual-login view, never a persisted asset.
 
-The main document and Host requests remain bound to one public HTTPS mirror.
-Public HTTPS subresources, child frames and dedicated/blob Workers can load
+The main document and Host requests remain bound to one HTTPS mirror.
+HTTPS subresources, child frames and dedicated/blob Workers can load
 without per-CDN exceptions. The context-private CONNECT proxy validates every
-DNS answer for each destination and pins its numeric address for the session.
+DNS answer as a numeric IPv4/IPv6 address and pins it for the session, including
+private, loopback and TUN/Fake-IP answers returned by the Server's DNS.
 Limits are 128 pinned hosts, 8 concurrent DNS lookups with a bounded queue and
-10-second DNS/queue deadlines, 64 answers per host and 128 sockets. Private/IP
-literal/unsafe-port targets are rejected at proxy level too. Successful pins
+10-second DNS/queue deadlines, 64 answers per host and 128 sockets. IP-literal
+origins and unsafe ports are rejected at proxy level. Successful pins
 never change on reload; settled failed resolutions retry only on deliberate
 reload. TLS verification, browser CORS and third-party cookie policies remain
 enabled. Main-frame cross-origin redirects, service workers, page WebSockets,
@@ -81,15 +82,13 @@ replayed (`browser_reload_post_denied`). Snapshot only updates the picture.
 Snapshot adds `networkErrorCode` and `blockedResourceCount` (capped at 10000),
 without raw destination URLs. Deliberate reload resets these diagnostics.
 
-Deployment-only `OMC_CLOAK_TUN_FAKE_IP=true` permits DNS-derived IPv4
-`198.18.0.0/15` addresses for a trusted TUN route. It is off by default and cannot
-be enabled by IPC/session/plugin input. Other private/reserved ranges and all
-IP-literal origins remain denied, including mixed DNS answers. Without opt-in,
-Fake-IP returns `tun_fake_ip_requires_opt_in`, not a mirror-permission error.
-Numeric CONNECT pinning, original HTTPS hostname and TLS certificate validation
-remain unchanged. No external DNS/proxy fallback is introduced. Restart Server
-(recreate Docker container) after changing the deployment variable. The TUN must
-route the Server/companion environment itself, not only the user's web browser.
+The former TUN opt-in environment variable is retired. DNS answers may resolve
+to local services in the Server's network, so administrators should only use
+trusted mirrors and plugins. Third-party page resources can contact those
+services over HTTPS under normal browser rules; the Server does not inject
+mirror credentials into other origins. No external DNS/proxy fallback is
+introduced. The Server/companion environment itself must have a working route;
+a TUN configured only on the administrator's browser does not provide one.
 
 Plugin requests use fixed host-owned `fetch` in that same browser session, not
 Playwright's separate HTTP client. GET/POST only, no caller-controlled headers

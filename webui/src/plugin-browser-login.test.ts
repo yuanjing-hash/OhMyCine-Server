@@ -51,14 +51,14 @@ describe('unified browser login', () => {
     const base = vi.mocked(api).getMockImplementation()!
     vi.mocked(api).mockImplementation(async (path, ...args) => path.endsWith('/snapshot') ? { mime_type: 'image/png', image_base64: 'YWJj', width: 800, height: 600, network_error_code: 'resource_network_failed', blocked_resource_count: 3, url: 'https://private.invalid/?cookie=secret' } : base(path, ...args))
     const wrapper = mount(PluginBrowserLogin, { props }); await flushPromises()
-    expect(wrapper.text()).toContain('部分公网资源连接失败')
+    expect(wrapper.text()).toContain('部分网页资源连接失败')
     expect(wrapper.text()).toContain('本次未加载 3 项')
     expect(wrapper.text()).toContain('不代表账号密码错误或登录失效')
     expect(wrapper.text()).not.toContain('private.invalid')
     expect(wrapper.find('img').exists()).toBe(true)
     vi.mocked(api).mockResolvedValueOnce({ mime_type: 'image/png', image_base64: 'YWJj', width: 800, height: 600, network_error_code: '', blocked_resource_count: 0 })
     await wrapper.findAll('button').find(b => b.text() === '更新画面')!.trigger('click'); await flushPromises()
-    expect(wrapper.text()).not.toContain('部分公网资源连接失败')
+    expect(wrapper.text()).not.toContain('部分网页资源连接失败')
     wrapper.unmount()
   })
   it('ignores unknown resource error text and out-of-range counts', async () => {
@@ -97,26 +97,11 @@ describe('unified browser login', () => {
     expect(vi.mocked(api).mock.calls.at(-1)![0]).toContain('/reload')
     wrapper.unmount()
   })
-  it('does not report disabled when the companion network state is unavailable', async () => {
+  it('explains the browser network state without an obsolete TUN switch', async () => {
     vi.mocked(api).mockResolvedValue({ state: 'unavailable', installed: false })
     const wrapper = mount(ServerBrowserPanel, { props: { canInstall: false } }); await flushPromises()
-    expect(wrapper.text()).toContain('TUN / Fake-IP 兼容：状态未知')
-    wrapper.unmount()
-  })
-  it('explains Fake-IP opt-in without blaming credentials or mirror permissions', async () => {
-    vi.mocked(api).mockResolvedValue({ state: 'launch_failed', installed: true, runtime_error: 'tun_fake_ip_requires_opt_in', tun_fake_ip_enabled: false })
-    const wrapper = mount(ServerBrowserPanel, { props: { canInstall: true } }); await flushPromises()
-    expect(wrapper.text()).toContain('无需关闭 TUN')
-    expect(wrapper.text()).toContain('OMC_CLOAK_TUN_FAKE_IP=true')
-    expect(wrapper.text()).toContain('重启 Server')
-    expect(wrapper.text()).not.toContain('镜像权限')
-    expect(wrapper.text()).not.toContain('接受许可并安装')
-    wrapper.unmount()
-  })
-  it('shows effective deployment TUN state', async () => {
-    vi.mocked(api).mockResolvedValue({ state: 'ready', installed: true, tun_fake_ip_enabled: true })
-    const wrapper = mount(ServerBrowserPanel, { props: { canInstall: false } }); await flushPromises()
-    expect(wrapper.text()).toContain('TUN / Fake-IP 兼容：已启用')
+    expect(wrapper.text()).toContain('浏览器使用 Server 所在环境的 DNS 和网络')
+    expect(wrapper.text()).not.toContain('OMC_CLOAK_TUN_FAKE_IP')
     wrapper.unmount()
   })
   it('closes the old connection session when identity changes', async () => {

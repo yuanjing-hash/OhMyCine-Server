@@ -48,7 +48,7 @@ func TestMigrationV56AddsRouteSnapshotsAndFreezesOneDefaultIngestLibrary(t *test
 		t.Fatal(err)
 	}
 	downloader := models.Downloader{ID: uuid.NewString(), OwnerID: owner.ID, Name: "115", NameNormalized: "v56-downloader-" + uuid.NewString(), Type: models.DownloaderTypePan115Offline, StorageID: &storage.ID, ProviderDirectoryID: "downloads", AutoListenLifeEvents: true, Enabled: true, CapabilitiesJSON: `{}`, CreatedAt: now, UpdatedAt: now}
-	if err := db.Omit("ExecutionLocation", "NodeID", "NodeName").Create(&downloader).Error; err != nil {
+	if err := db.Omit("SortOrder", "ExecutionLocation", "NodeID", "NodeName").Create(&downloader).Error; err != nil {
 		t.Fatal(err)
 	}
 	connectionB := models.Connection{Name: "115 B", NameNormalized: "v56-115-b-" + uuid.NewString(), Provider: models.ConnectionProviderPan115, CredentialCiphertext: "encrypted", Enabled: true, Revision: 1, CreatedAt: now, UpdatedAt: now}

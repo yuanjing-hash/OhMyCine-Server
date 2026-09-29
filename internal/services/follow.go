@@ -48,9 +48,10 @@ type FollowFilters struct {
 
 type FollowExecutionSnapshot struct {
 	Version            int            `json:"version"`
+	RoutingPolicy      string         `json:"routing_policy,omitempty"`
 	Seasons            []int          `json:"seasons"`
 	SiteIDs            []uint         `json:"site_ids"`
-	DownloaderID       string         `json:"downloader_id"`
+	DownloaderID       string         `json:"downloader_id,omitempty"`
 	MediaLibraryID     uint           `json:"media_library_id"`
 	Schedule           FollowSchedule `json:"schedule"`
 	Filters            FollowFilters  `json:"filters"`
@@ -222,7 +223,7 @@ func (s *FollowService) Defaults(ctx context.Context, actor Actor, tmdbID int64)
 		return FollowDefaults{}, err
 	}
 	var downloaders []models.Downloader
-	if err := s.db.Where("enabled = ?", true).Order("created_at,id").Find(&downloaders).Error; err != nil {
+	if err := s.db.Where("enabled = ?", true).Order("sort_order,id").Find(&downloaders).Error; err != nil {
 		return FollowDefaults{}, err
 	}
 	var libraries []models.MediaLibrary
@@ -271,31 +272,57 @@ func (s *FollowService) Defaults(ctx context.Context, actor Actor, tmdbID int64)
 			result.MediaLibraries = append(result.MediaLibraries, FollowLibraryOption{ID: item.ID, Name: item.Name, StorageType: storage.Type, ConnectionID: storage.ConnectionID})
 		}
 	}
-	result.Snapshot.Version = 1
+	result.Snapshot.Version = 2
+	result.Snapshot.RoutingPolicy = "source_priority"
 	result.Snapshot.Schedule = FollowSchedule{Kind: "interval", Minutes: 360}
 	result.Snapshot.MaxResourcesPerRun = 3
 	result.Snapshot.Filters = FollowFilters{Resolutions: []string{}, VideoCodecs: []string{}, Qualities: []string{}, IncludeKeywords: []string{}, ExcludeKeywords: []string{}, ReleaseGroups: []string{}, ExcludeReleaseGroups: []string{}, MinSeeders: 1}
-	foundTuple := false
-	for _, library := range authorizedLibraries {
-		for _, downloader := range authorizedDownloaders {
-			compatibleSiteIDs := make([]uint, 0, len(authorizedSites))
-			for _, site := range authorizedSites {
-				if s.validateFollowRoute(context.Background(), downloader, library, []models.Site{site}) == nil {
-					compatibleSiteIDs = append(compatibleSiteIDs, site.ID)
-				}
-			}
-			if len(compatibleSiteIDs) == 0 {
+	type routeChoices struct {
+		source       string
+		byDownloader map[string]map[uint]SourceRouteChoice
+	}
+	choicesBySite := make(map[uint]routeChoices, len(authorizedSites))
+	if s.downloads != nil {
+		for _, site := range authorizedSites {
+			recommendation, routeErr := s.downloads.RecommendSourceRoute(ctx, actor, site.ID, nil)
+			if routeErr != nil {
 				continue
 			}
-			result.Snapshot.MediaLibraryID = library.ID
-			result.Snapshot.DownloaderID = downloader.ID
-			result.Snapshot.SiteIDs = compatibleSiteIDs
-			foundTuple = true
-			break
+			choices := routeChoices{source: recommendation.SourceKind, byDownloader: make(map[string]map[uint]SourceRouteChoice)}
+			for _, choice := range recommendation.Choices {
+				if choices.byDownloader[choice.DownloaderID] == nil {
+					choices.byDownloader[choice.DownloaderID] = make(map[uint]SourceRouteChoice)
+				}
+				choices.byDownloader[choice.DownloaderID][choice.MediaLibraryID] = choice
+			}
+			choicesBySite[site.ID] = choices
 		}
-		if foundTuple {
-			break
+	}
+	foundTuple := false
+	for _, library := range authorizedLibraries {
+		compatibleSiteIDs := make([]uint, 0, len(authorizedSites))
+		for _, site := range authorizedSites {
+			if s.downloads != nil {
+				choices, ok := choicesBySite[site.ID]
+				if ok && recommendedSourceRoute(choices.source, []models.MediaLibrary{library}, authorizedDownloaders, choices.byDownloader) != nil {
+					compatibleSiteIDs = append(compatibleSiteIDs, site.ID)
+				}
+			} else {
+				for _, downloader := range authorizedDownloaders {
+					if s.validateFollowRoute(ctx, downloader, library, []models.Site{site}) == nil {
+						compatibleSiteIDs = append(compatibleSiteIDs, site.ID)
+						break
+					}
+				}
+			}
 		}
+		if len(compatibleSiteIDs) == 0 {
+			continue
+		}
+		result.Snapshot.MediaLibraryID = library.ID
+		result.Snapshot.SiteIDs = compatibleSiteIDs
+		foundTuple = true
+		break
 	}
 	if !foundTuple {
 		result.UnavailableReason = "没有可用的站点、下载器与目标媒体库组合；115 下载器不能接收 PT，跨数据源路线还需要可用的 Server 暂存与写入能力"
@@ -309,6 +336,9 @@ func (s *FollowService) Create(ctx context.Context, actor Actor, input CreateFol
 	}
 	if input.TMDBID <= 0 {
 		return FollowSummary{}, appError(CodeInvalidRequest, "订阅媒体身份无效", nil)
+	}
+	if err := requireSourceAwareFollowWrite(input.Snapshot); err != nil {
+		return FollowSummary{}, err
 	}
 	coverage, err := s.coverage.Coverage(ctx, actor, "tv", input.TMDBID)
 	if err != nil {
@@ -409,6 +439,9 @@ func (s *FollowService) Get(actor Actor, id string) (FollowSummary, error) {
 func (s *FollowService) Update(ctx context.Context, actor Actor, id string, input UpdateFollowInput, request RequestContext) (FollowSummary, error) {
 	record, err := s.load(actor, id, "update")
 	if err != nil {
+		return FollowSummary{}, err
+	}
+	if err := requireSourceAwareFollowWrite(input.Snapshot); err != nil {
 		return FollowSummary{}, err
 	}
 	snapshot, raw, err := s.validateSnapshot(actor, record.TMDBID, input.Snapshot)
@@ -664,15 +697,18 @@ func (s *FollowService) load(actor Actor, id, action string) (models.FollowSubsc
 }
 
 func (s *FollowService) validateSnapshot(actor Actor, tmdbID int64, input FollowExecutionSnapshot) (FollowExecutionSnapshot, []byte, error) {
+	return s.validateSnapshotWithRoutes(actor, tmdbID, input, true)
+}
+
+func (s *FollowService) validateSnapshotWithRoutes(actor Actor, tmdbID int64, input FollowExecutionSnapshot, requireRoutes bool) (FollowExecutionSnapshot, []byte, error) {
 	if !actor.Can(authz.PermissionDownloadsCreate) || !actor.Can(authz.PermissionMediaLibrariesRead) || !actor.Can(authz.PermissionDiscoveryRead) {
 		return input, nil, appError(CodePermissionDenied, "订阅执行权限不足", nil)
 	}
-	input.Version = 1
-	input.DownloaderID = strings.TrimSpace(input.DownloaderID)
+	input = normalizeFollowExecutionSnapshot(input)
 	if input.Schedule.Kind == "" {
 		input.Schedule.Kind = "interval"
 	}
-	if input.Schedule.Kind != "interval" || input.Schedule.Minutes < 30 || input.Schedule.Minutes > 10080 || input.DownloaderID == "" || input.MediaLibraryID == 0 || input.MaxResourcesPerRun < 1 || input.MaxResourcesPerRun > 10 || input.DownloadPriority < -100 || input.DownloadPriority > 100 {
+	if input.Schedule.Kind != "interval" || input.Schedule.Minutes < 30 || input.Schedule.Minutes > 10080 || input.MediaLibraryID == 0 || input.MaxResourcesPerRun < 1 || input.MaxResourcesPerRun > 10 || input.DownloadPriority < -100 || input.DownloadPriority > 100 {
 		return input, nil, appError(CodeFollowConfigurationInvalid, "订阅执行策略无效", nil)
 	}
 	if _, err := cronFromIntervalMinutes(input.Schedule.Minutes); err != nil {
@@ -686,13 +722,6 @@ func (s *FollowService) validateSnapshot(actor Actor, tmdbID int64, input Follow
 		return input, nil, appError(CodeFollowConfigurationInvalid, "订阅站点选择无效", nil)
 	}
 	input.SiteIDs = uniqueSortedUintsByOrder(input.SiteIDs, 20)
-	var downloader models.Downloader
-	if err := s.db.Where("id = ? AND enabled = ?", input.DownloaderID, true).First(&downloader).Error; err != nil {
-		return input, nil, appError(CodeFollowConfigurationInvalid, "订阅下载器不存在或已停用", err)
-	}
-	if !actor.CanResource(authz.PermissionDownloadsCreate, models.AuthorizationResourceDownloader, downloader.ID) {
-		return input, nil, appError(CodePermissionDenied, "无权让订阅使用这个下载器", nil)
-	}
 	var library models.MediaLibrary
 	if err := s.db.Where("id = ? AND enabled = ?", input.MediaLibraryID, true).First(&library).Error; err != nil {
 		return input, nil, appError(CodeFollowConfigurationInvalid, "订阅目标媒体库不存在或已停用", err)
@@ -709,8 +738,34 @@ func (s *FollowService) validateSnapshot(actor Actor, tmdbID int64, input Follow
 			return input, nil, appError(CodePermissionDenied, "无权让订阅搜索所选站点", nil)
 		}
 	}
-	if err := s.validateFollowRoute(context.Background(), downloader, library, sites); err != nil {
-		return input, nil, err
+	if requireRoutes {
+		for _, site := range sites {
+			if s.downloads != nil {
+				libraryID := library.ID
+				recommendation, routeErr := s.downloads.RecommendSourceRoute(context.Background(), actor, site.ID, &libraryID)
+				if routeErr != nil {
+					return input, nil, routeErr
+				}
+				if recommendation.Recommended == nil {
+					return input, nil, appError(CodeFollowConfigurationInvalid, "所选站点没有可用的下载器与目标媒体库路线", nil)
+				}
+			} else {
+				var downloaders []models.Downloader
+				if err := s.db.Where("enabled = ?", true).Order("sort_order,id").Find(&downloaders).Error; err != nil {
+					return input, nil, err
+				}
+				matched := false
+				for _, downloader := range downloaders {
+					if routeKind, routeErr := routeSourceForSite(site); routeErr == nil && routeDownloaderApplicable(routeKind, downloader) && s.validateFollowRoute(context.Background(), downloader, library, []models.Site{site}) == nil {
+						matched = true
+						break
+					}
+				}
+				if !matched {
+					return input, nil, appError(CodeFollowConfigurationInvalid, "所选站点没有可用的下载器与目标媒体库路线", nil)
+				}
+			}
+		}
 	}
 	var err error
 	for _, values := range []*[]string{&input.Filters.Resolutions, &input.Filters.VideoCodecs, &input.Filters.Qualities, &input.Filters.IncludeKeywords, &input.Filters.ExcludeKeywords, &input.Filters.ReleaseGroups, &input.Filters.ExcludeReleaseGroups} {
@@ -736,10 +791,9 @@ func (s *FollowService) validateSnapshot(actor Actor, tmdbID int64, input Follow
 	return input, raw, nil
 }
 
-// validateFollowRoute applies the authoritative Site -> Downloader -> target
-// matrix used by defaults, saves, and every worker run. 115 rejects only an
-// authoritative PT site; all authoritative BT sites remain eligible and the
-// SiteService rechecks the resolved source immediately before submission.
+// validateFollowRoute is the isolated-test fallback when DownloadService is
+// not wired. Production defaults, saves, and execution use RecommendSourceRoute
+// and SiteService.Download for the authoritative source and target checks.
 func (s *FollowService) validateFollowRoute(ctx context.Context, downloader models.Downloader, library models.MediaLibrary, sites []models.Site) error {
 	if !downloader.Enabled {
 		return appError(CodeFollowConfigurationInvalid, "订阅下载器不存在或已停用", nil)
@@ -830,7 +884,22 @@ func followSummary(record models.FollowSubscription) (FollowSummary, error) {
 	if err := json.Unmarshal([]byte(record.ExecutionSnapshotJSON), &snapshot); err != nil {
 		return FollowSummary{}, err
 	}
+	snapshot = normalizeFollowExecutionSnapshot(snapshot)
 	return FollowSummary{ID: record.ID, OwnerID: record.OwnerID, MediaType: record.MediaType, TMDBID: record.TMDBID, Title: record.Title, Year: record.Year, PosterRef: record.PosterRef, Status: record.Status, Revision: record.Revision, Snapshot: snapshot, ProgressTarget: record.ProgressTarget, ProgressPresent: record.ProgressPresent, ProgressMissing: record.ProgressMissing, LastRunID: record.LastRunID, LastRunAt: record.LastRunAt, NextRunAt: record.NextRunAt, LastErrorCode: record.LastErrorCode, LastErrorMessage: record.LastErrorMessage, CreatedAt: record.CreatedAt, UpdatedAt: record.UpdatedAt}, nil
+}
+
+func normalizeFollowExecutionSnapshot(input FollowExecutionSnapshot) FollowExecutionSnapshot {
+	input.Version = 2
+	input.RoutingPolicy = "source_priority"
+	input.DownloaderID = ""
+	return input
+}
+
+func requireSourceAwareFollowWrite(input FollowExecutionSnapshot) error {
+	if input.Version != 2 || input.RoutingPolicy != "source_priority" || strings.TrimSpace(input.DownloaderID) != "" {
+		return appError(CodePlayerUpdateRequired, "订阅下载器已改为按站点来源自动选择，请升级 Player 后重新保存", nil)
+	}
+	return nil
 }
 func followConstraintError(err error) error {
 	if err != nil && (strings.Contains(strings.ToLower(err.Error()), "unique") || strings.Contains(strings.ToLower(err.Error()), "constraint")) {

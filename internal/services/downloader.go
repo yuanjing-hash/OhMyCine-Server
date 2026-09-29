@@ -82,6 +82,7 @@ type DownloaderHealth struct {
 
 type DownloaderSummary struct {
 	ID                          string                   `json:"id"`
+	SortOrder                   int                      `json:"sort_order"`
 	Name                        string                   `json:"name"`
 	Type                        string                   `json:"type"`
 	BaseURL                     string                   `json:"base_url"`
@@ -110,7 +111,7 @@ func (s *DownloaderService) List(actor Actor) ([]DownloaderSummary, error) {
 		return nil, appError(CodePermissionDenied, "无权查看下载器", nil)
 	}
 	var records []models.Downloader
-	if err := s.db.Order("name_normalized, id").Find(&records).Error; err != nil {
+	if err := s.db.Order("sort_order, id").Find(&records).Error; err != nil {
 		return nil, err
 	}
 	items := make([]DownloaderSummary, 0, len(records))
@@ -222,6 +223,10 @@ func (s *DownloaderService) CreateContext(ctx context.Context, actor Actor, inpu
 		record.NodeName = executionNode.Name
 	}
 	err = s.db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Model(&models.Downloader{}).Select("COALESCE(MAX(sort_order), 0)").Scan(&record.SortOrder).Error; err != nil {
+			return err
+		}
+		record.SortOrder++
 		if err := tx.Create(&record).Error; err != nil {
 			return err
 		}
@@ -662,7 +667,60 @@ func (s *DownloaderService) summary(record models.Downloader) DownloaderSummary 
 		downloaderSaveRoot, nodeMountRoot = binding.DownloaderSaveRoot, binding.NodeMountRoot
 	}
 	location := normalizeExecutionLocation(record.ExecutionLocation)
-	return DownloaderSummary{ID: record.ID, Name: record.Name, Type: record.Type, BaseURL: baseURL, Enabled: record.Enabled, UsernameConfigured: usernameConfigured, PasswordConfigured: passwordConfigured, Capabilities: capabilities, Health: DownloaderHealth{Status: record.LastHealthStatus, Version: record.LastHealthVersion, ErrorCode: record.LastHealthErrorCode, LastChecked: record.LastHealthCheckedAt}, CreatedAt: record.CreatedAt, UpdatedAt: record.UpdatedAt, StorageID: record.StorageID, StorageName: name, ProviderDirectoryPath: record.ProviderDirectoryPath, AutoListenLifeEvents: record.AutoListenLifeEvents, LifeEventDefaultLibraryID: defaultLibraryID, LifeEventDefaultLibraryName: defaultLibraryName, ExecutionLocation: location, NodeID: record.NodeID, NodeName: record.NodeName, DownloaderSaveRoot: downloaderSaveRoot, NodeMountRoot: nodeMountRoot}
+	return DownloaderSummary{ID: record.ID, SortOrder: record.SortOrder, Name: record.Name, Type: record.Type, BaseURL: baseURL, Enabled: record.Enabled, UsernameConfigured: usernameConfigured, PasswordConfigured: passwordConfigured, Capabilities: capabilities, Health: DownloaderHealth{Status: record.LastHealthStatus, Version: record.LastHealthVersion, ErrorCode: record.LastHealthErrorCode, LastChecked: record.LastHealthCheckedAt}, CreatedAt: record.CreatedAt, UpdatedAt: record.UpdatedAt, StorageID: record.StorageID, StorageName: name, ProviderDirectoryPath: record.ProviderDirectoryPath, AutoListenLifeEvents: record.AutoListenLifeEvents, LifeEventDefaultLibraryID: defaultLibraryID, LifeEventDefaultLibraryName: defaultLibraryName, ExecutionLocation: location, NodeID: record.NodeID, NodeName: record.NodeName, DownloaderSaveRoot: downloaderSaveRoot, NodeMountRoot: nodeMountRoot}
+}
+
+// Reorder replaces the complete global order so an actor cannot silently move
+// downloaders outside their resource scope. Equal orders are never persisted.
+func (s *DownloaderService) Reorder(actor Actor, ids []string, request RequestContext) ([]DownloaderSummary, error) {
+	if !actor.Can(authz.PermissionDownloadersUpdate) || !actor.Can(authz.PermissionDownloadersRead) {
+		return nil, appError(CodePermissionDenied, "无权调整下载器顺序", nil)
+	}
+	var records []models.Downloader
+	if err := s.db.Order("sort_order, id").Find(&records).Error; err != nil {
+		return nil, err
+	}
+	if len(ids) != len(records) {
+		return nil, appError(CodeInvalidRequest, "请提交完整的下载器顺序", nil)
+	}
+	known := make(map[string]models.Downloader, len(records))
+	for _, record := range records {
+		if !actor.CanResource(authz.PermissionDownloadersUpdate, models.AuthorizationResourceDownloader, record.ID) || !actor.CanResource(authz.PermissionDownloadersRead, models.AuthorizationResourceDownloader, record.ID) {
+			return nil, appError(CodePermissionDenied, "无权调整全部下载器顺序", nil)
+		}
+		known[record.ID] = record
+	}
+	seen := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		if _, ok := known[id]; !ok || seen[id] {
+			return nil, appError(CodeInvalidRequest, "下载器顺序包含未知或重复的 ID", nil)
+		}
+		seen[id] = true
+	}
+	err := s.db.Transaction(func(tx *gorm.DB) error {
+		var current []models.Downloader
+		if err := tx.Order("sort_order, id").Find(&current).Error; err != nil {
+			return err
+		}
+		if len(current) != len(records) {
+			return appError(CodeConflict, "下载器列表已变化，请刷新后重试", nil)
+		}
+		for _, item := range current {
+			if _, ok := known[item.ID]; !ok {
+				return appError(CodeConflict, "下载器列表已变化，请刷新后重试", nil)
+			}
+		}
+		for index, id := range ids {
+			if err := tx.Model(&models.Downloader{}).Where("id = ?", id).Update("sort_order", index+1).Error; err != nil {
+				return err
+			}
+		}
+		return s.audit.Record(tx, &actor.User.ID, "downloader.reorder", "downloader", "all", "success", map[string]any{"count": len(ids)}, request)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return s.List(actor)
 }
 
 func downloaderTestMessage(providerType, code string) string {

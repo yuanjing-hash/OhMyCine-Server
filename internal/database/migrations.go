@@ -99,7 +99,23 @@ func schemaMigrationsThrough109() []migration {
 }
 
 func schemaMigrations() []migration {
-	return append(schemaMigrationsThrough109(), migration{Version: 110, Apply: migrateProviderDeletion}, migration{Version: 111, Apply: migrateCloudEmptyCleanup}, migration{Version: 112, Apply: migrateTGCloudSites}, migration{Version: 113, Apply: migrateMediaCatalogExclusions})
+	return append(schemaMigrationsThrough109(), migration{Version: 110, Apply: migrateProviderDeletion}, migration{Version: 111, Apply: migrateCloudEmptyCleanup}, migration{Version: 112, Apply: migrateTGCloudSites}, migration{Version: 113, Apply: migrateMediaCatalogExclusions}, migration{Version: 114, Apply: migrateDownloaderOrder})
+}
+
+func migrateDownloaderOrder(db *gorm.DB) error {
+	if err := db.Exec(`ALTER TABLE downloaders ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0`).Error; err != nil {
+		return err
+	}
+	var rows []struct{ ID string }
+	if err := db.Table("downloaders").Select("id").Order("name_normalized, id").Scan(&rows).Error; err != nil {
+		return err
+	}
+	for index, row := range rows {
+		if err := db.Exec(`UPDATE downloaders SET sort_order = ? WHERE id = ?`, index+1, row.ID).Error; err != nil {
+			return err
+		}
+	}
+	return db.Exec(`CREATE INDEX idx_downloaders_sort_order ON downloaders(sort_order, id)`).Error
 }
 
 func migrateStructureDraftPreviewRows(db *gorm.DB) error {

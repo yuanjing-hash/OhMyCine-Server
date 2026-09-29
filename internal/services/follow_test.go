@@ -31,7 +31,7 @@ func TestFollowSnapshotValidationAndRunSnapshotAreStable(t *testing.T) {
 	if err := queue.db.Create(&library).Error; err != nil {
 		t.Fatal(err)
 	}
-	downloader := models.Downloader{ID: "follow-downloader", Name: "Follow downloader", NameNormalized: "follow-downloader", Type: models.DownloaderTypeFake, Enabled: true, CapabilitiesJSON: `{}`}
+	downloader := models.Downloader{ID: "follow-downloader", Name: "Follow downloader", NameNormalized: "follow-downloader", Type: models.DownloaderTypeQBittorrent, Enabled: true, CapabilitiesJSON: `{}`}
 	if err := queue.db.Create(&downloader).Error; err != nil {
 		t.Fatal(err)
 	}
@@ -46,7 +46,7 @@ func TestFollowSnapshotValidationAndRunSnapshotAreStable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if normalized.Version != 1 || len(normalized.Seasons) != 2 || normalized.Seasons[0] != 1 || len(normalized.SiteIDs) != 1 || len(normalized.Filters.IncludeKeywords) != 1 {
+	if normalized.Version != 2 || normalized.RoutingPolicy != "source_priority" || normalized.DownloaderID != "" || len(normalized.Seasons) != 2 || normalized.Seasons[0] != 1 || len(normalized.SiteIDs) != 1 || len(normalized.Filters.IncludeKeywords) != 1 {
 		t.Fatalf("normalized=%+v", normalized)
 	}
 	pan115Downloader := models.Downloader{ID: "follow-pan115", Name: "115", NameNormalized: "follow-pan115", Type: models.DownloaderTypePan115Offline, Enabled: true, CapabilitiesJSON: `{}`}
@@ -55,8 +55,8 @@ func TestFollowSnapshotValidationAndRunSnapshotAreStable(t *testing.T) {
 	}
 	pan115Snapshot := snapshot
 	pan115Snapshot.DownloaderID = pan115Downloader.ID
-	if _, _, err := service.validateSnapshot(actor, 100, pan115Snapshot); ErrorCode(err) != CodeFollowConfigurationInvalid {
-		t.Fatalf("115 downloader accepted for PT follow: %v", err)
+	if selected, _, err := service.validateSnapshot(actor, 100, pan115Snapshot); err != nil || selected.DownloaderID != "" {
+		t.Fatalf("legacy downloader must be ignored for PT follow: %+v %v", selected, err)
 	}
 	connection := models.Connection{Name: "Follow 115", NameNormalized: "follow-115", Provider: models.ConnectionProviderPan115, CredentialCiphertext: "encrypted", Enabled: true, Revision: 1}
 	if err := queue.db.Create(&connection).Error; err != nil {
@@ -90,8 +90,8 @@ func TestFollowSnapshotValidationAndRunSnapshotAreStable(t *testing.T) {
 		t.Fatalf("115 downloader rejected authoritative BT follow: %v", err)
 	}
 	bt115Snapshot.SiteIDs = []uint{btSite.ID, site.ID}
-	if _, _, err := service.validateSnapshot(actor, 100, bt115Snapshot); ErrorCode(err) != CodeFollowConfigurationInvalid {
-		t.Fatalf("115 downloader accepted mixed BT/PT follow: %v", err)
+	if _, _, err := service.validateSnapshot(actor, 100, bt115Snapshot); err != nil {
+		t.Fatalf("mixed BT/PT sites should route per source: %v", err)
 	}
 	cloudSite := models.Site{Name: "TG", NameNormalized: "tg-follow", Kind: "pansou_tg", BaseURL: "https://pansou.example.test", Enabled: true, CloudConfigJSON: `{"provider":"115","channels":["movies"]}`, Revision: 1}
 	if err := queue.db.Create(&cloudSite).Error; err != nil {
@@ -103,8 +103,8 @@ func TestFollowSnapshotValidationAndRunSnapshotAreStable(t *testing.T) {
 		t.Fatalf("cloud follow rejected: %v", err)
 	}
 	cloudSnapshot.DownloaderID = downloader.ID
-	if _, _, err := service.validateSnapshot(actor, 100, cloudSnapshot); ErrorCode(err) != CodeFollowConfigurationInvalid {
-		t.Fatalf("cloud follow accepted ordinary downloader: %v", err)
+	if _, _, err := service.validateSnapshot(actor, 100, cloudSnapshot); err != nil {
+		t.Fatalf("legacy fixed downloader should not override cloud route: %v", err)
 	}
 	now := clock.Now()
 	record := models.FollowSubscription{ID: "follow-stable", OwnerID: actor.User.ID, MediaType: "tv", TMDBID: 100, Title: "Stable", Status: models.FollowStatusActive, Revision: 1, ExecutionSnapshotJSON: string(raw), NextRunAt: &now, CreatedAt: now, UpdatedAt: now}
@@ -400,7 +400,7 @@ func TestFollowWorkerUsesCoverageIdentitySearchAndDownloadPipeline(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	downloader, err := downloaders.Create(actor, DownloaderInput{Name: "Follow qBit", Type: models.DownloaderTypeQBittorrent, BaseURL: "http://follow-qbit.example.test", Enabled: true}, RequestContext{})
+	_, err = downloaders.Create(actor, DownloaderInput{Name: "Follow qBit", Type: models.DownloaderTypeQBittorrent, BaseURL: "http://follow-qbit.example.test", Enabled: true}, RequestContext{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -408,10 +408,12 @@ func TestFollowWorkerUsesCoverageIdentitySearchAndDownloadPipeline(t *testing.T)
 	coverage.now = func() time.Time { return current }
 	follows := NewFollowService(queue.db, queue.audit, queue, coverage, NewAuthorizationService(queue.db))
 	follows.now = func() time.Time { return current }
+	follows.SetDownloadService(downloads)
 	snapshot := FollowExecutionSnapshot{
+		Version:            2,
+		RoutingPolicy:      "source_priority",
 		Seasons:            []int{1},
 		SiteIDs:            []uint{site.ID},
-		DownloaderID:       downloader.ID,
 		MediaLibraryID:     library.ID,
 		Schedule:           FollowSchedule{Kind: "interval", Minutes: 60},
 		Filters:            FollowFilters{Resolutions: []string{"1080p"}, VideoCodecs: []string{"hevc"}, ExcludeReleaseGroups: []string{}, MinSeeders: 1},

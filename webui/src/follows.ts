@@ -9,7 +9,7 @@ export interface FollowFilters {
   min_seeders: number; max_age_hours: number | null; min_size_bytes: number | null; max_size_bytes: number | null
 }
 export interface FollowExecutionSnapshot {
-  version: 1; seasons: number[]; site_ids: number[]; downloader_id: string; media_library_id: number
+  version: 2; routing_policy: 'source_priority'; seasons: number[]; site_ids: number[]; media_library_id: number
   schedule: FollowSchedule; filters: FollowFilters; max_resources_per_run: number; download_priority: number
 }
 export interface FollowOption { id: string; name: string; type: string; connection_id?: number }
@@ -18,6 +18,14 @@ export interface FollowLibraryOption { id: number; name: string; storage_type: s
 export interface FollowDefaults {
   snapshot: FollowExecutionSnapshot; sites: FollowSiteOption[]; downloaders: FollowOption[]
   media_libraries: FollowLibraryOption[]; subscribed_seasons: number[]; coverage: MediaCoverage; unavailable_reason?: string
+}
+export interface FollowRoutePreview {
+  available: boolean
+  routes: Array<{
+    site_id: number; site_name: string; source_kind: 'pt' | 'bt' | '115_share'
+    recommended: { downloader_id: string; media_library_id: number } | null
+    reason_code: string; reason_message: string
+  }>
 }
 export type FollowStatus = 'active' | 'paused' | 'completed' | 'blocked'
 export interface FollowSummary {
@@ -40,21 +48,10 @@ export function followDefaultsPath(tmdbID: number) { return `/api/v1/follows/def
 export function followPath(id: string) { return `/api/v1/follows/${encodeURIComponent(id)}` }
 export function splitRuleText(value: string) { return [...new Set(value.split(/[,，\n]/).map(item => item.trim()).filter(Boolean))].slice(0, 16) }
 export function cloneFollowSnapshot(snapshot: FollowExecutionSnapshot): FollowExecutionSnapshot { return JSON.parse(JSON.stringify(snapshot)) as FollowExecutionSnapshot }
-export function compatibleFollowDownloaders(defaults: FollowDefaults, libraryID: number) {
-  const library = defaults.media_libraries.find(item => item.id === libraryID)
-  if (!library) return []
-  // Target execution capability is authoritative on the Server route preview.
-  // This helper only keeps the selected records internally consistent.
-  return defaults.downloaders
-}
-export function compatibleFollowSites(defaults: FollowDefaults, libraryID: number, downloaderID: string) {
-  const downloader = compatibleFollowDownloaders(defaults, libraryID).find(item => item.id === downloaderID)
-  if (!downloader) return []
-  return defaults.sites.filter(item => item.site_type === 'cloud_share' ? downloader.type === 'pan115_offline' : downloader.type !== 'pan115_offline' || item.site_type === 'bt' || item.site_type === 'bt_resource')
-}
 export function canSubmitFollow(defaults: FollowDefaults | null, snapshot: FollowExecutionSnapshot | null) {
-  if (!defaults || !snapshot || !snapshot.seasons.length || !snapshot.site_ids.length || !snapshot.downloader_id || !snapshot.media_library_id) return false
-  const siteIDs = new Set(compatibleFollowSites(defaults, snapshot.media_library_id, snapshot.downloader_id).map(item => item.id))
+  if (!defaults || !snapshot || snapshot.version !== 2 || snapshot.routing_policy !== 'source_priority' || !snapshot.seasons.length || !snapshot.site_ids.length || !snapshot.media_library_id) return false
+  if (!defaults.media_libraries.some(item => item.id === snapshot.media_library_id)) return false
+  const siteIDs = new Set(defaults.sites.map(item => item.id))
   return snapshot.site_ids.every(id => siteIDs.has(id))
 }
 export function followStatusLabel(status: FollowStatus) { return ({ active: '追更中', paused: '已暂停', completed: '当前已补齐', blocked: '需要处理' } as const)[status] }
@@ -62,6 +59,11 @@ export function followRunStatusLabel(status: FollowRunSummary['status']) { retur
 export function isFollowRevisionConflict(reason: unknown) { return reason instanceof APIError && reason.errorCode === 'follow_revision_conflict' }
 
 export async function loadFollowDefaults(tmdbID: number) { return api<FollowDefaults>(followDefaultsPath(tmdbID)) }
+export async function previewFollowRoutes(siteIDs: number[], mediaLibraryID: number, signal?: AbortSignal) {
+  return api<FollowRoutePreview>('/api/v1/follows/routes/preview', {
+    method: 'POST', body: JSON.stringify({ site_ids: siteIDs, media_library_id: mediaLibraryID }), signal,
+  })
+}
 export async function createFollow(input: { tmdb_id: number; title: string; year?: number; poster_ref?: string; snapshot: FollowExecutionSnapshot }) { return api<FollowSummary>('/api/v1/follows', { method: 'POST', body: JSON.stringify(input) }) }
 export async function loadFollow(id: string) { return api<FollowSummary>(followPath(id)) }
 export async function updateFollow(id: string, revision: number, snapshot: FollowExecutionSnapshot) { return api<FollowSummary>(followPath(id), { method: 'PUT', body: JSON.stringify({ revision, snapshot }) }) }

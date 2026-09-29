@@ -1,4 +1,3 @@
-import ipaddr from 'ipaddr.js';
 import { lookup } from 'node:dns/promises';
 import { isIP } from 'node:net';
 
@@ -22,9 +21,7 @@ export function sameOrigin(value, origin) {
     return u.origin === origin && !u.username && !u.password && !u.hash;
   } catch { return false; }
 }
-export function publicIP(address) {
-  try { return ipaddr.parse(address).range() === 'unicast'; } catch { return false; }
-}
+export function numericIP(address) { return typeof address === 'string' && !address.includes('%') && isIP(address) !== 0; }
 export function resourceURL(value) {
   let u;
   try { u = new URL(value); } catch { throw new Fault('network_denied'); }
@@ -32,22 +29,14 @@ export function resourceURL(value) {
     !u.hostname.endsWith('.') && !isIP(u.hostname.replace(/^\[|\]$/g, '')), 'network_denied');
   return u;
 }
-export function tunFakeIP(address) {
-  // Deliberately not part of publicIP: only an explicitly trusted TUN route
-  // may consume DNS-derived IPv4 benchmark addresses. Never accept mapped IPv6.
-  if (isIP(address) !== 4) return false;
-  const [a, b] = address.split('.').map(Number);
-  return a === 198 && (b === 18 || b === 19);
-}
-export async function resolvePublic(origin, resolver = lookup, allowTUNFakeIP = false) {
+export async function resolvePinnedAddress(origin, resolver = lookup) {
   const hostname = new URL(originURL(origin)).hostname;
   let timer;
   const results = await Promise.race([
     resolver(hostname, { all: true, verbatim: true }),
     new Promise((_, reject) => { timer = setTimeout(() => reject(new Fault('network_timeout')), 10_000); }),
   ]).finally(() => clearTimeout(timer));
-  requireThat(Array.isArray(results) && results.length > 0 && results.length <= 64 && results.every(r => publicIP(r.address) || tunFakeIP(r.address)), 'network_denied');
-  requireThat(allowTUNFakeIP === true || !results.some(r => tunFakeIP(r.address)), 'tun_fake_ip_requires_opt_in');
+  requireThat(Array.isArray(results) && results.length > 0 && results.length <= 64 && results.every(r => numericIP(r?.address)), 'network_denied');
   // One immutable numeric address per context: Chromium never resolves the upstream.
   return results[0].address;
 }

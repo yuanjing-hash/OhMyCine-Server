@@ -5,8 +5,7 @@ import { api, APIError } from '@/api/client'
 import { Permissions } from '@/auth/generated-permissions'
 import SharePreviewDialog from '@/components/SharePreviewDialog.vue'
 import { shareValidationLabel, type ShareSelection, type ShareValidation } from '@/share-preview'
-import DownloadRouteTargetPicker from '@/components/DownloadRouteTargetPicker.vue'
-import { previewDownloadRoutes, routeTargetByID, type DownloadRoutePreview } from '@/download-routes'
+import { previewDownloadRoutes, recommendDownloadRoute, routeTargetByID, type DownloadRouteChoice, type DownloadRoutePreview, type DownloadRouteRecommendation } from '@/download-routes'
 import { formatBytes } from '@/downloads'
 import { useSearchResultRecognition } from '@/search-result-recognition'
 import { useAuthStore } from '@/stores/auth'
@@ -68,6 +67,10 @@ const downloadSiteID = ref<number | undefined>()
 const routePreview = ref<DownloadRoutePreview | null>(null)
 const routePreviewLoading = ref(false)
 let routePreviewRequest: AbortController | null = null
+const routeRecommendation = ref<DownloadRouteRecommendation | null>(null)
+const routeChoices = ref<DownloadRouteChoice[]>([])
+const routeRecommendationLoading = ref(false)
+let routeRecommendationRequest: AbortController | null = null
 const submitting = ref(false)
 const recognitionItems = computed(() => mode.value === 'resources' ? groups.value.flatMap(group => group.items) : [])
 const resultRecognition = useSearchResultRecognition(recognitionItems, () => auth.can(Permissions.MediaLibrariesRead))
@@ -89,8 +92,29 @@ let source: EventSource | null = null
 let streamTimeout: number | undefined
 let mediaSearchRequest: AbortController | null = null
 
-const enabledDownloaders = computed(() => downloaders.value.filter(item => item.enabled && (downloadDialog.value?.source_kind !== '115_share' || item.type === 'pan115_offline' && item.capabilities.share_receive)))
+const enabledDownloaders = computed(() => {
+  const compatible = new Set(routeChoices.value.filter(choice => choice.media_library_id === downloadForm.value.mediaLibraryID && choice.enabled).map(choice => choice.downloader_id))
+  return downloaders.value.filter(item => item.enabled && compatible.has(item.id))
+})
+function choiceAppliesToSource(choice: DownloadRouteChoice) {
+  const source = routeRecommendation.value?.source_kind
+  return source === 'pt' ? choice.downloader_type === 'qbittorrent' : source === '115_share' ? choice.downloader_type === 'pan115_offline' : true
+}
+const targetChoices = computed(() => {
+  const byLibrary = new Map<number, DownloadRouteChoice>()
+  const relevant = routeChoices.value.filter(choiceAppliesToSource)
+  for (const choice of relevant.length ? relevant : routeChoices.value) {
+    const previous = byLibrary.get(choice.media_library_id)
+    if (!previous || !previous.enabled && choice.enabled) byLibrary.set(choice.media_library_id, choice)
+  }
+  return [...byLibrary.values()]
+})
 const selectedRoute = computed(() => routeTargetByID(routePreview.value, downloadForm.value.mediaLibraryID))
+const selectedChoice = computed(() => routeChoices.value.find(choice => choice.media_library_id === downloadForm.value.mediaLibraryID && choice.downloader_id === downloadForm.value.downloaderID))
+const routeFailure = computed(() => {
+  if (!routeRecommendation.value || selectedRoute.value?.enabled) return ''
+  return selectedRoute.value?.reason_message || selectedChoice.value?.reason_message || routeRecommendation.value.choices.find(choice => choiceAppliesToSource(choice) && !choice.enabled)?.reason_message || '当前没有可执行的下载与入库路线'
+})
 const selectedLibrary = computed(() => libraries.value.find(item => item.id === selectedRoute.value?.media_library_id) ?? null)
 const selectableSiteOptions = computed(() => siteOptions.value.filter(item => item.searchable))
 const activeChannel = ref<'all' | number>('all')
@@ -340,7 +364,6 @@ async function loadDownloadOptions() {
   if (auth.can(Permissions.DownloadersRead)) requests.push(api<ListResponse<DownloaderSummary>>('/api/v1/downloaders').then(response => { downloaders.value = response.list }))
   if (auth.can(Permissions.MediaLibrariesRead)) requests.push(api<ListResponse<MediaLibraryDetail>>('/api/v1/media-libraries').then(response => { libraries.value = response.list }))
   await Promise.all(requests)
-  if (!enabledDownloaders.value.some(item => item.id === downloadForm.value.downloaderID)) downloadForm.value.downloaderID = enabledDownloaders.value[0]?.id ?? ''
 }
 
 async function openSharePreview(item: TorrentSearchResult) {
@@ -353,19 +376,65 @@ async function acceptShareSelection(selection: ShareSelection) {
  await openDownload(item, selection)
 }
 async function openDownload(item: TorrentSearchResult, selection: ShareSelection | null = null) {
+  routeRecommendationRequest?.abort()
+  routeRecommendationRequest = null
+  routeRecommendationLoading.value = false
   shareSelection.value = selection
   downloadDialog.value = item
   downloadSiteID.value = groups.value.find(group => group.items.some(candidate => candidate.token === item.token))?.site_id
   downloadForm.value = { downloaderID: selection?.downloaderID ?? '', mediaLibraryID: 0, priority: 0 }
-  try { await loadDownloadOptions(); await loadRoutePreview() }
+  routePreviewRequest?.abort()
+  routePreviewRequest = null
+  routePreview.value = null
+  routePreviewLoading.value = false
+  routeChoices.value = []
+  routeRecommendation.value = null
+  try { await loadDownloadOptions(); await loadRouteRecommendation() }
   catch (reason) { notify(message(reason), 'error') }
+}
+
+function expectedRouteBytes() {
+  if (shareSelection.value) return shareSelection.value.totalSize > 0 ? shareSelection.value.totalSize : undefined
+  const item = downloadDialog.value
+  return item?.source_kind !== '115_share' && item?.size_bytes && item.size_bytes > 0 ? item.size_bytes : undefined
+}
+
+async function loadRouteRecommendation(mediaLibraryID?: number) {
+  routeRecommendationRequest?.abort()
+  routeRecommendationRequest = null
+  routePreviewRequest?.abort()
+  routePreview.value = null
+  routePreviewLoading.value = false
+  const item = downloadDialog.value
+  if (!item) return
+  const controller = new AbortController()
+  routeRecommendationRequest = controller
+  routeRecommendationLoading.value = true
+  try {
+    const recommendation = await recommendDownloadRoute(item.token, mediaLibraryID, expectedRouteBytes(), controller.signal)
+    if (controller.signal.aborted) return
+    routeRecommendation.value = recommendation
+    if (!mediaLibraryID) routeChoices.value = recommendation.choices
+    if (!mediaLibraryID) downloadForm.value.mediaLibraryID = recommendation.recommended?.media_library_id ?? 0
+    downloadForm.value.downloaderID = shareSelection.value?.downloaderID ?? recommendation.recommended?.downloader_id ?? ''
+    await loadRoutePreview()
+  } catch (reason) {
+    if (!controller.signal.aborted) notify(message(reason), 'error')
+  } finally {
+    if (routeRecommendationRequest === controller) { routeRecommendationRequest = null; routeRecommendationLoading.value = false }
+  }
+}
+
+async function chooseTarget(mediaLibraryID: number) {
+  downloadForm.value.mediaLibraryID = mediaLibraryID
+  await loadRouteRecommendation(mediaLibraryID)
 }
 
 async function loadRoutePreview() {
   routePreviewRequest?.abort()
   routePreviewRequest = null
   routePreview.value = null
-  downloadForm.value.mediaLibraryID = 0
+  routePreviewLoading.value = false
   if (!downloadForm.value.downloaderID || !downloadDialog.value) return
   const controller = new AbortController()
   routePreviewRequest = controller
@@ -375,7 +444,7 @@ async function loadRoutePreview() {
       downloader_id: downloadForm.value.downloaderID,
       source_kind: downloadDialog.value.source_kind === '115_share' ? '115_share' : 'torrent',
       site_id: downloadSiteID.value,
-      expected_bytes: shareSelection.value?.totalSize ?? downloadDialog.value.size_bytes ?? undefined,
+      expected_bytes: expectedRouteBytes(),
     }, controller.signal)
     if (!controller.signal.aborted) routePreview.value = preview
   } catch (reason) {
@@ -384,8 +453,6 @@ async function loadRoutePreview() {
     if (routePreviewRequest === controller) { routePreviewRequest = null; routePreviewLoading.value = false }
   }
 }
-
-watch(() => downloadForm.value.downloaderID, () => void loadRoutePreview())
 
 async function submitDownload() {
   const item = downloadDialog.value
@@ -503,6 +570,7 @@ onMounted(async () => {
   if (trustedIdentity.value || keyword.value.trim() || (searchBy.value === 'tmdb_id' && tmdbID.value)) search()
 })
 onBeforeUnmount(() => {
+  routeRecommendationRequest?.abort()
   cancelSearchRequests()
   resultRecognition.dispose()
   window.clearInterval(validationTimer)
@@ -645,18 +713,18 @@ onBeforeUnmount(() => {
 
     <SharePreviewDialog v-if="sharePreviewDialog" :result-token="sharePreviewDialog.token" :title="sharePreviewDialog.title" :downloaders="downloaders" @close="sharePreviewDialog = null" @select="acceptShareSelection" @validation="rememberShareValidation" />
     <div v-if="downloadDialog" class="modal-backdrop fixed inset-0 z-50 flex items-center justify-center p-4" @click.self="!submitting && (downloadDialog = null)">
-      <form class="panel w-full max-w-xl" role="dialog" aria-modal="true" aria-labelledby="pt-download-title" @submit.prevent="submitDownload">
+      <form class="panel max-h-[90vh] w-full max-w-xl overflow-y-auto" role="dialog" aria-modal="true" aria-labelledby="pt-download-title" @submit.prevent="submitDownload">
         <div class="flex items-start justify-between gap-3"><div><h2 id="pt-download-title" class="m-0 text-xl">{{ downloadDialog.source_kind === '115_share' ? '转存到媒体库' : '创建下载任务' }}</h2><p class="page-description mt-1 line-clamp-2 text-sm">{{ downloadDialog.title }}</p></div><button class="btn-secondary" type="button" :disabled="submitting" @click="downloadDialog = null">关闭</button></div>
         <div class="mt-5 grid gap-4 sm:grid-cols-2">
-          <div><label class="label">下载器</label><select v-model="downloadForm.downloaderID" class="input" required :disabled="!!shareSelection"><option value="" disabled>请选择</option><option v-for="item in enabledDownloaders" :key="item.id" :value="item.id">{{ item.name }} · {{ item.type === 'pan115_offline' ? '115 网盘' : item.type }}</option></select></div>
-          <p v-if="downloadDialog.source_kind === '115_share' && !enabledDownloaders.length" class="semantic-warning sm:col-span-2">请先在下载器设置中启用支持分享转存的 115 下载器，并配置网盘账号和接收目录。</p>
-          <DownloadRouteTargetPicker v-model="downloadForm.mediaLibraryID" :preview="routePreview" :loading="routePreviewLoading" />
+          <div><label class="label">下载器</label><select v-model="downloadForm.downloaderID" class="input" required :disabled="!!shareSelection || routeRecommendationLoading" @change="loadRoutePreview"><option value="" disabled>请选择可执行的下载器</option><option v-for="item in enabledDownloaders" :key="item.id" :value="item.id">{{ item.name }} · {{ item.type === 'pan115_offline' ? '115 网盘' : item.type }}</option></select><p class="text-subtle mb-0 mt-2 text-xs">按资源来源和全局下载器顺序推荐；可手动改选兼容的下载器。</p></div>
+          <div><label class="label">目标媒体库</label><div v-if="routeRecommendationLoading && !targetChoices.length" class="semantic-inset p-3 text-sm text-muted">正在计算入库路线…</div><div v-else-if="!targetChoices.length" class="semantic-warning p-3 text-sm">当前没有可用媒体库。</div><div v-else class="grid max-h-48 gap-2 overflow-y-auto" role="radiogroup" aria-label="目标媒体库"><label v-for="choice in targetChoices" :key="choice.media_library_id" class="semantic-list-item flex items-start gap-2 p-2 text-sm" :class="{ 'semantic-list-item--selected': downloadForm.mediaLibraryID === choice.media_library_id, 'opacity-60': !choice.enabled }"><input type="radio" name="explore-download-target" :checked="downloadForm.mediaLibraryID === choice.media_library_id" :disabled="!choice.enabled || routeRecommendationLoading" @change="chooseTarget(choice.media_library_id)" /><span><strong>{{ choice.library_name }}</strong><small class="text-subtle mt-1 block">{{ choice.route_label || choice.reason_message || '路线待确认' }}</small></span></label></div></div>
+          <p v-if="routeFailure && !routeRecommendationLoading && !routePreviewLoading" class="semantic-warning sm:col-span-2">{{ routeFailure }}。可调整目标媒体库或手动选择兼容下载器。</p>
           <div class="sm:col-span-2"><label class="label">队列优先级</label><input v-model.number="downloadForm.priority" class="input" type="number" min="-100" max="100" /></div>
         </div>
         <div v-if="selectedLibrary && selectedRoute" class="semantic-inset mt-4 grid gap-3 p-4 text-sm sm:grid-cols-2"><div><span class="text-subtle block text-xs">最终媒体库</span><strong>{{ selectedLibrary.name }}</strong></div><div><span class="text-subtle block text-xs">分类与入库</span><strong>{{ selectedRoute.route_label }} · {{ selectedLibrary.profile_name }} · {{ selectedLibrary.transfer_mode }}</strong></div></div>
         <p v-if="shareSelection" class="semantic-inset mt-4 p-3 text-sm">本次仅转存所选 {{ shareSelection.fileCount }} 个文件 · {{ formatBytes(shareSelection.totalSize) }}。更换账号或文件范围请重新预览。</p>
         <p class="text-subtle mt-4 text-xs">{{ downloadDialog.source_kind === '115_share' ? '分享内容将转存到 115 下载器目录，随后自动识别、整理并入库。' : '确认后获取资源，自动识别、整理并入库。' }}</p>
-        <div class="mt-5 flex justify-end gap-3"><button class="btn-secondary" type="button" :disabled="submitting" @click="downloadDialog = null">取消</button><button class="btn-primary" :disabled="submitting || routePreviewLoading || !downloadForm.downloaderID || !selectedRoute?.enabled || !selectedLibrary">{{ submitting ? '正在提交…' : downloadDialog.source_kind === '115_share' ? '确认转存' : '确认并入队' }}</button></div>
+        <div class="mt-5 flex justify-end gap-3"><button class="btn-secondary" type="button" :disabled="submitting" @click="downloadDialog = null">取消</button><button class="btn-primary" :disabled="submitting || routeRecommendationLoading || routePreviewLoading || !downloadForm.downloaderID || !selectedRoute?.enabled || !selectedLibrary">{{ submitting ? '正在提交…' : downloadDialog.source_kind === '115_share' ? '确认转存' : '确认并入队' }}</button></div>
       </form>
     </div>
   </section>
