@@ -158,7 +158,7 @@ describe('automatic result recognition', () => {
   })
 
   it('starts restored cards in visible sort order and offers retry on every card', async () => {
-    const state = { input: { keyword: '作品', mediaType: '', siteIDs: [1], searchBy: 'title' as const }, groups: [{ site_id: 1, site_name: 'Jackett', site_type: 'bt' as const, status: 'success' as const, page: 1, has_next: false, skipped: 0, items: [{ ...item('low'), seeders: 1 }, { ...item('high'), seeders: 9 }, { ...item('middle'), seeders: 5 }] }], recognitions: {}, searched: true, savedAt: Date.now() }
+    const state = { input: { keyword: '作品', mediaType: '', siteIDs: [1], searchBy: 'title' as const }, groups: [{ site_id: 1, site_name: 'Jackett', site_type: 'bt' as const, status: 'success' as const, page: 1, has_next: false, skipped: 0, items: [{ ...item('low'), seeders: 1, published_at: '2026-08-30T00:00:00Z' }, { ...item('high'), seeders: 9, published_at: '2026-08-10T00:00:00Z' }, { ...item('middle'), seeders: 5, published_at: '2026-08-20T00:00:00Z' }] }], recognitions: {}, searched: true, savedAt: Date.now() }
     saveTorrentSearchSession(sessionStorage, state)
     const pending = deferred<TorrentRecognitionResult>()
     vi.mocked(api).mockImplementation(path => path === torrentRecognitionPath ? pending.promise : Promise.resolve(present))

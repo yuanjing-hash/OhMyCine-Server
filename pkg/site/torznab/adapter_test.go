@@ -15,6 +15,10 @@ func TestTorznabCapsSearchAndTorrentResolution(t *testing.T) {
 	const apiKey = "server-only-api-key"
 	var server *httptest.Server
 	server = httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == jackettResultsPath {
+			http.NotFound(writer, request)
+			return
+		}
 		if request.URL.Query().Get("apikey") != apiKey {
 			t.Error("API key was not supplied to Torznab")
 			http.Error(writer, "unauthorized", http.StatusUnauthorized)
@@ -74,7 +78,7 @@ func TestTorznabHTTPJackettEndToEnd(t *testing.T) {
 	const apiPath = "/api/v2.0/indexers/all/results/torznab/api"
 	var server *httptest.Server
 	server = httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		if request.URL.Path == "/api" {
+		if request.URL.Path == "/api" || request.URL.Path == jackettResultsPath {
 			http.NotFound(writer, request)
 			return
 		}
@@ -131,6 +135,10 @@ func TestTorznabSearchKeepsOnlyRelatedReleaseTitles(t *testing.T) {
 	const apiKey = "private-jackett-key"
 	var server *httptest.Server
 	server = httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == jackettResultsPath {
+			http.NotFound(writer, request)
+			return
+		}
 		values := request.URL.Query()
 		if request.URL.Path != "/api" || values.Get("t") != "search" || values.Get("q") != "名侦探柯南 2025" || values.Get("cat") != "5000" || values.Get("apikey") != apiKey {
 			t.Errorf("unexpected Torznab search request: path=%q t=%q q=%q cat=%q", request.URL.Path, values.Get("t"), values.Get("q"), values.Get("cat"))

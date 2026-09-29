@@ -22,6 +22,7 @@ const (
 	Kind            = "torznab"
 	maxXMLBytes     = 4 << 20
 	maxTorrentBytes = 4 << 20
+	searchPageSize  = 100
 )
 
 type Adapter struct {
@@ -71,7 +72,13 @@ func (a *Adapter) Search(ctx context.Context, config site.Config, query site.Que
 	if query.Year != nil {
 		keyword += " " + strconv.Itoa(*query.Year)
 	}
-	values := url.Values{"t": {"search"}, "q": {keyword}, "limit": {"100"}, "offset": {strconv.Itoa((query.Page - 1) * 100)}}
+	if manualPath, ok := jackettManualPath(config.BaseURL); ok {
+		page, available, err := a.searchJackett(ctx, config, query, keyword, manualPath)
+		if available {
+			return page, err
+		}
+	}
+	values := url.Values{"t": {"search"}, "q": {keyword}, "limit": {strconv.Itoa(searchPageSize)}, "offset": {strconv.Itoa((query.Page - 1) * searchPageSize)}}
 	switch strings.ToLower(query.MediaType) {
 	case "movie":
 		values.Set("cat", "2000")
@@ -97,7 +104,7 @@ func (a *Adapter) Search(ctx context.Context, config site.Config, query site.Que
 		return site.Page{}, site.ErrInvalidReply
 	}
 	rawCount := len(rawPage.Channel.Items)
-	result := site.Page{Page: query.Page, HasNext: query.Page < 20 && rawCount >= 100, Items: make([]site.Result, 0, len(parsed)), Skipped: rawCount - len(parsed)}
+	result := site.Page{Page: query.Page, HasNext: query.Page < 20 && rawCount >= searchPageSize, Items: make([]site.Result, 0, len(parsed)), Skipped: rawCount - len(parsed)}
 	for _, item := range parsed {
 		if !titleMatchesKeyword(query.Keyword, item.Title) {
 			result.Skipped++
@@ -250,7 +257,7 @@ func (a *Adapter) ResolveSource(ctx context.Context, config site.Config, identit
 }
 
 func (a *Adapter) request(ctx context.Context, config site.Config, query url.Values) ([]byte, error) {
-	if strings.TrimSpace(config.APIKey) == "" || len(config.APIKey) > 2048 || strings.ContainsAny(config.APIKey, "\x00\r\n") {
+	if !validAPIKey(config.APIKey) {
 		return nil, site.ErrAuthentication
 	}
 	client, base, err := a.clientFactory(config)
@@ -264,22 +271,22 @@ func (a *Adapter) request(ctx context.Context, config site.Config, query url.Val
 	}
 	query.Set("apikey", config.APIKey)
 	target.RawQuery = query.Encode()
-	body, status, err := requestTorznabTarget(ctx, client, &target)
+	body, status, err := requestTarget(ctx, client, &target, "application/xml,application/rss+xml;q=0.9", maxXMLBytes)
 	if rootAddress && status == http.StatusNotFound {
 		// Jackett's root is not itself a Torznab endpoint. Only a 404 from
 		// the generic /api path permits the same-origin all-indexer fallback.
 		target.Path = "/api/v2.0/indexers/all/results/torznab/api"
-		body, _, err = requestTorznabTarget(ctx, client, &target)
+		body, _, err = requestTarget(ctx, client, &target, "application/xml,application/rss+xml;q=0.9", maxXMLBytes)
 	}
 	return body, err
 }
 
-func requestTorznabTarget(ctx context.Context, client *http.Client, target *url.URL) ([]byte, int, error) {
+func requestTarget(ctx context.Context, client *http.Client, target *url.URL, accept string, maxBytes int64) ([]byte, int, error) {
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), nil)
 	if err != nil {
 		return nil, 0, site.ErrUnavailable
 	}
-	request.Header.Set("Accept", "application/xml,application/rss+xml;q=0.9")
+	request.Header.Set("Accept", accept)
 	response, err := client.Do(request)
 	if err != nil {
 		return nil, 0, site.ErrUnavailable
@@ -294,8 +301,8 @@ func requestTorznabTarget(ctx context.Context, client *http.Client, target *url.
 	if response.StatusCode != http.StatusOK {
 		return nil, response.StatusCode, site.ErrUnavailable
 	}
-	body, err := io.ReadAll(io.LimitReader(response.Body, maxXMLBytes+1))
-	if err != nil || len(body) > maxXMLBytes {
+	body, err := io.ReadAll(io.LimitReader(response.Body, maxBytes+1))
+	if err != nil || int64(len(body)) > maxBytes {
 		return nil, response.StatusCode, site.ErrInvalidReply
 	}
 	return body, response.StatusCode, nil

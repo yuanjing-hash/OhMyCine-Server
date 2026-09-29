@@ -1934,4 +1934,4 @@ Server 可生成 Linux bash 或 Windows PowerShell 完整命令；命令先校�
 
 Server 管理网页调用 `POST /api/v1/sites/routes/recommend` 和 `POST /api/v1/follows/routes/preview`；Player 使用 `POST /api/v1/player/discovery/routes/recommend` 和 `POST /api/v1/player/discovery/follows/routes/preview`。推荐只返回当前用户可见的安全路线信息，不返回站点凭据或下载来源；最终提交再次校验。管理员可通过 `PUT /api/v1/downloaders/order` 提交完整下载器顺序。新的订阅写入使用版本 2 的 `routing_policy=source_priority`，旧版固定 `downloader_id` 写入收到明确的升级错误。
 
-Torznab 站点可单独使用 HTTP 或 HTTPS，其他站点仍按原有 HTTPS 规则。Jackett 根地址先探测 `/api`；仅在返回 404 时尝试同协议、同主机的 `/api/v2.0/indexers/all/results/torznab/api`。指定完整 Torznab API 路径时不会改写。HTTP 的 API Key 会明文传输，站点表单向管理员提示这一点。
+Torznab 站点可单独使用 HTTP 或 HTTPS，其他站点仍按原有 HTTPS 规则。连接测试对根地址先探测 `/api`，仅在 404 时回退到 Jackett 的 Torznab 汇总路径。搜索时，根地址及显式 Jackett 全部索引器地址优先访问与 Jackett 网页相同的 `/api/v2.0/indexers/all/results` 手动搜索接口，按上游顺序分成每页 100 条；该接口不存在（404/405）才走原 Torznab XML 接口。其他显式 Torznab/Prowlarr API 路径维持原状。Jackett 网页自身可能返回不相关标题，因此此模式保留原始结果；通用 Torznab XML 仍按标题过滤。下载地址继续限制为同协议、同主机，来源中的 API Key 不保留在结果身份内，取种时使用已加密配置中的 Key。HTTP 的 API Key 会明文传输，站点表单向管理员提示这一点。

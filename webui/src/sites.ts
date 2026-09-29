@@ -356,7 +356,7 @@ export function filterAndSortTorrentResults(groups: readonly PTSearchGroup[], fi
     .filter(({ item }) => item.source_kind === '115_share' || !promotion || item.promotion?.toLowerCase() === promotion)
     .filter(({ item }) => item.source_kind === '115_share' || filters.minimumSeeders == null || (item.seeders ?? -1) >= filters.minimumSeeders)
     .sort((left, right) => {
-      if (filters.sort === 'published') return compareOptionalNumber(timestamp(left.item.published_at), timestamp(right.item.published_at)) || stableTieBreak(left, right)
+      if (filters.sort === 'published') return compareOptionalNumber(timestamp(left.item.published_at), timestamp(right.item.published_at)) || left.group.site_id - right.group.site_id
       if (filters.sort === 'size') return compareOptionalNumber(left.item.size_bytes, right.item.size_bytes) || stableTieBreak(left, right)
       return compareOptionalNumber(left.item.seeders, right.item.seeders)
         || compareOptionalNumber(left.item.completed, right.item.completed)

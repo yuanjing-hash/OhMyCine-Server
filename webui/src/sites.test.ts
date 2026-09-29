@@ -88,6 +88,15 @@ describe('PT discovery contracts', () => {
     expect(filterAndSortTorrentResults([first, second], { ...filters, direction: 'asc' }).map(entry => entry.item.token)).toEqual(['a', 'z'])
   })
 
+  it('keeps the upstream order when a site has equal publication times', () => {
+    const values = group(1)
+    values.items = [
+      { token: 'first', title: 'Z', published_at: '2026-08-20T00:00:00Z', expires_at: '2026-08-25T00:10:00Z' },
+      { token: 'second', title: 'A', published_at: '2026-08-20T00:00:00Z', expires_at: '2026-08-25T00:10:00Z' },
+    ]
+    expect(filterAndSortTorrentResults([values], { activeChannel: 1, enabledSiteTypes: ['pt'], sort: 'published', direction: 'desc' }).map(entry => entry.item.token)).toEqual(['first', 'second'])
+  })
+
   it('keeps missing or invalid sort values after known values in either direction', () => {
     const values = group(1)
     values.items = [

@@ -119,7 +119,7 @@ const enabledSiteTypes = ref<Array<'pt' | 'bt' | 'bt_resource' | 'cloud_share'>>
 const resolutionFilter = ref('')
 const promotionFilter = ref('')
 const minimumSeeders = ref<number | undefined>()
-const resultSort = ref<'seeders' | 'published' | 'size'>('seeders')
+const resultSort = ref<'seeders' | 'published' | 'size'>(lockedSiteID.value ? 'published' : 'seeders')
 const resultDirection = ref<TorrentResultDirection>('desc')
 
 const orderedGroups = computed(() => [...groups.value].sort((left, right) => left.site_id - right.site_id))
