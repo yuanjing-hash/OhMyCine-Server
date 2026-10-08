@@ -119,20 +119,12 @@ jobs:
           npm ci
           npm run build
 
-      - name: Verify Server
+      - name: Check release build dependencies
         run: |
           go mod verify
           go list -deps -tags webui ./cmd/server | grep -Fxq 'time/tzdata'
-          # Full regression remains in Server CI; beta verifies release-critical paths.
-          if [[ "$CHANNEL" == stable ]]; then
-            go test ./... -timeout 30m
-          else
-            go test ./internal/database ./internal/authz ./internal/buildinfo ./cmd/... -timeout 5m
-            go test ./internal/services -run '^Test(Scheduler|Queue|CancelledRepair|PartialRepair|CatalogStructure.*Cancel|CatalogRuntimeAccess|ManagementHistoryPurge)' -timeout 5m
-          fi
           cd webui
           go mod verify
-          go test .
 
       - name: Derive Node release trust root
         env:
