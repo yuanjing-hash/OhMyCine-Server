@@ -13,6 +13,43 @@ import (
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/services"
 )
 
+func TestQueueWebSocketUsesAutomaticBrowserOriginPolicy(t *testing.T) {
+	client := newTestClient(t)
+	client.setup(t)
+	server := httptest.NewServer(client.router)
+	defer server.Close()
+	for _, test := range []struct {
+		name          string
+		headers       http.Header
+		authenticated bool
+		status        int
+	}{
+		{"HTTPS domain behind proxy", http.Header{"Origin": {"https://media.example.test"}, "Sec-Fetch-Site": {"same-origin"}}, true, http.StatusSwitchingProtocols},
+		{"direct IP without fetch metadata", http.Header{"Origin": {server.URL}}, true, http.StatusSwitchingProtocols},
+		{"foreign browser", http.Header{"Origin": {"https://foreign.example.test"}, "Sec-Fetch-Site": {"cross-site"}}, true, http.StatusForbidden},
+		{"Referer cannot replace WebSocket Origin", http.Header{"Referer": {server.URL + "/"}}, true, http.StatusForbidden},
+		{"same-origin still requires session", http.Header{"Origin": {"https://media.example.test"}, "Sec-Fetch-Site": {"same-origin"}}, false, http.StatusUnauthorized},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			headers := test.headers.Clone()
+			if test.authenticated {
+				headers.Set("Cookie", client.cookie.String())
+			}
+			connection, response, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http")+"/api/v1/jobs/events/ws", headers)
+			if connection != nil {
+				_ = connection.Close()
+			}
+			if response == nil {
+				t.Fatalf("no handshake response: %v", err)
+			}
+			defer response.Body.Close()
+			if response.StatusCode != test.status || (test.status == http.StatusSwitchingProtocols && err != nil) {
+				t.Fatalf("status=%d want=%d err=%v", response.StatusCode, test.status, err)
+			}
+		})
+	}
+}
+
 func TestQueueWebSocketRechecksEstablishedSessionBeforeDelivery(t *testing.T) {
 	for _, scenario := range []string{"logout", "revoked", "disabled", "permission-denied"} {
 		t.Run(scenario, func(t *testing.T) {

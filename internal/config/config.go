@@ -139,7 +139,8 @@ func (c Config) Address() string {
 	return fmt.Sprintf("%s:%d", c.Host, c.Port)
 }
 
-// AllowedOrigins returns the exact browser origins accepted for mutation requests.
+// AllowedOrigins returns explicit exceptions to the automatic browser same-origin
+// policy. PublicOrigin remains the configured base for advertised media URLs.
 func (c Config) AllowedOrigins() []string {
 	origins := []string{c.PublicOrigin}
 	if c.DevOrigin != "" && c.DevOrigin != c.PublicOrigin {

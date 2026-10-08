@@ -5,7 +5,6 @@ import (
 	"encoding/hex"
 	"mime"
 	"net/http"
-	"net/url"
 	"strings"
 	"time"
 
@@ -69,28 +68,16 @@ func SecurityHeaders() gin.HandlerFunc {
 }
 
 func BrowserMutationProtection(allowedOrigins []string) gin.HandlerFunc {
-	allowed := map[string]struct{}{}
-	for _, origin := range allowedOrigins {
-		allowed[strings.TrimRight(origin, "/")] = struct{}{}
-	}
 	return func(c *gin.Context) {
 		if c.Request.Method == http.MethodGet || c.Request.Method == http.MethodHead || c.Request.Method == http.MethodOptions {
 			c.Next()
 			return
 		}
-		if site := strings.ToLower(c.GetHeader("Sec-Fetch-Site")); site == "cross-site" {
+		if site := strings.ToLower(strings.TrimSpace(c.GetHeader("Sec-Fetch-Site"))); site == "cross-site" {
 			abortJSON(c, http.StatusForbidden, "CROSS_SITE_REQUEST", "跨站请求已拒绝")
 			return
 		}
-		origin := strings.TrimRight(strings.TrimSpace(c.GetHeader("Origin")), "/")
-		if origin == "" {
-			if referer := strings.TrimSpace(c.GetHeader("Referer")); referer != "" {
-				if parsed, err := url.Parse(referer); err == nil {
-					origin = parsed.Scheme + "://" + parsed.Host
-				}
-			}
-		}
-		if _, ok := allowed[origin]; !ok {
+		if !BrowserOriginAllowed(c.Request, allowedOrigins) {
 			abortJSON(c, http.StatusForbidden, "ORIGIN_NOT_ALLOWED", "请求来源不受信任")
 			return
 		}

@@ -31,7 +31,9 @@ Server 与公网 Node 使用独立镜像，均支持 `linux/amd64` 和 `linux/ar
 docker compose -f compose.server.yml up -d
 ```
 
-默认访问 `http://127.0.0.1:3000`。同目录 `.env` 中的 `OMC_PUBLIC_ORIGIN` 应与浏览器实际访问的 HTTP 或 HTTPS 地址完全一致，否则修改操作会被来源校验拒绝。局域网直连时同时设置 `OMC_BIND_ADDRESS` 为对应网卡地址。公网推荐 HTTPS 反向代理，保留 localhost 绑定。
+默认访问 `http://127.0.0.1:3000`。网页操作与实时通知自动识别同源访问，局域网 IP 和反代域名无需逐一配置允许来源；现代浏览器优先使用 `Sec-Fetch-Site: same-origin`，缺少该信息时比较 `Origin`/`Referer` 与实际请求 `Host`。反代保留这些浏览器头、原始 `Host` 及 WebSocket 升级，不把 `Origin` 改写为后端地址；`X-Forwarded-Host` 不会被自动信任。局域网直连时设置 `OMC_BIND_ADDRESS` 为对应网卡地址。公网使用 HTTPS 反向代理，同机代理保留 localhost 绑定。
+
+需要生成供其它设备使用的 STRM 或 Emby 网关链接时，在 Compose 使用的 `.env` 中将 `OMC_PUBLIC_ORIGIN` 设为这些设备实际可达的地址，不带路径。该配置只作为额外显式可信来源，不限制正常同源网页；HTTPS origin 仍会自动启用 Secure Cookie，此时网页登录需使用 HTTPS。
 
 `server-state` 卷保存数据库、加密密钥、插件及日志，备份迁移时整体保留。需要本地媒体库、STRM 或接收 Node 文件时，额外挂载对应目录，在页面使用容器内路径。容器使用 UID/GID `65532:65532`，宿主机绑定目录要授予对应读写权限。镜像包含 FFmpeg，路径 `/usr/bin/ffmpeg`。
 

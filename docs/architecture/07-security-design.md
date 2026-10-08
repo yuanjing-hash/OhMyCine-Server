@@ -94,7 +94,7 @@ Server 同源 Web 管理端使用用户名密码登录，建立可撤销的服�
 - HTTPS 使用 `__Host-omc_session; Secure; HttpOnly; SameSite=Lax; Path=/`；显式局域网 HTTP 模式使用 host-only 普通 Cookie 并提示保护等级差异
 - 登录失败需要限速，避免暴力破解
 
-所有 Cookie 认证的状态变更请求还必须校验 session-bound `X-CSRF-Token`、精确 Origin（必要时 Referer fallback）、Fetch Metadata 和 `application/json`。CSRF token 只保存在前端内存，不进入 URL、日志或持久化存储。
+所有 Cookie 认证的状态变更请求还必须校验 session-bound `X-CSRF-Token`、浏览器同源信息和 `application/json`。浏览器的 `Sec-Fetch-Site: same-origin` 自动建立同源证据，兼容 HTTPS 反代终止 TLS 与后端 Host 改写；`cross-site` 始终拒绝，`same-site` 不整体信任兄弟子域。缺少同源 Fetch Metadata 时，严格解析 `Origin`（缺省时允许 `Referer` fallback），与实际请求 `Host` 的完整主机和端口比较，或匹配显式配置来源；缺失、`null`、畸形和重复来源均不因此获准。实时通知 WebSocket 升级复用同一规则并要求有效 Cookie 会话，不因 GET 而跳过来源检查。反代应保留浏览器来源头及原始 Host，不通过 `Forwarded`/`X-Forwarded-*` 自动扩展信任。CSRF token 只保存在前端内存，不进入 URL、日志或持久化存储。
 
 持久化任务队列的 worker payload/checkpoint 属于私有执行状态，不进入 REST、WebSocket、日志或审计。写入前限制为 64 KiB JSON 对象，并递归拒绝 Authorization、Cookie、password、secret、token、passkey、credential、签名 URL 与本地/绝对路径形态的字段。租约只持久化随机 token 的 SHA-256；所有 heartbeat、checkpoint 和完成操作都必须持有当前未过期 token。运行中暂停/取消先在短事务内持久化中断意图，事务提交后才通知 worker，且在 worker确认或租约过期前继续占用并发槽，避免非协作 worker 造成超卖。下载流水线取消必须二次确认并先调用 provider `Cancel(taskID, false)` 删除任务、保留文件；成功或明确 task-not-found 后才把 DownloadTask 与相关 Job 标记为 cancelled 并释放 Follow claim。终态删除默认也使用 `delete_data=false`，只有用户显式勾选完全删除才传 `true` 删除源/临时文件。provider 不可用、返回不确定错误或 ProviderTaskID 已存在但 Downloader 配置缺失时，必须保留本地记录；Submit 在取消后返回的迟到 provider ID 必须先持久化再用独立有界上下文清理，失败留下可诊断重试事实，不得仅为清空界面而伪造成功。
 
@@ -326,7 +326,7 @@ Player ↔ Server 配置同步是高风险功能，因为它可能把本地凭�
 
 默认推荐 `signed-url`。
 
-监听地址与对外公布地址必须分离。`0.0.0.0`/`::` 可以作为 Server bind address，但不能成为 `OMC_PUBLIC_ORIGIN`、CSRF origin、STRM 内容或 Emby gateway 地址；这些地址只由启动时严格校验的全局 `OMC_PUBLIC_ORIGIN` 生成，不能信任请求 Host/Forwarded，也不能在每个媒体库或播放器上重复配置。
+监听地址、浏览器同源校验与对外公布地址各自承担独立职责。`0.0.0.0`/`::` 可以作为 Server bind address，但不能成为 `OMC_PUBLIC_ORIGIN`、STRM 内容或 Emby gateway 地址。持久 STRM 与网关链接只由启动时严格校验的全局 `OMC_PUBLIC_ORIGIN` 生成，不能由请求 Host/Forwarded 改写，也不能在每个媒体库或播放器上重复配置。网页操作与实时通知自动识别浏览器同源信息；`OMC_PUBLIC_ORIGIN` 仅兼作额外显式可信来源，不是网页的单域名准入列表。
 
 Emby 管理使用加密 Connection 凭据，独立“播放器管理”页面只读取受控聚合摘要：服务器名、版本、媒体库/电影/剧集/单集数量及查询时间。禁止返回 API Key、库名、item ID、路径、用户、session 或上游原始 payload；可选统计失败必须保持 unknown/partial，不能伪造成 0。302 gateway 不注入保存的服务 API Key，只保留客户端自身 Emby 权限。
 

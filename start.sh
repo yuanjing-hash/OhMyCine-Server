@@ -32,7 +32,7 @@ OhMyCine Server 一键前台启动
   OMC_ENV            运行环境（默认 production）
   OMC_SERVER_HOST    监听地址（默认 0.0.0.0）
   OMC_SERVER_PORT    监听端口（默认 3000）
-  OMC_PUBLIC_ORIGIN  浏览器精确来源（默认按监听地址和端口生成）
+  OMC_PUBLIC_ORIGIN  STRM/网关对外地址（网页同源自动识别）
   OMC_COOKIE_SECURE  Cookie Secure 开关（默认由 public origin 推导）
   OMC_TMDB_READ_ACCESS_TOKEN / OMC_TMDB_API_KEY  二选一的运行时 TMDB 凭据
   OHMYCINE_TMDB_READ_ACCESS_TOKEN / OHMYCINE_TMDB_API_KEY  二选一的构建凭据

@@ -40,7 +40,7 @@ Windows 可以把不敏感的监听配置写入 `.runtime/windows/config/server.
 }
 ```
 
-优先级为 `OMC_*` 环境变量 > `server.json` > 默认值。配置文件只接受上面三个字段，禁止放 API Key、Cookie、密码或其它凭据。`listen_host` 是进程绑定地址，`public_origin` 是 Web UI CSRF 精确来源，也是 STRM 与 Emby 网关对外生成地址的唯一全局来源。`0.0.0.0` 只能用于监听，不能作为 `public_origin`。
+优先级为 `OMC_*` 环境变量 > `server.json` > 默认值。配置文件只接受上面三个字段，禁止放 API Key、Cookie、密码或其它凭据。`listen_host` 是进程绑定地址，`public_origin` 是 STRM 与 Emby 网关对外生成地址的唯一全局来源，并作为额外显式可信浏览器来源。网页自动识别实际同源访问，不要求 IP、域名都与该配置相同。`0.0.0.0` 只能用于监听，不能作为 `public_origin`。
 
 Web UI、STRM 和 Emby 302 网关共用主程序的 3000 端口，不需要为每个 Emby 单独开端口。同机 Emby 可以使用默认的 `http://127.0.0.1:3000` 网关地址；NAS 或其它 Player 跨设备访问时，应把 `public_origin` 配成 Server 实际可达的局域网 IP 或域名。
 
@@ -145,7 +145,7 @@ $env:OMC_SERVER_PORT = '3300'
 | `OMC_CLOAKBROWSER_COMPANION_URL` | 未设置 | 可选的本机 CloakBrowser companion 根地址，例如 `http://127.0.0.1:9222`；仅允许 loopback。用户须从官方渠道显式安装并接受其许可，OhMyCine 不下载或分发浏览器二进制 |
 | `OMC_UPDATE_MODE` | 自动检测 | 设为 `managed` 时保留官方版本检查但禁用进程内安装；适用于 Docker、NAS 套件、只读目录或由外部工具管理的部署 |
 | `OMC_ENV` | `production` | `development` / `production` |
-| `OMC_PUBLIC_ORIGIN` | `http://127.0.0.1:3000`（默认端口） | Web UI、STRM 与 Emby 网关使用的精确对外来源；不得使用通配监听地址 |
+| `OMC_PUBLIC_ORIGIN` | `http://127.0.0.1:3000`（默认端口） | STRM 与 Emby 网关的对外生成地址及额外显式可信来源；网页同源访问自动识别，不得使用通配监听地址 |
 | `OMC_COOKIE_SECURE` | 随 public origin 推导 | HTTPS 生产环境应为 `true` |
 
 例如在独立端口启动：
@@ -160,7 +160,7 @@ Windows 可运行 `powershell -ExecutionPolicy Bypass -File .\scripts\setup-ffmp
 
 TMDB 有效凭据优先级为：Web UI 加密自定义凭据 → 运行时部署凭据 → 正式构建内置应用凭据。每一级都显式区分 `read_access_token`（Bearer）和 `api_key`（v3 query），不按内容猜测；同一级的两个环境变量不能同时配置。清除自定义凭据会回到下一级；API 永远只返回 `custom/deployment/builtin/none` 来源与安全类型，不回显密文。默认 API 是 `https://api.tmdb.org/3`，仅 DNS、连接或超时错误回退 `https://api.themoviedb.org/3`；任何 HTTP 响应均不回退。自定义 API 和图片 HTTPS 前缀必须在设置页分别测试成功后才会保存。
 
-脚本默认监听 `0.0.0.0`，但默认对外来源仍是回环地址。IPv6 地址可以写成 `::1` 或 `[::1]`，脚本会使用 Go 监听所需的方括号形式。监听 `0.0.0.0` 或 `::` 时，默认浏览器来源分别仍为 `http://127.0.0.1:<端口>` 和 `http://[::1]:<端口>`；从局域网主机名、域名或反向代理访问时，必须将 `OMC_PUBLIC_ORIGIN` 显式设为浏览器实际使用的精确来源。公网部署还必须使用 HTTPS 反向代理；不要把默认配置直接暴露到公网。
+脚本默认监听 `0.0.0.0`，但默认对外生成地址仍是回环地址。IPv6 地址可以写成 `::1` 或 `[::1]`，脚本会使用 Go 监听所需的方括号形式。监听 `0.0.0.0` 或 `::` 时，默认对外生成地址分别为 `http://127.0.0.1:<端口>` 和 `http://[::1]:<端口>`；网页从局域网主机名、域名或反向代理同源访问时自动识别，反代应保留原始 `Host`、浏览器来源头和 WebSocket。生成供其它设备使用的 STRM、网关链接时，将 `OMC_PUBLIC_ORIGIN` 设为实际可达地址。公网使用 HTTPS 反向代理；HTTPS public origin 自动启用的 Secure Cookie 要求网页登录使用 HTTPS。
 
 `OMC_RUNTIME_DIR`、`OMC_BINARY_PATH`、`OMC_DATABASE_PATH` 和 `OMC_LOG_DIR` 的相对路径均以仓库根目录为基准，因此从任意当前目录调用脚本时行为一致。只有默认的 `.runtime/` 运行目录由仓库规则自动忽略；若覆盖到仓库内的其它路径，请自行确认不会误提交运行数据。
 

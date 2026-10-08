@@ -17,11 +17,9 @@ func (a *API) QueueEvents(c *gin.Context) {
 		c.AbortWithStatus(http.StatusServiceUnavailable)
 		return
 	}
-	allowed := map[string]struct{}{}
-	for _, origin := range a.config.AllowedOrigins() {
-		allowed[origin] = struct{}{}
-	}
-	upgrader := websocket.Upgrader{CheckOrigin: func(request *http.Request) bool { _, ok := allowed[request.Header.Get("Origin")]; return ok }}
+	upgrader := websocket.Upgrader{CheckOrigin: func(request *http.Request) bool {
+		return middleware.BrowserOriginAllowed(request, a.config.AllowedOrigins())
+	}}
 	actor, ok := middleware.ActorFrom(c)
 	token := middleware.SessionTokenFrom(c)
 	if !ok || token == "" || a.auth == nil {

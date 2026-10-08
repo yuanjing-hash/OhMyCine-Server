@@ -66,11 +66,13 @@ docker compose -f deploy/compose.server.yml up -d
 
 ### 局域网访问与端口
 
-上面的最小配置只允许宿主机访问。供其他设备上的 Player 或 Emby 使用时，将 `ports` 改为 `"3000:3000"`，并把 `OMC_PUBLIC_ORIGIN` 改为 Server 实际可达地址，例如 `http://192.168.1.10:3000`。
+上面的最小配置只允许宿主机访问。局域网直连时，将 `ports` 改为 `"3000:3000"`。网页自动识别同源请求，从局域网 IP 或反代域名打开后即可登录和操作，无需为网页访问逐一配置允许域名。供 Emby 或其它设备使用生成的 STRM、网关链接时，再把 `OMC_PUBLIC_ORIGIN` 改为这些设备实际可达的地址，例如 `http://192.168.1.10:3000`。
 
 使用宿主机端口 3300 时，映射写成 `"3300:3000"`，对外来源写成 `http://192.168.1.10:3300`；容器内部仍监听 3000。
 
-`OMC_PUBLIC_ORIGIN` 同时用于浏览器来源校验、STRM 和 Emby 网关地址生成，应与实际访问协议、主机和端口一致，不带路径。`0.0.0.0` 是监听地址，不能用作对外来源。反向代理部署时填写实际 HTTPS 域名，并转发 WebSocket；公网访问应通过 HTTPS 反向代理。
+`OMC_PUBLIC_ORIGIN` 用于生成 STRM 和 Emby 网关地址，不是网页访问的唯一允许域名；它仍可作为缺少浏览器同源信息时的显式可信来源。生成链接时应填写接收设备可达的协议、主机和端口，不带路径。`0.0.0.0` 是监听地址，不能用作对外来源。
+
+反向代理应保留浏览器的 `Origin`、`Referer`、`Sec-Fetch-*` 和原始 `Host`，并转发 WebSocket。现代浏览器的 `Sec-Fetch-Site: same-origin` 可以识别 HTTPS 反代，即使代理连接后端使用 HTTP；没有该信息时，Server 比较来源与请求 `Host`，不会自动信任 `X-Forwarded-Host`。Nginx 可用 `proxy_set_header Host $http_host;` 保留原始主机及端口。跨站请求仍会被拒绝，写操作继续要求会话与 CSRF。公网访问使用 HTTPS；设置 HTTPS 的 `OMC_PUBLIC_ORIGIN` 会自动启用 Secure Cookie，此时网页登录也需通过 HTTPS。
 
 ## docker run
 
@@ -95,7 +97,7 @@ docker run -d \
 docker logs -f --tail=100 ohmycine-server
 ```
 
-局域网访问同样需要改成 `-p 3000:3000`，并设置实际的 `OMC_PUBLIC_ORIGIN`。
+局域网直连同样需要改成 `-p 3000:3000`。网页无需另配允许域名；生成供其它设备使用的 STRM 或网关链接时，设置实际可达的 `OMC_PUBLIC_ORIGIN`。
 
 ## 持久化数据在哪里
 
