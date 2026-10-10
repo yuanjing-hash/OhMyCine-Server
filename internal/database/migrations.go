@@ -99,7 +99,7 @@ func schemaMigrationsThrough109() []migration {
 }
 
 func schemaMigrations() []migration {
-	return append(schemaMigrationsThrough109(), migration{Version: 110, Apply: migrateProviderDeletion}, migration{Version: 111, Apply: migrateCloudEmptyCleanup}, migration{Version: 112, Apply: migrateTGCloudSites}, migration{Version: 113, Apply: migrateMediaCatalogExclusions}, migration{Version: 114, Apply: migrateDownloaderOrder}, migration{Version: 115, Apply: migrateUserResourceAccessPolicies}, migration{Version: 116, Apply: migratePluginAccountSummary})
+	return append(schemaMigrationsThrough109(), migration{Version: 110, Apply: migrateProviderDeletion}, migration{Version: 111, Apply: migrateCloudEmptyCleanup}, migration{Version: 112, Apply: migrateTGCloudSites}, migration{Version: 113, Apply: migrateMediaCatalogExclusions}, migration{Version: 114, Apply: migrateDownloaderOrder}, migration{Version: 115, Apply: migrateUserResourceAccessPolicies}, migration{Version: 116, Apply: migratePluginAccountSummary}, migration{Version: 117, Apply: migratePluginCatalogueSnapshots})
 }
 
 func migratePluginAccountSummary(db *gorm.DB) error {

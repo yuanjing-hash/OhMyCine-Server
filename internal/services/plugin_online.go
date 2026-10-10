@@ -19,6 +19,7 @@ import (
 	serverlog "github.com/yuanjing-hash/OhMyCine-Server/internal/logging"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/plugins/contract"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/plugins/hostapi"
 	"gorm.io/gorm"
 )
 
@@ -45,6 +46,7 @@ type PluginOnlineLibrarySummary struct {
 	ArtworkRevision          string                `json:"artworkRevision,omitempty"`
 	ArtworkSource            string                `json:"artworkSource,omitempty"`
 	OfflineDownloadSupported bool                  `json:"offlineDownloadSupported"`
+	SystemHistorySupported   bool                  `json:"systemHistorySupported"`
 }
 
 func (s *PluginRepositoryService) OnlineArtworkCandidates(ctx context.Context, actor Actor, libraryID, scopeKey string) ([]contract.LibraryArtworkCandidate, error) {
@@ -123,6 +125,7 @@ type pluginErrorEnvelope struct {
 	PluginError *struct {
 		Code    string `json:"code"`
 		Message string `json:"message"`
+		Reason  string `json:"reason,omitempty"`
 	} `json:"pluginError"`
 }
 
@@ -162,6 +165,7 @@ func (s *PluginRepositoryService) OnlineLibraries(actor Actor) ([]PluginOnlineLi
 			Available: true, HomeContributions: home, ArtworkURL: artworkURL,
 			ArtworkRevision: fallbackArtworkRevision(artworkURL), ArtworkSource: artworkSource,
 			OfflineDownloadSupported: s.offline != nil && canPlayerOffline(actor) && manifestHasPermission(manifest, contract.PermissionDownloadPlan) && pluginHasActivePermission(s.db, library.PluginID, contract.PermissionDownloadPlan) && (manifestHasCapability(manifest, contract.CapabilityMediaOffline) || manifestHasCapability(manifest, contract.CapabilityMediaDownload)),
+			SystemHistorySupported:   s.OnlineHistoryAvailable(),
 		})
 	}
 	sort.SliceStable(result, func(i, j int) bool {
@@ -174,23 +178,31 @@ func (s *PluginRepositoryService) OnlineLibraries(actor Actor) ([]PluginOnlineLi
 }
 
 func (s *PluginRepositoryService) OnlineNavigation(ctx context.Context, actor Actor, libraryID string) (json.RawMessage, error) {
-	_, connection, manifest, err := s.onlineLibrary(libraryID)
+	defer s.foregroundOnline()()
+	if !actor.Can(authz.PermissionMediaLibrariesRead) {
+		return nil, appError(CodePermissionDenied, "无权使用在线媒体库", nil)
+	}
+	scope, err := s.authorizedOnlineScope(actor, libraryID)
 	if err != nil {
 		return nil, err
 	}
-	raw, err := s.invokeOnline(ctx, actor, libraryID, contract.CapabilitySiteNavigation, map[string]any{"connectionId": libraryID, "depth": 0})
+	if !manifestHasCapability(scope.manifest, contract.CapabilitySiteNavigation) {
+		return nil, appError(CodePermissionDenied, "在线媒体库不支持此操作", nil)
+	}
+	raw, _, err := s.catalogueRead(ctx, scope, "navigation", "", 0, nil, false)
 	if err != nil {
 		return nil, err
 	}
-	normalized, err := s.normalizeOnlineNavigation(libraryID, manifest, raw)
+	normalized, err := s.normalizeOnlineNavigation(libraryID, scope.manifest, raw)
 	if err != nil {
-		s.logInvalidOnlineNavigation(libraryID, manifest.ID, err)
+		s.logInvalidOnlineNavigation(libraryID, scope.manifest.ID, err)
 		return nil, err
 	}
-	return s.projectOnlineArtwork(ctx, connection.PluginID, connection.ID, normalized)
+	return s.projectOnlineArtwork(ctx, scope.connection.PluginID, scope.connection.ID, normalized)
 }
 
 func (s *PluginRepositoryService) OnlineFeed(ctx context.Context, actor Actor, libraryID, routeKey, cursor, refreshSession string) (json.RawMessage, error) {
+	defer s.foregroundOnline()()
 	if !safeOnlineText(routeKey, 256) || !safeOptionalOnlineText(cursor, maxOnlineIdentifierBytes) || !safeOptionalOnlineText(refreshSession, maxOnlineIdentifierBytes) {
 		return nil, appError(CodeInvalidRequest, "在线媒体栏目请求无效", nil)
 	}
@@ -199,6 +211,23 @@ func (s *PluginRepositoryService) OnlineFeed(ctx context.Context, actor Actor, l
 			return nil, appError(CodeInvalidRequest, "在线媒体刷新会话无效", nil)
 		}
 	}
+	if cursor == "" && refreshSession == "" {
+		if !actor.Can(authz.PermissionMediaLibrariesRead) {
+			return nil, appError(CodePermissionDenied, "无权使用在线媒体库", nil)
+		}
+		scope, err := s.authorizedOnlineScope(actor, libraryID)
+		if err != nil {
+			return nil, err
+		}
+		if !manifestHasCapability(scope.manifest, contract.CapabilitySiteFeed) {
+			return nil, appError(CodePermissionDenied, "在线媒体库不支持此操作", nil)
+		}
+		raw, _, err := s.catalogueRead(ctx, scope, "feed", routeKey, 0, nil, false)
+		if err != nil {
+			return nil, err
+		}
+		return s.projectOnlineArtwork(ctx, scope.connection.PluginID, scope.connection.ID, raw)
+	}
 	if refreshSession == "" {
 		refreshSession = uuid.NewString()
 	}
@@ -206,6 +235,7 @@ func (s *PluginRepositoryService) OnlineFeed(ctx context.Context, actor Actor, l
 }
 
 func (s *PluginRepositoryService) RefreshOnlineFeed(ctx context.Context, actor Actor, libraryID, routeKey string) (json.RawMessage, error) {
+	defer s.foregroundOnline()()
 	if !safeOnlineText(routeKey, 256) {
 		return nil, appError(CodeInvalidRequest, "在线媒体栏目请求无效", nil)
 	}
@@ -223,6 +253,10 @@ func (s *PluginRepositoryService) onlineFeed(ctx context.Context, actor Actor, l
 	if !manifestHasCapability(manifest, contract.CapabilitySiteFeed) || (forceRefresh && !manifestHasCapability(manifest, contract.CapabilityFeedRefresh)) {
 		return nil, appError(CodePermissionDenied, "在线媒体库不支持此操作", nil)
 	}
+	scope, scopeErr := s.authorizedOnlineScope(actor, libraryID)
+	if scopeErr != nil {
+		return nil, scopeErr
+	}
 	if forceRefresh {
 		var recent int64
 		if err := s.db.Model(&models.PluginFeedCache{}).Where("library_id = ? AND route_key = ? AND updated_at > ?", library.ID, routeKey, time.Now().UTC().Add(-2*time.Second)).Count(&recent).Error; err != nil {
@@ -231,12 +265,20 @@ func (s *PluginRepositoryService) onlineFeed(ctx context.Context, actor Actor, l
 		if recent > 0 {
 			return nil, appError(CodePluginFeedRateLimited, "在线栏目刷新过于频繁，请稍后重试", nil)
 		}
+		raw, _, err := s.catalogueRead(ctx, scope, "feed", routeKey, 0, nil, true)
+		if err != nil {
+			return nil, err
+		}
+		return s.projectOnlineArtwork(ctx, connection.PluginID, connection.ID, raw)
 	}
 	cursorKey := fmt.Sprintf("%x", sha256.Sum256([]byte(cursor)))
 	if !forceRefresh {
 		var cached models.PluginFeedCache
-		err := s.db.Where("library_id = ? AND route_key = ? AND cursor_key = ? AND refresh_session = ? AND expires_at > ?", library.ID, routeKey, cursorKey, refreshSession, time.Now().UTC()).First(&cached).Error
+		err := s.db.Where("library_id = ? AND route_key = ? AND cursor_key = ? AND refresh_session = ? AND scope_key = ? AND expires_at > ?", library.ID, routeKey, cursorKey, refreshSession, scope.key, time.Now().UTC()).First(&cached).Error
 		if err == nil && json.Valid([]byte(cached.ResponseJSON)) {
+			if err := checkOnlineScopeTx(s.db.WithContext(ctx), scope); err != nil {
+				return nil, err
+			}
 			return s.projectOnlineArtwork(ctx, connection.PluginID, connection.ID, json.RawMessage(cached.ResponseJSON))
 		}
 		if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
@@ -249,19 +291,28 @@ func (s *PluginRepositoryService) onlineFeed(ctx context.Context, actor Actor, l
 	if err != nil {
 		return nil, err
 	}
-	normalized, err := contract.NormalizeFeedSections(raw, refreshSession)
+	raw, err = checkCataloguePluginError(raw, contract.CapabilitySiteFeed)
+	if err != nil {
+		return nil, err
+	}
+	normalized, err := s.sanitizeCatalogue(scope, "feed", raw, refreshSession, 0, nil)
 	if err != nil {
 		return nil, appError(CodePluginResponseInvalid, "在线媒体栏目响应无效", err)
 	}
 	now := time.Now().UTC()
-	record := models.PluginFeedCache{LibraryID: library.ID, RouteKey: routeKey, CursorKey: cursorKey, RefreshSession: refreshSession, ResponseJSON: string(normalized), ExpiresAt: now.Add(pluginFeedCacheTTL), CreatedAt: now, UpdatedAt: now}
-	if err := s.db.Where("library_id = ? AND route_key = ? AND cursor_key = ? AND refresh_session = ?", library.ID, routeKey, cursorKey, refreshSession).
-		Assign(map[string]any{"response_json": record.ResponseJSON, "expires_at": record.ExpiresAt, "updated_at": now}).FirstOrCreate(&record).Error; err != nil {
+	record := models.PluginFeedCache{LibraryID: library.ID, RouteKey: routeKey, CursorKey: cursorKey, RefreshSession: refreshSession, ScopeKey: scope.key, ResponseJSON: string(normalized), ExpiresAt: now.Add(30 * time.Minute), CreatedAt: now, UpdatedAt: now}
+	if err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := checkOnlineScopeTx(tx, scope); err != nil {
+			return err
+		}
+		if err := tx.Where("library_id = ? AND route_key = ? AND cursor_key = ? AND refresh_session = ?", library.ID, routeKey, cursorKey, refreshSession).
+			Assign(map[string]any{"response_json": record.ResponseJSON, "scope_key": scope.key, "expires_at": record.ExpiresAt, "updated_at": now}).FirstOrCreate(&record).Error; err != nil {
+			return err
+		}
+		return prunePluginFeedTx(tx, library.ID, now)
+	}); err != nil {
 		return nil, err
 	}
-	// Cleanup is bounded and best-effort; cache failure must not hide a valid
-	// provider response from the Player.
-	_ = s.db.Where("expires_at < ?", now.Add(-time.Hour)).Delete(&models.PluginFeedCache{}).Error
 	return s.projectOnlineArtwork(ctx, connection.PluginID, connection.ID, normalized)
 }
 
@@ -283,8 +334,15 @@ func (s *PluginRepositoryService) OnlineDetail(ctx context.Context, actor Actor,
 	if !safeOnlineText(itemID, maxOnlineIdentifierBytes) {
 		return nil, appError(CodeInvalidRequest, "在线媒体标识无效", nil)
 	}
+	scope, scopeErr := s.authorizedOnlineScope(actor, libraryID)
+	if scopeErr != nil {
+		return nil, scopeErr
+	}
 	raw, err := s.invokeOnline(ctx, actor, libraryID, contract.CapabilitySiteDetail, map[string]any{"connectionId": libraryID, "itemId": itemID})
 	if err != nil {
+		return nil, err
+	}
+	if err := s.rememberOnlineDetail(ctx, scope, itemID, raw); err != nil {
 		return nil, err
 	}
 	return s.projectOnlineArtworkForLibrary(ctx, libraryID, raw)
@@ -293,6 +351,10 @@ func (s *PluginRepositoryService) OnlineDetail(ctx context.Context, actor Actor,
 func (s *PluginRepositoryService) OnlinePlayback(ctx context.Context, actor Actor, libraryID, itemID, segmentID, versionID, variantID string) (json.RawMessage, error) {
 	if !safeOnlineText(itemID, maxOnlineIdentifierBytes) || !safeOnlineText(segmentID, maxOnlineIdentifierBytes) || !safeOnlineText(versionID, maxOnlineIdentifierBytes) || !safeOptionalOnlineText(variantID, maxOnlineIdentifierBytes) {
 		return nil, appError(CodeInvalidRequest, "在线媒体播放请求无效", nil)
+	}
+	scope, scopeErr := s.authorizedOnlineScope(actor, libraryID)
+	if scopeErr != nil {
+		return nil, scopeErr
 	}
 	response, err := s.invokeOnline(ctx, actor, libraryID, contract.CapabilityMediaPlayback, map[string]any{
 		"connectionId": libraryID, "itemId": itemID, "segmentId": segmentID, "versionId": versionID, "variantId": emptyAsNil(variantID),
@@ -312,6 +374,24 @@ func (s *PluginRepositoryService) OnlinePlayback(ctx context.Context, actor Acto
 	if err := contract.ValidatePlaybackPlan(plan, time.Now().UTC()); err != nil {
 		return nil, appError(CodePluginResponseInvalid, "在线播放方案无效", err)
 	}
+	if plan.WorkID != itemID || plan.SegmentID != segmentID || plan.VersionID != versionID || variantID != "" && plan.VariantID != variantID {
+		return nil, appError(CodePluginResponseInvalid, "在线播放身份与所选分集、版本或清晰度不一致", nil)
+	}
+	if inspector, ok := s.artwork.(interface {
+		ResolveAsset(string) (hostapi.Asset, error)
+	}); ok {
+		for _, media := range plan.Assets {
+			asset, err := inspector.ResolveAsset(media.URLRef)
+			if err != nil || asset.PluginID != scope.connection.PluginID || asset.ConnectionID != scope.connection.ID || asset.PackageID != scope.packageID || asset.RuntimeGeneration != scope.generation || asset.Artwork || asset.OfflineOnly || !asset.ExpiresAt.After(time.Now()) {
+				return nil, appError(CodePluginResponseInvalid, "在线播放资源归属或有效期无效", nil)
+			}
+		}
+	}
+	if s.history != nil {
+		if err := s.rememberOnlinePlayback(ctx, actor, scope, itemID, segmentID, versionID); err != nil {
+			return nil, err
+		}
+	}
 	return rewriteOnlineAssetReferences(response)
 }
 
@@ -327,11 +407,29 @@ func (s *PluginRepositoryService) SyncOnlineProgress(ctx context.Context, actor 
 	if durationSeconds != nil && (*durationSeconds < 0 || *durationSeconds > 365*24*60*60) {
 		return nil, appError(CodeInvalidRequest, "在线播放时长无效", nil)
 	}
-	return s.invokeOnline(ctx, actor, libraryID, contract.CapabilityPlaybackProgress, map[string]any{
+	_, _, manifest, err := s.onlineLibrary(libraryID)
+	if err != nil {
+		return nil, err
+	}
+	if s.history != nil {
+		if err := s.saveOnlineProgress(ctx, actor, libraryID, itemID, segmentID, versionID, event, positionSeconds, durationSeconds, occurredAt); err != nil {
+			return nil, err
+		}
+		if !manifestHasCapability(manifest, contract.CapabilityPlaybackProgress) {
+			return json.RawMessage(`{"accepted":true,"remote":false}`), nil
+		}
+	} else if !manifestHasCapability(manifest, contract.CapabilityPlaybackProgress) {
+		return nil, appError(CodePluginRuntimeUnavailable, "在线播放历史服务不可用", nil)
+	}
+	raw, err := s.invokeOnline(ctx, actor, libraryID, contract.CapabilityPlaybackProgress, map[string]any{
 		"connectionId": libraryID, "itemId": itemID, "segmentId": segmentID, "versionId": versionID,
 		"event": event, "positionSeconds": positionSeconds, "durationSeconds": durationSeconds,
 		"idempotencyKey": idempotencyKey, "occurredAt": emptyAsNil(occurredAt),
 	})
+	if err != nil && s.history != nil {
+		return json.RawMessage(`{"accepted":true,"remote":false}`), nil
+	}
+	return raw, err
 }
 
 func (s *PluginRepositoryService) OnlineHistory(ctx context.Context, actor Actor, libraryID, encodedCursor string, pageSize int) (PluginOnlineHistoryPage, error) {
@@ -554,6 +652,7 @@ func markPluginActionDuplicate(raw json.RawMessage) (json.RawMessage, error) {
 }
 
 func (s *PluginRepositoryService) invokeOnline(ctx context.Context, actor Actor, libraryID string, capability contract.Capability, request any) (json.RawMessage, error) {
+	defer s.foregroundOnline()()
 	if !actor.Can(authz.PermissionMediaLibrariesRead) {
 		return nil, appError(CodePermissionDenied, "无权使用在线媒体库", nil)
 	}
@@ -598,22 +697,69 @@ func (s *PluginRepositoryService) invokeOnline(ctx context.Context, actor Actor,
 			Str("plugin_id", safeLabel(connection.PluginID, 128)).
 			Str("library_id", safeLabel(libraryID, 128)).
 			Str("capability", safeLabel(string(capability), 96)).
-			Str("error_code", safeLabel(envelope.PluginError.Code, 96)).
+			Str("error_code", safePluginOnlineCode(envelope.PluginError.Code)).
+			Str("reason", safePluginOnlineReason(envelope.PluginError.Reason)).
 			Msg(serverlog.OperationPluginRuntime.Message("在线媒体能力调用失败"))
 		// Plugin text is untrusted and may contain an upstream URL, credential,
 		// cookie, or provider diagnostic. Only the bounded code selects a stable,
 		// Server-owned message.
-		return nil, mapPluginOnlineError(envelope.PluginError.Code, capability)
+		return nil, mapPluginOnlineErrorReason(envelope.PluginError.Code, envelope.PluginError.Reason, capability)
 	}
 	return append(json.RawMessage(nil), trimmed...), nil
 }
 
 func mapPluginOnlineError(pluginCode string, capability contract.Capability) error {
+	return mapPluginOnlineErrorReason(pluginCode, "", capability)
+}
+
+func safePluginOnlineCode(value string) string {
+	switch value {
+	case "not-authenticated", "access-restricted", "permission-denied", "not-found", "quality-unavailable", "rate-limited", "invalid-response", "playback-audio-unavailable", "asset-domain-denied", "upstream-unavailable", "unsupported", "invalid-request":
+		return value
+	default:
+		return "unknown"
+	}
+}
+func safePluginOnlineReason(value string) string {
+	switch value {
+	case "entitlement-required", "region-restricted", "drm-unsupported", "quality-unavailable", "incomplete-stream", "asset-domain-denied", "network-access-denied", "download-unavailable":
+		return value
+	default:
+		return ""
+	}
+}
+
+func mapPluginOnlineErrorReason(pluginCode, reason string, capability contract.Capability) error {
+	// Only this closed provider-neutral enum selects Server-owned text. The
+	// provider message, URL, response body and credentials remain unexposed.
+	switch reason {
+	case "entitlement-required":
+		if pluginCode == "not-authenticated" {
+			return appError(CodePluginOnlineAuthentication, "在线媒体账号登录已失效，请在 Server 插件设置中重新登录", nil)
+		}
+		return appError(CodePluginOnlineAccessRestricted, "当前视频未获得完整播放权益，请在官方客户端确认该账号与具体节目的权限", nil)
+	case "region-restricted":
+		return appError(CodePluginOnlineAccessRestricted, "当前地区无法播放此在线媒体", nil)
+	case "drm-unsupported":
+		return appError(CodePluginOnlineAccessRestricted, "该视频采用当前不支持的 DRM 保护", nil)
+	case "quality-unavailable":
+		return appError(CodePluginOnlineQualityUnavailable, "所选在线媒体清晰度不可用，请选择其他清晰度", nil)
+	case "incomplete-stream":
+		return appError(CodePluginOnlineAccessRestricted, "来源只返回了试看或不完整视频，无法开始完整播放", nil)
+	case "asset-domain-denied":
+		return appError(CodePluginResponseInvalid, "视频资源域名未在插件权限中声明，请更新插件后重试", nil)
+	case "network-access-denied":
+		return appError(CodePermissionDenied, "插件网络访问被拒绝，请检查域名解析、网络权限与代理配置", nil)
+	case "download-unavailable":
+		return appError(CodePermissionDenied, "来源尚未为该视频开放下载入口", nil)
+	}
 	switch strings.TrimSpace(pluginCode) {
 	case "not-authenticated":
 		return appError(CodePluginOnlineAuthentication, "在线媒体账号登录已失效，请在 Server 插件设置中重新登录", nil)
 	case "access-restricted":
 		return appError(CodePluginOnlineAccessRestricted, "当前账号或地区无法播放此在线媒体", nil)
+	case "permission-denied":
+		return appError(CodePermissionDenied, "在线媒体访问被拒绝，请检查账号权益和插件网络权限", nil)
 	case "not-found":
 		return appError(CodeNotFound, "在线媒体不存在或不可访问", nil)
 	case "quality-unavailable":

@@ -201,6 +201,11 @@ func TestPluginOnlineLibraryPlaybackHistoryAndDisableBoundary(t *testing.T) {
 		t.Fatalf("connection health=%+v err=%v", healthy, err)
 	}
 	runtime.handler = nil
+	// Exercise a cold provider error; a valid catalogue snapshot intentionally
+	// remains usable during a bounded upstream outage.
+	if err := service.db.Where("library_id = ?", connection.ID).Delete(&models.PluginCatalogueSnapshot{}).Error; err != nil {
+		t.Fatal(err)
+	}
 	runtime.responses["site.navigation"] = []byte(" \n [{\"id\":\"recommended\",\"title\":\"推荐\",\"pageType\":\"feed\",\"routeKey\":\"recommended\"}] \n")
 	navigation, err := service.OnlineNavigation(context.Background(), actor, connection.ID)
 	if err != nil || !json.Valid(navigation) || navigation[0] != '[' {
@@ -296,6 +301,10 @@ func TestPluginOnlineLibraryPlaybackHistoryAndDisableBoundary(t *testing.T) {
 	}
 	runtime.handler = nil
 	runtime.responses["site.navigation"] = []byte(`{"pluginError":{"code":"upstream-unavailable","message":"站点暂时不可用"}}`)
+	// Exercise a cold upstream failure; a valid snapshot deliberately survives outages.
+	if err := service.db.Where("library_id = ?", connection.ID).Delete(&models.PluginCatalogueSnapshot{}).Error; err != nil {
+		t.Fatal(err)
+	}
 	if _, err := service.OnlineNavigation(context.Background(), actor, connection.ID); ErrorCode(err) != CodePluginOnlineLibraryUnavailable || ErrorMessage(err) != "在线媒体来源暂时不可用" {
 		t.Fatalf("provider error=%v code=%s", err, ErrorCode(err))
 	}

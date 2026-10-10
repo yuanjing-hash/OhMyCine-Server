@@ -668,6 +668,7 @@ type PluginFeedCache struct {
 	CursorKey      string    `gorm:"size:64;not null;uniqueIndex:idx_plugin_feed_cache_identity,priority:3" json:"-"`
 	RefreshSession string    `gorm:"size:36;not null;uniqueIndex:idx_plugin_feed_cache_identity,priority:4" json:"refresh_session"`
 	ResponseJSON   string    `gorm:"type:text;not null" json:"-"`
+	ScopeKey       string    `gorm:"size:64;not null;default:''" json:"-"`
 	ExpiresAt      time.Time `gorm:"not null;index" json:"expires_at"`
 	CreatedAt      time.Time `gorm:"not null" json:"created_at"`
 	UpdatedAt      time.Time `gorm:"not null" json:"updated_at"`
