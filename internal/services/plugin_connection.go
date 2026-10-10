@@ -13,9 +13,11 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/authz"
+	serverlog "github.com/yuanjing-hash/OhMyCine-Server/internal/logging"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/plugins/contract"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/plugins/hostapi"
+	pluginruntime "github.com/yuanjing-hash/OhMyCine-Server/internal/plugins/runtime"
 	"gorm.io/gorm"
 )
 
@@ -542,6 +544,13 @@ func (s *PluginRepositoryService) invokePluginOperation(ctx context.Context, con
 	}
 	response, err := s.runtime.Invoke(ctx, connection.PluginID, operation, payload)
 	if err != nil {
+		// Log only Server-owned stable codes and declared identity/operation.
+		// Causes, guest output, request bodies and provider URLs can hold secrets.
+		serverlog.OperationPluginRuntime.Event(s.log.Warn()).
+			Str("plugin_id", safeLabel(connection.PluginID, 128)).
+			Str("operation", safeLabel(operation, 128)).
+			Str("error_code", pluginruntime.ErrorCode(err)).
+			Msg("插件调用失败")
 		return nil, appError(CodePluginRuntimeUnavailable, "插件调用失败", err)
 	}
 	return response, nil

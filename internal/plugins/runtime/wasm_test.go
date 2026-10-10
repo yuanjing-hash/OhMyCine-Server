@@ -9,12 +9,12 @@ import (
 )
 
 func TestOnlineControlOperationTimeoutsAreBounded(t *testing.T) {
-	for _, operation := range []string{"site.auth.poll", "site.detail", "media.playback", "media.offline_download_plan"} {
+	for _, operation := range []string{"site.auth.poll", "site.detail", "site.navigation", "site.feed", "site.search", "library.artwork_candidates", "media.metadata", "media.playback", "media.offline_download_plan"} {
 		if operationTimeout(operation) != 45*time.Second {
 			t.Fatalf("multi-request control budget wrong: %s", operation)
 		}
 	}
-	if operationTimeout("site.navigation") != resourceCallTimeout || operationTimeout("unknown") != defaultCallTimeout {
+	if operationTimeout("site.history") != resourceCallTimeout || operationTimeout("unknown") != defaultCallTimeout {
 		t.Fatal("default budget changed")
 	}
 }
