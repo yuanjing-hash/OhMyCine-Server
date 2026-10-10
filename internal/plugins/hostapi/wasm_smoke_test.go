@@ -81,7 +81,7 @@ func TestMangoWASMCurrentHostPublicFixtureSmoke(t *testing.T) {
 				t.Fatalf("%s: %v", selection.operation, err)
 			}
 			var response map[string]any
-			if json.Unmarshal(output, &response) != nil || response["error"] != nil {
+			if json.Unmarshal(output, &response) != nil || response["pluginError"] != nil {
 				t.Fatalf("%s returned business error: %s", selection.operation, output)
 			}
 			if selection.operation == "site.auth.start" && response["loginSession"] == nil {
@@ -166,7 +166,7 @@ func TestMangoWASMCurrentHostMediaPlaybackAndOfflineEntitlement(t *testing.T) {
 				t.Fatal(err)
 			}
 			var errorResponse struct {
-				Error any `json:"error"`
+				Error any `json:"pluginError"`
 			}
 			if json.Unmarshal(output, &errorResponse) != nil || errorResponse.Error != nil {
 				t.Fatalf("free media rejected: %s", output)
@@ -208,7 +208,7 @@ func TestMangoWASMCurrentHostMediaPlaybackAndOfflineEntitlement(t *testing.T) {
 			var envelope struct {
 				Error struct {
 					Code string `json:"code"`
-				} `json:"error"`
+				} `json:"pluginError"`
 			}
 			if json.Unmarshal(output, &envelope) != nil || envelope.Error.Code != "permission-denied" {
 				t.Fatalf("real trial not rejected: %s", output)
@@ -227,7 +227,7 @@ func TestMangoWASMCurrentHostMediaPlaybackAndOfflineEntitlement(t *testing.T) {
 	var envelope struct {
 		Error struct {
 			Code string `json:"code"`
-		} `json:"error"`
+		} `json:"pluginError"`
 	}
 	if json.Unmarshal(output, &envelope) != nil || envelope.Error.Code != "permission-denied" || dispatches != 2 {
 		t.Fatal("synthetic disabled-download negative reached media")

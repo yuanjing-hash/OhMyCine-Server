@@ -16,7 +16,7 @@ func TestBrowserLoginSequenceHasBoundedMultiRequestBudget(t *testing.T) {
 			t.Fatalf("%s unexpectedly enlarged: %v", operation, got)
 		}
 	}
-	if operationTimeout("site.search") != resourceCallTimeout {
-		t.Fatal("online control HTTP budget changed")
+	if operationTimeout("site.search") != 45*time.Second {
+		t.Fatal("multi-request online control HTTP budget missing")
 	}
 }

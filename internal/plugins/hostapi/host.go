@@ -78,6 +78,8 @@ type Host struct {
 	log              zerolog.Logger
 	client           *http.Client
 	resolve          Resolver
+	customResolver   bool
+	dnsFallback      *fakeIPResolver
 	now              func() time.Time
 	eventsMu         sync.Mutex
 	eventSeq         uint64
@@ -101,7 +103,12 @@ func (host *Host) SetBrowserCommit(commit func(context.Context, models.PluginCon
 }
 
 func WithHTTPClient(client *http.Client) Option { return func(host *Host) { host.client = client } }
-func WithResolver(resolver Resolver) Option     { return func(host *Host) { host.resolve = resolver } }
+
+// A caller-supplied resolver is a complete controlled policy. Never add an
+// implicit external DNS query to test fixtures or an explicit custom resolver.
+func WithResolver(resolver Resolver) Option {
+	return func(host *Host) { host.resolve, host.customResolver = resolver, true }
+}
 
 func New(db *gorm.DB, credentials *credential.Store, log zerolog.Logger, options ...Option) *Host {
 	host := &Host{
@@ -116,6 +123,10 @@ func New(db *gorm.DB, credentials *credential.Store, log zerolog.Logger, options
 	}
 	for _, option := range options {
 		option(host)
+	}
+	if !host.customResolver {
+		host.dnsFallback = newFakeIPResolver(host.resolve)
+		host.resolve = host.dnsFallback.LookupIPAddr
 	}
 	if host.client == nil {
 		host.client = host.defaultHTTPClient()
@@ -137,20 +148,24 @@ func (host *Host) dialPublicContext(ctx context.Context, network, address string
 	if err != nil || !allowedAssetPort(port) {
 		return nil, denied("plugin_http_dial_denied", err)
 	}
-	addresses, err := host.resolve(ctx, hostname)
-	if err != nil || len(addresses) == 0 {
-		return nil, denied("plugin_http_dns_unavailable", err)
-	}
-	if err := requirePublicAddresses(addresses); err != nil {
+	addresses, err := host.publicHostAddresses(ctx, hostname)
+	if err != nil {
 		return nil, err
 	}
 	dialer := net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
+	return dialPublicIPs(ctx, network, port, addresses, dialer.DialContext)
+}
+
+func dialPublicIPs(ctx context.Context, network, port string, addresses []net.IPAddr, dial func(context.Context, string, string) (net.Conn, error)) (net.Conn, error) {
+	if err := requirePublicAddresses(addresses); err != nil {
+		return nil, err
+	}
 	var lastErr error
 	for _, resolved := range addresses {
 		if resolved.IP == nil || (network == "tcp4" && resolved.IP.To4() == nil) || (network == "tcp6" && resolved.IP.To4() != nil) {
 			continue
 		}
-		connection, dialErr := dialer.DialContext(ctx, network, net.JoinHostPort(resolved.IP.String(), port))
+		connection, dialErr := dial(ctx, network, net.JoinHostPort(resolved.IP.String(), port))
 		if dialErr == nil {
 			return connection, nil
 		}
@@ -1263,17 +1278,26 @@ func (host *Host) connectionExists(pluginID, connectionID string) bool {
 }
 
 func (host *Host) requirePublicHost(ctx context.Context, hostname string) error {
+	_, err := host.publicHostAddresses(ctx, hostname)
+	return err
+}
+
+func (host *Host) publicHostAddresses(ctx context.Context, hostname string) ([]net.IPAddr, error) {
 	addresses, err := host.resolve(ctx, hostname)
 	if err != nil || len(addresses) == 0 {
-		return denied("plugin_http_dns_unavailable", err)
+		var hostError *Error
+		if errors.As(err, &hostError) {
+			return nil, hostError
+		}
+		return nil, denied("plugin_http_dns_unavailable", err)
 	}
-	return requirePublicAddresses(addresses)
+	return addresses, requirePublicAddresses(addresses)
 }
 
 func requirePublicAddresses(addresses []net.IPAddr) error {
 	for _, address := range addresses {
 		ip := address.IP
-		if ip == nil || ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() || ip.IsMulticast() {
+		if address.Zone != "" || ip == nil || ip.To16() == nil || ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() || ip.IsMulticast() || isFakeIP(ip) {
 			return denied("plugin_http_private_address_denied", nil)
 		}
 	}

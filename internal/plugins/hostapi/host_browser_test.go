@@ -31,12 +31,11 @@ func TestHostBrowserFakeIPDNSAndPrivateBoundary(t *testing.T) {
 		})
 		raw, _ := json.Marshal(httpRequest{ConnectionID: fixture.connection.ID, Credential: "site.session", Method: "GET", URL: "https://api.example.test/search"})
 		_, err := host.Call(context.Background(), fixture.pluginID, OperationHTTP, raw)
-		if address == "198.18.7.137" {
-			if err != nil || !called {
-				t.Fatalf("Fake-IP cannot reach managed browser policy: %v", err)
-			}
-		} else if err == nil || called {
-			t.Fatal("private destination reached browser")
+		// An explicit controlled resolver does not opt into network repair.
+		// Synthetic addresses must be replaced by the default resolver before
+		// any browser dispatch, just like private addresses.
+		if err == nil || called {
+			t.Fatal("private or synthetic destination reached browser")
 		}
 	}
 }
