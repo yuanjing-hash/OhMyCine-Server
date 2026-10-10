@@ -197,6 +197,12 @@ func TestMangoWASMCurrentHostMediaPlaybackAndOfflineEntitlement(t *testing.T) {
 	if dispatches != 2 {
 		t.Fatal("media resolution did not use controlled dispatch twice")
 	}
+	registeredAssets := func() int {
+		api.assetsMu.Lock()
+		defer api.assetsMu.Unlock()
+		return len(api.assets)
+	}
+	assetsBeforeTrial := registeredAssets()
 	for _, operation := range []string{"media.playback", "media.offline_download_plan"} {
 		t.Run(operation+"_real_trial_rejected", func(t *testing.T) {
 			trial := map[string]string{"connectionId": fixture.connection.ID, "itemId": "clip:778406", "segmentId": "video:24623021", "versionId": "mgtv:778406:24623021", "variantId": "h264:3:239415301"}
@@ -207,14 +213,21 @@ func TestMangoWASMCurrentHostMediaPlaybackAndOfflineEntitlement(t *testing.T) {
 			}
 			var envelope struct {
 				Error struct {
-					Code string `json:"code"`
+					Code   string `json:"code"`
+					Reason string `json:"reason"`
 				} `json:"pluginError"`
 			}
-			if json.Unmarshal(output, &envelope) != nil || envelope.Error.Code != "permission-denied" {
-				t.Fatalf("real trial not rejected: %s", output)
+			// The observed trial explicitly reports user.login=false. Preserve
+			// that canonical authentication denial and its closed entitlement reason.
+			if json.Unmarshal(output, &envelope) != nil || envelope.Error.Code != "not-authenticated" || envelope.Error.Reason != "entitlement-required" {
+				t.Fatal("observed anonymous trial lacked authentication/entitlement denial")
 			}
-			if dispatches != 2 {
-				t.Fatal("trial reached CDN dispatch")
+			var fields map[string]json.RawMessage
+			if json.Unmarshal(output, &fields) != nil || len(fields) != 1 || fields["pluginError"] == nil {
+				t.Fatal("trial returned a playback or download plan with its denial")
+			}
+			if dispatches != 2 || registeredAssets() != assetsBeforeTrial {
+				t.Fatal("trial reached CDN dispatch or registered an asset")
 			}
 		})
 	}

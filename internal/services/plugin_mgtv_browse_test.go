@@ -26,9 +26,10 @@ import (
 )
 
 type mangoBrowseControl struct {
-	files string
-	bad   bool
-	reads int
+	files  string
+	bad    bool
+	reads  int
+	client *http.Client
 }
 
 func mangoBrowseService(t *testing.T, live bool) (*PluginRepositoryService, Actor, string, *hostapi.Host, *mangoBrowseControl) {
@@ -135,6 +136,7 @@ func mangoBrowseService(t *testing.T, live bool) (*PluginRepositoryService, Acto
 	options := []hostapi.Option{hostapi.WithHTTPClient(client), hostapi.WithResolver(func(context.Context, string) ([]net.IPAddr, error) {
 		return []net.IPAddr{{IP: net.ParseIP("203.0.113.10")}}, nil
 	})}
+	control.client = client
 	if live {
 		options = nil
 	}
@@ -235,7 +237,13 @@ func TestMangoWASMBrowseServiceFullPayloadAndErrors(t *testing.T) {
 		mangoBrowseCycle(t, service, actor, libraryID, api, 40)
 	}
 	control.bad = true
-	if raw, err := service.OnlineFeed(context.Background(), actor, libraryID, "catalog:2", "", ""); err == nil || len(raw) != 0 {
+	// A normal cached first page survives an upstream outage. Explicit refresh
+	// must still reject malformed data and retain the previous valid snapshot.
+	scope, err := service.catalogueScope(libraryID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if raw, _, err := service.catalogueRead(context.Background(), scope, "feed", "catalog:2", 0, nil, true); err == nil || len(raw) != 0 {
 		t.Fatal("malformed upstream catalogue was accepted as empty/successful feed")
 	}
 	control.bad = false

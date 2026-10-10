@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/authz"
 	serverlog "github.com/yuanjing-hash/OhMyCine-Server/internal/logging"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/plugins/contract"
 )
@@ -62,29 +63,34 @@ type pluginNavigationNode struct {
 }
 
 func (s *PluginRepositoryService) OnlineNavigationChildren(ctx context.Context, actor Actor, libraryID, token string) (json.RawMessage, error) {
+	defer s.foregroundOnline()()
+	if !actor.Can(authz.PermissionMediaLibrariesRead) {
+		return nil, appError(CodePermissionDenied, "无权使用在线媒体库", nil)
+	}
 	claim, err := s.verifyPluginNavigationToken(token)
 	if err != nil || claim.LibraryID != libraryID || claim.Depth < 1 || claim.Depth >= maxPluginNavigationDepth {
 		return nil, appError(CodeInvalidRequest, "在线媒体导航节点无效", err)
 	}
-	_, connection, manifest, err := s.onlineLibrary(libraryID)
+	scope, err := s.authorizedOnlineScope(actor, libraryID)
 	if err != nil {
 		return nil, err
 	}
-	if manifest.NavigationMode != "hierarchical" {
+	if scope.manifest.NavigationMode != "hierarchical" {
 		return nil, appError(CodePermissionDenied, "在线媒体库不支持层级导航", nil)
 	}
-	raw, err := s.invokeOnline(ctx, actor, libraryID, contract.CapabilitySiteNavigation, map[string]any{
-		"connectionId": libraryID, "parentNodeKey": claim.NodeKey, "depth": claim.Depth,
-	})
+	if !manifestHasCapability(scope.manifest, contract.CapabilitySiteNavigation) {
+		return nil, appError(CodePermissionDenied, "在线媒体库不支持此操作", nil)
+	}
+	raw, _, err := s.catalogueRead(ctx, scope, "navigation", claim.NodeKey, claim.Depth, claim.Ancestors, false)
 	if err != nil {
 		return nil, err
 	}
 	normalized, err := s.normalizeHierarchicalNavigation(libraryID, raw, claim.Depth, claim.Ancestors)
 	if err != nil {
-		s.logInvalidOnlineNavigation(libraryID, manifest.ID, err)
+		s.logInvalidOnlineNavigation(libraryID, scope.manifest.ID, err)
 		return nil, err
 	}
-	return s.projectOnlineArtwork(ctx, connection.PluginID, connection.ID, normalized)
+	return s.projectOnlineArtwork(ctx, scope.connection.PluginID, scope.connection.ID, normalized)
 }
 
 func (s *PluginRepositoryService) logInvalidOnlineNavigation(libraryID, pluginID string, err error) {

@@ -91,6 +91,9 @@ type PluginRepositoryService struct {
 	pluginRoot     string
 	lifecycleMu    sync.Mutex
 	navigationKey  [32]byte
+	catalogueOnce  sync.Once
+	catalogue      *pluginCatalogueCache
+	history        *PlayerHistoryService
 }
 
 type PluginRepositorySummary struct {

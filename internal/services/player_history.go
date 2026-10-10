@@ -22,41 +22,43 @@ const playerHistorySyncLimit = 500
 const playerHistoryFutureTolerance = 5 * time.Minute
 
 type PlayerHistoryChange struct {
-	SyncKey          string   `json:"sync_key"`
-	HistoryIdentity  string   `json:"history_identity,omitempty"`
-	SourceKind       string   `json:"source_kind"`
-	SourceName       string   `json:"source_name,omitempty"`
-	SourceLocator    string   `json:"source_locator,omitempty"`
-	SourceID         string   `json:"source_id"`
-	LibraryID        string   `json:"library_id,omitempty"`
-	ItemID           string   `json:"item_id,omitempty"`
-	ItemToken        string   `json:"item_token,omitempty"`
-	MediaIdentity    string   `json:"media_identity"`
-	Title            string   `json:"title"`
-	DisplayTitle     string   `json:"display_title,omitempty"`
-	DisplaySubtitle  string   `json:"display_subtitle,omitempty"`
-	SeriesTitle      string   `json:"series_title,omitempty"`
-	EpisodeTitle     string   `json:"episode_title,omitempty"`
-	SeasonNumber     *int     `json:"season_number,omitempty"`
-	EpisodeNumber    *int     `json:"episode_number,omitempty"`
-	StreamIdentity   string   `json:"stream_identity,omitempty"`
-	MediaType        string   `json:"media_type,omitempty"`
-	PosterURL        string   `json:"poster_url,omitempty"`
-	BackdropURL      string   `json:"backdrop_url,omitempty"`
-	TitleLogoURL     string   `json:"title_logo_url,omitempty"`
-	PosterAssetID    string   `json:"poster_asset_id,omitempty"`
-	BackdropAssetID  string   `json:"backdrop_asset_id,omitempty"`
-	TitleLogoAssetID string   `json:"title_logo_asset_id,omitempty"`
-	PosterPath       string   `json:"poster_path,omitempty"`
-	BackdropPath     string   `json:"backdrop_path,omitempty"`
-	EpisodeStillPath string   `json:"episode_still_path,omitempty"`
-	EpisodeStillURL  string   `json:"episode_still_url,omitempty"`
-	Position         float64  `json:"position"`
-	Duration         *float64 `json:"duration,omitempty"`
-	Completed        bool     `json:"completed"`
-	Deleted          bool     `json:"deleted,omitempty"`
-	UpdatedAt        int64    `json:"updated_at"`
-	Revision         uint64   `json:"revision,omitempty"`
+	onlineScope       *pluginCatalogueScope
+	onlineOriginalKey string
+	SyncKey           string   `json:"sync_key"`
+	HistoryIdentity   string   `json:"history_identity,omitempty"`
+	SourceKind        string   `json:"source_kind"`
+	SourceName        string   `json:"source_name,omitempty"`
+	SourceLocator     string   `json:"source_locator,omitempty"`
+	SourceID          string   `json:"source_id"`
+	LibraryID         string   `json:"library_id,omitempty"`
+	ItemID            string   `json:"item_id,omitempty"`
+	ItemToken         string   `json:"item_token,omitempty"`
+	MediaIdentity     string   `json:"media_identity"`
+	Title             string   `json:"title"`
+	DisplayTitle      string   `json:"display_title,omitempty"`
+	DisplaySubtitle   string   `json:"display_subtitle,omitempty"`
+	SeriesTitle       string   `json:"series_title,omitempty"`
+	EpisodeTitle      string   `json:"episode_title,omitempty"`
+	SeasonNumber      *int     `json:"season_number,omitempty"`
+	EpisodeNumber     *int     `json:"episode_number,omitempty"`
+	StreamIdentity    string   `json:"stream_identity,omitempty"`
+	MediaType         string   `json:"media_type,omitempty"`
+	PosterURL         string   `json:"poster_url,omitempty"`
+	BackdropURL       string   `json:"backdrop_url,omitempty"`
+	TitleLogoURL      string   `json:"title_logo_url,omitempty"`
+	PosterAssetID     string   `json:"poster_asset_id,omitempty"`
+	BackdropAssetID   string   `json:"backdrop_asset_id,omitempty"`
+	TitleLogoAssetID  string   `json:"title_logo_asset_id,omitempty"`
+	PosterPath        string   `json:"poster_path,omitempty"`
+	BackdropPath      string   `json:"backdrop_path,omitempty"`
+	EpisodeStillPath  string   `json:"episode_still_path,omitempty"`
+	EpisodeStillURL   string   `json:"episode_still_url,omitempty"`
+	Position          float64  `json:"position"`
+	Duration          *float64 `json:"duration,omitempty"`
+	Completed         bool     `json:"completed"`
+	Deleted           bool     `json:"deleted,omitempty"`
+	UpdatedAt         int64    `json:"updated_at"`
+	Revision          uint64   `json:"revision,omitempty"`
 }
 
 type PlayerHistorySyncResult struct {
@@ -85,6 +87,7 @@ type PlayerHistoryService struct {
 	now            func() time.Time
 	artworkSlots   chan struct{}
 	writeAdmission *CatalogWriteAdmission
+	plugins        *PluginRepositoryService
 }
 
 func NewPlayerHistoryService(db *gorm.DB, libraries ...*MediaLibraryService) *PlayerHistoryService {
@@ -97,6 +100,13 @@ func NewPlayerHistoryService(db *gorm.DB, libraries ...*MediaLibraryService) *Pl
 
 func (s *PlayerHistoryService) SetWriteAdmission(admission *CatalogWriteAdmission) {
 	s.writeAdmission = admission
+}
+
+func (s *PlayerHistoryService) SetPluginService(plugins *PluginRepositoryService) {
+	s.plugins = plugins
+	if plugins != nil {
+		plugins.history = s
+	}
 }
 
 func (s *PlayerHistoryService) Sync(actor Actor, cursor uint64, changes []PlayerHistoryChange) (PlayerHistorySyncResult, error) {
@@ -120,6 +130,9 @@ func (s *PlayerHistoryService) SyncContext(ctx context.Context, actor Actor, cur
 		if err == nil && item.UpdatedAt > latestAllowed {
 			err = appError(CodeHistoryClockAhead, "设备时间明显超前，请校准设备时间后重试", nil)
 		}
+		if err == nil && isOnlineHistoryChange(item) {
+			item, err = s.prepareOnlineHistoryChange(ctx, actor, item)
+		}
 		if err != nil {
 			if len(changes) == 1 {
 				return PlayerHistorySyncResult{}, err
@@ -137,6 +150,15 @@ func (s *PlayerHistoryService) SyncContext(ctx context.Context, actor Actor, cur
 	}
 	err := withForegroundTransaction(ctx, s.db, s.writeAdmission, func(tx *gorm.DB) error {
 		for _, original := range normalized {
+			if isOnlineHistoryChange(original) {
+				if err := s.commitOnlineHistoryChange(tx, actor, original); err != nil {
+					if len(changes) == 1 || !isPlayerHistoryRecordError(err) {
+						return err
+					}
+					rejected = append(rejected, playerHistoryRejection(original.SyncKey, err))
+				}
+				continue
+			}
 			if original.SourceKind == "server" && s.libraries != nil {
 				authority, err := s.resolveServerHistoryAuthority(tx, actor, original)
 				if err != nil {
@@ -167,6 +189,8 @@ func (s *PlayerHistoryService) SyncContext(ctx context.Context, actor Actor, cur
 	}
 	result := PlayerHistorySyncResult{Cursor: cursor, Changes: make([]PlayerHistoryChange, 0, len(rows)), Rejected: rejected}
 	imageClient := s.playerHistoryImageClient()
+	artworkContext, cancelArtwork := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelArtwork()
 	for _, row := range rows {
 		if row.Revision > result.Cursor {
 			result.Cursor = row.Revision
@@ -177,7 +201,7 @@ func (s *PlayerHistoryService) SyncContext(ctx context.Context, actor Actor, cur
 		if row.SourceKind == "server" && row.Deleted && row.HistoryIdentity != "" && row.SyncKey != playerHistoryCanonicalSyncKey(row.HistoryIdentity) {
 			continue
 		}
-		result.Changes = append(result.Changes, playerHistoryArtworkDTO(playerHistoryChangeDTO(row), imageClient))
+		result.Changes = append(result.Changes, s.projectOnlineHistoryArtwork(artworkContext, actor, playerHistoryChangeDTO(row), imageClient))
 		if row.ClientUpdatedAt > latestAllowed {
 			// Preserve legacy ordering/merge facts. Old clients cannot safely
 			// apply a lower timestamp as a corrective delta.
@@ -242,7 +266,7 @@ func (s *PlayerHistoryService) List(actor Actor, page, pageSize int, sourceKind 
 	if sourceKind != "" && (len(sourceKind) > 32 || strings.ContainsAny(sourceKind, "\r\n\x00")) {
 		return PlayerHistoryPage{}, appError(CodeInvalidRequest, "播放历史来源类型无效", nil)
 	}
-	if sourceKind == "server" && s.libraries != nil {
+	if sourceKind == "server" && (s.libraries != nil || s.plugins != nil) {
 		return s.listAvailableServerHistory(actor, page, pageSize)
 	}
 	query := s.db.Model(&models.PlayerPlaybackHistory{}).Where("user_id = ? AND deleted = ?", actor.User.ID, false)
@@ -260,8 +284,10 @@ func (s *PlayerHistoryService) List(actor Actor, page, pageSize int, sourceKind 
 	}
 	result := PlayerHistoryPage{List: make([]PlayerHistoryChange, 0, len(rows)), Total: total, Page: page, PageSize: pageSize, HasMore: int64(offset+len(rows)) < total}
 	imageClient := s.playerHistoryImageClient()
+	artworkContext, cancelArtwork := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelArtwork()
 	for _, row := range rows {
-		result.List = append(result.List, playerHistoryArtworkDTO(playerHistoryChangeDTO(row), imageClient))
+		result.List = append(result.List, s.projectOnlineHistoryArtwork(artworkContext, actor, playerHistoryChangeDTO(row), imageClient))
 	}
 	return result, nil
 }
@@ -270,15 +296,20 @@ func (s *PlayerHistoryService) listAvailableServerHistory(actor Actor, page, pag
 	wantedOffset := (page - 1) * pageSize
 	result := PlayerHistoryPage{List: make([]PlayerHistoryChange, 0, pageSize), Page: page, PageSize: pageSize}
 	imageClient := s.playerHistoryImageClient()
+	artworkContext, cancelArtwork := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelArtwork()
 	err := s.visitAvailableHistory(actor, true, false, func(change PlayerHistoryChange) bool {
 		if result.Total >= int64(wantedOffset) && len(result.List) < pageSize {
-			result.List = append(result.List, playerHistoryArtworkDTO(change, imageClient))
+			result.List = append(result.List, change)
 		}
 		result.Total++
 		return true
 	})
 	if err != nil {
 		return PlayerHistoryPage{}, err
+	}
+	for i := range result.List {
+		result.List[i] = s.projectOnlineHistoryArtwork(artworkContext, actor, result.List[i], imageClient)
 	}
 	result.HasMore = int64(wantedOffset+len(result.List)) < result.Total
 	return result, nil
@@ -381,15 +412,20 @@ func (s *PlayerHistoryService) ServerContinueWatching(actor Actor, limit int, li
 	}
 	items := make([]PlayerHistoryChange, 0, limit+1)
 	imageClient := s.playerHistoryImageClient()
+	artworkContext, cancelArtwork := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelArtwork()
 	err := s.visitAvailableHistory(actor, true, true, func(change PlayerHistoryChange) bool {
 		id, _ := strconv.ParseUint(change.LibraryID, 10, 32)
-		if _, allowed := libraries[uint(id)]; allowed {
-			items = append(items, playerHistoryArtworkDTO(change, imageClient))
+		if _, allowed := libraries[uint(id)]; allowed || isOnlineHistoryChange(change) {
+			items = append(items, change)
 		}
 		return len(items) <= limit
 	})
 	if err != nil {
 		return nil, false, err
+	}
+	for i := range items {
+		items[i] = s.projectOnlineHistoryArtwork(artworkContext, actor, items[i], imageClient)
 	}
 	return boundedOverviewList(items, limit, false)
 }
@@ -474,6 +510,15 @@ func (s *PlayerHistoryService) browserHistoryAvailabilityTx(tx *gorm.DB, actor A
 			continue
 		}
 		serverRows = append(serverRows, row)
+		if strings.HasPrefix(row.ItemToken, "online-version|") {
+			serverRows = serverRows[:len(serverRows)-1]
+			ok, err := onlineHistoryAvailableTx(tx, actor, row)
+			if err != nil {
+				return nil, err
+			}
+			available[index] = ok
+			continue
+		}
 		serverIndexes = append(serverIndexes, index)
 	}
 	serverAvailable, err := s.availableServerHistoryRows(tx, actor, serverRows)

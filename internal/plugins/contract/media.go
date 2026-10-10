@@ -78,18 +78,19 @@ type MediaIdentity struct {
 }
 
 type MediaWork struct {
-	ID              string         `json:"id"`
-	Title           string         `json:"title"`
-	Kind            string         `json:"kind"`
-	Identity        MediaIdentity  `json:"identity"`
-	OriginalTitle   string         `json:"originalTitle,omitempty"`
-	Overview        string         `json:"overview,omitempty"`
-	PosterURL       string         `json:"posterUrl,omitempty"`
-	BackdropURL     string         `json:"backdropUrl,omitempty"`
-	Author          string         `json:"author,omitempty"`
-	PublishedAt     string         `json:"publishedAt,omitempty"`
-	DurationSeconds int64          `json:"durationSeconds,omitempty"`
-	Segments        []MediaSegment `json:"segments,omitempty"`
+	ID               string         `json:"id"`
+	Title            string         `json:"title"`
+	Kind             string         `json:"kind"`
+	Identity         MediaIdentity  `json:"identity"`
+	OriginalTitle    string         `json:"originalTitle,omitempty"`
+	Overview         string         `json:"overview,omitempty"`
+	PosterURL        string         `json:"posterUrl,omitempty"`
+	BackdropURL      string         `json:"backdropUrl,omitempty"`
+	Author           string         `json:"author,omitempty"`
+	PublishedAt      string         `json:"publishedAt,omitempty"`
+	DurationSeconds  int64          `json:"durationSeconds,omitempty"`
+	Segments         []MediaSegment `json:"segments,omitempty"`
+	DefaultSegmentID string         `json:"defaultSegmentId,omitempty"`
 }
 
 type LibraryArtworkCandidate struct {
@@ -217,6 +218,9 @@ func NormalizeFeedSections(data []byte, refreshSession string) ([]byte, error) {
 }
 
 func validateMediaWork(work MediaWork) error {
+	if err := ValidateDefaultSegment(work); err != nil {
+		return err
+	}
 	if !safeDTOText(work.ID, 512) || !safeDTOText(work.Title, 512) || !safeDTOText(work.Identity.Scheme, 128) || !safeDTOText(work.Identity.Value, 512) || work.DurationSeconds < 0 || work.DurationSeconds > 365*24*60*60 || len(work.Segments) > 1000 {
 		return errors.New("media work is invalid")
 	}
@@ -248,6 +252,25 @@ func validateMediaWork(work MediaWork) error {
 				}
 			}
 		}
+	}
+	return nil
+}
+
+func ValidateDefaultSegment(work MediaWork) error {
+	if work.DefaultSegmentID == "" {
+		return nil
+	}
+	if !safeDTOText(work.DefaultSegmentID, 512) {
+		return errors.New("default segment identity is invalid")
+	}
+	count := 0
+	for _, segment := range work.Segments {
+		if segment.ID == work.DefaultSegmentID {
+			count++
+		}
+	}
+	if count != 1 {
+		return errors.New("default segment must belong to the work exactly once")
 	}
 	return nil
 }
