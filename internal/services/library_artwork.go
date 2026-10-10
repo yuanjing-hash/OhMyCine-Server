@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/authz"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/plugins/contract"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/plugins/hostapi"
@@ -74,8 +75,9 @@ type LibraryArtworkService struct {
 	mu    sync.RWMutex
 	cache map[string][]byte
 	// generation maps the deterministic candidate/template key to the digest
-	// of the actual encoded JPEG. Public immutable URLs always use the latter.
+	// of the actual encoded JPEG. Authenticated URLs always use the latter.
 	generation         map[string]string
+	pluginSources      map[string]map[string]struct{}
 	order              []string
 	root               string
 	now                func() time.Time
@@ -454,6 +456,9 @@ func (s *LibraryArtworkService) DecoratePluginNavigation(ctx context.Context, ac
 			s.log.Debug().Str("module", "library_artwork").Str("plugin_id", manifest.ID).Str("scope", scopeKey).Str("error_code", "library_artwork_generation_failed").Msg("插件分类封面生成失败，继续使用兜底图")
 			continue
 		}
+		if !s.rememberPluginSource(asset.Digest, libraryID) {
+			continue
+		}
 		response.Nodes[index].ArtworkURL = s.artworkURL(asset.Digest)
 		response.Nodes[index].ArtworkRevision = asset.Digest
 		response.Nodes[index].ArtworkSource = "generated"
@@ -470,7 +475,7 @@ func (s *LibraryArtworkService) pluginArtworkCandidates(pluginID, connectionID, 
 	for _, item := range items {
 		item := item
 		candidates = append(candidates, artworkCandidate{
-			key: "plugin:" + scopeKey + ":" + item.ID,
+			key: "plugin:" + pluginID + ":" + connectionID + ":" + scopeKey + ":" + item.ID,
 			load: func(loadCtx context.Context) ([]byte, error) {
 				stream, err := s.assets.OpenAssetForPluginConnection(loadCtx, pluginID, connectionID, item.AssetRef, http.MethodGet, "")
 				if err != nil {
@@ -491,13 +496,82 @@ func (s *LibraryArtworkService) pluginArtworkCandidates(pluginID, connectionID, 
 	return candidates
 }
 
-func (s *LibraryArtworkService) Open(digest string) (LibraryArtworkAsset, error) {
+// Open checks the current source before consulting the byte cache. A content
+// digest identifies bytes; it is never authority to view a library's contents.
+func (s *LibraryArtworkService) Open(ctx context.Context, actor Actor, digest string) (LibraryArtworkAsset, error) {
 	if len(digest) != sha256.Size*2 {
 		return LibraryArtworkAsset{}, appError(CodeNotFound, "媒体库封面不存在", nil)
 	}
 	if _, err := hex.DecodeString(digest); err != nil {
 		return LibraryArtworkAsset{}, appError(CodeNotFound, "媒体库封面不存在", nil)
 	}
+	if !s.canReadSource(ctx, actor, digest) {
+		return LibraryArtworkAsset{}, appError(CodeNotFound, "媒体库封面不存在", nil)
+	}
+	return s.openContent(digest)
+}
+
+func (s *LibraryArtworkService) canReadSource(ctx context.Context, actor Actor, digest string) bool {
+	if s.db != nil {
+		var libraryIDs []uint
+		err := s.db.WithContext(ctx).Model(&models.MediaCategoryArtwork{}).
+			Joins("JOIN media_libraries ON media_libraries.id = media_category_artworks.library_id AND media_libraries.enabled = ?", true).
+			Joins("JOIN storages ON storages.id = media_libraries.storage_id AND storages.enabled = ?", true).
+			Where("media_category_artworks.scope_kind = ? AND media_category_artworks.content_hash = ? AND media_category_artworks.relative_path <> ''", libraryArtworkScopeCategory, digest).
+			Distinct().Pluck("media_category_artworks.library_id", &libraryIDs).Error
+		if err != nil {
+			return false
+		}
+		for _, libraryID := range libraryIDs {
+			if actor.CanResource(authz.PermissionMediaLibrariesRead, models.AuthorizationResourceMediaLibrary, uintID(libraryID)) {
+				return true
+			}
+		}
+	}
+	if s.plugins == nil || !actor.Can(authz.PermissionMediaLibrariesRead) {
+		return false
+	}
+	s.mu.RLock()
+	var onlineLibraryIDs []string
+	for libraryID := range s.pluginSources[digest] {
+		onlineLibraryIDs = append(onlineLibraryIDs, libraryID)
+	}
+	s.mu.RUnlock()
+	for _, libraryID := range onlineLibraryIDs {
+		if _, _, _, err := s.plugins.onlineLibrary(libraryID); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
+// Online navigation covers are memory-only. Retain their source association
+// within the same bounded cache so a disabled source cannot be read by digest.
+func (s *LibraryArtworkService) rememberPluginSource(digest, libraryID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, exists := s.cache[digest]; !exists {
+		return false
+	}
+	if s.pluginSources == nil {
+		s.pluginSources = make(map[string]map[string]struct{})
+	}
+	sources := s.pluginSources[digest]
+	if sources == nil {
+		sources = make(map[string]struct{})
+		s.pluginSources[digest] = sources
+	}
+	if _, exists := sources[libraryID]; exists {
+		return true
+	}
+	if len(sources) >= libraryArtworkCacheLimit {
+		return false
+	}
+	sources[libraryID] = struct{}{}
+	return true
+}
+
+func (s *LibraryArtworkService) openContent(digest string) (LibraryArtworkAsset, error) {
 	s.mu.RLock()
 	data, ok := s.cache[digest]
 	s.mu.RUnlock()
@@ -685,7 +759,7 @@ func (s *LibraryArtworkService) generate(ctx context.Context, title string, cand
 	cachedDigest := s.generation[generationKey]
 	s.mu.RUnlock()
 	if cachedDigest != "" {
-		if cached, err := s.Open(cachedDigest); err == nil {
+		if cached, err := s.openContent(cachedDigest); err == nil {
 			return cached, nil
 		}
 	}
@@ -740,6 +814,7 @@ func (s *LibraryArtworkService) rememberContent(digest string, data []byte) {
 	if len(s.order) >= libraryArtworkCacheLimit {
 		evicted := s.order[0]
 		delete(s.cache, evicted)
+		delete(s.pluginSources, evicted)
 		for key, cachedDigest := range s.generation {
 			if cachedDigest == evicted {
 				delete(s.generation, key)

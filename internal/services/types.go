@@ -9,11 +9,12 @@ import (
 
 // Actor is the authenticated authorization context used by policy-aware services.
 type Actor struct {
-	User              models.User
-	RoleCodes         []string
-	Permissions       map[string]struct{}
-	DeniedPermissions map[string]struct{}
-	ResourceRules     []AuthorizationRule
+	User                   models.User
+	RoleCodes              []string
+	Permissions            map[string]struct{}
+	DeniedPermissions      map[string]struct{}
+	ResourceRules          []AuthorizationRule
+	ResourceAccessPolicies map[string]ResourceAccessPolicy
 }
 
 type AuthorizationRule struct {
@@ -32,12 +33,20 @@ func (a Actor) Can(code string) bool {
 }
 
 func (a Actor) CanResource(code, resourceType, resourceID string) bool {
+	resourceID = canonicalResourceID(resourceType, resourceID)
+	if resourceID == "" && resourceType != "" {
+		return false
+	}
+	return a.canResourceWithoutPolicy(code, resourceType, resourceID) && a.resourcePoliciesAllow(code, resourceType, resourceID)
+}
+
+func (a Actor) canResourceWithoutPolicy(code, resourceType, resourceID string) bool {
 	if _, denied := a.DeniedPermissions[code]; denied {
 		return false
 	}
 	allowed := a.Can(code)
 	for _, rule := range a.ResourceRules {
-		if rule.PermissionCode != code || rule.ResourceType != resourceType || rule.ResourceID != resourceID {
+		if rule.PermissionCode != code || rule.ResourceType != resourceType || canonicalResourceID(resourceType, rule.ResourceID) != resourceID {
 			continue
 		}
 		if rule.Effect == models.AuthorizationEffectDeny {

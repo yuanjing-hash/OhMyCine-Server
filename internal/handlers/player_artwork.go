@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/middleware"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/services"
 )
 
@@ -60,17 +61,22 @@ func (a *API) PluginLibraryArtwork(c *gin.Context) {
 }
 
 func (a *API) GeneratedLibraryArtwork(c *gin.Context) {
+	c.Header("Cache-Control", "no-store")
+	actor, ok := middleware.ActorFrom(c)
+	if !ok {
+		c.Status(http.StatusUnauthorized)
+		return
+	}
 	if a.libraryArtwork == nil {
 		c.Status(http.StatusNotFound)
 		return
 	}
 	digest := c.Param("digest")
-	artwork, err := a.libraryArtwork.Open(digest)
+	artwork, err := a.libraryArtwork.Open(c.Request.Context(), actor, digest)
 	if err != nil {
 		c.Status(http.StatusNotFound)
 		return
 	}
-	c.Header("Cache-Control", "public, max-age=31536000, immutable")
 	c.Header("Content-Type", "image/jpeg")
 	c.Header("Content-Length", strconv.Itoa(len(artwork.Bytes)))
 	c.Header("ETag", `"`+artwork.Digest+`"`)

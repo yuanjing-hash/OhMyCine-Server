@@ -575,6 +575,9 @@ func (s *MediaLibraryService) Reorder(actor Actor, ids []uint, request RequestCo
 		if id == 0 {
 			return nil, appError(CodeInvalidRequest, "媒体库顺序无效", nil)
 		}
+		if !actor.CanResource(authz.PermissionMediaLibrariesUpdate, models.AuthorizationResourceMediaLibrary, uintID(id)) {
+			return nil, appError(CodePermissionDenied, "无权调整这个媒体库的顺序", nil)
+		}
 		if _, exists := seen[id]; exists {
 			return nil, appError(CodeInvalidRequest, "媒体库顺序包含重复项", nil)
 		}

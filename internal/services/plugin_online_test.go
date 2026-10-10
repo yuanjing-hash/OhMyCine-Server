@@ -6,12 +6,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image/color"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/rs/zerolog"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/authz"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/credential"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
@@ -93,6 +95,26 @@ func TestPluginOnlineLibraryPlaybackHistoryAndDisableBoundary(t *testing.T) {
 	libraries, err := service.OnlineLibraries(actor)
 	if err != nil || len(libraries) != 2 || libraries[0].ID != connection.ID || len(libraries[0].HomeContributions) != 1 || libraries[0].HomeContributions[0] != "recommended" || libraries[0].ArtworkURL != "/api/v1/assets/plugin-covers/"+strings.Repeat("a", 64) || libraries[0].ArtworkSource != "custom" || libraries[0].ArtworkRevision == "" {
 		t.Fatalf("libraries=%+v err=%v", libraries, err)
+	}
+	artwork := NewLibraryArtworkService(service.db, nil, service, nil, zerolog.Nop())
+	cover, err := artwork.generate(context.Background(), "在线媒体", []artworkCandidate{{key: "online:video-1", load: solidArtworkLoader(color.RGBA{R: 120, G: 40, B: 80, A: 255})}})
+	if err != nil || !artwork.rememberPluginSource(cover.Digest, connection.ID) {
+		t.Fatalf("online generated cover setup: %v", err)
+	}
+	if _, err := artwork.Open(context.Background(), actor, cover.Digest); err != nil {
+		t.Fatalf("active online generated cover unavailable: %v", err)
+	}
+	if _, err := artwork.Open(context.Background(), Actor{}, cover.Digest); ErrorCode(err) != CodeNotFound {
+		t.Fatalf("online cover bypassed library read permission: %v", err)
+	}
+	if err := service.db.Model(&models.PluginConnection{}).Where("id = ?", connection.ID).Update("enabled", false).Error; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := artwork.Open(context.Background(), actor, cover.Digest); ErrorCode(err) != CodeNotFound {
+		t.Fatalf("warm online cover bypassed disabled connection: %v", err)
+	}
+	if err := service.db.Model(&models.PluginConnection{}).Where("id = ?", connection.ID).Update("enabled", true).Error; err != nil {
+		t.Fatal(err)
 	}
 	feedCalls, actionCalls := 0, 0
 	artworkScope := ""
@@ -279,6 +301,9 @@ func TestPluginOnlineLibraryPlaybackHistoryAndDisableBoundary(t *testing.T) {
 	}
 	if err := service.db.Model(&models.PluginInstallation{}).Where("plugin_id = ?", installation.PluginID).Update("status", models.PluginInstallationDisabled).Error; err != nil {
 		t.Fatal(err)
+	}
+	if _, err := artwork.Open(context.Background(), actor, cover.Digest); ErrorCode(err) != CodeNotFound {
+		t.Fatalf("warm online cover bypassed disabled plugin: %v", err)
 	}
 	if _, err := service.OnlinePlayback(context.Background(), actor, connection.ID, "BV1234567890", "cid:1", "v1", "qn:80"); ErrorCode(err) != CodePluginOnlineLibraryUnavailable {
 		t.Fatalf("disabled error=%v code=%s", err, ErrorCode(err))

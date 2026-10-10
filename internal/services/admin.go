@@ -60,12 +60,22 @@ func (s *AdminService) ReplaceUserAuthorizationRules(actor Actor, userID uint, i
 		if err != nil {
 			return err
 		}
+		if !currentActor.Can(authz.PermissionRolesAssign) {
+			return appError(CodePermissionDenied, "没有修改用户授权的权限", nil)
+		}
 		var user models.User
 		if err := tx.First(&user, userID).Error; err != nil {
 			return notFound(err, "用户不存在")
 		}
 		if user.IsOwner {
 			return appError(CodeOwnerProtected, "实例 owner 的授权不能被覆盖", nil)
+		}
+		before, err := s.authz.resolveUserWithDB(tx, userID, false)
+		if err != nil {
+			return err
+		}
+		if len(input.Rules) > 1000 {
+			return appError(CodeInvalidRequest, "用户直接授权最多允许 1000 项", nil)
 		}
 		seen := map[string]struct{}{}
 		rows := make([]models.UserAuthorizationRule, 0, len(input.Rules))
@@ -74,6 +84,7 @@ func (s *AdminService) ReplaceUserAuthorizationRules(actor Actor, userID uint, i
 			rule.Effect = strings.TrimSpace(rule.Effect)
 			rule.ResourceType = strings.TrimSpace(rule.ResourceType)
 			rule.ResourceID = strings.TrimSpace(rule.ResourceID)
+			rule.ResourceID = canonicalResourceID(rule.ResourceType, rule.ResourceID)
 			if !authz.Contains(rule.PermissionCode) {
 				return appError(CodeInvalidRequest, "包含未知权限代码", nil)
 			}
@@ -83,17 +94,14 @@ func (s *AdminService) ReplaceUserAuthorizationRules(actor Actor, userID uint, i
 			if !validAuthorizationScope(rule.ResourceType, rule.ResourceID) {
 				return appError(CodeInvalidRequest, "授权资源范围无效", nil)
 			}
-			if rule.Effect == models.AuthorizationEffectAllow {
-				allowed := currentActor.Can(rule.PermissionCode)
-				if rule.ResourceType != "" {
-					allowed = currentActor.CanResource(rule.PermissionCode, rule.ResourceType, rule.ResourceID)
-				}
-				if !allowed {
-					return appError(CodePermissionDenied, "不能授予当前操作者不具备的权限", nil)
-				}
+			retained := false
+			for _, old := range before.ResourceRules {
+				retained = retained || (old.ResourceType == rule.ResourceType && old.ResourceID == rule.ResourceID)
 			}
-			if err := validateAuthorizationResource(tx, rule.ResourceType, rule.ResourceID); err != nil {
-				return err
+			if !retained {
+				if err := validateAuthorizationResource(tx, rule.ResourceType, rule.ResourceID); err != nil {
+					return err
+				}
 			}
 			key := rule.PermissionCode + "\x00" + rule.Effect + "\x00" + rule.ResourceType + "\x00" + rule.ResourceID
 			if _, exists := seen[key]; exists {
@@ -109,6 +117,13 @@ func (s *AdminService) ReplaceUserAuthorizationRules(actor Actor, userID uint, i
 			if err := tx.Create(&rows[index]).Error; err != nil {
 				return err
 			}
+		}
+		after, err := s.authz.resolveUserWithDB(tx, userID, false)
+		if err != nil {
+			return err
+		}
+		if err := validateAuthorityExpansion(currentActor, before, after); err != nil {
+			return err
 		}
 		if err := tx.Model(&user).Update("authz_version", gorm.Expr("authz_version + 1")).Error; err != nil {
 			return err
@@ -202,7 +217,10 @@ func (s *AdminService) CreateUser(actor Actor, input CreateUserInput, request Re
 		if err != nil {
 			return err
 		}
-		if err := s.validateRoleAssignment(tx, currentActor, input.RoleIDs); err != nil {
+		if !currentActor.Can(authz.PermissionUsersCreate) {
+			return appError(CodePermissionDenied, "没有创建用户的权限", nil)
+		}
+		if err := s.validateRoleAssignment(tx, input.RoleIDs); err != nil {
 			return err
 		}
 		user = models.User{Username: strings.TrimSpace(input.Username), UsernameNormalized: NormalizeUsername(input.Username), DisplayName: displayName, PasswordHash: hash, Status: models.UserStatusActive, AuthzVersion: 1}
@@ -213,6 +231,13 @@ func (s *AdminService) CreateUser(actor Actor, input CreateUserInput, request Re
 			if err := tx.Create(&models.UserRole{UserID: user.ID, RoleID: roleID, AssignedBy: &actor.User.ID}).Error; err != nil {
 				return err
 			}
+		}
+		after, err := s.authz.resolveUserWithDB(tx, user.ID, false)
+		if err != nil {
+			return err
+		}
+		if err := validateAuthorityExpansion(currentActor, Actor{}, after); err != nil {
+			return err
 		}
 		return s.audit.Record(tx, &actor.User.ID, "users.create", "user", uintID(user.ID), "success", map[string]any{"username": user.Username, "role_ids": input.RoleIDs}, request)
 	})
@@ -300,6 +325,9 @@ func (s *AdminService) DeleteUser(actor Actor, userID uint, request RequestConte
 		if user.IsOwner {
 			return appError(CodeOwnerProtected, "实例 owner 不能被删除", nil)
 		}
+		if err := tx.Where("user_id = ?", userID).Delete(&models.UserResourceAccessPolicy{}).Error; err != nil {
+			return err
+		}
 		if err := tx.Delete(&user).Error; err != nil {
 			return err
 		}
@@ -323,12 +351,19 @@ func (s *AdminService) ReplaceUserRoles(actor Actor, userID uint, roleIDs []uint
 		if err != nil {
 			return err
 		}
-		if err := s.validateRoleAssignment(tx, currentActor, roleIDs); err != nil {
+		if !currentActor.Can(authz.PermissionRolesAssign) {
+			return appError(CodePermissionDenied, "没有分配用户角色的权限", nil)
+		}
+		if err := s.validateRoleAssignment(tx, roleIDs); err != nil {
 			return err
 		}
 		var user models.User
 		if err := tx.First(&user, userID).Error; err != nil {
 			return notFound(err, "用户不存在")
+		}
+		before, err := s.authz.resolveUserWithDB(tx, userID, false)
+		if err != nil {
+			return err
 		}
 		if user.IsOwner {
 			var count int64
@@ -346,6 +381,13 @@ func (s *AdminService) ReplaceUserRoles(actor Actor, userID uint, roleIDs []uint
 			if err := tx.Create(&models.UserRole{UserID: userID, RoleID: roleID, AssignedBy: &actor.User.ID}).Error; err != nil {
 				return err
 			}
+		}
+		after, err := s.authz.resolveUserWithDB(tx, userID, false)
+		if err != nil {
+			return err
+		}
+		if err := validateAuthorityExpansion(currentActor, before, after); err != nil {
+			return err
 		}
 		if err := tx.Model(&user).Update("authz_version", gorm.Expr("authz_version + 1")).Error; err != nil {
 			return err
@@ -429,8 +471,14 @@ func (s *AdminService) CreateRole(actor Actor, input CreateRoleInput, request Re
 		if err != nil {
 			return err
 		}
-		codes, err := s.validatePermissionGrant(currentActor, input.PermissionCodes)
+		if !currentActor.Can(authz.PermissionRolesCreate) {
+			return appError(CodePermissionDenied, "没有创建角色的权限", nil)
+		}
+		codes, err := validatePermissionCodes(input.PermissionCodes)
 		if err != nil {
+			return err
+		}
+		if err := validateAuthorityExpansion(currentActor, Actor{}, rolePermissionActor(codes)); err != nil {
 			return err
 		}
 		role = models.Role{Code: code, Name: name, Description: description, Kind: models.RoleKindCustom, Active: true}
@@ -485,6 +533,22 @@ func (s *AdminService) UpdateRole(actor Actor, roleID uint, input UpdateRoleInpu
 		if err != nil {
 			return err
 		}
+		if !before.Can(authz.PermissionRolesUpdate) {
+			return appError(CodePermissionDenied, "没有修改角色的权限", nil)
+		}
+		var currentRole models.Role
+		if err := tx.First(&currentRole, role.ID).Error; err != nil {
+			return notFound(err, "角色不存在")
+		}
+		if input.Active != nil && *input.Active && !currentRole.Active {
+			codes, err := s.permissionsForRoles(tx, []models.Role{currentRole})
+			if err != nil {
+				return err
+			}
+			if err := validateAuthorityExpansion(before, Actor{}, rolePermissionActor(codes)); err != nil {
+				return err
+			}
+		}
 		if err := tx.Model(&role).Updates(updates).Error; err != nil {
 			return err
 		}
@@ -493,6 +557,11 @@ func (s *AdminService) UpdateRole(actor Actor, roleID uint, input UpdateRoleInpu
 		}
 		if err := s.ensureAdminRemains(tx); err != nil {
 			return err
+		}
+		if input.Active != nil && *input.Active != currentRole.Active {
+			if err := bumpRoleUsersAuthorization(tx, role.ID); err != nil {
+				return err
+			}
 		}
 		return s.audit.Record(tx, &actor.User.ID, "roles.update", "role", uintID(role.ID), "success", map[string]any{"fields": mapKeys(updates)}, request)
 	}); err != nil {
@@ -510,7 +579,10 @@ func (s *AdminService) ReplaceRolePermissions(actor Actor, roleID uint, permissi
 		if err != nil {
 			return err
 		}
-		codes, err := s.validatePermissionGrant(currentActor, permissionCodes)
+		if !currentActor.Can(authz.PermissionRolesUpdate) {
+			return appError(CodePermissionDenied, "没有修改角色权限的权限", nil)
+		}
+		codes, err := validatePermissionCodes(permissionCodes)
 		if err != nil {
 			return err
 		}
@@ -520,6 +592,13 @@ func (s *AdminService) ReplaceRolePermissions(actor Actor, roleID uint, permissi
 		}
 		if role.Protected {
 			return appError(CodeProtectedRole, "系统角色权限由版本迁移维护", nil)
+		}
+		oldCodes, err := s.permissionsForRoles(tx, []models.Role{role})
+		if err != nil {
+			return err
+		}
+		if err := validateAuthorityExpansion(currentActor, rolePermissionActor(oldCodes), rolePermissionActor(codes)); err != nil {
+			return err
 		}
 		before, err := s.authz.resolveWithDB(tx, actor.User.ID)
 		if err != nil {
@@ -532,6 +611,9 @@ func (s *AdminService) ReplaceRolePermissions(actor Actor, roleID uint, permissi
 			return err
 		}
 		if err := s.ensureAdminRemains(tx); err != nil {
+			return err
+		}
+		if err := bumpRoleUsersAuthorization(tx, role.ID); err != nil {
 			return err
 		}
 		return s.audit.Record(tx, &actor.User.ID, "roles.permissions_update", "role", uintID(role.ID), "success", map[string]any{"permissions": codes}, request)
@@ -601,7 +683,7 @@ func (s *AdminService) Dashboard() (DashboardSummary, error) {
 	return summary, nil
 }
 
-func (s *AdminService) validateRoleAssignment(db *gorm.DB, actor Actor, roleIDs []uint) error {
+func (s *AdminService) validateRoleAssignment(db *gorm.DB, roleIDs []uint) error {
 	var roles []models.Role
 	if err := db.Where("id IN ? AND active = ?", uniqueUint(roleIDs), true).Find(&roles).Error; err != nil {
 		return err
@@ -609,27 +691,34 @@ func (s *AdminService) validateRoleAssignment(db *gorm.DB, actor Actor, roleIDs 
 	if len(roles) != len(uniqueUint(roleIDs)) {
 		return appError(CodeInvalidRequest, "角色不存在或已停用", nil)
 	}
-	codes, err := s.permissionsForRoles(db, roles)
-	if err != nil {
-		return err
-	}
-	if !actor.IsSystemAdmin() && !subset(codes, actor.Permissions) {
-		return appError(CodePrivilegeEscalation, "不能授予操作者自己没有的权限", nil)
-	}
+	// Net-new effective grants are checked after applying the role change in
+	// the same transaction; re-granting an unchanged broader role is not expansion.
 	return nil
 }
 
-func (s *AdminService) validatePermissionGrant(actor Actor, codes []string) ([]string, error) {
+func validatePermissionCodes(codes []string) ([]string, error) {
 	codes = uniqueStrings(codes)
 	for _, code := range codes {
 		if !authz.Contains(code) {
 			return nil, appError(CodeInvalidRequest, fmt.Sprintf("未知权限码：%s", code), nil)
 		}
 	}
-	if !actor.IsSystemAdmin() && !subset(codes, actor.Permissions) {
-		return nil, appError(CodePrivilegeEscalation, "不能授予操作者自己没有的权限", nil)
-	}
+	// Callers compare before/after templates so removing permissions from an
+	// existing broader role remains possible without granting them again.
 	return codes, nil
+}
+
+func rolePermissionActor(codes []string) Actor {
+	actor := Actor{Permissions: map[string]struct{}{}}
+	for _, code := range codes {
+		actor.Permissions[code] = struct{}{}
+	}
+	return actor
+}
+
+func bumpRoleUsersAuthorization(tx *gorm.DB, roleID uint) error {
+	return tx.Model(&models.User{}).Where("id IN (SELECT user_id FROM user_roles WHERE role_id = ?)", roleID).
+		Update("authz_version", gorm.Expr("authz_version + 1")).Error
 }
 
 func (s *AdminService) permissionsForRoles(db *gorm.DB, roles []models.Role) ([]string, error) {
@@ -739,7 +828,7 @@ func (s *AdminService) authorizationRulesForUser(db *gorm.DB, userID uint) ([]Au
 	}
 	result := make([]AuthorizationRule, 0, len(rows))
 	for _, row := range rows {
-		result = append(result, AuthorizationRule{PermissionCode: row.PermissionCode, Effect: row.Effect, ResourceType: row.ResourceType, ResourceID: row.ResourceID})
+		result = append(result, AuthorizationRule{PermissionCode: row.PermissionCode, Effect: row.Effect, ResourceType: row.ResourceType, ResourceID: canonicalResourceID(row.ResourceType, row.ResourceID)})
 	}
 	return result, nil
 }

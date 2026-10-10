@@ -114,6 +114,13 @@ func (s *AcquisitionService) project(actor Actor, row models.MediaAcquisition) (
 		var task models.DownloadTask
 		if err := s.db.First(&task, "id = ?", row.DownloadTaskID).Error; err == nil {
 			title = task.DisplayName
+			visible, err := downloadResourcesVisible(s.db, actor, task)
+			if err != nil {
+				return AcquisitionStatus{}, err
+			}
+			if !visible {
+				title = ""
+			}
 			row.Stage, row.Status, row.LastErrorCode = acquisitionDownloadState(task), task.Phase, task.LastErrorCode
 			if row.TargetLibraryID == nil {
 				row.TargetLibraryID = task.TargetLibraryID
@@ -134,6 +141,10 @@ func (s *AcquisitionService) project(actor Actor, row models.MediaAcquisition) (
 				}
 				if status.TargetLibraryID != nil && !actor.CanResource(authz.PermissionMediaLibrariesRead, models.AuthorizationResourceMediaLibrary, uintID(*status.TargetLibraryID)) {
 					status.TargetLibraryID = nil
+					status.Title = ""
+				}
+				if !taskDownloaderVisible(actor, task.DownloaderID) {
+					status.Title = ""
 				}
 				return status, nil
 			}
@@ -156,6 +167,7 @@ func (s *AcquisitionService) project(actor Actor, row models.MediaAcquisition) (
 	}
 	if status.TargetLibraryID != nil && !actor.CanResource(authz.PermissionMediaLibrariesRead, models.AuthorizationResourceMediaLibrary, uintID(*status.TargetLibraryID)) {
 		status.TargetLibraryID = nil
+		status.Title = ""
 	}
 	return status, nil
 }

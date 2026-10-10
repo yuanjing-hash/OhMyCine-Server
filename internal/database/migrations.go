@@ -99,7 +99,24 @@ func schemaMigrationsThrough109() []migration {
 }
 
 func schemaMigrations() []migration {
-	return append(schemaMigrationsThrough109(), migration{Version: 110, Apply: migrateProviderDeletion}, migration{Version: 111, Apply: migrateCloudEmptyCleanup}, migration{Version: 112, Apply: migrateTGCloudSites}, migration{Version: 113, Apply: migrateMediaCatalogExclusions}, migration{Version: 114, Apply: migrateDownloaderOrder})
+	return append(schemaMigrationsThrough109(), migration{Version: 110, Apply: migrateProviderDeletion}, migration{Version: 111, Apply: migrateCloudEmptyCleanup}, migration{Version: 112, Apply: migrateTGCloudSites}, migration{Version: 113, Apply: migrateMediaCatalogExclusions}, migration{Version: 114, Apply: migrateDownloaderOrder}, migration{Version: 115, Apply: migrateUserResourceAccessPolicies}, migration{Version: 116, Apply: migratePluginAccountSummary})
+}
+
+func migratePluginAccountSummary(db *gorm.DB) error {
+	if err := db.Exec(`ALTER TABLE plugin_connections ADD COLUMN account_summary_json TEXT NOT NULL DEFAULT ''`).Error; err != nil {
+		return err
+	}
+	return db.Exec(`ALTER TABLE plugin_connections ADD COLUMN account_checked_at DATETIME`).Error
+}
+
+func migrateUserResourceAccessPolicies(db *gorm.DB) error {
+	return db.Exec(`CREATE TABLE user_resource_access_policies (
+		user_id INTEGER NOT NULL, scope TEXT NOT NULL CHECK(scope IN ('downloader_use','site_search','library_read','library_ingest')),
+		mode TEXT NOT NULL CHECK(mode IN ('all','allowlist','denylist')), resource_ids_json TEXT NOT NULL DEFAULT '[]',
+		updated_by INTEGER, created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL,
+		PRIMARY KEY(user_id,scope), FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+		FOREIGN KEY(updated_by) REFERENCES users(id) ON DELETE SET NULL
+	)`).Error
 }
 
 func migrateDownloaderOrder(db *gorm.DB) error {

@@ -29,6 +29,9 @@ func (s *DownloadService) RetargetCompletedImport(ctx context.Context, actor Act
 	if !actor.Can(authz.PermissionJobsControlAll) && (task.OwnerID != actor.User.ID || !actor.Can(authz.PermissionJobsControlOwn)) {
 		return DownloadTaskSummary{}, appError(CodePermissionDenied, "无权修改该任务的入库目标", nil)
 	}
+	if !actor.CanIngestLibrary(uintID(libraryID)) || !taskDownloaderVisible(actor, task.DownloaderID) || !taskLibraryVisible(actor, requestedTargetID(task.TargetLibraryID)) {
+		return DownloadTaskSummary{}, appError(CodePermissionDenied, "无权使用该任务资源或新的入库目标", nil)
+	}
 	if task.DownloaderID == nil {
 		return DownloadTaskSummary{}, appError(CodeMediaLibraryStorageUnavailable, "该任务的下载器快照不支持修改目标", nil)
 	}
@@ -109,6 +112,19 @@ func (s *DownloadService) RetargetCompletedImport(ctx context.Context, actor Act
 		}
 		if lockedJob.Status != models.JobStatusFailed || lockedTransfer.Phase != models.TransferTaskStatusFailed {
 			return appError(CodeQueueStateConflict, "仅入库失败的任务可以修改目标", nil)
+		}
+		if err := authorizeJobContinuationTx(tx, actor, lockedJob); err != nil {
+			return err
+		}
+		current, err := NewAuthorizationService(tx).Resolve(actor.User.ID)
+		if err != nil || !current.CanIngestLibrary(uintID(libraryID)) {
+			return appError(CodePermissionDenied, "无权向新的媒体库入库", nil)
+		}
+		if lockedTask.OwnerID != actor.User.ID {
+			owner, err := NewAuthorizationService(tx).Resolve(lockedTask.OwnerID)
+			if err != nil || !owner.CanIngestLibrary(uintID(libraryID)) {
+				return appError(CodePermissionDenied, "任务所属用户无权向新的媒体库入库", nil)
+			}
 		}
 		if lockedTransfer.ProcessedFiles != 0 || lockedTransfer.CleanupRemoved != 0 || strings.TrimSpace(lockedTransfer.PlanSummaryJSON) != "" || strings.TrimSpace(lockedTransfer.CloudStateJSON) != "" || lockedTransfer.CleanupStatus != models.TransferCleanupPending {
 			return appError(CodeQueueStateConflict, "任务已产生入库规划、云端检查点或部分写入，不能静默切换目标", nil)

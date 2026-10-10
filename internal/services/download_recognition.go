@@ -146,6 +146,9 @@ func (s *DownloadService) OverrideRecognition(ctx context.Context, actor Actor, 
 		if lockedJob.Status != models.JobStatusFailed || lockedTask.ScrapeStatus != "completed_unrecognized" {
 			return appError(CodeQueueStateConflict, "该任务已不处于识别失败状态", nil)
 		}
+		if err := authorizeJobContinuationTx(tx, actor, lockedJob); err != nil {
+			return err
+		}
 		if err := tx.Model(&lockedTask).Updates(map[string]any{
 			"recognition_override_tmdb_id":    verified.ID,
 			"recognition_override_media_type": verified.MediaType,
@@ -281,6 +284,13 @@ func (s *DownloadService) downloadRecognitionRecoveryContext(actor Actor, id str
 	var job models.Job
 	if err := s.db.First(&job, "id = ?", task.JobID).Error; err != nil {
 		return task, job, queueNotFound(err)
+	}
+	resources, err := jobResourceAccessRows(s.db, []models.Job{job})
+	if err != nil {
+		return task, job, err
+	}
+	if !resources[job.ID].visible(actor) || (control && !resources[job.ID].canContinue(actor, job.JobType)) {
+		return task, job, appError(CodePermissionDenied, "当前权限不允许读取或重新入库这个任务", nil)
 	}
 	_, snapshotExists, snapshotErr := completedDownloadManifest(task.CompletedManifestJSON)
 	if snapshotErr != nil {

@@ -256,6 +256,28 @@ type UserAuthorizationRule struct {
 	UpdatedAt      time.Time `json:"updated_at"`
 }
 
+const (
+	ResourceAccessScopeDownloaderUse = "downloader_use"
+	ResourceAccessScopeSiteSearch    = "site_search"
+	ResourceAccessScopeLibraryRead   = "library_read"
+	ResourceAccessScopeLibraryIngest = "library_ingest"
+	ResourceAccessModeAll            = "all"
+	ResourceAccessModeAllowlist      = "allowlist"
+	ResourceAccessModeDenylist       = "denylist"
+)
+
+// UserResourceAccessPolicy restricts existing authority; it never grants a
+// function permission. A missing scope keeps the historical all-resources default.
+type UserResourceAccessPolicy struct {
+	UserID          uint      `gorm:"primaryKey" json:"-"`
+	Scope           string    `gorm:"primaryKey;size:32" json:"scope"`
+	Mode            string    `gorm:"size:16;not null" json:"mode"`
+	ResourceIDsJSON string    `gorm:"type:text;not null;default:'[]'" json:"-"`
+	UpdatedBy       *uint     `json:"-"`
+	CreatedAt       time.Time `json:"-"`
+	UpdatedAt       time.Time `json:"-"`
+}
+
 type Session struct {
 	ID                string     `gorm:"primaryKey;size:64" json:"id"`
 	TokenHash         string     `gorm:"size:64;not null;uniqueIndex" json:"-"`
@@ -571,6 +593,8 @@ type PluginConnection struct {
 	ResourceType         string     `gorm:"size:32;not null;default:'';index" json:"resource_type,omitempty"`
 	EntryOrigin          string     `gorm:"size:2048;not null;default:''" json:"entry_origin,omitempty"`
 	LoginAccountLabel    string     `gorm:"size:128;not null;default:''" json:"login_account_label,omitempty"`
+	AccountSummaryJSON   string     `gorm:"type:text;not null;default:''" json:"-"`
+	AccountCheckedAt     *time.Time `json:"-"`
 	CredentialVersion    uint64     `gorm:"not null;default:0" json:"credential_version"`
 	Enabled              bool       `gorm:"not null;default:true;index" json:"enabled"`
 	LastHealthStatus     string     `gorm:"size:16;not null;default:'unknown';index" json:"last_health_status"`

@@ -341,7 +341,7 @@ func (s *DownloaderService) updateNodeDownloader(ctx context.Context, actor Acto
 		}
 		return DownloaderSummary{}, err
 	}
-	return s.summary(record), nil
+	return s.summary(actor, record), nil
 }
 
 func (s *DownloaderService) updateNodeStorageDownloader(ctx context.Context, actor Actor, record models.Downloader, input UpdateDownloaderInput, request RequestContext) (DownloaderSummary, error) {
@@ -407,7 +407,7 @@ func (s *DownloaderService) updateNodeStorageDownloader(ctx context.Context, act
 		}
 		return DownloaderSummary{}, err
 	}
-	return s.summary(record), nil
+	return s.summary(actor, record), nil
 }
 
 func nodeStorageDownloaderRouteChanged(record models.Downloader, nodeID string, storageID *uint, providerDirectoryID string) bool {

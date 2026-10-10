@@ -385,6 +385,10 @@ func siteFixture(t *testing.T) (*SiteService, *stubSiteAdapter, Actor, *credenti
 	downloads, downloaders, queue, actor, _ := downloadFixture(t)
 	actor.Permissions[authz.PermissionSystemAdmin] = struct{}{}
 	actor.Permissions[authz.PermissionDiscoveryRead] = struct{}{}
+	for _, code := range []string{authz.PermissionSitesRead, authz.PermissionSitesCreate, authz.PermissionSitesUpdate, authz.PermissionSitesTest, authz.PermissionSitesDelete} {
+		actor.Permissions[code] = struct{}{}
+	}
+	persistFixtureAuthority(t, queue.db, actor)
 	store, err := credential.Open(filepath.Join(t.TempDir(), "site-credentials.key"), "")
 	if err != nil {
 		t.Fatal(err)

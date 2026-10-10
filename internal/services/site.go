@@ -324,7 +324,7 @@ func (s *SiteService) List(actor Actor) ([]SiteSummary, error) {
 	}
 	items := make([]SiteSummary, 0, len(records))
 	for _, record := range records {
-		if !actor.IsSystemAdmin() && !actor.CanResource(authz.PermissionSitesRead, models.AuthorizationResourceSite, uintID(record.ID)) {
+		if !actor.CanResource(authz.PermissionSitesRead, models.AuthorizationResourceSite, uintID(record.ID)) {
 			continue
 		}
 		items = append(items, s.siteSummary(record))
@@ -521,7 +521,7 @@ func (s *SiteService) Update(ctx context.Context, actor Actor, id uint, input Si
 	if record.SourceType == "plugin" {
 		return SiteSummary{}, appError(CodeSiteManagedByPlugin, "插件资源站请在插件连接页管理", nil)
 	}
-	if !actor.IsSystemAdmin() && !actor.CanResource(authz.PermissionSitesUpdate, models.AuthorizationResourceSite, uintID(record.ID)) {
+	if !actor.CanResource(authz.PermissionSitesUpdate, models.AuthorizationResourceSite, uintID(record.ID)) {
 		return SiteSummary{}, appError(CodePermissionDenied, "无权编辑这个站点", nil)
 	}
 	if input.Revision == 0 || input.Revision != record.Revision {
@@ -709,7 +709,7 @@ func (s *SiteService) Test(ctx context.Context, actor Actor, id uint, request Re
 	if err != nil {
 		return SiteSummary{}, err
 	}
-	if !actor.IsSystemAdmin() && !actor.CanResource(authz.PermissionSitesTest, models.AuthorizationResourceSite, uintID(record.ID)) {
+	if !actor.CanResource(authz.PermissionSitesTest, models.AuthorizationResourceSite, uintID(record.ID)) {
 		return SiteSummary{}, appError(CodePermissionDenied, "无权测试这个站点", nil)
 	}
 	if err := s.waitLimit(ctx, record); err != nil {
@@ -745,7 +745,7 @@ func (s *SiteService) Delete(actor Actor, id uint, request RequestContext) error
 	if record.SourceType == "plugin" {
 		return appError(CodeSiteManagedByPlugin, "插件资源站请在插件连接页删除", nil)
 	}
-	if !actor.IsSystemAdmin() && !actor.CanResource(authz.PermissionSitesDelete, models.AuthorizationResourceSite, uintID(record.ID)) {
+	if !actor.CanResource(authz.PermissionSitesDelete, models.AuthorizationResourceSite, uintID(record.ID)) {
 		return appError(CodePermissionDenied, "无权删除这个站点", nil)
 	}
 	if err := s.db.Transaction(func(tx *gorm.DB) error {
@@ -1496,7 +1496,7 @@ func (s *SiteService) Download(ctx context.Context, actor Actor, input SiteDownl
 	if !actor.CanResource(authz.PermissionDownloadsCreate, models.AuthorizationResourceDownloader, selectedDownloader.ID) {
 		return DownloadTaskSummary{}, appError(CodePermissionDenied, "无权使用这个下载器创建任务", nil)
 	}
-	if input.MediaLibraryID != nil && !actor.CanResource(authz.PermissionDownloadsCreate, models.AuthorizationResourceMediaLibrary, uintID(*input.MediaLibraryID)) {
+	if input.MediaLibraryID != nil && !actor.CanIngestLibrary(uintID(*input.MediaLibraryID)) {
 		return DownloadTaskSummary{}, appError(CodePermissionDenied, "无权向这个媒体库入库", nil)
 	}
 	var claimedSite models.Site
@@ -1696,7 +1696,7 @@ func (s *SiteService) Download(ctx context.Context, actor Actor, input SiteDownl
 			return nil
 		}
 	}
-	submitInput := SubmitDownloadInput{DownloaderID: input.DownloaderID, MediaLibraryID: input.MediaLibraryID, ProfileID: input.ProfileID, DisplayName: claim.Title, Priority: input.Priority, Source: source, PluginID: pluginID, PluginVersion: pluginVersion, PluginConnectionID: pluginConnectionID, PluginResourceClaimID: resourceClaimID, RecognitionOverride: recognitionOverride, FollowSubscriptionID: input.FollowSubscriptionID, FollowResourceFingerprint: input.FollowResourceFingerprint, ForceRecognitionOverride: input.FollowSubscriptionID != "", BeforePersist: beforePersist}
+	submitInput := SubmitDownloadInput{SourceSiteID: claimedSite.ID, DownloaderID: input.DownloaderID, MediaLibraryID: input.MediaLibraryID, ProfileID: input.ProfileID, DisplayName: claim.Title, Priority: input.Priority, Source: source, PluginID: pluginID, PluginVersion: pluginVersion, PluginConnectionID: pluginConnectionID, PluginResourceClaimID: resourceClaimID, RecognitionOverride: recognitionOverride, FollowSubscriptionID: input.FollowSubscriptionID, FollowResourceFingerprint: input.FollowResourceFingerprint, ForceRecognitionOverride: input.FollowSubscriptionID != "", BeforePersist: beforePersist}
 	var result DownloadTaskSummary
 	if source.ShareSelection != nil {
 		result, err = s.submitShareSelection(ctx, actor, input.PreviewToken, submitInput, request)

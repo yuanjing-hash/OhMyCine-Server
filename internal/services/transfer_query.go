@@ -174,7 +174,7 @@ func (s *TransferService) List(actor Actor, filter TransferListFilter) (Transfer
 	if err != nil {
 		return TransferPage{}, err
 	}
-	filterOptions, err := s.transferFilterOptions(query.Session(&gorm.Session{}))
+	filterOptions, err := s.transferFilterOptions(actor, query.Session(&gorm.Session{}))
 	if err != nil {
 		return TransferPage{}, err
 	}
@@ -192,8 +192,19 @@ func (s *TransferService) List(actor Actor, filter TransferListFilter) (Transfer
 		return TransferPage{}, err
 	}
 	list := make([]TransferSummary, 0, len(rows))
+	jobs := make([]models.Job, 0, len(rows))
+	for _, row := range rows {
+		jobs = append(jobs, models.Job{ID: row.JobID, JobType: "transfer"})
+	}
+	resources, err := jobResourceAccessRows(s.db, jobs)
+	if err != nil {
+		return TransferPage{}, err
+	}
 	for _, row := range rows {
 		finalizeTransferProjection(&row)
+		if !resources[row.JobID].visible(actor) {
+			row.TransferSummary = safeTransferSummary(row.TransferSummary)
+		}
 		list = append(list, row.TransferSummary)
 	}
 	return TransferPage{List: list, Total: total, Page: filter.Page, PageSize: filter.PageSize, Stats: stats, FilterOptions: filterOptions}, nil
@@ -219,6 +230,19 @@ func (s *TransferService) Get(actor Actor, id string) (TransferDetail, error) {
 	job, attempts, timeline, err := s.queue.domainDetail(row.JobID)
 	if err != nil {
 		return TransferDetail{}, err
+	}
+	resources, err := jobResourceAccessRows(s.db, []models.Job{{ID: row.JobID, JobType: "transfer"}})
+	if err != nil {
+		return TransferDetail{}, err
+	}
+	if !resources[row.JobID].visible(actor) {
+		row.TransferSummary = safeTransferSummary(row.TransferSummary)
+		row.MovieDirectoryTemplate, row.MovieFilenameTemplate, row.TVDirectoryTemplate, row.TVFilenameTemplate = "", "", "", ""
+		plan = nil
+		redactJobResources(&job)
+		for i := range attempts {
+			attempts[i].SafeErrorMessage = ""
+		}
 	}
 	return TransferDetail{
 		TransferSummary:        row.TransferSummary,
@@ -296,7 +320,7 @@ func (s *TransferService) transferStats(query *gorm.DB) (TransferStats, error) {
 	return stats, nil
 }
 
-func (s *TransferService) transferFilterOptions(query *gorm.DB) (TransferFilterOptions, error) {
+func (s *TransferService) transferFilterOptions(actor Actor, query *gorm.DB) (TransferFilterOptions, error) {
 	options := TransferFilterOptions{Libraries: make([]TransferLibraryOption, 0), Categories: make([]string, 0)}
 	if err := query.Session(&gorm.Session{}).
 		Select("transfer.library_id AS id, MAX(transfer.library_name) AS name").
@@ -305,6 +329,30 @@ func (s *TransferService) transferFilterOptions(query *gorm.DB) (TransferFilterO
 		Scan(&options.Libraries).Error; err != nil {
 		return TransferFilterOptions{}, err
 	}
+	allowed := make([]TransferLibraryOption, 0, len(options.Libraries))
+	libraryIDs := make([]uint, 0, len(options.Libraries))
+	for _, library := range options.Libraries {
+		if taskLibraryVisible(actor, library.ID) {
+			allowed = append(allowed, library)
+			libraryIDs = append(libraryIDs, library.ID)
+		}
+	}
+	options.Libraries = allowed
+	if len(libraryIDs) == 0 {
+		return options, nil
+	}
+	query = query.Where("transfer.library_id IN ?", libraryIDs)
+	var downloaders []models.Downloader
+	if err := s.db.Select("id").Find(&downloaders).Error; err != nil {
+		return TransferFilterOptions{}, err
+	}
+	downloaderIDs := make([]string, 0, len(downloaders))
+	for _, downloader := range downloaders {
+		if taskDownloaderVisible(actor, &downloader.ID) {
+			downloaderIDs = append(downloaderIDs, downloader.ID)
+		}
+	}
+	query = query.Where("download.downloader_id IS NULL OR download.downloader_id IN ?", downloaderIDs)
 	if err := query.Session(&gorm.Session{}).
 		Where("download.scrape_category <> ''").
 		Distinct("download.scrape_category").

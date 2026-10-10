@@ -213,6 +213,8 @@ func downloadFixture(t *testing.T) (*DownloadService, *DownloaderService, *Queue
 	for _, code := range []string{authz.PermissionDownloadersRead, authz.PermissionDownloadersCreate, authz.PermissionDownloadersUpdate, authz.PermissionDownloadersDelete, authz.PermissionDownloadersTest, authz.PermissionDownloadsReadOwn, authz.PermissionDownloadsReadAll, authz.PermissionDownloadsCreate} {
 		actor.Permissions[code] = struct{}{}
 	}
+	actor.Permissions[authz.PermissionMediaLibrariesRead] = struct{}{}
+	persistFixtureAuthority(t, queue.db, actor)
 	store, err := credential.Open(filepath.Join(t.TempDir(), "credentials.key"), "")
 	if err != nil {
 		t.Fatal(err)
@@ -509,7 +511,7 @@ func TestDownloadTargetRequiresExplicitLibraryAndKeepsSnapshot(t *testing.T) {
 }
 
 func TestPan115DownloadTargetRequiresAvailableCrossSourceCapabilitiesAndWritableMode(t *testing.T) {
-	downloads, downloaders, queue, _, _ := downloadFixture(t)
+	downloads, downloaders, queue, actor, _ := downloadFixture(t)
 	now := time.Now().UTC()
 	connectionA := models.Connection{Name: "115 A", NameNormalized: "115-a-target", Provider: cloudpkg.ProviderPan115, CredentialCiphertext: "encrypted", Enabled: true, Revision: 1, CreatedAt: now, UpdatedAt: now}
 	connectionB := models.Connection{Name: "115 B", NameNormalized: "115-b-target", Provider: cloudpkg.ProviderPan115, CredentialCiphertext: "encrypted", Enabled: true, Revision: 1, CreatedAt: now, UpdatedAt: now}
@@ -541,6 +543,17 @@ func TestPan115DownloadTargetRequiresAvailableCrossSourceCapabilitiesAndWritable
 		t.Fatal(err)
 	}
 	provider := models.Downloader{ID: "pan115-target", Name: "115 Offline", NameNormalized: "115-offline-target", Type: models.DownloaderTypePan115Offline, StorageID: &sourceStorage.ID, Enabled: true, CapabilitiesJSON: `{}`}
+	if err := queue.db.Model(&library).Update("default_ingest_connection_id", connectionA.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if summary := downloaders.summary(actor, provider); summary.LifeEventDefaultLibraryID == nil || *summary.LifeEventDefaultLibraryID != library.ID {
+		t.Fatalf("default library omitted for allowed actor: %+v", summary)
+	}
+	restricted := actor
+	restricted.ResourceAccessPolicies = map[string]ResourceAccessPolicy{models.ResourceAccessScopeLibraryRead: {Mode: models.ResourceAccessModeAllowlist}}
+	if summary := downloaders.summary(restricted, provider); summary.LifeEventDefaultLibraryID != nil || summary.LifeEventDefaultLibraryName != "" {
+		t.Fatalf("downloader disclosed forbidden default library: %+v", summary)
+	}
 	localRoot := t.TempDir()
 	localStorage := models.Storage{Name: "Local Target", NameNormalized: "local-target-" + strings.ToLower(filepath.Base(localRoot)), Type: models.StorageTypeLocal, RootPath: localRoot, RootPathNormalized: strings.ToLower(localRoot), Enabled: true, Capabilities: `{}`}
 	if err := queue.db.Create(&localStorage).Error; err != nil {
@@ -2041,7 +2054,7 @@ func TestRouteCategoryRetryReusesImmutableTaskStagingSnapshot(t *testing.T) {
 func persistedRouteTask(t *testing.T, downloads *DownloadService, id, root string) models.DownloadTask {
 	t.Helper()
 	task := models.DownloadTask{ID: id, OwnerID: 1, ProviderTaskID: "provider-hash", StagingAbsolutePath: root, Phase: models.DownloadTaskStatusClassifying, SourceCiphertext: "encrypted", CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()}
-	_, err := downloads.queue.EnqueueWith(EnqueueJobInput{OwnerID: task.OwnerID, JobType: "download", DisplayName: id, Payload: downloadJobPayload{DownloadTaskID: id}}, func(tx *gorm.DB, job models.Job) error {
+	_, err := downloads.queue.EnqueueWith(EnqueueJobInput{OwnerID: task.OwnerID, JobType: "download", DisplayName: id, Payload: downloadJobPayload{DownloadTaskID: id, ResourceAccessVersion: 1}}, func(tx *gorm.DB, job models.Job) error {
 		task.JobID = job.ID
 		return tx.Create(&task).Error
 	})

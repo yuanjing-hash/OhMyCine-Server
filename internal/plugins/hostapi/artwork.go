@@ -78,7 +78,7 @@ func (host *Host) OpenArtwork(ctx context.Context, reference string) ([]byte, st
 	if !asset.Artwork {
 		return nil, "", denied("plugin_artwork_reference_denied", nil)
 	}
-	stream, err := host.openAsset(ctx, reference, "GET", "", true)
+	stream, err := host.openAsset(ctx, reference, "GET", "", true, false)
 	if err != nil {
 		return nil, "", err
 	}

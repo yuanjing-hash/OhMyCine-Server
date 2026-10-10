@@ -240,6 +240,10 @@ OhMyCine Server
 
 父菜单“用户管理”在用户可看到上述任一子页时出现；打开时跳转到第一个可见子页。例如只有 `roles.read` 的用户可进入角色页，不因缺少 `users.read` 而被整个工作区拒绝。
 
+账户页选择用户后，在「权限设置」中编辑四类资源名单：下载器使用、站点搜索、媒体库访问、媒体库入库。各自可选择全部开放、白名单或黑名单，并以资源名称选择，显示选择数量、当前有效权限及拒绝原因。目标库必须既能访问又能入库；这些名单不授予角色或功能权限，原有直接授权仍独立保留，资源范围改为名称选择。
+
+Owner 与当前操作者自己的授权只读。切换用户时取消过时的读取，旧响应不能覆盖新用户；保存一次提交四项策略和版本。并发冲突保留草稿，提供明确的重新加载操作；保存资源名单不会重置资料、角色或直接授权的其他草稿。已删除或超出操作者范围的已有引用标为占位，不能默默丢弃。
+
 ### 6.2 头像中的自助设置
 
 当前用户的个人操作永远通过头像菜单进入，不要求管理权限：
@@ -523,3 +527,7 @@ Jackett 根地址及显式全部索引器地址使用与 Jackett 网页相同的
 ### Search result automatic recognition
 
 Resource search progressively recognizes current-page PT/BT/cloud-share claims with two concurrent workers and a per-item timeout. Ordinary detection buttons are removed; manual correction remains. The existing actor-scoped media coverage endpoint supplies work-level library badges, with per-search identity deduplication and explicit unknown/permission/error states. Search changes and unmount abort old work; stale JSON/SSE results cannot repopulate a new search. Manual confirmation wins over late automatic results both in the UI and in the Server claim vault under its write lock. Library evidence is never persisted in browser search sessions. Share availability remains click-triggered.
+
+## 只读插件账号展示
+
+只读扫码 capability site.auth 不要求账号写入能力 site.interaction。登录确认保存有限账号/会员摘要与确认时间，页面刷新后显示最近观察；凭据重置、24 小时未确认、过期或明确异常时会员显示未知。会员摘要仅用于展示，每个视频权益独立重新验证。详见 [插件原生离线下载](28-plugin-native-offline.md)。

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
-import type { PluginQRCodeAuthState, PluginSettingsField, PluginSettingsPage } from '@/plugins'
+import type { PluginQRCodeAuthState, PluginSettingsField, PluginSettingsPage, PluginAuthPollSummary } from '@/plugins'
 
 const props = defineProps<{
   page: PluginSettingsPage
@@ -9,6 +9,8 @@ const props = defineProps<{
   credentialConfigured?: boolean
   healthStatus?: string
   qrAuthState?: PluginQRCodeAuthState
+  accountSummary?: PluginAuthPollSummary['account']
+  accountCheckedAt?: string
   qrAuthActionVisible?: boolean
   qrAuthActionDisabled?: boolean
 }>()
@@ -25,6 +27,7 @@ watch(() => props.page, page => {
 
 const selectedTab = computed(() => props.page.tabs.find(tab => tab.id === activeTab.value) ?? props.page.tabs[0])
 const qrCodeVisible = computed(() => props.qrAuthState?.state === 'pending' || props.qrAuthState?.state === 'scanned')
+const membership = computed(() => props.qrAuthState?.state === 'confirmed' ? props.qrAuthState.membership : props.accountSummary?.membership)
 
 function value(field: PluginSettingsField) {
   return field.key ? props.modelValue[field.key] : undefined
@@ -40,7 +43,7 @@ function credentialLabel() {
   if (props.qrAuthState?.state === 'confirmed') return props.qrAuthState.accountName ? `已登录：${props.qrAuthState.accountName}` : '账号已登录'
   if (props.qrAuthState?.state === 'expired') return '二维码已过期，请重新生成'
   if (props.qrAuthState?.state === 'pending') return '等待扫码确认'
-  if (props.healthStatus === 'healthy') return '账号已登录，连接正常'
+  if (props.healthStatus === 'healthy') return props.accountSummary?.name ? `已登录：${props.accountSummary.name}` : '账号已登录，连接正常'
   if (props.healthStatus === 'auth_pending') return '等待扫码确认'
   if (props.healthStatus === 'auth_expired') return '登录已过期，请重新登录'
   if (props.healthStatus === 'error') return '账号连接异常'
@@ -75,6 +78,11 @@ function formatTime(value: string) {
             <div class="flex flex-wrap items-center justify-between gap-3">
               <div><strong>{{ field.label }}</strong><p v-if="field.description" class="text-subtle m-0 mt-1 text-xs">{{ field.description }}</p></div>
               <span :class="healthStatus === 'healthy' || qrAuthState?.state === 'confirmed' ? 'status-chip status-chip--ready' : credentialConfigured || qrAuthState ? 'status-chip status-chip--warning' : 'status-chip'">{{ credentialLabel() }}</span>
+            </div>
+            <div v-if="membership" class="text-subtle text-xs" role="status">
+              <span>{{ membership.label || (membership.status === 'active' ? '会员有效' : membership.status === 'inactive' ? '非会员' : '会员状态待确认') }}</span>
+              <span v-if="membership.expiresAt"> · 有效期至 {{ formatTime(membership.expiresAt) }}</span>
+              <span v-if="accountCheckedAt"> · 上次确认 {{ formatTime(accountCheckedAt) }}</span>
             </div>
             <div v-if="qrCodeVisible && qrAuthState" class="semantic-inset grid justify-items-center gap-2 p-3 text-center text-xs">
               <img :src="qrAuthState.qrDataURL" width="220" height="220" alt="插件登录二维码" class="rounded bg-white p-2" />

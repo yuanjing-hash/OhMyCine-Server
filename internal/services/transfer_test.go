@@ -554,6 +554,10 @@ func transferFixture(t *testing.T, mode, policy string, existingTarget bool) (*Q
 	t.Helper()
 	queue, actor, _ := queueFixture(t)
 	queue.SetClock(realClock{})
+	actor.Permissions[authz.PermissionMediaLibrariesRead] = struct{}{}
+	actor.Permissions[authz.PermissionDownloadsCreate] = struct{}{}
+	actor.Permissions[authz.PermissionTransfersReadAll] = struct{}{}
+	persistFixtureAuthority(t, queue.db, actor)
 	var profile models.MediaClassificationProfile
 	if err := queue.db.Where("code = ?", "default-v1").First(&profile).Error; err != nil {
 		t.Fatal(err)
@@ -584,7 +588,7 @@ func transferFixture(t *testing.T, mode, policy string, existingTarget bool) (*Q
 		t.Fatal(err)
 	}
 	task := models.DownloadTask{ID: "download-" + mode + "-" + policy, OwnerID: actor.User.ID, DownloaderName: "qBit", ProviderType: models.DownloaderTypeQBittorrent, SourceCiphertext: "encrypted", StagingAbsolutePath: staging, ProfileID: profile.ID, ProfileRevision: profile.Revision, ProfileRulesJSON: profile.RulesJSON, TargetLibraryID: &library.ID, TargetLibraryName: library.Name, TargetStorageID: &storage.ID, TargetStorageRoot: target, TargetRelativeRoot: "/", TransferMode: mode, ConflictPolicy: policy, MovieDirectoryTemplate: library.MovieDirectoryTemplate, MovieFilenameTemplate: library.MovieFilenameTemplate, TVDirectoryTemplate: library.TVDirectoryTemplate, TVFilenameTemplate: library.TVFilenameTemplate, DisplayName: "Movie", Phase: models.DownloadTaskStatusCompleted, ScrapeStatus: "completed_verified", ScrapeTitle: "Movie", ScrapeMediaType: "movie", ScrapeCategory: category, ScrapeTMDBID: &tmdbID, ScrapeConfidence: &confidence, ScrapeYear: &year, IdentitySource: mediaIdentitySourceAutomatic, IdentityStatus: mediaIdentityStatusVerified, IdentityRevision: 1, IdentitySnapshotJSON: string(identityRaw), ManifestFileCount: 1, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()}
-	_, err = queue.EnqueueWith(EnqueueJobInput{OwnerID: actor.User.ID, JobType: "download", DisplayName: "Movie", Payload: downloadJobPayload{DownloadTaskID: task.ID}}, func(tx *gorm.DB, job models.Job) error {
+	_, err = queue.EnqueueWith(EnqueueJobInput{OwnerID: actor.User.ID, JobType: "download", DisplayName: "Movie", Payload: downloadJobPayload{DownloadTaskID: task.ID, ResourceAccessVersion: 1}}, func(tx *gorm.DB, job models.Job) error {
 		task.JobID = job.ID
 		return tx.Create(&task).Error
 	})

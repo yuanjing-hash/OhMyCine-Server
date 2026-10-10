@@ -280,11 +280,17 @@ func (s *SeedingService) List(actor Actor, limit int) ([]SeedingTaskSummary, err
 	}
 	statuses := map[string]string{}
 	displayNames := map[string]string{}
+	resources := map[string]jobResourceAccess{}
 	if len(jobIDs) > 0 {
 		var jobs []models.Job
-		if err := s.db.Select("id", "status").Where("id IN ?", jobIDs).Find(&jobs).Error; err != nil {
+		if err := s.db.Select("id", "status", "job_type").Where("id IN ?", jobIDs).Find(&jobs).Error; err != nil {
 			return nil, err
 		}
+		rows, err := jobResourceAccessRows(s.db, jobs)
+		if err != nil {
+			return nil, err
+		}
+		resources = rows
 		for _, job := range jobs {
 			statuses[job.ID] = job.Status
 		}
@@ -304,7 +310,11 @@ func (s *SeedingService) List(actor Actor, limit int) ([]SeedingTaskSummary, err
 	}
 	result := make([]SeedingTaskSummary, 0, len(records))
 	for _, record := range records {
-		result = append(result, seedingTaskSummary(record, statuses[record.JobID], displayNames[record.DownloadTaskID]))
+		item := seedingTaskSummary(record, statuses[record.JobID], displayNames[record.DownloadTaskID])
+		if !resources[record.JobID].visible(actor) {
+			item = safeSeedingSummary(item)
+		}
+		result = append(result, item)
 	}
 	return result, nil
 }
@@ -339,7 +349,15 @@ func (s *SeedingService) Stop(ctx context.Context, actor Actor, id string, reque
 	if err := s.db.First(&task, "id = ?", task.ID).Error; err != nil {
 		return SeedingTaskSummary{}, err
 	}
-	return seedingTaskSummary(task, job.Status, download.DisplayName), nil
+	item := seedingTaskSummary(task, job.Status, download.DisplayName)
+	resources, err := jobResourceAccessRows(s.db, []models.Job{job})
+	if err != nil {
+		return SeedingTaskSummary{}, err
+	}
+	if !resources[job.ID].visible(actor) {
+		item = safeSeedingSummary(item)
+	}
+	return item, nil
 }
 
 func (s *SeedingService) cleanupProvider(ctx context.Context, task *models.SeedingTask) error {

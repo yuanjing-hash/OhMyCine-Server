@@ -83,6 +83,10 @@ func newShareIngestFixture(t *testing.T) shareIngestFixture {
 		permissions[code] = struct{}{}
 	}
 	actor := Actor{User: user, Permissions: permissions}
+	for _, code := range []string{authz.PermissionSitesRead, authz.PermissionSitesCreate, authz.PermissionSitesUpdate, authz.PermissionSitesTest, authz.PermissionSitesDelete, authz.PermissionDiscoveryRead} {
+		actor.Permissions[code] = struct{}{}
+	}
+	persistFixtureAuthority(t, db, actor)
 	connection, err := connections.Create(actor, ConnectionInput{Name: "115", Provider: cloudpkg.ProviderPan115, Cookie: testPan115Cookie, Enabled: true}, RequestContext{})
 	if err != nil {
 		t.Fatal(err)

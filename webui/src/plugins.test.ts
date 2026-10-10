@@ -154,6 +154,8 @@ describe('plugin connection contracts', () => {
     } satisfies Pick<InstalledPluginSummary, 'capabilities' | 'permissions' | 'settings_page'>
 
     expect(pluginQRCodeAuthScope(plugin)).toBe('bilibili.session')
+    expect(pluginQRCodeAuthScope({ ...plugin, capabilities: ['site.auth'] })).toBe('bilibili.session')
+    expect(pluginQRCodeAuthScope({ ...plugin, capabilities: [] })).toBeNull()
     expect(buildPluginConnectionQRCodePayload(connection, 'bilibili.session')).toEqual({
       credential_scope: 'bilibili.session',
       credential_mode: 'cookie',

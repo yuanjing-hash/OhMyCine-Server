@@ -195,7 +195,7 @@ func TestCloudFollowReusesShareForNewEpisodes(t *testing.T) {
 	coverage := NewMediaCoverageService(f.db, metadata)
 	follows := NewFollowService(f.db, NewAuditService(f.db), f.downloads.queue, coverage, NewAuthorizationService(f.db))
 	follows.SetDownloadService(f.downloads)
-	snapshot := FollowExecutionSnapshot{Seasons: []int{1}, SiteIDs: []uint{site.ID}, DownloaderID: f.downloader.ID, MediaLibraryID: library.ID, Schedule: FollowSchedule{Kind: "interval", Minutes: 60}, Filters: FollowFilters{MinSeeders: 10}, MaxResourcesPerRun: 2}
+	snapshot := FollowExecutionSnapshot{Version: 2, RoutingPolicy: "source_priority", Seasons: []int{1}, SiteIDs: []uint{site.ID}, MediaLibraryID: library.ID, Schedule: FollowSchedule{Kind: "interval", Minutes: 60}, Filters: FollowFilters{MinSeeders: 10}, MaxResourcesPerRun: 2}
 	subscription, err := follows.Create(context.Background(), actor, CreateFollowInput{TMDBID: 100, Title: "Fixture Show", Snapshot: snapshot}, RequestContext{})
 	if err != nil {
 		t.Fatal(err)
@@ -334,6 +334,19 @@ func TestCloudSharePreviewSelectionAuthorizationAndPersistence(t *testing.T) {
 	if result, err := service.RecognizeShareEntry(context.Background(), f.actor, preview.Token, selected); err != nil || result.Year == nil || *result.Year != 1954 {
 		t.Fatalf("file recognition=%+v err=%v", result, err)
 	}
+	// Cached claims and preview entries remain subject to current resource policy.
+	denied := f.actor
+	denied.ResourceAccessPolicies = map[string]ResourceAccessPolicy{models.ResourceAccessScopeSiteSearch: {Mode: models.ResourceAccessModeAllowlist}}
+	if _, err := service.PreviewShare(context.Background(), denied, token, f.downloader.ID); ErrorCode(err) != CodePermissionDenied {
+		t.Fatalf("revoked site preview=%v", err)
+	}
+	if _, err := service.RecognizeShareEntry(context.Background(), denied, preview.Token, selected); ErrorCode(err) != CodePermissionDenied {
+		t.Fatalf("cached revoked site entry=%v", err)
+	}
+	denied.ResourceAccessPolicies = map[string]ResourceAccessPolicy{models.ResourceAccessScopeDownloaderUse: {Mode: models.ResourceAccessModeAllowlist}}
+	if _, err := service.RecognizeShareEntry(context.Background(), denied, preview.Token, selected); ErrorCode(err) != CodePermissionDenied {
+		t.Fatalf("cached revoked downloader entry=%v", err)
+	}
 	input := SiteDownloadInput{ResultToken: token, DownloaderID: f.downloader.ID, PreviewToken: preview.Token, SelectedEntryTokens: []string{selected}}
 	src := DownloadSourceInput{Kind: downloadpkg.SourcePan115Share, URL: claim.TorrentID}
 	invalid := input
@@ -354,6 +367,17 @@ func TestCloudSharePreviewSelectionAuthorizationAndPersistence(t *testing.T) {
 	library := f.createLibrary(t, "Selected Movies", "library", "intake", "/中转")
 	f.db.Model(&models.MediaLibrary{}).Where("id = ?", library.ID).Update("enabled", true)
 	input.MediaLibraryID = &library.ID
+	input.BeforeSubmit = func() error {
+		return f.db.Create(&models.UserResourceAccessPolicy{UserID: f.actor.User.ID, Scope: models.ResourceAccessScopeDownloaderUse, Mode: models.ResourceAccessModeAllowlist, ResourceIDsJSON: "[]"}).Error
+	}
+	if _, err := service.Download(context.Background(), f.actor, input, RequestContext{}); ErrorCode(err) != CodePermissionDenied {
+		t.Fatalf("authority race accepted: %v", err)
+	}
+	var taskCount int64
+	if err := f.db.Model(&models.DownloadTask{}).Count(&taskCount).Error; err != nil || taskCount != 0 {
+		t.Fatalf("revoked submit persisted task: %d %v", taskCount, err)
+	}
+	f.db.Where("user_id = ? AND scope = ?", f.actor.User.ID, models.ResourceAccessScopeDownloaderUse).Delete(&models.UserResourceAccessPolicy{})
 	// Fail configuration races within the actual download transaction.
 	input.BeforeSubmit = func() error {
 		return f.db.Model(&models.Downloader{}).Where("id = ?", f.downloader.ID).Update("provider_directory_id", "nested").Error
