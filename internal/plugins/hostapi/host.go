@@ -84,6 +84,7 @@ type Host struct {
 	events           map[string][]eventRecord
 	assetsMu         sync.Mutex
 	assets           map[string]Asset
+	offlineAssets    map[string]Asset
 	artworkNamespace uuid.UUID
 	capturesMu       sync.Mutex
 	captures         map[string]credentialCapture
@@ -109,6 +110,7 @@ func New(db *gorm.DB, credentials *credential.Store, log zerolog.Logger, options
 		now:              time.Now,
 		events:           make(map[string][]eventRecord),
 		assets:           make(map[string]Asset),
+		offlineAssets:    make(map[string]Asset),
 		artworkNamespace: uuid.New(),
 		captures:         make(map[string]credentialCapture),
 	}
@@ -247,6 +249,8 @@ type Asset struct {
 	Body              []byte
 	ContentType       string
 	Artwork           bool
+	HLSDepth          int
+	OfflineOnly       bool
 }
 
 // AssetStream is the only supported bridge from a registered opaque asset to
@@ -365,14 +369,19 @@ func (host *Host) ResolveAsset(reference string) (Asset, error) {
 	host.assetsMu.Lock()
 	defer host.assetsMu.Unlock()
 	asset, ok := host.assets[reference]
+	if !ok {
+		asset, ok = host.offlineAssets[reference]
+	}
 	if !ok || !asset.ExpiresAt.After(now) {
 		delete(host.assets, reference)
+		delete(host.offlineAssets, reference)
 		return Asset{}, invalid("plugin_asset_expired", nil)
 	}
 	asset.Headers = asset.Headers.Clone()
 	asset.Body = append([]byte(nil), asset.Body...)
 	if err := host.validateAssetOwner(asset); err != nil {
 		delete(host.assets, reference)
+		delete(host.offlineAssets, reference)
 		return Asset{}, err
 	}
 	return asset, nil
@@ -395,10 +404,10 @@ func (host *Host) validateAssetOwner(asset Asset) error {
 // streaming and intentionally have no media-size cap; registration, caller
 // authentication and Range requests are bounded at their own boundaries.
 func (host *Host) OpenAsset(ctx context.Context, reference, method, rangeHeader string) (*AssetStream, error) {
-	return host.openAsset(ctx, reference, method, rangeHeader, false)
+	return host.openAsset(ctx, reference, method, rangeHeader, false, false)
 }
 
-func (host *Host) openAsset(ctx context.Context, reference, method, rangeHeader string, allowArtwork bool) (*AssetStream, error) {
+func (host *Host) openAsset(ctx context.Context, reference, method, rangeHeader string, allowArtwork, allowOffline bool) (*AssetStream, error) {
 	method = strings.ToUpper(strings.TrimSpace(method))
 	if method != http.MethodGet && method != http.MethodHead {
 		return nil, denied("plugin_asset_method_denied", nil)
@@ -412,6 +421,9 @@ func (host *Host) openAsset(ctx context.Context, reference, method, rangeHeader 
 	}
 	if asset.Artwork && !allowArtwork {
 		return nil, denied("plugin_artwork_reference_denied", nil)
+	}
+	if asset.OfflineOnly && !allowOffline {
+		return nil, denied("plugin_offline_reference_denied", nil)
 	}
 	authorization, err := host.authorization(asset.PluginID)
 	if err != nil {
@@ -436,8 +448,14 @@ func (host *Host) openAsset(ctx context.Context, reference, method, rangeHeader 
 		return nil, invalid("plugin_asset_request_invalid", err)
 	}
 	request.Header = asset.Headers.Clone()
+	if isHLSAsset(target, "") {
+		request.Method = http.MethodGet
+	}
 	if rangeHeader != "" {
 		request.Header.Set("Range", rangeHeader)
+	}
+	if isHLSAsset(target, "") {
+		request.Header.Del("Range")
 	}
 	client := host.clientForPermissions(permissions, true)
 	response, err := client.Do(request)
@@ -459,6 +477,9 @@ func (host *Host) openAsset(ctx context.Context, reference, method, rangeHeader 
 	if response.StatusCode != http.StatusOK && response.StatusCode != http.StatusPartialContent {
 		_ = response.Body.Close()
 		return nil, invalid("plugin_asset_upstream_unavailable", nil)
+	}
+	if isHLSAsset(target, response.Header.Get("Content-Type")) {
+		return host.rewriteHLSAsset(ctx, reference, asset, authorization, response, method, rangeHeader)
 	}
 	return &AssetStream{StatusCode: response.StatusCode, Header: headers, Body: response.Body}, nil
 }
@@ -842,7 +863,7 @@ func (host *Host) commitCredentialContext(ctx context.Context, pluginID string, 
 	}
 	result := host.db.Model(&models.PluginConnection{}).
 		Where("id = ? AND plugin_id = ? AND enabled = ? AND revision = ? AND credential_scope = ? AND credential_mode = ?", connection.ID, pluginID, true, connection.Revision, input.Scope, models.PluginCredentialModeCookie).
-		Updates(map[string]any{"credential_ciphertext": ciphertext, "credential_version": connection.CredentialVersion + 1, "revision": connection.Revision + 1, "updated_at": now})
+		Updates(map[string]any{"credential_ciphertext": ciphertext, "credential_version": connection.CredentialVersion + 1, "revision": connection.Revision + 1, "updated_at": now, "account_summary_json": "", "account_checked_at": nil, "login_account_label": ""})
 	if result.Error != nil {
 		return nil, invalid("plugin_credential_store_unavailable", result.Error)
 	}
@@ -852,7 +873,7 @@ func (host *Host) commitCredentialContext(ctx context.Context, pluginID string, 
 	if host.browserCommit != nil {
 		host.browserCommit(ctx, connection)
 	}
-	return map[string]any{"credentialUpdated": true}, nil
+	return map[string]any{"credentialUpdated": true, "credentialVersion": connection.CredentialVersion + 1}, nil
 }
 
 func (host *Host) mergeCapturedCredential(pluginID string, connection models.PluginConnection, captured []capturedCookie) (string, error) {
@@ -957,7 +978,7 @@ func (host *Host) clientForPermissions(permissions []contract.Permission, allowA
 		if err := host.requirePublicHost(next.Context(), next.URL.Hostname()); err != nil {
 			return err
 		}
-		if !strings.EqualFold(via[len(via)-1].URL.Hostname(), next.URL.Hostname()) {
+		if !sameAssetOrigin(via[len(via)-1].URL, next.URL) {
 			next.Header.Del("Cookie")
 			next.Header.Del("Authorization")
 		}

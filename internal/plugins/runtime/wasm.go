@@ -42,25 +42,26 @@ const (
 // Operation codes are part of the public runtime v1 ABI. Keep these values in
 // sync with plugin-sdk/src/runtime.ts and the cross-language fixture.
 var operationCodes = map[string]uint64{
-	"site.navigation":            1,
-	"site.feed":                  2,
-	"site.search":                3,
-	"site.detail":                4,
-	"media.playback":             5,
-	"media.download_plan":        6,
-	"site.history":               7,
-	"playback.progress_sync":     8,
-	"site.interaction":           9,
-	"site.auth.start":            10,
-	"site.auth.poll":             11,
-	"media.metadata":             12,
-	"library.artwork_candidates": 13,
-	"resource.search":            14,
-	"resource.resolve":           15,
-	"resource.health":            16,
-	"resource.auth.login":        17,
-	"resource.auth.captcha":      18,
-	"resource.auth.cookie":       19,
+	"site.navigation":             1,
+	"site.feed":                   2,
+	"site.search":                 3,
+	"site.detail":                 4,
+	"media.playback":              5,
+	"media.download_plan":         6,
+	"site.history":                7,
+	"playback.progress_sync":      8,
+	"site.interaction":            9,
+	"site.auth.start":             10,
+	"site.auth.poll":              11,
+	"media.metadata":              12,
+	"library.artwork_candidates":  13,
+	"resource.search":             14,
+	"resource.resolve":            15,
+	"resource.health":             16,
+	"resource.auth.login":         17,
+	"resource.auth.captcha":       18,
+	"resource.auth.cookie":        19,
+	"media.offline_download_plan": 20,
 }
 
 type Error struct {
@@ -207,6 +208,14 @@ func (host *Host) Invoke(ctx context.Context, pluginID, operation string, reques
 }
 
 func operationTimeout(operation string) time.Duration {
+	if operation == "site.auth.poll" || operation == "site.detail" || operation == "media.playback" || operation == "media.offline_download_plan" {
+		// Account confirmation and exact representation resolution can require
+		// several sequential control requests. Each Host HTTP call stays bounded.
+		return 45 * time.Second
+	}
+	if strings.HasPrefix(operation, "site.") {
+		return resourceCallTimeout
+	}
 	if operation == "resource.auth.login" || operation == "resource.auth.captcha" {
 		// Login can bootstrap a form, submit credentials and fetch a challenge.
 		// Each Host request retains its 15-second cap; bound the whole sequence.

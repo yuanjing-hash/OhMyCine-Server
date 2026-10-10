@@ -42,11 +42,13 @@ const (
 	CapabilitySiteDetail       Capability = "site.detail"
 	CapabilitySiteUserLibrary  Capability = "site.user_library"
 	CapabilitySiteInteraction  Capability = "site.interaction"
+	CapabilitySiteAuth         Capability = "site.auth"
 	CapabilityMediaPlayback    Capability = "media.playback"
 	CapabilityQualitySwitch    Capability = "media.quality_switch"
 	CapabilityMediaSubtitle    Capability = "media.subtitle"
 	CapabilityMediaDanmaku     Capability = "media.danmaku"
 	CapabilityMediaDownload    Capability = "media.download_plan"
+	CapabilityMediaOffline     Capability = "media.offline_download_plan"
 	CapabilityMediaMetadata    Capability = "media.metadata"
 	CapabilityHomeContribution Capability = "home.contribution"
 	CapabilityFeedRefresh      Capability = "feed.refresh"
@@ -63,9 +65,9 @@ const (
 
 var knownCapabilities = map[Capability]struct{}{
 	CapabilitySiteNavigation: {}, CapabilitySiteFeed: {}, CapabilitySiteSearch: {}, CapabilitySiteDetail: {},
-	CapabilitySiteUserLibrary: {}, CapabilitySiteInteraction: {}, CapabilityMediaPlayback: {},
+	CapabilitySiteUserLibrary: {}, CapabilitySiteInteraction: {}, CapabilitySiteAuth: {}, CapabilityMediaPlayback: {},
 	CapabilityQualitySwitch: {}, CapabilityMediaSubtitle: {}, CapabilityMediaDanmaku: {},
-	CapabilityMediaDownload: {}, CapabilityHomeContribution: {}, CapabilityFeedRefresh: {},
+	CapabilityMediaDownload: {}, CapabilityMediaOffline: {}, CapabilityHomeContribution: {}, CapabilityFeedRefresh: {},
 	CapabilityMediaMetadata: {},
 	CapabilitySiteHistory:   {}, CapabilityPlaybackProgress: {}, CapabilityLibraryArtwork: {},
 	CapabilityResourceSearch: {}, CapabilityResourceResolve: {}, CapabilityResourceHealth: {},

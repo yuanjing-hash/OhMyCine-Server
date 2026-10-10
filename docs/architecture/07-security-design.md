@@ -733,3 +733,7 @@ ports:
 - 正式安装链由至少 RSA-3072 的离线私钥签 manifest，Server 和安装器只携带公钥。
   Release 工作流分别在构建前派生信任根、签名时重新派生并比较；私钥不会通过
   `$GITHUB_ENV`、构建参数或发布资产传播。开发构建没有信任根时不提供完整命令。
+
+## 原生在线离线传输边界
+
+原生私有计划每次要求当前设备 read + download 和插件当前下载授权。敏感 Header 留在 Host，短期 CDN URL/密钥只在 no-store 原生响应内使用，禁止写日志和任务持久状态；OfflineOnly 引用不能从普通播放网关重放。重定向按 scheme/host/port 判断 origin，跨 origin 去掉认证 Header；所有子资产保持 owner/package/generation 和网络校验。详见 [插件原生离线下载](28-plugin-native-offline.md)。

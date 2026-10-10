@@ -361,6 +361,20 @@ type DownloadPlan struct {
 	Merge             *DownloadMerge  `json:"merge,omitempty"`
 }
 
+// OfflineDownloadPlan grants only Player-local transfer of the exact selection.
+// It contains no URL, local path, command line, or provider credential.
+type OfflineDownloadPlan struct {
+	Version           int             `json:"version"`
+	WorkID            string          `json:"workId"`
+	SegmentID         string          `json:"segmentId"`
+	VersionID         string          `json:"versionId"`
+	VariantID         string          `json:"variantId"`
+	SuggestedFileName string          `json:"suggestedFileName"`
+	Format            string          `json:"format"`
+	Assets            []DownloadAsset `json:"assets"`
+	ExpiresAt         int64           `json:"expiresAt,omitempty"`
+}
+
 type ProviderArtwork struct {
 	Kind     string `json:"kind"`
 	AssetRef string `json:"assetRef"`

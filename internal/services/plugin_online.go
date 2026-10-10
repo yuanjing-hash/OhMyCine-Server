@@ -32,18 +32,19 @@ const (
 )
 
 type PluginOnlineLibrarySummary struct {
-	ID                string                `json:"id"`
-	PluginID          string                `json:"pluginId"`
-	ConnectionID      string                `json:"connectionId"`
-	Name              string                `json:"name"`
-	ProviderLabel     string                `json:"providerLabel"`
-	Capabilities      []contract.Capability `json:"capabilities"`
-	Available         bool                  `json:"available"`
-	ErrorCode         string                `json:"errorCode,omitempty"`
-	HomeContributions []string              `json:"homeContributions"`
-	ArtworkURL        string                `json:"artworkUrl,omitempty"`
-	ArtworkRevision   string                `json:"artworkRevision,omitempty"`
-	ArtworkSource     string                `json:"artworkSource,omitempty"`
+	ID                       string                `json:"id"`
+	PluginID                 string                `json:"pluginId"`
+	ConnectionID             string                `json:"connectionId"`
+	Name                     string                `json:"name"`
+	ProviderLabel            string                `json:"providerLabel"`
+	Capabilities             []contract.Capability `json:"capabilities"`
+	Available                bool                  `json:"available"`
+	ErrorCode                string                `json:"errorCode,omitempty"`
+	HomeContributions        []string              `json:"homeContributions"`
+	ArtworkURL               string                `json:"artworkUrl,omitempty"`
+	ArtworkRevision          string                `json:"artworkRevision,omitempty"`
+	ArtworkSource            string                `json:"artworkSource,omitempty"`
+	OfflineDownloadSupported bool                  `json:"offlineDownloadSupported"`
 }
 
 func (s *PluginRepositoryService) OnlineArtworkCandidates(ctx context.Context, actor Actor, libraryID, scopeKey string) ([]contract.LibraryArtworkCandidate, error) {
@@ -160,6 +161,7 @@ func (s *PluginRepositoryService) OnlineLibraries(actor Actor) ([]PluginOnlineLi
 			Name: library.Name, ProviderLabel: manifest.Name, Capabilities: append([]contract.Capability(nil), manifest.Capabilities...),
 			Available: true, HomeContributions: home, ArtworkURL: artworkURL,
 			ArtworkRevision: fallbackArtworkRevision(artworkURL), ArtworkSource: artworkSource,
+			OfflineDownloadSupported: s.offline != nil && canPlayerOffline(actor) && manifestHasPermission(manifest, contract.PermissionDownloadPlan) && pluginHasActivePermission(s.db, library.PluginID, contract.PermissionDownloadPlan) && (manifestHasCapability(manifest, contract.CapabilityMediaOffline) || manifestHasCapability(manifest, contract.CapabilityMediaDownload)),
 		})
 	}
 	sort.SliceStable(result, func(i, j int) bool {

@@ -527,3 +527,7 @@ Jackett 根地址及显式全部索引器地址使用与 Jackett 网页相同的
 ### Search result automatic recognition
 
 Resource search progressively recognizes current-page PT/BT/cloud-share claims with two concurrent workers and a per-item timeout. Ordinary detection buttons are removed; manual correction remains. The existing actor-scoped media coverage endpoint supplies work-level library badges, with per-search identity deduplication and explicit unknown/permission/error states. Search changes and unmount abort old work; stale JSON/SSE results cannot repopulate a new search. Manual confirmation wins over late automatic results both in the UI and in the Server claim vault under its write lock. Library evidence is never persisted in browser search sessions. Share availability remains click-triggered.
+
+## 只读插件账号展示
+
+只读扫码 capability site.auth 不要求账号写入能力 site.interaction。登录确认保存有限账号/会员摘要与确认时间，页面刷新后显示最近观察；凭据重置、24 小时未确认、过期或明确异常时会员显示未知。会员摘要仅用于展示，每个视频权益独立重新验证。详见 [插件原生离线下载](28-plugin-native-offline.md)。

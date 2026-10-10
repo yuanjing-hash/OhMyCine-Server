@@ -152,6 +152,8 @@ export interface PluginConnectionSummary {
   resource_type?: string
   entry_origin?: string
   login_account_label?: string
+  account?: PluginAuthPollSummary['account']
+  account_checked_at?: string
   enabled: boolean
   health_status: 'unknown' | 'auth_pending' | 'auth_expired' | 'healthy' | 'error' | string
   health_error_code?: string
@@ -191,8 +193,15 @@ export interface PluginAuthStartSummary {
 export interface PluginAuthPollSummary {
   state: 'pending' | 'scanned' | 'confirmed' | 'expired'
   authenticated: boolean
-  account?: { id: string, name: string, avatarUrl?: string }
+  account?: { id: string, name: string, avatarUrl?: string, membership?: PluginMembershipSummary }
   pollAfterSeconds?: number
+  credentialVersion?: number
+}
+
+export interface PluginMembershipSummary {
+  status: 'active' | 'inactive' | 'unknown'
+  label?: string
+  expiresAt?: string
 }
 
 export interface PluginQRCodeAuthState {
@@ -201,6 +210,7 @@ export interface PluginQRCodeAuthState {
   expiresAt: string
   state: PluginAuthPollSummary['state']
   accountName?: string
+  membership?: PluginMembershipSummary
 }
 
 export const pluginRepositoryListPath = '/api/v1/plugin-repositories'
@@ -385,7 +395,7 @@ export function pluginQRCodeAuthScope(plugin: Pick<InstalledPluginSummary, 'capa
   const exposesCredentialStatus = plugin.settings_page?.tabs.some(tab =>
     tab.sections.some(section => section.fields.some(field => field.type === 'credential-status')),
   ) ?? false
-  if (!exposesCredentialStatus || !plugin.capabilities.includes('site.interaction')) return null
+  if (!exposesCredentialStatus || !(plugin.capabilities.includes('site.auth') || plugin.capabilities.includes('site.interaction'))) return null
   const scopes = new Set(
     plugin.permissions
       .filter(permission => permission.kind === 'credential.use')

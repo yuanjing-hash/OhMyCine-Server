@@ -438,7 +438,7 @@ async function pollConnectionAuth(plugin: InstalledPluginSummary, connection: Pl
   if (!current) return
   try {
     const response = await api<PluginAuthPollSummary>(pluginConnectionAuthPath(plugin.id, connection.id, 'poll'), { method: 'POST', body: JSON.stringify({ login_session: current.loginSession }) })
-    connectionAuth.value = { ...connectionAuth.value, [connection.id]: { ...current, state: response.state, accountName: response.account?.name } }
+    connectionAuth.value = { ...connectionAuth.value, [connection.id]: { ...current, state: response.state, accountName: response.account?.name, membership: response.account?.membership } }
     if (response.state === 'pending' || response.state === 'scanned') scheduleAuthPoll(plugin, connection, response.pollAfterSeconds ?? 2)
     else {
       authPollTimers.delete(connection.id)
@@ -839,6 +839,8 @@ onMounted(() => { void loadAll() })
                   :page="plugin.settings_page"
                   :credential-configured="connection.credential_configured"
                   :health-status="connection.health_status"
+                  :account-summary="connection.account"
+                  :account-checked-at="connection.account_checked_at"
                   :qr-auth-state="canManage ? connectionAuth[connection.id] : undefined"
                   :qr-auth-action-visible="canManage && Boolean(pluginQRCodeAuthScope(plugin))"
                   :qr-auth-action-disabled="connectionBusyID !== '' || !connection.enabled"
@@ -851,6 +853,8 @@ onMounted(() => { void loadAll() })
                   :page="plugin.settings_page"
                   :credential-configured="connection.credential_configured"
                   :health-status="connection.health_status"
+                  :account-summary="connection.account"
+                  :account-checked-at="connection.account_checked_at"
                   :qr-auth-state="canManage ? connectionAuth[connection.id] : undefined"
                   :qr-auth-action-visible="canManage && Boolean(pluginQRCodeAuthScope(plugin))"
                   :qr-auth-action-disabled="connectionBusyID !== '' || !connection.enabled"

@@ -108,6 +108,9 @@ func (a *API) playerCapabilitiesWithServices(actor services.Actor) []string {
 	if a.playerHistory != nil {
 		capabilities = append(capabilities, "history_artwork_upload_v1")
 	}
+	if a.pluginRepositories != nil && a.pluginRepositories.OfflineAvailable() && actor.Can(authz.PermissionMediaLibrariesRead) && actor.Can(authz.PermissionDownloadsCreate) {
+		capabilities = append(capabilities, "online_offline_plan_v1")
+	}
 	sort.Strings(capabilities)
 	return capabilities
 }
