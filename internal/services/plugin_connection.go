@@ -472,6 +472,12 @@ func strictPluginResponse(raw []byte, destination any) error {
 func pluginAuthResponseError(raw []byte, cause error) error {
 	var envelope pluginErrorEnvelope
 	if json.Unmarshal(raw, &envelope) == nil && envelope.PluginError != nil {
+		if strings.TrimSpace(envelope.PluginError.Code) == "permission-denied" {
+			// The plugin text is untrusted. A denied Host call may be caused by
+			// permissions, ownership or DNS policy; never assert a single cause
+			// or forward provider diagnostics/addresses in the client message.
+			return appError(CodePermissionDenied, "插件登录访问被拒绝，请检查插件权限、域名授权，以及 DNS 是否解析到私网或代理 fake-IP", nil)
+		}
 		return appError(CodePluginOnlineLibraryUnavailable, "插件登录服务暂时不可用", nil)
 	}
 	return appError(CodePluginResponseInvalid, "插件登录响应无效", cause)
