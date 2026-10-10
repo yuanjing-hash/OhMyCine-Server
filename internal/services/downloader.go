@@ -119,7 +119,7 @@ func (s *DownloaderService) List(actor Actor) ([]DownloaderSummary, error) {
 		if !actor.CanResource(authz.PermissionDownloadersRead, models.AuthorizationResourceDownloader, record.ID) {
 			continue
 		}
-		items = append(items, s.summary(record))
+		items = append(items, s.summary(actor, record))
 	}
 	return items, nil
 }
@@ -243,7 +243,7 @@ func (s *DownloaderService) CreateContext(ctx context.Context, actor Actor, inpu
 		}
 		return DownloaderSummary{}, err
 	}
-	return s.summary(record), nil
+	return s.summary(actor, record), nil
 }
 
 func (s *DownloaderService) Update(actor Actor, id string, input UpdateDownloaderInput, request RequestContext) (DownloaderSummary, error) {
@@ -356,7 +356,7 @@ func (s *DownloaderService) UpdateContext(ctx context.Context, actor Actor, id s
 		}
 		return DownloaderSummary{}, err
 	}
-	return s.summary(record), nil
+	return s.summary(actor, record), nil
 }
 
 func (s *DownloaderService) Test(ctx context.Context, actor Actor, id string, request RequestContext) (DownloaderSummary, error) {
@@ -392,7 +392,7 @@ func (s *DownloaderService) Test(ctx context.Context, actor Actor, id string, re
 	if err != nil {
 		return DownloaderSummary{}, appError(CodeDownloaderUnavailable, downloaderTestMessage(record.Type, errorCode), err)
 	}
-	return s.summary(record), nil
+	return s.summary(actor, record), nil
 }
 
 func (s *DownloaderService) Delete(actor Actor, id string, request RequestContext) error {
@@ -635,7 +635,7 @@ func normalizeDownloaderName(input string) (string, string, error) {
 
 func downloaderPurpose(id, field string) string { return "downloader:" + id + ":" + field }
 
-func (s *DownloaderService) summary(record models.Downloader) DownloaderSummary {
+func (s *DownloaderService) summary(actor Actor, record models.Downloader) DownloaderSummary {
 	var capabilities downloadpkg.Capabilities
 	_ = json.Unmarshal([]byte(record.CapabilitiesJSON), &capabilities)
 	name := ""
@@ -649,7 +649,7 @@ func (s *DownloaderService) summary(record models.Downloader) DownloaderSummary 
 		if record.Type == models.DownloaderTypePan115Offline {
 			if s.db.Select("id", "name", "connection_id").First(&storage, *record.StorageID).Error == nil && storage.ConnectionID != nil {
 				var library models.MediaLibrary
-				if s.db.Select("id", "name").Where("default_ingest_connection_id = ? AND enabled = ?", *storage.ConnectionID, true).First(&library).Error == nil {
+				if s.db.Select("id", "name").Where("default_ingest_connection_id = ? AND enabled = ?", *storage.ConnectionID, true).First(&library).Error == nil && taskLibraryVisible(actor, library.ID) {
 					value := library.ID
 					defaultLibraryID, defaultLibraryName = &value, library.Name
 				}

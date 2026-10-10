@@ -407,6 +407,9 @@ func (s *QueueService) List(actor Actor, filter JobListFilter) (JobPage, error) 
 	if err := s.projectJobWaitReasons(actor, jobs, list); err != nil {
 		return JobPage{}, err
 	}
+	if err := s.projectJobResourceAccess(actor, jobs, list); err != nil {
+		return JobPage{}, err
+	}
 	return JobPage{List: list, Total: total, Page: filter.Page, PageSize: filter.PageSize}, nil
 }
 
@@ -429,6 +432,9 @@ func (s *QueueService) Get(actor Actor, id string) (JobDTO, error) {
 	if err := s.projectJobWaitReasons(actor, []models.Job{job}, dtos); err != nil {
 		return JobDTO{}, err
 	}
+	if err := s.projectJobResourceAccess(actor, []models.Job{job}, dtos); err != nil {
+		return JobDTO{}, err
+	}
 	return dtos[0], nil
 }
 
@@ -443,6 +449,15 @@ func (s *QueueService) Attempts(actor Actor, id string) ([]models.JobAttempt, er
 	var attempts []models.JobAttempt
 	if err := s.db.Where("job_id = ?", id).Order("attempt_number DESC").Limit(200).Find(&attempts).Error; err != nil {
 		return nil, err
+	}
+	resources, err := jobResourceAccessRows(s.db, []models.Job{job})
+	if err != nil {
+		return nil, err
+	}
+	if !resources[job.ID].visible(actor) {
+		for i := range attempts {
+			attempts[i].SafeErrorMessage = ""
+		}
 	}
 	return attempts, nil
 }
@@ -581,6 +596,9 @@ func (s *QueueService) Lane(actor Actor, jobType string, priority int) ([]JobDTO
 		dto.LaneRank = &rank
 		list = append(list, dto)
 	}
+	if err := s.projectJobResourceAccess(actor, jobs, list); err != nil {
+		return nil, err
+	}
 	return list, nil
 }
 
@@ -650,6 +668,9 @@ func (s *QueueService) Control(actor Actor, id, action string, request RequestCo
 		case "retry":
 			if from != models.JobStatusFailed {
 				return appError(CodeQueueStateConflict, "仅失败任务可以重试", nil)
+			}
+			if err := authorizeJobContinuationTx(tx, actor, job); err != nil {
+				return err
 			}
 			updates["status"] = models.JobStatusQueued
 			updates["next_attempt_at"] = nil
@@ -893,6 +914,11 @@ func (s *QueueService) Respond(actor Actor, id string, version uint64, response 
 		}
 		if action.ExpiresAt != nil && action.ExpiresAt.Before(now) {
 			return appError(CodeQueueActionStale, "等待操作已过期", nil)
+		}
+		if response != "cancel" && response != "pause" {
+			if err := authorizeJobContinuationTx(tx, actor, job, "respond"); err != nil {
+				return err
+			}
 		}
 		var checkpoint map[string]any
 		if err := json.Unmarshal([]byte(job.CheckpointJSON), &checkpoint); err != nil {

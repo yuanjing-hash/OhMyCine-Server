@@ -143,6 +143,21 @@ func TestCredentialRevealAllowlistAuditAndCustomMetadataOnly(t *testing.T) {
 	if _, err := service.Reveal(Actor{User: user, Permissions: map[string]struct{}{}}, CredentialRevealInput{ResourceType: CredentialResourceConnection, ResourceID: "7", Field: "credential"}, RequestContext{}); ErrorCode(err) != CodePermissionDenied {
 		t.Fatalf("permission error=%v", err)
 	}
+	restricted := actor
+	restricted.ResourceAccessPolicies = map[string]ResourceAccessPolicy{
+		models.ResourceAccessScopeDownloaderUse: {Scope: models.ResourceAccessScopeDownloaderUse, Mode: models.ResourceAccessModeAllowlist, ResourceIDs: []string{}},
+		models.ResourceAccessScopeSiteSearch:    {Scope: models.ResourceAccessScopeSiteSearch, Mode: models.ResourceAccessModeDenylist, ResourceIDs: []string{"9"}},
+	}
+	for _, input := range []CredentialRevealInput{
+		{ResourceType: CredentialResourceDownloader, ResourceID: downloader.ID, Field: "password"},
+		{ResourceType: CredentialResourceSite, ResourceID: "9", Field: "cookie"},
+		{ResourceType: CredentialResourceSite, ResourceID: "09", Field: "passkey"},
+	} {
+		result, err := service.Reveal(restricted, input, RequestContext{})
+		if ErrorCode(err) != CodePermissionDenied || result.Value != "" {
+			t.Fatalf("restricted credential revealed: type=%s id=%s err=%v", input.ResourceType, input.ResourceID, err)
+		}
+	}
 
 	var records []models.AuditLog
 	if err := db.Where("action = ?", "credential.reveal").Find(&records).Error; err != nil || len(records) < 4 {

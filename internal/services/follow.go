@@ -419,7 +419,7 @@ func (s *FollowService) List(actor Actor, page, pageSize int, status string) (Fo
 	}
 	list := make([]FollowSummary, 0, len(rows))
 	for _, row := range rows {
-		item, err := followSummary(row)
+		item, err := followSummaryForActor(actor, row)
 		if err != nil {
 			return FollowPage{}, err
 		}
@@ -433,7 +433,7 @@ func (s *FollowService) Get(actor Actor, id string) (FollowSummary, error) {
 	if err != nil {
 		return FollowSummary{}, err
 	}
-	return followSummary(record)
+	return followSummaryForActor(actor, record)
 }
 
 func (s *FollowService) Update(ctx context.Context, actor Actor, id string, input UpdateFollowInput, request RequestContext) (FollowSummary, error) {
@@ -534,7 +534,11 @@ func (s *FollowService) SetPaused(actor Actor, id string, paused bool, request R
 	}); err != nil {
 		return FollowSummary{}, err
 	}
-	return s.getSummary(id)
+	var updated models.FollowSubscription
+	if err := s.db.First(&updated, "id = ?", id).Error; err != nil {
+		return FollowSummary{}, err
+	}
+	return followSummaryForActor(actor, updated)
 }
 
 func (s *FollowService) Delete(actor Actor, id string, request RequestContext) error {
@@ -565,6 +569,15 @@ func (s *FollowService) Runs(actor Actor, id string) ([]FollowRunSummary, error)
 	for _, row := range rows {
 		summary := map[string]int{}
 		_ = json.Unmarshal([]byte(row.FilterSummaryJSON), &summary)
+		var snapshot FollowExecutionSnapshot
+		if err := json.Unmarshal([]byte(row.ExecutionSnapshotJSON), &snapshot); err != nil {
+			row.ErrorMessage = ""
+		} else {
+			access := jobResourceAccess{LibraryID: snapshot.MediaLibraryID, SiteIDs: snapshot.SiteIDs}
+			if !access.visible(actor) {
+				row.ErrorMessage = ""
+			}
+		}
 		result = append(result, FollowRunSummary{ID: row.ID, JobID: row.JobID, Trigger: row.Trigger, Status: row.Status, SubscriptionRevision: row.SubscriptionRevision, SearchedNamesCount: row.SearchedNamesCount, Candidates: row.Candidates, Selected: row.Selected, FilterSummary: summary, ErrorCode: row.ErrorCode, ErrorMessage: row.ErrorMessage, StartedAt: row.StartedAt, FinishedAt: row.FinishedAt, CreatedAt: row.CreatedAt})
 	}
 	return result, nil
@@ -577,6 +590,34 @@ func (s *FollowService) Enqueue(ctx context.Context, actor Actor, id, trigger st
 	}
 	if record.Status == models.FollowStatusPaused {
 		return "", appError(CodeConflict, "已暂停的订阅不能立即搜索", nil)
+	}
+	var snapshot FollowExecutionSnapshot
+	if err := json.Unmarshal([]byte(record.ExecutionSnapshotJSON), &snapshot); err != nil {
+		return "", appError(CodeFollowConfigurationInvalid, "订阅配置快照无效", err)
+	}
+	// Execution is a control permission. Preserve its existing independence
+	// from read/create functions while applying the caller's resource limits.
+	libraryID := uintID(snapshot.MediaLibraryID)
+	if !actor.ResourceAccessAllows(models.ResourceAccessScopeLibraryRead, libraryID) || !actor.ResourceAccessAllows(models.ResourceAccessScopeLibraryIngest, libraryID) || explicitResourceDeny(actor, authz.PermissionMediaLibrariesRead, models.AuthorizationResourceMediaLibrary, libraryID) || explicitResourceDeny(actor, authz.PermissionDownloadsCreate, models.AuthorizationResourceMediaLibrary, libraryID) {
+		return "", appError(CodePermissionDenied, "当前资源权限不允许执行这个订阅", nil)
+	}
+	siteIDs := make([]uint, 0, len(snapshot.SiteIDs))
+	for _, siteID := range snapshot.SiteIDs {
+		id := uintID(siteID)
+		if actor.ResourceAccessAllows(models.ResourceAccessScopeSiteSearch, id) && !explicitResourceDeny(actor, authz.PermissionDiscoveryRead, models.AuthorizationResourceSite, id) {
+			siteIDs = append(siteIDs, siteID)
+		}
+	}
+	if len(siteIDs) == 0 {
+		return "", appError(CodePermissionDenied, "订阅没有当前允许搜索的站点", nil)
+	}
+	if len(siteIDs) != len(snapshot.SiteIDs) {
+		snapshot.SiteIDs = siteIDs
+		raw, err := json.Marshal(snapshot)
+		if err != nil {
+			return "", err
+		}
+		record.ExecutionSnapshotJSON = string(raw)
 	}
 	jobID, err := s.enqueueRecord(ctx, record, trigger)
 	if err != nil {
@@ -730,12 +771,31 @@ func (s *FollowService) validateSnapshotWithRoutes(actor Actor, tmdbID int64, in
 		return input, nil, appError(CodePermissionDenied, "无权让订阅入库到这个媒体库", nil)
 	}
 	var sites []models.Site
-	if err := s.db.Where("id IN ? AND enabled = ?", input.SiteIDs, true).Find(&sites).Error; err != nil || len(sites) != len(input.SiteIDs) {
+	if err := s.db.Where("id IN ? AND enabled = ?", input.SiteIDs, true).Find(&sites).Error; err != nil || (requireRoutes && len(sites) != len(input.SiteIDs)) {
 		return input, nil, appError(CodeFollowConfigurationInvalid, "订阅站点不存在或已停用", err)
 	}
+	allowedSites := make(map[uint]struct{}, len(sites))
 	for _, site := range sites {
 		if !actor.CanResource(authz.PermissionDiscoveryRead, models.AuthorizationResourceSite, uintID(site.ID)) {
-			return input, nil, appError(CodePermissionDenied, "无权让订阅搜索所选站点", nil)
+			if requireRoutes {
+				return input, nil, appError(CodePermissionDenied, "无权让订阅搜索所选站点", nil)
+			}
+			continue
+		}
+		allowedSites[site.ID] = struct{}{}
+	}
+	if !requireRoutes {
+		// A future run intersects its frozen selection with current authority.
+		// Do not rewrite the stored subscription, or block its other sites.
+		filtered := make([]uint, 0, len(input.SiteIDs))
+		for _, id := range input.SiteIDs {
+			if _, allowed := allowedSites[id]; allowed {
+				filtered = append(filtered, id)
+			}
+		}
+		input.SiteIDs = filtered
+		if len(filtered) == 0 {
+			return input, nil, appError(CodePermissionDenied, "订阅没有当前允许搜索的站点，请联系管理员调整权限", nil)
 		}
 	}
 	if requireRoutes {
@@ -756,6 +816,9 @@ func (s *FollowService) validateSnapshotWithRoutes(actor Actor, tmdbID int64, in
 				}
 				matched := false
 				for _, downloader := range downloaders {
+					if !actor.CanResource(authz.PermissionDownloadsCreate, models.AuthorizationResourceDownloader, downloader.ID) {
+						continue
+					}
 					if routeKind, routeErr := routeSourceForSite(site); routeErr == nil && routeDownloaderApplicable(routeKind, downloader) && s.validateFollowRoute(context.Background(), downloader, library, []models.Site{site}) == nil {
 						matched = true
 						break

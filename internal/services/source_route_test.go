@@ -124,4 +124,23 @@ func TestFollowRuntimeDoesNotBlockOtherSitesForMissingRoute(t *testing.T) {
 	if _, _, err := follows.validateSnapshotWithRoutes(actor, 100, snapshot, false); err != nil {
 		t.Fatalf("worker blocked before candidate selection: %v", err)
 	}
+	other := site
+	other.ID, other.Name, other.NameNormalized = 0, "Route restricted", "route-restricted"
+	other.BaseURL = "https://restricted.example.test"
+	if err := queue.db.Create(&other).Error; err != nil {
+		t.Fatal(err)
+	}
+	snapshot.SiteIDs = []uint{other.ID, site.ID}
+	actor.ResourceAccessPolicies = map[string]ResourceAccessPolicy{models.ResourceAccessScopeSiteSearch: {Scope: models.ResourceAccessScopeSiteSearch, Mode: models.ResourceAccessModeAllowlist, ResourceIDs: []string{uintID(site.ID)}}}
+	filtered, _, err := follows.validateSnapshotWithRoutes(actor, 100, snapshot, false)
+	if err != nil || len(filtered.SiteIDs) != 1 || filtered.SiteIDs[0] != site.ID || len(snapshot.SiteIDs) != 2 {
+		t.Fatalf("site intersection=%+v err=%v", filtered.SiteIDs, err)
+	}
+	if _, _, err := follows.validateSnapshotWithRoutes(actor, 100, snapshot, true); ErrorCode(err) != CodePermissionDenied {
+		t.Fatalf("new follow accepted unauthorized stored site: %v", err)
+	}
+	actor.ResourceAccessPolicies[models.ResourceAccessScopeSiteSearch] = ResourceAccessPolicy{Mode: models.ResourceAccessModeAllowlist}
+	if _, _, err := follows.validateSnapshotWithRoutes(actor, 100, snapshot, false); ErrorCode(err) != CodePermissionDenied {
+		t.Fatalf("empty authorized intersection=%v", err)
+	}
 }

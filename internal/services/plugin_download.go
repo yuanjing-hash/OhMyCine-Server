@@ -73,7 +73,7 @@ func (e *PluginDownloadExecutor) Submit(ctx context.Context, actor Actor, input 
 	if !actor.HasPermission(authz.PermissionDownloadsCreate) {
 		return DownloadTaskSummary{}, appError(CodePermissionDenied, "无权创建下载任务", nil)
 	}
-	if !actor.CanResource(authz.PermissionDownloadsCreate, models.AuthorizationResourceMediaLibrary, uintID(input.MediaLibraryID)) {
+	if !actor.CanIngestLibrary(uintID(input.MediaLibraryID)) {
 		return DownloadTaskSummary{}, appError(CodePermissionDenied, "无权入库到这个媒体库", nil)
 	}
 	if !safeOnlineText(input.ConnectionID, 128) || !safeOnlineText(input.ItemID, maxOnlineIdentifierBytes) || !safeOnlineText(input.SegmentID, maxOnlineIdentifierBytes) || !safeOnlineText(input.VersionID, maxOnlineIdentifierBytes) || !safeOptionalOnlineText(input.VariantID, maxOnlineIdentifierBytes) || input.Priority < -100 || input.Priority > 100 {
@@ -142,7 +142,14 @@ func (e *PluginDownloadExecutor) Submit(ctx context.Context, actor Actor, input 
 		TVDirectoryTemplate: organization.TVDirectoryTemplate, TVFilenameTemplate: organization.TVFilenameTemplate,
 		DisplayName: displayName, Phase: models.DownloadTaskStatusQueued, CreatedAt: now, UpdatedAt: now,
 	}
-	job, err := e.downloads.queue.EnqueueWith(EnqueueJobInput{OwnerID: actor.User.ID, JobType: "download", Priority: input.Priority, DisplayName: displayName, Provider: models.DownloaderTypePluginHTTP, ResourceKey: "plugin:" + connection.PluginID, Payload: downloadJobPayload{DownloadTaskID: taskID}}, func(tx *gorm.DB, job models.Job) error {
+	job, err := e.downloads.queue.EnqueueWith(EnqueueJobInput{OwnerID: actor.User.ID, JobType: "download", Priority: input.Priority, DisplayName: displayName, Provider: models.DownloaderTypePluginHTTP, ResourceKey: "plugin:" + connection.PluginID, Payload: downloadJobPayload{DownloadTaskID: taskID, ResourceAccessVersion: 1}}, func(tx *gorm.DB, job models.Job) error {
+		current, err := NewAuthorizationService(tx).Resolve(actor.User.ID)
+		if err != nil {
+			return err
+		}
+		if !current.CanIngestLibrary(uintID(input.MediaLibraryID)) {
+			return appError(CodePermissionDenied, "当前权限不允许向这个媒体库入库", nil)
+		}
 		record.JobID = job.ID
 		if err := tx.Create(&record).Error; err != nil {
 			return err

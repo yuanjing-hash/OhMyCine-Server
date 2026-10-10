@@ -17,6 +17,10 @@ func (s *AuthorizationService) Resolve(userID uint) (Actor, error) {
 }
 
 func (s *AuthorizationService) resolveWithDB(db *gorm.DB, userID uint) (Actor, error) {
+	return s.resolveUserWithDB(db, userID, true)
+}
+
+func (s *AuthorizationService) resolveUserWithDB(db *gorm.DB, userID uint, requireActive bool) (Actor, error) {
 	var user models.User
 	if err := db.First(&user, userID).Error; err != nil {
 		if err == gorm.ErrRecordNotFound {
@@ -24,7 +28,7 @@ func (s *AuthorizationService) resolveWithDB(db *gorm.DB, userID uint) (Actor, e
 		}
 		return Actor{}, err
 	}
-	if user.Status != models.UserStatusActive {
+	if requireActive && user.Status != models.UserStatusActive {
 		return Actor{}, appError(CodeNotAuthenticated, "账户已停用", nil)
 	}
 	var roles []models.Role
@@ -76,17 +80,12 @@ func (s *AuthorizationService) resolveWithDB(db *gorm.DB, userID uint) (Actor, e
 			}
 			continue
 		}
-		resourceRules = append(resourceRules, AuthorizationRule{PermissionCode: rule.PermissionCode, Effect: rule.Effect, ResourceType: rule.ResourceType, ResourceID: rule.ResourceID})
+		resourceRules = append(resourceRules, AuthorizationRule{PermissionCode: rule.PermissionCode, Effect: rule.Effect, ResourceType: rule.ResourceType, ResourceID: canonicalResourceID(rule.ResourceType, rule.ResourceID)})
+	}
+	policies, err := loadResourceAccessPolicies(db, userID)
+	if err != nil {
+		return Actor{}, err
 	}
 	sort.Strings(roleCodes)
-	return Actor{User: user, RoleCodes: roleCodes, Permissions: permissions, DeniedPermissions: deniedPermissions, ResourceRules: resourceRules}, nil
-}
-
-func subset(requested []string, allowed map[string]struct{}) bool {
-	for _, code := range requested {
-		if _, ok := allowed[code]; !ok {
-			return false
-		}
-	}
-	return true
+	return Actor{User: user, RoleCodes: roleCodes, Permissions: permissions, DeniedPermissions: deniedPermissions, ResourceRules: resourceRules, ResourceAccessPolicies: policies}, nil
 }

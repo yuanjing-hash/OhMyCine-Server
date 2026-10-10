@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/authz"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/mediarecognition"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
 	cloudpkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud"
@@ -182,6 +183,7 @@ func TestMediaReorganizationLocalWorkerIsIdempotentAndUpdatesIdentity(t *testing
 
 func TestMediaReorganizationPreviewReclassifiesWithCurrentLibraryProfile(t *testing.T) {
 	queue, actor, download, _, _ := transferFixture(t, models.MediaLibraryTransferCopy, models.MediaLibraryConflictOverwrite, false)
+	actor.Permissions[authz.PermissionMediaLibrariesRead] = struct{}{}
 	year, oldID := 2024, int64(550)
 	identity := MediaIdentitySnapshot{Version: 1, Revision: 1, Source: mediaIdentitySourceAutomatic, Status: mediaIdentityStatusVerified, TMDBID: &oldID, MediaType: "movie", Title: "Movie", Year: &year, Category: "华语电影"}
 	identityRaw, _ := json.Marshal(identity)
@@ -233,6 +235,37 @@ func TestMediaReorganizationPreviewReclassifiesWithCurrentLibraryProfile(t *test
 	var target MediaIdentitySnapshot
 	if err := json.Unmarshal([]byte(persisted.TargetIdentityJSON), &target); err != nil || target.Category != "外语电影" || target.Revision != 2 || !target.Locked {
 		t.Fatalf("target identity category was not persisted: target=%+v err=%v", target, err)
+	}
+
+	// A previously valid preview is not authority to create a new task after
+	// library ingest is revoked. Confirm resolves persisted authority in its
+	// queue/domain transaction, even if the caller still holds the old Actor.
+	persistFixtureAuthority(t, queue.db, actor)
+	if err := queue.db.Create(&models.UserResourceAccessPolicy{UserID: actor.User.ID, Scope: models.ResourceAccessScopeLibraryIngest, Mode: models.ResourceAccessModeAllowlist, ResourceIDsJSON: "[]"}).Error; err != nil {
+		t.Fatal(err)
+	}
+	var before, after, taskCount int64
+	if err := queue.db.Model(&models.Job{}).Count(&before).Error; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Confirm(actor, preview.ConfirmationToken, RequestContext{}); ErrorCode(err) != CodePermissionDenied {
+		t.Fatalf("revoked preview confirmation error=%v", err)
+	}
+	if err := queue.db.Model(&models.Job{}).Count(&after).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := queue.db.Model(&models.MediaReorganizationTask{}).Count(&taskCount).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := queue.db.First(&persisted, "id = ?", persisted.ID).Error; err != nil || persisted.ConsumedAt != nil || after != before || taskCount != 0 {
+		t.Fatalf("denial changed queue or preview: jobs=%d/%d tasks=%d consumed=%v err=%v", before, after, taskCount, persisted.ConsumedAt, err)
+	}
+	currentActor, err := NewAuthorizationService(queue.db).Resolve(actor.User.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Preview(context.Background(), currentActor, MediaReorganizationPreviewInput{TransferTaskID: transfer.ID, TMDBID: 999, MediaType: "movie", ConflictPolicy: models.MediaLibraryConflictRename}, RequestContext{}); ErrorCode(err) != CodePermissionDenied {
+		t.Fatalf("revoked preview error=%v", err)
 	}
 }
 

@@ -68,7 +68,7 @@ type MediaReorganizationPreviewResult struct {
 type MediaReorganizationTaskSummary struct {
 	ID                     string     `json:"id"`
 	JobID                  string     `json:"job_id"`
-	LibraryID              uint       `json:"library_id"`
+	LibraryID              uint       `json:"library_id,omitempty"`
 	SourceIdentityRevision uint64     `json:"source_identity_revision"`
 	TargetIdentityRevision uint64     `json:"target_identity_revision"`
 	Phase                  string     `json:"phase"`
@@ -232,7 +232,8 @@ func (s *MediaReorganizationService) Confirm(actor Actor, token string, request 
 	jobID := uuid.NewString()
 	enqueueInput.Payload = mediaReorganizationJobPayload{ReorganizationTaskID: jobID}
 	queued, err := s.queue.EnqueueWith(enqueueInput, func(tx *gorm.DB, job models.Job) error {
-		if err := AssertCatalogPhysicalAdmissionTx(tx, schedulingPreview.LibraryID); err != nil {
+		currentActor, err := NewAuthorizationService(tx).resolveWithDB(tx, actor.User.ID)
+		if err != nil {
 			return err
 		}
 		var preview models.MediaReorganizationPreview
@@ -242,8 +243,11 @@ func (s *MediaReorganizationService) Confirm(actor Actor, token string, request 
 		if preview.ActorID != actor.User.ID || preview.ConsumedAt != nil || !preview.ExpiresAt.After(time.Now().UTC()) {
 			return appError(CodeReorganizationPreviewExpired, "重新整理预览已失效，请重新预览", nil)
 		}
-		transfer, download, library, _, items, err := s.loadBoundaryWithDB(tx, actor, preview.TransferTaskID)
+		transfer, download, library, _, items, err := s.loadBoundaryWithDB(tx, currentActor, preview.TransferTaskID)
 		if err != nil {
+			return err
+		}
+		if err := AssertCatalogPhysicalAdmissionTx(tx, library.ID); err != nil {
 			return err
 		}
 		var plan reorganizationPlan
@@ -286,10 +290,14 @@ func (s *MediaReorganizationService) Get(actor Actor, id string) (MediaReorganiz
 	if err := s.db.First(&task, "id = ?", strings.TrimSpace(id)).Error; err != nil {
 		return MediaReorganizationTaskSummary{}, appError(CodeNotFound, "重新整理任务不存在", nil)
 	}
-	if task.OwnerID != actor.User.ID && !actor.Can(authz.PermissionJobsReadAll) {
+	if !actor.Can(authz.PermissionJobsReadAll) && !actor.Can(authz.PermissionTransfersReadAll) && (task.OwnerID != actor.User.ID || (!actor.Can(authz.PermissionJobsReadOwn) && !actor.Can(authz.PermissionTransfersReadOwn))) {
 		return MediaReorganizationTaskSummary{}, appError(CodePermissionDenied, "无权查看该重新整理任务", nil)
 	}
-	return reorganizationTaskSummary(task), nil
+	summary := reorganizationTaskSummary(task)
+	if !actor.CanResource(authz.PermissionMediaLibrariesRead, models.AuthorizationResourceMediaLibrary, uintID(task.LibraryID)) {
+		summary.LibraryID = 0
+	}
+	return summary, nil
 }
 
 func (s *MediaReorganizationService) loadBoundary(actor Actor, transferID string) (models.TransferTask, models.DownloadTask, models.MediaLibrary, models.Storage, []models.MediaManagedItem, error) {
@@ -301,8 +309,15 @@ func (s *MediaReorganizationService) loadBoundaryWithDB(db *gorm.DB, actor Actor
 	if err := db.First(&transfer, "id = ?", transferID).Error; err != nil {
 		return transfer, models.DownloadTask{}, models.MediaLibrary{}, models.Storage{}, nil, appError(CodeNotFound, "媒体整理任务不存在", nil)
 	}
-	if transfer.OwnerID != actor.User.ID && !actor.Can(authz.PermissionJobsControlAll) {
+	if !actor.Can(authz.PermissionJobsControlAll) && (transfer.OwnerID != actor.User.ID || !actor.Can(authz.PermissionJobsControlOwn)) {
 		return transfer, models.DownloadTask{}, models.MediaLibrary{}, models.Storage{}, nil, appError(CodePermissionDenied, "无权重新整理该媒体", nil)
+	}
+	if !actor.Can(authz.PermissionTransfersReadAll) && (transfer.OwnerID != actor.User.ID || !actor.Can(authz.PermissionTransfersReadOwn)) {
+		return transfer, models.DownloadTask{}, models.MediaLibrary{}, models.Storage{}, nil, appError(CodePermissionDenied, "无权读取该媒体的整理记录", nil)
+	}
+	libraryID := uintID(transfer.LibraryID)
+	if !actor.CanResource(authz.PermissionMediaLibrariesRead, models.AuthorizationResourceMediaLibrary, libraryID) || !actor.ResourceAccessAllows(models.ResourceAccessScopeLibraryIngest, libraryID) {
+		return transfer, models.DownloadTask{}, models.MediaLibrary{}, models.Storage{}, nil, appError(CodePermissionDenied, "无权访问或向该媒体库入库", nil)
 	}
 	var download models.DownloadTask
 	var library models.MediaLibrary

@@ -72,7 +72,7 @@ func TestDownloadRecognitionOverrideSearchesByKeywordAndRetriesExistingProviderT
 		t.Fatal(err)
 	}
 	taskID := "download-recognition-recovery"
-	job, err := queue.EnqueueWith(EnqueueJobInput{OwnerID: actor.User.ID, JobType: "download", DisplayName: "大明王朝", Provider: models.DownloaderTypePan115Offline, ResourceKey: "provider:115", Payload: downloadJobPayload{DownloadTaskID: taskID}}, func(tx *gorm.DB, queued models.Job) error {
+	job, err := queue.EnqueueWith(EnqueueJobInput{OwnerID: actor.User.ID, JobType: "download", DisplayName: "大明王朝", Provider: models.DownloaderTypePan115Offline, ResourceKey: "provider:115", Payload: downloadJobPayload{DownloadTaskID: taskID, ResourceAccessVersion: 1}}, func(tx *gorm.DB, queued models.Job) error {
 		return tx.Create(&models.DownloadTask{
 			ID: taskID, OwnerID: actor.User.ID, JobID: queued.ID, DownloaderName: "115", ProviderType: models.DownloaderTypePan115Offline,
 			ProviderTaskID: "completed-provider-task", SourceCiphertext: "encrypted", DisplayName: releaseName,

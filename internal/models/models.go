@@ -256,6 +256,28 @@ type UserAuthorizationRule struct {
 	UpdatedAt      time.Time `json:"updated_at"`
 }
 
+const (
+	ResourceAccessScopeDownloaderUse = "downloader_use"
+	ResourceAccessScopeSiteSearch    = "site_search"
+	ResourceAccessScopeLibraryRead   = "library_read"
+	ResourceAccessScopeLibraryIngest = "library_ingest"
+	ResourceAccessModeAll            = "all"
+	ResourceAccessModeAllowlist      = "allowlist"
+	ResourceAccessModeDenylist       = "denylist"
+)
+
+// UserResourceAccessPolicy restricts existing authority; it never grants a
+// function permission. A missing scope keeps the historical all-resources default.
+type UserResourceAccessPolicy struct {
+	UserID          uint      `gorm:"primaryKey" json:"-"`
+	Scope           string    `gorm:"primaryKey;size:32" json:"scope"`
+	Mode            string    `gorm:"size:16;not null" json:"mode"`
+	ResourceIDsJSON string    `gorm:"type:text;not null;default:'[]'" json:"-"`
+	UpdatedBy       *uint     `json:"-"`
+	CreatedAt       time.Time `json:"-"`
+	UpdatedAt       time.Time `json:"-"`
+}
+
 type Session struct {
 	ID                string     `gorm:"primaryKey;size:64" json:"id"`
 	TokenHash         string     `gorm:"size:64;not null;uniqueIndex" json:"-"`

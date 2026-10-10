@@ -46,6 +46,18 @@ func queueFixture(t *testing.T) (*QueueService, Actor, *fakeQueueClock) {
 	return service, Actor{User: user, Permissions: permissions}, clock
 }
 
+// Transactional reauthorization uses actual database authority, rather than
+// the in-memory convenience Actor used by service-only fixtures.
+func persistFixtureAuthority(t *testing.T, db *gorm.DB, actor Actor) {
+	t.Helper()
+	for code := range actor.Permissions {
+		rule := models.UserAuthorizationRule{UserID: actor.User.ID, PermissionCode: code, Effect: models.AuthorizationEffectAllow, CreatedBy: actor.User.ID}
+		if err := db.Where("user_id = ? AND permission_code = ? AND resource_type = '' AND resource_id = ''", actor.User.ID, code).FirstOrCreate(&rule).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 func enqueueFake(t *testing.T, service *QueueService, actor Actor, name, resource string) JobDTO {
 	t.Helper()
 	job, err := service.Enqueue(EnqueueJobInput{OwnerID: actor.User.ID, JobType: "fake", Priority: 10, DisplayName: name, ResourceKey: resource, Payload: map[string]any{"step": 1}})

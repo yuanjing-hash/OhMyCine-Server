@@ -76,6 +76,9 @@ func (s *DownloadService) PreviewRoutes(ctx context.Context, actor Actor, input 
 	if !actor.CanResource(authz.PermissionDownloadsCreate, models.AuthorizationResourceDownloader, downloader.ID) {
 		return DownloadRoutePreview{}, appError(CodePermissionDenied, "无权使用这个下载器创建任务", nil)
 	}
+	if input.SiteID != nil && !actor.CanResource(authz.PermissionDiscoveryRead, models.AuthorizationResourceSite, uintID(*input.SiteID)) {
+		return DownloadRoutePreview{}, appError(CodePermissionDenied, "无权使用这个站点的资源", nil)
+	}
 	if err := s.validatePreviewSource(downloader, input.SourceKind, input.SiteID); err != nil {
 		return DownloadRoutePreview{}, err
 	}
@@ -93,7 +96,7 @@ func (s *DownloadService) PreviewRoutes(ctx context.Context, actor Actor, input 
 	}
 	preview := DownloadRoutePreview{DownloaderID: downloader.ID, SourceKind: input.SourceKind, Options: make([]DownloadRouteTargetOption, 0, len(rows))}
 	for _, row := range rows {
-		if !actor.CanResource(authz.PermissionDownloadsCreate, models.AuthorizationResourceMediaLibrary, uintID(row.ID)) {
+		if !actor.CanIngestLibrary(uintID(row.ID)) {
 			continue
 		}
 		location := normalizeExecutionLocation(downloader.ExecutionLocation)

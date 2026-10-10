@@ -281,7 +281,24 @@ func TestFollowOwnAndAllPermissionMatrixDoesNotRequireReadForMutations(t *testin
 	if err := queue.db.Create(&otherUser).Error; err != nil {
 		t.Fatal(err)
 	}
-	snapshotRaw, _ := json.Marshal(FollowExecutionSnapshot{Version: 1, Seasons: []int{1}, Schedule: FollowSchedule{Kind: "interval", Minutes: 60}})
+	var profile models.MediaClassificationProfile
+	if err := queue.db.First(&profile, "code = ?", "default-v1").Error; err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	storage := models.Storage{Name: "Permission target", NameNormalized: "permission-target", Type: models.StorageTypeLocal, RootPath: root, RootPathNormalized: root, Enabled: true, Capabilities: `{}`}
+	if err := queue.db.Create(&storage).Error; err != nil {
+		t.Fatal(err)
+	}
+	library := models.MediaLibrary{Name: "Permission library", NameNormalized: "permission-library", StorageID: storage.ID, ProfileID: profile.ID, ProfileRevision: profile.Revision, RelativeRoot: "/", Enabled: true, VideoExtensionsJSON: `[]`, IgnorePatternsJSON: `[]`}
+	if err := queue.db.Create(&library).Error; err != nil {
+		t.Fatal(err)
+	}
+	site := models.Site{Name: "Permission site", NameNormalized: "permission-site", Kind: "pttime", BaseURL: "https://pt.example.test", Enabled: true, Revision: 1}
+	if err := queue.db.Create(&site).Error; err != nil {
+		t.Fatal(err)
+	}
+	snapshotRaw, _ := json.Marshal(FollowExecutionSnapshot{Version: 2, RoutingPolicy: "source_priority", SiteIDs: []uint{site.ID}, MediaLibraryID: library.ID, Seasons: []int{1}, Schedule: FollowSchedule{Kind: "interval", Minutes: 60}})
 	now := clock.Now()
 	record := models.FollowSubscription{ID: "follow-permission", OwnerID: owner.User.ID, MediaType: "tv", TMDBID: 100, Title: "Permission", Status: models.FollowStatusActive, Revision: 1, LifecycleRevision: 1, ExecutionSnapshotJSON: string(snapshotRaw), NextRunAt: &now, CreatedAt: now, UpdatedAt: now}
 	if err := queue.db.Create(&record).Error; err != nil {

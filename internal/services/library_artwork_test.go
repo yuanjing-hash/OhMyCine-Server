@@ -20,8 +20,10 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/authz"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/classification"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/plugins/contract"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/metadata/tmdb"
 )
 
@@ -55,7 +57,7 @@ func TestLibraryArtworkGeneratorComposesAndCachesStableCover(t *testing.T) {
 	if got := decoded.Bounds().Size(); got.X != libraryArtworkWidth || got.Y != libraryArtworkHeight {
 		t.Fatalf("cover size=%v", got)
 	}
-	opened, err := service.Open(first.Digest)
+	opened, err := service.openContent(first.Digest)
 	if err != nil || !bytes.Equal(opened.Bytes, first.Bytes) {
 		t.Fatalf("cached artwork unavailable: err=%v", err)
 	}
@@ -63,12 +65,28 @@ func TestLibraryArtworkGeneratorComposesAndCachesStableCover(t *testing.T) {
 	if err != nil || parsed.RawQuery != "" || !strings.HasPrefix(parsed.Path, "/api/v1/assets/generated-library-covers/") {
 		t.Fatalf("content-addressed artwork URL invalid: url=%q err=%v", parsed, err)
 	}
+	items := []contract.LibraryArtworkCandidate{{ID: "same-upstream-id", AssetRef: "asset"}}
+	one := service.pluginArtworkCandidates("plugin", "account-one", "route:home", items)
+	two := service.pluginArtworkCandidates("plugin", "account-two", "route:home", items)
+	one[0].load = candidates[0].load
+	two[0].load = candidates[1].load
+	accountOne, err := service.generate(context.Background(), "同名导航", one)
+	if err != nil {
+		t.Fatal(err)
+	}
+	accountTwo, err := service.generate(context.Background(), "同名导航", two)
+	if err != nil || accountOne.Digest == accountTwo.Digest {
+		t.Fatalf("online source cache crossed account boundaries: %v", err)
+	}
 }
 
 func TestMediaCategoryArtworkPersistsAcrossRestartAndRetainsActiveVersionOnFailure(t *testing.T) {
 	mediaLibraries, db, actor, storage, profile := mediaLibraryTestService(t)
 	library, err := mediaLibraries.Create(context.Background(), actor, testLibraryInput("Artwork library", storage, profile, false), RequestContext{})
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&models.MediaLibrary{}).Where("id = ?", library.ID).Update("enabled", true).Error; err != nil {
 		t.Fatal(err)
 	}
 	root := t.TempDir()
@@ -113,9 +131,27 @@ func TestMediaCategoryArtworkPersistsAcrossRestartAndRetainsActiveVersionOnFailu
 	if loads != 1 || unchanged.Revision != first.Revision || unchanged.ContentHash != first.ContentHash || !secondInfo.ModTime().Equal(firstInfo.ModTime()) {
 		t.Fatalf("unchanged generation rewrote artwork: loads=%d first=%+v unchanged=%+v mtimes=%s/%s", loads, first, unchanged, firstInfo.ModTime(), secondInfo.ModTime())
 	}
-	opened, err := restarted.Open(first.ContentHash)
+	opened, err := restarted.Open(context.Background(), actor, first.ContentHash)
 	if err != nil || opened.Digest != first.ContentHash || len(opened.Bytes) == 0 {
 		t.Fatalf("restart open failed: asset=%+v err=%v", opened, err)
+	}
+	reader := rolePermissionActor([]string{authz.PermissionMediaLibrariesRead})
+	reader.ResourceAccessPolicies = map[string]ResourceAccessPolicy{models.ResourceAccessScopeLibraryRead: {Mode: models.ResourceAccessModeAllowlist}}
+	if _, err := restarted.Open(context.Background(), reader, first.ContentHash); ErrorCode(err) != CodeNotFound {
+		t.Fatalf("warm generated cover bypassed revoked library access: %v", err)
+	}
+	reader.ResourceAccessPolicies[models.ResourceAccessScopeLibraryRead] = ResourceAccessPolicy{Mode: models.ResourceAccessModeAllowlist, ResourceIDs: []string{uintID(library.ID)}}
+	if _, err := restarted.Open(context.Background(), reader, first.ContentHash); err != nil {
+		t.Fatalf("allowed generated cover unavailable: %v", err)
+	}
+	if err := db.Model(&models.Storage{}).Where("id = ?", storage.ID).Update("enabled", false).Error; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := restarted.Open(context.Background(), reader, first.ContentHash); ErrorCode(err) != CodeNotFound {
+		t.Fatalf("warm generated cover bypassed disabled storage: %v", err)
+	}
+	if err := db.Model(&models.Storage{}).Where("id = ?", storage.ID).Update("enabled", true).Error; err != nil {
+		t.Fatal(err)
 	}
 	decorated := restarted.DecorateMediaCategories(context.Background(), library.ID, []PlayerMediaCategory{{ID: categoryKey, Name: "电影", MediaType: "movie", ArtworkURL: "/fallback.png"}})
 	if len(decorated) != 1 || decorated[0].ArtworkSource != "generated" || decorated[0].ArtworkURL != restarted.artworkURL(first.ContentHash) {

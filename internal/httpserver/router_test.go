@@ -47,11 +47,65 @@ type testClient struct {
 	lastHeader  http.Header
 	libraries   *services.MediaLibraryService
 	history     *services.PlayerHistoryService
+	artworkRoot string
 }
 type testEnvelope struct {
 	Code    int             `json:"code"`
 	Message string          `json:"message"`
 	Data    json.RawMessage `json:"data"`
+}
+
+func TestUserResourceAccessRoutesEnforceRevisionAndCSRF(t *testing.T) {
+	client := newTestClient(t)
+	path := "/api/v1/users/2/resource-access"
+	status, _ := client.request(t, http.MethodGet, path, nil, false)
+	if status != http.StatusUnauthorized || client.lastHeader.Get("Cache-Control") != "no-store" {
+		t.Fatalf("anonymous policy response status=%d headers=%v", status, client.lastHeader)
+	}
+	client.setup(t)
+	user := models.User{Username: "resource-target", UsernameNormalized: "resource-target", DisplayName: "Resource Target", Status: models.UserStatusActive, PasswordHash: "unused", AuthzVersion: 1}
+	if err := client.db.Create(&user).Error; err != nil {
+		t.Fatal(err)
+	}
+	var role models.Role
+	if err := client.db.Where("code = ?", authz.RoleViewer).First(&role).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := client.db.Create(&models.UserRole{UserID: user.ID, RoleID: role.ID}).Error; err != nil {
+		t.Fatal(err)
+	}
+	path = "/api/v1/users/" + strconv.FormatUint(uint64(user.ID), 10) + "/resource-access"
+	status, envelope := client.request(t, http.MethodGet, path, nil, false)
+	var policy services.UserResourceAccess
+	if status != http.StatusOK || json.Unmarshal(envelope.Data, &policy) != nil || policy.Revision != 1 || len(policy.Policies) != 4 {
+		t.Fatalf("policy GET status=%d data=%s", status, envelope.Data)
+	}
+	policy.Policies[0].Mode = models.ResourceAccessModeAllowlist
+	status, _ = client.request(t, http.MethodPut, path, policy, false)
+	if status != http.StatusForbidden {
+		t.Fatalf("policy save without CSRF status=%d", status)
+	}
+	status, envelope = client.request(t, http.MethodPut, path, policy, true)
+	if status != http.StatusOK {
+		t.Fatalf("policy save status=%d message=%s", status, envelope.Message)
+	}
+	var updated services.UserResourceAccess
+	if json.Unmarshal(envelope.Data, &updated) != nil || updated.Revision != 2 {
+		t.Fatalf("policy save did not return current revision: %s", envelope.Data)
+	}
+	status, envelope = client.request(t, http.MethodPut, path, policy, true)
+	if status != http.StatusConflict || !strings.Contains(string(envelope.Data), services.CodeConflict) {
+		t.Fatalf("stale policy save status=%d data=%s", status, envelope.Data)
+	}
+	status, envelope = client.request(t, http.MethodPut, path, map[string]any{"revision": 2, "policies": updated.Policies, "unknown": true}, true)
+	if status != http.StatusBadRequest {
+		t.Fatalf("unknown policy field accepted: %d %s", status, envelope.Data)
+	}
+	status, envelope = client.request(t, http.MethodGet, path+"/options", nil, false)
+	var options services.UserResourceAccessOptions
+	if status != http.StatusOK || client.lastHeader.Get("Cache-Control") != "no-store" || json.Unmarshal(envelope.Data, &options) != nil || options.Revision != 2 || len(options.Scopes) != 4 {
+		t.Fatalf("policy options status=%d data=%s", status, envelope.Data)
+	}
 }
 
 func TestServerUpdateRoutesSetNoStoreBeforeAuthentication(t *testing.T) {
@@ -279,6 +333,8 @@ func newTestClient(t *testing.T, cloudDrivers ...cloudpkg.Driver) *testClient {
 	}
 	profiles := services.NewMediaClassificationProfileService(db, audit, nil)
 	api := handlers.NewAPI(cfg, auth, admin, audit, storages, directories, profiles, log)
+	artworkRoot := filepath.Join(testRoot, "library-artwork")
+	api.SetLibraryArtworkService(services.NewLibraryArtworkService(db, nil, nil, nil, log, services.WithLibraryArtworkRoot(artworkRoot)))
 	libraries := services.NewMediaLibraryService(db, audit, log)
 	profiles.SetReferences(libraries)
 	profiles.SetRevisionNotifier(libraries)
@@ -390,7 +446,7 @@ func newTestClient(t *testing.T, cloudDrivers ...cloudpkg.Driver) *testClient {
 	api.SetSeedingSettingsService(seedingSettings)
 	api.SetSeedingService(seeding)
 	api.SetPluginRepositoryService(services.NewPluginRepositoryService(db, audit, nil, log))
-	return &testClient{router: New(cfg, api, auth, log), queue: queue, queueEvents: events, db: db, connections: connections, signedProxy: signedProxy, embyGateway: embyGateway, changes: changes, sites: sites, libraries: libraries, history: playerHistory}
+	return &testClient{router: New(cfg, api, auth, log), queue: queue, queueEvents: events, db: db, connections: connections, signedProxy: signedProxy, embyGateway: embyGateway, changes: changes, sites: sites, libraries: libraries, history: playerHistory, artworkRoot: artworkRoot}
 }
 
 func TestTransferNodeRoutesAreNoStoreAndKeepEnrollmentSecretsOutOfLists(t *testing.T) {

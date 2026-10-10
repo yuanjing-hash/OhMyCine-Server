@@ -172,6 +172,12 @@ func (s *DownloadService) RecommendSourceRoute(ctx context.Context, actor Actor,
 			visibleDownloaders = append(visibleDownloaders, downloader)
 		}
 	}
+	if len(downloaders) > 0 && len(visibleDownloaders) == 0 {
+		return SourceRouteRecommendation{}, appError(CodePermissionDenied, "没有当前允许使用的下载器", nil)
+	}
+	if len(libraries) > 0 && len(visibleLibraries) == 0 {
+		return SourceRouteRecommendation{}, appError(CodePermissionDenied, "没有当前允许入库的媒体库", nil)
+	}
 	result := SourceRouteRecommendation{SourceKind: source, Choices: make([]SourceRouteChoice, 0, len(visibleLibraries)*len(visibleDownloaders))}
 	choiceByDownloader := make(map[string]map[uint]SourceRouteChoice, len(visibleDownloaders))
 	previewSourceKind, previewSiteID := routeSourceDownloadKind(source), &siteID

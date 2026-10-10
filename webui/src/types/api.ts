@@ -41,6 +41,41 @@ export interface AuthorizationRule {
   resource_id: string
 }
 
+export type ResourceAccessScope = 'downloader_use' | 'site_search' | 'library_read' | 'library_ingest'
+export type ResourceAccessMode = 'all' | 'allowlist' | 'denylist'
+export type AuthorizationResourceType = Exclude<AuthorizationRule['resource_type'], ''>
+
+export interface ResourceAccessPolicy {
+  scope: ResourceAccessScope
+  mode: ResourceAccessMode
+  resource_ids: string[]
+}
+
+export interface UserResourceAccess {
+  revision: number
+  policies: ResourceAccessPolicy[]
+}
+
+export interface ResourceAccessOption {
+  id: string
+  name: string
+  type: string
+  status: string
+  deleted: boolean
+  effective_allowed: boolean
+  can_grant: boolean
+  denial_reason: string
+}
+
+export interface ResourceAccessOptions {
+  revision: number
+  scopes: {
+    scope: ResourceAccessScope
+    resource_type: AuthorizationResourceType
+    options: ResourceAccessOption[]
+  }[]
+}
+
 export interface PermissionDefinition {
   code: PermissionCode
   module: string

@@ -182,6 +182,9 @@ type DownloadSourceInput struct {
 }
 
 type SubmitDownloadInput struct {
+	// SourceSiteID is set only by SiteService after validating its actor-bound claim.
+	// Public download handlers never deserialize provenance from the client.
+	SourceSiteID          uint
 	DownloaderID          string
 	MediaLibraryID        *uint
 	ProfileID             uint
@@ -299,7 +302,9 @@ type downloadSourceEnvelope struct {
 }
 
 type downloadJobPayload struct {
-	DownloadTaskID string `json:"download_task_id"`
+	DownloadTaskID        string `json:"download_task_id"`
+	SourceSiteID          uint   `json:"source_site_id,omitempty"`
+	ResourceAccessVersion int    `json:"resource_access_version,omitempty"`
 }
 
 type DownloadTaskSummary struct {
@@ -378,7 +383,7 @@ func (s *DownloadService) Submit(ctx context.Context, actor Actor, input SubmitD
 	if !actor.CanResource(authz.PermissionDownloadsCreate, models.AuthorizationResourceDownloader, downloaderID) {
 		return DownloadTaskSummary{}, appError(CodePermissionDenied, "无权使用这个下载器创建任务", nil)
 	}
-	if input.MediaLibraryID != nil && !actor.CanResource(authz.PermissionDownloadsCreate, models.AuthorizationResourceMediaLibrary, uintID(*input.MediaLibraryID)) {
+	if input.MediaLibraryID != nil && !actor.CanIngestLibrary(uintID(*input.MediaLibraryID)) {
 		return DownloadTaskSummary{}, appError(CodePermissionDenied, "无权向这个媒体库入库", nil)
 	}
 	return s.submit(ctx, actor.User.ID, input, request, models.DownloadSourceOriginUser, "", "")
@@ -601,7 +606,14 @@ func (s *DownloadService) submit(ctx context.Context, ownerID uint, input Submit
 		}
 		record.RoutePlanRevision, record.RoutePlanDigest = revision, digest
 	}
-	job, err := s.queue.EnqueueWith(EnqueueJobInput{OwnerID: ownerID, JobType: "download", Priority: input.Priority, DisplayName: displayName, Provider: downloaderRecord.Type, ResourceKey: downloadQueueResourceKey(downloaderRecord), Payload: downloadJobPayload{DownloadTaskID: taskID}}, func(tx *gorm.DB, job models.Job) error {
+	job, err := s.queue.EnqueueWith(EnqueueJobInput{OwnerID: ownerID, JobType: "download", Priority: input.Priority, DisplayName: displayName, Provider: downloaderRecord.Type, ResourceKey: downloadQueueResourceKey(downloaderRecord), Payload: downloadJobPayload{DownloadTaskID: taskID, SourceSiteID: input.SourceSiteID, ResourceAccessVersion: 1}}, func(tx *gorm.DB, job models.Job) error {
+		current, err := NewAuthorizationService(tx).Resolve(ownerID)
+		if err != nil {
+			return err
+		}
+		if !current.CanResource(authz.PermissionDownloadsCreate, models.AuthorizationResourceDownloader, downloaderRecord.ID) || (input.MediaLibraryID != nil && !current.CanIngestLibrary(uintID(*input.MediaLibraryID))) || (input.SourceSiteID != 0 && !current.CanResource(authz.PermissionDiscoveryRead, models.AuthorizationResourceSite, uintID(input.SourceSiteID))) {
+			return appError(CodePermissionDenied, "当前权限不允许创建这个下载或入库任务", nil)
+		}
 		if input.BeforePersist != nil {
 			if err := input.BeforePersist(tx); err != nil {
 				return err
@@ -949,6 +961,7 @@ func (s *DownloadService) ListScoped(actor Actor, scope string, limit int) ([]Do
 		jobIDs = append(jobIDs, record.JobID)
 	}
 	jobs := map[string]string{}
+	resources := map[string]jobResourceAccess{}
 	waitReasons := map[string]*JobWaitReasonDTO{}
 	type transferSummary struct {
 		ID             string
@@ -971,6 +984,11 @@ func (s *DownloadService) ListScoped(actor Actor, scope string, limit int) ([]Do
 		if err := s.db.Where("id IN ?", jobIDs).Find(&rows).Error; err != nil {
 			return nil, 0, err
 		}
+		loadedResources, resourceErr := jobResourceAccessRows(s.db, rows)
+		if resourceErr != nil {
+			return nil, 0, resourceErr
+		}
+		resources = loadedResources
 		jobDTOs := make([]JobDTO, len(rows))
 		reader := s.queue
 		if reader == nil {
@@ -1029,7 +1047,10 @@ func (s *DownloadService) ListScoped(actor Actor, scope string, limit int) ([]Do
 			item.SeedingPhase = seed.Phase
 		}
 		item.LifecycleScope = downloadLifecycleScope(item)
-		items = append(items, item)
+		if !resources[record.JobID].visible(actor) {
+			item = safeDownloadTaskSummary(item)
+		}
+		items = append(items, downloadSummaryForActor(actor, record, item))
 	}
 	return items, total, nil
 }

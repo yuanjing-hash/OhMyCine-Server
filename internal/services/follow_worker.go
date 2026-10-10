@@ -81,7 +81,7 @@ func (w *FollowSearchWorker) Run(ctx context.Context, runtime JobRuntime, job Cl
 		return w.block(run, subscription, CodeFollowConfigurationInvalid, "订阅执行快照无效")
 	}
 	if snapshot, _, err = w.follows.validateSnapshotWithRoutes(actor, subscription.TMDBID, snapshot, false); err != nil {
-		return w.block(run, subscription, CodeFollowConfigurationInvalid, ErrorMessage(err))
+		return w.block(run, subscription, ErrorCode(err), ErrorMessage(err))
 	}
 	coverage, err := w.follows.coverage.Coverage(ctx, actor, "tv", subscription.TMDBID)
 	if err != nil {
@@ -200,6 +200,12 @@ func (w *FollowSearchWorker) Run(ctx context.Context, runtime JobRuntime, job Cl
 			candidate.Fingerprint = followFingerprint(candidate.SiteID, fmt.Sprintf("%s:%d:%v", candidate.Fingerprint, candidate.Season, episodes), 0, nil)
 		}
 		libraryID := snapshot.MediaLibraryID
+		// Search may outlive an authorization edit. Each new resource submission
+		// uses the owner's current authority; accepted tasks retain their plan.
+		actor, err = w.follows.authorization.Resolve(run.OwnerID)
+		if err != nil {
+			return w.block(run, subscription, CodePermissionDenied, "订阅用户或权限不可用")
+		}
 		recommendation, routeErr := w.follows.downloads.RecommendSourceRoute(ctx, actor, candidate.SiteID, &libraryID)
 		if routeErr != nil || recommendation.Recommended == nil {
 			submitFailures++

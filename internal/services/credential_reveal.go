@@ -61,6 +61,25 @@ func (s *CredentialRevealService) Reveal(actor Actor, input CredentialRevealInpu
 		s.auditReveal(actor, input, "failure", CodePermissionDenied, request)
 		return CredentialRevealResult{}, appError(CodePermissionDenied, "无权查看已保存凭据", nil)
 	}
+	scope := ""
+	switch input.ResourceType {
+	case CredentialResourceDownloader:
+		scope = models.ResourceAccessScopeDownloaderUse
+	case CredentialResourceSite:
+		id, err := revealUintID(input.ResourceID)
+		if err != nil {
+			s.auditReveal(actor, input, "failure", ErrorCode(err), request)
+			return CredentialRevealResult{}, err
+		}
+		// Use the same stable identity as the persisted policy, including when
+		// the supplied numeric ID contains leading zeros.
+		input.ResourceID = uintID(id)
+		scope = models.ResourceAccessScopeSiteSearch
+	}
+	if scope != "" && !actor.ResourceAccessAllows(scope, input.ResourceID) {
+		s.auditReveal(actor, input, "failure", CodePermissionDenied, request)
+		return CredentialRevealResult{}, appError(CodePermissionDenied, "无权查看该资源的已保存凭据", nil)
+	}
 	value, err := s.reveal(input)
 	if err != nil {
 		s.auditReveal(actor, input, "failure", ErrorCode(err), request)
