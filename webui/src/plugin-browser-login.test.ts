@@ -188,4 +188,27 @@ describe('unified browser login', () => {
     expect(wrapper.text()).not.toContain('运行依赖')
     wrapper.unmount()
   })
+  it.each([
+    ['browser_sandbox_unavailable', '沙箱不可用'], ['browser_dependencies_missing', '缺少运行依赖'],
+    ['browser_executable_unavailable', '无法执行'], ['browser_profile_unavailable', '私有临时目录'],
+    ['browser_launch_timeout', '启动超时'],
+  ])('renders safe startup reason %s without retrying on status', async (code, label) => {
+    vi.mocked(api).mockResolvedValue({ state: 'launch_failed', installed: true, runtime_error: code })
+    const wrapper = mount(ServerBrowserPanel, { props: { canInstall: true } }); await flushPromises()
+    expect(wrapper.text()).toContain(label)
+    expect(wrapper.text()).not.toContain('实际启动结果以登录时检查为准')
+    expect(api).toHaveBeenCalledTimes(1)
+    await wrapper.findAll('button').find(b => b.text() === '检查组件状态')!.trigger('click'); await flushPromises()
+    expect(api).toHaveBeenLastCalledWith('/api/v1/settings/browser/status', expect.anything())
+    wrapper.unmount()
+  })
+  it('shows a fixed sandbox diagnosis in plugin interaction without upstream details', async () => {
+    browserMock()
+    const wrapper = mount(PluginBrowserLogin, { props }); await flushPromises()
+    vi.mocked(api).mockRejectedValueOnce(new APIError(503, 'resource_browser_sandbox_unavailable', 'Cookie=synthetic /private/profile'))
+    await wrapper.findAll('button').find(b => b.text() === '更新画面')!.trigger('click'); await flushPromises()
+    expect(wrapper.text()).toContain('沙箱不可用')
+    expect(wrapper.text()).not.toContain('/private/profile')
+    wrapper.unmount()
+  })
 })

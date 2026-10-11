@@ -4,6 +4,9 @@ services:
     restart: unless-stopped
     init: true
     shm_size: "256mb"
+    # Keep this compose file beside seccomp/ from the same Server release.
+    security_opt:
+      - seccomp=./seccomp/browser.json
     ports:
       - "${OMC_BIND_ADDRESS:-127.0.0.1}:3000:3000"
     environment:

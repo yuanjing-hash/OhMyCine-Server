@@ -2,6 +2,7 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import QRCode from 'qrcode'
 import { api, APIError } from '@/api/client'
+import { resourceBrowserStartupError } from '@/browser-startup-errors'
 import { Permissions } from '@/auth/generated-permissions'
 import PluginSettingsForm from '@/components/PluginSettingsForm.vue'
 import PluginResourceLogin from '@/components/PluginResourceLogin.vue'
@@ -137,7 +138,7 @@ function resourceFailure(id: string, reason: unknown) {
       resource_browser_unavailable: 'Server 内置浏览器不可用。请先到系统设置 → 内置浏览器完成安装或检查运行依赖。',
       resource_browser_login_expired: '本次登录验证已过期，请重新输入账号密码。已保存的登录状态不会因此删除。',
     }
-    resourceLoginErrors.value = { ...resourceLoginErrors.value, [id]: reason instanceof APIError ? browserErrors[reason.errorCode] ?? message(reason) : message(reason) }
+    resourceLoginErrors.value = { ...resourceLoginErrors.value, [id]: reason instanceof APIError ? resourceBrowserStartupError(reason.errorCode) ?? browserErrors[reason.errorCode] ?? message(reason) : message(reason) }
   }
 }
 

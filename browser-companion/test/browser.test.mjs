@@ -1,9 +1,12 @@
-import test from 'node:test';
+import test, { afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { openBrowser } from '../src/browser.mjs';
 import { pinnedProxy } from '../src/proxy.mjs';
 import { validateCookies, exportCookies } from '../src/cookies.mjs';
+
+const adapters = new Set();
+afterEach(async () => { for (const adapter of adapters) await adapter.close(); adapters.clear(); });
 
 async function fixture(cookies = [], network = {}) {
   const calls = {};
@@ -32,6 +35,7 @@ async function fixture(cookies = [], network = {}) {
     pinnedProxy: async (origin, address) => { calls.pinned = { origin, address }; return { url: 'http://127.0.0.1:12345', close: async () => {} }; },
     chromium: { launch: async options => { calls.launch = options; return browser; } },
   });
+  adapters.add(adapter);
   return { adapter, calls };
 }
 test('browser retains sandbox, constrained proxy, no downloads/SW/WebSockets', async () => {
