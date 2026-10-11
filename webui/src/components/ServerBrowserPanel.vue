@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { api } from '@/api/client'
+import { browserStartupErrors } from '@/browser-startup-errors'
 
 const props = defineProps<{ canInstall: boolean }>()
 const accepted = ref(false)
@@ -16,6 +17,7 @@ const labels: Record<string, string> = {
   launch_failed: '浏览器启动失败，请检查 Server 浏览器运行依赖与沙箱支持后重试',
 }
 const runtimeLabels: Record<string, string> = {
+  ...browserStartupErrors,
   browser_launch_failed: '浏览器启动失败，请检查 Server 浏览器运行依赖与沙箱支持后重试',
   browser_navigation_failed: '浏览器无法打开站点，请检查当前镜像连通性后重试登录',
   network_denied: '站点地址或请求被浏览器网络规则拒绝；请检查 HTTPS 地址、DNS 和 Server 网络配置',
@@ -26,7 +28,7 @@ const runtimeLabels: Record<string, string> = {
   timeout: '浏览器操作超时，请检查站点连通性后重试',
 }
 const label = computed(() => status.value?.runtime_error
-  ? runtimeLabels[status.value.runtime_error] ?? `${status.value.installed ? '组件已安装，但最近启动失败' : '组件服务启动失败'}。请检查完整 Server 安装与当前镜像连通性，然后重试。`
+  ? Object.hasOwn(runtimeLabels, status.value.runtime_error) ? runtimeLabels[status.value.runtime_error] : `${status.value.installed ? '组件已安装，但最近启动失败' : '组件服务启动失败'}。请检查完整 Server 安装与当前镜像连通性，然后重试。`
   : labels[status.value?.state ?? ''] ?? '尚未检查')
 async function run(install = false) {
   if (busy.value || (install && (!props.canInstall || !accepted.value))) return

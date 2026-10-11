@@ -1,6 +1,7 @@
 import { Fault, requireThat, sameOrigin, resolvePinnedAddress, resourceURL } from './policy.mjs';
 import { pinnedProxy } from './proxy.mjs';
 import { validateCookies, exportCookies } from './cookies.mjs';
+import { startupFailure, browserEnvironment } from './startup.mjs';
 
 export const WIDTH = 1280, HEIGHT = 800, MAX_BODY = 2 * 1024 * 1024;
 
@@ -20,22 +21,27 @@ export async function openBrowser(executablePath, origin, dependencies = {}) {
       : code === 'resource_network_failed' ? code : 'resource_network_denied';
   };
   const proxy = await (dependencies.pinnedProxy || pinnedProxy)(origin, address, { onBlocked: blocked });
-  let browser;
+  let browser, environment, closed;
+  const close = () => closed ??= (async () => {
+    try { await browser?.close(); }
+    finally { try { await proxy.close(); } finally { await environment?.close(); } }
+  })();
   try {
-    const chromium = dependencies.chromium || (await import('playwright-core')).chromium;
-    const browserEnv = {};
-    for (const key of ['PATH', 'Path', 'SystemRoot', 'WINDIR', 'TEMP', 'TMP', 'HOME', 'USERPROFILE',
-      'LOCALAPPDATA', 'APPDATA', 'LANG', 'LC_ALL', 'DISPLAY', 'XDG_RUNTIME_DIR'])
-      if (process.env[key]) browserEnv[key] = process.env[key];
+    requireThat(!dependencies.signal?.aborted, 'request_cancelled', 503);
+    let chromium;
+    try { chromium = dependencies.chromium || (await import('playwright-core')).chromium; }
+    catch (error) { throw startupFailure(error); }
+    environment = await browserEnvironment();
     // Playwright controls the officially acquired Cloak executable. Never use
     // upstream launch defaults that add --no-sandbox, auto-update or license IO.
-    browser = await chromium.launch({ executablePath, headless: true, chromiumSandbox: true, env: browserEnv,
+    browser = await chromium.launch({ executablePath, headless: true, chromiumSandbox: true, env: environment.env,
       timeout: 30_000, proxy: { server: proxy.url, bypass: '<-loopback>' },
       args: ['--disable-quic', '--disable-background-networking', '--disable-component-update',
         '--disable-domain-reliability', '--disable-features=DnsOverHttps,AsyncDns',
         '--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE 127.0.0.1',
         '--force-webrtc-ip-handling-policy=disable_non_proxied_udp'],
-    }).catch(() => { throw new Fault('browser_launch_failed', 503); });
+    }).catch(error => { throw startupFailure(error); });
+    requireThat(!dependencies.signal?.aborted, 'request_cancelled', 503);
     const context = await browser.newContext({ viewport: { width: WIDTH, height: HEIGHT },
       acceptDownloads: false, serviceWorkers: 'block', permissions: [], ignoreHTTPSErrors: false });
     context.setDefaultTimeout(10_000);
@@ -64,6 +70,7 @@ export async function openBrowser(executablePath, origin, dependencies = {}) {
     page.on('download', d => d.cancel().catch(() => {}));
     await page.goto(origin, { waitUntil: 'domcontentloaded' })
       .catch(() => { throw new Fault('browser_navigation_failed', 502); });
+    requireThat(!dependencies.signal?.aborted, 'request_cancelled', 503);
     return {
       async cookies() { return await exportCookies(context, origin); },
       async reload() {
@@ -150,7 +157,7 @@ export async function openBrowser(executablePath, origin, dependencies = {}) {
         let timer;
         const result = await Promise.race([pending, new Promise((_, reject) => {
           timer = setTimeout(() => {
-            browser.close().catch(() => {}); proxy.close().catch(() => {});
+            close().catch(() => {});
             reject(new Fault('browser_request_timeout', 504));
           }, 20_000);
         })]).finally(() => clearTimeout(timer));
@@ -165,11 +172,10 @@ export async function openBrowser(executablePath, origin, dependencies = {}) {
         return { status: result.status, bodyBase64: result.bodyBase64, headers: { 'content-type': mime },
           cookies: await exportCookies(context, origin) };
       },
-      async close() { try { await browser.close(); } finally { await proxy.close(); } },
+      close,
     };
   } catch (err) {
-    await browser?.close().catch(() => {});
-    await proxy.close();
+    await close().catch(() => {});
     throw err;
   }
 }

@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { resourceBrowserStartupError } from '@/browser-startup-errors'
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { api, APIError } from '@/api/client'
 import type { ResourceLoginResponse } from '@/plugins'
@@ -99,7 +100,7 @@ async function run(operation: string, payload: Record<string, unknown> = {}) {
     if (code === 'resource_browser_session_expired') {
       session.value = ''; image.value = ''; input.value = ''; resourceWarning.value = ''; success.value = false
     }
-    error.value = code === 'resource_browser_verification_required' ? '站点仍要求验证，请在浏览器画面内手动完成。'
+    error.value = resourceBrowserStartupError(code) ?? (code === 'resource_browser_verification_required' ? '站点仍要求验证，请在浏览器画面内手动完成。'
       : code === 'resource_auth_required' || code === 'resource_auth_failed' ? '站点尚未确认登录，请先在画面内登录。'
       : code === 'resource_browser_session_expired' ? '本次验证已过期，请取消后重新提交登录。已保存的登录状态不因此删除。'
       : code === 'resource_browser_login_expired' ? '保存的本次密码请求已过期，网页仍可使用；请在画面内登录后再次确认，或取消后重新输入账号密码。'
@@ -110,7 +111,7 @@ async function run(operation: string, payload: Record<string, unknown> = {}) {
       : code === 'resource_browser_unavailable' || code === 'resource_browser_start_failed' ? 'Server 浏览器启动失败，请到系统设置的内置浏览器中检查运行状态。'
       : code === 'resource_browser_reload_failed' ? '网页重新加载未完成，请检查网络或更新画面查看状态；不代表登录失效。'
       : code === 'resource_browser_reload_post_denied' ? '当前页面来自表单提交，为避免重复提交，不能直接重新加载。可更新画面或继续手动验证。'
-      : '操作未完成。请检查组件状态或更新画面后重试；未确认登录成功。'
+      : '操作未完成。请检查组件状态或更新画面后重试；未确认登录成功。')
   } finally {
     clearTimeout(timeout)
     if (version === generation) busy.value = false

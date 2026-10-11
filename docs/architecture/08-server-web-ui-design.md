@@ -531,3 +531,9 @@ Resource search progressively recognizes current-page PT/BT/cloud-share claims w
 ## 只读插件账号展示
 
 只读扫码 capability site.auth 不要求账号写入能力 site.interaction。登录确认保存有限账号/会员摘要与确认时间，页面刷新后显示最近观察；凭据重置、24 小时未确认、过期或明确异常时会员显示未知。会员摘要仅用于展示，每个视频权益独立重新验证。详见 [插件原生离线下载](28-plugin-native-offline.md)。
+
+## 内置浏览器启动状态
+
+系统设置的“检查组件状态”只读取安装元数据和最近启动原因，不启动浏览器、不请求站点、不清除失败。组件已安装不能等同于运行健康或账号登录成功。修正部署后明确重试插件登录，才能重新验证启动和当前镜像页面。
+
+启动原因通过 companion → Go → UI 的固定词汇传递：`browser_sandbox_unavailable`、`browser_profile_unavailable`、`browser_dependencies_missing`、`browser_executable_unavailable`、`browser_launch_timeout`，未知为 `browser_launch_failed`。插件登录的对应错误前缀为 `resource_`，系统面板与插件交互复用固定中文提示。任何未知状态和原因均收敛为安全回退，不显示原始异常、argv、路径、代理、URL 或凭据，不把启动故障误报为密码错误或登录失效。部署修改、服务重建及真实账号验收仍是独立操作，参见 [浏览器组件部署](../deployment/browser-companion.md)。
