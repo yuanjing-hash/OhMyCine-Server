@@ -19,6 +19,7 @@ export interface UserMediaItem {
   season_count: number
   episode_count: number
   category_name?: string
+  added_at?: string
   modified_at: string
 }
 
@@ -167,6 +168,7 @@ function normalizeMediaItem(value: unknown): UserMediaItem {
     ...(text(source.poster_url) ? { poster_url: text(source.poster_url) } : {}),
     ...(text(source.backdrop_url) ? { backdrop_url: text(source.backdrop_url) } : {}),
     season_count: nonNegativeNumber(source.season_count), episode_count: nonNegativeNumber(source.episode_count),
+    ...(text(source.added_at) ? { added_at: text(source.added_at) } : {}),
     ...(text(source.category_name) ? { category_name: text(source.category_name) } : {}), modified_at: text(source.modified_at),
   }
 }

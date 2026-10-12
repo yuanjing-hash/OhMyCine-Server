@@ -72,6 +72,11 @@ func TestCatalogScanBackgroundRecognitionLinksPendingEntriesWithoutGenerationSwe
 	if len(after) != 2 || after[0].ID != before[0].ID || after[1].ID != before[1].ID || after[0].RecognitionID == nil || *after[0].RecognitionID != *after[1].RecognitionID || *after[0].Season != 2 || *after[0].Episode != 1 {
 		t.Fatalf("recognized versions: %+v", after)
 	}
+	for index, row := range after {
+		if !row.CreatedAt.Equal(before[index].CreatedAt) {
+			t.Fatalf("background recognition changed ingestion time: got=%s want=%s", row.CreatedAt, before[index].CreatedAt)
+		}
+	}
 	var current models.MediaLibrary
 	if err := service.db.First(&current, library.ID).Error; err != nil {
 		t.Fatal(err)

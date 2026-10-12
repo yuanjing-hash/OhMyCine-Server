@@ -12,7 +12,9 @@ import (
 	"time"
 
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/authz"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/database"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
+	"gorm.io/gorm"
 )
 
 func createCatalogTestLibrary(t *testing.T) (*MediaLibraryService, models.MediaLibrary, Actor) {
@@ -23,6 +25,102 @@ func createCatalogTestLibrary(t *testing.T) (*MediaLibraryService, models.MediaL
 		t.Fatal(err)
 	}
 	return service, detail.MediaLibrary, actor
+}
+
+func TestMediaCatalogRecentOrderUsesIngestionTimeBeforePaging(t *testing.T) {
+	for _, mode := range []string{"legacy", "versioned"} {
+		t.Run(mode, func(t *testing.T) {
+			service, library, actor := createCatalogTestLibrary(t)
+			if err := service.db.Model(&library).Update("enabled", true).Error; err != nil {
+				t.Fatal(err)
+			}
+			now := time.Date(2026, 10, 12, 0, 0, 0, 0, time.UTC)
+			rec := models.MediaLibraryRecognition{LibraryID: library.ID, SourceKey: "recent-fixture", ProfileID: library.ProfileID, ProfileRevision: library.ProfileRevision, Status: "unrecognized", MediaType: "movie", Title: "Fixture", MetadataJSON: "{}"}
+			if err := service.db.Create(&rec).Error; err != nil {
+				t.Fatal(err)
+			}
+			entries := make([]models.MediaLibraryEntry, 0, 34)
+			for index := 0; index < 32; index++ {
+				entries = append(entries, models.MediaLibraryEntry{LibraryID: library.ID, RecognitionID: &rec.ID,
+					RelativePath: fmt.Sprintf("/Movie%02d.mkv", index), ProviderID: fmt.Sprintf("movie-%02d", index), WorkKey: fmt.Sprintf("movie:%03d", index),
+					MediaType: "movie", Title: fmt.Sprintf("A movie %02d", index), MatchStatus: "unrecognized", Size: 1,
+					ModifiedAt: now.Add(time.Duration(100-index) * time.Hour), CreatedAt: now.Add(time.Duration(index) * time.Minute), UpdatedAt: now})
+			}
+			// The newest movie is outside the title-ordered first page and has an
+			// older source mtime. A tie must use the same work key in SQL and merge.
+			entries[31].Title, entries[31].ModifiedAt = "Z newest movie", now.Add(-24*time.Hour)
+			entries[30].CreatedAt = entries[31].CreatedAt
+			season, firstEpisode, secondEpisode := 1, 1, 2
+			entries = append(entries,
+				models.MediaLibraryEntry{LibraryID: library.ID, RecognitionID: &rec.ID, RelativePath: "/Series/S01E01.mkv", ProviderID: "episode-1", WorkKey: "series:recent", MediaType: "tv", Title: "Z series", SeriesTitle: "Z series", Season: &season, Episode: &firstEpisode, MatchStatus: "unrecognized", Size: 1, ModifiedAt: now.Add(-48 * time.Hour), CreatedAt: now.Add(-24 * time.Hour), UpdatedAt: now},
+				models.MediaLibraryEntry{LibraryID: library.ID, RecognitionID: &rec.ID, RelativePath: "/Series/S01E02.mkv", ProviderID: "episode-2", WorkKey: "series:recent", MediaType: "tv", Title: "Z series", SeriesTitle: "Z series", Season: &season, Episode: &secondEpisode, MatchStatus: "unrecognized", Size: 1, ModifiedAt: now.Add(-48 * time.Hour), CreatedAt: now.Add(time.Hour), UpdatedAt: now})
+			if err := service.db.Create(&entries).Error; err != nil {
+				t.Fatal(err)
+			}
+			if mode == "versioned" {
+				var location struct{ File string }
+				if err := service.db.Raw("PRAGMA database_list").Scan(&location).Error; err != nil {
+					t.Fatal(err)
+				}
+				readDB, err := database.OpenReadOnly(location.File)
+				if err != nil {
+					t.Fatal(err)
+				}
+				pool, _ := readDB.DB()
+				t.Cleanup(func() { _ = pool.Close() })
+				store := NewCatalogSnapshotStore(service.db, readDB)
+				service.SetCatalogSnapshotStore(store)
+				if err := service.db.Transaction(func(tx *gorm.DB) error {
+					return StartCatalogConversionTx(tx, models.CatalogHead{LibraryID: library.ID, SourceEpoch: 1, SourceFingerprint: "source-a", ConfigFingerprint: "config-a"}, func(*gorm.DB) error { return nil })
+				}); err != nil {
+					t.Fatal(err)
+				}
+				catalogConvert(t, store, library, rec, entries)
+				candidate, token := catalogCandidate(t, store, library, "delta", 1)
+				hidden := entries[0]
+				hidden.CreatedAt = now.Add(24 * time.Hour)
+				if err := store.AppendBatch(context.Background(), candidate.ID, token, CatalogFactBatch{Entries: []models.CatalogEntryFact{CatalogEntryFromLegacy(hidden, &rec)}}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			ordinary, err := service.PlayerCatalog(actor, library.ID, MediaPageQuery{Page: 1, PageSize: 20})
+			if err != nil || len(ordinary.List) != 20 || ordinary.List[0].Title != "A movie 00" {
+				t.Fatalf("ordinary order changed: %+v err=%v", ordinary, err)
+			}
+			query := MediaPageQuery{Page: 1, PageSize: playerOverviewRecentlyAddedLimit, order: mediaCatalogOrderAdded}
+			recent, err := service.PlayerCatalog(actor, library.ID, query)
+			if err != nil || recent.Total != 33 || len(recent.List) != playerOverviewRecentlyAddedLimit {
+				t.Fatalf("recent page=%+v err=%v", recent, err)
+			}
+			if recent.List[0].ID != encodeCatalogToken("series:recent") || !recent.List[0].AddedAt.Equal(entries[33].CreatedAt) || recent.List[0].FileCount != 2 || recent.List[1].ID != encodeCatalogToken("movie:030") || recent.List[2].ID != encodeCatalogToken("movie:031") {
+				t.Fatalf("recent ingestion/episode/tie order=%+v", recent.List[:3])
+			}
+			if !recent.List[2].ModifiedAt.Equal(entries[31].ModifiedAt) || !browserMediaItem(recent.List[2]).AddedAt.Equal(entries[31].CreatedAt) {
+				t.Fatalf("timestamp projection=%+v", recent.List[2])
+			}
+			query.Page = 2
+			second, err := service.PlayerCatalog(actor, library.ID, query)
+			if err != nil || len(second.List) != 9 || !playerOverviewCatalogItemBefore(recent.List[23], second.List[0]) {
+				t.Fatalf("recent pagination=%+v err=%v", second, err)
+			}
+			if _, err := service.PlayerCatalog(actor, library.ID, MediaPageQuery{Page: 1, PageSize: playerOverviewRecentlyAddedLimit}); ErrorCode(err) != CodeInvalidRequest {
+				t.Fatalf("ordinary public page size changed: %v", err)
+			}
+			if _, err := service.ExcludeCatalogWork(context.Background(), actor, library.ID, encodeCatalogToken("series:recent"), RequestContext{}); err != nil {
+				t.Fatal(err)
+			}
+			query.Page = 1
+			recent, err = service.PlayerCatalog(actor, library.ID, query)
+			if err != nil || recent.Total != 32 || recent.List[0].ID != encodeCatalogToken("movie:030") {
+				t.Fatalf("recent exclusion=%+v err=%v", recent, err)
+			}
+			denied := actor
+			denied.ResourceRules = append(append([]AuthorizationRule{}, actor.ResourceRules...), AuthorizationRule{PermissionCode: authz.PermissionMediaLibrariesRead, Effect: models.AuthorizationEffectDeny, ResourceType: models.AuthorizationResourceMediaLibrary, ResourceID: uintID(library.ID)})
+			if _, err := service.PlayerCatalog(denied, library.ID, query); ErrorCode(err) != CodePermissionDenied {
+				t.Fatalf("recent authorization=%v", err)
+			}
+		})
+	}
 }
 
 func TestAggregateMediaCatalogMergesOnlyTrustedTMDBIdentityBeforePaging(t *testing.T) {

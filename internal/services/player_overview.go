@@ -19,7 +19,6 @@ const (
 	playerOverviewCollectionsLimit   = 12
 	playerOverviewHistoryLimit       = 12
 	playerOverviewLibrariesLimit     = 24
-	playerOverviewCatalogPageSize    = 20
 	playerOverviewHistoryPageSize    = 100
 )
 
@@ -256,15 +255,12 @@ func (s *PlayerOverviewService) loadLibraries(actor Actor) ([]PlayerMediaLibrary
 }
 
 func (s *PlayerOverviewService) catalogCandidates(actor Actor, libraries []PlayerMediaLibrary) ([]PlayerMediaItem, int, error) {
-	if len(libraries) > playerOverviewHeroLimit {
-		libraries = libraries[:playerOverviewHeroLimit]
-	}
-	items := make([]PlayerMediaItem, 0, len(libraries)*playerOverviewCatalogPageSize)
+	items := make([]PlayerMediaItem, 0, playerOverviewRecentlyAddedLimit)
 	total := 0
 	successful := 0
 	var firstErr error
 	for _, library := range libraries {
-		page, err := s.libraries.PlayerCatalog(actor, library.ID, MediaPageQuery{Page: 1, PageSize: playerOverviewCatalogPageSize})
+		page, err := s.libraries.PlayerCatalog(actor, library.ID, MediaPageQuery{Page: 1, PageSize: playerOverviewRecentlyAddedLimit, order: mediaCatalogOrderAdded})
 		if err != nil {
 			if firstErr == nil {
 				firstErr = err
@@ -273,18 +269,42 @@ func (s *PlayerOverviewService) catalogCandidates(actor Actor, libraries []Playe
 		}
 		successful++
 		total += page.Total
-		items = append(items, page.List...)
+		for _, item := range page.List {
+			// Keep a sorted, bounded global set. Every library is already ordered
+			// before its page limit, so no later row can enter the global top 24.
+			position := sort.Search(len(items), func(index int) bool {
+				return playerOverviewCatalogItemBefore(item, items[index])
+			})
+			if position == playerOverviewRecentlyAddedLimit {
+				continue
+			}
+			if len(items) < playerOverviewRecentlyAddedLimit {
+				items = append(items, PlayerMediaItem{})
+			}
+			copy(items[position+1:], items[position:len(items)-1])
+			items[position] = item
+		}
 	}
 	if len(libraries) > 0 && successful == 0 {
 		return nil, 0, firstErr
 	}
-	sort.SliceStable(items, func(left, right int) bool {
-		if items[left].ModifiedAt.Equal(items[right].ModifiedAt) {
-			return items[left].ItemToken < items[right].ItemToken
-		}
-		return items[left].ModifiedAt.After(items[right].ModifiedAt)
-	})
 	return items, total, nil
+}
+
+func playerOverviewCatalogItemBefore(left, right PlayerMediaItem) bool {
+	if !left.AddedAt.Equal(right.AddedAt) {
+		return left.AddedAt.After(right.AddedAt)
+	}
+	if left.LibraryID != right.LibraryID {
+		return left.LibraryID < right.LibraryID
+	}
+	// Match the SQL work_key tie-breaker rather than the base64 token's order.
+	leftKey, leftErr := decodeCatalogToken(left.ID)
+	rightKey, rightErr := decodeCatalogToken(right.ID)
+	if leftErr != nil || rightErr != nil {
+		return left.ID < right.ID
+	}
+	return leftKey < rightKey
 }
 
 func playerOverviewHistoryItems(page PlayerHistoryPage, allowedLibraries map[uint]struct{}, continueOnly bool) ([]PlayerHistoryChange, bool, error) {

@@ -48,7 +48,7 @@ type playerOverviewLibrariesFake struct {
 	pages        map[uint]PlayerMediaItemPage
 	pageErrors   map[uint]error
 	mu           sync.Mutex
-	pageSizes    []int
+	queries      []MediaPageQuery
 }
 
 func (fake *playerOverviewLibrariesFake) PlayerLibraries(Actor) ([]PlayerMediaLibrary, error) {
@@ -57,7 +57,7 @@ func (fake *playerOverviewLibrariesFake) PlayerLibraries(Actor) ([]PlayerMediaLi
 
 func (fake *playerOverviewLibrariesFake) PlayerCatalog(_ Actor, libraryID uint, query MediaPageQuery) (PlayerMediaItemPage, error) {
 	fake.mu.Lock()
-	fake.pageSizes = append(fake.pageSizes, query.PageSize)
+	fake.queries = append(fake.queries, query)
 	fake.mu.Unlock()
 	return fake.pages[libraryID], fake.pageErrors[libraryID]
 }
@@ -73,13 +73,14 @@ func TestPlayerOverviewBoundsOrdersAndFiltersAuthorizedServerState(t *testing.T)
 		catalog = append(catalog, PlayerMediaItem{
 			ID: fmt.Sprintf("work-%02d", index), ItemToken: fmt.Sprintf("work|1|%02d", index),
 			LibraryID: 1, Title: fmt.Sprintf("Work %02d", index), Kind: "movie",
-			BackdropPath: "/backdrop.jpg", ModifiedAt: now.Add(time.Duration(index) * time.Minute),
+			BackdropPath: "/backdrop.jpg", ModifiedAt: now.Add(-time.Duration(index) * time.Minute), AddedAt: now.Add(time.Duration(index) * time.Minute),
 		})
 	}
 	libraryReader := &playerOverviewLibrariesFake{libraries: libraries, pages: map[uint]PlayerMediaItemPage{1: {List: catalog, Total: 40}}, pageErrors: map[uint]error{}}
 	for index := 2; index <= 25; index++ {
 		libraryReader.pages[uint(index)] = PlayerMediaItemPage{}
 	}
+	libraryReader.pages[25] = PlayerMediaItemPage{List: []PlayerMediaItem{{ID: "newest-library-25", LibraryID: 25, AddedAt: now.Add(time.Hour), ModifiedAt: now.Add(-time.Hour)}}, Total: 1}
 
 	duration := 100.0
 	history := &playerOverviewHistoryFake{page: PlayerHistoryPage{HasMore: true, List: []PlayerHistoryChange{
@@ -105,7 +106,7 @@ func TestPlayerOverviewBoundsOrdersAndFiltersAuthorizedServerState(t *testing.T)
 	if len(overview.Sections.Featured.List) != 12 || !overview.Sections.Featured.HasMore || overview.Sections.Featured.List[0].ID != "work-29" {
 		t.Fatalf("featured=%+v", overview.Sections.Featured)
 	}
-	if len(overview.Sections.RecentlyAdded.List) != 24 || !overview.Sections.RecentlyAdded.HasMore || overview.Sections.RecentlyAdded.List[0].ID != "work-29" {
+	if len(overview.Sections.RecentlyAdded.List) != 24 || !overview.Sections.RecentlyAdded.HasMore || overview.Sections.RecentlyAdded.List[0].ID != "newest-library-25" || overview.Sections.RecentlyAdded.List[1].ID != "work-29" {
 		t.Fatalf("recently added=%+v", overview.Sections.RecentlyAdded)
 	}
 	if got := overview.Sections.ContinueWatching.List; len(got) != 1 || got[0].SyncKey != "allowed-progress" {
@@ -125,12 +126,12 @@ func TestPlayerOverviewBoundsOrdersAndFiltersAuthorizedServerState(t *testing.T)
 	}
 	libraryReader.mu.Lock()
 	defer libraryReader.mu.Unlock()
-	if len(libraryReader.pageSizes) != 12 {
-		t.Fatalf("catalog calls=%d want=12", len(libraryReader.pageSizes))
+	if len(libraryReader.queries) != len(libraries) {
+		t.Fatalf("catalog calls=%d want=%d", len(libraryReader.queries), len(libraries))
 	}
-	for _, pageSize := range libraryReader.pageSizes {
-		if pageSize != playerOverviewCatalogPageSize {
-			t.Fatalf("catalog page size=%d", pageSize)
+	for _, query := range libraryReader.queries {
+		if query.PageSize != playerOverviewRecentlyAddedLimit || query.order != mediaCatalogOrderAdded {
+			t.Fatalf("catalog query=%+v", query)
 		}
 	}
 }
@@ -161,7 +162,7 @@ func TestPlayerOverviewCatalogKeepsSuccessfulLibraryWhenSiblingFails(t *testing.
 	now := time.Now().UTC()
 	libraryReader := &playerOverviewLibrariesFake{
 		libraries:  []PlayerMediaLibrary{{ID: 1}, {ID: 2}},
-		pages:      map[uint]PlayerMediaItemPage{1: {List: []PlayerMediaItem{{ID: "available", ItemToken: "work|1|available", BackdropPath: "/backdrop.jpg", ModifiedAt: now}}, Total: 1}},
+		pages:      map[uint]PlayerMediaItemPage{1: {List: []PlayerMediaItem{{ID: "available", ItemToken: "work|1|available", BackdropPath: "/backdrop.jpg", ModifiedAt: now, AddedAt: now}}, Total: 1}},
 		pageErrors: map[uint]error{2: errors.New("one library failed")},
 	}
 	overview := newPlayerOverviewService(
