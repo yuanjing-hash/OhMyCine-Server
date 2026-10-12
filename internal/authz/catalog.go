@@ -98,6 +98,7 @@ const (
 	RoleAdministrator                           = "administrator"
 	RoleOperator                                = "operator"
 	RoleViewer                                  = "viewer"
+	RoleUser                                    = "user"
 )
 
 //go:embed catalog.json

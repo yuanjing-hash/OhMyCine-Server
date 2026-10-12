@@ -66,7 +66,7 @@ onMounted(load)
     <form v-if="createOpen" class="panel mt-6 grid gap-4 md:grid-cols-2 xl:grid-cols-4" @submit.prevent="createUser">
       <div><label class="label">用户名</label><input v-model="createForm.username" class="input" required minlength="3" maxlength="64" /></div>
       <div><label class="label">显示名称</label><input v-model="createForm.displayName" class="input" maxlength="128" /></div>
-      <div><label class="label">初始密码</label><SecretInput v-model="createForm.password" class="input" required minlength="12" maxlength="128" autocomplete="new-password" /></div>
+      <div><label class="label">初始密码</label><SecretInput v-model="createForm.password" class="input" required minlength="8" maxlength="128" autocomplete="new-password" /></div>
       <div><label class="label">角色</label><select v-if="auth.can(Permissions.RolesRead)" v-model="createForm.roleIDs" class="input min-h-11" multiple><option v-for="role in roles.filter(item => item.active)" :key="role.id" :value="role.id">{{ role.name }}</option></select><p v-else class="text-subtle m-0 text-sm">未授予角色查看权限时，新账户使用默认只读角色。</p></div>
       <button class="btn-primary md:col-span-2 xl:col-span-4" :disabled="saving">创建账户</button>
     </form>
@@ -99,7 +99,7 @@ onMounted(load)
           </div><p v-else class="text-subtle mt-4 text-sm">未配置直接规则，完全继承角色权限。</p>
           <button v-if="auth.can(Permissions.RolesAssign)" class="btn-secondary mt-4" :disabled="saving || !canEditAuthorization || editRules.some(rule => Boolean(rule.resource_type) && !rule.resource_id)">保存直接授权</button>
         </form>
-        <form v-if="auth.can(Permissions.UsersUpdate) && (!selected.is_owner || selected.id === auth.user?.id)" class="semantic-divider mt-6 border-t pt-5" @submit.prevent="resetUserPassword"><h3 class="mt-0 text-sm">重置密码</h3><div class="grid gap-3 md:grid-cols-2"><SecretInput v-model="resetPassword" class="input" minlength="12" maxlength="128" required autocomplete="new-password" placeholder="至少 12 位新密码" /><SecretInput v-model="currentPassword" class="input" required autocomplete="current-password" placeholder="当前操作者密码（重新认证）" /></div><button class="btn-secondary mt-3" :disabled="saving">重置并撤销目标会话</button></form>
+        <form v-if="auth.can(Permissions.UsersUpdate) && (!selected.is_owner || selected.id === auth.user?.id)" class="semantic-divider mt-6 border-t pt-5" @submit.prevent="resetUserPassword"><h3 class="mt-0 text-sm">重置密码</h3><div class="grid gap-3 md:grid-cols-2"><SecretInput v-model="resetPassword" class="input" minlength="8" maxlength="128" required autocomplete="new-password" placeholder="至少 8 位新密码" /><SecretInput v-model="currentPassword" class="input" required autocomplete="current-password" placeholder="当前操作者密码（重新认证）" /></div><button class="btn-secondary mt-3" :disabled="saving">重置并撤销目标会话</button></form>
         <div class="semantic-divider mt-6 flex flex-wrap gap-3 border-t pt-5"><button v-if="selected.status === 'active' && auth.can(Permissions.UsersDisable)" class="btn-danger" :disabled="saving || selected.is_owner || selected.id === auth.user?.id" @click="toggleEnabled">停用账户</button><button v-else-if="selected.status === 'disabled' && auth.can(Permissions.UsersUpdate)" class="btn-secondary" :disabled="saving || selected.id === auth.user?.id" @click="toggleEnabled">启用账户</button><button v-if="auth.can(Permissions.UsersDelete)" class="btn-danger" :disabled="saving || selected.is_owner || selected.id === auth.user?.id" @click="deleteUser">删除账户</button></div>
       </section>
     </div>

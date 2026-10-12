@@ -125,8 +125,8 @@ func validateUsername(username string) error {
 }
 
 func validatePassword(password string) error {
-	if len(password) < 12 || len(password) > 128 {
-		return appError(CodeInvalidRequest, "密码长度应为 12 到 128 个字符", nil)
+	if len(password) < 8 || len(password) > 128 {
+		return appError(CodeInvalidRequest, "密码长度应为 8 到 128 个字符", nil)
 	}
 	return nil
 }

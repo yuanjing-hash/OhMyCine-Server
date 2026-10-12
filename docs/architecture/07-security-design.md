@@ -100,6 +100,8 @@ Server 同源 Web 管理端使用用户名密码登录，建立可撤销的服�
 - HTTPS 使用 `__Host-omc_session; Secure; HttpOnly; SameSite=Lax; Path=/`；显式局域网 HTTP 模式使用 host-only 普通 Cookie 并提示保护等级差异
 - 登录失败需要限速，避免暴力破解
 
+用户账号密码最少 8 位，最多 128 字节；首次 Owner 设置、创建用户及修改/重置密码共用后端校验，页面同步最低长度。密码哈希成本、重置时的重新认证和会话撤销规则保持不变。外部连接密码、CookieCloud 共享认证等使用各自的校验规则。
+
 所有 Cookie 认证的状态变更请求还必须校验 session-bound `X-CSRF-Token`、浏览器同源信息和 `application/json`。浏览器的 `Sec-Fetch-Site: same-origin` 自动建立同源证据，兼容 HTTPS 反代终止 TLS 与后端 Host 改写；`cross-site` 始终拒绝，`same-site` 不整体信任兄弟子域。缺少同源 Fetch Metadata 时，严格解析 `Origin`（缺省时允许 `Referer` fallback），与实际请求 `Host` 的完整主机和端口比较，或匹配显式配置来源；缺失、`null`、畸形和重复来源均不因此获准。实时通知 WebSocket 升级复用同一规则并要求有效 Cookie 会话，不因 GET 而跳过来源检查。反代应保留浏览器来源头及原始 Host，不通过 `Forwarded`/`X-Forwarded-*` 自动扩展信任。CSRF token 只保存在前端内存，不进入 URL、日志或持久化存储。
 
 持久化任务队列的 worker payload/checkpoint 属于私有执行状态，不进入 REST、WebSocket、日志或审计。写入前限制为 64 KiB JSON 对象，并递归拒绝 Authorization、Cookie、password、secret、token、passkey、credential、签名 URL 与本地/绝对路径形态的字段。租约只持久化随机 token 的 SHA-256；所有 heartbeat、checkpoint 和完成操作都必须持有当前未过期 token。运行中暂停/取消先在短事务内持久化中断意图，事务提交后才通知 worker，且在 worker确认或租约过期前继续占用并发槽，避免非协作 worker 造成超卖。下载流水线取消必须二次确认并先调用 provider `Cancel(taskID, false)` 删除任务、保留文件；成功或明确 task-not-found 后才把 DownloadTask 与相关 Job 标记为 cancelled 并释放 Follow claim。终态删除默认也使用 `delete_data=false`，只有用户显式勾选完全删除才传 `true` 删除源/临时文件。provider 不可用、返回不确定错误或 ProviderTaskID 已存在但 Downloader 配置缺失时，必须保留本地记录；Submit 在取消后返回的迟到 provider ID 必须先持久化再用独立有界上下文清理，失败留下可诊断重试事实，不得仅为清空界面而伪造成功。
@@ -149,7 +151,10 @@ MediaLibrary 使用独立的 `media_libraries.read/create/update/delete/scan` �
 | administrator | 受保护系统角色，拥有 canonical permission catalog 全部能力 |
 | operator | 管理连接、存储目标、STRM 和刷新，不管理用户/角色/秘密导出 |
 | viewer | 只读状态和脱敏业务摘要 |
+| user（正常用户） | 发现、创建下载及追更，查看和控制自己的任务；不授予用户、角色、库或下载器管理权限 |
 | custom | 管理员从固定 permission code 中组合，支持多角色权限并集 |
+
+内置正常用户模板只在不存在 `user` code 时添加；已有同 code 自定义角色的权限、启用状态与用户分配全部保留，不因升级自动扩权。
 
 ### 5.2 权限粒度
 
