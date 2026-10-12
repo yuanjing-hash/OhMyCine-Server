@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { Fault, requireThat, originURL } from './policy.mjs';
 import { openBrowser } from './browser.mjs';
 import { validateCookies } from './cookies.mjs';
+import { STARTUP_CODES } from './startup.mjs';
 
 export const SESSION_TTL = 30 * 60_000;
 export function supportedPlatform(platform = process.platform, arch = process.arch) {
@@ -100,9 +101,10 @@ export class Runtime {
         const origin = originURL(input.origin);
         const cookies = validateCookies(input.cookies ?? [], origin);
         let browser;
-        try { browser = await this.opener(this.executablePath, origin, { cookies }); }
+        try { browser = await this.opener(this.executablePath, origin, { cookies, signal }); }
         catch (error) {
-          const codes = ['browser_launch_failed', 'browser_navigation_failed', 'network_denied', 'network_timeout'];
+          if (this.stopping || signal?.aborted) throw new Fault(this.stopping ? 'browser_stopping' : 'request_cancelled', 503);
+          const codes = [...STARTUP_CODES, 'browser_navigation_failed', 'network_denied', 'network_timeout'];
           this.runtimeError = error instanceof Fault && codes.includes(error.code) ? error.code : 'browser_launch_failed';
           this.state = 'launch_failed';
           throw new Fault(this.runtimeError, 503);

@@ -2,6 +2,7 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import QRCode from 'qrcode'
 import { api, APIError } from '@/api/client'
+import { resourceBrowserStartupError } from '@/browser-startup-errors'
 import { Permissions } from '@/auth/generated-permissions'
 import PluginSettingsForm from '@/components/PluginSettingsForm.vue'
 import PluginResourceLogin from '@/components/PluginResourceLogin.vue'
@@ -137,7 +138,7 @@ function resourceFailure(id: string, reason: unknown) {
       resource_browser_unavailable: 'Server 内置浏览器不可用。请先到系统设置 → 内置浏览器完成安装或检查运行依赖。',
       resource_browser_login_expired: '本次登录验证已过期，请重新输入账号密码。已保存的登录状态不会因此删除。',
     }
-    resourceLoginErrors.value = { ...resourceLoginErrors.value, [id]: reason instanceof APIError ? browserErrors[reason.errorCode] ?? message(reason) : message(reason) }
+    resourceLoginErrors.value = { ...resourceLoginErrors.value, [id]: reason instanceof APIError ? resourceBrowserStartupError(reason.errorCode) ?? browserErrors[reason.errorCode] ?? message(reason) : message(reason) }
   }
 }
 
@@ -438,7 +439,7 @@ async function pollConnectionAuth(plugin: InstalledPluginSummary, connection: Pl
   if (!current) return
   try {
     const response = await api<PluginAuthPollSummary>(pluginConnectionAuthPath(plugin.id, connection.id, 'poll'), { method: 'POST', body: JSON.stringify({ login_session: current.loginSession }) })
-    connectionAuth.value = { ...connectionAuth.value, [connection.id]: { ...current, state: response.state, accountName: response.account?.name } }
+    connectionAuth.value = { ...connectionAuth.value, [connection.id]: { ...current, state: response.state, accountName: response.account?.name, membership: response.account?.membership } }
     if (response.state === 'pending' || response.state === 'scanned') scheduleAuthPoll(plugin, connection, response.pollAfterSeconds ?? 2)
     else {
       authPollTimers.delete(connection.id)
@@ -839,6 +840,8 @@ onMounted(() => { void loadAll() })
                   :page="plugin.settings_page"
                   :credential-configured="connection.credential_configured"
                   :health-status="connection.health_status"
+                  :account-summary="connection.account"
+                  :account-checked-at="connection.account_checked_at"
                   :qr-auth-state="canManage ? connectionAuth[connection.id] : undefined"
                   :qr-auth-action-visible="canManage && Boolean(pluginQRCodeAuthScope(plugin))"
                   :qr-auth-action-disabled="connectionBusyID !== '' || !connection.enabled"
@@ -851,6 +854,8 @@ onMounted(() => { void loadAll() })
                   :page="plugin.settings_page"
                   :credential-configured="connection.credential_configured"
                   :health-status="connection.health_status"
+                  :account-summary="connection.account"
+                  :account-checked-at="connection.account_checked_at"
                   :qr-auth-state="canManage ? connectionAuth[connection.id] : undefined"
                   :qr-auth-action-visible="canManage && Boolean(pluginQRCodeAuthScope(plugin))"
                   :qr-auth-action-disabled="connectionBusyID !== '' || !connection.enabled"

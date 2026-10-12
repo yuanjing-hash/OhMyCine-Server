@@ -42,25 +42,26 @@ const (
 // Operation codes are part of the public runtime v1 ABI. Keep these values in
 // sync with plugin-sdk/src/runtime.ts and the cross-language fixture.
 var operationCodes = map[string]uint64{
-	"site.navigation":            1,
-	"site.feed":                  2,
-	"site.search":                3,
-	"site.detail":                4,
-	"media.playback":             5,
-	"media.download_plan":        6,
-	"site.history":               7,
-	"playback.progress_sync":     8,
-	"site.interaction":           9,
-	"site.auth.start":            10,
-	"site.auth.poll":             11,
-	"media.metadata":             12,
-	"library.artwork_candidates": 13,
-	"resource.search":            14,
-	"resource.resolve":           15,
-	"resource.health":            16,
-	"resource.auth.login":        17,
-	"resource.auth.captcha":      18,
-	"resource.auth.cookie":       19,
+	"site.navigation":             1,
+	"site.feed":                   2,
+	"site.search":                 3,
+	"site.detail":                 4,
+	"media.playback":              5,
+	"media.download_plan":         6,
+	"site.history":                7,
+	"playback.progress_sync":      8,
+	"site.interaction":            9,
+	"site.auth.start":             10,
+	"site.auth.poll":              11,
+	"media.metadata":              12,
+	"library.artwork_candidates":  13,
+	"resource.search":             14,
+	"resource.resolve":            15,
+	"resource.health":             16,
+	"resource.auth.login":         17,
+	"resource.auth.captcha":       18,
+	"resource.auth.cookie":        19,
+	"media.offline_download_plan": 20,
 }
 
 type Error struct {
@@ -79,10 +80,8 @@ func ErrorCode(err error) string {
 	return CodeUnavailable
 }
 
-// Host is the minimal first-generation WASM sandbox. It deliberately does not
-// instantiate WASI or any OhMyCine host module, so plugins have no filesystem,
-// network, environment, clock, randomness, credential or process capability.
-// Those APIs will be added individually behind Manifest permissions.
+// Host runs the versioned WASM sandbox without WASI. All external capabilities
+// pass through the permission-checked ohmycine Host bridge.
 type Host struct {
 	mu      sync.Mutex
 	runtime wazero.Runtime
@@ -100,6 +99,10 @@ type CapabilityHost interface {
 type runningModule struct {
 	module api.Module
 	mu     sync.Mutex
+	// Retain the exact validated bytes, never reread a mutable entry path when
+	// recovering a module closed by cancellation, a deadline or a guest trap.
+	source []byte
+	name   string
 }
 
 func NewHost(ctx context.Context) *Host {
@@ -133,13 +136,17 @@ func (host *Host) Start(ctx context.Context, pluginID, entryPath string, generat
 		return &Error{Code: CodeInvalidModule, Cause: errors.New("plugin runtime identity is invalid")}
 	}
 	name := fmt.Sprintf("%s@%d", pluginID, generation)
-	module, err := host.instantiate(ctx, entryPath, name, true)
+	source, err := os.ReadFile(entryPath)
+	if err != nil {
+		return &Error{Code: CodeInvalidModule, Cause: err}
+	}
+	module, err := host.instantiateBytes(ctx, source, name, true)
 	if err != nil {
 		return err
 	}
 	host.mu.Lock()
 	previous := host.modules[pluginID]
-	host.modules[pluginID] = &runningModule{module: module}
+	host.modules[pluginID] = &runningModule{module: module, source: source, name: name}
 	host.mu.Unlock()
 	if previous != nil {
 		_ = previous.module.Close(context.Background())
@@ -151,7 +158,7 @@ func (host *Host) Start(ctx context.Context, pluginID, entryPath string, generat
 // Inputs and outputs are copied at the sandbox boundary and never retain guest
 // memory. The packed i64 result uses the high 32 bits for pointer and low 32
 // bits for length, which is deterministic across SDK languages.
-func (host *Host) Invoke(ctx context.Context, pluginID, operation string, request []byte) ([]byte, error) {
+func (host *Host) Invoke(ctx context.Context, pluginID, operation string, request []byte) (output []byte, invokeError error) {
 	code, ok := operationCodes[operation]
 	if !ok {
 		return nil, &Error{Code: CodeOperationInvalid, Cause: errors.New("unknown plugin operation")}
@@ -165,8 +172,41 @@ func (host *Host) Invoke(ctx context.Context, pluginID, operation string, reques
 	if running == nil {
 		return nil, &Error{Code: CodeUnavailable, Cause: errors.New("plugin is not running")}
 	}
+	return host.invokeRunning(ctx, pluginID, operation, code, request, running)
+}
+
+func (host *Host) invokeRunning(ctx context.Context, pluginID, operation string, code uint64, request []byte, running *runningModule) (output []byte, invokeError error) {
 	running.mu.Lock()
 	defer running.mu.Unlock()
+	// A request can be cancelled while another call owns the guest. Passing its
+	// cancelled context into alloc would close an otherwise healthy module.
+	if err := ctx.Err(); err != nil {
+		return nil, callError(ctx, CodeResponseInvalid, err)
+	}
+	host.mu.Lock()
+	active := host.modules[pluginID] == running
+	host.mu.Unlock()
+	if !active {
+		return nil, &Error{Code: CodeUnavailable, Cause: errors.New("plugin is no longer running")}
+	}
+	if running.module.IsClosed() {
+		// Do not replay a failed invocation: it may already have written storage
+		// or credentials. A new request gets a fresh sandbox from pinned bytes.
+		module, err := host.instantiateBytes(ctx, running.source, running.name, true)
+		if err != nil {
+			return nil, err
+		}
+		host.mu.Lock()
+		active = host.modules[pluginID] == running
+		if active {
+			running.module = module
+		}
+		host.mu.Unlock()
+		if !active {
+			_ = module.Close(context.Background())
+			return nil, &Error{Code: CodeUnavailable, Cause: errors.New("plugin was stopped during recovery")}
+		}
+	}
 	module := running.module
 	allocate := module.ExportedFunction("omc_alloc")
 	invoke := module.ExportedFunction("omc_invoke")
@@ -174,6 +214,13 @@ func (host *Host) Invoke(ctx context.Context, pluginID, operation string, reques
 	if allocate == nil || invoke == nil {
 		return nil, &Error{Code: CodeCapabilityDenied, Cause: errors.New("plugin does not expose the invocation ABI")}
 	}
+	defer func() {
+		if invokeError != nil {
+			// A trap or invalid output can leave guest allocations outstanding.
+			// Dispose that heap; only the next request may rebuild it.
+			_ = module.Close(context.Background())
+		}
+	}()
 	callContext, cancel := context.WithTimeout(ctx, operationTimeout(operation))
 	defer cancel()
 	allocated, err := allocate.Call(callContext, uint64(len(request)))
@@ -198,15 +245,31 @@ func (host *Host) Invoke(ctx context.Context, pluginID, operation string, reques
 	}
 	copied := append([]byte(nil), response...)
 	if free != nil {
-		_, _ = free.Call(callContext, uint64(responsePointer), uint64(responseLength))
+		// A disconnected caller must not kill a healthy guest while releasing
+		// buffers after successful execution. Cleanup has its own short CPU cap.
+		cleanupContext, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), defaultCallTimeout)
+		defer cleanupCancel()
+		if _, err := free.Call(cleanupContext, uint64(responsePointer), uint64(responseLength)); err != nil {
+			return nil, callError(cleanupContext, CodeResponseInvalid, err)
+		}
 		if responsePointer != pointer || responseLength != uint32(len(request)) {
-			_, _ = free.Call(callContext, uint64(pointer), uint64(len(request)))
+			if _, err := free.Call(cleanupContext, uint64(pointer), uint64(len(request))); err != nil {
+				return nil, callError(cleanupContext, CodeResponseInvalid, err)
+			}
 		}
 	}
 	return copied, nil
 }
 
 func operationTimeout(operation string) time.Duration {
+	if operation == "site.auth.poll" || operation == "site.detail" || operation == "site.navigation" || operation == "site.feed" || operation == "site.search" || operation == "library.artwork_candidates" || operation == "media.metadata" || operation == "media.playback" || operation == "media.offline_download_plan" {
+		// Account confirmation and exact representation resolution can require
+		// several sequential control requests. Each Host HTTP call stays bounded.
+		return 45 * time.Second
+	}
+	if strings.HasPrefix(operation, "site.") {
+		return resourceCallTimeout
+	}
 	if operation == "resource.auth.login" || operation == "resource.auth.captcha" {
 		// Login can bootstrap a form, submit credentials and fetch a challenge.
 		// Each Host request retains its 15-second cap; bound the whole sequence.
@@ -253,6 +316,10 @@ func (host *Host) instantiate(ctx context.Context, entryPath, name string, start
 	if err != nil {
 		return nil, &Error{Code: CodeInvalidModule, Cause: err}
 	}
+	return host.instantiateBytes(ctx, wasm, name, start)
+}
+
+func (host *Host) instantiateBytes(ctx context.Context, wasm []byte, name string, start bool) (api.Module, error) {
 	callContext, cancel := context.WithTimeout(ctx, defaultCallTimeout)
 	defer cancel()
 	compiled, err := host.runtime.CompileModule(callContext, wasm)

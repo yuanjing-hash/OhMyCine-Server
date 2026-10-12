@@ -80,10 +80,12 @@ const manualSearching = ref(false)
 const manualSaving = ref(false)
 let searchGeneration = 0
 const searchRequests = new Map<number, AbortController>()
+const failedSearchSiteIDs = new Set<number>()
 function cancelSearchRequests() {
   searchGeneration++
   for (const request of searchRequests.values()) request.abort()
   searchRequests.clear()
+  failedSearchSiteIDs.clear()
 }
 let source: EventSource | null = null
 let streamTimeout: number | undefined
@@ -123,7 +125,8 @@ const resultSort = ref<'seeders' | 'published' | 'size'>(lockedSiteID.value ? 'p
 const resultDirection = ref<TorrentResultDirection>('desc')
 
 const orderedGroups = computed(() => [...groups.value].sort((left, right) => left.site_id - right.site_id))
-const failedGroups = computed(() => orderedGroups.value.filter(group => group.status === 'error'))
+function siteIsRunning(siteID: number) { return searchProgress.value?.site_id === siteID && searchProgress.value.site_status === 'running' }
+const failedGroups = computed(() => orderedGroups.value.filter(group => group.status === 'error' && !siteIsRunning(group.site_id)))
 const searchProgressPercent = computed(() => {
   const progress = searchProgress.value
   if (!progress?.total) return 0
@@ -205,26 +208,75 @@ function stopStream() {
   streamTimeout = undefined
 }
 
+function cancelSearch() {
+  const hadJSONRequest = searchRequests.size > 0
+  const siteID = searchProgress.value?.site_id
+  cancelSearchRequests()
+  stopStream()
+  searching.value = false
+  if (hadJSONRequest) updateJSONProgress(siteID)
+  if (searchProgress.value) searchProgress.value = { ...searchProgress.value, pending: 0, running: 0, site_status: 'cancelled' }
+}
+
+function updateJSONProgress(siteID?: number) {
+  const siteIDs = lockedSiteID.value ? [lockedSiteID.value] : activeSearchSiteIDs.value
+  const runningSites = new Set([...searchRequests.keys()].flatMap(id => id ? [id] : siteIDs))
+  const bySite = new Map(groups.value.map(group => [group.site_id, group]))
+  const terminalSites = siteIDs.filter(id => !runningSites.has(id))
+  const failed = terminalSites.filter(id => failedSearchSiteIDs.has(id) || bySite.get(id)?.status === 'error').length
+  const succeeded = terminalSites.filter(id => !failedSearchSiteIDs.has(id) && bySite.get(id)?.status === 'success').length
+  const running = siteIDs.filter(id => runningSites.has(id)).length
+  const group = siteID ? bySite.get(siteID) : undefined
+  searchProgress.value = {
+    total: siteIDs.length,
+    pending: siteIDs.length - running - succeeded - failed,
+    running,
+    completed: succeeded + failed,
+    succeeded,
+    failed,
+    result_count: siteIDs.reduce((total, id) => total + (bySite.get(id)?.items.length ?? 0), 0),
+    site_id: siteID,
+    site_name: siteID ? group?.site_name ?? lockedSite.value?.name ?? siteOptions.value.find(site => site.id === siteID)?.name : undefined,
+    site_status: siteID ? runningSites.has(siteID) ? 'running' : failedSearchSiteIDs.has(siteID) ? 'error' : group?.status : undefined,
+    error_code: group?.error_code,
+  }
+}
+
 async function searchJSON(siteID?: number, page = 1) {
   const run = searchGeneration
   const key = lockedSiteID.value ?? siteID ?? 0
+  const siteIDs = key ? [key] : [...activeSearchSiteIDs.value]
   searchRequests.get(key)?.abort()
   const controller = new AbortController()
   searchRequests.set(key, controller)
+  for (const id of siteIDs) failedSearchSiteIDs.delete(id)
+  searchError.value = ''
+  searching.value = true
+  updateJSONProgress(key || undefined)
+  const isCurrent = () => !controller.signal.aborted && run === searchGeneration && searchRequests.get(key) === controller
   try {
     const identity = trustedIdentity.value
     const path = identity
       ? mediaIdentitySearchURL(identity.mediaType, identity.tmdbID, { page, siteID: lockedSiteID.value ?? siteID, siteIDs: lockedSiteID.value || siteID ? undefined : activeSearchSiteIDs.value })
       : torrentSearchURL(torrentSearchPath, searchInput(siteID, page))
     const response = await api<TorrentSearchResponse & { query_names?: DiscoverySearchName[] }>(path, { signal: controller.signal })
-    if (controller.signal.aborted || run !== searchGeneration) return
+    if (!isCurrent()) return
+    const returnedSiteIDs = new Set(response.groups.map(group => group.site_id))
+    if (response.groups.length !== siteIDs.length || returnedSiteIDs.size !== siteIDs.length || siteIDs.some(id => !returnedSiteIDs.has(id))) throw new Error('站点搜索结果不完整，请重试')
     identityNames.value = response.query_names ?? identityNames.value
     for (const group of response.groups) groups.value = upsertTorrentGroup(groups.value, group)
     searched.value = true
-  } catch (reason) { if (!controller.signal.aborted && run === searchGeneration) searchError.value = message(reason) }
+  } catch (reason) {
+    if (!isCurrent()) return
+    for (const id of siteIDs) failedSearchSiteIDs.add(id)
+    searchError.value = message(reason)
+  }
   finally {
-    if (searchRequests.get(key) === controller) searchRequests.delete(key)
-    if (run === searchGeneration) searching.value = searchRequests.size > 0
+    if (isCurrent()) {
+      searchRequests.delete(key)
+      updateJSONProgress(key || undefined)
+      searching.value = source !== null || searchRequests.size > 0
+    }
   }
 }
 
@@ -335,22 +387,8 @@ function executeSearch(siteIDs: number[]) {
   }, identity ? 120_000 : 30_000)
 }
 
-async function retrySite(group: TorrentSearchGroup) {
-  searching.value = true
-  searchError.value = ''
-  await searchJSON(group.site_id, 1)
-  const failed = groups.value.filter(item => item.status === 'error').length
-  if (searchProgress.value) {
-    searchProgress.value = {
-      ...searchProgress.value,
-      failed,
-      succeeded: Math.max(0, searchProgress.value.completed - failed),
-      result_count: groups.value.reduce((total, item) => total + item.items.length, 0),
-      site_id: group.site_id,
-      site_name: group.site_name,
-      site_status: groups.value.find(item => item.site_id === group.site_id)?.status,
-    }
-  }
+function retrySite(group: TorrentSearchGroup) {
+  void searchJSON(group.site_id, 1)
 }
 
 async function nextPage(group: TorrentSearchGroup) {
@@ -617,7 +655,7 @@ onBeforeUnmount(() => {
       <section v-if="searchProgress" class="panel" aria-live="polite">
         <div class="flex flex-wrap items-center justify-between gap-3">
           <div><strong>站点搜索进度 {{ searchProgress.completed }} / {{ searchProgress.total }}</strong><p class="text-subtle mb-0 mt-1 text-xs">等待 {{ searchProgress.pending }} · 正在搜索 {{ searchProgress.running }} · 成功 {{ searchProgress.succeeded }} · 失败 {{ searchProgress.failed }} · 已发现 {{ searchProgress.result_count }}</p></div>
-          <button v-if="searching" class="btn-secondary" type="button" @click="stopStream(); searching = false">取消搜索</button>
+          <button v-if="searching" class="btn-secondary" type="button" @click="cancelSearch">取消搜索</button>
         </div>
         <div class="mt-3 h-2 overflow-hidden rounded-full bg-[var(--surface-subtle)]" role="progressbar" :aria-valuemin="0" :aria-valuemax="searchProgress.total" :aria-valuenow="searchProgress.completed">
           <div class="h-full rounded-full bg-[var(--accent)] transition-[width] duration-200" :style="{ width: `${searchProgressPercent}%` }"></div>
@@ -644,7 +682,7 @@ onBeforeUnmount(() => {
           <p class="text-subtle mb-0 text-xs xl:col-span-2">不同筛选项之间为 AND；同类标签按任一匹配。排序只针对已经取回的当前页结果。</p>
         </form>
 
-        <div v-if="activeGroup?.status === 'error'" class="semantic-warning flex flex-wrap items-center justify-between gap-3 p-4"><span>{{ activeGroup.site_name }} 暂时不可用（{{ activeGroup.error_code || 'site_unavailable' }}）。</span><button class="btn-secondary" :disabled="searching" @click="retrySite(activeGroup)">重试此站</button></div>
+        <div v-if="activeGroup?.status === 'error' && !siteIsRunning(activeGroup.site_id)" class="semantic-warning flex flex-wrap items-center justify-between gap-3 p-4"><span>{{ activeGroup.site_name }} 暂时不可用（{{ activeGroup.error_code || 'site_unavailable' }}）。</span><button class="btn-secondary" :disabled="searching" @click="retrySite(activeGroup)">重试此站</button></div>
         <div v-if="!visibleResults.length" class="panel py-10 text-center text-muted">当前渠道和筛选条件下没有结果。</div>
         <div v-else class="grid gap-4 xl:grid-cols-2">
           <article v-for="entry in visibleResults" :key="entry.item.token" class="panel flex min-h-72 flex-col">

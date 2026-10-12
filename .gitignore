@@ -3,6 +3,7 @@
 /webui/dist/
 /webui/node_modules/
 /dist/
+/build/mgtv-preview/
 **/__pycache__/
 **/*.pyc
 /server

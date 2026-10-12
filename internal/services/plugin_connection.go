@@ -13,9 +13,11 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/authz"
+	serverlog "github.com/yuanjing-hash/OhMyCine-Server/internal/logging"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/plugins/contract"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/plugins/hostapi"
+	pluginruntime "github.com/yuanjing-hash/OhMyCine-Server/internal/plugins/runtime"
 	"gorm.io/gorm"
 )
 
@@ -24,23 +26,25 @@ const maxPluginConnectionConfigBytes = 64 * 1024
 var sensitiveConfigKey = regexp.MustCompile(`(?i)(password|secret|token|cookie|authorization|api[_-]?key|passkey|credential)`)
 
 type PluginConnectionSummary struct {
-	ID                   string          `json:"id"`
-	PluginID             string          `json:"plugin_id"`
-	Name                 string          `json:"name"`
-	Config               json.RawMessage `json:"config"`
-	CredentialScope      string          `json:"credential_scope"`
-	CredentialMode       string          `json:"credential_mode"`
-	CredentialConfigured bool            `json:"credential_configured"`
-	ResourceType         string          `json:"resource_type,omitempty"`
-	EntryOrigin          string          `json:"entry_origin,omitempty"`
-	LoginAccountLabel    string          `json:"login_account_label,omitempty"`
-	Enabled              bool            `json:"enabled"`
-	HealthStatus         string          `json:"health_status"`
-	HealthErrorCode      string          `json:"health_error_code,omitempty"`
-	HealthCheckedAt      *time.Time      `json:"health_checked_at,omitempty"`
-	Revision             uint64          `json:"revision"`
-	CreatedAt            time.Time       `json:"created_at"`
-	UpdatedAt            time.Time       `json:"updated_at"`
+	ID                   string                `json:"id"`
+	PluginID             string                `json:"plugin_id"`
+	Name                 string                `json:"name"`
+	Config               json.RawMessage       `json:"config"`
+	CredentialScope      string                `json:"credential_scope"`
+	CredentialMode       string                `json:"credential_mode"`
+	CredentialConfigured bool                  `json:"credential_configured"`
+	ResourceType         string                `json:"resource_type,omitempty"`
+	EntryOrigin          string                `json:"entry_origin,omitempty"`
+	LoginAccountLabel    string                `json:"login_account_label,omitempty"`
+	Account              *PluginAccountSummary `json:"account,omitempty"`
+	AccountCheckedAt     *time.Time            `json:"account_checked_at,omitempty"`
+	Enabled              bool                  `json:"enabled"`
+	HealthStatus         string                `json:"health_status"`
+	HealthErrorCode      string                `json:"health_error_code,omitempty"`
+	HealthCheckedAt      *time.Time            `json:"health_checked_at,omitempty"`
+	Revision             uint64                `json:"revision"`
+	CreatedAt            time.Time             `json:"created_at"`
+	UpdatedAt            time.Time             `json:"updated_at"`
 }
 
 type CreatePluginConnectionInput struct {
@@ -71,16 +75,43 @@ type PluginAuthStartSummary struct {
 }
 
 type PluginAccountSummary struct {
-	ID        string `json:"id"`
-	Name      string `json:"name"`
-	AvatarURL string `json:"avatarUrl,omitempty"`
+	ID         string                   `json:"id"`
+	Name       string                   `json:"name"`
+	AvatarURL  string                   `json:"avatarUrl,omitempty"`
+	Membership *PluginMembershipSummary `json:"membership,omitempty"`
+}
+
+type PluginMembershipSummary struct {
+	Status    string `json:"status"`
+	Label     string `json:"label,omitempty"`
+	ExpiresAt string `json:"expiresAt,omitempty"`
+}
+
+func validMembershipSummary(summary *PluginMembershipSummary) bool {
+	if summary == nil {
+		return true
+	}
+	if summary.Status != "active" && summary.Status != "inactive" && summary.Status != "unknown" {
+		return false
+	}
+	if !safeOptionalOnlineText(summary.Label, 128) {
+		return false
+	}
+	if summary.ExpiresAt != "" {
+		value, err := time.Parse(time.RFC3339, summary.ExpiresAt)
+		if err != nil || value.Year() < 2000 || value.Year() > 2200 {
+			return false
+		}
+	}
+	return true
 }
 
 type PluginAuthPollSummary struct {
-	State            string                `json:"state"`
-	Authenticated    bool                  `json:"authenticated"`
-	Account          *PluginAccountSummary `json:"account,omitempty"`
-	PollAfterSeconds int                   `json:"pollAfterSeconds,omitempty"`
+	State             string                `json:"state"`
+	Authenticated     bool                  `json:"authenticated"`
+	Account           *PluginAccountSummary `json:"account,omitempty"`
+	PollAfterSeconds  int                   `json:"pollAfterSeconds,omitempty"`
+	CredentialVersion *uint64               `json:"credentialVersion,omitempty"`
 }
 
 func (s *PluginRepositoryService) ListConnections(actor Actor, pluginID string) ([]PluginConnectionSummary, error) {
@@ -213,6 +244,9 @@ func (s *PluginRepositoryService) UpdateConnection(actor Actor, pluginID, connec
 	}
 	entryChanged := resourceType != "" && entryOrigin != current.EntryOrigin
 	updates := map[string]any{"name": name, "config_json": string(config), "credential_scope": scope, "credential_mode": mode, "resource_type": resourceType, "entry_origin": entryOrigin, "revision": input.Revision + 1, "updated_at": time.Now().UTC()}
+	if entryChanged || input.ClearCredential || input.Credential != nil || mode != current.CredentialMode || scope != current.CredentialScope {
+		updates["account_summary_json"], updates["account_checked_at"], updates["login_account_label"] = "", nil, ""
+	}
 	if input.Enabled != nil {
 		updates["enabled"] = *input.Enabled
 	}
@@ -319,7 +353,7 @@ func (s *PluginRepositoryService) StartConnectionAuth(ctx context.Context, actor
 	if err != nil {
 		return PluginAuthStartSummary{}, err
 	}
-	raw, err := s.invokePluginOperation(ctx, connection.ID, "site.auth.start", contract.CapabilitySiteInteraction, map[string]any{"connectionId": connection.ID})
+	raw, err := s.invokePluginOperation(ctx, connection.ID, "site.auth.start", pluginAuthCapability(manifest), map[string]any{"connectionId": connection.ID})
 	if err != nil {
 		return PluginAuthStartSummary{}, err
 	}
@@ -344,11 +378,11 @@ func (s *PluginRepositoryService) PollConnectionAuth(ctx context.Context, actor 
 	if !safeOnlineText(loginSession, 512) {
 		return PluginAuthPollSummary{}, appError(CodeInvalidRequest, "插件登录会话无效", nil)
 	}
-	connection, _, err := s.authConnection(pluginID, connectionID)
+	connection, manifest, err := s.authConnection(pluginID, connectionID)
 	if err != nil {
 		return PluginAuthPollSummary{}, err
 	}
-	raw, err := s.invokePluginOperation(ctx, connection.ID, "site.auth.poll", contract.CapabilitySiteInteraction, map[string]any{"connectionId": connection.ID, "loginSession": loginSession})
+	raw, err := s.invokePluginOperation(ctx, connection.ID, "site.auth.poll", pluginAuthCapability(manifest), map[string]any{"connectionId": connection.ID, "loginSession": loginSession})
 	if err != nil {
 		s.recordPluginConnectionHealth(connection.ID, "error", CodePluginOnlineLibraryUnavailable)
 		return PluginAuthPollSummary{}, err
@@ -364,10 +398,28 @@ func (s *PluginRepositoryService) PollConnectionAuth(ctx context.Context, actor 
 		}
 		s.recordPluginConnectionHealth(connection.ID, "auth_pending", "")
 	case "confirmed":
-		if !response.Authenticated || response.Account == nil || !safeOnlineText(response.Account.ID, 256) || !safeOnlineText(response.Account.Name, 256) || !safeOptionalHTTPSURL(response.Account.AvatarURL) {
+		if !response.Authenticated || response.Account == nil || !safeOnlineText(response.Account.ID, 256) || !safeOnlineText(response.Account.Name, 256) || !safeOptionalHTTPSURL(response.Account.AvatarURL) || !validMembershipSummary(response.Account.Membership) {
 			return PluginAuthPollSummary{}, appError(CodePluginResponseInvalid, "插件登录响应无效", nil)
 		}
-		s.recordPluginConnectionHealth(connection.ID, "healthy", "")
+		if manifestHasCapability(manifest, contract.CapabilitySiteAuth) && (response.CredentialVersion == nil || *response.CredentialVersion == 0) {
+			return PluginAuthPollSummary{}, appError(CodePluginResponseInvalid, "插件登录响应缺少凭据版本", nil)
+		}
+		// Persist only a bounded last-observed display snapshot, never authority.
+		storedAccount := *response.Account
+		storedAccount.AvatarURL = ""
+		accountJSON, _ := json.Marshal(storedAccount)
+		query := s.db.Model(&models.PluginConnection{}).Where("id = ? AND plugin_id = ? AND enabled = ?", connection.ID, pluginID, true)
+		if response.CredentialVersion != nil {
+			query = query.Where("credential_version = ?", *response.CredentialVersion)
+		}
+		observed := time.Now().UTC()
+		updated := query.Updates(map[string]any{"login_account_label": response.Account.Name, "account_summary_json": string(accountJSON), "account_checked_at": observed, "last_health_status": "healthy", "last_health_error_code": "", "last_health_checked_at": observed})
+		if updated.Error != nil {
+			return PluginAuthPollSummary{}, appError(CodeInternalError, "保存账号摘要失败", nil)
+		}
+		if updated.RowsAffected != 1 {
+			return PluginAuthPollSummary{}, appError(CodeConflict, "登录凭据已更新，请重新确认账号", nil)
+		}
 	case "expired":
 		if response.Authenticated || response.Account != nil {
 			return PluginAuthPollSummary{}, appError(CodePluginResponseInvalid, "插件登录响应无效", nil)
@@ -388,10 +440,17 @@ func (s *PluginRepositoryService) authConnection(pluginID, connectionID string) 
 	if err != nil {
 		return models.PluginConnection{}, contract.Manifest{}, err
 	}
-	if !manifestHasCapability(manifest, contract.CapabilitySiteInteraction) || connection.CredentialMode != models.PluginCredentialModeCookie || connection.CredentialScope == "" || !manifestHasCredentialScope(manifest, connection.CredentialScope) {
+	if (!manifestHasCapability(manifest, contract.CapabilitySiteAuth) && !manifestHasCapability(manifest, contract.CapabilitySiteInteraction)) || connection.CredentialMode != models.PluginCredentialModeCookie || connection.CredentialScope == "" || !manifestHasCredentialScope(manifest, connection.CredentialScope) {
 		return models.PluginConnection{}, contract.Manifest{}, appError(CodePermissionDenied, "插件连接不支持安全登录", nil)
 	}
 	return connection, manifest, nil
+}
+
+func pluginAuthCapability(manifest contract.Manifest) contract.Capability {
+	if manifestHasCapability(manifest, contract.CapabilitySiteAuth) {
+		return contract.CapabilitySiteAuth
+	}
+	return contract.CapabilitySiteInteraction
 }
 
 func (s *PluginRepositoryService) recordPluginConnectionHealth(connectionID, status, errorCode string) {
@@ -415,6 +474,12 @@ func strictPluginResponse(raw []byte, destination any) error {
 func pluginAuthResponseError(raw []byte, cause error) error {
 	var envelope pluginErrorEnvelope
 	if json.Unmarshal(raw, &envelope) == nil && envelope.PluginError != nil {
+		if strings.TrimSpace(envelope.PluginError.Code) == "permission-denied" {
+			// The plugin text is untrusted. A denied Host call may be caused by
+			// permissions, ownership or DNS policy; never assert a single cause
+			// or forward provider diagnostics/addresses in the client message.
+			return appError(CodePermissionDenied, "插件登录访问被拒绝，请检查插件权限、域名授权，以及 DNS 是否解析到私网或代理 fake-IP", nil)
+		}
 		return appError(CodePluginOnlineLibraryUnavailable, "插件登录服务暂时不可用", nil)
 	}
 	return appError(CodePluginResponseInvalid, "插件登录响应无效", cause)
@@ -479,6 +544,13 @@ func (s *PluginRepositoryService) invokePluginOperation(ctx context.Context, con
 	}
 	response, err := s.runtime.Invoke(ctx, connection.PluginID, operation, payload)
 	if err != nil {
+		// Log only Server-owned stable codes and declared identity/operation.
+		// Causes, guest output, request bodies and provider URLs can hold secrets.
+		serverlog.OperationPluginRuntime.Event(s.log.Warn()).
+			Str("plugin_id", safeLabel(connection.PluginID, 128)).
+			Str("operation", safeLabel(operation, 128)).
+			Str("error_code", pluginruntime.ErrorCode(err)).
+			Msg("插件调用失败")
 		return nil, appError(CodePluginRuntimeUnavailable, "插件调用失败", err)
 	}
 	return response, nil
@@ -646,7 +718,22 @@ func manifestHasCapability(manifest contract.Manifest, capability contract.Capab
 }
 
 func pluginConnectionSummary(record models.PluginConnection) PluginConnectionSummary {
-	return PluginConnectionSummary{ID: record.ID, PluginID: record.PluginID, Name: record.Name, Config: json.RawMessage(record.ConfigJSON), CredentialScope: record.CredentialScope, CredentialMode: record.CredentialMode, CredentialConfigured: record.CredentialCiphertext != "", ResourceType: record.ResourceType, EntryOrigin: record.EntryOrigin, LoginAccountLabel: record.LoginAccountLabel, Enabled: record.Enabled, HealthStatus: record.LastHealthStatus, HealthErrorCode: record.LastHealthErrorCode, HealthCheckedAt: record.LastHealthCheckedAt, Revision: record.Revision, CreatedAt: record.CreatedAt, UpdatedAt: record.UpdatedAt}
+	result := PluginConnectionSummary{ID: record.ID, PluginID: record.PluginID, Name: record.Name, Config: json.RawMessage(record.ConfigJSON), CredentialScope: record.CredentialScope, CredentialMode: record.CredentialMode, CredentialConfigured: record.CredentialCiphertext != "", ResourceType: record.ResourceType, EntryOrigin: record.EntryOrigin, LoginAccountLabel: record.LoginAccountLabel, Enabled: record.Enabled, HealthStatus: record.LastHealthStatus, HealthErrorCode: record.LastHealthErrorCode, HealthCheckedAt: record.LastHealthCheckedAt, Revision: record.Revision, CreatedAt: record.CreatedAt, UpdatedAt: record.UpdatedAt}
+	var account PluginAccountSummary
+	if len(record.AccountSummaryJSON) <= 2048 && record.AccountCheckedAt != nil && strictPluginResponse([]byte(record.AccountSummaryJSON), &account) == nil && safeOnlineText(account.ID, 256) && safeOnlineText(account.Name, 256) && safeOptionalHTTPSURL(account.AvatarURL) && validMembershipSummary(account.Membership) {
+		result.Account, result.AccountCheckedAt = &account, record.AccountCheckedAt
+		if account.Membership != nil {
+			stale := time.Since(*record.AccountCheckedAt) > 24*time.Hour || record.LastHealthStatus != "healthy" || record.CredentialCiphertext == ""
+			if account.Membership.ExpiresAt != "" {
+				expires, _ := time.Parse(time.RFC3339, account.Membership.ExpiresAt)
+				stale = stale || !expires.After(time.Now().UTC())
+			}
+			if stale {
+				account.Membership = &PluginMembershipSummary{Status: "unknown", Label: "会员状态需要重新确认"}
+			}
+		}
+	}
+	return result
 }
 
 func pluginConnectionNotFound(err error) error {

@@ -216,3 +216,33 @@ test('launch failure preserves installation but status reports failure and allow
   fail = false; await runtime.dispatch('/v1/session/create', input);
   assert.equal(runtime.status().state, 'ready'); assert.equal(runtime.status().runtimeError, '');
 });
+
+test('finite startup reasons survive Runtime and status polling never retries', async t => {
+  for (const code of ['browser_sandbox_unavailable', 'browser_dependencies_missing', 'browser_executable_unavailable', 'browser_launch_timeout', 'browser_profile_unavailable']) {
+    let opened = 0;
+    const runtime = await fixture(t, { opener: async () => { opened++; throw new Fault(code); } });
+    runtime.state = 'ready'; runtime.executablePath = '/synthetic';
+    const input = { identity: 'owner', origin: 'https://example.com' };
+    await assert.rejects(runtime.dispatch('/v1/session/create', input), error => error.code === code && error.message === code);
+    for (let i = 0; i < 3; i++) {
+      const status = await runtime.dispatch('/v1/status', {});
+      assert.equal(status.runtimeError, code); assert.equal(status.installed, true); assert.equal(status.state, 'launch_failed');
+    }
+    assert.equal(opened, 1); assert.equal(runtime.session, null);
+    runtime.opener = async () => ({ close: async () => {} });
+    await runtime.dispatch('/v1/session/create', input);
+    assert.equal(runtime.status().runtimeError, '');
+  }
+});
+
+test('cancelled failing launch does not replace component health with a launch error', async t => {
+  let rejectOpen;
+  const runtime = await fixture(t, { opener: () => new Promise((_, reject) => { rejectOpen = reject; }) });
+  runtime.state = 'ready';
+  const controller = new AbortController();
+  const pending = runtime.dispatch('/v1/session/create', { identity: 'owner', origin: 'https://example.com' }, { signal: controller.signal });
+  await Promise.resolve(); controller.abort(); rejectOpen(new Fault('browser_sandbox_unavailable'));
+  await assert.rejects(pending, /^Error: request_cancelled$/);
+  assert.equal(runtime.status().state, 'ready'); assert.equal(runtime.status().runtimeError, '');
+  assert.equal(runtime.busy, false); assert.equal(runtime.session, null);
+});

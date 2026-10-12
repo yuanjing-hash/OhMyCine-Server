@@ -16,7 +16,11 @@ OhMyCine 分发自己的 companion 源码及固定版本依赖声明，不在 Gi
 
 主 Server 镜像包含 Node.js 22、companion 的锁定依赖、Linux 浏览器共享库及中日韩字体，支持 amd64/arm64。无需另设 companion 容器或填写服务地址。`compose.server.yml` 配置 init 进程和 256 MiB 共享内存，浏览器端口不对外公开。
 
-浏览器缓存保存在 `server-state` 卷中的 `/var/lib/ohmycine/browser`。容器使用非 root 用户，保留浏览器 sandbox；不要用 privileged 或关闭 sandbox 来处理启动失败。宿主机若限制非特权用户命名空间，需先核实平台安全配置，产品应显示组件启动失败而非声称登录失效。
+浏览器组件缓存保存在持久挂载中的 `/var/lib/ohmycine/browser`。每次 Linux 浏览器会话另外创建独立的 0700 临时 HOME、XDG 配置和缓存目录，不读取宿主机或管理员的浏览器配置；关闭、启动失败、导航失败和取消后清理。临时目录需要可写空间，持久组件缓存和加密登录 Cookie 不会随该清理删除。
+
+容器使用非 root 用户，保留 Chromium sandbox。完整 Server 下载归档内的 `deploy/compose.server.yml` 必须与同一发行版的 `deploy/seccomp/` 目录一起保存；Compose 引用邻接的 `seccomp/browser.json`。完整策略以固定 Moby 默认策略为基线，只为 amd64/arm64 的 Chromium 用户、PID 和网络命名空间 clone，以及 `unshare(CLONE_NEWUSER)` 增加参数受限权限。其他默认拒绝及条件规则保留，不增加 capability，不使用 privileged、SYS_ADMIN、seccomp=unconfined、host IPC 或关闭 sandbox。来源、基线哈希和差异见 [浏览器 seccomp 策略](./browser-seccomp.md)。
+
+已有容器只拉取新版镜像不会更新它的 Compose 或 seccomp 设置。先备份当前 Compose，将同版完整 `deploy/seccomp/` 放到 Compose 邻接目录，加入 `security_opt: ["seccomp=./seccomp/browser.json"]`，核对原有端口、数据、媒体和下载挂载后，再由管理员明确执行服务重建。保留原有数据、加密密钥和浏览器组件缓存。Docker profile 是容器创建参数，无法在运行中的旧容器里通过“检查组件状态”改变。OhMyCine 不会自动修改主机 sysctl/AppArmor 或重建服务；宿主机仍禁止非特权用户命名空间时，需要管理员核实平台策略，页面显示“沙箱不可用”，不能声称登录失效。
 
 公开镜像构建验证不下载安装浏览器。实际浏览器启动、人工验证和登录验收仍需要在接受许可后完成，不能以普通容器健康检查替代。
 
@@ -64,3 +68,18 @@ Linux 还需要与 Dockerfile 一致的 Chromium 共享库和字体。此步骤�
 ## 更新限制
 
 当前程序内自更新只替换 Go 可执行文件，**不会同步 companion 源码及其 npm 依赖**。需要浏览器组件变更时，归档部署必须手动更新完整发行目录并重新执行上述 npm 命令；保留数据、配置、密钥和缓存。Docker 使用更新后的完整镜像。Windows 全自动运行时分发及多组件原子更新仍待补齐，不能把单文件自更新宣称为浏览器组件也已升级。
+
+## 启动诊断
+
+“检查组件状态”只读取安装元数据和最近的运行失败，不启动浏览器，不请求站点，也不会清空已知失败。修正部署后重新提交插件登录才会尝试启动。启动成功并打开页面后清除本次启动错误；组件已安装、浏览器能启动和账号登录成功是分别验证的状态。
+
+| 安全原因 | 处理方向 |
+| --- | --- |
+| 沙箱不可用 | 核对配套 Docker seccomp 和宿主机用户命名空间支持 |
+| 私有临时目录不可用 | 核对 Server 临时目录可写权限及可用空间 |
+| 缺少运行依赖 | 更新完整目录或镜像，核对 Node、包装依赖和共享库 |
+| 浏览器文件不可执行 | 核对已取得组件的文件及执行权限 |
+| 启动超时 | 核对 Server 资源后明确重试登录 |
+| 未识别的启动失败 | 检查完整安装与运行环境；不会返回原始浏览器日志 |
+
+分类仅在内存中识别有限的启动特征。API、组件状态和 UI 不保存或展示原始异常、argv、文件路径、代理、页面 URL 或 Cookie；普通“Operation not permitted”不会被武断认定为沙箱问题。

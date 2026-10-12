@@ -26,7 +26,7 @@ import (
 	sqlite3 "modernc.org/sqlite/lib"
 )
 
-const CurrentServerVersion = "0.1.0"
+const CurrentServerVersion = "0.1.1"
 
 var pluginCommitSHAPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
 
@@ -86,10 +86,14 @@ type PluginRepositoryService struct {
 	assets         PluginAssetFetcher
 	runtime        PluginRuntimeHost
 	artwork        PluginArtworkGateway
+	offline        PluginOfflineGateway
 	credentials    *credential.Store
 	pluginRoot     string
 	lifecycleMu    sync.Mutex
 	navigationKey  [32]byte
+	catalogueOnce  sync.Once
+	catalogue      *pluginCatalogueCache
+	history        *PlayerHistoryService
 }
 
 type PluginRepositorySummary struct {
