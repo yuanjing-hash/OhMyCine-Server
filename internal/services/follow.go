@@ -240,11 +240,24 @@ func (s *FollowService) Defaults(ctx context.Context, actor Actor, tmdbID int64)
 			continue
 		}
 		definition, found := builtin.DefinitionForKey(item.Kind)
-		if !found {
+		source, sourceErr := routeSourceForSite(item)
+		if sourceErr != nil {
 			continue
 		}
+		siteType := definition.SiteType
+		if !found && source == RouteSourceBT {
+			if item.LastHealthStatus != "healthy" {
+				continue
+			}
+			// A derived healthy Site can outlive its plugin/connection. Reuse
+			// the resource gateway's current lifecycle check before offering it.
+			if pluginID, _, err := (&PluginRepositoryService{db: s.db}).ResourceProvenance(item.PluginConnectionID); err != nil || pluginID != item.PluginID {
+				continue
+			}
+			siteType = "bt_resource"
+		}
 		authorizedSites = append(authorizedSites, item)
-		result.Sites = append(result.Sites, FollowSiteOption{ID: item.ID, Name: item.Name, SiteType: definition.SiteType})
+		result.Sites = append(result.Sites, FollowSiteOption{ID: item.ID, Name: item.Name, SiteType: siteType})
 	}
 	authorizedDownloaders := make([]models.Downloader, 0, len(downloaders))
 	for _, item := range downloaders {
@@ -864,27 +877,20 @@ func (s *FollowService) validateFollowRoute(ctx context.Context, downloader mode
 	if !library.Enabled {
 		return appError(CodeFollowConfigurationInvalid, "订阅目标媒体库不存在或已停用", nil)
 	}
+	sourceKind := downloadpkg.SourceURL
 	for _, record := range sites {
-		def, ok := builtin.DefinitionForKey(record.Kind)
-		if ok && def.SiteType == builtin.SiteTypeCloud && downloader.Type != models.DownloaderTypePan115Offline {
-			return appError(CodeFollowConfigurationInvalid, "网盘站点需要支持分享转存的 115 下载器", nil)
-		}
-	}
-	if downloader.Type == models.DownloaderTypePan115Offline {
-		for _, site := range sites {
-			definition, found := builtin.DefinitionForKey(site.Kind)
-			if !found || (definition.SiteType != builtin.SiteTypeBT && definition.SiteType != builtin.SiteTypeCloud) {
-				return appError(CodeFollowConfigurationInvalid, "订阅包含 PT 或未知来源站点，不能使用 115 离线下载", nil)
+		source, err := routeSourceForSite(record)
+		if source == RouteSource115Share {
+			if downloader.Type != models.DownloaderTypePan115Offline {
+				return appError(CodeFollowConfigurationInvalid, "网盘站点需要支持分享转存的 115 下载器", nil)
 			}
+			sourceKind = downloadpkg.SourcePan115Share
+		}
+		if downloader.Type == models.DownloaderTypePan115Offline && (err != nil || source != RouteSourceBT && source != RouteSource115Share) {
+			return appError(CodeFollowConfigurationInvalid, "订阅包含 PT 或未知来源站点，不能使用 115 离线下载", nil)
 		}
 	}
 	if s.downloads != nil {
-		sourceKind := downloadpkg.SourceURL
-		for _, record := range sites {
-			if def, ok := builtin.DefinitionForKey(record.Kind); ok && def.SiteType == builtin.SiteTypeCloud {
-				sourceKind = downloadpkg.SourcePan115Share
-			}
-		}
 		target, _, err := s.downloads.snapshotDownloadTarget(ctx, downloader, library, sourceKind)
 		if err != nil {
 			return err
