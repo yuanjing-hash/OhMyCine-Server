@@ -438,6 +438,15 @@ func (s *DownloadService) submit(ctx context.Context, ownerID uint, input Submit
 	if source.Kind == downloadpkg.SourceTorrent && downloaderRecord.Type == models.DownloaderTypePan115Offline {
 		return DownloadTaskSummary{}, appError(CodeDownloadSourceInvalid, "种子文件只能提交到非网盘 BT 下载器", nil)
 	}
+	if input.SourceSiteID != 0 {
+		var site models.Site
+		if err := s.db.WithContext(ctx).First(&site, input.SourceSiteID).Error; err != nil {
+			return DownloadTaskSummary{}, appError(CodeSiteUnavailable, "站点不存在或已停用", err)
+		}
+		if err := validateSiteDownloadSource(downloaderRecord, source.Kind, site); err != nil {
+			return DownloadTaskSummary{}, err
+		}
+	}
 	if source.Kind == downloadpkg.SourcePan115Share {
 		sourceOrigin = models.DownloadSourceOriginShare
 	}
@@ -616,6 +625,15 @@ func (s *DownloadService) submit(ctx context.Context, ownerID uint, input Submit
 		}
 		if input.BeforePersist != nil {
 			if err := input.BeforePersist(tx); err != nil {
+				return err
+			}
+		}
+		if input.SourceSiteID != 0 {
+			var site models.Site
+			if err := tx.First(&site, input.SourceSiteID).Error; err != nil {
+				return appError(CodeSiteUnavailable, "站点不存在或已停用", err)
+			}
+			if err := validateSiteDownloadSource(downloaderRecord, source.Kind, site); err != nil {
 				return err
 			}
 		}

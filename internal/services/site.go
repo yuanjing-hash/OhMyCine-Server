@@ -1500,7 +1500,7 @@ func (s *SiteService) Download(ctx context.Context, actor Actor, input SiteDownl
 		return DownloadTaskSummary{}, appError(CodePermissionDenied, "无权向这个媒体库入库", nil)
 	}
 	var claimedSite models.Site
-	if err := s.db.Select("id", "kind", "source_type", "plugin_connection_id", "enabled").First(&claimedSite, claim.SiteID).Error; err != nil {
+	if err := s.db.WithContext(ctx).First(&claimedSite, claim.SiteID).Error; err != nil {
 		return DownloadTaskSummary{}, siteNotFound(err)
 	}
 	if !actor.CanResource(authz.PermissionDiscoveryRead, models.AuthorizationResourceSite, uintID(claimedSite.ID)) {
@@ -1508,10 +1508,11 @@ func (s *SiteService) Download(ctx context.Context, actor Actor, input SiteDownl
 	}
 	definition, definitionFound := builtin.DefinitionForKey(claimedSite.Kind)
 	isPluginResource := claimedSite.SourceType == "plugin" && claimedSite.Kind == pluginResourceKind
-	if definitionFound && definition.SiteType == builtin.SiteTypeCloud && selectedDownloader.Type != models.DownloaderTypePan115Offline {
+	routeSource, routeErr := routeSourceForSite(claimedSite)
+	if routeSource == RouteSource115Share && selectedDownloader.Type != models.DownloaderTypePan115Offline {
 		return DownloadTaskSummary{}, appError(CodeDownloadSourceInvalid, "网盘分享资源只能通过对应网盘转存", nil)
 	}
-	if selectedDownloader.Type == models.DownloaderTypePan115Offline && !isPluginResource && (!definitionFound || (definition.SiteType != builtin.SiteTypeBT && definition.SiteType != builtin.SiteTypeCloud)) {
+	if selectedDownloader.Type == models.DownloaderTypePan115Offline && (routeErr != nil || (routeSource != RouteSourceBT && routeSource != RouteSource115Share)) {
 		return DownloadTaskSummary{}, appError(CodeDownloadSourceInvalid, "只有已确认的公开 BT 资源可以提交到 115 离线下载", nil)
 	}
 	record := claimedSite
@@ -1546,7 +1547,7 @@ func (s *SiteService) Download(ctx context.Context, actor Actor, input SiteDownl
 		if err != nil {
 			return DownloadTaskSummary{}, err
 		}
-		if resourceClaim.PluginID != pluginID || resourceClaim.PluginVersion != pluginVersion || resourceClaim.PluginConnectionID != record.PluginConnectionID || resourceClaim.ResourceID != claim.TorrentID {
+		if resourceClaim.PluginID != pluginID || record.PluginID != pluginID || resourceClaim.PluginVersion != pluginVersion || resourceClaim.PluginConnectionID != record.PluginConnectionID || resourceClaim.ResourceID != claim.TorrentID {
 			return DownloadTaskSummary{}, appError(CodeSiteResultExpired, "资源站插件或镜像已变化，请重新搜索", nil)
 		}
 		resolved, resolveErr := s.pluginResources.ResolveResource(ctx, PluginResourceResolveInput{ConnectionID: resourceClaim.PluginConnectionID, ResourceID: resourceClaim.ResourceID})
