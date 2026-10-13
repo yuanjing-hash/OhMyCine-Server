@@ -62,6 +62,8 @@ Emby 不作为文件数据源展示，而进入独立“播放器管理”工作
 
 Player 现已通过独立 `ServerDataSource` 接入 Server 媒体目录。用户首次在 Player 输入 Server 用户名和密码，Server 只在该次验证后签发可撤销的 `omc_player_` device token；数据库仅保存 token 与设备 ID 的不可逆摘要，Player 密码不持久化，device token 进入 Player provider-specific 安全凭据库。`/api/v1/player/*` 使用独立 Bearer 中间件并注册在浏览器 Origin/CSRF 边界之外，Bearer 不能进入 Cookie 管理 API；停用用户、重置密码、同设备重新登录、登出或显式撤销都会使对应令牌失效。Player 专用 DTO 只返回安全媒体库、作品、版本和身份投影，不返回绝对路径、115 provider ID、Cookie、Emby API Key、signed STRM URL 或上游临时地址。
 
+当前物理媒体作品的 catalog、详情、搜索、收藏、合集与总览响应均提供 `added_at`：取作品当前可见源条目 `created_at` 的最大值，表示 Server 首次收录这些条目的时间；`modified_at` 继续表示源文件修改时间。重复扫描、重新识别和元数据刷新保留已有条目的 `created_at`，新增分集或版本才推进作品的 `added_at`。最近入库在分页前按 `added_at` 倒序、媒体库 ID 和作品身份排序；同批收录时使用后两项稳定决胜。Player 使用当前总览与 `added_at` 契约，不提供旧 Server 的名称或文件时间排序兜底，必须先更新 Server 再更新 Player。
+
 Player 图片契约在 `/api/v1/player` 的 device Bearer 边界内交付：catalog/详情作品沿用 `poster_url`、`backdrop_url`，新增最多八张 `still_urls`；`people[].profile_url`、`versions[].poster_url/backdrop_url/still_url/episode_still_url` 与历史 `episode_still_url` 均由当前 TMDB 快照安全图片身份生成 `/api/v1/player/discovery/images/tmdb/:token`。历史中的 Server 作品海报和背景也由 Server 当前快照重建，忽略客户端上传的外部图片；Emby/Jellyfin 自身图片仍由其服务器提供。浏览器管理端继续使用 Cookie 边界上的 `/api/v1/discovery/images/...`；媒体库及分类封面继续沿用现有受控静态资源路由。
 
 Player 的观看历史、收藏和合集现由 Server 提供可选的多设备持久层，同时保留 Player 本地数据库作为离线后备。历史增量合并和分页读取、收藏及手工合集全部按 device token 对应用户隔离；媒体操作只接受可重新解析到当前可见 catalog work 的不透明标识。电影识别快照额外保存 TMDB `belongs_to_collection` 的 ID、名称和安全图片文件标识，首次成功扫库会在同一事务内建立自动合集，后续完整扫描幂等补齐并清除已离库的 TMDB 自动成员，partial 扫描只增不删；同一作品多版本只计一次，至少两部不同电影时才对用户显示。自动对账不修改手工合集或手工成员，系统合集返回时仍按用户的媒体库权限过滤。

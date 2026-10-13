@@ -453,7 +453,7 @@ func (s *PlayerHistoryService) visitAvailableHistoryTx(tx *gorm.DB, actor Actor,
 		query = query.Where("source_kind = ?", "server")
 	}
 	if continueOnly {
-		query = query.Where("completed = ? AND position > 0 AND (duration IS NULL OR duration <= 0 OR (position * 1.0 / duration) < ?)", false, 0.92)
+		query = query.Where("completed = ? AND position > 0", false)
 	}
 	var lastTime int64
 	var lastKey string
@@ -1091,10 +1091,12 @@ func normalizePlayerHistoryChange(change PlayerHistoryChange) (PlayerHistoryChan
 	change.EpisodeStillPath = safeTMDBImagePath(change.EpisodeStillPath)
 	if change.SourceLocator != "" {
 		parsed, err := url.Parse(change.SourceLocator)
-		if err != nil || parsed.Scheme != "http" && parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.Path != "" && parsed.Path != "/" || parsed.RawQuery != "" || parsed.Fragment != "" {
+		if err != nil || parsed.Scheme != "http" && parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
 			return PlayerHistoryChange{}, appError(CodeInvalidRequest, "播放历史来源地址无效", nil)
 		}
-		change.SourceLocator = parsed.Scheme + "://" + parsed.Host
+		// A reverse-proxy base path is part of the provider endpoint identity.
+		// This value is only relayed; it never authorizes fetching that endpoint.
+		change.SourceLocator = parsed.Scheme + "://" + parsed.Host + strings.TrimRight(parsed.EscapedPath(), "/")
 	}
 	return change, nil
 }

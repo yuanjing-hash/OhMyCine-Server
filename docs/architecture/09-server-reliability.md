@@ -24,9 +24,9 @@ Server 的 Player 版本响应增加可选 `version_name`，仅含允许的技�
 
 ## 历史资格、时钟与外部图片
 
-Server 来源的继续观看先筛选未完成且进度小于 92% 的记录，再校验当前作品存在及库/Storage/账号权限，取 limit+1 判断还有没有更多。不能从最近 100 条历史截取，也不能用“恰好满一页”猜测还有下一页。列表共享按 `client_updated_at DESC,sync_key ASC` 的有界 keyset 遍历，过滤后计算页码/总数。
+Server 来源的继续观看先筛选 `completed=false` 且有真实播放进度的记录，再校验当前作品存在及库/Storage/账号权限，取 limit+1 判断还有没有更多。完成状态只接受真正的播放结束或用户显式标记，不能按进度比例隐藏接近结尾但播放失败的记录。不能从最近 100 条历史截取，也不能用“恰好满一页”猜测还有下一页。列表共享按 `client_updated_at DESC,sync_key ASC` 的有界 keyset 遍历，过滤后计算页码/总数。
 
-浏览器账号历史可显示同账号从 Player 中转的外部来源名称、标题和受控图片，但这些项不提供 Server 播放入口；它们不进入 Server 源媒体目录和 Player Server 源总览。数据源私有地址、ID、播放 token 均不进入浏览器 DTO。
+浏览器账号历史、继续观看及其计数只展示当前账号可访问且仍在库的 Server 记录。Emby/Jellyfin 历史继续在后台中转，供同账号的 Player 跨设备同步，不进入浏览器栏目、Server 源媒体目录或 Player Server 源总览。数据源私有地址、ID、播放 token 均不进入浏览器 DTO。
 
 上传播放事件超过 Server 当前时间五分钟时，以 `history_clock_ahead` 拒绝该行；批次内正常兄弟行继续提交。历史中已存在的异常未来时间不擅自覆盖，返回增量携带对应 warning。旧客户端如果已经跨过该 revision，仍需后续客户端排序/异常提示适配；不能宣称服务端已修复所有旧客户端排序。
 

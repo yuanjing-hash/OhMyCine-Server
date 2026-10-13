@@ -97,6 +97,7 @@ type PlayerMediaItem struct {
 	SeasonCount     int64               `json:"season_count"`
 	EpisodeCount    int64               `json:"episode_count"`
 	ModifiedAt      time.Time           `json:"modified_at"`
+	AddedAt         time.Time           `json:"added_at"`
 	CategoryName    string              `json:"category_name"`
 	MatchStatus     string              `json:"match_status"`
 }
@@ -626,7 +627,7 @@ func (s *MediaLibraryService) playerMediaItemTx(tx *gorm.DB, reader *CatalogRead
 		TMDBID: snapshot.TMDBID, IMDbID: snapshot.IMDbID, PosterPath: safeTMDBImagePath(snapshot.PosterPath), BackdropPath: safeTMDBImagePath(snapshot.BackdropPath),
 		PosterURL: playerCatalogImageURLWithClient(imageClient, snapshot.PosterPath, "w500"), BackdropURL: playerCatalogImageURLWithClient(imageClient, snapshot.BackdropPath, "w1280"),
 		StillPaths: snapshotStillPaths(snapshot), StillURLs: playerStillURLs(imageClient, snapshotStillPaths(snapshot)), WorkIdentity: identity, FileCount: item.FileCount,
-		SeasonCount: item.SeasonCount, EpisodeCount: item.EpisodeCount, ModifiedAt: item.ModifiedAt,
+		SeasonCount: item.SeasonCount, EpisodeCount: item.EpisodeCount, ModifiedAt: item.ModifiedAt, AddedAt: item.AddedAt,
 		CategoryName: item.CategoryName, MatchStatus: item.MatchStatus,
 	}, nil
 }

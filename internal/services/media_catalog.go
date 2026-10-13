@@ -22,6 +22,13 @@ const (
 	maxMediaQueryLength  = 200
 )
 
+type mediaCatalogOrder uint8
+
+const (
+	mediaCatalogOrderTitle mediaCatalogOrder = iota
+	mediaCatalogOrderAdded
+)
+
 type MediaPageQuery struct {
 	Page        int
 	PageSize    int
@@ -29,6 +36,7 @@ type MediaPageQuery struct {
 	MediaType   string
 	MatchStatus string
 	Category    string
+	order       mediaCatalogOrder
 }
 
 type MediaLibraryEntryPage struct {
@@ -47,6 +55,7 @@ type MediaCatalogItem struct {
 	EpisodeCount         int64                     `json:"episode_count"`
 	Size                 int64                     `json:"size"`
 	ModifiedAt           time.Time                 `json:"modified_at"`
+	AddedAt              time.Time                 `json:"added_at"`
 	CategoryName         string                    `json:"category_name"`
 	MatchStatus          string                    `json:"match_status"`
 	TMDBID               *int64                    `json:"tmdb_id,omitempty"`
@@ -123,6 +132,7 @@ type mediaCatalogRow struct {
 	EpisodeCount         int64
 	Size                 int64
 	ModifiedText         string
+	AddedText            string
 	CategoryName         string
 	MatchStatus          string
 	TMDBID               *int64
@@ -191,7 +201,7 @@ func (s *MediaLibraryService) catalogTx(tx *gorm.DB, reader *CatalogReader, acto
 	}
 	rows := make([]mediaCatalogRow, 0)
 	rowsQuery := applyCatalogFilters(reader.VisibleEntries().Where("library_id = ? AND work_key <> ''", libraryID), query)
-	if err := selectCatalogRows(rowsQuery).
+	if err := selectOrderedCatalogRows(rowsQuery, query.order).
 		Offset((query.Page - 1) * query.PageSize).
 		Limit(query.PageSize).
 		Scan(&rows).Error; err != nil {
@@ -285,6 +295,9 @@ func (s *MediaLibraryService) aggregateCatalogTx(tx *gorm.DB, reader *CatalogRea
 			if item.ModifiedAt.After(current.ModifiedAt) {
 				current.ModifiedAt = item.ModifiedAt
 			}
+			if item.AddedAt.After(current.AddedAt) {
+				current.AddedAt = item.AddedAt
+			}
 			current.LibraryWorks = append(current.LibraryWorks, work)
 			continue
 		}
@@ -296,6 +309,12 @@ func (s *MediaLibraryService) aggregateCatalogTx(tx *gorm.DB, reader *CatalogRea
 	}
 	sort.SliceStable(order, func(i, j int) bool {
 		left, right := merged[order[i]], merged[order[j]]
+		if query.order == mediaCatalogOrderAdded {
+			if left.AddedAt.Equal(right.AddedAt) {
+				return order[i] < order[j]
+			}
+			return left.AddedAt.After(right.AddedAt)
+		}
 		if left.Title == right.Title {
 			return order[i] < order[j]
 		}
@@ -440,8 +459,14 @@ func normalizeMediaPageQuery(query MediaPageQuery) (MediaPageQuery, error) {
 	if query.PageSize == 0 {
 		query.PageSize = defaultMediaPageSize
 	}
-	if query.Page < 1 || (query.PageSize != 20 && query.PageSize != 50 && query.PageSize != 100) {
+	// The overview's internal recent query is bounded independently of the
+	// public catalog page sizes. HTTP callers cannot set this ordering field.
+	internalRecentPage := query.order == mediaCatalogOrderAdded && query.PageSize == playerOverviewRecentlyAddedLimit
+	if query.Page < 1 || (!internalRecentPage && query.PageSize != 20 && query.PageSize != 50 && query.PageSize != 100) {
 		return MediaPageQuery{}, appError(CodeInvalidRequest, "分页参数无效", nil)
+	}
+	if query.order != mediaCatalogOrderTitle && query.order != mediaCatalogOrderAdded {
+		return MediaPageQuery{}, appError(CodeInvalidRequest, "目录排序无效", nil)
 	}
 	query.Query = strings.TrimSpace(query.Query)
 	if len([]rune(query.Query)) > maxMediaQueryLength {
@@ -503,7 +528,11 @@ func applyCatalogFilters(db *gorm.DB, query MediaPageQuery) *gorm.DB {
 }
 
 func selectCatalogRows(db *gorm.DB) *gorm.DB {
-	return db.Select(`media_library_entries.library_id AS library_id, work_key,
+	return selectOrderedCatalogRows(db, mediaCatalogOrderTitle)
+}
+
+func selectOrderedCatalogRows(db *gorm.DB, order mediaCatalogOrder) *gorm.DB {
+	rows := db.Select(`media_library_entries.library_id AS library_id, work_key,
 		CASE WHEN MAX(CASE WHEN media_type = 'tv' THEN 1 ELSE 0 END) = 1 THEN 'series' ELSE 'movie' END AS kind,
 		MAX(CASE WHEN series_title <> '' THEN series_title ELSE title END) AS title,
 		COUNT(*) AS file_count,
@@ -511,6 +540,7 @@ func selectCatalogRows(db *gorm.DB) *gorm.DB {
 		SUM(CASE WHEN episode IS NOT NULL THEN 1 ELSE 0 END) AS episode_count,
 		COALESCE(SUM(size), 0) AS size,
 		MAX(modified_at) AS modified_text,
+		MAX(media_library_entries.created_at) AS added_text,
 		MIN(category_name) AS category_name,
 		MAX(tmdb_id) AS tmdb_id,
 		MAX(release_year) AS release_year,
@@ -518,12 +548,15 @@ func selectCatalogRows(db *gorm.DB) *gorm.DB {
 		MIN(recognition_error_code) AS recognition_error_code,
 		MAX(recognition_id) AS recognition_id,
 		CASE WHEN SUM(CASE WHEN match_status = 'matched' THEN 1 ELSE 0 END) = COUNT(*) THEN 'matched' ELSE 'unrecognized' END AS match_status`).
-		Group("media_library_entries.library_id, work_key").
-		Order("title COLLATE NOCASE, work_key")
+		Group("media_library_entries.library_id, work_key")
+	if order == mediaCatalogOrderAdded {
+		return rows.Order("added_text DESC, media_library_entries.library_id, work_key")
+	}
+	return rows.Order("title COLLATE NOCASE, work_key")
 }
 
 func catalogItem(row mediaCatalogRow) MediaCatalogItem {
-	return MediaCatalogItem{ID: encodeCatalogToken(row.WorkKey), Title: row.Title, Kind: row.Kind, FileCount: row.FileCount, SeasonCount: row.SeasonCount, EpisodeCount: row.EpisodeCount, Size: row.Size, ModifiedAt: parseCatalogTime(row.ModifiedText), CategoryName: row.CategoryName, MatchStatus: row.MatchStatus, TMDBID: row.TMDBID, ReleaseYear: row.ReleaseYear, Confidence: row.Confidence, RecognitionErrorCode: row.RecognitionErrorCode, LibraryWorks: []MediaCatalogLibraryWork{}}
+	return MediaCatalogItem{ID: encodeCatalogToken(row.WorkKey), Title: row.Title, Kind: row.Kind, FileCount: row.FileCount, SeasonCount: row.SeasonCount, EpisodeCount: row.EpisodeCount, Size: row.Size, ModifiedAt: parseCatalogTime(row.ModifiedText), AddedAt: parseCatalogTime(row.AddedText), CategoryName: row.CategoryName, MatchStatus: row.MatchStatus, TMDBID: row.TMDBID, ReleaseYear: row.ReleaseYear, Confidence: row.Confidence, RecognitionErrorCode: row.RecognitionErrorCode, LibraryWorks: []MediaCatalogLibraryWork{}}
 }
 
 func (s *MediaLibraryService) catalogItemsTx(tx *gorm.DB, reader *CatalogReader, rows []mediaCatalogRow) ([]MediaCatalogItem, error) {

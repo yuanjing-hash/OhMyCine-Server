@@ -18,6 +18,7 @@ type BrowserMediaItem struct {
 	EpisodeCount int64     `json:"episode_count,omitempty"`
 	CategoryName string    `json:"category_name,omitempty"`
 	ModifiedAt   time.Time `json:"modified_at"`
+	AddedAt      time.Time `json:"added_at"`
 }
 
 type BrowserHistoryItem struct {
@@ -87,7 +88,7 @@ func browserMediaItem(item PlayerMediaItem) BrowserMediaItem {
 		ReleaseYear: item.ReleaseYear, Rating: item.Rating, PosterURL: browserArtworkURL(item.PosterURL),
 		BackdropURL: browserArtworkURL(item.BackdropURL), SeasonCount: item.SeasonCount,
 		EpisodeCount: item.EpisodeCount, CategoryName: item.CategoryName,
-		ModifiedAt: item.ModifiedAt,
+		ModifiedAt: item.ModifiedAt, AddedAt: item.AddedAt,
 	}
 }
 

@@ -406,6 +406,8 @@ Server 更新是系统设置页中的管理员专属面板，不进入普通用�
 
 ### 发现 / 媒体库总览
 
+“最近入库”按 Server 首次收录的时间倒序，而不是来源文件的修改时间。作品取其可见文件中最新的收录时间，新增集数或版本会提升作品；重复扫描和元数据刷新不会刷新旧文件的收录时间。所有当前用户可访问的媒体库参与候选选择，按入库时间取候选后再合并最多 24 个作品，不先按名称截断。
+
 `/discovery/library` 默认展示当前登录用户可访问的 Server 媒体总览：继续观看、我的收藏、TMDB 自动合集、我的合集、最近入库和媒体库。完整播放历史、收藏、两类合集及原有全部作品海报墙通过同页标签或“查看全部”按需加载；首屏不预取完整 catalog，也不再并列显示语义重复的“最近历史”摘要栏。
 
 管理端使用浏览器 Session 专用的 `/api/v1/media-libraries/overview|history|favorites|collections` 读取接口，均要求 `media_libraries.read` 且返回 `Cache-Control: no-store`。网页历史及继续观看只显示当前账号有权访问的 Server 媒体库记录；Emby/Jellyfin 的记录仅供 Player 设备间同步，不进入网页卡片与计数。网页删除单条历史通过独立 history_id 写入同步删除标记。已删除、禁用、无权或无法定位到当前 catalog 的 Server 历史/收藏/合集成员不展示，浏览器响应不包含来源地址、来源 ID、Player item token、provider ID、物理路径、凭据或播放流地址。

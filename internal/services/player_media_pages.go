@@ -189,7 +189,7 @@ func (s *PlayerMediaStateService) browserStateItems(keys []mediaStateWork) ([]Br
 		}
 		item, snapshot := catalogItem(row), snapshots[key]
 		result = append(result, BrowserMediaItem{LibraryID: key.libraryID, WorkID: item.ID, Title: item.Title, Kind: item.Kind, ReleaseYear: item.ReleaseYear, Rating: snapshot.VoteAverage,
-			PosterURL: catalogImageURLWithClient(imageClient, snapshot.PosterPath, "w500"), BackdropURL: catalogImageURLWithClient(imageClient, snapshot.BackdropPath, "w1280"), SeasonCount: item.SeasonCount, EpisodeCount: item.EpisodeCount, CategoryName: item.CategoryName, ModifiedAt: item.ModifiedAt})
+			PosterURL: catalogImageURLWithClient(imageClient, snapshot.PosterPath, "w500"), BackdropURL: catalogImageURLWithClient(imageClient, snapshot.BackdropPath, "w1280"), SeasonCount: item.SeasonCount, EpisodeCount: item.EpisodeCount, CategoryName: item.CategoryName, ModifiedAt: item.ModifiedAt, AddedAt: item.AddedAt})
 	}
 	return result, nil
 }
