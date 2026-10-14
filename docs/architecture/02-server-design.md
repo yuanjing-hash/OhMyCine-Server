@@ -1191,6 +1191,7 @@ users ──< user_roles >── roles ──< role_permissions >── permissi
 - `administrator`：受保护系统角色，授权器把它解析为完整 permission catalog。
 - `operator`：面向后续连接、目标、STRM Run 和媒体服务器刷新，不含用户/角色/秘密导出权限。
 - `viewer`：只读状态与后续脱敏业务摘要。
+- `normal_user`（正常用户）：受保护、启用的系统模板，提供媒体库读取、发现搜索、创建下载和追更、查看及控制自己任务的 13 项权限，不含库、用户或系统设置管理。资源名单和直接拒绝仍限制实际访问；不自动分配给已有用户，普通启动保留独立的自定义 `user` 角色。
 - 自定义角色：只能组合 canonical permission code；非系统管理员只能授予自己已经拥有的权限，阻止委派式权限提升。
 - Router route meta、导航、按钮和 Gin API 使用相同 permission code。例如用户页面和 `GET /api/v1/users` 都要求 `users.read`，创建按钮和 `POST /api/v1/users` 都要求 `users.create`。
 - owner 不能被删除、停用或失去 `administrator`；所有用户/角色写操作在事务内校验变更后仍存在有效管理员。

@@ -111,6 +111,7 @@ func TestMigrateAddsStorageFoundationAndIsIdempotent(t *testing.T) {
 	if err := Migrate(db); err != nil {
 		t.Fatal(err)
 	}
+	assertNormalUserTemplate(t, db)
 	if !db.Migrator().HasTable("storages") || !db.Migrator().HasTable("media_classification_profiles") {
 		t.Fatal("foundation table missing")
 	}
@@ -1490,4 +1491,139 @@ func TestMigrateV2ToV3PreservesStorageAndCustomProfilesAcrossReseed(t *testing.T
 	if storageCount != 1 || builtinCount != 1 || customCount != 1 {
 		t.Fatalf("preservation counts storage=%d builtin=%d custom=%d", storageCount, builtinCount, customCount)
 	}
+}
+
+func TestSeedNormalUserRolePreservesExistingAccountsAndTemplateIdentity(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "normal-user.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sqlDB, _ := db.DB()
+	t.Cleanup(func() { _ = sqlDB.Close() })
+	if err := migrateAuthFoundation(db); err != nil {
+		t.Fatal(err)
+	}
+	user := models.User{Username: "existing", UsernameNormalized: "existing", DisplayName: "Existing", PasswordHash: "fixture", Status: models.UserStatusActive, AuthzVersion: 7}
+	if err := db.Create(&user).Error; err != nil {
+		t.Fatal(err)
+	}
+	var before models.User
+	if err := db.First(&before, user.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := seedAuthorization(db); err != nil {
+		t.Fatal(err)
+	}
+	first := assertNormalUserTemplate(t, db)
+	if err := seedAuthorization(db); err != nil {
+		t.Fatal(err)
+	}
+	repeated := assertNormalUserTemplate(t, db)
+	if first.ID != repeated.ID || !first.CreatedAt.Equal(repeated.CreatedAt) {
+		t.Fatal("reseed replaced the built-in normal-user identity")
+	}
+	var roleCount, assignmentCount int64
+	if err := db.Model(&models.Role{}).Where("code = ?", authz.RoleUser).Count(&roleCount).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&models.UserRole{}).Count(&assignmentCount).Error; err != nil {
+		t.Fatal(err)
+	}
+	var after models.User
+	if err := db.First(&after, user.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if roleCount != 1 || assignmentCount != 0 || !reflect.DeepEqual(before, after) {
+		t.Fatalf("seed changed existing account authority: roles=%d assignments=%d", roleCount, assignmentCount)
+	}
+}
+
+func TestSeedNormalUserRolePreservesCustomUserAlongsideSystemTemplate(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "custom-user.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sqlDB, _ := db.DB()
+	t.Cleanup(func() { _ = sqlDB.Close() })
+	if err := migrateAuthFoundation(db); err != nil {
+		t.Fatal(err)
+	}
+	role := models.Role{Code: "user", Name: "定制用户", Description: "保留我的设置", Kind: models.RoleKindCustom, Active: true}
+	if err := db.Create(&role).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&role).Update("active", false).Error; err != nil {
+		t.Fatal(err)
+	}
+	user := models.User{Username: "custom", UsernameNormalized: "custom", DisplayName: "Custom", PasswordHash: "fixture", Status: models.UserStatusActive, AuthzVersion: 9}
+	if err := db.Create(&user).Error; err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
+	if err := db.Create(&models.UserRole{UserID: user.ID, RoleID: role.ID, AssignedBy: &user.ID, CreatedAt: now}).Error; err != nil {
+		t.Fatal(err)
+	}
+	for _, code := range []string{"jobs.read_own", "users.read"} {
+		if err := db.Create(&models.Permission{Code: code, Module: "fixture", Name: "Fixture", Description: "Fixture", Risk: "normal"}).Error; err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Create(&models.RolePermission{RoleID: role.ID, PermissionCode: code, CreatedAt: now}).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	type snapshot struct {
+		Role        models.Role
+		User        models.User
+		Grants      []models.RolePermission
+		Assignments []models.UserRole
+	}
+	read := func() snapshot {
+		var state snapshot
+		for _, query := range []*gorm.DB{
+			db.First(&state.Role, role.ID),
+			db.First(&state.User, user.ID),
+			db.Where("role_id = ?", role.ID).Order("permission_code").Find(&state.Grants),
+			db.Order("user_id, role_id").Find(&state.Assignments),
+		} {
+			if query.Error != nil {
+				t.Fatal(query.Error)
+			}
+		}
+		return state
+	}
+	// Read both sides through SQLite so timestamp locations compare faithfully.
+	before := read()
+	for i := 0; i < 2; i++ {
+		if err := seedAuthorization(db); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(before, read()) {
+			t.Fatal("seed changed a custom user role, its grants, account or assignment")
+		}
+		assertNormalUserTemplate(t, db)
+	}
+}
+
+func assertNormalUserTemplate(t *testing.T, db *gorm.DB) models.Role {
+	t.Helper()
+	var role models.Role
+	if err := db.Where("code = ?", authz.RoleUser).First(&role).Error; err != nil {
+		t.Fatal(err)
+	}
+	if role.Code != "normal_user" || role.Name != "正常用户" || role.Description != "用户" || role.Kind != models.RoleKindSystem || !role.Protected || !role.Active {
+		t.Fatalf("normal-user template drifted: %+v", role)
+	}
+	var codes []string
+	if err := db.Model(&models.RolePermission{}).Where("role_id = ?", role.ID).Order("permission_code").Pluck("permission_code", &codes).Error; err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"dashboard.read", "discovery.read", "downloads.create", "downloads.read_own",
+		"follows.create", "follows.delete_own", "follows.execute_own", "follows.read_own", "follows.update_own",
+		"jobs.control_own", "jobs.read_own", "media_libraries.read", "transfers.read_own",
+	}
+	if !reflect.DeepEqual(codes, want) {
+		t.Fatalf("normal-user grants=%v, want exact confirmed grants %v", codes, want)
+	}
+	return role
 }

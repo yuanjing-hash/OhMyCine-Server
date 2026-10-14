@@ -55,6 +55,9 @@ func TestPlayerSnapshotPublicViewsAndPinnedDecoration(t *testing.T) {
 		if len(before.List) != 1 || before.List[0].PosterPath != "/old.jpg" {
 			t.Fatalf("old projection: %+v", before)
 		}
+		if !before.List[0].AddedAt.Equal(entries[0].CreatedAt) {
+			t.Fatalf("snapshot ingestion time: got=%s want=%s", before.List[0].AddedAt, entries[0].CreatedAt)
+		}
 		c, token := catalogCandidate(t, store, library, "delta", 1)
 		rec.Title, rec.ManualOverride, rec.MetadataJSON = "Corrected", true, playerSnapshotMetadata(t, "Corrected", "/new.jpg")
 		if err := store.AppendBatch(context.Background(), c.ID, token, CatalogFactBatch{Recognitions: []models.CatalogRecognitionFact{CatalogRecognitionFromLegacy(rec)}}); err != nil {
@@ -65,7 +68,7 @@ func TestPlayerSnapshotPublicViewsAndPinnedDecoration(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		if len(after.List) != 1 || after.List[0].Title != before.List[0].Title || after.List[0].PosterPath != "/old.jpg" {
+		if len(after.List) != 1 || after.List[0].Title != before.List[0].Title || after.List[0].PosterPath != "/old.jpg" || !after.List[0].AddedAt.Equal(before.List[0].AddedAt) {
 			t.Fatalf("mixed pinned projection: %+v", after)
 		}
 		return nil
@@ -82,7 +85,7 @@ func TestPlayerSnapshotPublicViewsAndPinnedDecoration(t *testing.T) {
 		t.Fatalf("categories=%+v err=%v", categories, err)
 	}
 	page, err := s.PlayerSearch(actor, MediaPageQuery{Query: "Corrected", Page: 1, PageSize: 20})
-	if err != nil || len(page.List) != 1 || page.List[0].Title != "Corrected" || page.List[0].PosterPath != "/new.jpg" {
+	if err != nil || len(page.List) != 1 || page.List[0].Title != "Corrected" || page.List[0].PosterPath != "/new.jpg" || !page.List[0].AddedAt.Equal(entries[0].CreatedAt) {
 		t.Fatalf("search=%+v err=%v", page, err)
 	}
 	detail, err := s.PlayerCatalogDetail(context.Background(), actor, library.ID, encodeCatalogToken(entries[0].WorkKey))

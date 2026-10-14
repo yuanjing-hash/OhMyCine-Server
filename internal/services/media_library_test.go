@@ -195,12 +195,26 @@ func TestMediaLibraryScanUsesSharedTMDBRecognitionAndPersistentCache(t *testing.
 		t.Fatalf("snapshot=%+v err=%v", snapshot, err)
 	}
 	requestCount := requests
+	ingestedAt := entry.CreatedAt
 	second, err := service.Scan(context.Background(), actor, created.ID, "full")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if second.CacheHits != 1 || requests != requestCount {
 		t.Fatalf("second=%+v requests=%d want=%d", second, requests, requestCount)
+	}
+	modifiedAt := entry.ModifiedAt.Add(time.Hour)
+	if err := os.Chtimes(filepath.Join(storage.RootPath, "Seven.Samurai.1954.1080p.BluRay.mkv"), modifiedAt, modifiedAt); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Scan(context.Background(), actor, created.ID, "full"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.First(&entry, entry.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if !entry.CreatedAt.Equal(ingestedAt) || !entry.ModifiedAt.After(ingestedAt) {
+		t.Fatalf("rescan changed ingestion time or ignored source mtime: %+v", entry)
 	}
 	page, err := service.Recognitions(actor, created.ID, MediaPageQuery{Page: 1, PageSize: 20}, "matched")
 	if err != nil || page.Total != 1 || page.List[0].TMDBID == nil || *page.List[0].TMDBID != 346 || strings.Contains(page.List[0].SourceSummary, storage.RootPath) {
@@ -218,6 +232,9 @@ func TestMediaLibraryScanUsesSharedTMDBRecognitionAndPersistentCache(t *testing.
 	cleared, err := service.ClearRecognitionOverride(context.Background(), actor, created.ID, page.List[0].Token, RequestContext{})
 	if err != nil || cleared.ManualOverride || cleared.Status != "matched" {
 		t.Fatalf("cleared=%+v err=%v", cleared, err)
+	}
+	if err := db.First(&entry, entry.ID).Error; err != nil || !entry.CreatedAt.Equal(ingestedAt) {
+		t.Fatalf("metadata edit changed ingestion time: %+v err=%v", entry, err)
 	}
 }
 

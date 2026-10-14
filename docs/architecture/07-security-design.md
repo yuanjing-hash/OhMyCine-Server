@@ -75,6 +75,8 @@ OhMyCine 是自托管家庭影院生态系统，安全设计的核心目标是�
 
 ### 3.1 用户授权与 Player 能力
 
+系统“正常用户”使用独立的 `normal_user` 角色，内置、启用且受保护；它在日常搜索、下载、追更和本人任务权限之外明确包含 `media_libraries.read`。默认全部开放的资源范围不能代替功能权限，正常用户仍不能管理用户、库或系统设置。普通启动不覆盖自定义模板；针对某份模板的明确授权替换需保留账号绑定和资源策略，并在同一事务更新授权版本、写审计。
+
 Server 的角色只提供权限模板；用户有效权限由角色允许、用户直接允许和用户直接拒绝共同计算，拒绝优先。媒体库、下载器和站点操作必须在 service 层使用稳定资源 ID 做精确 scope 校验，列表/defaults 也只能返回当前用户可用资源，不能依赖按钮隐藏或路由 middleware 作为唯一边界。
 
 用户管理可为每个用户分别配置下载器使用、站点搜索、媒体库访问和媒体库入库名单。每项默认全部开放，也可使用白名单或黑名单；空白名单禁止全部，空黑名单开放全部。名单只收紧既有角色/功能权限，不覆盖直接拒绝，不把旧的单资源允许解释成白名单。入库必须同时满足目标库访问与入库权限。
@@ -99,6 +101,8 @@ Server 同源 Web 管理端使用用户名密码登录，建立可撤销的服�
 - session 默认 2 小时 idle、7 天 absolute 上限；登出、停用和密码重置可立即撤销
 - HTTPS 使用 `__Host-omc_session; Secure; HttpOnly; SameSite=Lax; Path=/`；显式局域网 HTTP 模式使用 host-only 普通 Cookie 并提示保护等级差异
 - 登录失败需要限速，避免暴力破解
+
+用户账号密码最少 8 位，最多 128 字节；首次 Owner 设置、创建用户及修改/重置密码共用后端校验，页面同步最低长度。密码哈希成本、重置时的重新认证和会话撤销规则保持不变。外部连接密码、CookieCloud 共享认证等使用各自的校验规则。
 
 所有 Cookie 认证的状态变更请求还必须校验 session-bound `X-CSRF-Token`、浏览器同源信息和 `application/json`。浏览器的 `Sec-Fetch-Site: same-origin` 自动建立同源证据，兼容 HTTPS 反代终止 TLS 与后端 Host 改写；`cross-site` 始终拒绝，`same-site` 不整体信任兄弟子域。缺少同源 Fetch Metadata 时，严格解析 `Origin`（缺省时允许 `Referer` fallback），与实际请求 `Host` 的完整主机和端口比较，或匹配显式配置来源；缺失、`null`、畸形和重复来源均不因此获准。实时通知 WebSocket 升级复用同一规则并要求有效 Cookie 会话，不因 GET 而跳过来源检查。反代应保留浏览器来源头及原始 Host，不通过 `Forwarded`/`X-Forwarded-*` 自动扩展信任。CSRF token 只保存在前端内存，不进入 URL、日志或持久化存储。
 
@@ -149,7 +153,10 @@ MediaLibrary 使用独立的 `media_libraries.read/create/update/delete/scan` �
 | administrator | 受保护系统角色，拥有 canonical permission catalog 全部能力 |
 | operator | 管理连接、存储目标、STRM 和刷新，不管理用户/角色/秘密导出 |
 | viewer | 只读状态和脱敏业务摘要 |
+| user（正常用户） | 发现、创建下载及追更，查看和控制自己的任务；不授予用户、角色、库或下载器管理权限 |
 | custom | 管理员从固定 permission code 中组合，支持多角色权限并集 |
+
+内置正常用户模板只在不存在 `user` code 时添加；已有同 code 自定义角色的权限、启用状态与用户分配全部保留，不因升级自动扩权。
 
 ### 5.2 权限粒度
 

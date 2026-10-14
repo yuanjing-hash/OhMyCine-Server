@@ -74,9 +74,15 @@ func TestCatalogScanFullAndPartialPreserveVersionsAndStableIdentity(t *testing.T
 			if len(rows) != 2 || rows[0].ID != entries[0].ID || rows[1].ID != entries[1].ID || *rows[0].Season != 2 || *rows[0].Episode != 1 {
 				t.Fatalf("version identity: %+v", rows)
 			}
+			for index, row := range rows {
+				if !row.CreatedAt.Equal(entries[index].CreatedAt) {
+					t.Fatalf("full scan changed ingestion time: got=%s want=%s", row.CreatedAt, entries[index].CreatedAt)
+				}
+			}
 			library, run = catalogScanRun(t, service, library.ID, storage, profile)
 			changed := scanFile(entries[0])
 			changed.Size = 123
+			changed.ModifiedAt = time.Now().UTC().Add(time.Hour)
 			partial := medialibrary.Result{Partial: true, Files: []medialibrary.File{changed}}
 			published, err = service.publishCatalogScan(context.Background(), library, storage, profile, run, partial, provider, service.catalogScanCommit)
 			if err != nil {
@@ -88,6 +94,9 @@ func TestCatalogScanFullAndPartialPreserveVersionsAndStableIdentity(t *testing.T
 			rows = catalogReadEntries(t, service.catalogStore, library.ID, "")
 			if len(rows) != 2 || rows[0].Size != 123 || rows[1].ID != entries[1].ID {
 				t.Fatalf("partial dropped unseen: %+v", rows)
+			}
+			if !rows[0].ModifiedAt.Equal(changed.ModifiedAt) || !rows[0].CreatedAt.Equal(entries[0].CreatedAt) {
+				t.Fatalf("source modification changed ingestion time: %+v", rows[0])
 			}
 			var layers []models.CatalogHeadLayer
 			if err := service.db.Where("library_id=?", library.ID).Order("rank").Find(&layers).Error; err != nil {

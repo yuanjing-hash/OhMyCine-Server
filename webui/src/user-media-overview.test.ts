@@ -34,6 +34,19 @@ describe('Server media-library overview contract', () => {
     expect(historyProgress({ ...page.list[0], position: 200 })).toBe(100)
   })
 
+  it('preserves Server ingestion order and keeps source modification time separate', () => {
+    const result = normalizeUserMediaOverview({ sections: {
+      recently_added: { status: 'ok', list: [
+        { library_id: 13, work_id: 'new-work', title: '新入库', added_at: '2026-10-12T10:00:00Z', modified_at: '2000-01-01T00:00:00Z' },
+        { library_id: 1, work_id: 'old-work', title: '旧作品', added_at: '2026-01-01T00:00:00Z', modified_at: '2026-10-12T12:00:00Z' },
+      ] },
+      favorites: { list: [{ library_id: 1, work_id: 'legacy-work', title: '旧版响应' }] },
+    } })
+    expect(result.sections.recently_added.list.map(item => item.work_id)).toEqual(['new-work', 'old-work'])
+    expect(result.sections.recently_added.list[0]).toMatchObject({ added_at: '2026-10-12T10:00:00Z', modified_at: '2000-01-01T00:00:00Z' })
+    expect(result.sections.favorites.list[0].added_at).toBeUndefined()
+  })
+
   it('keeps synced external-source history and its safe artwork as non-playable account history', () => {
     const page = normalizeUserHistoryPage({ list: [{
       library_id: 0, work_id: 'emby:item:42', source_kind: 'emby', source_name: '客厅 Emby',

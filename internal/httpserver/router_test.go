@@ -29,6 +29,7 @@ import (
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud/pan115"
 	downloadpkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/downloader"
 	sitepkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/site"
+	"golang.org/x/crypto/bcrypt"
 	"gorm.io/gorm"
 )
 
@@ -2126,8 +2127,26 @@ func (c *testClient) login(t *testing.T, username, password string) {
 }
 
 func TestSetupSessionAndViewerPermissionBoundary(t *testing.T) {
+	const ownerPassword = "Owner123"
+	const viewerPassword = "Viewer12"
+	const resetPassword = "Renew123"
 	client := newTestClient(t)
-	setup := client.setup(t)
+	status, envelope := client.request(t, http.MethodPost, "/api/v1/setup/owner", map[string]any{"username": "owner", "password": "seven77"}, false)
+	if status != http.StatusBadRequest || !bytes.Contains(envelope.Data, []byte(services.CodeInvalidRequest)) {
+		t.Fatalf("seven-character setup password status=%d data=%s", status, envelope.Data)
+	}
+	status, envelope = client.request(t, http.MethodPost, "/api/v1/setup/owner", map[string]any{"username": "owner", "display_name": "Owner", "password": ownerPassword}, false)
+	if status != http.StatusCreated {
+		t.Fatalf("eight-character setup password status=%d message=%s", status, envelope.Message)
+	}
+	var setup map[string]any
+	if err := json.Unmarshal(envelope.Data, &setup); err != nil {
+		t.Fatal(err)
+	}
+	client.csrf, _ = setup["csrf_token"].(string)
+	if client.csrf == "" || client.cookie == nil {
+		t.Fatal("setup did not issue csrf and session cookie")
+	}
 	status, transfers := client.request(t, http.MethodGet, "/api/v1/transfers?page=1&page_size=20", nil, false)
 	if status != http.StatusOK || !bytes.Contains(transfers.Data, []byte(`"stats"`)) || client.lastHeader.Get("Cache-Control") != "no-store" {
 		t.Fatalf("owner transfers status=%d cache=%q data=%s", status, client.lastHeader.Get("Cache-Control"), transfers.Data)
@@ -2186,13 +2205,24 @@ func TestSetupSessionAndViewerPermissionBoundary(t *testing.T) {
 	if viewerID == 0 {
 		t.Fatal("viewer role missing")
 	}
-	status, _ = client.request(t, http.MethodPost, "/api/v1/users", map[string]any{"username": "viewer", "display_name": "Viewer", "password": "viewer-strong-password", "role_ids": []uint{viewerID}}, true)
+	status, envelope = client.request(t, http.MethodPost, "/api/v1/users", map[string]any{"username": "viewer", "password": "seven77", "role_ids": []uint{viewerID}}, true)
+	if status != http.StatusBadRequest || !bytes.Contains(envelope.Data, []byte(services.CodeInvalidRequest)) {
+		t.Fatalf("seven-character create password status=%d data=%s", status, envelope.Data)
+	}
+	status, _ = client.request(t, http.MethodPost, "/api/v1/users", map[string]any{"username": "viewer", "display_name": "Viewer", "password": viewerPassword, "role_ids": []uint{viewerID}}, true)
 	if status != http.StatusCreated {
 		t.Fatalf("create viewer status=%d", status)
 	}
+	var viewerUser models.User
+	if err := client.db.First(&viewerUser, "username_normalized = ?", "viewer").Error; err != nil {
+		t.Fatal(err)
+	}
+	if cost, err := bcrypt.Cost([]byte(viewerUser.PasswordHash)); err != nil || cost != 12 {
+		t.Fatalf("password hash cost=%d err=%v", cost, err)
+	}
 
 	viewer := newTestClientWithRouter(client.router)
-	viewer.login(t, "viewer", "viewer-strong-password")
+	viewer.login(t, "viewer", viewerPassword)
 	status, _ = viewer.request(t, http.MethodGet, "/api/v1/dashboard", nil, false)
 	if status != http.StatusOK {
 		t.Fatalf("viewer dashboard status=%d", status)
@@ -2229,6 +2259,32 @@ func TestSetupSessionAndViewerPermissionBoundary(t *testing.T) {
 	if status != http.StatusForbidden {
 		t.Fatalf("viewer metadata token test status=%d", status)
 	}
+	resetPath := "/api/v1/users/" + uintString(viewerUser.ID) + "/reset-password"
+	status, envelope = client.request(t, http.MethodPost, resetPath, map[string]any{"password": "seven77", "current_password": ownerPassword}, true)
+	if status != http.StatusBadRequest || !bytes.Contains(envelope.Data, []byte(services.CodeInvalidRequest)) {
+		t.Fatalf("seven-character reset password status=%d data=%s", status, envelope.Data)
+	}
+	status, envelope = client.request(t, http.MethodPost, resetPath, map[string]any{"password": resetPassword, "current_password": "incorrect"}, true)
+	if status != http.StatusUnauthorized || !bytes.Contains(envelope.Data, []byte(services.CodeInvalidCredentials)) {
+		t.Fatalf("password reset reauthentication status=%d data=%s", status, envelope.Data)
+	}
+	status, _ = viewer.request(t, http.MethodGet, "/api/v1/auth/me", nil, false)
+	if status != http.StatusOK {
+		t.Fatalf("failed password reset revoked session status=%d", status)
+	}
+	status, envelope = client.request(t, http.MethodPost, resetPath, map[string]any{"password": resetPassword, "current_password": ownerPassword}, true)
+	if status != http.StatusOK {
+		t.Fatalf("eight-character reset password status=%d message=%s", status, envelope.Message)
+	}
+	status, _ = viewer.request(t, http.MethodGet, "/api/v1/auth/me", nil, false)
+	if status != http.StatusUnauthorized {
+		t.Fatalf("password reset kept old session status=%d", status)
+	}
+	status, _ = viewer.request(t, http.MethodPost, "/api/v1/auth/login", map[string]string{"username": "viewer", "password": viewerPassword}, false)
+	if status != http.StatusUnauthorized {
+		t.Fatalf("password reset kept old password status=%d", status)
+	}
+	viewer.login(t, "viewer", resetPassword)
 
 	user := setup["user"].(map[string]any)
 	ownerID := uint(user["id"].(float64))

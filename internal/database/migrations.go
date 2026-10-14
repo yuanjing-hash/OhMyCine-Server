@@ -2243,7 +2243,7 @@ func seedAuthorization(db *gorm.DB) error {
 				}
 			}
 		}
-		return nil
+		return seedNormalUserRole(tx)
 	})
 }
 
