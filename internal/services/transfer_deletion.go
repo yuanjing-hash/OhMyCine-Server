@@ -16,6 +16,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/authz"
+	serverlog "github.com/yuanjing-hash/OhMyCine-Server/internal/logging"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/medialibrary"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
 	storagefs "github.com/yuanjing-hash/OhMyCine-Server/internal/storage"
@@ -187,7 +188,7 @@ func (s *TransferService) PreviewDeletion(ctx context.Context, actor Actor, tran
 	return result, nil
 }
 
-func (s *TransferService) ConfirmDeletion(ctx context.Context, actor Actor, transferID, rawToken string, request RequestContext) (TransferDeletionResult, error) {
+func (s *TransferService) ConfirmDeletion(ctx context.Context, actor Actor, transferID, rawToken string, request RequestContext) (result TransferDeletionResult, resultErr error) {
 	ctx, cancel := boundedTransferDeletionContext(ctx)
 	defer cancel()
 	rawToken = strings.TrimSpace(rawToken)
@@ -286,6 +287,19 @@ func (s *TransferService) ConfirmDeletion(ctx context.Context, actor Actor, tran
 	if boundary.physicalPermit != nil {
 		defer quiesceCatalogPhysicalWrite(s.db, *boundary.physicalPermit, s.log)
 	}
+	ctx = serverlog.WithBusinessFields(ctx, transferBusinessFields(boundary.transfer, boundary.download))
+	ctx = serverlog.WithBusinessFields(ctx, map[string]any{"source_name": firstNonEmpty(boundary.download.DownloaderName, "下载暂存区"), "target_name": boundary.library.Name, "library_name": boundary.library.Name})
+	started := time.Now()
+	serverlog.RecordBusiness(ctx, s.log, serverlog.OperationDownloadStagingCleanup, serverlog.BusinessEvent{Code: "deletion.start", Stage: "cleanup", Outcome: "started", Message: "删除确认与归属边界已通过，开始按用户选择的范围处理；未选择的来源或媒体库内容保留", Fields: map[string]any{"action": preview.Scope, "total_count": len(boundary.managed), "user_id": actor.User.ID}})
+	defer func() {
+		outcome, message := "finished", "本次所选删除范围及目录记录已按原流程处理；物理移除确认和外部下载器受理分别见文件与来源记录"
+		fields := map[string]any{"action": preview.Scope, "processed_count": state.SourceRemoved + state.LibraryRemoved, "duration_ms": time.Since(started).Milliseconds(), "user_id": actor.User.ID}
+		if resultErr != nil {
+			outcome, message = "partial", "本次删除处理未全部完成，记录和未确认清单保留；已确认动作不重复推断或重做"
+			fields["error_code"] = ErrorCode(resultErr)
+		}
+		serverlog.RecordBusiness(ctx, s.log, serverlog.OperationDownloadStagingCleanup, serverlog.BusinessEvent{Code: "deletion.finish", Stage: "cleanup", Outcome: outcome, Message: message, Fields: fields})
+	}()
 
 	if state.LibraryCompleted == nil {
 		state.LibraryCompleted = map[uint]bool{}
@@ -482,6 +496,7 @@ func (s *TransferService) validateSourceDeletionBoundary(ctx context.Context, b 
 		_, _, present, detached, rootGone, err := s.pan115DeletionBoundary(ctx, *b, b.sourceManifest.Files)
 		b.sourcePresent, b.sourceDetached, b.sourceRootGone = present, detached, rootGone
 		if rootGone {
+			serverlog.RecordBusiness(ctx, s.log, serverlog.OperationDownloadStagingCleanup, serverlog.BusinessEvent{Code: "deletion.source.missing", Stage: "cleanup", Outcome: "reused", Message: "现有边界核对确认下载包已不存在，本次未再次回收", Fields: map[string]any{"total_count": len(b.sourceManifest.Files)}})
 			b.sourceMissing = len(b.sourceManifest.Files)
 		}
 		return err
@@ -710,6 +725,7 @@ func (s *TransferService) deleteTransferSource(ctx context.Context, b transferDe
 		if !ok || !mutations.Capabilities().Recycle {
 			return 0, appError(CodeTransferDeletionUnavailable, "115 回收能力不可用", nil)
 		}
+		outcome := "accepted"
 		if err := mutations.Recycle(ctx, root.ID); err != nil {
 			_, statErr := driver.Stat(ctx, root.ID)
 			if code, _ := cloudpkg.ErrorInfo(statErr); code != cloudpkg.CodeNotFound {
@@ -718,7 +734,9 @@ func (s *TransferService) deleteTransferSource(ctx context.Context, b transferDe
 				}
 				return 0, err
 			}
+			outcome = "confirmed"
 		}
+		serverlog.RecordBusiness(ctx, s.log, serverlog.OperationDownloadStagingCleanup, serverlog.BusinessEvent{Code: "deletion.source.recycle", Stage: "cleanup", Outcome: outcome, Message: "受控下载包回收调用已返回；受理与现有缺失核对按本条状态区分，不扩展到其他目录", Fields: map[string]any{"processed_count": present}})
 		_ = s.db.Model(&models.DownloadTask{}).Where("id = ?", b.download.ID).Updates(map[string]any{"provider_task_id": "", "provider_status": "deleted", "updated_at": time.Now().UTC()}).Error
 		return present, nil
 	}
@@ -728,16 +746,23 @@ func (s *TransferService) deleteTransferSource(ctx context.Context, b transferDe
 			return 0, appError(CodeTransferDeletionUnavailable, "原下载器不可用，未删除源文件", nil)
 		}
 		if err := client.Cancel(ctx, b.download.ProviderTaskID, true); err == nil {
+			serverlog.RecordBusiness(ctx, s.log, serverlog.OperationDownloadStagingCleanup, serverlog.BusinessEvent{Code: "deletion.source.accepted", Stage: "cleanup", Outcome: "accepted", Message: "原下载器已接受移除任务及其数据的请求；不伪装远端逐文件遥测", Fields: map[string]any{"total_count": len(b.sourceManifest.Files)}})
 			_ = s.db.Model(&models.DownloadTask{}).Where("id = ?", b.download.ID).Updates(map[string]any{"provider_task_id": "", "provider_status": "deleted", "updated_at": time.Now().UTC()}).Error
 			return len(b.sourceManifest.Files), nil
 		} else if !providerTaskMissing(err) {
 			return 0, err
 		}
 	}
-	return deleteLocalSourceManifest(b.download, b.sourceManifest.Files)
+	return deleteLocalSourceManifestObserved(b.download, b.sourceManifest.Files, func(file downloadpkg.File, outcome, message string) {
+		s.deletionFileEvent(ctx, file.RelativePath, file.Size, outcome, message)
+	})
 }
 
 func deleteLocalSourceManifest(download models.DownloadTask, files []downloadpkg.File) (int, error) {
+	return deleteLocalSourceManifestObserved(download, files, nil)
+}
+
+func deleteLocalSourceManifestObserved(download models.DownloadTask, files []downloadpkg.File, observe stagingCleanupObserver) (int, error) {
 	root, err := canonicalLocalDeletionRoot(download.StagingAbsolutePath)
 	if err != nil {
 		return 0, err
@@ -757,7 +782,13 @@ func deleteLocalSourceManifest(download models.DownloadTask, files []downloadpkg
 			return removed, errors.New("source file changed")
 		}
 		if err := os.Remove(target); err != nil {
+			if observe != nil {
+				observe(file, "failed", "本地来源文件移除失败，后续清单保留")
+			}
 			return removed, err
+		}
+		if observe != nil {
+			observe(file, "confirmed", "已移除归属核对通过的本地来源文件")
 		}
 		removed++
 		pruneEmptyStagingDirectories(root, filepath.Dir(target))
@@ -800,8 +831,10 @@ func (s *TransferService) deleteTransferLibrary(ctx context.Context, b transferD
 					return removed, errors.New("managed library file changed")
 				}
 				if err := os.Remove(target); err != nil {
+					s.deletionFileEvent(ctx, item.RelativePath, item.Size, "failed", "本地托管媒体库文件移除失败，后续清单保留")
 					return removed, err
 				}
+				s.deletionFileEvent(ctx, item.RelativePath, item.Size, "confirmed", "已移除归属核对通过的本地媒体库文件")
 				removed++
 				pruneEmptyStagingDirectories(root, filepath.Dir(target))
 			}
@@ -839,8 +872,10 @@ func (s *TransferService) deleteTransferLibrary(ctx context.Context, b transferD
 				return removed, errors.New("managed cloud item changed")
 			}
 			if err := mutations.Recycle(ctx, current.ID); err != nil {
+				s.deletionFileEvent(ctx, item.RelativePath, item.Size, "uncertain", "云端托管文件回收未取得成功受理结果，不推断文件已删除")
 				return removed, err
 			}
+			s.deletionFileEvent(ctx, item.RelativePath, item.Size, "accepted", "云端托管文件回收请求已受理；本阶段没有追加删除结果探测")
 			removed++
 		} else if code, _ := cloudpkg.ErrorInfo(err); code != cloudpkg.CodeNotFound {
 			return removed, err

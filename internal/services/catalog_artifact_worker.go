@@ -523,6 +523,9 @@ func (s *MediaArtifactService) prepareCatalogArtifactScope(ctx context.Context, 
 				applicable := policy.STRMEnabled
 				healthy, artifactIDs := inspections[index].healthy, inspections[index].artifactIDs
 				if healthy {
+					for _, artifact := range artifacts {
+						s.observeLocalArtifact(ctx, run, artifact.Kind, artifact.RelativePath, "skipped", "content_reused", -1, nil, false)
+					}
 					for _, artifactID := range artifactIDs {
 						rebind = append(rebind, catalogArtifactRebind{ID: artifactID, ProviderItemID: entry.ProviderID, UpdateProvider: artifacts[0].ProviderItemID != entry.ProviderID})
 					}
@@ -615,6 +618,9 @@ func (s *MediaArtifactService) prepareCatalogArtifactScope(ctx context.Context, 
 				applicable := policy.STRMEnabled && policy.StorageType != models.StorageTypeLocal
 				healthy := inspections[index].healthy
 				if healthy {
+					for _, artifact := range artifacts {
+						s.observeLocalArtifact(ctx, run, artifact.Kind, artifact.RelativePath, "skipped", "content_reused", -1, nil, false)
+					}
 					rebind = append(rebind, catalogArtifactRebind{ID: inspections[index].artifactIDs[0], ProviderItemID: asset.ProviderID, UpdateProvider: artifacts[0].ProviderItemID != asset.ProviderID})
 					if row.ScopeMode == catalogArtifactScopeIncremental {
 						noops = append(noops, id)
@@ -715,6 +721,9 @@ func (s *MediaArtifactService) prepareCatalogArtifactScope(ctx context.Context, 
 				applicable := policy.Metadata
 				healthy, artifactIDs := inspections[index].healthy, inspections[index].artifactIDs
 				if healthy {
+					for _, artifact := range artifacts {
+						s.observeLocalArtifact(ctx, run, artifact.Kind, artifact.RelativePath, "skipped", "content_reused", -1, nil, false)
+					}
 					for _, artifactID := range artifactIDs {
 						rebind = append(rebind, catalogArtifactRebind{ID: artifactID})
 					}

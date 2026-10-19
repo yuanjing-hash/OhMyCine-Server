@@ -114,6 +114,8 @@ func (w *TransferWorker) runRemoteNodeUpload(ctx context.Context, runtime JobRun
 	if err != nil {
 		return w.cloudFailure(task, cloudTransferError("transfer_plan_invalid", false, err))
 	}
+	ctx = withFileDisplayNames(ctx, firstNonEmpty(node.Name, "传输节点"), task.LibraryName)
+	w.transferEvent(ctx, task, "node.upload.plan", "planning", "planned", "节点直传计划已冻结，将按原批次发送并读取节点回执；主 Server 不伪装节点内部文件操作过程", map[string]any{"total_count": len(rows), "batch_count": len(batches)})
 	for _, batch := range batches {
 		if ctx.Err() != nil {
 			return WorkerResult{}
@@ -213,6 +215,7 @@ func buildRemoteUploadBatches(rows []models.RemoteUploadFile, storage models.Sto
 }
 
 func (w *TransferWorker) executeRemoteUploadBatch(ctx context.Context, runtime JobRuntime, client remoteUploadNodeClient, node models.TransferNode, storage models.Storage, task *models.TransferTask, download models.DownloadTask, allRows []models.RemoteUploadFile, batch remoteUploadBatch) error {
+	w.transferEvent(ctx, *task, "node.upload.dispatch", "upload", "started", "开始处理节点直传批次，发送或核对既有冻结计划；不重复创建已完成的操作", map[string]any{"batch_count": batch.index + 1, "total_count": len(batch.rows)})
 	operationKey := remoteUploadOperationKey(task.ID, batch.index)
 	plan, record, completed, err := w.prepareRemoteUploadOperation(ctx, node.ID, download.ID, operationKey, batch.plan)
 	if err != nil {
@@ -263,12 +266,25 @@ func (w *TransferWorker) executeRemoteUploadBatch(ctx context.Context, runtime J
 
 	credentialRefreshes := 0
 	leaseExpiresAt := plan.LeaseExpiresAt
+	lastObserved := ""
 	for {
 		if err := validateStorageActionResponse(response, request, len(batch.rows)); err != nil {
 			return err
 		}
 		if err := w.applyRemoteUploadResponse(ctx, task, allRows, batch.rows, response); err != nil {
 			return err
+		}
+		observed := response.Status + ":" + response.ErrorCode
+		if observed != lastObserved {
+			lastObserved = observed
+			outcome, message := "accepted", "主 Server 已取得节点批次回执，继续等待节点返回可核对的最终文件结果"
+			if response.Status == nodeprotocol.StorageActionCompleted {
+				outcome, message = "confirmed", "节点已返回批次完成回执；仅确认回执中实际文件，后续目录发布独立处理"
+			}
+			if response.Status == nodeprotocol.StorageActionWaitingCredentials || response.Status == nodeprotocol.StorageActionReconciliation {
+				outcome, message = "waiting", "节点批次正在等待凭据或结果核对，原任务保持恢复流程，不能视为媒体已入库"
+			}
+			w.transferEvent(ctx, *task, "node.upload.receipt", "upload", outcome, message, map[string]any{"completed_count": response.CompletedFiles, "total_count": len(batch.rows)})
 		}
 		phase := nodeprotocol.PhaseUploadingTarget
 		switch response.Status {
@@ -518,6 +534,15 @@ func (w *TransferWorker) applyRemoteUploadResponse(ctx context.Context, task *mo
 			return cloudTransferError("transfer_state_persist_failed", true, firstNonNil(result.Error, gorm.ErrRecordNotFound))
 		}
 		row.Status, row.TargetParentID, row.TargetItemID, row.TargetSHA1, row.UpdatedAt = file.Status, file.TargetParentID, file.TargetItemID, strings.ToUpper(file.SHA1), now
+		display := relativeFileDisplay(row.SourceRelative, row.TargetRelative, row.Size)
+		outcome, message := "confirmed", "节点文件回执已通过身份、名称与大小检查，已记录目标文件结果"
+		if file.Status == nodeprotocol.StorageFileReused {
+			outcome, message = "reused", "节点回执说明复用已有目标，未将复用记为新上传"
+		}
+		if file.Status == nodeprotocol.StorageFileSkipped {
+			outcome, message = "skipped", "节点回执说明同名目标已按策略跳过，没有确认新的上传文件"
+		}
+		w.transferEvent(ctx, *task, "node.upload.file", "upload", outcome, message+"："+display.description(), display.fields())
 		for allIndex := range allRows {
 			if allRows[allIndex].ID == row.ID {
 				allRows[allIndex] = *row

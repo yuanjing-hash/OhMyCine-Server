@@ -308,6 +308,9 @@ type downloadJobPayload struct {
 }
 
 type DownloadTaskSummary struct {
+	// Internal observation from the actual insert/idempotency branch. Never sent
+	// to clients or inferred from a successful return/time-based heuristic.
+	submissionOutcome string
 	ShareValidation   *SiteShareValidation  `json:"share_validation,omitempty"`
 	SelectionTasks    []DownloadTaskSummary `json:"selection_tasks,omitempty"`
 	SelectionPending  int                   `json:"selection_pending,omitempty"`
@@ -375,7 +378,20 @@ const (
 	DownloadListScopeAll     = "all"
 )
 
-func (s *DownloadService) Submit(ctx context.Context, actor Actor, input SubmitDownloadInput, request RequestContext) (DownloadTaskSummary, error) {
+func (s *DownloadService) Submit(ctx context.Context, actor Actor, input SubmitDownloadInput, request RequestContext) (result DownloadTaskSummary, resultErr error) {
+	defer func() {
+		if resultErr == nil {
+			return
+		}
+		fields := map[string]any{"user_id": actor.User.ID, "downloader_id": input.DownloaderID, "error_code": ErrorCode(resultErr)}
+		if input.MediaLibraryID != nil {
+			fields["library_id"] = *input.MediaLibraryID
+		}
+		if input.SourceSiteID > 0 {
+			fields["site_id"] = input.SourceSiteID
+		}
+		serverlog.RecordBusiness(ctx, s.log, serverlog.OperationDownloadTask, serverlog.BusinessEvent{Code: "download.request.failed", Stage: "enqueue", Outcome: "failed", Message: "下载请求未获接受，未确认新任务创建；请结合当前权限、下载器与目标路线错误码检查", Fields: fields})
+	}()
 	if !actor.Can(authz.PermissionDownloadsCreate) {
 		return DownloadTaskSummary{}, appError(CodePermissionDenied, "无权创建下载任务", nil)
 	}
@@ -401,7 +417,7 @@ func (s *DownloadService) submit(ctx context.Context, ownerID uint, input Submit
 			if existing.Phase != models.DownloadTaskStatusFailed && existing.Phase != models.DownloadTaskStatusCancelled {
 				var job models.Job
 				_ = s.db.First(&job, "id = ?", existing.JobID).Error
-				return downloadTaskSummary(existing, job.Status), nil
+				return s.observedSubmission(ctx, existing, job.Status, "reused", input.SourceSiteID), nil
 			}
 			result := s.db.Model(&models.DownloadTask{}).
 				Where("id = ? AND phase IN ?", existing.ID, []string{models.DownloadTaskStatusFailed, models.DownloadTaskStatusCancelled}).
@@ -663,12 +679,12 @@ func (s *DownloadService) submit(ctx context.Context, ownerID uint, input Submit
 			if queryErr := s.db.Where("follow_subscription_id = ? AND follow_resource_fingerprint = ?", input.FollowSubscriptionID, input.FollowResourceFingerprint).First(&existing).Error; queryErr == nil {
 				var existingJob models.Job
 				_ = s.db.First(&existingJob, "id = ?", existing.JobID).Error
-				return downloadTaskSummary(existing, existingJob.Status), nil
+				return s.observedSubmission(ctx, existing, existingJob.Status, "reused", input.SourceSiteID), nil
 			}
 		}
 		return DownloadTaskSummary{}, err
 	}
-	return downloadTaskSummary(record, job.Status), nil
+	return s.observedSubmission(ctx, record, job.Status, "created", input.SourceSiteID), nil
 }
 
 func validDownloadIdentityBinding(identity DownloadRecognitionIdentity) bool {
@@ -1610,17 +1626,38 @@ func NewDownloadWorker(service *DownloadService) *DownloadWorker {
 	return &DownloadWorker{service: service, pollInterval: 2 * time.Second, reconnectInterval: 10 * time.Second, pan115PollInterval: pan115DownloadFallbackPollInterval, heartbeatInterval: pan115DownloadHeartbeatInterval, tagCleanupInterval: managedTagCleanupRetryInterval}
 }
 
-func (w *DownloadWorker) Run(ctx context.Context, runtime JobRuntime, job ClaimedJob) WorkerResult {
+func (w *DownloadWorker) Run(ctx context.Context, runtime JobRuntime, job ClaimedJob) (result WorkerResult) {
+	started := time.Now()
+	var observedTask models.DownloadTask
+	defer func() {
+		if observedTask.ID != "" {
+			w.recordDownloadEnd(ctx, observedTask, started, result)
+		}
+	}()
 	if w.service != nil && w.service.pluginDownloads != nil {
 		var payload downloadJobPayload
 		if json.Unmarshal([]byte(job.Job.PayloadJSON), &payload) == nil && payload.DownloadTaskID != "" {
-			var provider struct{ ProviderType string }
+			var provider models.DownloadTask
 			if w.service.db.Model(&models.DownloadTask{}).Select("provider_type").First(&provider, "id = ?", payload.DownloadTaskID).Error == nil && provider.ProviderType == models.DownloaderTypePluginHTTP {
+				// The plugin executor owns its provider protocol; this wrapper only
+				// records the Server task lifecycle and its actual terminal state.
+				_ = w.service.db.First(&observedTask, "id = ?", payload.DownloadTaskID).Error
+				w.recordDownload(ctx, observedTask, "download.start", "start", "started", "开始执行插件下载任务，后续阶段以插件执行器确认的结果为准", nil)
 				return w.service.pluginDownloads.Run(ctx, runtime, job)
 			}
 		}
 	}
-	if recoveryTask, recovery, recoveryErr := w.completedRecognitionRecoveryTask(job); recoveryErr != nil {
+	recoveryTask, recovery, recoveryErr := w.completedRecognitionRecoveryTask(job)
+	observedTask = recoveryTask
+	ctx = serverlog.WithBusinessFields(ctx, downloadBusinessFields(observedTask))
+	var sourcePayload downloadJobPayload
+	if json.Unmarshal([]byte(job.Job.PayloadJSON), &sourcePayload) == nil && sourcePayload.SourceSiteID > 0 {
+		ctx = serverlog.WithBusinessFields(ctx, map[string]any{"site_id": sourcePayload.SourceSiteID})
+	}
+	if observedTask.ID != "" {
+		w.recordDownload(ctx, observedTask, "download.start", "start", "started", fmt.Sprintf("开始执行下载任务 %s，下载器：%s；先复核原任务状态", serverlog.BusinessDisplayName(observedTask.DisplayName), serverlog.BusinessDisplayName(observedTask.DownloaderName)), nil)
+	}
+	if recoveryErr != nil {
 		return w.failure(recoveryTask, recoveryErr)
 	} else if recovery {
 		if recoveryTask.Phase == models.DownloadTaskStatusCancelled {
@@ -1644,8 +1681,10 @@ func (w *DownloadWorker) Run(ctx context.Context, runtime JobRuntime, job Claime
 		}
 		return w.runCompletedRecognitionRecovery(ctx, runtime, recoveryTask, manifest)
 	}
-	started := time.Now()
 	task, downloaderRecord, client, source, savePath, err := w.load(ctx, job)
+	if task.ID != "" {
+		observedTask = task
+	}
 	if err != nil {
 		return w.failure(task, err)
 	}
@@ -1653,7 +1692,6 @@ func (w *DownloadWorker) Run(ctx context.Context, runtime JobRuntime, job Claime
 		return WorkerResult{}
 	}
 	operation := downloadOperation(downloaderRecord.Type, task.SourceOrigin)
-	operation.Event(w.service.log.Info()).Str("task_id", task.ID).Str("downloader_id", downloaderRecord.ID).Str("provider_type", downloaderRecord.Type).Msg(operation.Message("开始执行"))
 	if isCompletedRecognitionRecovery(task) {
 		manifestClient, ok := client.(downloadpkg.ManifestClient)
 		if !ok {
@@ -1681,7 +1719,7 @@ func (w *DownloadWorker) Run(ctx context.Context, runtime JobRuntime, job Claime
 		}
 	}
 	if task.ProviderTaskID == "" {
-		operation.Event(w.service.log.Info()).Str("task_id", task.ID).Str("downloader_id", downloaderRecord.ID).Msg(operation.Message("正在提交到下载器"))
+		w.recordDownload(ctx, task, "download.provider_submit", "submit", "started", fmt.Sprintf("准备将 %s 提交到下载器 %s；当前尚未取得下载器接受确认", serverlog.BusinessDisplayName(task.DisplayName), serverlog.BusinessDisplayName(task.DownloaderName)), nil)
 		active, persistErr := w.updateActiveTask(&task, map[string]any{"phase": models.DownloadTaskStatusSubmitting, "updated_at": time.Now().UTC()})
 		if persistErr != nil {
 			return WorkerResult{ErrorCode: "download_state_persist_failed", ErrorMessage: "下载任务状态保存失败"}
@@ -1714,7 +1752,9 @@ func (w *DownloadWorker) Run(ctx context.Context, runtime JobRuntime, job Claime
 			}
 			return WorkerResult{}
 		}
-		operation.Event(w.service.log.Info()).Str("task_id", task.ID).Str("downloader_id", downloaderRecord.ID).Str("provider_status", providerTask.Status).Msg(operation.Message("已提交到下载器"))
+		w.recordDownload(ctx, task, "download.provider_accepted", "submit", "accepted", "下载器已返回任务身份并完成持久保存；继续跟踪原任务，尚未确认下载完成", nil)
+	} else {
+		w.recordDownload(ctx, task, "download.provider_reused", "tracking", "reused", "已有持久保存的下载器任务身份，继续核对原任务状态，本次不重新提交下载", nil)
 	}
 	if metadataClient, ok := client.(downloadpkg.MetadataClient); ok && task.ScrapeStatus != "classified" && task.ScrapeStatus != "fallback_unrecognized" {
 		result := w.prepareClassification(ctx, runtime, &task, metadataClient, savePath)
@@ -1743,7 +1783,7 @@ func (w *DownloadWorker) Run(ctx context.Context, runtime JobRuntime, job Claime
 					if persistErr := w.markProviderReconnectWait(&task, code, message); persistErr != nil {
 						return WorkerResult{ErrorCode: "download_state_persist_failed", ErrorMessage: "下载器连接状态保存失败"}
 					}
-					operation.Event(w.service.log.Warn()).Str("task_id", task.ID).Str("error_code", code).Msg(operation.Message("连接暂时不可用，保留原任务并等待恢复"))
+					w.recordDownload(ctx, task, "download.reconnect_wait", "tracking", "waiting", "下载器连接暂时不可用，保留原任务等待连接恢复，不重复提交下载", map[string]any{"error_code": code})
 				}
 				if waitErr := w.waitForProviderReconnect(ctx); waitErr != nil {
 					return WorkerResult{}
@@ -1756,6 +1796,7 @@ func (w *DownloadWorker) Run(ctx context.Context, runtime JobRuntime, job Claime
 		if providerTask.ID != "" && providerTask.ID != task.ProviderTaskID {
 			task.ProviderTaskID = providerTask.ID
 		}
+		wasUnavailable := task.ProviderStatus == "unavailable"
 		if err := w.persistTrackedTelemetry(ctx, job, &task, providerTask); err != nil {
 			if ctx.Err() != nil || errors.Is(err, context.Canceled) {
 				return WorkerResult{}
@@ -1764,6 +1805,9 @@ func (w *DownloadWorker) Run(ctx context.Context, runtime JobRuntime, job Claime
 				return WorkerResult{ErrorCode: CodeQueueLeaseInvalid, ErrorMessage: "下载跟踪租约已失效，旧执行器已停止写入"}
 			}
 			return w.telemetryPersistenceFailure(task, durableProviderID, err)
+		}
+		if wasUnavailable {
+			w.recordDownload(ctx, task, "download.reconnected", "tracking", "confirmed", "下载器连接已恢复，已重新取得原任务状态，继续跟踪原下载", nil)
 		}
 		if task.ProviderTag != "" && (nextTagCleanupAt.IsZero() || !time.Now().Before(nextTagCleanupAt)) {
 			if cleanupErr := w.service.cleanupManagedProviderTag(ctx, &task, client); cleanupErr != nil {
@@ -1791,7 +1835,7 @@ func (w *DownloadWorker) Run(ctx context.Context, runtime JobRuntime, job Claime
 			return w.telemetryPersistenceFailure(task, task.ProviderTaskID, err)
 		}
 		if providerTask.Completed {
-			operation.Event(w.service.log.Info()).Str("task_id", task.ID).Str("downloader_id", downloaderRecord.ID).Msg(operation.Message("下载器已报告完成，开始复核文件清单"))
+			w.recordDownload(ctx, task, "download.provider_completed", "verify", "confirmed", "下载器已报告完成；开始复核真实文件清单及媒体身份，此时尚未确认入库", nil)
 			var completedManifest *downloadpkg.Manifest
 			var completedSourceManifest *downloadpkg.Manifest
 			if manifestClient, ok := client.(downloadpkg.ManifestClient); ok {
@@ -1835,7 +1879,6 @@ func (w *DownloadWorker) Run(ctx context.Context, runtime JobRuntime, job Claime
 			}
 			now := time.Now().UTC()
 			_, _ = w.updateActiveTask(&task, map[string]any{"phase": models.DownloadTaskStatusCompleted, "finished_at": now, "updated_at": now})
-			operation.Event(w.service.log.Info()).Str("task_id", task.ID).Str("downloader_id", downloaderRecord.ID).Bool("transfer_enqueued", task.TargetLibraryID != nil).Int64("duration_ms", time.Since(started).Milliseconds()).Msg(operation.Message("完成"))
 			return WorkerResult{}
 		}
 		if providerTask.Failed {
@@ -1981,7 +2024,7 @@ func (w *DownloadWorker) runCompletedRecognitionRecovery(ctx context.Context, ru
 	if !active {
 		return WorkerResult{}
 	}
-	serverlog.OperationDownloadClassification.Event(w.service.log.Info()).Str("task_id", task.ID).Int("manifest_files", len(manifest.Files)).Int("selected_files", len(selected.Files)).Msg(serverlog.OperationDownloadClassification.Message("已复用完成文件清单继续入库"))
+	w.recordDownload(ctx, task, "download.manifest_reused", "verify", "confirmed", "已复用原任务保存的完整文件清单并重新确认媒体，整理任务已接受；未重新下载，后续入库查看关联整理任务", map[string]any{"total_count": len(manifest.Files), "selected_count": len(selected.Files)})
 	return WorkerResult{}
 }
 
@@ -2155,7 +2198,7 @@ func (w *DownloadWorker) waitForPan115Poll(ctx context.Context, runtime JobRunti
 
 func (w *DownloadWorker) prepareClassification(ctx context.Context, runtime JobRuntime, task *models.DownloadTask, client downloadpkg.MetadataClient, savePath string) *WorkerResult {
 	started := time.Now()
-	serverlog.OperationDownloadClassification.Event(w.service.log.Info()).Str("task_id", task.ID).Msg(serverlog.OperationDownloadClassification.Message("等待下载器元数据"))
+	w.recordDownload(ctx, *task, "download.metadata_wait", "metadata", "waiting", "等待下载器返回完整文件清单，取得可信媒体身份后再设置下载分类", nil)
 	for {
 		manifest, err := client.Manifest(ctx, task.ProviderTaskID)
 		if err != nil {
@@ -2168,7 +2211,7 @@ func (w *DownloadWorker) prepareClassification(ctx context.Context, runtime JobR
 			return &result
 		}
 		if manifest.Complete && len(manifest.Files) > 0 {
-			serverlog.OperationDownloadClassification.Event(w.service.log.Info()).Str("task_id", task.ID).Int("manifest_files", len(manifest.Files)).Msg(serverlog.OperationDownloadClassification.Message("文件清单已就绪，开始识别"))
+			w.recordDownload(ctx, *task, "download.metadata_ready", "metadata", "confirmed", fmt.Sprintf("下载器文件清单已就绪，共 %d 项，开始核对作品、季集与分类", len(manifest.Files)), map[string]any{"total_count": len(manifest.Files)})
 			if err := client.Pause(ctx, task.ProviderTaskID); err != nil {
 				result := w.failure(*task, err)
 				return &result
@@ -2199,7 +2242,7 @@ func (w *DownloadWorker) prepareClassification(ctx context.Context, runtime JobR
 					result := WorkerResult{ErrorCode: "download_state_persist_failed", ErrorMessage: "下载任务检查点保存失败"}
 					return &result
 				}
-				serverlog.OperationDownloadClassification.Event(w.service.log.Info()).Str("task_id", task.ID).Str("media_type", match.MediaType).Str("category", match.Category).Int("manifest_files", len(manifest.Files)).Int64("duration_ms", time.Since(started).Milliseconds()).Msg(serverlog.OperationDownloadClassification.Message("识别完成并已设置下载器分类"))
+				w.recordDownload(ctx, *task, "download.classified", "classification", "confirmed", fmt.Sprintf("识别为 %s，下载器分类 %s 已设置并恢复原任务；尚未移动或入库媒体", serverlog.BusinessDisplayName(match.Title), serverlog.BusinessDisplayName(match.Category)), map[string]any{"title": match.Title, "media_type": match.MediaType, "total_count": len(manifest.Files), "duration_ms": time.Since(started).Milliseconds()})
 				return nil
 			}
 			code := classificationFallbackCode(matchErr, match)
@@ -2209,7 +2252,7 @@ func (w *DownloadWorker) prepareClassification(ctx context.Context, runtime JobR
 				result := WorkerResult{ErrorCode: "download_state_persist_failed", ErrorMessage: "刮削降级结果保存失败"}
 				return &result
 			}
-			serverlog.OperationDownloadClassification.Event(w.service.log.Warn()).Str("task_id", task.ID).Str("reason_code", code).Str("credential_source", match.CredentialSource).Str("credential_kind", match.CredentialKind).Int("manifest_files", len(manifest.Files)).Int64("duration_ms", time.Since(started).Milliseconds()).Msg(serverlog.OperationDownloadClassification.Message("未达到可信阈值，已归入未识别分类"))
+			w.recordDownload(ctx, *task, "download.classification_unrecognized", "classification", "partial", "媒体身份未达到可信阈值，准备归入未识别分类；未把分类计划记为已完成入库", map[string]any{"reason": code, "total_count": len(manifest.Files), "duration_ms": time.Since(started).Milliseconds()})
 			if err := w.routeCategory(ctx, task, client, savePath, match.Category, "fallback_unrecognized", code, message); err != nil {
 				result := w.failure(*task, err)
 				return &result
@@ -2571,7 +2614,7 @@ func (w *DownloadWorker) verifyCompleted(ctx context.Context, task *models.Downl
 		if persistErr := w.persistScrape(task, match, "completed_unrecognized", len(manifest.Files)); persistErr != nil {
 			return downloadpkg.Manifest{}, appError("download_state_persist_failed", "完成后刮削结果保存失败", persistErr)
 		}
-		serverlog.OperationDownloadClassification.Event(w.service.log.Warn()).Str("task_id", task.ID).Str("reason_code", code).Str("credential_source", match.CredentialSource).Str("credential_kind", match.CredentialKind).Int("manifest_files", len(manifest.Files)).Msg(serverlog.OperationDownloadClassification.Message("下载包未识别，已阻止自动入库"))
+		w.recordDownload(ctx, *task, "download.manifest_unrecognized", "verify", "failed", "下载器虽已报告完成，但文件清单未得到可信媒体身份，已阻止自动入库；来源文件保留", map[string]any{"reason": code, "total_count": len(manifest.Files)})
 		return downloadpkg.Manifest{}, appError(CodeTransferMediaUnrecognized, "下载已完成，但媒体未识别，未自动入库；请修正识别条件后重试", nil)
 	}
 	selected, err := selectDownloadPackageManifest(manifest, match.MediaType)
@@ -2591,7 +2634,7 @@ func (w *DownloadWorker) verifyCompleted(ctx context.Context, task *models.Downl
 	if err := w.persistScrape(task, match, "completed_verified", len(selected.Files)); err != nil {
 		return downloadpkg.Manifest{}, appError("download_state_persist_failed", "完成后刮削结果保存失败", err)
 	}
-	serverlog.OperationDownloadClassification.Event(w.service.log.Info()).Str("task_id", task.ID).Str("media_type", match.MediaType).Int("manifest_files", len(manifest.Files)).Int("selected_files", len(selected.Files)).Int("excluded_files", len(manifest.Files)-len(selected.Files)).Msg(serverlog.OperationDownloadClassification.Message("下载包识别完成，已生成安全入库清单"))
+	w.recordDownload(ctx, *task, "download.manifest_verified", "verify", "confirmed", fmt.Sprintf("下载包识别为 %s；完整清单 %d 项，选择可入库媒体及附属文件 %d 项，排除 %d 项；尚未执行移动或重命名", serverlog.BusinessDisplayName(match.Title), len(manifest.Files), len(selected.Files), len(manifest.Files)-len(selected.Files)), map[string]any{"title": match.Title, "media_type": match.MediaType, "total_count": len(manifest.Files), "selected_count": len(selected.Files), "rejected_count": len(manifest.Files) - len(selected.Files)})
 	return selected, nil
 }
 

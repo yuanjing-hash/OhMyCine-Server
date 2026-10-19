@@ -302,6 +302,11 @@ func (s *Scheduler) dispatch(ctx context.Context) {
 			continue
 		}
 		workerCtx, cancel := context.WithCancel(ctx)
+		fields := map[string]any{"job_id": claimed.Job.ID, "attempt_number": claimed.Job.AttemptCount, "generation": claimed.Job.StartedGeneration}
+		if claimed.Job.OwnerID != nil {
+			fields["user_id"] = *claimed.Job.OwnerID
+		}
+		workerCtx = serverlog.WithBusinessFields(workerCtx, fields)
 		serverlog.OperationTaskQueue.Event(s.log.Info()).Str("job_id", claimed.Job.ID).Str("job_type", claimed.Job.JobType).Int("attempt", claimed.Job.AttemptCount).Msg(serverlog.OperationTaskQueue.Message("任务开始执行"))
 		s.runningMu.Lock()
 		s.running[claimed.Job.ID] = runningWork{cancel: cancel, worker: worker, job: *claimed}

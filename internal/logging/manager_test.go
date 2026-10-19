@@ -127,6 +127,10 @@ func TestManagerFallsBackToStdoutWhenLogDirectoryIsAFile(t *testing.T) {
 	if !manager.Health().Degraded || !strings.Contains(stdout.String(), "still visible") {
 		t.Fatalf("expected degraded stdout fallback: health=%+v output=%s", manager.Health(), stdout.String())
 	}
+	page, err := manager.Query(context.Background(), Filter{})
+	if err != nil || !page.Partial {
+		t.Fatalf("unreadable log directory was reported complete: %+v %v", page, err)
+	}
 }
 
 func TestBusinessOperationCanBeDisplayedAndFiltered(t *testing.T) {
@@ -174,5 +178,39 @@ func TestSanitizeJSONBoundsOversizedEvents(t *testing.T) {
 	}
 	if !bytes.Contains(out, []byte(`"operation":"incremental_strm_generation"`)) || !bytes.Contains(out, []byte(`"operation_label":"增量STRM生成"`)) {
 		t.Fatalf("oversized event lost operation identity: %s", out)
+	}
+}
+
+func TestManagerDoesNotQueryCompressOrDeleteUnmanagedHistory(t *testing.T) {
+	dir := t.TempDir()
+	content := []byte(`{"timestamp":"` + time.Now().UTC().Format(time.RFC3339Nano) + `","level":"info","module":"test","component":"backup","message":"private-unmanaged-backup"}` + "\n")
+	for _, name := range []string{"runtime-user-backup.jsonl", "runtime-20269999T000000.000000000Z-000001.jsonl"} {
+		if err := os.WriteFile(filepath.Join(dir, name), content, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		old := time.Now().Add(-90 * 24 * time.Hour)
+		if err := os.Chtimes(filepath.Join(dir, name), old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+	manager, err := NewManager(dir, "production", &bytes.Buffer{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = manager.Close() })
+	logger := manager.Logger("test", "managed")
+	logger.Info().Msg("managed observation")
+	page, err := manager.Query(context.Background(), Filter{})
+	if err != nil || len(page.List) != 1 || page.List[0].Message != "managed observation" {
+		t.Fatalf("unmanaged history queried: %+v %v", page, err)
+	}
+	for _, name := range []string{"runtime-user-backup.jsonl", "runtime-20269999T000000.000000000Z-000001.jsonl"} {
+		retained, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil || !bytes.Equal(retained, content) {
+			t.Fatalf("unmanaged file was changed: %s %v", name, err)
+		}
+		if _, err := os.Stat(filepath.Join(dir, name+".gz")); !os.IsNotExist(err) {
+			t.Fatalf("unmanaged history compressed: %s %v", name, err)
+		}
 	}
 }

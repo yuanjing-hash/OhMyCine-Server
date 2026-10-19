@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/rs/zerolog"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/authz"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/medialibrary"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
@@ -154,6 +155,7 @@ type followJobPayload struct {
 }
 
 type FollowService struct {
+	log           zerolog.Logger
 	db            *gorm.DB
 	audit         *AuditService
 	queue         *QueueService
@@ -166,8 +168,11 @@ type FollowService struct {
 }
 
 func NewFollowService(db *gorm.DB, audit *AuditService, queue *QueueService, coverage *MediaCoverageService, authorization *AuthorizationService) *FollowService {
-	return &FollowService{db: db, audit: audit, queue: queue, coverage: coverage, authorization: authorization, now: func() time.Time { return time.Now().UTC() }}
+	return &FollowService{db: db, audit: audit, queue: queue, coverage: coverage, authorization: authorization, log: zerolog.Nop(), now: func() time.Time { return time.Now().UTC() }}
 }
+
+// SetLogger is optional for existing service consumers and local fixtures.
+func (s *FollowService) SetLogger(log zerolog.Logger) { s.log = log }
 
 func (s *FollowService) SetDownloadService(downloads *DownloadService) { s.downloads = downloads }
 

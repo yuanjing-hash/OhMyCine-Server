@@ -226,6 +226,14 @@ func (w *TransferWorker) runCloudTransfer(ctx context.Context, runtime JobRuntim
 			return w.cloudFailure(task, err)
 		}
 	}
+	ctx = serverlog.WithBusinessFields(ctx, map[string]any{"source_name": sourceStorage.Name, "target_name": task.LibraryName, "source_connection_id": *sourceStorage.ConnectionID, "target_connection_id": *targetStorage.ConnectionID})
+	ctx = withCloudFileDisplays(ctx, targets)
+	previouslyComplete := map[string]bool{}
+	for key, saved := range state.Items {
+		previouslyComplete[key] = saved.Status == "completed" || saved.Status == "skipped"
+	}
+	w.transferEvent(ctx, task, "cloud.plan", "planning", "planned", fmt.Sprintf("已完成 %d 项云端命名计划；从 %s 整理到 %s，后续只在现有对账确认后记录完成", len(targets), serverlog.BusinessDisplayName(sourceStorage.Name), serverlog.BusinessDisplayName(task.LibraryName)), map[string]any{"total_count": len(targets), "conflict_count": len(conflicts), "conflict_decision": policy})
+	sampledUnchanged := 0
 	if batchMutations == nil && state.BatchIntent != nil {
 		if err := downgradeCloudBatchIntent(&state, targets, download.TransferMode); err != nil {
 			return w.cloudFailure(task, cloudTransferError("cloud_transfer_state_invalid", false, err))
@@ -233,8 +241,10 @@ func (w *TransferWorker) runCloudTransfer(ctx context.Context, runtime JobRuntim
 	}
 	if batchMutations != nil && policy == models.MediaLibraryConflictOverwrite && len(conflicts) > 0 {
 		if err := recycleCloudConflictBatches(ctx, batchMutations, driver, download.TargetProviderRootID, conflicts); err != nil {
+			w.transferEvent(ctx, task, "cloud.conflict.recycle", "conflict", "uncertain", "覆盖策略的同名目标回收尚未全部核对通过；不将未确认项记为已删除", map[string]any{"conflict_count": len(conflicts), "conflict_decision": policy})
 			return w.cloudFailure(task, err)
 		}
+		w.transferEvent(ctx, task, "cloud.conflict.recycle", "conflict", "confirmed", "覆盖策略所涉同名目标已通过既有目录对账，确认不再占用计划位置，继续原文件整理流程", map[string]any{"conflict_count": len(conflicts), "conflict_decision": policy})
 		// Every exact conflict has been reconciled as absent. Clearing this private
 		// attempt-local projection prevents the singleton compatibility path from
 		// issuing a second recycle request.
@@ -288,6 +298,9 @@ func (w *TransferWorker) runCloudTransfer(ctx context.Context, runtime JobRuntim
 				continue
 			}
 			if applied[key] {
+				if index < 20 && w.cloudFileEvent(ctx, task, key, "cloud.file.reused", "reconciliation", "reused", "现有对账已确认原目标，未重新移动或复制（有界样本）") {
+					sampledUnchanged++
+				}
 				itemState = cloudTransferItemState{SourceID: key, CurrentID: key, TargetParentID: state.Directories[pathpkg.Dir(target.Relative)], TargetName: pathpkg.Base(target.Relative), Status: "completed"}
 				if download.TransferMode == models.MediaLibraryTransferCopy {
 					itemState.CurrentID = ""
@@ -296,6 +309,9 @@ func (w *TransferWorker) runCloudTransfer(ctx context.Context, runtime JobRuntim
 			} else if conflict := conflicts[key]; conflict.ID != "" {
 				switch policy {
 				case models.MediaLibraryConflictSkip:
+					if index < 20 && w.cloudFileEvent(ctx, task, key, "cloud.file.skipped", "conflict", "skipped", "同名目标按策略保留，未移动或覆盖来源（有界样本）") {
+						sampledUnchanged++
+					}
 					state.Items[key] = cloudTransferItemState{SourceID: key, TargetParentID: conflict.ParentID, TargetName: conflict.Name, Status: "skipped"}
 				case models.MediaLibraryConflictOverwrite:
 					if conflict.IsDir {
@@ -311,6 +327,7 @@ func (w *TransferWorker) runCloudTransfer(ctx context.Context, runtime JobRuntim
 							return w.cloudFailure(task, err)
 						}
 					}
+					w.cloudFileEvent(ctx, task, key, "cloud.conflict.accepted", "conflict", "accepted", "覆盖策略的受控同名目标回收已返回可继续结果；本阶段不追加回收探测")
 					invalidateCloudDirectoryListings(ctx, conflict.ParentID)
 				default:
 					return w.cloudFailure(task, cloudTransferError("transfer_conflict_failed", false, nil))
@@ -408,6 +425,19 @@ func (w *TransferWorker) runCloudTransfer(ctx context.Context, runtime JobRuntim
 	if err := validateCloudTransferCompletion(ctx, driver, state, targets); err != nil {
 		return w.cloudFailure(task, err)
 	}
+	reusedFiles, skippedFiles := 0, 0
+	for _, target := range targets {
+		key := target.File.ProviderItemID
+		if state.Items[key].Status == "skipped" {
+			skippedFiles++
+		} else if state.Items[key].Status == "completed" && (previouslyComplete[key] || applied[key]) {
+			reusedFiles++
+		}
+		if state.Items[target.File.ProviderItemID].Status == "completed" && !previouslyComplete[target.File.ProviderItemID] && !applied[target.File.ProviderItemID] {
+			w.cloudFileEvent(ctx, task, target.File.ProviderItemID, "cloud.file.verified", "reconciliation", "confirmed", "现有最终对账已确认目标位置、名称与大小")
+		}
+	}
+	w.recordUnchangedFileSummary(ctx, task, "cloud.file.summary", len(targets), reusedFiles, skippedFiles, sampledUnchanged)
 
 	now := time.Now().UTC()
 	err = w.service.db.Transaction(func(tx *gorm.DB) error {
@@ -1201,6 +1231,14 @@ func (w *TransferWorker) prestageCloudCopyBatches(ctx context.Context, mutations
 		if reconcileErr != nil {
 			return reconcileErr
 		}
+		batchOutcome := "confirmed"
+		if len(remaining) > 0 {
+			batchOutcome = "partial"
+			if len(remaining) == len(chunk) {
+				batchOutcome = "uncertain"
+			}
+		}
+		w.transferEvent(ctx, *task, "cloud.copy.batch", "copy", batchOutcome, "既有逐项内容核对已确认本批次受控中转副本数量；未确认数量另列，副本改名和最终放置仍单独执行", map[string]any{"total_count": len(chunk), "completed_count": len(chunk) - len(remaining), "uncertain_count": len(remaining)})
 		if len(remaining) > 0 {
 			state.BatchIntent.Items = remaining
 			if err := w.persistCloudStateTimed(ctx, task, *state, models.TransferTaskStatusMoving, completedCloudItems(*state), nil); err != nil {
@@ -1428,6 +1466,11 @@ func (w *TransferWorker) executeCloudMoveBatches(ctx context.Context, mutations 
 				ids = append(ids, item.SourceID)
 			}
 			callErr := executeCloudBatchMutation(ctx, func() error { return mutations.MoveMany(ctx, ids, parentID) })
+			ackOutcome := "accepted"
+			if callErr != nil {
+				ackOutcome = "uncertain"
+			}
+			w.transferEvent(ctx, *task, "cloud.move.batch", "move", ackOutcome, "云端批次移动调用已返回，接下来按原有逐项对账确认位置与名称；调用返回不代表全部移动完成", map[string]any{"total_count": len(chunk)})
 			invalidateCloudDirectoryListings(ctx, parentID)
 			remaining, reconcileErr := w.reconcileCloudMoveIntent(ctx, mutations, driver, task, state)
 			if reconcileErr != nil {
@@ -1588,14 +1631,17 @@ func (w *TransferWorker) reconcileCloudMoveIntent(ctx context.Context, mutations
 		if item.IsDir || item.ParentID != intent.TargetParentID || item.Size != expected.Size || (expected.SHA1 != "" && !strings.EqualFold(item.SHA1, expected.SHA1)) {
 			return nil, cloudTransferError("cloud_transfer_source_changed", false, errors.New("cloud move result identity changed"))
 		}
+		w.cloudFileEvent(ctx, *task, expected.SourceID, "cloud.move.position", "move", "confirmed", "现有目录对账已确认文件到达目标目录；最终命名仍需单独确认")
 		if item.Name != expected.TargetName {
 			if err := mutations.Rename(ctx, item.ID, expected.TargetName); err != nil {
 				verified, statErr := driver.Stat(ctx, item.ID)
 				if statErr != nil || verified.ID != expected.SourceID || verified.IsDir || verified.ParentID != intent.TargetParentID || verified.Name != expected.TargetName || verified.Size != expected.Size ||
 					(expected.SHA1 != "" && !strings.EqualFold(verified.SHA1, expected.SHA1)) {
+					w.cloudFileEvent(ctx, *task, expected.SourceID, "cloud.rename.partial", "rename", "partial", "移动位置已确认，但重命名未能确认；保留原任务与现有文件，按原恢复流程继续")
 					return nil, err
 				}
 			}
+			w.cloudFileEvent(ctx, *task, expected.SourceID, "cloud.rename.accepted", "rename", "accepted", "云端重命名调用已受理，最终名称仍由现有完成对账确认")
 			invalidateCloudDirectoryListings(ctx, intent.TargetParentID)
 		}
 		state.Items[expected.SourceID] = cloudTransferItemState{SourceID: expected.SourceID, CurrentID: expected.SourceID, TargetParentID: intent.TargetParentID, TargetName: expected.TargetName, Status: "completed"}
@@ -1605,9 +1651,11 @@ func (w *TransferWorker) reconcileCloudMoveIntent(ctx context.Context, mutations
 
 func (w *TransferWorker) executeCloudMove(ctx context.Context, mutations cloudpkg.MutationDriver, driver cloudpkg.Driver, task *models.TransferTask, state *cloudTransferState, source cloudpkg.Item, targetParentID, targetName string) error {
 	if source.ParentID != targetParentID {
+		w.cloudFileEvent(ctx, *task, source.ID, "cloud.move.start", "move", "started", "开始将受控来源文件移动到计划目标目录")
 		if err := mutations.Move(ctx, source.ID, targetParentID); err != nil {
 			current, statErr := driver.Stat(ctx, source.ID)
 			if statErr != nil || current.ParentID != targetParentID {
+				w.cloudFileEvent(ctx, *task, source.ID, "cloud.move.uncertain", "move", "uncertain", "云端移动未取得目标位置确认，不能判断移动已经完成")
 				return err
 			}
 		}
@@ -1615,7 +1663,11 @@ func (w *TransferWorker) executeCloudMove(ctx context.Context, mutations cloudpk
 	}
 	current, err := driver.Stat(ctx, source.ID)
 	if err != nil {
+		w.cloudFileEvent(ctx, *task, source.ID, "cloud.move.uncertain", "move", "uncertain", "移动调用后无法取得文件状态，结果待原流程核对")
 		return err
+	}
+	if current.ParentID == targetParentID {
+		w.cloudFileEvent(ctx, *task, source.ID, "cloud.move.position", "move", "confirmed", "现有文件核对已确认目标目录位置；目标名称单独处理")
 	}
 	if current.Name != targetName {
 		if err := w.persistCloudState(task, *state, models.TransferTaskStatusRenaming, completedCloudItems(*state), nil); err != nil {
@@ -1624,9 +1676,15 @@ func (w *TransferWorker) executeCloudMove(ctx context.Context, mutations cloudpk
 		if err := mutations.Rename(ctx, source.ID, targetName); err != nil {
 			verified, statErr := driver.Stat(ctx, source.ID)
 			if statErr != nil || verified.Name != targetName {
+				outcome, message := "uncertain", "移动及命名结果仍待核对，未将本文件记为成功"
+				if current.ParentID == targetParentID {
+					outcome, message = "partial", "已确认移动目录阶段，但重命名未能确认；未将本文件记为完整成功"
+				}
+				w.cloudFileEvent(ctx, *task, source.ID, "cloud.rename.partial", "rename", outcome, message)
 				return err
 			}
 		}
+		w.cloudFileEvent(ctx, *task, source.ID, "cloud.rename.accepted", "rename", "accepted", "云端重命名调用已受理，等待现有最终位置与名称对账")
 		invalidateCloudDirectoryListings(ctx, targetParentID)
 		if err := w.persistCloudState(task, *state, models.TransferTaskStatusMoving, completedCloudItems(*state), nil); err != nil {
 			return cloudTransferError("transfer_state_persist_failed", true, err)
@@ -1709,6 +1767,7 @@ func (w *TransferWorker) executeCloudCopy(ctx context.Context, mutations cloudpk
 			}
 		}
 		copyID = candidate.ID
+		w.cloudFileEvent(ctx, *task, source.ID, "cloud.copy.materialized", "copy", "confirmed", "已有内容核对确认一份云端副本；副本仍在受控中转阶段，尚未确认最终目标位置")
 		itemState = cloudTransferItemState{SourceID: source.ID, CurrentID: copyID, TargetParentID: targetParentID, TargetName: targetName, Status: "copied"}
 		state.Items[source.ID] = itemState
 		if err := w.persistCloudState(task, *state, models.TransferTaskStatusMoving, completedCloudItems(*state), nil); err != nil {
@@ -1726,9 +1785,11 @@ func (w *TransferWorker) executeCloudCopy(ctx context.Context, mutations cloudpk
 		if err := mutations.Rename(ctx, copyID, targetName); err != nil {
 			verified, statErr := driver.Stat(ctx, copyID)
 			if statErr != nil || verified.Name != targetName {
+				w.cloudFileEvent(ctx, *task, source.ID, "cloud.copy.rename_partial", "rename", "partial", "复制副本已确认，但副本重命名未确认；来源及已有副本保留")
 				return err
 			}
 		}
+		w.cloudFileEvent(ctx, *task, source.ID, "cloud.copy.rename_accepted", "rename", "accepted", "云端副本重命名调用已受理，最终目标放置仍待核对")
 		invalidateCloudDirectoryListings(ctx, current.ParentID)
 		if err := w.persistCloudState(task, *state, models.TransferTaskStatusMoving, completedCloudItems(*state), nil); err != nil {
 			return cloudTransferError("transfer_state_persist_failed", true, err)
@@ -1742,6 +1803,7 @@ func (w *TransferWorker) executeCloudCopy(ctx context.Context, mutations cloudpk
 		if err := mutations.Move(ctx, copyID, targetParentID); err != nil {
 			verified, statErr := driver.Stat(ctx, copyID)
 			if statErr != nil || verified.ParentID != targetParentID {
+				w.cloudFileEvent(ctx, *task, source.ID, "cloud.copy.place_uncertain", "move", "uncertain", "副本最终放置结果未能确认，按原任务核对，不重复推断成功")
 				return err
 			}
 		}

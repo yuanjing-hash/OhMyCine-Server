@@ -1,6 +1,7 @@
 ﻿<script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import JobRepairDetails from '@/components/JobRepairDetails.vue';
+import ExecutionLogsPanel from '@/components/ExecutionLogsPanel.vue';
 import ClearHistoryButton from '@/components/ClearHistoryButton.vue';
 import { useRoute, useRouter } from 'vue-router';
 import { createLatestRequest } from '@/latest-request';
@@ -128,7 +129,7 @@ function handleEscape(event: KeyboardEvent) {
   if (event.key === 'Escape') { closeDrawer(); return; }
   if (event.key !== 'Tab') return;
   const drawer = document.querySelector<HTMLElement>('.task-drawer');
-  const controls = Array.from(drawer?.querySelectorAll<HTMLElement>('button:not(:disabled), a[href], input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex="0"]') ?? []);
+  const controls = Array.from(drawer?.querySelectorAll<HTMLElement>('button:not(:disabled), a[href], input:not(:disabled), select:not(:disabled), textarea:not(:disabled), summary, [tabindex="0"]') ?? []).filter(element => element.getClientRects().length > 0);
   const first = controls[0], last = controls[controls.length - 1];
   if (!first || !last) return;
   if (!drawer?.contains(document.activeElement) || (!event.shiftKey && document.activeElement === last)) { event.preventDefault(); first.focus(); }
@@ -242,6 +243,10 @@ async function drop(index: number) {
   }
 }
 onMounted(()=>window.addEventListener("keydown",handleEscape));
+watch(() => auth.user?.id, (current, previous) => {
+  if (current === previous) return;
+  listRequest.cancel(); detailRequest.cancel(); jobs.value = []; selected.value = null; attempts.value = []; timeline.value = []; detailID.value = '';
+});
 onBeforeUnmount(() => { alive = false; listRequest.cancel(); detailRequest.cancel(); window.removeEventListener("keydown",handleEscape); });
 </script>
 <template>
@@ -493,23 +498,28 @@ onBeforeUnmount(() => { alive = false; listRequest.cancel(); detailRequest.cance
           </div>
         </section>
         <section class="p-4">
+          <ExecutionLogsPanel v-if="selected" :key="selected.id" :scope="{ kind: 'job', jobId: selected.id }" :attempt-count="selected.attempt_count" :active="['queued', 'running', 'retry_wait', 'waiting_user_action'].includes(selected.status)" :fallback-summary="{ title: selected.display_name, status: selected.status, started_at: selected.started_at ?? undefined, finished_at: selected.finished_at ?? undefined }" />
           <JobRepairDetails v-if="selected?.job_type === 'media_library_repair'" :job-id="selected.id" :revision="selected.revision" :active="selected.status === 'running'" />
-          <h3>状态时间线</h3>
-          <ol class="task-timeline">
-            <li v-for="event in timeline" :key="event.id">
-              <strong>任务状态更新</strong><span>{{ statusLabels[event.from_status as JobStatus] || "开始" }} →
-                {{ statusLabels[event.to_status as JobStatus] || "—" }}</span><time>{{ new Date(event.created_at).toLocaleString() }}</time>
-            </li>
-          </ol>
-          <div v-if="selected" class="flex items-center gap-3"><button class="btn-secondary" :disabled="detailLoading || timelinePage <= 1" @click="timelinePage--; loadDetail(detailID, true)">上一页时间线</button><span>第 {{ timelinePage }} 页</span><button class="btn-secondary" :disabled="detailLoading || timelinePage * 50 >= timelineTotal" @click="timelinePage++; loadDetail(detailID, true)">下一页时间线</button></div>
-          <h3 class="mt-6">执行尝试</h3>
-          <ol class="task-timeline">
-            <li v-for="attempt in attempts" :key="attempt.id">
-              <strong>第 {{ attempt.attempt_number }} 次 ·
-                {{ statusLabels[attempt.status as JobStatus] || '执行结束' }}</strong><span>{{ attempt.error_message || "无错误" }}</span><time>{{ new Date(attempt.started_at).toLocaleString() }}</time>
-            </li>
-          </ol>
-          <div v-if="selected" class="flex items-center gap-3"><button class="btn-secondary" :disabled="detailLoading || attemptPage <= 1" @click="attemptPage--; loadDetail(detailID, true)">上一页尝试</button><span>第 {{ attemptPage }} 页</span><button class="btn-secondary" :disabled="detailLoading || attemptPage * 50 >= attemptTotal" @click="attemptPage++; loadDetail(detailID, true)">下一页尝试</button></div>
+          <details class="mt-6 border-t border-[var(--border)] pt-4">
+            <summary class="cursor-pointer font-700">状态与执行尝试</summary>
+            <p class="text-muted text-xs">以下记录说明任务的排队、运行和重试状态；实际业务过程请查看上方执行日志。</p>
+            <h3>状态时间线</h3>
+            <ol class="task-timeline">
+              <li v-for="event in timeline" :key="event.id">
+                <strong>任务状态更新</strong><span>{{ statusLabels[event.from_status as JobStatus] || "开始" }} →
+                  {{ statusLabels[event.to_status as JobStatus] || "—" }}</span><time>{{ new Date(event.created_at).toLocaleString() }}</time>
+              </li>
+            </ol>
+            <div v-if="selected" class="flex items-center gap-3"><button class="btn-secondary" :disabled="detailLoading || timelinePage <= 1" @click="timelinePage--; loadDetail(detailID, true)">上一页时间线</button><span>第 {{ timelinePage }} 页</span><button class="btn-secondary" :disabled="detailLoading || timelinePage * 50 >= timelineTotal" @click="timelinePage++; loadDetail(detailID, true)">下一页时间线</button></div>
+            <h3 class="mt-6">执行尝试</h3>
+            <ol class="task-timeline">
+              <li v-for="attempt in attempts" :key="attempt.id">
+                <strong>第 {{ attempt.attempt_number }} 次 ·
+                  {{ statusLabels[attempt.status as JobStatus] || '执行结束' }}</strong><span>{{ attempt.error_message || "无错误" }}</span><time>{{ new Date(attempt.started_at).toLocaleString() }}</time>
+              </li>
+            </ol>
+            <div v-if="selected" class="flex items-center gap-3"><button class="btn-secondary" :disabled="detailLoading || attemptPage <= 1" @click="attemptPage--; loadDetail(detailID, true)">上一页尝试</button><span>第 {{ attemptPage }} 页</span><button class="btn-secondary" :disabled="detailLoading || attemptPage * 50 >= attemptTotal" @click="attemptPage++; loadDetail(detailID, true)">下一页尝试</button></div>
+          </details>
         </section>
       </aside>
     </div>

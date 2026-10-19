@@ -512,7 +512,7 @@ func syncPan115RecycleSchedule(tx *gorm.DB, ownerID uint, connection models.Conn
 	return syncManagedSchedule(tx, ownerID, "115 回收站清理 · "+connection.Name, "pan115_recycle_cleanup", "connection", uintID(connection.ID), connection.RecycleCleanupCron, "Asia/Shanghai", enabled, overwriteExisting, time.Now().UTC())
 }
 
-func (s *ConnectionService) Test(ctx context.Context, actor Actor, id uint, request RequestContext) (ConnectionSummary, error) {
+func (s *ConnectionService) Test(ctx context.Context, actor Actor, id uint, request RequestContext) (summary ConnectionSummary, resultErr error) {
 	if !actor.Can(authz.PermissionConnectionsTest) {
 		return ConnectionSummary{}, appError(CodePermissionDenied, "无权测试连接", nil)
 	}
@@ -522,7 +522,13 @@ func (s *ConnectionService) Test(ctx context.Context, actor Actor, id uint, requ
 	status, errorCode, outcome := "offline", cloudpkg.CodeUnavailable, "failure"
 	var account cloudpkg.Account
 	started := time.Now()
-	serverlog.OperationConnectionProbe.Event(s.log.Info()).Uint("connection_id", id).Msg(serverlog.OperationConnectionProbe.Message("开始检测"))
+	label := serverlog.BusinessDisplayName(record.Name)
+	fields := map[string]any{"connection_id": id, "connection_name": record.Name, "user_id": actor.User.ID, "request_id": request.RequestID}
+	serverlog.RecordBusiness(ctx, s.log, serverlog.OperationConnectionProbe, serverlog.BusinessEvent{Code: "connection.probe.start", Stage: "probe", Outcome: "started", Message: "开始检测连接“" + label + "”的服务可达性和账号状态", Fields: fields})
+	defer func() {
+		fields["status"], fields["error_code"] = status, errorCode
+		remainingBusinessResult(ctx, s.log, serverlog.OperationConnectionProbe, "connection.probe.finish", "probe", "连接“"+label+"”检测成功，账号身份和服务状态已确认并保存", "连接“"+label+"”检测或保存结果失败", started, fields, resultErr)
+	}()
 	if err == nil && !record.Enabled {
 		err = appError(CodeConnectionUnavailable, "连接已停用", nil)
 	}
@@ -587,11 +593,6 @@ func (s *ConnectionService) Test(ctx context.Context, actor Actor, id uint, requ
 			return ConnectionSummary{}, saveErr
 		}
 	}
-	event := s.log.Info()
-	if err != nil {
-		event = s.log.Warn()
-	}
-	serverlog.OperationConnectionProbe.Event(event).Uint("connection_id", id).Str("provider", record.Provider).Str("status", status).Str("error_code", errorCode).Int64("duration_ms", time.Since(started).Milliseconds()).Msg(serverlog.OperationConnectionProbe.Message("检测完成"))
 	if err != nil {
 		return ConnectionSummary{}, appError(CodeConnectionUnavailable, connectionTestMessage(record.Provider, errorCode), err)
 	}

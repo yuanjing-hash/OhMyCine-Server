@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -19,6 +20,16 @@ import (
 const activeName = "runtime.jsonl"
 
 const maxEventBytes = 64 * 1024
+
+var managedHistoryName = regexp.MustCompile(`^runtime-[0-9]{8}T[0-9]{6}\.[0-9]{9}Z-[0-9]{6,20}\.jsonl(?:\.gz)?$`)
+
+func isManagedHistoryName(name string) bool {
+	if !managedHistoryName.MatchString(name) {
+		return false
+	}
+	_, err := time.Parse("20060102T150405.000000000Z", name[len("runtime-"):len("runtime-")+26])
+	return err == nil
+}
 
 type Health struct {
 	Degraded bool   `json:"degraded"`
@@ -98,7 +109,7 @@ func (m *Manager) Apply(policy Policy) error {
 }
 
 func (m *Manager) Write(p []byte) (int, error) {
-	clean := SanitizeJSON(p)
+	clean := SanitizeJSON(normalizeBusinessOrigin(p))
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if eventLevel(clean) < m.level {
@@ -138,7 +149,7 @@ func (m *Manager) recoverAndOpen() error {
 	defer m.mu.Unlock()
 	entries, _ := os.ReadDir(m.dir)
 	for _, entry := range entries {
-		if !entry.IsDir() && strings.HasPrefix(entry.Name(), "runtime-") && strings.HasSuffix(entry.Name(), ".jsonl") {
+		if entry.Type().IsRegular() && isManagedHistoryName(entry.Name()) && strings.HasSuffix(entry.Name(), ".jsonl") {
 			_ = compressFile(filepath.Join(m.dir, entry.Name()))
 		}
 	}
@@ -222,7 +233,7 @@ func (m *Manager) managedHistoryLocked() []managedFile {
 	entries, _ := os.ReadDir(m.dir)
 	files := make([]managedFile, 0)
 	for _, e := range entries {
-		if e.IsDir() || !strings.HasPrefix(e.Name(), "runtime-") || (!strings.HasSuffix(e.Name(), ".jsonl.gz") && !strings.HasSuffix(e.Name(), ".jsonl")) {
+		if !e.Type().IsRegular() || !isManagedHistoryName(e.Name()) {
 			continue
 		}
 		if info, err := e.Info(); err == nil {
@@ -286,7 +297,7 @@ func (m *Manager) markDegradedLocked(reason string) {
 		return
 	}
 	m.lastDiagnostic, m.lastDiagnosticReason = time.Now(), reason
-	_, _ = fmt.Fprintf(m.stdout, `{"level":"warn","message":"Runtime file logging degraded","module":"logging","component":"manager","reason":%q}`+"\n", reason)
+	_, _ = fmt.Fprintf(m.stdout, `{"level":"warn","message":"【运行日志】日志文件暂不可写，已继续输出到控制台","module":"logging","component":"manager","operation":"runtime_logging","operation_label":"运行日志","reason":%q}`+"\n", reason)
 }
 func parseLevel(level string) zerolog.Level {
 	parsed, err := zerolog.ParseLevel(level)

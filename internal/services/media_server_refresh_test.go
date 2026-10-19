@@ -1,6 +1,7 @@
 package services
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
@@ -10,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/rs/zerolog"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/authz"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
 	"gorm.io/gorm"
@@ -115,6 +117,8 @@ func TestManualRefreshAtContentRevisionZeroStillCallsUpstreamOnce(t *testing.T) 
 	}))
 	defer upstream.Close()
 	fixture := newMediaServerRefreshFixture(t)
+	var businessLog bytes.Buffer
+	fixture.service.SetLogger(zerolog.New(zerolog.SyncWriter(&businessLog)).With().Timestamp().Logger())
 	target := fixture.createTarget(t, fixture.createConnection(t, upstream.URL), 0)
 
 	job, err := fixture.service.ManualRefresh(fixture.actor, target.ID, RequestContext{})
@@ -146,6 +150,15 @@ func TestManualRefreshAtContentRevisionZeroStillCallsUpstreamOnce(t *testing.T) 
 	}
 	if persisted.PayloadJSON != `{"target_id":`+uintID(target.ID)+`}` {
 		t.Fatalf("unsafe or unexpected payload=%q", persisted.PayloadJSON)
+	}
+	terminal := businessRecords(t, &businessLog, "event_code", "media_refresh.finish")
+	if len(terminal) != 1 || terminal[0]["outcome"] != "finished" || terminal[0]["job_id"] != claimed.Job.ID || !strings.Contains(terminal[0]["message"].(string), "刷新请求已受理") || !strings.Contains(terminal[0]["message"].(string), "异步") {
+		t.Fatalf("request acceptance was not distinguished from indexing completion: %+v", terminal)
+	}
+	for _, forbidden := range []string{"private-management-key", target.UpstreamLibraryID, upstream.URL} {
+		if strings.Contains(businessLog.String(), forbidden) {
+			t.Fatalf("refresh event leaked protected upstream identity: %q", forbidden)
+		}
 	}
 }
 

@@ -25,7 +25,8 @@ func New(cfg config.Config, api *handlers.API, auth *services.AuthService, log z
 	router.Use(func(c *gin.Context) {
 		requestPath := c.Request.URL.Path
 		mediaLibraryStructure := strings.HasPrefix(requestPath, "/api/v1/media-libraries/") && strings.Contains(requestPath, "/structure")
-		if requestPath == "/api/v1/system/update" || strings.HasPrefix(requestPath, "/api/v1/system/update/") || mediaLibraryStructure {
+		executionLogs := strings.HasSuffix(requestPath, "/execution-logs") && (strings.HasPrefix(requestPath, "/api/v1/jobs/") || strings.HasPrefix(requestPath, "/api/v1/follows/"))
+		if requestPath == "/api/v1/system/update" || strings.HasPrefix(requestPath, "/api/v1/system/update/") || mediaLibraryStructure || executionLogs {
 			c.Header("Cache-Control", "no-store")
 		}
 		c.Next()
@@ -269,6 +270,7 @@ func New(cfg config.Config, api *handlers.API, auth *services.AuthService, log z
 	protected.GET("/jobs/:id", middleware.NoStore(), jobRead, api.Job)
 	protected.GET("/jobs/:id/attempts", middleware.NoStore(), jobRead, api.JobAttempts)
 	protected.GET("/jobs/:id/timeline", middleware.NoStore(), jobRead, api.JobTimeline)
+	protected.GET("/jobs/:id/execution-logs", middleware.NoStore(), jobRead, api.JobExecutionLogs)
 	protected.GET("/jobs/:id/repair-details", middleware.NoStore(), jobRead, api.JobRepairDetails)
 	protected.POST("/jobs/:id/pause", jobRead, jobControl, api.JobControl("pause"))
 	protected.POST("/jobs/:id/resume", jobRead, jobControl, api.JobControl("resume"))
@@ -304,6 +306,7 @@ func New(cfg config.Config, api *handlers.API, auth *services.AuthService, log z
 	protected.POST("/follows/:id/resume", followUpdate, api.SetFollowPaused(false))
 	protected.POST("/follows/:id/search", followExecute, api.SearchFollow)
 	protected.GET("/follows/:id/runs", middleware.NoStore(), followRead, api.FollowRuns)
+	protected.GET("/follows/:id/runs/:run_id/execution-logs", middleware.NoStore(), followRead, api.FollowExecutionLogs)
 
 	connectionAPI := v1.Group("")
 	connectionAPI.Use(middleware.NoStore(), middleware.Auth(auth, api.CookieName()), middleware.CSRF(auth))

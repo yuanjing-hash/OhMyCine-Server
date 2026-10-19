@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"sort"
 	"strconv"
 	"strings"
@@ -11,6 +12,7 @@ import (
 	"unicode"
 
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/authz"
+	serverlog "github.com/yuanjing-hash/OhMyCine-Server/internal/logging"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/mediarecognition"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/metadata/tmdb"
@@ -115,11 +117,18 @@ func (s *SiteService) SearchMediaIdentityEachProgress(ctx context.Context, actor
 func (s *SiteService) searchMediaIdentitySite(ctx context.Context, actor Actor, input MediaIdentitySearchInput, verified tmdb.Match, names []tmdb.SearchName, record models.Site) SiteSearchGroup {
 	var target *SiteSearchGroup
 	privateKeys := make(map[string]int)
+	ctx = serverlog.WithBusinessFields(ctx, map[string]any{"site_id": record.ID, "site_name": record.Name, "user_id": actor.User.ID})
+	if input.Season != nil {
+		ctx = serverlog.WithBusinessFields(ctx, map[string]any{"season": *input.Season})
+	}
 	for _, name := range names {
 		if ctx.Err() != nil {
 			break
 		}
 		group := s.searchSite(ctx, actor, record, SiteSearchInput{Keyword: name.Value, MediaType: input.MediaType, SearchBy: "title", Year: identitySearchYear(input.MediaType, verified.ReleaseYear), TMDBID: &input.TMDBID, Page: input.Page, SiteID: &record.ID})
+		aliasCtx := serverlog.WithBusinessFields(ctx, map[string]any{"query_name": name.Value})
+		rejections := newFollowRejections()
+		kept, replaced := 0, 0
 		if target == nil {
 			copy := group
 			copy.Items = []SiteSearchResult{}
@@ -140,11 +149,13 @@ func (s *SiteService) searchMediaIdentitySite(ctx context.Context, actor Actor, 
 		for _, item := range group.Items {
 			claim, claimErr := s.resolveAvailableClaim(item.Token, actor.User.ID)
 			if claimErr != nil {
+				rejections.add("claim_unavailable", item.Title)
 				continue
 			}
 			if !mediaIdentityResultMatches(item.Title, names, input.MediaType, verified.ReleaseYear, input.Season) {
 				s.deleteClaim(item.Token)
 				target.Skipped++
+				rejections.add("identity_mismatch", item.Title)
 				continue
 			}
 			identity := claim.TorrentID
@@ -155,10 +166,12 @@ func (s *SiteService) searchMediaIdentitySite(ctx context.Context, actor Actor, 
 			index, duplicate := privateKeys[key]
 			if duplicate && (item.SourceKind != "115_share" || compareOptionalTime(item.Published, target.Items[index].Published) <= 0) {
 				s.deleteClaim(item.Token)
+				rejections.add("duplicate", item.Title)
 				continue
 			}
 			if bindErr := s.bindClaimRecognition(item.Token, actor.User.ID, input.TMDBID, input.MediaType, mediaIdentitySourceDirectID, mediaIdentityStatusVerified, false); bindErr != nil {
 				s.deleteClaim(item.Token)
+				rejections.add("identity_bind_failed", item.Title)
 				continue
 			}
 			item.MatchedName = name.Value
@@ -167,10 +180,16 @@ func (s *SiteService) searchMediaIdentitySite(ctx context.Context, actor Actor, 
 				// Another language query may find a newer post for the same evolving share.
 				s.deleteClaim(target.Items[index].Token)
 				target.Items[index] = item
+				replaced++
 			} else {
 				privateKeys[key] = len(target.Items)
 				target.Items = append(target.Items, item)
+				kept++
 			}
+		}
+		rejections.record(aliasCtx, s.recordSearch)
+		if group.Status == "success" {
+			s.recordSearch(aliasCtx, "site.identity.finish", "identity", "confirmed", fmt.Sprintf("名称“%s”返回 %d 条可用结果，作品与季集验证、去重后新增 %d 条，替换同分享较旧帖子 %d 条，当前站点合计 %d 条", serverlog.BusinessDisplayName(name.Value), len(group.Items), kept, replaced, len(target.Items)), map[string]any{"result_count": len(group.Items), "identity_kept": kept, "updated_count": replaced, "deduplicated_count": len(target.Items)})
 		}
 	}
 	if target == nil {

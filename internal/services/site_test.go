@@ -1,6 +1,7 @@
 package services
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -511,6 +512,8 @@ func TestSiteCanDisableWhileUnavailableButMustProbeBeforeReenable(t *testing.T) 
 
 func TestSiteSearchIsolatesFailuresAndBindsClaimsToActor(t *testing.T) {
 	service, adapter, actor, _, _, _ := siteFixture(t)
+	var businessLog bytes.Buffer
+	service.log = zerolog.New(zerolog.SyncWriter(&businessLog)).With().Timestamp().Logger()
 	for _, input := range []SiteInput{validSiteInput("Working", "https://working.example.test"), validSiteInput("Broken", "https://broken.example.test")} {
 		if _, err := service.Create(context.Background(), actor, input, RequestContext{}); err != nil {
 			t.Fatal(err)
@@ -531,6 +534,19 @@ func TestSiteSearchIsolatesFailuresAndBindsClaimsToActor(t *testing.T) {
 	}
 	if statuses["Working"] != "success" || statuses["Broken"] != "error" || token == "" {
 		t.Fatalf("statuses=%v token=%q", statuses, token)
+	}
+	queries := businessRecords(t, &businessLog, "event_code", "site.query.finish")
+	if len(queries) != 2 || len(adapter.searchBases) != 2 {
+		t.Fatalf("failed search observation changed call counts: logs=%d calls=%d", len(queries), len(adapter.searchBases))
+	}
+	for _, query := range queries {
+		if query["outcome"] == "failed" {
+			for _, unknown := range []string{"raw_results", "result_count", "skipped_count"} {
+				if value, ok := query[unknown]; ok {
+					t.Fatalf("failed query fabricated %s=%v", unknown, value)
+				}
+			}
+		}
 	}
 	if _, err := service.resolveClaim(token, actor.User.ID+1); ErrorCode(err) != CodeSiteResultExpired {
 		t.Fatalf("cross-actor token err=%v", err)
@@ -633,6 +649,8 @@ func TestMediaIdentitySearchAggregatesAliasesDeduplicatesAndBindsVerifiedIdentit
 	defer upstream.Close()
 
 	service, adapter, actor, store, _, _ := siteFixture(t)
+	var businessLog bytes.Buffer
+	service.log = zerolog.New(zerolog.SyncWriter(&businessLog)).With().Timestamp().Logger()
 	metadata := NewMetadataSettingsService(service.db, service.audit, store, tmdb.Credential{Kind: tmdb.CredentialKindReadAccessToken, Value: "test-token"})
 	metadata.clientFactory = func(tmdb.Credential, string, string) (*tmdb.Client, error) {
 		return tmdb.NewForTest("test-token", upstream.URL, upstream.Client())
@@ -674,6 +692,19 @@ func TestMediaIdentitySearchAggregatesAliasesDeduplicatesAndBindsVerifiedIdentit
 		t.Fatalf("claim=%+v err=%v", claim, err)
 	}
 	encoded, _ := json.Marshal(result)
+	queries := businessRecords(t, &businessLog, "event_code", "site.query.start")
+	if len(queries) != len(adapter.searchBases) || len(queries) != 4 {
+		t.Fatalf("logs added or hid provider requests: logged=%d actual=%d", len(queries), len(adapter.searchBases))
+	}
+	terminals := businessRecords(t, &businessLog, "event_code", "site.search.finish")
+	if len(terminals) != 2 || terminals[0]["outcome"] != "partial" || terminals[1]["outcome"] != "partial" || terminals[1]["identity_kept"] != float64(1) || terminals[1]["failed_count"] != float64(1) {
+		t.Fatalf("partial site execution was lost: %+v", terminals)
+	}
+	for _, forbidden := range []string{"localized search unavailable", "passkey-server-only", "server-only-secret", "https://identity.example.test", "test-token"} {
+		if strings.Contains(businessLog.String(), forbidden) {
+			t.Fatalf("search narrative leaked private provider fact: %q", forbidden)
+		}
+	}
 	if strings.Contains(string(encoded), "error_count") {
 		t.Fatalf("internal partial failure count leaked through public JSON: %s", encoded)
 	}

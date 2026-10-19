@@ -9,7 +9,9 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/rs/zerolog"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/authz"
+	serverlog "github.com/yuanjing-hash/OhMyCine-Server/internal/logging"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
 	mediaserverpkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/mediaserver"
 	"gorm.io/gorm"
@@ -38,6 +40,7 @@ type mediaServerRefreshJobPayload struct {
 }
 
 type MediaServerRefreshService struct {
+	log         zerolog.Logger
 	db          *gorm.DB
 	queue       *QueueService
 	audit       *AuditService
@@ -45,8 +48,11 @@ type MediaServerRefreshService struct {
 }
 
 func NewMediaServerRefreshService(db *gorm.DB, queue *QueueService, audit *AuditService, connections *ConnectionService) *MediaServerRefreshService {
-	return &MediaServerRefreshService{db: db, queue: queue, audit: audit, connections: connections}
+	return &MediaServerRefreshService{db: db, queue: queue, audit: audit, connections: connections, log: zerolog.Nop()}
 }
+
+// SetLogger remains optional for existing composition and fixture consumers.
+func (s *MediaServerRefreshService) SetLogger(log zerolog.Logger) { s.log = log }
 
 func (s *MediaServerRefreshService) List(actor Actor) ([]models.MediaServerRefreshTarget, error) {
 	if !actor.Can(authz.PermissionConnectionsRead) || !actor.HasPermission(authz.PermissionMediaLibrariesRead) {
@@ -374,7 +380,7 @@ func NewMediaServerRefreshWorker(service *MediaServerRefreshService) *MediaServe
 	return &MediaServerRefreshWorker{service: service}
 }
 
-func (w *MediaServerRefreshWorker) Run(ctx context.Context, _ JobRuntime, job ClaimedJob) WorkerResult {
+func (w *MediaServerRefreshWorker) Run(ctx context.Context, _ JobRuntime, job ClaimedJob) (result WorkerResult) {
 	var payload mediaServerRefreshJobPayload
 	if err := json.Unmarshal([]byte(job.Job.PayloadJSON), &payload); err != nil || payload.TargetID == 0 {
 		return WorkerResult{ErrorCode: "media_server_refresh_payload_invalid", ErrorMessage: "媒体服务器刷新任务参数无效"}
@@ -383,14 +389,43 @@ func (w *MediaServerRefreshWorker) Run(ctx context.Context, _ JobRuntime, job Cl
 	if err := w.service.db.First(&target, payload.TargetID).Error; errors.Is(err, gorm.ErrRecordNotFound) {
 		// Deleting a target revokes its queued work. A stale system Job is a
 		// successful no-op and must not leave a misleading operator failure.
+		recordMediaBusiness(ctx, w.service.log, serverlog.OperationMediaServerRefresh, "media_refresh.skip", "refresh", "skipped", "刷新目标已删除，旧排队任务安全结束，没有访问上游服务器", map[string]any{"job_id": job.Job.ID})
 		return WorkerResult{}
 	} else if err != nil {
 		return WorkerResult{ErrorCode: "media_server_refresh_target_missing", ErrorMessage: "媒体服务器刷新目标不存在"}
 	}
 	if !target.Enabled || (target.DesiredRevision <= target.SuccessfulRevision && target.ManualGeneration <= target.SuccessfulManualGeneration) {
+		recordMediaBusiness(ctx, w.service.log, serverlog.OperationMediaServerRefresh, "media_refresh.skip", "refresh", "skipped", "刷新目标已停用或当前版本已受理过，本轮没有重复发送刷新请求", map[string]any{"job_id": job.Job.ID, "library_id": target.LibraryID, "connection_id": target.ConnectionID})
 		return WorkerResult{}
 	}
 	started, desired, manualGeneration := time.Now().UTC(), target.DesiredRevision, target.ManualGeneration
+	ctx = serverlog.WithBusinessFields(ctx, map[string]any{"job_id": job.Job.ID, "library_id": target.LibraryID, "connection_id": target.ConnectionID, "target_name": target.UpstreamLibraryName})
+	var label struct{ Name string }
+	if w.service.db.Model(&models.MediaLibrary{}).Select("name").First(&label, target.LibraryID).Error == nil {
+		ctx = serverlog.WithBusinessFields(ctx, map[string]any{"library_name": label.Name})
+	}
+	accepted := false
+	recordMediaBusiness(ctx, w.service.log, serverlog.OperationMediaServerRefresh, "media_refresh.start", "refresh", "started", fmt.Sprintf("开始通知媒体服务器刷新目标库 %s；这一步只请求重新扫描，不等待或保证对方完成索引", serverlog.BusinessDisplayName(target.UpstreamLibraryName)), nil)
+	defer func() {
+		outcome, message := "finished", "媒体服务器刷新请求已受理；对方的扫描和索引仍异步进行，当前没有声称索引已完成"
+		if result.ErrorCode != "" {
+			outcome, message = "failed", "媒体服务器刷新请求未获确认，请检查目标连接与错误码"
+		}
+		if result.RetryAt != nil {
+			outcome, message = "waiting", "媒体服务器暂时不可用或限流，本次请求尚未确认受理，按原重试计划等待"
+		}
+		if accepted && result.ErrorCode != "" {
+			outcome, message = "partial", "媒体服务器已受理刷新请求，但本地结果保存未完成；不能据此断言对方索引结果"
+		}
+		if ctx.Err() != nil && !accepted {
+			outcome, message = "cancelled", "刷新执行已取消，未确认媒体服务器是否受理"
+		}
+		fields := map[string]any{"duration_ms": time.Since(started).Milliseconds()}
+		if result.ErrorCode != "" {
+			fields["error_code"] = result.ErrorCode
+		}
+		recordMediaBusiness(ctx, w.service.log, serverlog.OperationMediaServerRefresh, "media_refresh.finish", "finish", outcome, message, fields)
+	}()
 	run := models.MediaServerRefreshRun{ID: uuid.NewString(), TargetID: target.ID, JobID: job.Job.ID, DesiredRevision: desired, Status: models.JobStatusRunning, StartedAt: started}
 	if err := w.service.db.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Create(&run).Error; err != nil {
@@ -400,10 +435,12 @@ func (w *MediaServerRefreshWorker) Run(ctx context.Context, _ JobRuntime, job Cl
 	}); err != nil {
 		return WorkerResult{ErrorCode: "media_server_refresh_state_failed", ErrorMessage: "媒体服务器刷新状态保存失败"}
 	}
-	client, _, err := w.service.connections.mediaServerClient(target.ConnectionID)
+	client, connection, err := w.service.connections.mediaServerClient(target.ConnectionID)
 	if err == nil {
+		ctx = serverlog.WithBusinessFields(ctx, map[string]any{"connection_name": connection.Name})
 		callCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
 		err = client.RefreshLibrary(callCtx, target.UpstreamLibraryID)
+		accepted = err == nil
 		cancel()
 	}
 	finished := time.Now().UTC()

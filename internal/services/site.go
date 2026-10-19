@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/url"
 	"sort"
 	"strconv"
@@ -1008,25 +1009,38 @@ func (s *SiteService) SearchEachProgress(ctx context.Context, actor Actor, input
 	}, emit, emitProgress)
 }
 
-func (s *SiteService) searchSite(ctx context.Context, actor Actor, record models.Site, input SiteSearchInput) SiteSearchGroup {
+func (s *SiteService) searchSite(ctx context.Context, actor Actor, record models.Site, input SiteSearchInput) (group SiteSearchGroup) {
+	ctx = serverlog.WithBusinessFields(ctx, map[string]any{"site_id": record.ID, "site_name": record.Name, "query_name": input.Keyword, "user_id": actor.User.ID})
 	if record.SourceType == "plugin" && record.Kind == pluginResourceKind {
 		return s.searchPluginResource(ctx, actor, record, input)
 	}
+	started, stage, requested, rawCount := time.Now(), "prepare", false, 0
+	defer func() { s.recordSearchResult(ctx, group, started, stage, requested, rawCount) }()
 	definition, _ := builtin.DefinitionForKey(record.Kind)
-	group := SiteSearchGroup{SiteID: record.ID, SiteName: record.Name, SiteType: definition.SiteType, Status: "success", Page: input.Page, Items: []SiteSearchResult{}}
+	group = SiteSearchGroup{SiteID: record.ID, SiteName: record.Name, SiteType: definition.SiteType, Status: "success", Page: input.Page, Items: []SiteSearchResult{}}
 	config, err := s.config(record)
 	if err != nil {
 		group.Status, group.ErrorCode = "error", CodeSiteCredentialInvalid
 		return group
 	}
+	stage = "limit"
 	if err := s.waitLimit(ctx, record); err != nil {
 		group.Status, group.ErrorCode = "error", ErrorCode(err)
 		return group
 	}
+	stage, requested = "query", true
+	observeFollowRequest(ctx, record.ID)
+	s.recordSearch(ctx, "site.query.start", "query", "started", fmt.Sprintf("站点 %s：使用名称“%s”查询第 %d 页", serverlog.BusinessDisplayName(record.Name), serverlog.BusinessDisplayName(input.Keyword), input.Page), nil)
 	page, err := s.adapters[record.Kind].Search(ctx, config, sitepkg.Query{Keyword: input.Keyword, MediaType: input.MediaType, Year: input.Year, TMDBID: input.TMDBID, Page: input.Page})
 	if err != nil {
 		group.Status, group.ErrorCode = "error", siteErrorCode(err)
 		return group
+	}
+	rawCount = len(page.Items)
+	if stats := followStats(ctx); stats != nil {
+		stats.mu.Lock()
+		stats.raw += rawCount
+		stats.mu.Unlock()
 	}
 	group.HasNext, group.Skipped = page.HasNext, page.Skipped
 	expires := s.now().Add(ptResultTTL)
@@ -1050,12 +1064,13 @@ func (s *SiteService) searchSite(ctx context.Context, actor Actor, record models
 		}
 		group.Items = append(group.Items, SiteSearchResult{ShareValidation: s.cachedShareValidation(ctx, actor, item.TorrentID), SourceKind: item.SourceKind, CloudProvider: item.CloudProvider, Channel: item.Channel, PostURL: item.PostURL, ResourceFingerprint: item.Fingerprint, Token: token, Title: item.Title, Subtitle: item.Subtitle, SizeBytes: item.SizeBytes, Published: item.Published, Seeders: item.Seeders, Leechers: item.Leechers, Completed: item.Completed, Promotion: item.Promotion, Quality: item.Quality, Tags: item.Tags, Specifications: specifications, ExpiresAt: expires})
 	}
-	serverlog.OperationDiscoverySearch.Event(s.log.Info()).Uint("site_id", record.ID).Str("site_type", group.SiteType).Int("results", len(group.Items)).Int("skipped", group.Skipped).Msg(serverlog.OperationDiscoverySearch.Message("站点种子资源搜索完成"))
 	return group
 }
 
-func (s *SiteService) searchPluginResource(ctx context.Context, actor Actor, record models.Site, input SiteSearchInput) SiteSearchGroup {
-	group := SiteSearchGroup{SiteID: record.ID, SiteName: record.Name, SiteType: "bt_resource", Status: "success", Page: input.Page, Items: []SiteSearchResult{}}
+func (s *SiteService) searchPluginResource(ctx context.Context, actor Actor, record models.Site, input SiteSearchInput) (group SiteSearchGroup) {
+	started, requested, rawCount := time.Now(), false, 0
+	defer func() { s.recordSearchResult(ctx, group, started, "query", requested, rawCount) }()
+	group = SiteSearchGroup{SiteID: record.ID, SiteName: record.Name, SiteType: "bt_resource", Status: "success", Page: input.Page, Items: []SiteSearchResult{}}
 	if s.pluginResources == nil {
 		group.Status, group.ErrorCode = "error", "resource_entry_unavailable"
 		return group
@@ -1064,10 +1079,19 @@ func (s *SiteService) searchPluginResource(ctx context.Context, actor Actor, rec
 	// bounded batch while new claims are being produced so an always-on Server
 	// cannot grow this short-lived vault without limit.
 	_ = s.cleanupExpiredPluginResourceClaims(pluginResourceClaimCleanupBatch)
+	requested = true
+	observeFollowRequest(ctx, record.ID)
+	s.recordSearch(ctx, "site.query.start", "query", "started", fmt.Sprintf("通过站点插件 %s 搜索“%s”，第 %d 页", serverlog.BusinessDisplayName(record.Name), serverlog.BusinessDisplayName(input.Keyword), input.Page), nil)
 	page, err := s.pluginResources.SearchResource(ctx, PluginResourceSearchInput{ConnectionID: record.PluginConnectionID, Query: input.Keyword, Kind: input.MediaType, Year: input.Year, Page: input.Page})
 	if err != nil {
 		group.Status, group.ErrorCode = "error", ErrorCode(err)
 		return group
+	}
+	rawCount = len(page.Items)
+	if stats := followStats(ctx); stats != nil {
+		stats.mu.Lock()
+		stats.raw += rawCount
+		stats.mu.Unlock()
 	}
 	pluginID, pluginVersion, provenanceErr := s.pluginResources.ResourceProvenance(record.PluginConnectionID)
 	if provenanceErr != nil {
@@ -1475,7 +1499,7 @@ func siteRecognitionSpecifications(specifications []string, releaseGroup string)
 	return result
 }
 
-func (s *SiteService) Download(ctx context.Context, actor Actor, input SiteDownloadInput, request RequestContext) (DownloadTaskSummary, error) {
+func (s *SiteService) Download(ctx context.Context, actor Actor, input SiteDownloadInput, request RequestContext) (result DownloadTaskSummary, resultErr error) {
 	if !actor.Can(authz.PermissionDownloadsCreate) {
 		return DownloadTaskSummary{}, appError(CodePermissionDenied, "无权创建下载任务", nil)
 	}
@@ -1484,6 +1508,13 @@ func (s *SiteService) Download(ctx context.Context, actor Actor, input SiteDownl
 	if err != nil {
 		return DownloadTaskSummary{}, err
 	}
+	stage, started := "prepare", time.Now()
+	ctx = serverlog.WithBusinessFields(ctx, map[string]any{"site_id": claim.SiteID, "user_id": actor.User.ID, "downloader_id": input.DownloaderID})
+	defer func() {
+		if resultErr != nil {
+			s.recordSearch(ctx, "site.download.failed", stage, "failed", "资源转交下载未完成：当前阶段未获接受；未将读取、校验或提交失败视为入库完成", map[string]any{"error_code": ErrorCode(resultErr), "duration_ms": time.Since(started).Milliseconds()})
+		}
+	}()
 	completed := false
 	defer func() { s.finishClaim(token, completed) }()
 	var selectedDownloader models.Downloader
@@ -1506,6 +1537,11 @@ func (s *SiteService) Download(ctx context.Context, actor Actor, input SiteDownl
 	if !actor.CanResource(authz.PermissionDiscoveryRead, models.AuthorizationResourceSite, uintID(claimedSite.ID)) {
 		return DownloadTaskSummary{}, appError(CodePermissionDenied, "无权使用这个站点的搜索结果", nil)
 	}
+	ctx = serverlog.WithBusinessFields(ctx, map[string]any{"site_name": claimedSite.Name, "resource_name": claim.Title, "downloader_name": selectedDownloader.Name})
+	if input.MediaLibraryID != nil {
+		ctx = serverlog.WithBusinessFields(ctx, map[string]any{"library_id": *input.MediaLibraryID})
+	}
+	s.recordSearch(ctx, "site.download.start", "prepare", "started", fmt.Sprintf("准备将站点 %s 的资源 %s 交给下载器 %s；先核对实际来源和当前权限", serverlog.BusinessDisplayName(claimedSite.Name), serverlog.BusinessDisplayName(claim.Title), serverlog.BusinessDisplayName(selectedDownloader.Name)), nil)
 	definition, definitionFound := builtin.DefinitionForKey(claimedSite.Kind)
 	isPluginResource := claimedSite.SourceType == "plugin" && claimedSite.Kind == pluginResourceKind
 	routeSource, routeErr := routeSourceForSite(claimedSite)
@@ -1534,6 +1570,7 @@ func (s *SiteService) Download(ctx context.Context, actor Actor, input SiteDownl
 		return DownloadTaskSummary{}, err
 	}
 	var source DownloadSourceInput
+	stage = "source"
 	var pluginID, pluginVersion, pluginConnectionID string
 	if isPluginResource {
 		if s.pluginResources == nil || claim.PluginClaimID == "" {
@@ -1600,6 +1637,7 @@ func (s *SiteService) Download(ctx context.Context, actor Actor, input SiteDownl
 	}
 
 	var previewGuard func(*gorm.DB) error
+	stage = "share_check"
 	if input.PreviewToken != "" || len(input.SelectedEntryTokens) > 0 {
 		selection, guard, selectionErr := s.resolveShareSelection(ctx, actor, input, claim, source)
 		if selectionErr != nil {
@@ -1698,7 +1736,7 @@ func (s *SiteService) Download(ctx context.Context, actor Actor, input SiteDownl
 		}
 	}
 	submitInput := SubmitDownloadInput{SourceSiteID: claimedSite.ID, DownloaderID: input.DownloaderID, MediaLibraryID: input.MediaLibraryID, ProfileID: input.ProfileID, DisplayName: claim.Title, Priority: input.Priority, Source: source, PluginID: pluginID, PluginVersion: pluginVersion, PluginConnectionID: pluginConnectionID, PluginResourceClaimID: resourceClaimID, RecognitionOverride: recognitionOverride, FollowSubscriptionID: input.FollowSubscriptionID, FollowResourceFingerprint: input.FollowResourceFingerprint, ForceRecognitionOverride: input.FollowSubscriptionID != "", BeforePersist: beforePersist}
-	var result DownloadTaskSummary
+	stage = "enqueue"
 	if source.ShareSelection != nil {
 		result, err = s.submitShareSelection(ctx, actor, input.PreviewToken, submitInput, request)
 	} else {
@@ -1710,7 +1748,11 @@ func (s *SiteService) Download(ctx context.Context, actor Actor, input SiteDownl
 	result.ShareValidation = shareValidation
 	completed = result.SelectionPending == 0
 	_ = s.audit.Record(s.db, &actor.User.ID, "site.download", "site", uintID(record.ID), "success", map[string]any{"download_task_id": result.ID}, request)
-	serverlog.OperationDiscoverySearch.Event(s.log.Info()).Uint("site_id", record.ID).Str("download_task_id", result.ID).Msg(serverlog.OperationDiscoverySearch.Message("种子资源搜索结果已提交下载"))
+	outcome, message := "accepted", "资源已转交持久下载任务，后续下载、转存与入库结果请查看关联任务"
+	if result.SelectionPending > 0 {
+		outcome, message = "partial", "所选内容仅有部分任务获接受，仍有选择待处理；已接受的任务不会重复创建"
+	}
+	s.recordSearch(ctx, "site.download.accepted", "enqueue", outcome, message, map[string]any{"related_task_id": result.ID, "related_job_id": result.JobID, "duration_ms": time.Since(started).Milliseconds()})
 	return result, nil
 }
 

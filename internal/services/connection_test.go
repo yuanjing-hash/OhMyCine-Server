@@ -426,6 +426,8 @@ func TestConnectionProbePersistsOnlySafeSummary(t *testing.T) {
 	used, total := uint64(12), uint64(34)
 	driver := &fakeCloudDriver{account: cloud.Account{ID: "account-1", Name: "测试账号", VIP: true, UsedBytes: &used, TotalBytes: &total}}
 	db, _, service, actor := newConnectionTestService(t, driver)
+	logManager, logger := captureRemainingBusiness(t, "connection")
+	service.log = logger
 	created, err := service.Create(actor, ConnectionInput{Name: "Cloud", Provider: cloud.ProviderPan115, Cookie: testPan115Cookie, Enabled: true}, RequestContext{})
 	if err != nil {
 		t.Fatal(err)
@@ -443,6 +445,10 @@ func TestConnectionProbePersistsOnlySafeSummary(t *testing.T) {
 	}
 	if record.LastHealthStatus != "online" || record.QuotaUsedBytes == nil || *record.QuotaUsedBytes != used {
 		t.Fatalf("safe health fields were not persisted: %+v", record)
+	}
+	finished := requireRemainingBusinessEvent(t, remainingBusinessEntries(t, logManager), "connection.probe.finish", "finished")
+	if finished.Fields["connection_name"] != "Cloud" || finished.Fields["status"] != "online" {
+		t.Fatalf("probe narrative=%+v", finished)
 	}
 }
 

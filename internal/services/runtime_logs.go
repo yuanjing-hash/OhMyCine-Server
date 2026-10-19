@@ -15,9 +15,11 @@ import (
 )
 
 type RuntimeLogService struct {
-	db      *gorm.DB
-	manager *logging.Manager
-	audit   *AuditService
+	db               *gorm.DB
+	manager          *logging.Manager
+	audit            *AuditService
+	executionQueue   *QueueService
+	executionFollows *FollowService
 }
 
 type RuntimeLogSettings struct {
@@ -49,6 +51,11 @@ func (s *RuntimeLogService) Query(ctx context.Context, actor Actor, filter loggi
 	if err != nil {
 		return logging.QueryResult{}, appError(CodeRuntimeLogFilterInvalid, "运行日志筛选条件无效", err)
 	}
+	visible, restricted, err := s.projectRuntimeEntries(queryContext, actor, result.List)
+	if err != nil {
+		return logging.QueryResult{}, appError(CodeRuntimeLogUnavailable, "运行日志暂不可用", err)
+	}
+	result.List, result.Partial = visible, result.Partial || restricted || s.manager.Health().Degraded
 	return result, nil
 }
 
@@ -56,13 +63,12 @@ func (s *RuntimeLogService) Facets(ctx context.Context, actor Actor, filter logg
 	if !actor.Can(authz.PermissionLogsRead) {
 		return logging.Facets{}, appError(CodePermissionDenied, "没有查看运行日志的权限", nil)
 	}
-	queryContext, cancel := context.WithTimeout(ctx, 3*time.Second)
-	defer cancel()
-	result, err := s.manager.Facets(queryContext, filter)
+	filter.Limit, filter.Cursor = logging.MaxQueryLimit, ""
+	result, err := s.Query(ctx, actor, filter)
 	if err != nil {
-		return logging.Facets{}, appError(CodeRuntimeLogFilterInvalid, "运行日志筛选条件无效", err)
+		return logging.Facets{}, err
 	}
-	return result, nil
+	return logging.EntryFacets(result.List), nil
 }
 
 func (s *RuntimeLogService) Settings(actor Actor) (RuntimeLogSettings, error) {
@@ -118,31 +124,54 @@ func (s *RuntimeLogService) UpdateSettings(actor Actor, policy logging.Policy, r
 }
 
 func (s *RuntimeLogService) Export(ctx context.Context, actor Actor, filter logging.Filter, request RequestContext) ([]byte, int, error) {
+	payload, count, _, err := s.ExportWithCoverage(ctx, actor, filter, request)
+	return payload, count, err
+}
+
+// ExportWithCoverage preserves the existing Export contract while allowing the
+// HTTP caller to explain bounded/partial output without inventing lost history.
+func (s *RuntimeLogService) ExportWithCoverage(ctx context.Context, actor Actor, filter logging.Filter, request RequestContext) ([]byte, int, bool, error) {
 	if !actor.Can(authz.PermissionLogsExport) {
-		return nil, 0, appError(CodePermissionDenied, "没有导出运行日志的权限", nil)
+		return nil, 0, false, appError(CodePermissionDenied, "没有导出运行日志的权限", nil)
 	}
 	exportContext, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 	filter.Limit = logging.MaxQueryLimit
 	filter.Cursor = ""
+	if err := filter.Normalize(time.Now().UTC()); err != nil {
+		return nil, 0, false, appError(CodeRuntimeLogFilterInvalid, "运行日志筛选条件无效", err)
+	}
 	var plain bytes.Buffer
 	count := 0
+	partial := s.manager.Health().Degraded
 	const maxExportPlainBytes = 32 * 1024 * 1024
 	for count < 5000 {
 		result, err := s.manager.Query(exportContext, filter)
 		if err != nil {
-			return nil, 0, err
+			return nil, 0, false, err
 		}
-		for _, entry := range result.List {
+		partial = partial || result.Partial || result.Malformed > 0
+		visible, restricted, err := s.projectRuntimeEntries(exportContext, actor, result.List)
+		if err != nil {
+			return nil, 0, false, appError(CodeRuntimeLogUnavailable, "运行日志导出失败", err)
+		}
+		partial = partial || restricted
+		capped := false
+		for _, entry := range visible {
 			line, _ := json.Marshal(entry)
-			if plain.Len()+len(line)+1 > maxExportPlainBytes {
+			if count >= 5000 || plain.Len()+len(line)+1 > maxExportPlainBytes {
+				capped = true
 				break
 			}
 			plain.Write(line)
 			plain.WriteByte('\n')
 			count++
 		}
-		if result.NextCursor == "" || count >= 5000 || plain.Len() >= maxExportPlainBytes {
+		if capped || (count >= 5000 && result.NextCursor != "") {
+			partial = true
+			break
+		}
+		if result.NextCursor == "" {
 			break
 		}
 		filter.Cursor = result.NextCursor
@@ -150,15 +179,16 @@ func (s *RuntimeLogService) Export(ctx context.Context, actor Actor, filter logg
 	var compressed bytes.Buffer
 	zw := gzip.NewWriter(&compressed)
 	if _, err := zw.Write(plain.Bytes()); err != nil {
-		return nil, 0, appError(CodeRuntimeLogUnavailable, "运行日志导出失败", err)
+		return nil, 0, false, appError(CodeRuntimeLogUnavailable, "运行日志导出失败", err)
 	}
 	if err := zw.Close(); err != nil {
-		return nil, 0, appError(CodeRuntimeLogUnavailable, "运行日志导出失败", err)
+		return nil, 0, false, appError(CodeRuntimeLogUnavailable, "运行日志导出失败", err)
 	}
-	if err := s.audit.Record(nil, &actor.User.ID, "logs.export", "runtime_logs", "filtered", "success", map[string]any{"result_count": count, "output_bytes": compressed.Len(), "from": filter.From, "to": filter.To, "levels": filter.Levels, "modules": filter.Modules, "components": filter.Components, "operations": filter.Operations, "plugin_ids": filter.PluginIDs}, request); err != nil {
-		return nil, 0, err
+	partial = partial || s.manager.Health().Degraded
+	if err := s.audit.Record(nil, &actor.User.ID, "logs.export", "runtime_logs", "filtered", "success", map[string]any{"result_count": count, "output_bytes": compressed.Len(), "partial": partial, "from": filter.From, "to": filter.To, "levels": filter.Levels, "modules": filter.Modules, "components": filter.Components, "operations": filter.Operations, "plugin_ids": filter.PluginIDs}, request); err != nil {
+		return nil, 0, false, err
 	}
-	return compressed.Bytes(), count, nil
+	return compressed.Bytes(), count, partial, nil
 }
 
 func policyFromModel(model models.RuntimeLogPolicy) logging.Policy {

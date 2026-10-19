@@ -401,7 +401,7 @@ func withArtifactScanContext(event *zerolog.Event, policy mediaArtifactPolicy, p
 	return event.Str("phase", phase)
 }
 
-func (w *MediaArtifactWorker) Run(ctx context.Context, runtime JobRuntime, job ClaimedJob) WorkerResult {
+func (w *MediaArtifactWorker) Run(ctx context.Context, runtime JobRuntime, job ClaimedJob) (executionResult WorkerResult) {
 	if w == nil || w.service == nil {
 		return WorkerResult{ErrorCode: "artifact_service_unavailable", ErrorMessage: "媒体产物服务不可用"}
 	}
@@ -413,6 +413,16 @@ func (w *MediaArtifactWorker) Run(ctx context.Context, runtime JobRuntime, job C
 	if err != nil {
 		return WorkerResult{ErrorCode: "artifact_run_missing", ErrorMessage: "媒体产物记录不存在"}
 	}
+	started := time.Now()
+	state := &artifactBusinessState{counts: map[string]int{}}
+	ctx = context.WithValue(ctx, artifactBusinessKey{}, state)
+	ctx = serverlog.WithBusinessFields(ctx, map[string]any{"job_id": job.Job.ID, "library_id": run.LibraryID, "task_id": run.ID, "generation": run.Generation, "scan_run_id": policy.ScanRunID})
+	var libraryLabel struct{ Name string }
+	if w.service.db.Model(&models.MediaLibrary{}).Select("name").First(&libraryLabel, run.LibraryID).Error == nil {
+		ctx = serverlog.WithBusinessFields(ctx, map[string]any{"library_name": libraryLabel.Name})
+	}
+	recordMediaBusiness(ctx, w.service.log, serverlog.OperationMediaArtifact, "artifact.start", "start", "started", fmt.Sprintf("开始核对媒体库 %s 的产物与当前目录版本；按配置生成或复用 NFO、图片和 STRM，发布与上游刷新另行确认", serverlog.BusinessDisplayName(libraryLabel.Name)), nil)
+	defer func() { w.service.observeArtifactEnd(ctx, run, state, started, executionResult) }()
 	if run.Status == models.MediaArtifactStatusCompleted {
 		if superseded, err := w.service.artifactPolicySuperseded(policy); err != nil {
 			return WorkerResult{ErrorCode: "artifact_state_unavailable", ErrorMessage: "媒体产物状态不可用"}
@@ -434,7 +444,6 @@ func (w *MediaArtifactWorker) Run(ctx context.Context, runtime JobRuntime, job C
 	} else if superseded {
 		return w.service.recoverSupersededArtifactExecution(ctx, job, run, policy)
 	}
-	started := time.Now()
 	now := time.Now().UTC()
 	if err := w.service.catalogArtifactWriteTx(ctx, func(tx *gorm.DB) error {
 		if _, err := w.service.queue.verifyLease(tx, job.Job.ID, job.LeaseToken); err != nil {
@@ -898,7 +907,7 @@ func (s *MediaArtifactService) finishArtifactGeneration(ctx context.Context, cla
 	if policy.ScanPartial && policy.ScopeVersion != 1 {
 		return WorkerResult{}
 	}
-	return s.publishGenerationReady(run.LibraryID, run.Generation, policy)
+	return s.publishGenerationReady(run.LibraryID, run.Generation, policy, ctx)
 }
 
 func mediaLibraryRequiresArtifacts(storageType string, library models.MediaLibrary, available bool) bool {
@@ -921,7 +930,7 @@ func mediaLibraryRequiresCloudCleanup(library models.MediaLibrary, run models.Me
 	return json.Unmarshal([]byte(run.CheckpointJSON), &checkpoint) == nil && len(checkpoint.Directories) > 0
 }
 
-func (s *MediaArtifactService) publishGenerationReady(libraryID uint, generation uint64, policy mediaArtifactPolicy) WorkerResult {
+func (s *MediaArtifactService) publishGenerationReady(libraryID uint, generation uint64, policy mediaArtifactPolicy, contexts ...context.Context) WorkerResult {
 	if s.changes == nil {
 		return WorkerResult{}
 	}
@@ -972,6 +981,11 @@ func (s *MediaArtifactService) publishGenerationReady(libraryID uint, generation
 	}
 	if len(readied) > 0 {
 		s.changes.NotifyCommitted(libraryID, readied[len(readied)-1].Revision)
+		ctx := context.Background()
+		if len(contexts) > 0 && contexts[0] != nil {
+			ctx = contexts[0]
+		}
+		recordMediaBusiness(ctx, s.log, serverlog.OperationMediaArtifact, "artifact.published", "publish", "confirmed", "产物与清理边界已确认，媒体变更已发布并发出刷新通知；通知不代表上游扫描完成", map[string]any{"library_id": libraryID, "generation": generation, "published_count": len(readied)})
 	}
 	return WorkerResult{}
 }
@@ -1148,6 +1162,7 @@ func (s *MediaArtifactService) writeSourceAsset(ctx context.Context, root string
 
 func (s *MediaArtifactService) writeNFO(ctx context.Context, root string, run models.MediaArtifactRun, targetKind string, recognition models.MediaLibraryRecognition, entries []models.MediaLibraryEntry, manifest *artifactManifestIndex) (string, error) {
 	if len(entries) == 0 {
+		s.observeLocalArtifact(ctx, run, models.MediaArtifactKindNFO, "", "skipped", "no_media", -1, nil, false)
 		return "skipped", nil
 	}
 	_, snapshot, err := decodeRecognitionMetadata(recognition.MetadataJSON)
@@ -1156,6 +1171,7 @@ func (s *MediaArtifactService) writeNFO(ctx context.Context, root string, run mo
 	}
 	content, err := nfo.Render(snapshot)
 	if errors.Is(err, nfo.ErrSnapshotIncomplete) {
+		s.observeLocalArtifact(ctx, run, models.MediaArtifactKindNFO, "", "skipped", "snapshot_incomplete", -1, nil, false)
 		return "skipped", nil
 	}
 	if err != nil {
@@ -1174,6 +1190,7 @@ func (s *MediaArtifactService) writeNFO(ctx context.Context, root string, run mo
 		return outcome, nil
 	}
 	if s.metadata == nil {
+		recordMediaBusiness(ctx, s.log, serverlog.OperationMediaArtifact, "artifact.image.failed", "image_fetch", "failed", "NFO 已处理，但图片元数据客户端未配置，本轮不能继续生成图片；不会把部分产物当作全部完成", map[string]any{"library_id": run.LibraryID, "task_id": run.ID, "error_code": "metadata_image_client_unavailable"})
 		return outcome, errors.New("metadata image client is unavailable")
 	}
 	client, _, _, err := s.metadata.clientWithCredentialInfo()
@@ -1193,6 +1210,7 @@ func (s *MediaArtifactService) writeNFO(ctx context.Context, root string, run mo
 		}
 		body, err := client.DownloadJPEG(ctx, image.TMDBPath, size, limit)
 		if err != nil {
+			recordMediaBusiness(ctx, s.log, serverlog.OperationMediaArtifact, "artifact.image.failed", "image_fetch", "failed", "当前图片下载未成功，已生成的 NFO 保留；未额外重试或输出凭据和图片 URL", map[string]any{"library_id": run.LibraryID, "task_id": run.ID, "action": imageKind, "error_code": "metadata_image_fetch_failed"})
 			return combined, err
 		}
 		season := ""
@@ -1319,13 +1337,14 @@ func (s *MediaArtifactService) reusableSTRM(target string, artifact models.Media
 }
 
 type artifactManifestIndex struct {
-	rows             map[string]models.MediaArtifact
-	dirty            map[string]struct{}
-	beforeWrite      func() error
-	reserve          func(*models.MediaArtifact) error
-	catalogBindingID string
-	lazy             bool
-	physical         *artifactPhysicalExecution
+	observationContext context.Context
+	rows               map[string]models.MediaArtifact
+	dirty              map[string]struct{}
+	beforeWrite        func() error
+	reserve            func(*models.MediaArtifact) error
+	catalogBindingID   string
+	lazy               bool
+	physical           *artifactPhysicalExecution
 }
 
 func newArtifactManifestIndex(capacity int) *artifactManifestIndex {
@@ -1355,7 +1374,7 @@ type localArtifactSpec struct {
 	Render            func(models.MediaArtifact, string) (localArtifactRender, error)
 }
 
-func (s *MediaArtifactService) writeLocalArtifact(root string, run models.MediaArtifactRun, spec localArtifactSpec) (string, error) {
+func (s *MediaArtifactService) writeLocalArtifact(root string, run models.MediaArtifactRun, spec localArtifactSpec) (outcome string, writeErr error) {
 	relative := spec.RelativePath
 	var artifact models.MediaArtifact
 	key := artifactManifestKey(spec.TargetKind, relative)
@@ -1378,8 +1397,23 @@ func (s *MediaArtifactService) writeLocalArtifact(root string, run models.MediaA
 	if err != nil {
 		return "", err
 	}
+	ctx := context.Background()
+	if spec.Manifest != nil && spec.Manifest.observationContext != nil {
+		ctx = spec.Manifest.observationContext
+	}
+	if spec.Manifest != nil && spec.Manifest.physical != nil {
+		ctx = spec.Manifest.physical.ctx
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	reason, physicallyWritten, contentSize := "", false, int64(-1)
+	defer func() {
+		s.observeLocalArtifact(ctx, run, spec.Kind, relative, outcome, reason, contentSize, writeErr, physicallyWritten)
+	}()
 	if !exists {
 		if _, err := os.Lstat(target); err == nil {
+			reason = "unmanaged_collision"
 			return "skipped", nil
 		} else if !errors.Is(err, os.ErrNotExist) {
 			return "", err
@@ -1390,6 +1424,7 @@ func (s *MediaArtifactService) writeLocalArtifact(root string, run models.MediaA
 		}
 		artifact = models.MediaArtifact{OpaqueID: opaque, RunID: run.ID, LibraryID: run.LibraryID, SourceIdentity: spec.SourceIdentity, ProviderItemID: spec.ProviderItemID, Kind: spec.Kind, TargetKind: spec.TargetKind, RelativePath: relative, Managed: true, Active: true, Status: models.MediaArtifactStatusQueued, CreatedAt: time.Now().UTC()}
 	} else if !artifact.Managed {
+		reason = "unmanaged"
 		return "skipped", nil
 	} else if artifact.Status == models.MediaArtifactStatusCleanup && !artifact.Active {
 		return "", errors.New("managed artifact cleanup is in progress")
@@ -1419,6 +1454,7 @@ func (s *MediaArtifactService) writeLocalArtifact(root string, run models.MediaA
 	if err != nil {
 		return "", err
 	}
+	contentSize = int64(len(render.Content))
 	fingerprint := sha256.Sum256(render.Content)
 	if spec.Manifest != nil && spec.Manifest.beforeWrite != nil {
 		if err := spec.Manifest.beforeWrite(); err != nil {
@@ -1455,6 +1491,7 @@ func (s *MediaArtifactService) writeLocalArtifact(root string, run models.MediaA
 			} else if err := s.db.Save(&artifact).Error; err != nil {
 				return "", err
 			}
+			reason = "content_reused"
 			return "skipped", nil
 		}
 	}
@@ -1483,6 +1520,7 @@ func (s *MediaArtifactService) writeLocalArtifact(root string, run models.MediaA
 		}
 		return "", err
 	}
+	physicallyWritten = true
 	if receipt != nil {
 		if err := s.reconcileArtifactPhysicalWrite(root, *receipt, *spec.Manifest.physical); err != nil {
 			return "", err

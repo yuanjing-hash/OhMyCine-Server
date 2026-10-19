@@ -421,7 +421,9 @@ func TestCloudTransferCompletionLogContainsOnlyAggregateTiming(t *testing.T) {
 			t.Fatalf("completion log missing aggregate field %q: %s", field, logText)
 		}
 	}
-	for _, secret := range []string{fixture.sourceID, "Movie.2024.mkv", "library-root", "target-storage-root"} {
+	// Validated file basenames and scope-relative plan displays are now an
+	// intentional business-log contract. Provider identities and roots stay private.
+	for _, secret := range []string{fixture.sourceID, "library-root", "target-storage-root", `"provider_item_id"`, `"provider_parent_id"`} {
 		if strings.Contains(logText, secret) {
 			t.Fatalf("completion log leaked provider identity/path %q: %s", secret, logText)
 		}

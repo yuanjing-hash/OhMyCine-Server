@@ -28,10 +28,13 @@ func (w *TransferWorker) finishCompletedTransfer(ctx context.Context, task model
 	// The persisted successful targets are the only authorized catalog scope.
 	// Failure retries this batch; it must never wake an unscoped library scan.
 	if w.service.libraryReconciler != nil {
+		w.transferEvent(ctx, task, "transfer.catalog.start", "publishing", "started", "文件整理结果已保存，开始按本批成功目标更新目录；不会触发整个媒体库扫描", nil)
 		if err := w.service.libraryReconciler.ReconcileTransferBatch(ctx, task.ID); err != nil {
+			w.transferEvent(ctx, task, "transfer.catalog.wait", "publishing", "retry", "本批目录发布未完成，保留已经整理的文件，仅按原批次重试目录更新", map[string]any{"error_code": "transfer_batch_publish_failed"})
 			next := time.Now().UTC().Add(time.Minute)
 			return WorkerResult{RetryAt: &next, ErrorCode: "transfer_batch_publish_failed", ErrorMessage: "入库文件目录更新失败，将仅重试本批次"}
 		}
+		w.transferEvent(ctx, task, "transfer.catalog.finish", "publishing", "confirmed", "本批成功目标的目录更新调用已完成；NFO、图片、STRM和下游媒体刷新仍分别记录", nil)
 	}
 	if err := w.service.db.Transaction(func(tx *gorm.DB) error {
 		if err := ensureDownloadPipelineActive(tx, task.DownloadTaskID); err != nil {
@@ -97,6 +100,7 @@ func (w *TransferWorker) finishCompletedTransfer(ctx context.Context, task model
 		if task.CleanupStatus != models.TransferCleanupCompleted {
 			_ = w.service.db.Model(&models.TransferTask{}).Where("id = ?", task.ID).Updates(map[string]any{"cleanup_status": models.TransferCleanupDeferred, "cleanup_error_code": "", "updated_at": time.Now().UTC()}).Error
 		}
+		w.transferEvent(ctx, task, "transfer.cleanup.deferred", "cleanup", "waiting", "来源文件仍用于做种或软链接，暂存清理已延后；不会提前删除下载源", map[string]any{"transfer_mode": download.TransferMode})
 		return WorkerResult{}
 	}
 	if task.CleanupStatus == models.TransferCleanupCompleted || task.CleanupStatus == models.TransferCleanupSkipped {
@@ -154,7 +158,25 @@ func (s *TransferService) CleanupAfterSeeding(ctx context.Context, downloadTaskI
 	return err
 }
 
-func (s *TransferService) cleanupTransferStaging(ctx context.Context, task models.TransferTask, download models.DownloadTask) (int, error) {
+func (s *TransferService) cleanupTransferStaging(ctx context.Context, task models.TransferTask, download models.DownloadTask) (removed int, resultErr error) {
+	ctx = serverlog.WithBusinessFields(ctx, transferBusinessFields(task, download))
+	started := time.Now()
+	serverlog.RecordBusiness(ctx, s.log, serverlog.OperationDownloadStagingCleanup, serverlog.BusinessEvent{Code: "cleanup.start", Stage: "cleanup", Outcome: "started", Message: "开始核对完整下载清单与已选入库清单，只清理可证明归属的未选项；其他视频及未匹配字幕保留"})
+	defer func() {
+		outcome, message := "finished", "本次受控暂存清理已完成，未选视频和未匹配字幕不在删除范围"
+		fields := map[string]any{"deleted_count": removed, "duration_ms": time.Since(started).Milliseconds()}
+		if resultErr != nil {
+			outcome, message = "partial", "暂存清理未全部完成，后续文件保留，按原任务恢复；已确认清理数量单独记录"
+			fields["error_code"] = transferStagingCleanupCode(resultErr)
+		}
+		serverlog.RecordBusiness(ctx, s.log, serverlog.OperationDownloadStagingCleanup, serverlog.BusinessEvent{Code: "cleanup.finish", Stage: "cleanup", Outcome: outcome, Message: message, Fields: fields})
+	}()
+	ctx = context.WithValue(ctx, stagingCleanupObserverKey{}, stagingCleanupObserver(func(file downloadpkg.File, outcome, message string) {
+		display := relativeFileDisplay(file.RelativePath, "", file.Size)
+		fields := display.fields()
+		delete(fields, "new_name")
+		serverlog.RecordBusiness(ctx, s.log, serverlog.OperationDownloadStagingCleanup, serverlog.BusinessEvent{Code: "cleanup.file", Stage: "cleanup", Outcome: outcome, Message: message + "：" + firstNonEmpty(display.source, serverlog.BusinessDisplayName(display.oldName)), Fields: fields})
+	}))
 	extras, err := transferCleanupDifference(task)
 	if err != nil {
 		return 0, s.persistTransferCleanupFailure(task.ID, "download_staging_manifest_invalid", err)
@@ -167,7 +189,7 @@ func (s *TransferService) cleanupTransferStaging(ctx context.Context, task model
 		return 0, nil
 	}
 	_ = s.db.Model(&models.TransferTask{}).Where("id = ?", task.ID).Updates(map[string]any{"cleanup_status": models.TransferCleanupRunning, "cleanup_error_code": "", "updated_at": time.Now().UTC()}).Error
-	removed := 0
+	removed = 0
 	if cloudCleanup {
 		if task.Phase != models.TransferTaskStatusCompleted {
 			err = transferStagingCleanupFailure("download_staging_package_not_completed", errors.New("transfer is not completed"))
@@ -184,7 +206,9 @@ func (s *TransferService) cleanupTransferStaging(ctx context.Context, task model
 			}
 		}
 	} else {
-		removed, err = cleanupLocalStaging(download, extras)
+		removed, err = cleanupLocalStagingObserved(download, extras, func(file downloadpkg.File, outcome, message string) {
+			observeStagingCleanup(ctx, file, outcome, message)
+		})
 	}
 	if err != nil {
 		return removed, s.persistTransferCleanupFailureWithCount(task.ID, transferStagingCleanupCode(err), removed, err)
@@ -293,6 +317,10 @@ func transferCleanupFileKey(file downloadpkg.File) string {
 }
 
 func cleanupLocalStaging(download models.DownloadTask, extras []downloadpkg.File) (int, error) {
+	return cleanupLocalStagingObserved(download, extras, nil)
+}
+
+func cleanupLocalStagingObserved(download models.DownloadTask, extras []downloadpkg.File, observe stagingCleanupObserver) (int, error) {
 	stagingRoot := filepath.Clean(download.StagingAbsolutePath)
 	if stagingRoot == "." || !filepath.IsAbs(stagingRoot) {
 		return 0, errors.New("download staging root is invalid")
@@ -315,7 +343,13 @@ func cleanupLocalStaging(download models.DownloadTask, extras []downloadpkg.File
 			return removed, errors.New("download staging file changed")
 		}
 		if err := os.Remove(target); err != nil {
+			if observe != nil {
+				observe(file, "failed", "本地暂存文件移除失败，当前与后续文件保留")
+			}
 			return removed, err
+		}
+		if observe != nil {
+			observe(file, "confirmed", "已移除本清单归属的本地未选暂存文件")
 		}
 		removed++
 		pruneEmptyStagingDirectories(stagingRoot, filepath.Dir(target))
@@ -483,6 +517,12 @@ func cleanupCloudStagingItems(ctx context.Context, boundary cloudStagingCleanupB
 			for _, itemID := range chunk {
 				if _, exists := remaining[itemID]; !exists {
 					missing++
+					for _, file := range byParent[parentID] {
+						if file.ProviderItemID == itemID {
+							observeStagingCleanup(ctx, file, "confirmed", "现有回收后目录核对已确认此未选文件不再位于下载包中")
+							break
+						}
+					}
 				}
 			}
 			removed += missing

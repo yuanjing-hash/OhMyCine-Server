@@ -565,7 +565,9 @@ func (s *STRMManagementService) buildCleanupPlan(libraryID uint, runID string, a
 	}
 	if automatic && (plan.Policy.ScopeVersion == 1 || plan.Policy.CatalogScopeMode == catalogArtifactScopeIncremental) {
 		if err := s.libraries.withCatalogRead(context.Background(), []uint{libraryID}, func(tx *gorm.DB, reader *CatalogReader) error {
-			if err := checkDeletedWorkRestoration(tx, reader, plan.Policy, plan.Artifacts); err != nil { return err }
+			if err := checkDeletedWorkRestoration(tx, reader, plan.Policy, plan.Artifacts); err != nil {
+				return err
+			}
 			for start := 0; start < len(plan.Artifacts); start += CatalogBatchRows {
 				ids := []string{}
 				paths := []string{}
@@ -764,7 +766,24 @@ func (s *STRMManagementService) lockCleanupBoundary(libraryID uint) func() {
 	return lock.Unlock
 }
 
-func (s *STRMManagementService) executeCleanupPlan(ctx context.Context, plan artifactCleanupPlan) (int, int, error) {
+func (s *STRMManagementService) executeCleanupPlan(ctx context.Context, plan artifactCleanupPlan) (removed, removedDirectories int, cleanupError error) {
+	ctx = serverlog.WithBusinessFields(ctx, map[string]any{"library_id": plan.Library.ID, "library_name": plan.Library.Name})
+	if plan.Run != nil {
+		ctx = serverlog.WithBusinessFields(ctx, map[string]any{"task_id": plan.Run.ID})
+	}
+	started, deletedFiles := time.Now(), 0
+	recordMediaBusiness(ctx, s.log, serverlog.OperationArtifactCleanup, "artifact.cleanup.start", "cleanup", "started", fmt.Sprintf("开始清理媒体库 %s 中已确认不再使用的 %d 个受管产物；保留活动与非系统文件", serverlog.BusinessDisplayName(plan.Library.Name), len(plan.Artifacts)), map[string]any{"total_count": len(plan.Artifacts)})
+	defer func() {
+		outcome, message := "finished", fmt.Sprintf("清理阶段结束：实际删除文件 %d 个，清除受管清单 %d 条，删除空目录 %d 个；没有删除媒体源文件", deletedFiles, removed, removedDirectories)
+		fields := map[string]any{"deleted_count": deletedFiles, "processed_count": removed, "completed_count": removedDirectories, "duration_ms": time.Since(started).Milliseconds()}
+		if cleanupError != nil {
+			outcome, message, fields["error_code"] = "failed", fmt.Sprintf("清理未全部完成：此前已确认删除 %d 个文件、%d 个空目录；保留剩余清单等待核对，未重复删除", deletedFiles, removedDirectories), cleanupStableCode(cleanupError)
+		}
+		if ctx.Err() != nil {
+			outcome = "cancelled"
+		}
+		recordMediaBusiness(ctx, s.log, serverlog.OperationArtifactCleanup, "artifact.cleanup.finish", "finish", outcome, message, fields)
+	}()
 	if permit, ok := ctx.Value(artifactCleanupPermitContextKey{}).(CatalogPhysicalWritePermit); ok {
 		plan.PhysicalPermit = &permit
 	}
@@ -774,8 +793,6 @@ func (s *STRMManagementService) executeCleanupPlan(ctx context.Context, plan art
 		guard.Generation = plan.Run.Generation
 		guard.AppliedGeneration = plan.Run.Generation
 	}
-	removed := 0
-	removedDirectories := 0
 	for _, artifact := range plan.Artifacts {
 		if err := ctx.Err(); err != nil {
 			return removed, removedDirectories, cleanupFailure("artifact_cleanup_context_canceled")
@@ -839,10 +856,15 @@ func (s *STRMManagementService) executeCleanupPlan(ctx context.Context, plan art
 				}
 				return removed, removedDirectories, cleanupFailure("artifact_cleanup_target_changed")
 			}
-			if err := s.removeFile(target); err != nil && !errors.Is(err, os.ErrNotExist) {
+			removeErr := s.removeFile(target)
+			if removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
 				// The external call has begun: keep its durable cleanup claim even
 				// when it reports failure. Retry must reconcile this exact manifest.
 				return removed, removedDirectories, cleanupFailure("artifact_cleanup_delete_failed")
+			}
+			if removeErr == nil {
+				deletedFiles++
+				recordMediaBusiness(ctx, s.log, serverlog.OperationArtifactCleanup, "artifact.cleanup.file", "cleanup", "confirmed", "已删除不再使用的受管产物："+artifactDisplayPath(current.RelativePath), map[string]any{"relative_path": artifactDisplayPath(current.RelativePath), "action": current.Kind})
 			}
 		}
 		pruned, err := s.removeEmptyCleanupAncestors(ctx, cleanupTarget.Root, cleanupTarget.RootIdentity, target)
@@ -1081,6 +1103,10 @@ func (s *STRMManagementService) removeEmptyCleanupAncestors(ctx context.Context,
 			return removed, cleanupFailure("artifact_cleanup_directory_delete_failed")
 		}
 		removed++
+		if relative, relativeErr := filepath.Rel(root, directory); relativeErr == nil {
+			display := serverlog.BusinessRelativePath(filepath.ToSlash(relative))
+			recordMediaBusiness(ctx, s.log, serverlog.OperationArtifactCleanup, "artifact.cleanup.directory", "cleanup", "confirmed", "已删除经验证的空产物目录："+display, map[string]any{"relative_path": display, "action": "empty_directory"})
+		}
 		current = parent
 	}
 	return removed, nil
@@ -1187,6 +1213,7 @@ func (s *STRMManagementService) AutoCleanup(ctx context.Context, runID string) A
 				return ArtifactCleanupResult{ErrorCode: code}
 			}
 			serverlog.OperationArtifactCleanup.Event(s.log.Info()).Uint("library_id", run.LibraryID).Str("task_id", run.ID).Uint64("generation", run.Generation).Str("status", "skipped").Str("reason_code", skip.reason).Int64("duration_ms", time.Since(started).Milliseconds()).Msg(serverlog.OperationArtifactCleanup.Message("自动清理跳过"))
+			recordMediaBusiness(ctx, s.log, serverlog.OperationArtifactCleanup, "artifact.cleanup.skipped", "cleanup", "skipped", "本轮未删除产物："+artifactCleanupSkipLabel(skip.reason), map[string]any{"library_id": run.LibraryID, "task_id": run.ID, "reason": skip.reason})
 			return ArtifactCleanupResult{Skipped: true}
 		}
 		code := cleanupStableCode(err)

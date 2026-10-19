@@ -162,3 +162,35 @@ func TestProviderEventMonitorIsolatesConnectionFailuresAndCloses(t *testing.T) {
 		t.Fatal("provider event monitor did not stop")
 	}
 }
+
+func TestProviderEventMonitorLogsConfirmedAndEmptyPollsWithoutExtraCalls(t *testing.T) {
+	db, _, connections, actor := newConnectionTestService(t, &fakeCloudDriver{})
+	connection, err := connections.Create(actor, ConnectionInput{Name: "具名事件连接", Provider: cloud.ProviderPan115, Cookie: testPan115Cookie, Enabled: true}, RequestContext{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stamp := time.Now().UTC().Truncate(time.Second)
+	if err := db.Create(&models.ProviderCursor{ConnectionID: connection.ID, Stream: providerLifeStream, CursorTime: stamp, CursorID: "1", UpdatedAt: stamp}).Error; err != nil {
+		t.Fatal(err)
+	}
+	driver := &monitorCloudDriver{page: cloud.ChangePage{Events: []cloud.ChangeEvent{{ID: "2", Time: stamp.Add(time.Second), Kind: cloud.ChangeDeleted, ItemID: "private-provider-file"}}, NextCursor: cloud.ChangeCursor{Time: stamp.Add(time.Second), ID: "2"}}}
+	connections.mu.Lock()
+	connections.drivers[connection.ID] = driver
+	connections.mu.Unlock()
+	notifier := &monitorEventNotifier{called: make(chan struct{}, 2)}
+	manager, logger := captureRemainingBusiness(t, "provider")
+	monitor := NewProviderEventMonitor(db, connections, NewProviderEventService(db, notifier), logger)
+	monitor.poll(context.Background(), connection.ID)
+	monitor.poll(context.Background(), connection.ID)
+	if driver.callCount() != 2 {
+		t.Fatalf("logging added provider requests: %d", driver.callCount())
+	}
+	entries := remainingBusinessEntries(t, manager)
+	if len(entries) != 1 {
+		t.Fatalf("empty poll amplified info logs: %+v", entries)
+	}
+	entry := requireRemainingBusinessEvent(t, entries, "provider.poll.finish", "finished")
+	if entry.Fields["connection_name"] != connection.Name || entry.Fields["created_count"] != float64(1) || entry.Fields["processed_count"] != float64(1) {
+		t.Fatalf("provider counts changed meaning: %+v", entry)
+	}
+}

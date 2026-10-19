@@ -213,6 +213,9 @@ func (s *TransferService) EnqueuePackage(download models.DownloadTask, manifest,
 	}
 	if err == nil {
 		serverlog.OperationMediaTransfer.Event(s.log.Info()).Str("task_id", record.ID).Str("download_task_id", download.ID).Uint("library_id", record.LibraryID).Int("files", len(manifest.Files)).Msg(serverlog.OperationMediaTransfer.Message("已进入整理队列"))
+		fields := transferBusinessFields(record, download)
+		fields["related_job_id"], fields["related_task_id"], fields["total_count"] = download.JobID, download.ID, len(manifest.Files)
+		serverlog.RecordBusiness(context.Background(), s.log, serverlog.OperationMediaTransfer, serverlog.BusinessEvent{Code: "transfer.enqueued", Stage: "enqueue", Outcome: "accepted", Message: "媒体整理任务已持久保存，关联原下载任务；文件移动、重命名和入库仍待执行", Fields: fields})
 	}
 	return err
 }
@@ -266,7 +269,7 @@ type TransferPlanSummary struct {
 	SkippedFiles   int                       `json:"skipped_files"`
 }
 
-func (w *TransferWorker) Run(ctx context.Context, runtime JobRuntime, job ClaimedJob) WorkerResult {
+func (w *TransferWorker) Run(ctx context.Context, runtime JobRuntime, job ClaimedJob) (result WorkerResult) {
 	started := time.Now()
 	var payload transferJobPayload
 	if err := json.Unmarshal([]byte(job.Job.PayloadJSON), &payload); err != nil || payload.TransferTaskID == "" {
@@ -276,14 +279,17 @@ func (w *TransferWorker) Run(ctx context.Context, runtime JobRuntime, job Claime
 	if err := w.service.db.First(&task, "id = ?", payload.TransferTaskID).Error; err != nil {
 		return WorkerResult{ErrorCode: "transfer_task_missing", ErrorMessage: "入库任务不存在"}
 	}
-	serverlog.OperationMediaTransfer.Event(w.service.log.Info()).Str("task_id", task.ID).Uint("library_id", task.LibraryID).Int("total_files", task.TotalFiles).Msg(serverlog.OperationMediaTransfer.Message("开始规划并入库"))
+	var download models.DownloadTask
+	ctx = serverlog.WithBusinessFields(ctx, transferBusinessFields(task, download))
+	w.transferEvent(ctx, task, "transfer.start", "start", "started", "开始本次媒体整理，先复核已保存清单、来源与目标边界；尚未移动或入库文件", map[string]any{"total_count": task.TotalFiles})
+	defer func() { w.recordTransferEnd(ctx, task, download, started, result) }()
 	if task.Phase == models.TransferTaskStatusCompleted {
 		return w.finishCompletedTransfer(ctx, task)
 	}
-	var download models.DownloadTask
 	if err := w.service.db.First(&download, "id = ?", task.DownloadTaskID).Error; err != nil {
 		return w.fail(task, "transfer_download_missing", "原下载任务不存在")
 	}
+	ctx = serverlog.WithBusinessFields(ctx, transferBusinessFields(task, download))
 	if download.Phase == models.DownloadTaskStatusCancelled {
 		return WorkerResult{}
 	}
@@ -405,6 +411,7 @@ func (w *TransferWorker) Run(ctx context.Context, runtime JobRuntime, job Claime
 	}
 	task.PlanSummaryJSON = encodedSummary
 	task.TotalFiles = len(plan)
+	w.transferEvent(ctx, task, "transfer.plan", "planning", "planned", fmt.Sprintf("已生成 %d 项安全整理计划，方式：%s；具体来源、目标及文件名将在实际执行时逐项记录", len(plan), transferModeMessage(download.TransferMode)), map[string]any{"total_count": len(plan), "transfer_mode": download.TransferMode})
 	policy := download.ConflictPolicy
 	if response := transferActionResponse(job.Job.CheckpointJSON); response != "" {
 		policy = response
@@ -421,6 +428,7 @@ func (w *TransferWorker) Run(ctx context.Context, runtime JobRuntime, job Claime
 		}
 	}
 	if conflicts > 0 && policy == models.MediaLibraryConflictAsk {
+		w.transferEvent(ctx, task, "transfer.conflict", "conflict", "waiting", fmt.Sprintf("发现 %d 个同名目标，等待选择覆盖、跳过或重命名；尚未处理这些冲突文件", conflicts), map[string]any{"conflict_count": conflicts, "conflict_decision": policy})
 		return WorkerResult{Wait: &WaitForAction{ActionType: "transfer_conflict", Prompt: "目标媒体库存在同名文件，请选择处理方式", Options: []string{models.MediaLibraryConflictOverwrite, models.MediaLibraryConflictSkip, models.MediaLibraryConflictRename}, Preview: map[string]string{"媒体库": task.LibraryName, "冲突文件": strconv.Itoa(conflicts)}, Checkpoint: map[string]any{"conflict_count": conflicts}}}
 	}
 	_ = w.service.db.Model(&task).Updates(map[string]any{"phase": models.TransferTaskStatusTransferring, "updated_at": time.Now().UTC()}).Error
@@ -462,14 +470,35 @@ func (w *TransferWorker) Run(ctx context.Context, runtime JobRuntime, job Claime
 		if base, ok := renameGroups[item.Group]; ok {
 			item.Destination = base + strings.TrimPrefix(item.Destination, item.Group)
 		}
-		destination, skip, err := resolveTransferConflict(item, policy, download.TransferMode)
+		display := localFileDisplay(download, targetRoot, item)
+		skipReason := ""
+		destination, skip, err := resolveTransferConflictObserved(item, policy, download.TransferMode, func(reason string) {
+			skipReason = reason
+			if reason == "overwrite_removed" {
+				w.transferEvent(ctx, task, "file.overwrite", "conflict", "confirmed", "已移除受控目标位置的同名文件，来源文件尚待整理："+display.description(), display.fields())
+			}
+		})
 		if err != nil {
+			w.transferEvent(ctx, task, "file.conflict_failed", "conflict", "failed", "目标冲突处理失败，未继续本文件操作："+display.description(), display.fields())
 			return w.fail(task, "transfer_conflict_failed", "无法处理目标文件冲突")
 		}
+		item.Destination = destination
+		display = localFileDisplay(download, targetRoot, item)
 		if !skip {
-			if err := executeTransfer(download.TransferMode, item.Source, destination, targetRoot); err != nil {
+			w.transferEvent(ctx, task, "file.start", "organize", "started", "开始"+transferModeMessage(download.TransferMode)+"："+display.description(), display.fields())
+			if err := executeTransferObserved(download.TransferMode, item.Source, destination, targetRoot, func(outcome, message string) {
+				w.transferEvent(ctx, task, "file.result", "organize", outcome, message+"："+display.description(), display.fields())
+			}); err != nil {
 				return w.fail(task, "transfer_write_failed", "文件入库失败")
 			}
+		} else {
+			outcome, message := "skipped", "同名目标已按跳过策略保留，未移动或覆盖来源文件"
+			if skipReason == "already_applied" {
+				outcome, message = "reused", "已由现有文件核验确认原操作完成，本轮不重复执行"
+			}
+			fields := display.fields()
+			fields["conflict_decision"] = policy
+			w.transferEvent(ctx, task, "file.skipped", "conflict", outcome, message+"："+display.description(), fields)
 		}
 		var completedRelative string
 		{
@@ -1311,16 +1340,26 @@ func transferAlreadyApplied(mode string, item transferPlanItem) bool {
 }
 
 func resolveTransferConflict(item transferPlanItem, policy, mode string) (string, bool, error) {
+	return resolveTransferConflictObserved(item, policy, mode, nil)
+}
+
+func resolveTransferConflictObserved(item transferPlanItem, policy, mode string, observe func(string)) (string, bool, error) {
 	if _, err := os.Lstat(item.Destination); errors.Is(err, os.ErrNotExist) {
 		return item.Destination, false, nil
 	} else if err != nil {
 		return "", false, err
 	}
 	if transferAlreadyApplied(mode, item) {
+		if observe != nil {
+			observe("already_applied")
+		}
 		return item.Destination, true, nil
 	}
 	switch policy {
 	case models.MediaLibraryConflictSkip:
+		if observe != nil {
+			observe("conflict_skip")
+		}
 		return item.Destination, true, nil
 	case models.MediaLibraryConflictOverwrite:
 		info, err := os.Lstat(item.Destination)
@@ -1329,6 +1368,9 @@ func resolveTransferConflict(item transferPlanItem, policy, mode string) (string
 		}
 		if err := os.Remove(item.Destination); err != nil {
 			return "", false, err
+		}
+		if observe != nil {
+			observe("overwrite_removed")
 		}
 		return item.Destination, false, nil
 	case models.MediaLibraryConflictRename:
@@ -1347,25 +1389,53 @@ func resolveTransferConflict(item transferPlanItem, policy, mode string) (string
 }
 
 func executeTransfer(mode, source, destination, targetRoot string) error {
+	return executeTransferObserved(mode, source, destination, targetRoot, nil)
+}
+
+func executeTransferObserved(mode, source, destination, targetRoot string, observe func(string, string)) error {
+	record := func(outcome, message string) {
+		if observe != nil {
+			observe(outcome, message)
+		}
+	}
 	if ensureWithin(targetRoot, destination) != nil {
+		record("failed", "目标路径未通过边界校验，未执行文件操作")
 		return errors.New("target escapes library root")
 	}
 	if err := ensureSafeDirectoryPath(targetRoot, filepath.Dir(destination), true); err != nil {
+		record("failed", "目标目录不可安全使用，未执行本文件操作")
 		return err
 	}
 	switch mode {
 	case models.MediaLibraryTransferMove:
 		if err := os.Rename(source, destination); err == nil {
+			record("confirmed", "移动及目标文件名已确认，来源文件已移至目标位置")
 			return nil
 		}
 		if err := copyFileAtomic(source, destination); err != nil {
+			record("failed", "跨目录移动的复制阶段失败，未确认目标文件写入")
 			return err
 		}
-		return os.Remove(source)
+		if err := os.Remove(source); err != nil {
+			record("partial", "目标副本已写入，但来源文件移除失败；本次移动尚未全部完成")
+			return err
+		}
+		record("confirmed", "目标副本已写入且来源文件已移除，移动已完成")
+		return nil
 	case models.MediaLibraryTransferCopy:
-		return copyFileAtomic(source, destination)
+		if err := copyFileAtomic(source, destination); err != nil {
+			record("failed", "复制失败，未确认目标文件写入")
+			return err
+		}
+		record("confirmed", "复制与目标文件名已确认，来源文件保留")
+		return nil
 	case models.MediaLibraryTransferSymlink:
-		return os.Symlink(source, destination)
+		if err := os.Symlink(source, destination); err != nil {
+			record("failed", "软链接创建失败，来源文件保留")
+			return err
+		}
+		record("confirmed", "软链接已创建，来源文件保留并继续作为链接目标")
+		return nil
 	default:
 		return errors.New("unsupported transfer mode")
 	}

@@ -84,6 +84,9 @@ func (w *TransferWorker) runCloudUpload(ctx context.Context, runtime JobRuntime,
 		return w.cloudFailure(task, cloudTransferError("transfer_state_persist_failed", true, err))
 	}
 	task.PlanSummaryJSON, task.TotalFiles = encodedSummary, len(targets)
+	ctx = withFileDisplayNames(ctx, firstNonEmpty(download.DownloaderName, "受控暂存区"), task.LibraryName)
+	ctx = withCloudFileDisplays(ctx, targets)
+	w.transferEvent(ctx, task, "upload.plan", "planning", "planned", "已生成受控文件上传及目标命名计划；上传回执、目标确认与后续目录发布分别记录", map[string]any{"total_count": len(targets)})
 
 	policy := download.ConflictPolicy
 	if response := transferActionResponse(taskJobCheckpoint(w.service.db, task.JobID)); response != "" {
@@ -100,6 +103,11 @@ func (w *TransferWorker) runCloudUpload(ctx context.Context, runtime JobRuntime,
 		return w.cloudFailure(task, cloudTransferError("transfer_state_persist_failed", true, err))
 	}
 
+	reusedTargets := map[string]bool{}
+	for key, item := range state.Items {
+		reusedTargets[key] = item.Status == "completed"
+	}
+	sampledUnchanged := 0
 	for index, target := range targets {
 		if ctx.Err() != nil {
 			return WorkerResult{}
@@ -121,12 +129,16 @@ func (w *TransferWorker) runCloudUpload(ctx context.Context, runtime JobRuntime,
 			}
 			if found {
 				state.Items[key] = cloudTransferItemState{SourceID: key, CurrentID: reconciled.ID, TargetParentID: parentID, TargetName: name, Status: "completed"}
+				reusedTargets[key] = true
 			}
 		}
 		if conflict := conflicts[key]; conflict.ID != "" {
 			switch policy {
 			case models.MediaLibraryConflictSkip:
 				state.Items[key] = cloudTransferItemState{SourceID: key, CurrentID: conflict.ID, TargetParentID: parentID, TargetName: name, Status: "skipped"}
+				if index < 20 && w.cloudFileEvent(ctx, task, key, "upload.file.skipped", "conflict", "skipped", "同名目标按策略保留，本文件未上传（有界样本）") {
+					sampledUnchanged++
+				}
 			case models.MediaLibraryConflictOverwrite:
 				if conflict.IsDir {
 					return w.cloudFailure(task, cloudTransferError("cloud_transfer_target_type_conflict", false, nil))
@@ -137,6 +149,7 @@ func (w *TransferWorker) runCloudUpload(ctx context.Context, runtime JobRuntime,
 				if err := mutations.Recycle(ctx, conflict.ID); err != nil {
 					return w.cloudFailure(task, err)
 				}
+				w.cloudFileEvent(ctx, task, key, "upload.conflict.accepted", "conflict", "accepted", "覆盖策略的受控同名目标回收请求已受理，继续原有上传流程")
 			case models.MediaLibraryConflictRename:
 				name, err = availableCloudUploadName(ctx, driver, parentID, name)
 				if err != nil {
@@ -153,6 +166,8 @@ func (w *TransferWorker) runCloudUpload(ctx context.Context, runtime JobRuntime,
 			}
 		}
 		if state.Items[key].Status == "uploading" {
+			display := relativeFileDisplay(target.File.RelativePath, pathpkg.Join(pathpkg.Dir(target.Relative), name), target.File.Size)
+			w.transferEvent(ctx, task, "upload.file.start", "upload", "started", "开始核对本地来源并处理本文件上传："+display.description(), display.fields())
 			source, err := resolveCloudUploadSource(task.ID, download, state, target.File.RelativePath)
 			if err != nil {
 				return w.cloudFailure(task, cloudTransferError("cloud_upload_source_invalid", false, err))
@@ -169,12 +184,14 @@ func (w *TransferWorker) runCloudUpload(ctx context.Context, runtime JobRuntime,
 			uploaded, uploadErr := uploadCloudFileWithHeartbeat(ctx, runtime, uploader, cloudpkg.UploadRequest{ParentID: parentID, Name: name, Size: target.File.Size, Reader: file})
 			closeErr := file.Close()
 			if uploadErr != nil {
+				w.cloudFileEvent(ctx, task, key, "upload.file_uncertain", "upload", "uncertain", "本文件上传调用未取得可用目标确认，不推断云端文件已完成")
 				return w.cloudFailure(task, uploadErr)
 			}
 			if closeErr != nil || uploaded.ID == "" || uploaded.ParentID != parentID || uploaded.Name != name || uploaded.IsDir || uploaded.Size != target.File.Size {
 				return w.cloudFailure(task, cloudTransferError("cloud_upload_reconcile_failed", true, closeErr))
 			}
 			state.Items[key] = cloudTransferItemState{SourceID: key, CurrentID: uploaded.ID, TargetParentID: parentID, TargetName: name, Status: "completed"}
+			w.transferEvent(ctx, task, "upload.file", "upload", "confirmed", "上传返回已确认计划目标目录、文件名和大小，目录入库仍由后续阶段处理："+display.description(), display.fields())
 		}
 		processed := completedCloudItems(state)
 		if index < len(summary.Items) {
@@ -199,6 +216,16 @@ func (w *TransferWorker) runCloudUpload(ctx context.Context, runtime JobRuntime,
 		}
 	}
 
+	reusedFiles, skippedFiles := 0, 0
+	for _, target := range targets {
+		key := normalizedManifestPath(target.File.RelativePath)
+		if state.Items[key].Status == "skipped" {
+			skippedFiles++
+		} else if state.Items[key].Status == "completed" && reusedTargets[key] {
+			reusedFiles++
+		}
+	}
+	w.recordUnchangedFileSummary(ctx, task, "upload.file.summary", len(targets), reusedFiles, skippedFiles, sampledUnchanged)
 	now := time.Now().UTC()
 	err = w.service.db.Transaction(func(tx *gorm.DB) error {
 		if err := ensureDownloadPipelineActive(tx, task.DownloadTaskID); err != nil {

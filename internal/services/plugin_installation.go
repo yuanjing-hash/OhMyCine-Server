@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -67,7 +68,13 @@ type InstalledPluginSummary struct {
 	UpdatedAt            time.Time              `json:"updated_at"`
 }
 
-func (s *PluginRepositoryService) PrepareInstall(ctx context.Context, actor Actor, pluginID string, repositoryID uint, version string, request RequestContext) (PluginInstallPreviewSummary, error) {
+func (s *PluginRepositoryService) PrepareInstall(ctx context.Context, actor Actor, pluginID string, repositoryID uint, version string, request RequestContext) (result PluginInstallPreviewSummary, resultErr error) {
+	observedAt := time.Now()
+	fields := map[string]any{"resource_name": pluginID, "user_id": actor.User.ID, "request_id": request.RequestID, "action": "prepare_install"}
+	serverlog.RecordBusiness(ctx, s.log, serverlog.OperationPluginRuntime, serverlog.BusinessEvent{Code: "plugin.prepare.start", Stage: "verify", Outcome: "started", Message: "开始准备插件“" + serverlog.BusinessDisplayName(pluginID) + "”的安装包，将校验发布资产、清单、摘要及可运行性", Fields: fields})
+	defer func() {
+		remainingBusinessResult(ctx, s.log, serverlog.OperationPluginRuntime, "plugin.prepare.finish", "verify", "插件“"+serverlog.BusinessDisplayName(result.Name)+"”版本 "+serverlog.BusinessDisplayName(result.Version)+" 的安装包已下载并通过校验，等待用户确认权限后安装", "插件“"+serverlog.BusinessDisplayName(pluginID)+"”的安装准备未完成", observedAt, fields, resultErr)
+	}()
 	if !actor.Can(authz.PermissionPluginsInstall) {
 		return PluginInstallPreviewSummary{}, appError(CodePermissionDenied, "无权安装插件", nil)
 	}
@@ -206,7 +213,14 @@ func (s *PluginRepositoryService) PrepareInstall(ctx context.Context, actor Acto
 	}, nil
 }
 
-func (s *PluginRepositoryService) ConfirmInstall(ctx context.Context, actor Actor, pluginID, expectedOperation, previewID, permissionFingerprint string, revision uint64, request RequestContext) (InstalledPluginSummary, error) {
+func (s *PluginRepositoryService) ConfirmInstall(ctx context.Context, actor Actor, pluginID, expectedOperation, previewID, permissionFingerprint string, revision uint64, request RequestContext) (result InstalledPluginSummary, resultErr error) {
+	observedAt := time.Now()
+	fields := map[string]any{"resource_name": pluginID, "user_id": actor.User.ID, "request_id": request.RequestID, "action": expectedOperation}
+	serverlog.RecordBusiness(ctx, s.log, serverlog.OperationPluginRuntime, serverlog.BusinessEvent{Code: "plugin.install.start", Stage: "install", Outcome: "started", Message: "开始确认插件“" + serverlog.BusinessDisplayName(pluginID) + "”的安装或更新，按已批准权限和原启用状态处理", Fields: fields})
+	defer func() {
+		fields["status"] = result.Status
+		remainingBusinessResult(ctx, s.log, serverlog.OperationPluginRuntime, "plugin.install.finish", "install", "插件“"+serverlog.BusinessDisplayName(result.Name)+"”版本 "+serverlog.BusinessDisplayName(result.Version)+" 的安装记录已保存，当前状态："+pluginBusinessState(result.Status), "插件“"+serverlog.BusinessDisplayName(pluginID)+"”安装或更新未完成", observedAt, fields, resultErr)
+	}()
 	if !actor.Can(authz.PermissionPluginsInstall) {
 		return InstalledPluginSummary{}, appError(CodePermissionDenied, "无权安装插件", nil)
 	}
@@ -372,7 +386,18 @@ func (s *PluginRepositoryService) ConfirmInstall(ctx context.Context, actor Acto
 	return s.installedByID(pluginID)
 }
 
-func (s *PluginRepositoryService) SetPluginEnabled(ctx context.Context, actor Actor, pluginID string, enabled bool, revision uint64, request RequestContext) (InstalledPluginSummary, error) {
+func (s *PluginRepositoryService) SetPluginEnabled(ctx context.Context, actor Actor, pluginID string, enabled bool, revision uint64, request RequestContext) (result InstalledPluginSummary, resultErr error) {
+	observedAt := time.Now()
+	action, label := "disable", "停用"
+	if enabled {
+		action, label = "enable", "启用"
+	}
+	fields := map[string]any{"resource_name": pluginID, "user_id": actor.User.ID, "request_id": request.RequestID, "action": action}
+	serverlog.RecordBusiness(ctx, s.log, serverlog.OperationPluginRuntime, serverlog.BusinessEvent{Code: "plugin.state.start", Stage: "runtime", Outcome: "started", Message: "开始" + label + "插件“" + serverlog.BusinessDisplayName(pluginID) + "”", Fields: fields})
+	defer func() {
+		fields["status"] = result.Status
+		remainingBusinessResult(ctx, s.log, serverlog.OperationPluginRuntime, "plugin.state.finish", "runtime", "插件“"+serverlog.BusinessDisplayName(result.Name)+"”"+label+"调用已返回，当前状态："+pluginBusinessState(result.Status), "插件“"+serverlog.BusinessDisplayName(pluginID)+"”"+label+"未完成", observedAt, fields, resultErr)
+	}()
 	if !actor.Can(authz.PermissionPluginsInstall) {
 		return InstalledPluginSummary{}, appError(CodePermissionDenied, "无权修改插件状态", nil)
 	}
@@ -470,7 +495,13 @@ func (s *PluginRepositoryService) SetPluginEnabled(ctx context.Context, actor Ac
 	return s.installedByID(pluginID)
 }
 
-func (s *PluginRepositoryService) RollbackPlugin(ctx context.Context, actor Actor, pluginID string, revision uint64, request RequestContext) (InstalledPluginSummary, error) {
+func (s *PluginRepositoryService) RollbackPlugin(ctx context.Context, actor Actor, pluginID string, revision uint64, request RequestContext) (result InstalledPluginSummary, resultErr error) {
+	observedAt := time.Now()
+	fields := map[string]any{"resource_name": pluginID, "user_id": actor.User.ID, "request_id": request.RequestID, "action": "rollback"}
+	serverlog.RecordBusiness(ctx, s.log, serverlog.OperationPluginRuntime, serverlog.BusinessEvent{Code: "plugin.rollback.start", Stage: "runtime", Outcome: "started", Message: "开始回滚插件“" + serverlog.BusinessDisplayName(pluginID) + "”到已保留版本", Fields: fields})
+	defer func() {
+		remainingBusinessResult(ctx, s.log, serverlog.OperationPluginRuntime, "plugin.rollback.finish", "runtime", "插件“"+serverlog.BusinessDisplayName(result.Name)+"”回滚调用已返回，当前版本 "+serverlog.BusinessDisplayName(result.Version)+"，状态："+pluginBusinessState(result.Status), "插件“"+serverlog.BusinessDisplayName(pluginID)+"”回滚未完成", observedAt, fields, resultErr)
+	}()
 	if !actor.Can(authz.PermissionPluginsInstall) {
 		return InstalledPluginSummary{}, appError(CodePermissionDenied, "无权回滚插件", nil)
 	}
@@ -550,7 +581,13 @@ func (s *PluginRepositoryService) RollbackPlugin(ctx context.Context, actor Acto
 	return s.installedByID(pluginID)
 }
 
-func (s *PluginRepositoryService) UninstallPlugin(actor Actor, pluginID string, revision uint64, request RequestContext) error {
+func (s *PluginRepositoryService) UninstallPlugin(actor Actor, pluginID string, revision uint64, request RequestContext) (resultErr error) {
+	observedAt := time.Now()
+	fields := map[string]any{"resource_name": pluginID, "user_id": actor.User.ID, "request_id": request.RequestID, "action": "uninstall"}
+	serverlog.RecordBusiness(context.Background(), s.log, serverlog.OperationPluginRuntime, serverlog.BusinessEvent{Code: "plugin.uninstall.start", Stage: "uninstall", Outcome: "started", Message: "开始卸载插件“" + serverlog.BusinessDisplayName(pluginID) + "”并回收其受管运行状态", Fields: fields})
+	defer func() {
+		remainingBusinessResult(context.Background(), s.log, serverlog.OperationPluginRuntime, "plugin.uninstall.finish", "uninstall", "插件“"+serverlog.BusinessDisplayName(pluginID)+"”的卸载流程已完成", "插件“"+serverlog.BusinessDisplayName(pluginID)+"”卸载未完成", observedAt, fields, resultErr)
+	}()
 	if !actor.Can(authz.PermissionPluginsInstall) {
 		return appError(CodePermissionDenied, "无权卸载插件", nil)
 	}
@@ -648,7 +685,21 @@ func (s *PluginRepositoryService) UninstallPlugin(actor Actor, pluginID string, 
 	return nil
 }
 
-func (s *PluginRepositoryService) RestorePlugins(ctx context.Context) error {
+func (s *PluginRepositoryService) RestorePlugins(ctx context.Context) (resultErr error) {
+	started := time.Now()
+	restored, failed, total := 0, 0, 0
+	defer func() {
+		if resultErr != nil {
+			remainingBusinessResult(ctx, s.log, serverlog.OperationPluginRuntime, "plugin.restore.finish", "restore", "", "插件恢复过程未完成", started, map[string]any{"success_count": restored, "failed_count": failed}, resultErr)
+			return
+		}
+		outcome := "finished"
+		if failed > 0 {
+			outcome = "partial"
+		}
+		serverlog.RecordBusiness(ctx, s.log, serverlog.OperationPluginRuntime, serverlog.BusinessEvent{Code: "plugin.restore.finish", Stage: "restore", Outcome: outcome, Message: fmt.Sprintf("已启用插件的恢复遍历已结束：计划 %d 个，已恢复 %d 个，失败 %d 个；失败项已独立记录原因", total, restored, failed), Fields: map[string]any{"total_count": total, "success_count": restored, "failed_count": failed, "duration_ms": time.Since(started).Milliseconds()}})
+	}()
+	serverlog.RecordBusiness(ctx, s.log, serverlog.OperationPluginRuntime, serverlog.BusinessEvent{Code: "plugin.restore.start", Stage: "restore", Outcome: "started", Message: "开始恢复已启用插件，将复核受管安装包并恢复可运行的插件代次"})
 	if s.runtime == nil {
 		return appError(CodePluginRuntimeUnavailable, "插件运行时不可用", nil)
 	}
@@ -672,24 +723,29 @@ func (s *PluginRepositoryService) RestorePlugins(ctx context.Context) error {
 	if err := s.db.Where("status = ?", models.PluginInstallationEnabled).Order("plugin_id ASC").Find(&installations).Error; err != nil {
 		return err
 	}
+	total = len(installations)
 	for _, installation := range installations {
 		var pluginPackage models.PluginPackage
 		if err := s.db.First(&pluginPackage, installation.ActivePackageID).Error; err != nil {
+			failed++
 			s.recordRestoreFailure(installation, CodePluginPackageInvalid)
 			continue
 		}
 		manifest, err := contract.ParseManifest([]byte(pluginPackage.ManifestJSON))
 		if err != nil {
+			failed++
 			s.recordRestoreFailure(installation, CodePluginManifestInvalid)
 			continue
 		}
 		if err := packagefs.ValidateManagedPackage(s.pluginRoot, pluginPackage.PackagePath, manifest, pluginPackage.ExtractedTreeSHA256); err != nil {
+			failed++
 			s.recordRestoreFailure(installation, CodePluginPackageInvalid)
 			continue
 		}
 		generation := installation.RuntimeGeneration + 1
 		entryPath := filepath.Join(pluginPackage.PackagePath, filepath.FromSlash(manifest.Entry))
 		if err := s.runtime.Start(ctx, installation.PluginID, entryPath, generation); err != nil {
+			failed++
 			s.recordRestoreFailure(installation, pluginruntime.ErrorCode(err))
 			continue
 		}
@@ -708,14 +764,20 @@ func (s *PluginRepositoryService) RestorePlugins(ctx context.Context) error {
 			}
 			return persistErr
 		}
+		restored++
+		serverlog.RecordBusiness(ctx, s.log, serverlog.OperationPluginRuntime, serverlog.BusinessEvent{Code: "plugin.restore.confirmed", Stage: "restore", Outcome: "confirmed", Message: "已恢复插件“" + serverlog.BusinessDisplayName(manifest.Name) + "”版本 " + serverlog.BusinessDisplayName(manifest.Version) + " 的运行代次", Fields: map[string]any{"resource_name": installation.PluginID, "generation": generation}})
 	}
 	return nil
 }
 
-func (s *PluginRepositoryService) ClosePlugins(ctx context.Context) error {
+func (s *PluginRepositoryService) ClosePlugins(ctx context.Context) (resultErr error) {
 	if s.runtime == nil {
 		return nil
 	}
+	started := time.Now()
+	defer func() {
+		remainingBusinessResult(ctx, s.log, serverlog.OperationPluginRuntime, "plugin.runtime.close", "shutdown", "插件运行时已关闭，活动运行代次已标记停止", "插件运行时关闭或状态保存未完成", started, nil, resultErr)
+	}()
 	s.lifecycleMu.Lock()
 	defer s.lifecycleMu.Unlock()
 	if err := s.runtime.Close(ctx); err != nil {
@@ -1052,7 +1114,17 @@ func (s *PluginRepositoryService) installedSummary(installation models.PluginIns
 	return item, nil
 }
 
-func (s *PluginRepositoryService) compensateFailedUpdate(actor Actor, pluginID string, failedRevision uint64, oldPackageID uint, oldPreviousID *uint, oldGeneration, failedGeneration uint64, code string, runtimeRestored bool, request RequestContext) error {
+func (s *PluginRepositoryService) compensateFailedUpdate(actor Actor, pluginID string, failedRevision uint64, oldPackageID uint, oldPreviousID *uint, oldGeneration, failedGeneration uint64, code string, runtimeRestored bool, request RequestContext) (resultErr error) {
+	defer func() {
+		outcome, message := "partial", "插件“"+serverlog.BusinessDisplayName(pluginID)+"”更新失败，安装记录已回退到旧版本，旧运行代次已保留或恢复"
+		if !runtimeRestored {
+			message = "插件“" + serverlog.BusinessDisplayName(pluginID) + "”更新失败，安装记录已回退，但旧运行代次未恢复，插件已标记故障"
+		}
+		if resultErr != nil {
+			outcome, message = "failed", "插件“"+serverlog.BusinessDisplayName(pluginID)+"”更新失败后的状态补偿未能保存，请检查插件当前状态"
+		}
+		serverlog.RecordBusiness(context.Background(), s.log, serverlog.OperationPluginRuntime, serverlog.BusinessEvent{Code: "plugin.update.compensated", Stage: "restore", Outcome: outcome, Message: message, Fields: map[string]any{"resource_name": pluginID, "user_id": actor.User.ID, "request_id": request.RequestID, "error_code": code}})
+	}()
 	now := time.Now().UTC()
 	status := models.PluginInstallationEnabled
 	if !runtimeRestored {
@@ -1105,6 +1177,7 @@ func (s *PluginRepositoryService) markRuntimeHostUnavailable(code string) error 
 }
 
 func (s *PluginRepositoryService) recordRestoreFailure(installation models.PluginInstallation, code string) {
+	serverlog.RecordBusiness(context.Background(), s.log, serverlog.OperationPluginRuntime, serverlog.BusinessEvent{Code: "plugin.restore.failed", Stage: "restore", Outcome: "failed", Message: "插件“" + serverlog.BusinessDisplayName(installation.PluginID) + "”未能恢复：" + remainingFailureReason(code) + "；不会阻止其他独立插件恢复", Fields: map[string]any{"resource_name": installation.PluginID, "error_code": code}})
 	now := time.Now().UTC()
 	generation := installation.RuntimeGeneration + 1
 	_ = s.db.Transaction(func(tx *gorm.DB) error {

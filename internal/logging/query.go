@@ -42,6 +42,12 @@ type Filter struct {
 	StorageID    string
 	DownloaderID string
 	ScanRunID    string
+	JobID        string
+	FollowID     string
+	FollowRunID  string
+	Attempt      string
+	BusinessOnly bool
+	Direction    string
 	Limit        int
 	Cursor       string
 }
@@ -59,11 +65,12 @@ type Entry struct {
 }
 
 type QueryResult struct {
-	List         []Entry `json:"list"`
-	NextCursor   string  `json:"next_cursor,omitempty"`
-	ScannedBytes int64   `json:"scanned_bytes"`
-	Malformed    int     `json:"malformed"`
-	Partial      bool    `json:"partial"`
+	List         []Entry   `json:"list"`
+	NextCursor   string    `json:"next_cursor,omitempty"`
+	ScannedBytes int64     `json:"scanned_bytes"`
+	Malformed    int       `json:"malformed"`
+	Partial      bool      `json:"partial"`
+	SnapshotTo   time.Time `json:"snapshot_to"`
 }
 type Facets struct {
 	Levels     []string `json:"levels"`
@@ -89,6 +96,23 @@ func (f *Filter) Normalize(now time.Time) error {
 	if len([]rune(f.Keyword)) > 128 {
 		return errors.New("keyword must not exceed 128 characters")
 	}
+	if f.Direction == "" {
+		f.Direction = "desc"
+	}
+	if f.Direction != "asc" && f.Direction != "desc" {
+		return errors.New("invalid query direction")
+	}
+	for _, id := range []string{f.JobID, f.FollowID, f.FollowRunID, f.RequestID, f.TaskID, f.LibraryID, f.ConnectionID, f.StorageID, f.DownloaderID, f.ScanRunID} {
+		if len(id) > 128 || strings.ContainsAny(id, "\x00\r\n") {
+			return errors.New("invalid correlation")
+		}
+	}
+	if f.Attempt != "" {
+		n, err := strconv.Atoi(f.Attempt)
+		if err != nil || n < 1 {
+			return errors.New("invalid attempt")
+		}
+	}
 	if f.Limit <= 0 {
 		f.Limit = DefaultQueryLimit
 	}
@@ -107,44 +131,69 @@ func (m *Manager) Query(ctx context.Context, filter Filter) (QueryResult, error)
 	if err := filter.Normalize(time.Now().UTC()); err != nil {
 		return QueryResult{}, err
 	}
-	offset, err := decodeCursor(filter)
+	anchor, err := decodeEntryCursor(filter)
 	if err != nil {
 		return QueryResult{}, err
 	}
-	files := m.queryFiles()
-	result := QueryResult{List: make([]Entry, 0, filter.Limit)}
-	matched := 0
+	files, fileErr := m.queryFiles()
+	result := QueryResult{List: make([]Entry, 0, filter.Limit), SnapshotTo: filter.To, Partial: fileErr != nil}
+	matched := []Entry{}
 	for _, file := range files {
 		if err := ctx.Err(); err != nil {
-			return result, err
+			result.Partial = true
+			break
 		}
-		entries, bytesRead, malformed, readErr := readEntries(ctx, file)
+		entries, bytesRead, malformed, readErr := readEntriesBudget(ctx, file, maxScanBytes-result.ScannedBytes)
 		result.ScannedBytes += bytesRead
 		result.Malformed += malformed
 		if readErr != nil {
 			result.Partial = true
-			continue
 		}
-		for i := len(entries) - 1; i >= 0; i-- {
-			entry := entries[i]
-			if !matches(entry, filter) {
-				continue
+		for _, entry := range entries {
+			if matches(entry, filter) {
+				if truncated, _ := entry.Fields["event_truncated"].(bool); truncated {
+					result.Partial = true
+				}
+				matched = append(matched, entry)
 			}
-			if matched < offset {
-				matched++
-				continue
-			}
-			if len(result.List) == filter.Limit {
-				result.NextCursor = encodeCursor(filter, matched)
-				return result, nil
-			}
-			result.List = append(result.List, entry)
-			matched++
 		}
 		if result.ScannedBytes >= maxScanBytes {
 			result.Partial = true
 			break
 		}
+	}
+	sort.SliceStable(matched, func(i, j int) bool {
+		less := matched[i].Timestamp.Before(matched[j].Timestamp)
+		if matched[i].Timestamp.Equal(matched[j].Timestamp) {
+			less = entryIdentity(matched[i]) < entryIdentity(matched[j])
+		}
+		if filter.Direction == "asc" {
+			return less
+		}
+		return !less && entryIdentity(matched[i]) != entryIdentity(matched[j])
+	})
+	anchorFound := anchor == nil
+	for _, entry := range matched {
+		key := entryIdentity(entry)
+		if anchor != nil {
+			if key == anchor.Key && entry.Timestamp.Equal(anchor.At) {
+				anchorFound = true
+				continue
+			}
+			before := entry.Timestamp.Before(anchor.At) || (entry.Timestamp.Equal(anchor.At) && key < anchor.Key)
+			if (filter.Direction == "asc" && before) || (filter.Direction == "desc" && !before) {
+				continue
+			}
+		}
+		if len(result.List) == filter.Limit {
+			last := result.List[len(result.List)-1]
+			result.NextCursor = encodeEntryCursor(filter, last)
+			break
+		}
+		result.List = append(result.List, entry)
+	}
+	if !anchorFound {
+		result.Partial = true
 	}
 	return result, nil
 }
@@ -156,8 +205,13 @@ func (m *Manager) Facets(ctx context.Context, filter Filter) (Facets, error) {
 	if err != nil {
 		return Facets{}, err
 	}
+	return EntryFacets(result.List), nil
+}
+
+// EntryFacets allows actor-scoped services to derive facets after projection.
+func EntryFacets(entries []Entry) Facets {
 	levels, modules, components, operations, plugins := map[string]struct{}{}, map[string]struct{}{}, map[string]struct{}{}, map[string]struct{}{}, map[string]struct{}{}
-	for _, entry := range result.List {
+	for _, entry := range entries {
 		levels[entry.Level] = struct{}{}
 		modules[entry.Module] = struct{}{}
 		components[entry.Component] = struct{}{}
@@ -168,20 +222,23 @@ func (m *Manager) Facets(ctx context.Context, filter Filter) (Facets, error) {
 			plugins[entry.PluginID] = struct{}{}
 		}
 	}
-	return Facets{Levels: sortedKeys(levels), Modules: sortedKeys(modules), Components: sortedKeys(components), Operations: sortedKeys(operations), PluginIDs: sortedKeys(plugins)}, nil
+	return Facets{Levels: sortedKeys(levels), Modules: sortedKeys(modules), Components: sortedKeys(components), Operations: sortedKeys(operations), PluginIDs: sortedKeys(plugins)}
 }
 
-func (m *Manager) queryFiles() []string {
+func (m *Manager) queryFiles() ([]string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	files := []string{}
-	entries, _ := os.ReadDir(m.dir)
+	entries, err := os.ReadDir(m.dir)
+	if err != nil {
+		return files, err
+	}
 	for _, e := range entries {
-		if e.IsDir() {
+		if !e.Type().IsRegular() {
 			continue
 		}
 		name := e.Name()
-		if name == activeName || (strings.HasPrefix(name, "runtime-") && (strings.HasSuffix(name, ".jsonl") || strings.HasSuffix(name, ".jsonl.gz"))) {
+		if name == activeName || isManagedHistoryName(name) {
 			files = append(files, filepath.Join(m.dir, name))
 		}
 	}
@@ -193,10 +250,14 @@ func (m *Manager) queryFiles() []string {
 		}
 		return ii.ModTime().After(jj.ModTime())
 	})
-	return files
+	return files, nil
 }
 
 func readEntries(ctx context.Context, path string) ([]Entry, int64, int, error) {
+	return readEntriesBudget(ctx, path, maxScanBytes)
+}
+
+func readEntriesBudget(ctx context.Context, path string, budget int64) ([]Entry, int64, int, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, 0, 0, err
@@ -211,18 +272,18 @@ func readEntries(ctx context.Context, path string) ([]Entry, int64, int, error) 
 		defer func() { _ = gz.Close() }()
 		reader = gz
 	}
-	limited := &io.LimitedReader{R: reader, N: maxScanBytes + 1}
+	limited := &io.LimitedReader{R: reader, N: budget + 1}
 	scanner := bufio.NewScanner(limited)
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 	entries := []Entry{}
 	malformed := 0
 	var read int64
 	for scanner.Scan() {
+		read = budget + 1 - limited.N
 		if err := ctx.Err(); err != nil {
 			return entries, read, malformed, err
 		}
 		line := scanner.Bytes()
-		read += int64(len(line) + 1)
 		var raw map[string]any
 		if json.Unmarshal(line, &raw) != nil {
 			malformed++
@@ -235,8 +296,12 @@ func readEntries(ctx context.Context, path string) ([]Entry, int64, int, error) 
 			malformed++
 		}
 	}
+	read = budget + 1 - limited.N
 	if err := scanner.Err(); err != nil {
 		return entries, read, malformed, err
+	}
+	if limited.N == 0 {
+		return entries, read, malformed, errors.New("scan limit reached")
 	}
 	return entries, read, malformed, nil
 }
@@ -277,13 +342,53 @@ func matches(e Entry, f Filter) bool {
 	if f.Keyword != "" && !strings.Contains(strings.ToLower(e.Message), strings.ToLower(f.Keyword)) {
 		return false
 	}
-	checks := map[string]string{"request_id": f.RequestID, "task_id": f.TaskID, "library_id": f.LibraryID, "connection_id": f.ConnectionID, "storage_id": f.StorageID, "downloader_id": f.DownloaderID, "scan_run_id": f.ScanRunID}
+	if f.BusinessOnly {
+		if version, ok := e.Fields["event_version"].(float64); !ok || version != 1 || e.PluginID != "" || e.Fields["event_id"] == nil || e.Fields["event_code"] == nil {
+			return false
+		}
+	}
+	checks := map[string]string{"request_id": f.RequestID, "task_id": f.TaskID, "library_id": f.LibraryID, "connection_id": f.ConnectionID, "storage_id": f.StorageID, "downloader_id": f.DownloaderID, "scan_run_id": f.ScanRunID, "job_id": f.JobID, "follow_id": f.FollowID, "follow_run_id": f.FollowRunID, "attempt_number": f.Attempt}
 	for k, want := range checks {
 		if want != "" && fmt.Sprint(e.Fields[k]) != want {
 			return false
 		}
 	}
 	return true
+}
+
+type entryCursor struct {
+	Hash string    `json:"h"`
+	At   time.Time `json:"t"`
+	Key  string    `json:"k"`
+}
+
+func entryIdentity(entry Entry) string {
+	if id, ok := entry.Fields["event_id"].(string); ok && id != "" {
+		return id
+	}
+	data, _ := json.Marshal(entry)
+	sum := sha256.Sum256(data)
+	return base64.RawURLEncoding.EncodeToString(sum[:])
+}
+
+func encodeEntryCursor(filter Filter, entry Entry) string {
+	data, _ := json.Marshal(entryCursor{Hash: filterHash(filter), At: entry.Timestamp, Key: entryIdentity(entry)})
+	return base64.RawURLEncoding.EncodeToString(data)
+}
+
+func decodeEntryCursor(filter Filter) (*entryCursor, error) {
+	if filter.Cursor == "" {
+		return nil, nil
+	}
+	if len(filter.Cursor) > 1024 {
+		return nil, errors.New("invalid cursor")
+	}
+	data, err := base64.RawURLEncoding.DecodeString(filter.Cursor)
+	var cursor entryCursor
+	if err != nil || json.Unmarshal(data, &cursor) != nil || cursor.Hash != filterHash(filter) || cursor.At.Before(filter.From) || cursor.At.After(filter.To) || cursor.Key == "" || len(cursor.Key) > 128 {
+		return nil, errors.New("invalid cursor")
+	}
+	return &cursor, nil
 }
 func containsOrEmpty(values []string, value string) bool {
 	if len(values) == 0 {

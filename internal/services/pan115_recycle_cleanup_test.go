@@ -50,6 +50,8 @@ func TestPan115RecycleCleanupPollCoalescesAndWorkerClearsWithoutSecrets(t *testi
 	}
 	queue := NewQueueService(db, NewAuditService(db))
 	service := NewPan115RecycleCleanupService(db, queue, NewAuditService(db), connections, zerolog.Nop())
+	logManager, logger := captureRemainingBusiness(t, "recycle")
+	service.log = logger
 	if err := service.Poll(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -97,6 +99,14 @@ func TestPan115RecycleCleanupPollCoalescesAndWorkerClearsWithoutSecrets(t *testi
 	}
 	if updated.RecycleCleanupLastStatus != models.RecycleCleanupStatusSucceeded || updated.RecycleCleanupLastRunAt == nil || updated.RecycleCleanupNextRunAt == nil {
 		t.Fatalf("updated=%+v", updated)
+	}
+	entries := remainingBusinessEntries(t, logManager)
+	requireRemainingBusinessEvent(t, entries, "recycle.accepted", "accepted")
+	requireRemainingBusinessEvent(t, entries, "recycle.finish", "finished")
+	for _, entry := range entries {
+		if entry.Message == "safe-code" || entry.Fields["cookie"] != nil {
+			t.Fatalf("recycle credential leak: %+v", entry)
+		}
 	}
 }
 

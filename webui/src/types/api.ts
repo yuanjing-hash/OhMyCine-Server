@@ -341,8 +341,9 @@ export interface MediaLibraryWritePayload {
 export interface RuntimeLogEntry {
   timestamp: string; level: 'debug' | 'info' | 'warn' | 'error'; message: string; module: string; component: string
   operation?: string; operation_label?: string; plugin_id?: string; fields: Record<string, unknown>
+  event_id?: string; stage?: string; outcome?: string
 }
-export interface RuntimeLogResult { list: RuntimeLogEntry[]; next_cursor?: string; scanned_bytes: number; malformed: number; partial: boolean }
+export interface RuntimeLogResult { list: RuntimeLogEntry[]; next_cursor?: string; snapshot_to?: string; scanned_bytes: number; malformed: number; partial: boolean }
 export interface RuntimeLogFacets { levels: string[]; modules: string[]; components: string[]; operations: string[]; plugin_ids: string[] }
 export interface RuntimeLogPolicy { level: 'debug' | 'info' | 'warn' | 'error'; max_file_mib: number; max_backups: number; retention_days: number; max_total_mib: number }
 export interface RuntimeLogSettings extends RuntimeLogPolicy { revision: number; health: { degraded: boolean; reason?: string } }
