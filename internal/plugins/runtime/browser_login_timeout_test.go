@@ -11,7 +11,10 @@ func TestBrowserLoginSequenceHasBoundedMultiRequestBudget(t *testing.T) {
 			t.Fatalf("%s timeout = %v", operation, got)
 		}
 	}
-	for _, operation := range []string{"resource.search", "resource.health", "resource.resolve", "resource.auth.cookie"} {
+	if operationTimeout("resource.search") != 35*time.Second {
+		t.Fatal("multi-request resource search budget missing")
+	}
+	for _, operation := range []string{"resource.health", "resource.resolve", "resource.auth.cookie"} {
 		if got := operationTimeout(operation); got != resourceCallTimeout {
 			t.Fatalf("%s unexpectedly enlarged: %v", operation, got)
 		}

@@ -27,13 +27,22 @@ type resourceBrowserSession struct {
 	Pending                                                   *pendingBrowserLogin
 	LastGET                                                   string
 	Authenticating                                            bool
+	HealthChecked                                             bool
 }
 
 type browserAuthKey struct{}
 type browserDiagnosticKey struct{}
 type browserDiagnostic struct {
-	mu  sync.Mutex
-	err error
+	mu            sync.Mutex
+	err           error
+	sessionLost   bool
+	nonGET        bool
+	httpStatus    int
+	responseClass string
+	parseReason   string
+	resultCode    string
+	rateLimited   bool
+	cold          bool
 }
 
 func (d *browserDiagnostic) failure() error {
@@ -273,6 +282,10 @@ func (s *PluginRepositoryService) ResourceBrowser(ctx context.Context, actor Act
 		s.browserMu.Lock()
 		session.Authenticating = false
 		if !s.validBrowserLocked(ctx, pluginID, connectionID) || s.browserSession != session {
+			switch ErrorCode(err) {
+			case "resource_browser_request_failed", "resource_browser_request_timeout", "resource_browser_request_denied":
+				return output, err
+			}
 			return nil, appError("resource_browser_session_expired", "浏览器会话已变化，请重新确认", nil)
 		}
 		if err == nil {
@@ -315,7 +328,7 @@ func (s *PluginRepositoryService) BrowserRequest(ctx context.Context, pluginID, 
 		if diagnostic, ok := ctx.Value(browserDiagnosticKey{}).(*browserDiagnostic); ok && resultErr != nil {
 			var safe error
 			switch ErrorCode(resultErr) {
-			case "resource_browser_request_failed", "resource_browser_request_timeout", "resource_browser_request_denied":
+			case "resource_browser_request_failed", "resource_browser_request_timeout", "resource_browser_request_denied", "resource_browser_session_expired", "resource_browser_login_pending", "resource_rate_limited":
 				safe = resultErr // Created below without an upstream cause.
 			default:
 				safe = browserFailure()
@@ -327,7 +340,25 @@ func (s *PluginRepositoryService) BrowserRequest(ctx context.Context, pluginID, 
 	}()
 	s.browserMu.Lock()
 	defer s.browserMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, true, err
+	}
+	if diagnostic, ok := ctx.Value(browserDiagnosticKey{}).(*browserDiagnostic); ok {
+		diagnostic.mu.Lock()
+		limited := diagnostic.rateLimited
+		diagnostic.mu.Unlock()
+		if limited {
+			return nil, true, appError("resource_rate_limited", "资源站请求受到限流，请稍后重试", nil)
+		}
+	}
 	if !s.validBrowserLocked(ctx, pluginID, connectionID) {
+		// A scoped operation must finish before restoring a replacement. Rebuild
+		// once at the read-only invocation boundary, with a new exact state scope.
+		_, stateScoped := ctx.Value(browserStateKey{}).(browserAuthScope)
+		_, authScoped := ctx.Value(browserAuthKey{}).(browserAuthScope)
+		if stateScoped || authScoped {
+			return nil, true, appError("resource_browser_session_expired", "浏览器会话已结束，请重新检查", nil)
+		}
 		if scope == "" {
 			return nil, false, nil
 		}
@@ -350,7 +381,10 @@ func (s *PluginRepositoryService) BrowserRequest(ctx context.Context, pluginID, 
 	}
 	session := s.browserSession
 	if (session.Pending != nil || session.Authenticating) && !authOK {
-		return nil, true, browserFailure()
+		return nil, true, appError("resource_browser_login_pending", "管理员正在完成浏览器登录，请完成或取消后再搜索", nil)
+	}
+	if state, ok := ctx.Value(browserStateKey{}).(browserAuthScope); ok && (state.PluginID != pluginID || state.ConnectionID != connectionID || state.SessionID != session.ID) {
+		return nil, true, appError("resource_browser_session_expired", "浏览器会话已变化，请重新检查", nil)
 	}
 	origin, err := url.Parse(session.Origin)
 	if err != nil || !strings.EqualFold(origin.Host, request.URL.Host) || origin.Scheme != request.URL.Scheme {
@@ -373,9 +407,29 @@ func (s *PluginRepositoryService) BrowserRequest(ctx context.Context, pluginID, 
 	if authOK && request.Method == http.MethodGet {
 		session.LastGET = request.URL.String()
 	}
+	if diagnostic, ok := ctx.Value(browserDiagnosticKey{}).(*browserDiagnostic); ok && request.Method != http.MethodGet {
+		diagnostic.mu.Lock()
+		diagnostic.nonGET = true
+		diagnostic.mu.Unlock()
+	}
 	err = s.browser.Call(ctx, "session/request", map[string]any{"sessionId": session.ID, "identity": session.Identity, "url": request.URL.String(), "method": request.Method, "body": string(body), "contentType": request.Header.Get("Content-Type")}, &output)
 	if err != nil {
-		switch browsercompanion.ErrorCode(err) {
+		code := browsercompanion.ErrorCode(err)
+		lost := code == "session_unavailable" || code == "session_expired" || code == "browser_request_timeout" || code == "browser_component_unavailable"
+		if lost || ctx.Err() != nil {
+			s.closeBrowserHandle(ctx, session.ID, session.Identity)
+			clearPending(session)
+			s.browserSession = nil
+			if diagnostic, ok := ctx.Value(browserDiagnosticKey{}).(*browserDiagnostic); ok {
+				diagnostic.mu.Lock()
+				diagnostic.sessionLost = true
+				diagnostic.mu.Unlock()
+			}
+		}
+		if ctx.Err() != nil {
+			return nil, true, ctx.Err()
+		}
+		switch code {
 		case "browser_request_timeout", "network_timeout":
 			return nil, true, appError("resource_browser_request_timeout", "浏览器中的站点请求超时；未确认登录状态，请稍后重试", nil)
 		case "network_denied", "resource_network_denied":
@@ -391,6 +445,24 @@ func (s *PluginRepositoryService) BrowserRequest(ctx context.Context, pluginID, 
 		return nil, true, browserFailure()
 	}
 	headers.Set("Content-Type", output.Headers["content-type"])
+	if diagnostic, ok := ctx.Value(browserDiagnosticKey{}).(*browserDiagnostic); ok {
+		diagnostic.mu.Lock()
+		diagnostic.httpStatus = output.Status
+		diagnostic.responseClass = "other"
+		mime := strings.ToLower(strings.SplitN(output.Headers["content-type"], ";", 2)[0])
+		if mime == "application/json" || strings.HasSuffix(mime, "+json") {
+			diagnostic.responseClass = "json"
+		}
+		if mime == "text/html" {
+			diagnostic.responseClass = "html"
+		}
+		diagnostic.err = nil
+		if output.Status == http.StatusTooManyRequests {
+			diagnostic.rateLimited = true
+			diagnostic.err = appError("resource_rate_limited", "资源站请求受到限流，请稍后重试", nil)
+		}
+		diagnostic.mu.Unlock()
+	}
 	if err := validateBrowserCookies(session.Origin, output.Cookies); err != nil {
 		return nil, true, err
 	}

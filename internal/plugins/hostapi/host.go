@@ -628,6 +628,7 @@ func (host *Host) http(ctx context.Context, pluginID string, authorization plugi
 	if method != http.MethodGet && method != http.MethodPost {
 		return httpResponse{}, denied("plugin_http_method_denied", nil)
 	}
+	observeHTTPMethod(ctx, method)
 	target, err := url.Parse(input.URL)
 	if err != nil || target.Scheme != "https" || target.User != nil || target.Hostname() == "" || target.Fragment != "" || target.Port() != "" {
 		return httpResponse{}, denied("plugin_http_url_denied", err)

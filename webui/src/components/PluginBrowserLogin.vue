@@ -46,10 +46,11 @@ async function run(operation: string, payload: Record<string, unknown> = {}) {
   controller = new AbortController()
   const signal = controller.signal
   const activeController = controller
-  const timeout = setTimeout(() => activeController.abort(), operation === 'confirm' ? 180000 : 45000)
+  const timeout = setTimeout(() => activeController.abort(), operation === 'confirm' || operation === 'health' ? 180000 : 45000)
   busy.value = true; error.value = ''
   try {
-    const result = await api<Record<string, unknown>>(`${path}/${operation}`, operation === 'status'
+    const endpoint = operation === 'health' ? `${path.slice(0, -'/browser'.length)}/health` : `${path}/${operation}`
+    const result = await api<Record<string, unknown>>(endpoint, operation === 'status'
       ? { signal }
       : { method: 'POST', body: JSON.stringify(payload), signal })
     if (version !== generation) {
@@ -76,6 +77,17 @@ async function run(operation: string, payload: Record<string, unknown> = {}) {
       handedOff = true
       success.value = response.state === 'authenticated'; image.value = ''; resourceWarning.value = ''; emit('result', response)
     }
+    if (operation === 'health') {
+      if (result.status === 'healthy') {
+        handedOff = true
+        success.value = true; image.value = ''; resourceWarning.value = ''
+        emit('result', { state: 'authenticated', accountName: typeof result.accountName === 'string' ? result.accountName : undefined })
+      } else {
+        error.value = result.status === 'auth_required' ? '站点尚未确认登录，请在画面内完成登录。'
+          : result.status === 'rate_limited' ? '站点暂时限制请求，请稍后重新检查。'
+          : '暂时无法确认登录状态，网页已保留；这不代表账号密码错误。'
+      }
+    }
     if (operation === 'close') { session.value = ''; image.value = ''; resourceWarning.value = ''; success.value = false; emit('cancel') }
     if (operation === 'snapshot') {
       if (result.mime_type !== 'image/png' || typeof result.image_base64 !== 'string' || result.image_base64.length > 8 * 1024 * 1024
@@ -101,6 +113,8 @@ async function run(operation: string, payload: Record<string, unknown> = {}) {
       session.value = ''; image.value = ''; input.value = ''; resourceWarning.value = ''; success.value = false
     }
     error.value = resourceBrowserStartupError(code) ?? (code === 'resource_browser_verification_required' ? '站点仍要求验证，请在浏览器画面内手动完成。'
+      : code === 'resource_browser_login_pending' ? '管理员正在完成本次登录，请继续原登录流程；普通检查不会重新提交密码。'
+      : code === 'resource_browser_restore_timeout' ? '恢复登录会话超时，尚未确认登录失效；请稍后重新检查。'
       : code === 'resource_auth_required' || code === 'resource_auth_failed' ? '站点尚未确认登录，请先在画面内登录。'
       : code === 'resource_browser_session_expired' ? '本次验证已过期，请取消后重新提交登录。已保存的登录状态不因此删除。'
       : code === 'resource_browser_login_expired' ? '保存的本次密码请求已过期，网页仍可使用；请在画面内登录后再次确认，或取消后重新输入账号密码。'
@@ -145,10 +159,10 @@ watch(() => [props.pluginId, props.connectionId, props.origin, props.disabled], 
 <template>
   <section class="semantic-inset mt-3 grid gap-3 p-3" aria-label="内置浏览器登录">
     <div class="flex flex-wrap items-center justify-between gap-2">
-      <strong class="text-sm">需要手动完成站点验证</strong>
+      <strong class="text-sm">站点浏览器与登录状态</strong>
     </div>
     <template v-if="opened">
-      <p class="text-subtle m-0 text-xs" role="status">{{ busy ? '正在处理…' : '请在下方画面完成站点要求的验证，然后继续登录' }}。当前镜像：{{ origin }}</p>
+      <p class="text-subtle m-0 text-xs" role="status">{{ busy ? '正在处理…' : '网页出现验证时请先完成验证；如果已经登录，可以直接重新检查登录状态' }}。当前镜像：{{ origin }}</p>
       <p v-if="error" class="semantic-error p-2 text-sm" role="alert">{{ error }}</p>
       <p v-if="resourceWarning" class="semantic-warning p-2 text-sm" role="status">{{ resourceWarning }}</p>
       <p v-if="success" class="semantic-success p-2 text-sm" role="status">已通过插件登录检测。</p>
@@ -162,7 +176,8 @@ watch(() => [props.pluginId, props.connectionId, props.origin, props.disabled], 
         <div class="flex flex-wrap gap-2">
           <button type="button" class="btn-secondary" :disabled="locked" @click="snapshot">更新画面</button>
           <button type="button" class="btn-secondary" :disabled="locked" @click="reload">重新加载网页</button>
-          <button type="button" class="btn-primary" :disabled="locked" @click="run('confirm', { session_id: session })">验证完成，继续登录</button>
+          <button type="button" class="btn-secondary" :disabled="locked" @click="run('health')">重新检查登录状态</button>
+          <button type="button" class="btn-primary" :disabled="locked" @click="run('confirm', { session_id: session })">继续本次登录</button>
           <button type="button" class="btn-secondary" :disabled="locked" @click="run('close', { session_id: session })">取消验证</button>
         </div>
         <img v-if="image" :src="image" :width="width" :height="height" alt="站点浏览器画面，点击输入框或手动验证位置" class="max-w-full cursor-crosshair border border-[var(--line)]" draggable="false" @click="clickImage" />

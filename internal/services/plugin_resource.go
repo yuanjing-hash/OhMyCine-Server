@@ -82,19 +82,28 @@ func (s *PluginRepositoryService) SearchResource(ctx context.Context, input Plug
 	if !manifestHasCapability(manifest, contract.CapabilityResourceResolve) {
 		return PluginResourceSearchPage{}, appError(CodePermissionDenied, "插件未声明资源站解析能力", nil)
 	}
-	if err := s.restoreResourceBrowser(ctx, input.ConnectionID); err != nil {
+	if err := s.PrepareResourceSearch(ctx, input.ConnectionID); err != nil {
 		return PluginResourceSearchPage{}, err
 	}
-	ctx = s.browserStateContext(ctx, input.ConnectionID)
-	raw, err := s.InvokePlugin(ctx, input.ConnectionID, "resource.search", request)
+	started := time.Now()
+	raw, ctx, err := s.invokeReadOnlyResource(ctx, input.ConnectionID, "resource.search", request)
+	defer s.recordResourceDiagnostic(ctx, input.ConnectionID, "resource.search", started)
 	if err != nil {
 		mapped := mapPluginResourceError(err)
-		s.persistResourceFailure(input.ConnectionID, mapped)
+		setResourceResultCode(ctx, mapped)
+		s.persistResourceFailure(ctx, input.ConnectionID, mapped)
 		return PluginResourceSearchPage{}, mapped
 	}
 	var response contract.ResourceSearchResponse
 	if err := decodePluginResourceResponse(raw, &response); err != nil {
-		s.persistResourceFailure(input.ConnectionID, err)
+		setResourceParseFailure(ctx, "response_invalid")
+		if diagnostic, ok := ctx.Value(browserDiagnosticKey{}).(*browserDiagnostic); ok {
+			if failure := diagnostic.failure(); failure != nil {
+				err = failure
+			}
+		}
+		setResourceResultCode(ctx, err)
+		s.persistResourceFailure(ctx, input.ConnectionID, err)
 		return PluginResourceSearchPage{}, err
 	}
 	wantedPage := input.Page
@@ -102,15 +111,18 @@ func (s *PluginRepositoryService) SearchResource(ctx context.Context, input Plug
 		wantedPage = 1
 	}
 	if response.Page != wantedPage || len(response.Items) > maxResourceItems {
+		setResourceParseFailure(ctx, "page_invalid")
 		return PluginResourceSearchPage{}, appError("resource_result_invalid", "插件资源站搜索结果无效", nil)
 	}
 	result := PluginResourceSearchPage{Page: response.Page, HasNext: response.HasNext, Items: make([]PluginResourceSearchItem, 0, len(response.Items))}
 	for _, item := range response.Items {
 		if !safeOnlineText(item.ID, 256) || !safeOnlineText(item.Title, 512) || item.SizeBytes < 0 || item.SizeBytes > 8<<40 || item.Seeders < 0 || item.Seeders > 1_000_000 || len(item.Tags) > 16 {
+			setResourceParseFailure(ctx, "item_invalid")
 			return PluginResourceSearchPage{}, appError("resource_result_invalid", "插件资源站结果包含无效项目", nil)
 		}
 		for _, tag := range item.Tags {
 			if !safeOnlineText(tag, 64) {
+				setResourceParseFailure(ctx, "tag_invalid")
 				return PluginResourceSearchPage{}, appError("resource_result_invalid", "插件资源站结果包含无效标签", nil)
 			}
 		}
@@ -141,12 +153,12 @@ func (s *PluginRepositoryService) ResolveResource(ctx context.Context, input Plu
 	raw, err := s.InvokePlugin(ctx, input.ConnectionID, "resource.resolve", request)
 	if err != nil {
 		mapped := mapPluginResourceError(err)
-		s.persistResourceFailure(input.ConnectionID, mapped)
+		s.persistResourceFailure(ctx, input.ConnectionID, mapped)
 		return PluginResourceResolveResult{}, mapped
 	}
 	var response contract.ResourceResolveResponse
 	if err := decodePluginResourceResponse(raw, &response); err != nil {
-		s.persistResourceFailure(input.ConnectionID, err)
+		s.persistResourceFailure(ctx, input.ConnectionID, err)
 		return PluginResourceResolveResult{}, err
 	}
 	magnet, ok := contract.NormalizeMagnet(response.Magnet)
@@ -163,6 +175,11 @@ func (s *PluginRepositoryService) ResourceHealth(ctx context.Context, pluginID, 
 	if err := s.requireResourceRoute(pluginID, connectionID); err != nil {
 		return contract.ResourceHealthResponse{}, err
 	}
+	_, unlock, err := s.lockResourceRecovery(ctx, connectionID)
+	if err != nil {
+		return contract.ResourceHealthResponse{}, err
+	}
+	defer unlock()
 	return s.resourceHealth(ctx, connectionID)
 }
 
@@ -174,22 +191,26 @@ func (s *PluginRepositoryService) resourceHealth(ctx context.Context, connection
 	if err := s.db.Select("credential_mode", "credential_ciphertext").First(&connection, "id = ? AND enabled = ?", connectionID, true).Error; err != nil {
 		return contract.ResourceHealthResponse{}, appError(CodeNotFound, "资源站连接不存在或已停用", err)
 	}
+	_, expectedBinding, err := s.browserBindingForHealth(connectionID)
+	if err != nil {
+		return contract.ResourceHealthResponse{}, err
+	}
 	var browserConnection models.PluginConnection
 	_ = s.db.Select("plugin_id").First(&browserConnection, "id = ?", connectionID).Error
 	if connection.CredentialMode != models.PluginCredentialModeNone && strings.TrimSpace(connection.CredentialCiphertext) == "" && !s.browserLive(ctx, browserConnection.PluginID, connectionID) && !s.hasBrowserState(connectionID) {
 		response := contract.ResourceHealthResponse{Status: "auth_required"}
-		if err := s.persistResourceHealth(connectionID, response); err != nil {
+		if err := s.persistResourceHealthBound(ctx, connectionID, response, expectedBinding); err != nil {
 			return contract.ResourceHealthResponse{}, err
 		}
 		return response, nil
 	}
-	if err := s.restoreResourceBrowser(ctx, connectionID); err != nil {
+	if err := s.restoreResourceBrowserBounded(ctx, connectionID); err != nil {
 		return contract.ResourceHealthResponse{}, err
 	}
-	ctx = s.browserStateContext(ctx, connectionID)
-	diagnostic := &browserDiagnostic{}
-	ctx = context.WithValue(ctx, browserDiagnosticKey{}, diagnostic)
-	raw, err := s.InvokePlugin(ctx, connectionID, "resource.health", contract.ResourceHealthRequest{ConnectionID: connectionID})
+	started := time.Now()
+	raw, ctx, err := s.invokeReadOnlyResource(ctx, connectionID, "resource.health", contract.ResourceHealthRequest{ConnectionID: connectionID})
+	defer s.recordResourceDiagnostic(ctx, connectionID, "resource.health", started)
+	diagnostic, _ := ctx.Value(browserDiagnosticKey{}).(*browserDiagnostic)
 	// A close/configuration edit while the guest was running must not publish
 	// health for a different session or allow a stale confirmation to succeed.
 	if expected, scoped := ctx.Value(browserAuthKey{}).(browserAuthScope); scoped {
@@ -197,31 +218,38 @@ func (s *PluginRepositoryService) resourceHealth(ctx context.Context, connection
 		valid := s.validBrowserLocked(ctx, expected.PluginID, connectionID) && s.browserSession.ID == expected.SessionID
 		s.browserMu.Unlock()
 		if !valid {
+			if failure := resourceDiagnosticFailure(diagnostic); failure != nil {
+				return contract.ResourceHealthResponse{}, failure
+			}
 			return contract.ResourceHealthResponse{}, appError("resource_browser_session_expired", "浏览器会话已变化，请重新确认", nil)
 		}
 	}
 	if err != nil {
 		mapped := mapPluginResourceError(err)
-		if failure := diagnostic.failure(); failure != nil {
+		if failure := resourceDiagnosticFailure(diagnostic); failure != nil {
 			mapped = failure
 		}
-		s.persistResourceFailure(connectionID, mapped)
+		setResourceResultCode(ctx, mapped)
+		s.persistResourceFailure(ctx, connectionID, mapped)
 		return contract.ResourceHealthResponse{}, mapped
 	}
 	var response contract.ResourceHealthResponse
 	if err := decodePluginResourceResponse(raw, &response); err != nil {
-		if failure := diagnostic.failure(); failure != nil {
+		setResourceParseFailure(ctx, "response_invalid")
+		if failure := resourceDiagnosticFailure(diagnostic); failure != nil {
 			err = failure
 		}
-		s.persistResourceFailure(connectionID, err)
+		setResourceResultCode(ctx, err)
+		s.persistResourceFailure(ctx, connectionID, err)
 		return contract.ResourceHealthResponse{}, err
 	}
-	if !map[string]bool{"healthy": true, "auth_required": true, "unavailable": true, "rate_limited": true}[response.Status] {
+	if !map[string]bool{"healthy": true, "auth_required": true, "unavailable": true, "rate_limited": true}[response.Status] || (response.AccountName != "" && !safeOnlineText(response.AccountName, 128)) {
+		setResourceParseFailure(ctx, "health_invalid")
 		return contract.ResourceHealthResponse{}, appError(CodePluginResponseInvalid, "插件资源站健康响应无效", nil)
 	}
 	if response.Status != "healthy" {
-		if failure := diagnostic.failure(); failure != nil {
-			s.persistResourceFailure(connectionID, failure)
+		if failure := resourceDiagnosticFailure(diagnostic); failure != nil {
+			s.persistResourceFailure(ctx, connectionID, failure)
 			return contract.ResourceHealthResponse{}, failure
 		}
 	}
@@ -230,13 +258,23 @@ func (s *PluginRepositoryService) resourceHealth(ctx context.Context, connection
 			return contract.ResourceHealthResponse{}, err
 		}
 	}
-	if err := s.persistResourceHealth(connectionID, response); err != nil {
+	if err := s.persistResourceHealthBound(ctx, connectionID, response, expectedBinding); err != nil {
 		return contract.ResourceHealthResponse{}, err
+	}
+	if response.Status == "healthy" {
+		s.markBrowserHealthChecked(ctx, connectionID)
 	}
 	return response, nil
 }
 
 func (s *PluginRepositoryService) persistResourceHealth(connectionID string, response contract.ResourceHealthResponse) error {
+	return s.persistResourceHealthBound(context.Background(), connectionID, response, "")
+}
+
+func (s *PluginRepositoryService) persistResourceHealthBound(ctx context.Context, connectionID string, response contract.ResourceHealthResponse, expectedBinding string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	status := response.Status
 	checkedAt := time.Now().UTC()
 	updates := map[string]any{"last_health_status": status, "last_health_error_code": "", "last_health_checked_at": checkedAt, "updated_at": checkedAt}
@@ -256,7 +294,16 @@ func (s *PluginRepositoryService) persistResourceHealth(connectionID string, res
 	if status == "unavailable" {
 		updates["last_health_error_code"] = "resource_entry_unavailable"
 	}
-	if err := s.db.Transaction(func(tx *gorm.DB) error {
+	if err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if expectedBinding != "" {
+			var connection models.PluginConnection
+			var installation models.PluginInstallation
+			if tx.First(&connection, "id = ? AND enabled = ?", connectionID, true).Error != nil ||
+				tx.First(&installation, "plugin_id = ? AND status = ?", connection.PluginID, models.PluginInstallationEnabled).Error != nil ||
+				browserBindingFingerprint(connection, installation) != expectedBinding {
+				return appError("resource_browser_session_expired", "资源站配置或浏览器会话已变化，请重新检查", nil)
+			}
+		}
 		if err := tx.Model(&models.PluginConnection{}).Where("id = ?", connectionID).Updates(updates).Error; err != nil {
 			return err
 		}
@@ -268,6 +315,9 @@ func (s *PluginRepositoryService) persistResourceHealth(connectionID string, res
 		}
 		return tx.Model(&models.Site{}).Where("plugin_connection_id = ?", connectionID).Updates(siteUpdates).Error
 	}); err != nil {
+		if ErrorCode(err) == "resource_browser_session_expired" {
+			return err
+		}
 		return appError(CodeInternalError, "资源站健康状态保存失败", err)
 	}
 	return nil
@@ -561,7 +611,7 @@ func (s *PluginRepositoryService) restoreResourceCredential(connection models.Pl
 	})
 }
 
-func (s *PluginRepositoryService) persistResourceFailure(connectionID string, err error) {
+func (s *PluginRepositoryService) persistResourceFailure(ctx context.Context, connectionID string, err error) {
 	status := ""
 	switch ErrorCode(err) {
 	case "resource_auth_required":
@@ -574,7 +624,11 @@ func (s *PluginRepositoryService) persistResourceFailure(connectionID string, er
 		status = "unavailable"
 	}
 	if status != "" {
-		_ = s.persistResourceHealth(connectionID, contract.ResourceHealthResponse{Status: status})
+		expectedBinding := ""
+		if binding, ok := ctx.Value(resourceReadBindingKey{}).(resourceReadBinding); ok && binding.connectionID == connectionID {
+			expectedBinding = binding.fingerprint
+		}
+		_ = s.persistResourceHealthBound(ctx, connectionID, contract.ResourceHealthResponse{Status: status}, expectedBinding)
 	}
 }
 
@@ -582,6 +636,13 @@ func (s *PluginRepositoryService) resourceManifest(connectionID string, capabili
 	var connection models.PluginConnection
 	if err := s.db.First(&connection, "id = ? AND enabled = ?", connectionID, true).Error; err != nil {
 		return contract.Manifest{}, appError(CodeNotFound, "资源站连接不存在或已停用", err)
+	}
+	if connection.ResourceType != "bt_resource" {
+		return contract.Manifest{}, appError(CodeNotFound, "资源站连接类型无效", nil)
+	}
+	var installation models.PluginInstallation
+	if err := s.db.Select("status").First(&installation, "plugin_id = ? AND status = ?", connection.PluginID, models.PluginInstallationEnabled).Error; err != nil {
+		return contract.Manifest{}, appError(CodePluginRuntimeUnavailable, "插件当前不可用", nil)
 	}
 	if resourceOperationNeedsCredential(capability) && connection.CredentialMode != models.PluginCredentialModeNone && strings.TrimSpace(connection.CredentialCiphertext) == "" && !s.hasBrowserState(connectionID) {
 		return contract.Manifest{}, appError("resource_auth_required", "资源站尚未登录，请先完成登录", nil)

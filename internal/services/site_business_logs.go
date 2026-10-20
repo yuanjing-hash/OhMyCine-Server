@@ -44,6 +44,18 @@ func (s *SiteService) recordSearchResult(ctx context.Context, group SiteSearchGr
 
 func siteBusinessFailure(code string) string {
 	switch code {
+	case CodeSearchRequestTimeout:
+		return "本次上游查询超时"
+	case CodeSearchSiteBudget:
+		return "该站本轮搜索预算耗尽"
+	case CodeSearchRateWait:
+		return "等待共享限速名额超时，本次查询未发送"
+	case CodeSearchBudget:
+		return "整轮搜索等待时间已到"
+	case CodeSearchCancelled:
+		return "用户取消搜索"
+	case CodeSearchResultLimit:
+		return "已达到安全结果容量上限"
 	case CodeSiteCredentialInvalid:
 		return "站点凭据不可用"
 	case CodePermissionDenied:

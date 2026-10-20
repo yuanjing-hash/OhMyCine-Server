@@ -1,8 +1,6 @@
 package handlers
 
 import (
-	"encoding/json"
-	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -14,22 +12,23 @@ import (
 )
 
 type siteWritePayload struct {
-	CloudConfig        *sitepkg.CloudConfig `json:"cloud_config"`
-	Username           string               `json:"username"`
-	Password           string               `json:"password"`
-	Name               string               `json:"name"`
-	Kind               string               `json:"kind"`
-	BaseURL            string               `json:"base_url"`
-	Cookie             string               `json:"cookie"`
-	Passkey            string               `json:"passkey"`
-	APIKey             string               `json:"api_key"`
-	UserAgent          string               `json:"user_agent"`
-	BrowserEmulation   bool                 `json:"browser_emulation"`
-	BrowserServiceURL  string               `json:"browser_service_url"`
-	Enabled            *bool                `json:"enabled"`
-	Priority           int                  `json:"priority"`
-	TimeoutSeconds     int                  `json:"timeout_seconds"`
-	RateLimitPerMinute int                  `json:"rate_limit_per_minute"`
+	CloudConfig          *sitepkg.CloudConfig `json:"cloud_config"`
+	Username             string               `json:"username"`
+	Password             string               `json:"password"`
+	Name                 string               `json:"name"`
+	Kind                 string               `json:"kind"`
+	BaseURL              string               `json:"base_url"`
+	Cookie               string               `json:"cookie"`
+	Passkey              string               `json:"passkey"`
+	APIKey               string               `json:"api_key"`
+	UserAgent            string               `json:"user_agent"`
+	BrowserEmulation     bool                 `json:"browser_emulation"`
+	BrowserServiceURL    string               `json:"browser_service_url"`
+	Enabled              *bool                `json:"enabled"`
+	Priority             int                  `json:"priority"`
+	TimeoutSeconds       int                  `json:"timeout_seconds"`
+	SearchTimeoutSeconds *int                 `json:"search_timeout_seconds"`
+	RateLimitPerMinute   int                  `json:"rate_limit_per_minute"`
 }
 
 func (a *API) Sites(c *gin.Context) {
@@ -93,7 +92,7 @@ func (a *API) CreateSite(c *gin.Context) {
 	if payload.Enabled != nil {
 		enabled = *payload.Enabled
 	}
-	item, err := a.sites.Create(c.Request.Context(), actor, services.SiteInput{CloudConfig: payload.CloudConfig, Username: payload.Username, Password: payload.Password, Name: payload.Name, Kind: payload.Kind, BaseURL: payload.BaseURL, Cookie: payload.Cookie, Passkey: payload.Passkey, APIKey: payload.APIKey, UserAgent: payload.UserAgent, BrowserEmulation: payload.BrowserEmulation, BrowserServiceURL: payload.BrowserServiceURL, Enabled: enabled, Priority: payload.Priority, TimeoutSeconds: payload.TimeoutSeconds, RateLimitPerMinute: payload.RateLimitPerMinute}, middleware.RequestContextFrom(c))
+	item, err := a.sites.Create(c.Request.Context(), actor, services.SiteInput{CloudConfig: payload.CloudConfig, Username: payload.Username, Password: payload.Password, Name: payload.Name, Kind: payload.Kind, BaseURL: payload.BaseURL, Cookie: payload.Cookie, Passkey: payload.Passkey, APIKey: payload.APIKey, UserAgent: payload.UserAgent, BrowserEmulation: payload.BrowserEmulation, BrowserServiceURL: payload.BrowserServiceURL, Enabled: enabled, Priority: payload.Priority, TimeoutSeconds: payload.TimeoutSeconds, SearchTimeoutSeconds: payload.SearchTimeoutSeconds, RateLimitPerMinute: payload.RateLimitPerMinute}, middleware.RequestContextFrom(c))
 	if err != nil {
 		writeError(c, a.log, err)
 		return
@@ -109,31 +108,32 @@ func (a *API) UpdateSite(c *gin.Context) {
 	}
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 64<<10)
 	var payload struct {
-		CloudConfig        *sitepkg.CloudConfig `json:"cloud_config"`
-		Username           *string              `json:"username"`
-		Password           *string              `json:"password"`
-		ClearPassword      bool                 `json:"clear_password"`
-		Name               *string              `json:"name"`
-		BaseURL            *string              `json:"base_url"`
-		Cookie             *string              `json:"cookie"`
-		Passkey            *string              `json:"passkey"`
-		ClearPasskey       bool                 `json:"clear_passkey"`
-		APIKey             *string              `json:"api_key"`
-		ClearAPIKey        bool                 `json:"clear_api_key"`
-		UserAgent          *string              `json:"user_agent"`
-		BrowserEmulation   *bool                `json:"browser_emulation"`
-		BrowserServiceURL  *string              `json:"browser_service_url"`
-		Enabled            *bool                `json:"enabled"`
-		Priority           *int                 `json:"priority"`
-		TimeoutSeconds     *int                 `json:"timeout_seconds"`
-		RateLimitPerMinute *int                 `json:"rate_limit_per_minute"`
-		Revision           uint64               `json:"revision"`
+		CloudConfig          *sitepkg.CloudConfig `json:"cloud_config"`
+		Username             *string              `json:"username"`
+		Password             *string              `json:"password"`
+		ClearPassword        bool                 `json:"clear_password"`
+		Name                 *string              `json:"name"`
+		BaseURL              *string              `json:"base_url"`
+		Cookie               *string              `json:"cookie"`
+		Passkey              *string              `json:"passkey"`
+		ClearPasskey         bool                 `json:"clear_passkey"`
+		APIKey               *string              `json:"api_key"`
+		ClearAPIKey          bool                 `json:"clear_api_key"`
+		UserAgent            *string              `json:"user_agent"`
+		BrowserEmulation     *bool                `json:"browser_emulation"`
+		BrowserServiceURL    *string              `json:"browser_service_url"`
+		Enabled              *bool                `json:"enabled"`
+		Priority             *int                 `json:"priority"`
+		TimeoutSeconds       *int                 `json:"timeout_seconds"`
+		SearchTimeoutSeconds *int                 `json:"search_timeout_seconds"`
+		RateLimitPerMinute   *int                 `json:"rate_limit_per_minute"`
+		Revision             uint64               `json:"revision"`
 	}
 	if err := strictJSON(c, &payload); err != nil {
 		writeError(c, a.log, invalid("站点配置无效", err))
 		return
 	}
-	item, err := a.sites.Update(c.Request.Context(), actor, id, services.SiteUpdateInput{CloudConfig: payload.CloudConfig, Username: payload.Username, Password: payload.Password, ClearPassword: payload.ClearPassword, Name: payload.Name, BaseURL: payload.BaseURL, Cookie: payload.Cookie, Passkey: payload.Passkey, ClearPasskey: payload.ClearPasskey, APIKey: payload.APIKey, ClearAPIKey: payload.ClearAPIKey, UserAgent: payload.UserAgent, BrowserEmulation: payload.BrowserEmulation, BrowserServiceURL: payload.BrowserServiceURL, Enabled: payload.Enabled, Priority: payload.Priority, TimeoutSeconds: payload.TimeoutSeconds, RateLimitPerMinute: payload.RateLimitPerMinute, Revision: payload.Revision}, middleware.RequestContextFrom(c))
+	item, err := a.sites.Update(c.Request.Context(), actor, id, services.SiteUpdateInput{CloudConfig: payload.CloudConfig, Username: payload.Username, Password: payload.Password, ClearPassword: payload.ClearPassword, Name: payload.Name, BaseURL: payload.BaseURL, Cookie: payload.Cookie, Passkey: payload.Passkey, ClearPasskey: payload.ClearPasskey, APIKey: payload.APIKey, ClearAPIKey: payload.ClearAPIKey, UserAgent: payload.UserAgent, BrowserEmulation: payload.BrowserEmulation, BrowserServiceURL: payload.BrowserServiceURL, Enabled: payload.Enabled, Priority: payload.Priority, TimeoutSeconds: payload.TimeoutSeconds, SearchTimeoutSeconds: payload.SearchTimeoutSeconds, RateLimitPerMinute: payload.RateLimitPerMinute, Revision: payload.Revision}, middleware.RequestContextFrom(c))
 	if err != nil {
 		writeError(c, a.log, err)
 		return
@@ -242,10 +242,13 @@ func parsePTSearch(c *gin.Context) (services.SiteSearchInput, error) {
 		return input, err
 	}
 	input.SiteID, input.SiteIDs = siteID, siteIDs
-	return input, nil
+	input.ProgressVersion, err = parseSearchProgressVersion(c)
+	return input, err
 }
 
 func (a *API) PTSearch(c *gin.Context) {
+	cancel := searchOperationDeadline(c)
+	defer cancel()
 	actor, _ := middleware.ActorFrom(c)
 	input, err := parsePTSearch(c)
 	if err != nil {
@@ -285,10 +288,13 @@ func parseMediaIdentitySearch(c *gin.Context) (services.MediaIdentitySearchInput
 	if input.SiteID, input.SiteIDs, err = parseSearchSiteScope(c); err != nil {
 		return input, err
 	}
-	return input, nil
+	input.ProgressVersion, err = parseSearchProgressVersion(c)
+	return input, err
 }
 
 func (a *API) MediaIdentitySearch(c *gin.Context) {
+	cancel := searchOperationDeadline(c)
+	defer cancel()
 	actor, _ := middleware.ActorFrom(c)
 	input, err := parseMediaIdentitySearch(c)
 	if err != nil {
@@ -310,46 +316,20 @@ func (a *API) MediaIdentitySearchStream(c *gin.Context) {
 		writeError(c, a.log, err)
 		return
 	}
-	flusher, ok := c.Writer.(http.Flusher)
-	if !ok {
-		writeError(c, a.log, &services.AppError{Code: services.CodeSiteUnavailable, Message: "当前 HTTP 服务不支持流式种子资源搜索"})
+	writer, err := newSiteSearchStream(c, input.ProgressVersion)
+	if err != nil {
+		writeError(c, a.log, err)
 		return
 	}
-	started := false
-	lastProgress := services.SiteSearchProgress{}
-	writeEvent := func(event string, value any) {
-		if c.Request.Context().Err() != nil {
-			return
-		}
-		payload, marshalErr := json.Marshal(value)
-		if marshalErr != nil {
-			return
-		}
-		_, _ = fmt.Fprintf(c.Writer, "event: %s\ndata: %s\n\n", event, payload)
-		flusher.Flush()
+	defer writer.close()
+	if input.ProgressVersion == 2 {
+		writer.start()
 	}
 	err = a.sites.SearchMediaIdentityEachProgress(c.Request.Context(), actor, input, func(result services.MediaIdentitySearchResult) {
-		c.Header("Content-Type", "text/event-stream; charset=utf-8")
-		c.Header("Cache-Control", "no-store")
-		c.Header("X-Accel-Buffering", "no")
-		c.Status(http.StatusOK)
-		started = true
-		writeEvent("media", gin.H{"media_type": result.MediaType, "tmdb_id": result.TMDBID, "title": result.Title, "year": result.Year, "query_names": result.QueryNames})
-	}, func(group services.SiteSearchGroup) {
-		writeEvent("site", group)
-	}, func(progress services.SiteSearchProgress) {
-		lastProgress = progress
-		writeEvent("progress", progress)
-	})
-	if err != nil {
-		if !started {
-			writeError(c, a.log, err)
-		} else if c.Request.Context().Err() == nil {
-			writeEvent("error", gin.H{"code": services.ErrorCode(err), "message": "种子资源搜索失败"})
-		}
-		return
-	}
-	writeEvent("done", lastProgress)
+		writer.start()
+		writer.event("media", gin.H{"media_type": result.MediaType, "tmdb_id": result.TMDBID, "title": result.Title, "year": result.Year, "query_names": result.QueryNames})
+	}, writer.site, writer.progress)
+	writer.finish(err, func(err error) { writeError(c, a.log, err) })
 }
 
 func (a *API) PTSearchStream(c *gin.Context) {
@@ -359,42 +339,15 @@ func (a *API) PTSearchStream(c *gin.Context) {
 		writeError(c, a.log, err)
 		return
 	}
-	flusher, ok := c.Writer.(http.Flusher)
-	if !ok {
-		writeError(c, a.log, &services.AppError{Code: services.CodeSiteUnavailable, Message: "当前 HTTP 服务不支持流式种子资源搜索"})
-		return
-	}
-	c.Header("Content-Type", "text/event-stream; charset=utf-8")
-	c.Header("Cache-Control", "no-store")
-	c.Header("X-Accel-Buffering", "no")
-	c.Status(http.StatusOK)
-	flusher.Flush()
-	lastProgress := services.SiteSearchProgress{}
-	writeEvent := func(event string, value any) {
-		if c.Request.Context().Err() != nil {
-			return
-		}
-		payload, marshalErr := json.Marshal(value)
-		if marshalErr != nil {
-			return
-		}
-		_, _ = fmt.Fprintf(c.Writer, "event: %s\ndata: %s\n\n", event, payload)
-		flusher.Flush()
-	}
-	err = a.sites.SearchEachProgress(c.Request.Context(), actor, input, func(group services.SiteSearchGroup) {
-		writeEvent("site", group)
-	}, func(progress services.SiteSearchProgress) {
-		lastProgress = progress
-		writeEvent("progress", progress)
-	})
-	if c.Request.Context().Err() != nil {
-		return
-	}
+	writer, err := newSiteSearchStream(c, input.ProgressVersion)
 	if err != nil {
-		writeEvent("error", gin.H{"code": services.ErrorCode(err), "message": "种子资源搜索失败"})
+		writeError(c, a.log, err)
 		return
 	}
-	writeEvent("done", lastProgress)
+	defer writer.close()
+	writer.start()
+	err = a.sites.SearchEachProgress(c.Request.Context(), actor, input, writer.site, writer.progress)
+	writer.finish(err, func(err error) { writeError(c, a.log, err) })
 }
 
 func (a *API) TorrentSearchStream(c *gin.Context) { a.PTSearchStream(c) }

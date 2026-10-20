@@ -624,13 +624,13 @@ func TestFollowWorkerUsesCoverageIdentitySearchAndDownloadPipeline(t *testing.T)
 		t.Fatal(err)
 	}
 	failedSearch := runNext()
-	if failedSearch.Status != models.FollowRunNoMatch || failedSearch.ErrorCode != "" || failedSearch.Selected != 0 {
-		t.Fatalf("passive search observation changed historical domain behavior: %+v", failedSearch)
+	if failedSearch.Status != models.FollowRunFailed || failedSearch.ErrorCode != "follow_search_incomplete" || failedSearch.Selected != 0 {
+		t.Fatalf("incomplete search was confused with authoritative no-match: %+v", failedSearch)
 	}
 	failedRecords := businessRecords(t, &businessLog, "follow_run_id", failedSearch.ID)
 	foundFailedSearch := false
 	for _, event := range failedRecords {
-		if event["event_code"] == "follow.finish" && event["outcome"] == "failed" && event["error_code"] == "follow_search_failed" {
+		if event["event_code"] == "follow.finish" && event["outcome"] == "failed" && event["error_code"] == "follow_search_incomplete" {
 			foundFailedSearch = true
 		}
 	}

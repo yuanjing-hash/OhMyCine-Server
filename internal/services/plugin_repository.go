@@ -79,6 +79,7 @@ type PluginRepositoryService struct {
 	browserMu      sync.Mutex
 	browserAuthMu  sync.Mutex
 	browserSession *resourceBrowserSession
+	recovery       resourceRecoveryState
 	db             *gorm.DB
 	audit          *AuditService
 	fetcher        PluginRegistryFetcher

@@ -308,10 +308,7 @@ func controlledClient(config site.Config) (*http.Client, *url.URL, error) {
 	if err != nil || base.Scheme != "https" || base.Host == "" || base.User != nil || base.RawQuery != "" || base.ForceQuery || base.Fragment != "" || strings.Contains(rawBase, "#") {
 		return nil, nil, site.ErrUnavailable
 	}
-	timeout := config.Timeout
-	if timeout < 3*time.Second || timeout > 30*time.Second {
-		timeout = 12 * time.Second
-	}
+	timeout := site.RequestTimeout(config, 12*time.Second)
 	client := &http.Client{Timeout: timeout, CheckRedirect: func(next *http.Request, via []*http.Request) error {
 		if len(via) >= 3 || next.URL.Scheme != "https" || !strings.EqualFold(next.URL.Host, via[0].URL.Host) {
 			return http.ErrUseLastResponse

@@ -106,10 +106,7 @@ func (a *Adapter) Search(ctx context.Context, c site.Config, q site.Query) (site
 	if err != nil || base.Scheme != "https" || base.Host == "" || base.User != nil || base.RawQuery != "" || base.Fragment != "" {
 		return site.Page{}, site.ErrUnavailable
 	}
-	timeout := c.Timeout
-	if timeout < 3*time.Second || timeout > 30*time.Second {
-		timeout = 30 * time.Second
-	}
+	timeout := site.RequestTimeout(c, 30*time.Second)
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	client := a.client

@@ -61,6 +61,60 @@ test('reload preserves the owned session and refuses another identity', async t 
   assert.equal(reloads, 1);
   assert.equal(runtime.session.id, created.sessionId);
 });
+
+test('a dead browser is evicted before any request and can be recreated', async t => {
+  let alive = true, closed = 0, requests = 0;
+  const runtime = await fixture(t, { opener: async () => ({ alive: () => alive,
+    request: async () => { requests++; return {}; }, close: async () => { closed++; } }) });
+  runtime.state = 'ready';
+  const created = await runtime.dispatch('/v1/session/create', { identity: 'owner', origin: 'https://example.com' });
+  alive = false;
+  await assert.rejects(runtime.dispatch('/v1/session/request', { sessionId: created.sessionId,
+    identity: 'owner', method: 'GET', url: 'https://example.com/search' }), /session_unavailable/);
+  assert.equal(runtime.session, null);
+  assert.equal(requests, 0);
+  assert.equal(closed, 1);
+  alive = true;
+  await runtime.dispatch('/v1/session/create', { identity: 'replacement', origin: 'https://example.com' });
+});
+
+test('request cancellation closes the context and ignores a late response', async t => {
+  let resolveRequest, started;
+  const ready = new Promise(resolve => { started = resolve; });
+  let closed = 0, requests = 0;
+  const runtime = await fixture(t, { opener: async () => ({ request: () => {
+    requests++; started(); return new Promise(resolve => { resolveRequest = resolve; });
+  }, close: async () => { closed++; } }) });
+  runtime.state = 'ready';
+  const created = await runtime.dispatch('/v1/session/create', { identity: 'owner', origin: 'https://example.com' });
+  const controller = new AbortController();
+  const pending = runtime.dispatch('/v1/session/request', { sessionId: created.sessionId,
+    identity: 'owner', method: 'POST', url: 'https://example.com/login' }, { signal: controller.signal });
+  await ready;
+  controller.abort();
+  await assert.rejects(pending, /request_cancelled/);
+  assert.equal(runtime.session, null);
+  assert.equal(closed, 1);
+  assert.equal(requests, 1);
+  resolveRequest({ status: 200 });
+  await Promise.resolve();
+  assert.equal(runtime.session, null);
+  assert.equal(closed, 1);
+});
+
+test('hard request deadline evicts the closed browser without replay', async t => {
+  let closed = 0, requests = 0;
+  const runtime = await fixture(t, { opener: async () => ({ request: async () => {
+    requests++; throw new Fault('browser_request_timeout', 504);
+  }, close: async () => { closed++; } }) });
+  runtime.state = 'ready';
+  const created = await runtime.dispatch('/v1/session/create', { identity: 'owner', origin: 'https://example.com' });
+  await assert.rejects(runtime.dispatch('/v1/session/request', { sessionId: created.sessionId,
+    identity: 'owner', method: 'POST', url: 'https://example.com/login' }), /browser_request_timeout/);
+  assert.equal(runtime.session, null);
+  assert.equal(closed, 1);
+  assert.equal(requests, 1);
+});
 test('license refusal never starts installer; explicit install persists only private metadata', async t => {
   let installs = 0;
   const runtime = await fixture(t);

@@ -42,7 +42,7 @@ func SafeErrorCode(code string) string {
 		"browser_launch_failed", "browser_sandbox_unavailable", "browser_dependencies_missing",
 		"browser_executable_unavailable", "browser_launch_timeout", "browser_profile_unavailable",
 		"browser_navigation_failed", "browser_reload_post_denied", "network_denied", "network_timeout",
-		"resource_network_denied", "resource_network_timeout", "resource_network_failed", "resource_limit_exceeded", "session_expired":
+		"resource_network_denied", "resource_network_timeout", "resource_network_failed", "resource_limit_exceeded", "session_expired", "session_unavailable":
 		return code
 	default:
 		return "browser_launch_failed"

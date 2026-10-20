@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"regexp"
 	"sort"
@@ -170,7 +171,12 @@ func (w *FollowSearchWorker) Run(ctx context.Context, runtime JobRuntime, job Cl
 	processed, total := int64(1), int64(4)
 	_ = runtime.Heartbeat(&progress, &processed, &total, nil, nil)
 	_ = runtime.Checkpoint(map[string]any{"stage": "search", "missing": missingCoordinates})
-	candidates, queryNames, filterSummary := w.searchCandidates(ctx, actor, subscription, snapshot, missing)
+	searchCtx, stopSearch := context.WithTimeoutCause(context.WithValue(ctx, followSearchBudgetKey{}, true), w.sites.searchPolicyValue().Follow, errors.New(CodeSearchBudget))
+	candidates, queryNames, filterSummary := w.searchCandidates(searchCtx, actor, subscription, snapshot, missing)
+	if searchCtx.Err() != nil && ctx.Err() == nil {
+		filterSummary["search_incomplete"]++
+	}
+	stopSearch()
 	if ctx.Err() != nil {
 		return w.stopRun(run, models.FollowRunCancelled, "follow_cancelled", "追更任务已取消")
 	}
@@ -180,6 +186,9 @@ func (w *FollowSearchWorker) Run(ctx context.Context, runtime JobRuntime, job Cl
 	stats.mu.Unlock()
 	w.record(ctx, "follow.selection", "selection", "confirmed", fmt.Sprintf("身份与订阅规则过滤后 %d 个可用候选，按缺集覆盖、站点顺序、质量偏好与做种等既有规则选中 %d 个资源", len(candidates), len(selected)), map[string]any{"candidates": len(candidates), "chosen": len(selected), "reason_counts": filterSummary})
 	if len(selected) == 0 {
+		if filterSummary["site_error"] > 0 || filterSummary["site_incomplete"] > 0 || filterSummary["search_incomplete"] > 0 {
+			return w.finish(run, subscription, models.FollowRunFailed, models.FollowStatusActive, "follow_search_incomplete", "本轮部分或全部站点搜索未完成，不能确定没有匹配资源", snapshot, queryNames, len(candidates), filterSummary)
+		}
 		return w.finish(run, subscription, models.FollowRunNoMatch, models.FollowStatusActive, "", "", snapshot, queryNames, len(candidates), filterSummary)
 	}
 	progress = 70
@@ -340,6 +349,10 @@ func (w *FollowSearchWorker) searchCandidates(ctx context.Context, actor Actor, 
 	seen := map[string]struct{}{}
 	for sitePriority, siteID := range snapshot.SiteIDs {
 		for _, season := range snapshot.Seasons {
+			if ctx.Err() != nil {
+				summary["search_incomplete"]++
+				return result, queryNames, summary
+			}
 			hasMissing := false
 			for key := range missing {
 				if key[0] == season {
@@ -363,6 +376,9 @@ func (w *FollowSearchWorker) searchCandidates(ctx context.Context, actor Actor, 
 			for _, group := range grouped.Groups {
 				groupCtx := serverlog.WithBusinessFields(searchCtx, map[string]any{"site_name": group.SiteName})
 				rejections := newFollowRejections()
+				if group.Partial {
+					summary["site_incomplete"]++
+				}
 				if group.ErrorCount > 0 {
 					summary["site_error"] += group.ErrorCount
 				}
@@ -671,6 +687,9 @@ func (w *FollowSearchWorker) finish(run models.FollowRun, subscription models.Fo
 	eventType := map[string]string{models.FollowRunNoMatch: "follow.no_match", models.FollowRunCompleted: "follow.completed", models.FollowRunFailed: "follow.blocked"}[runStatus]
 	if runStatus == models.FollowRunFailed && subscriptionStatus == models.FollowStatusActive {
 		eventType = "follow.submit_failed"
+		if code == "follow_search_incomplete" {
+			eventType = "follow.search_failed"
+		}
 	}
 	if eventType != "" {
 		w.follows.publish(eventType, run.OwnerID, run.JobID, runStatus)

@@ -51,6 +51,21 @@ func TestCompanionPreservesSafeNetworkFailure(t *testing.T) {
 	}
 }
 
+func TestCompanionPreservesLostSessionWithoutPrivateErrorText(t *testing.T) {
+	for _, code := range []string{"session_unavailable", "session_expired"} {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"error":"` + code + `"}`))
+		}))
+		manager := &Manager{address: server.URL, token: "synthetic"}
+		err := manager.call(context.Background(), "session/request", nil, nil)
+		server.Close()
+		if ErrorCode(err) != code {
+			t.Fatalf("lost-session code = %s", ErrorCode(err))
+		}
+	}
+}
+
 func TestCompanionProtocolTransport(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer synthetic-test-only" || r.Method != "POST" || r.URL.Path != "/v1/status" {

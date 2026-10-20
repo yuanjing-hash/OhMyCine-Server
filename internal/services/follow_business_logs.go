@@ -109,7 +109,7 @@ func (w *FollowSearchWorker) recordRunEnd(ctx context.Context, runtime JobRuntim
 		case models.FollowRunFailed:
 			message = "本轮追更失败：" + followBusinessFailure(persisted.ErrorCode)
 		}
-		if outcome == "finished" && (persisted.ErrorCode != "" || reasons["site_error"] > 0) {
+		if outcome == "finished" && (persisted.ErrorCode != "" || reasons["site_error"] > 0 || reasons["site_incomplete"] > 0 || reasons["search_incomplete"] > 0) {
 			outcome = "partial"
 			message += "；部分搜索或提交未成功，详见站点与资源记录"
 		}
@@ -151,6 +151,8 @@ func followBusinessFailure(code string) string {
 		return "所选资源均未能提交下载，请检查下载器和目标媒体库路线"
 	case "follow_search_failed":
 		return "所有实际站点搜索均失败，不能视为没有匹配资源"
+	case "follow_search_incomplete":
+		return "部分或全部站点查询未完成，暂时无法判断是否存在匹配资源，订阅会按原调度继续"
 	case "follow_coverage_unknown":
 		return "无法确认所选季集的媒体库覆盖状态"
 	case "follow_owner_unavailable", CodePermissionDenied:

@@ -1760,6 +1760,7 @@ type Site struct {
 	Enabled              bool       `gorm:"not null;default:true;index" json:"enabled"`
 	Priority             int        `gorm:"not null;default:100;index" json:"priority"`
 	TimeoutSeconds       int        `gorm:"not null;default:12" json:"timeout_seconds"`
+	SearchTimeoutSeconds *int       `json:"search_timeout_seconds"`
 	RateLimitPerMinute   int        `gorm:"not null;default:12" json:"rate_limit_per_minute"`
 	LastHealthStatus     string     `gorm:"size:16;not null;default:'unknown'" json:"last_health_status"`
 	LastHealthErrorCode  string     `gorm:"size:96;not null;default:''" json:"last_health_error_code"`

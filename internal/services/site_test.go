@@ -321,14 +321,15 @@ func TestPluginResourceSearchRequiresHealthyCurrentLifecycle(t *testing.T) {
 	if err := service.db.Model(&models.Site{}).Where("id = ?", site.ID).Update("last_health_status", "auth_required").Error; err != nil {
 		t.Fatal(err)
 	}
-	if _, err := service.Search(context.Background(), actor, SiteSearchInput{Keyword: "test", SiteID: &site.ID, Page: 1}); ErrorCode(err) != "resource_auth_required" {
-		t.Fatalf("selected unauthenticated plugin error=%v code=%s", err, ErrorCode(err))
+	recovered, err := service.Search(context.Background(), actor, SiteSearchInput{Keyword: "test", SiteID: &site.ID, Page: 1})
+	if err != nil || len(recovered) != 1 || bridge.searchCalls != 1 {
+		t.Fatalf("stale health blocked recovery: groups=%+v err=%v calls=%d", recovered, err, bridge.searchCalls)
 	}
 	if err := service.db.Model(&models.Site{}).Where("id = ?", site.ID).Update("last_health_status", "healthy").Error; err != nil {
 		t.Fatal(err)
 	}
 	groups, err = service.Search(context.Background(), actor, SiteSearchInput{Keyword: "test", SiteID: &site.ID, Page: 1})
-	if err != nil || len(groups) != 1 || groups[0].Status != "success" || bridge.searchCalls != 1 {
+	if err != nil || len(groups) != 1 || groups[0].Status != "success" || bridge.searchCalls != 2 {
 		t.Fatalf("healthy groups=%+v calls=%d err=%v", groups, bridge.searchCalls, err)
 	}
 }

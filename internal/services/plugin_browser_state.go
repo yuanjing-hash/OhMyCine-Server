@@ -174,7 +174,18 @@ func (s *PluginRepositoryService) prepareBrowserLocked(ctx context.Context, owne
 		return appError("resource_browser_start_failed", "浏览器启动失败，请在系统设置中查看运行状态", nil)
 	}
 	if created.SessionID == "" || !created.ExpiresAt.After(time.Now()) || created.ExpiresAt.After(time.Now().Add(31*time.Minute)) {
+		if created.SessionID != "" {
+			s.closeBrowserHandle(ctx, created.SessionID, identity)
+		}
 		return browserFailure()
+	}
+	if err := ctx.Err(); err != nil {
+		s.closeBrowserHandle(ctx, created.SessionID, identity)
+		return err
+	}
+	if _, currentBinding, err := s.browserBinding(pluginID, connectionID); err != nil || currentBinding != fingerprint {
+		s.closeBrowserHandle(ctx, created.SessionID, identity)
+		return appError("resource_browser_session_expired", "浏览器启动期间连接配置已变化，请重新检查", nil)
 	}
 	s.browserSession = &resourceBrowserSession{ID: created.SessionID, Identity: identity, PluginID: pluginID, ConnectionID: connectionID, Origin: connection.EntryOrigin, Fingerprint: fingerprint, Owner: owner, Expires: created.ExpiresAt}
 	return nil
@@ -206,10 +217,19 @@ func (s *PluginRepositoryService) BrowserCredentialCommitted(ctx context.Context
 }
 
 func (s *PluginRepositoryService) saveBrowserState(ctx context.Context, connectionID string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	s.browserMu.Lock()
 	defer s.browserMu.Unlock()
 	session := s.browserSession
 	if session == nil || session.ConnectionID != connectionID {
+		if scope, ok := ctx.Value(browserStateKey{}).(browserAuthScope); ok && scope.ConnectionID == connectionID {
+			return appError("resource_browser_session_expired", "浏览器会话已变化，请重新检查", nil)
+		}
+		if scope, ok := ctx.Value(browserAuthKey{}).(browserAuthScope); ok && scope.ConnectionID == connectionID {
+			return appError("resource_browser_session_expired", "浏览器会话已变化，请重新确认", nil)
+		}
 		return nil
 	}
 	auth, ok := ctx.Value(browserAuthKey{}).(browserAuthScope)
@@ -263,9 +283,6 @@ func (s *PluginRepositoryService) saveBrowserState(ctx context.Context, connecti
 }
 
 func (s *PluginRepositoryService) hasBrowserState(connectionID string) bool {
-	if s.browser == nil {
-		return false
-	}
 	var connection models.PluginConnection
 	var state models.PluginBrowserState
 	if s.db.First(&connection, "id = ? AND enabled = ?", connectionID, true).Error != nil || s.db.First(&state, "connection_id = ?", connectionID).Error != nil {
@@ -278,6 +295,9 @@ func (s *PluginRepositoryService) hasBrowserState(connectionID string) bool {
 // Cold browser startup is outside the WASM/Host per-request time budget.
 func (s *PluginRepositoryService) restoreResourceBrowser(ctx context.Context, connectionID string) error {
 	if s.browser == nil {
+		if s.hasBrowserState(connectionID) {
+			return browserFailure()
+		}
 		return nil
 	}
 	s.browserMu.Lock()

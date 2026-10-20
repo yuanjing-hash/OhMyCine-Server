@@ -1,13 +1,15 @@
 // @vitest-environment happy-dom
-import { expect, it, vi } from 'vitest'
+import { beforeEach, expect, it, vi } from 'vitest'
 import { flushPromises, mount } from '@vue/test-utils'
 import SitesView from './views/SitesView.vue'
 import { siteCatalogPath, sitesPath } from './sites'
 
 const request = vi.hoisted(() => vi.fn())
+const navigate = vi.hoisted(() => vi.fn())
 vi.mock('@/api/client', async original => ({ ...await original<object>(), api: request }))
 vi.mock('@/stores/auth', () => ({ useAuthStore: () => ({ can: () => true }) }))
-vi.mock('vue-router', () => ({ useRouter: () => ({ push: vi.fn() }) }))
+vi.mock('vue-router', () => ({ useRouter: () => ({ push: navigate }) }))
+beforeEach(() => { request.mockReset(); navigate.mockReset() })
 
 it('opens TG setup and generic PT setup when catalog entries have no preset URLs', async () => {
   const capabilities = { search: true, download: true }
@@ -57,4 +59,38 @@ it('opens TG setup and generic PT setup when catalog entries have no preset URLs
   } finally {
     wrapper.unmount()
   }
+})
+
+it('edits a separate search budget and allows a recoverable plugin to enter search', async () => {
+  const common = { enabled: true, capabilities: { search: true, download: true }, user_agent: '', priority: 100, timeout_seconds: 12, rate_limit_per_minute: 12, browser_emulation: false, revision: 1 }
+  const jackett = { ...common, id: 7, kind: 'torznab', name: 'Jackett', site_type: 'bt', base_url: 'http://jackett:9117', credential_kind: 'api_key', api_key_configured: true, search_timeout_seconds: null, effective_search_timeout_seconds: 120, health: { status: 'online' } }
+  const plugin = { ...common, id: 8, kind: 'plugin_resource', name: '挂了.com', site_type: 'bt_resource', base_url: 'https://site.example', credential_kind: 'plugin', health: { status: 'unavailable' } }
+  request.mockImplementation(async (path: string, options?: RequestInit) => {
+    if (options?.method === 'PATCH') return {}
+    if (path === sitesPath) return { list: [jackett, plugin] }
+    if (path === siteCatalogPath) return { list: [{ key: 'torznab', engine: 'torznab', site_type: 'bt', name: 'Torznab', credential_kind: 'api_key', capabilities: common.capabilities, base_urls: null }] }
+    throw new Error(`Unexpected request: ${path}`)
+  })
+  const wrapper = mount(SitesView, { global: { stubs: { RouterLink: true } } })
+  try {
+    await flushPromises()
+    const pluginSearch = wrapper.findAll('article')[1].findAll('button').find(button => button.text() === '搜索')!
+    expect(pluginSearch.attributes('disabled')).toBeUndefined()
+    await pluginSearch.trigger('click')
+    expect(navigate).toHaveBeenCalledWith({ name: 'explore', query: { site_id: '8' } })
+    await wrapper.findAll('article')[0].findAll('button').find(button => button.text() === '编辑')!.trigger('click')
+    const field = wrapper.get<HTMLInputElement>('#site-search-timeout')
+    expect(field.element.value).toBe('')
+    expect(field.attributes('placeholder')).toContain('120')
+    await field.setValue(150)
+    await wrapper.get('form').trigger('submit'); await flushPromises()
+    let patch = request.mock.calls.find(([, options]) => options?.method === 'PATCH')!
+    expect(JSON.parse(String(patch[1].body))).toMatchObject({ timeout_seconds: 12, search_timeout_seconds: 150 })
+    request.mockClear()
+    await wrapper.findAll('article')[0].findAll('button').find(button => button.text() === '编辑')!.trigger('click')
+    await wrapper.get('#site-search-timeout').setValue('')
+    await wrapper.get('form').trigger('submit'); await flushPromises()
+    patch = request.mock.calls.find(([, options]) => options?.method === 'PATCH')!
+    expect(JSON.parse(String(patch[1].body))).toMatchObject({ timeout_seconds: 12, search_timeout_seconds: 0 })
+  } finally { wrapper.unmount() }
 })

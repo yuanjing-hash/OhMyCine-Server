@@ -53,7 +53,9 @@ func TestSiteSearchCoordinatorUsesSharedBoundedParallelismAndMonotonicProgress(t
 }
 
 func TestSiteSearchCoordinatorIsolatesTimeout(t *testing.T) {
-	service := &SiteService{searchSlots: make(chan struct{}, 2)}
+	policy := defaultSearchPolicy
+	policy.NativeSite = 30 * time.Millisecond
+	service := &SiteService{searchSlots: make(chan struct{}, 2), searchPolicy: &policy}
 	records := []models.Site{{ID: 1, Name: "slow", TimeoutSeconds: 1}, {ID: 2, Name: "fast", TimeoutSeconds: 2}}
 	groups := map[uint]SiteSearchGroup{}
 	err := service.runSiteSearches(context.Background(), records, func(ctx context.Context, site models.Site) SiteSearchGroup {
@@ -68,5 +70,25 @@ func TestSiteSearchCoordinatorIsolatesTimeout(t *testing.T) {
 	}
 	if groups[1].Status != "error" || groups[2].Status != "success" {
 		t.Fatalf("timeout was not isolated: %+v", groups)
+	}
+}
+
+func TestCoordinatorKeepsPublishedBatchWhenLaterWorkerReturnsOnlyError(t *testing.T) {
+	policy := defaultSearchPolicy
+	policy.NativeSite = 15 * time.Millisecond
+	service := &SiteService{searchSlots: make(chan struct{}, 1), searchPolicy: &policy}
+	ctx := context.WithValue(context.Background(), detailedSearchKey{}, true)
+	var groups []SiteSearchGroup
+	err := service.runSiteSearches(ctx, []models.Site{{ID: 1, Kind: "pttime", Name: "fixture"}}, func(ctx context.Context, record models.Site) SiteSearchGroup {
+		publishSearchSnapshot(ctx, SiteSearchGroup{SiteID: 1, SiteName: record.Name, Status: "success", Page: 1, QueriesCompleted: 1, QueriesTotal: 2, Items: []SiteSearchResult{{Token: "stable", Title: "first"}}})
+		<-ctx.Done()
+		return SiteSearchGroup{SiteID: 1, SiteName: record.Name, Status: "error", Page: 1, ErrorCode: CodeSiteUnavailable}
+	}, func(group SiteSearchGroup) { groups = append(groups, group) }, nil)
+	if err != nil || len(groups) != 2 {
+		t.Fatalf("groups=%+v err=%v", groups, err)
+	}
+	final := groups[len(groups)-1]
+	if final.Status != "success" || !final.Partial || final.IncompleteReason != CodeSearchSiteBudget || final.QueriesCompleted != 1 || len(final.Items) != 1 || final.Items[0].Token != "stable" {
+		t.Fatalf("published truth was retracted: %+v", final)
 	}
 }

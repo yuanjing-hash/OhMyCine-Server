@@ -1946,3 +1946,8 @@ Torznab 站点可单独使用 HTTP 或 HTTPS，其他站点仍按原有 HTTPS �
 ## 插件原生本地离线合同
 
 Server 0.1.1 新增 Runtime op20 和 Player offline-plan/offline-assets 路由，控制清单有界展开，媒体由 Player 下载到本地，不创建 Server 入库任务。详细请求、响应、授权及限制见 [插件原生离线下载](28-plugin-native-offline.md)。
+
+
+## 慢速站点与同站渐进结果
+
+搜索请求、限速等待、站点聚合及整轮搜索采用独立预算；历史连接超时保留，Torznab缺省搜索请求为120秒。网页与Player入库通过可选progress_version=2接收同一站点已校验的累计快照和真实阶段，晚期失败保留已发结果。未协商客户端、JSON及Follow每站只消费最终组；Follow搜索未完成不能保存正常no_match。配置迁移、SSE兼容字段、claim生命周期和字节上限见[慢速站点搜索与渐进结果](30-progressive-site-search.md)。

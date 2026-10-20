@@ -42,6 +42,7 @@ interface SiteForm {
   enabled: boolean
   priority: number
   timeoutSeconds: number
+  searchTimeoutSeconds: number | ''
   rateLimitPerMinute: number
   browserEmulation: boolean
   browserServiceURL: string
@@ -101,7 +102,7 @@ function emptyForm(): SiteForm {
   return {
     channels: '', cloudProvider: '115', authEnabled: false, username: '', password: '',
     kind: 'pttime', name: 'PTTime', baseURL: '', cookie: '', passkey: '', apiKey: '', userAgent: '', enabled: true,
-    priority: 100, timeoutSeconds: 12, rateLimitPerMinute: 12,
+    priority: 100, timeoutSeconds: 12, searchTimeoutSeconds: '', rateLimitPerMinute: 12,
     browserEmulation: false, browserServiceURL: '', clearBrowserService: false, clearPasskey: false, clearAPIKey: false,
   }
 }
@@ -196,6 +197,7 @@ function openEdit(site: SiteSummary) {
     channels: site.cloud_config?.channels.join('\n') ?? '', cloudProvider: '115', authEnabled: site.cloud_config?.auth_enabled ?? false, username: site.login_username ?? '', password: '',
     kind: site.kind, name: site.name, baseURL: site.base_url, cookie: '', passkey: '', apiKey: '', userAgent: site.user_agent,
     enabled: site.enabled, priority: site.priority, timeoutSeconds: site.timeout_seconds,
+    searchTimeoutSeconds: site.search_timeout_seconds ?? '',
     rateLimitPerMinute: site.rate_limit_per_minute, browserEmulation: site.browser_emulation,
     browserServiceURL: '', clearBrowserService: false, clearPasskey: false, clearAPIKey: false,
   }
@@ -229,6 +231,7 @@ async function save() {
       enabled: form.value.enabled,
       priority: form.value.priority,
       timeout_seconds: form.value.timeoutSeconds,
+      search_timeout_seconds: form.value.searchTimeoutSeconds === '' ? 0 : form.value.searchTimeoutSeconds,
       rate_limit_per_minute: form.value.rateLimitPerMinute,
       browser_emulation: form.value.browserEmulation,
     }
@@ -263,14 +266,13 @@ function searchSite(site: SiteSummary) {
 }
 
 function siteSearchDisabled(site: SiteSummary) {
-  return !site.enabled || !site.capabilities.search || site.health.status === 'offline'
-    || (site.site_type === 'bt_resource' && site.health.status !== 'healthy')
+  return !site.enabled || !site.capabilities.search || site.site_type !== 'bt_resource' && site.health.status === 'offline'
 }
 
 function siteSearchHint(site: SiteSummary) {
   if (!site.enabled) return '启用站点后才能搜索'
   if (!site.capabilities.search) return '该适配器不支持搜索'
-  if (site.site_type === 'bt_resource' && site.health.status !== 'healthy') return '请先到插件连接页完成登录和检测'
+  if (site.site_type === 'bt_resource' && site.health.status !== 'healthy') return '搜索时会重新检查并恢复已保存的登录会话'
   if (site.health.status === 'offline') return '请先修复连接并重新测试'
   return '只搜索此站点'
 }
@@ -504,7 +506,8 @@ onMounted(loadSites)
           <label v-if="editing && credentialKind === 'api_key'" class="text-muted flex items-center gap-2 text-sm sm:col-span-2"><input v-model="form.clearAPIKey" type="checkbox" />清除已保存的 API Key</label>
           <div><label class="label" for="site-priority">优先级</label><input id="site-priority" v-model.number="form.priority" class="input" type="number" min="1" max="999" required /></div>
           <div><label class="label" for="site-rate">每分钟请求上限</label><input id="site-rate" v-model.number="form.rateLimitPerMinute" class="input" type="number" min="1" max="120" required /></div>
-          <div><label class="label" for="site-timeout">请求超时（秒）</label><input id="site-timeout" v-model.number="form.timeoutSeconds" class="input" type="number" min="3" max="30" required /></div>
+          <div><label class="label" for="site-timeout">连接检测超时（秒）</label><input id="site-timeout" v-model.number="form.timeoutSeconds" class="input" type="number" min="3" max="30" required /></div>
+          <div><label class="label" for="site-search-timeout">单次搜索超时（秒，可选）</label><input id="site-search-timeout" v-model.number="form.searchTimeoutSeconds" class="input" type="number" min="3" max="180" :placeholder="`自动：${form.kind === 'torznab' ? 120 : form.timeoutSeconds} 秒`" /><p class="text-subtle mb-0 mt-1 text-xs">留空使用适配器默认值；Jackett 默认等待 120 秒。此设置独立于连接检测，多个名称的总搜索时间仍有上限。</p></div>
           <div><label class="label" for="site-ua">自定义 User-Agent（可选）</label><input id="site-ua" v-model="form.userAgent" class="input font-mono" maxlength="256" autocomplete="off" /></div>
           <label v-if="browserEmulationMode" class="text-muted flex items-center gap-2 text-sm sm:col-span-2"><input v-model="form.browserEmulation" type="checkbox" />{{ browserEmulationMode === 'public_bt' ? '启用 Cloudflare 页面渲染兼容' : '启用无凭据页面渲染兼容' }}</label>
           <div v-if="form.browserEmulation" class="semantic-warning p-4 sm:col-span-2">

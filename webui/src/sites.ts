@@ -25,6 +25,8 @@ export interface SiteSummary {
   enabled: boolean
   priority: number
   timeout_seconds: number
+  search_timeout_seconds?: number | null
+  effective_search_timeout_seconds?: number
   rate_limit_per_minute: number
   browser_emulation: boolean
   browser_service_configured: boolean
@@ -139,6 +141,13 @@ export interface PTSearchGroup {
   has_next: boolean
   skipped: number
   items: PTSearchResult[]
+  complete?: boolean
+  revision?: number
+  partial?: boolean
+  incomplete_reason?: string
+  queries_completed?: number
+  queries_failed?: number
+  queries_total?: number
 }
 
 export interface PTRecognitionSpecifications {
@@ -308,6 +317,22 @@ export interface TorrentSearchProgress {
   site_name?: string
   site_status?: 'queued' | 'running' | 'success' | 'error' | 'timeout' | 'cancelled' | string
   error_code?: string
+  event_sequence?: number
+  phase?: string
+  site_detail?: TorrentSearchSiteDetail
+}
+export interface TorrentSearchSiteDetail {
+  site_id: number
+  site_name: string
+  phase: string
+  query_name?: string
+  query_index?: number
+  queries_completed?: number
+  queries_failed?: number
+  queries_total?: number
+  result_count: number
+  elapsed_ms: number
+  revision?: number
 }
 export const buildTorrentSearchQuery = buildPTSearchQuery
 export const torrentSearchURL = ptSearchURL
@@ -319,6 +344,7 @@ const torrentSearchSessionMaxBytes = 512 * 1024
 const torrentSearchSessionMaxAgeMs = 30 * 60 * 1000
 
 export interface TorrentSearchSession {
+  actorID?: number
   input: { keyword: string; mediaType: string; year?: number; tmdbID?: number; searchBy: 'title' | 'tmdb_id'; siteID?: number; siteIDs?: number[] }
   groups: TorrentSearchGroup[]
   recognitions: Record<string, TorrentRecognitionResult>
@@ -350,7 +376,7 @@ export function filterAndSortTorrentResults(groups: readonly PTSearchGroup[], fi
     || left.item.title.localeCompare(right.item.title)
     || left.item.token.localeCompare(right.item.token)
   return scoped
-    .flatMap(group => group.status === 'success' ? group.items.map(item => ({ item, group })) : [])
+    .flatMap(group => group.items.map(item => ({ item, group })))
     .filter(({ group }) => filters.enabledSiteTypes.includes(group.site_type))
     .filter(({ item }) => !resolution || item.specifications?.resolution === resolution || item.quality === resolution)
     .filter(({ item }) => item.source_kind === '115_share' || !promotion || item.promotion?.toLowerCase() === promotion)
@@ -471,6 +497,7 @@ export function readTorrentSearchSession(storage: SearchSessionStorage | undefin
       .map(([token, recognition]) => [token, restoreTorrentRecognition(recognition)] as const)
       .filter((entry): entry is readonly [string, TorrentRecognitionResult] => entry[1] !== null))
     return {
+      actorID: typeof value.actorID === 'number' && Number.isSafeInteger(value.actorID) && value.actorID > 0 ? value.actorID : undefined,
       input: {
         keyword: typeof value.input.keyword === 'string' ? value.input.keyword.slice(0, 160) : '',
         mediaType: typeof value.input.mediaType === 'string' ? value.input.mediaType : '',

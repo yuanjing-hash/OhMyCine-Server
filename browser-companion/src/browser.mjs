@@ -72,6 +72,7 @@ export async function openBrowser(executablePath, origin, dependencies = {}) {
       .catch(() => { throw new Fault('browser_navigation_failed', 502); });
     requireThat(!dependencies.signal?.aborted, 'request_cancelled', 503);
     return {
+      alive() { return !closed && browser.isConnected?.() !== false && page.isClosed?.() !== true; },
       async cookies() { return await exportCookies(context, origin); },
       async reload() {
         requireThat(samePageOrigin(page.url(), origin), 'navigation_denied');

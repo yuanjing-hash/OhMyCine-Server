@@ -28,7 +28,8 @@ async function fixture(cookies = [], network = {}) {
     addCookies: async value => { calls.importedCookies = value; },
     route: async (_, fn) => { calls.route = fn; },
     routeWebSocket: async (_, fn) => { calls.socket = fn; }, newPage: async () => page };
-  const browser = { newContext: async options => { calls.context = options; return context; }, close: async () => {} };
+  const browser = { isConnected: () => calls.connected !== false,
+    newContext: async options => { calls.context = options; return context; }, close: async () => {} };
   const adapter = await openBrowser('/synthetic', 'https://example.com', {
     cookies,
     resolvePinnedAddress: async origin => { calls.resolution = { origin }; return network.address || '8.8.8.8'; },
@@ -38,6 +39,15 @@ async function fixture(cookies = [], network = {}) {
   adapters.add(adapter);
   return { adapter, calls };
 }
+test('liveness reflects process disconnect and explicit close', async () => {
+  const { calls, adapter } = await fixture();
+  assert.equal(adapter.alive(), true);
+  calls.connected = false;
+  assert.equal(adapter.alive(), false);
+  calls.connected = true;
+  await adapter.close();
+  assert.equal(adapter.alive(), false);
+});
 test('browser retains sandbox, constrained proxy, no downloads/SW/WebSockets', async () => {
   const { calls, adapter } = await fixture();
   assert.equal(calls.launch.chromiumSandbox, true);

@@ -17,6 +17,23 @@ function browserMock() {
   })
 }
 describe('unified browser login', () => {
+  it('checks an already logged-in page without replaying a pending password request', async () => {
+    browserMock()
+    const wrapper = mount(PluginBrowserLogin, { props }); await flushPromises()
+    vi.mocked(api).mockClear()
+    vi.mocked(api).mockResolvedValueOnce({ status: 'healthy', accountName: '用户' })
+    await wrapper.findAll('button').find(button => button.text() === '重新检查登录状态')!.trigger('click')
+    await flushPromises()
+    expect(vi.mocked(api).mock.calls).toHaveLength(1)
+    expect(vi.mocked(api).mock.calls[0]).toEqual([
+      '/api/v1/plugins/plugin/connections/connection/resource/health',
+      expect.objectContaining({ method: 'POST', body: '{}' }),
+    ])
+    expect(wrapper.emitted('result')?.[0]).toEqual([{ state: 'authenticated', accountName: '用户' }])
+    expect(wrapper.text()).not.toContain('需要手动完成站点验证')
+    wrapper.unmount()
+  })
+
   it.each([
     ['resource_browser_login_expired', '网页仍可使用'],
     ['resource_entry_unavailable', '站点响应不可用或无法识别'],
@@ -26,7 +43,7 @@ describe('unified browser login', () => {
     browserMock()
     const wrapper = mount(PluginBrowserLogin, { props }); await flushPromises()
     vi.mocked(api).mockRejectedValueOnce(new APIError(500, code, 'private-secret'))
-    await wrapper.findAll('button').find(b => b.text() === '验证完成，继续登录')!.trigger('click'); await flushPromises()
+    await wrapper.findAll('button').find(b => b.text() === '继续本次登录')!.trigger('click'); await flushPromises()
     expect(wrapper.text()).toContain(message)
     expect(wrapper.text()).not.toContain('private-secret')
     expect(wrapper.find('img').exists()).toBe(true)
@@ -147,7 +164,7 @@ describe('unified browser login', () => {
     await wrapper.findAll('button').find(b => b.text() === '输入到当前焦点')!.trigger('click'); await flushPromises()
     expect((wrapper.get('input').element as HTMLInputElement).value).toBe('')
     vi.mocked(api).mockResolvedValueOnce({ state: 'captcha_required' })
-    await wrapper.findAll('button').find(b => b.text() === '验证完成，继续登录')!.trigger('click'); await flushPromises()
+    await wrapper.findAll('button').find(b => b.text() === '继续本次登录')!.trigger('click'); await flushPromises()
     expect(wrapper.emitted('result')?.[0]).toEqual([{ state: 'captcha_required' }])
     wrapper.unmount()
   })
