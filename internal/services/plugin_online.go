@@ -395,7 +395,7 @@ func (s *PluginRepositoryService) OnlinePlayback(ctx context.Context, actor Acto
 	return rewriteOnlineAssetReferences(response)
 }
 
-func (s *PluginRepositoryService) SyncOnlineProgress(ctx context.Context, actor Actor, libraryID, itemID, segmentID, versionID, event string, positionSeconds float64, durationSeconds *float64, idempotencyKey, occurredAt string) (json.RawMessage, error) {
+func (s *PluginRepositoryService) SyncOnlineProgress(ctx context.Context, actor Actor, libraryID, itemID, segmentID, versionID, event string, completed bool, positionSeconds float64, durationSeconds *float64, idempotencyKey, occurredAt string) (json.RawMessage, error) {
 	if !safeOnlineText(itemID, maxOnlineIdentifierBytes) || !safeOnlineText(segmentID, maxOnlineIdentifierBytes) || !safeOnlineText(versionID, maxOnlineIdentifierBytes) || !safeOnlineText(idempotencyKey, 128) || !safeOptionalOnlineText(occurredAt, 128) || positionSeconds < 0 || positionSeconds > 365*24*60*60 {
 		return nil, appError(CodeInvalidRequest, "在线播放进度请求无效", nil)
 	}
@@ -412,7 +412,7 @@ func (s *PluginRepositoryService) SyncOnlineProgress(ctx context.Context, actor 
 		return nil, err
 	}
 	if s.history != nil {
-		if err := s.saveOnlineProgress(ctx, actor, libraryID, itemID, segmentID, versionID, event, positionSeconds, durationSeconds, occurredAt); err != nil {
+		if err := s.saveOnlineProgress(ctx, actor, libraryID, itemID, segmentID, versionID, event, completed, positionSeconds, durationSeconds, occurredAt); err != nil {
 			return nil, err
 		}
 		if !manifestHasCapability(manifest, contract.CapabilityPlaybackProgress) {

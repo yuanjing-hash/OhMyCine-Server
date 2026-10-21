@@ -358,7 +358,7 @@ func onlineHistoryAvailableTx(tx *gorm.DB, actor Actor, row models.PlayerPlaybac
 	return count == 1, err
 }
 
-func (s *PluginRepositoryService) saveOnlineProgress(ctx context.Context, actor Actor, libraryID, work, segment, version, event string, position float64, duration *float64, occurredAt string) error {
+func (s *PluginRepositoryService) saveOnlineProgress(ctx context.Context, actor Actor, libraryID, work, segment, version, event string, completed bool, position float64, duration *float64, occurredAt string) error {
 	if s.history == nil {
 		return appError(CodePluginRuntimeUnavailable, "在线播放历史服务不可用", nil)
 	}
@@ -371,7 +371,7 @@ func (s *PluginRepositoryService) saveOnlineProgress(ctx context.Context, actor 
 		updatedAt = parsed.UnixMilli()
 	}
 	token := onlineHistoryToken(libraryID, work, segment, version)
-	change := PlayerHistoryChange{SyncKey: playerHistoryCanonicalSyncKey(token), HistoryIdentity: token, SourceKind: "server", SourceID: libraryID, LibraryID: "online-library|" + encodeOnlineHistoryPart(libraryID), ItemToken: token, ItemID: token, MediaIdentity: token, Title: "在线媒体", Position: position, Duration: duration, Completed: event == "completed", UpdatedAt: updatedAt}
+	change := PlayerHistoryChange{SyncKey: playerHistoryCanonicalSyncKey(token), HistoryIdentity: token, SourceKind: "server", SourceID: libraryID, LibraryID: "online-library|" + encodeOnlineHistoryPart(libraryID), ItemToken: token, ItemID: token, MediaIdentity: token, Title: "在线媒体", Position: position, Duration: duration, Completed: completed || event == "completed", UpdatedAt: updatedAt}
 	normalized, err := normalizePlayerHistoryChange(change)
 	if err != nil {
 		return err

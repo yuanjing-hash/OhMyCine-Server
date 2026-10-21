@@ -38,7 +38,7 @@ func TestOnlineHistorySuccessfulPlaybackAuthorityUserRowsAndContinue(t *testing.
 	if _, err = s.OnlinePlayback(ctx, actor, id, "work:1", "special:1", "bonus", "qn:80"); err != nil {
 		t.Fatal(err)
 	}
-	ack, err := s.SyncOnlineProgress(ctx, actor, id, "work:1", "special:1", "bonus", "started", 0, floatPointer(1000), "fixture-start", time.Now().Format(time.RFC3339Nano))
+	ack, err := s.SyncOnlineProgress(ctx, actor, id, "work:1", "special:1", "bonus", "started", false, 0, floatPointer(1000), "fixture-start", time.Now().Format(time.RFC3339Nano))
 	mustCatalogue(t, err)
 	if string(ack) != `{"accepted":true,"remote":false}` || r.count("playback.progress_sync") != 0 {
 		t.Fatal("system progress invoked unsupported provider write")
@@ -274,15 +274,75 @@ func TestOnlineHistoryProviderFailureKeepsSystemFactAndDefaultMembership(t *test
 	mustCatalogue(t, s.db.First(&pkg).Error)
 	manifest := strings.Replace(pkg.ManifestJSON, `"feed.refresh"`, `"feed.refresh","playback.progress_sync"`, 1)
 	mustCatalogue(t, s.db.Model(&pkg).Update("manifest_json", manifest).Error)
-	_, err := s.SyncOnlineProgress(ctx, actor, id, "work:1", "main:1", "full", "progress", 100, floatPointer(1000), "synthetic", time.Now().Format(time.RFC3339Nano))
+	baseTime := time.Now().UTC().Add(-time.Minute).Truncate(time.Millisecond)
+	seed := onlineHistoryInput(id, "main:1", "full", 920)
+	seed.Completed, seed.UpdatedAt = true, baseTime.UnixMilli()
+	_, err := history.SyncContext(ctx, actor, 0, []PlayerHistoryChange{seed})
 	mustCatalogue(t, err)
-	if r.count("playback.progress_sync") != 1 {
-		t.Fatal("declared provider operation was not preserved")
+	var providerRequest []byte
+	r.set(func(ctx context.Context, op string, input []byte) ([]byte, error) {
+		if op == "playback.progress_sync" {
+			providerRequest = append(providerRequest[:0], input...)
+		}
+		return catalogueResponse(ctx, op, input)
+	})
+	cases := []struct {
+		name, event   string
+		completed     bool
+		position      float64
+		wantCompleted bool
+	}{
+		{"watched-progress", "progress", true, 925, true},
+		{"watched-stop", "stopped", true, 930, true},
+		{"new-replay", "started", false, 10, false},
+		{"replay-progress", "progress", false, 20, false},
+		{"replay-stop", "stopped", false, 30, false},
+		{"eof", "completed", false, 1000, true},
 	}
-	page, err := history.List(actor, 1, 24, "server")
-	mustCatalogue(t, err)
-	if len(page.List) != 1 {
-		t.Fatal("provider failure rolled back user history")
+	for index, tc := range cases {
+		occurredAt := baseTime.Add(time.Duration(index+1) * time.Millisecond)
+		key := "fixture-" + tc.name
+		var revision uint64
+		for attempt := 0; attempt < 2; attempt++ {
+			ack, err := s.SyncOnlineProgress(ctx, actor, id, "work:1", "main:1", "full", tc.event, tc.completed, tc.position, floatPointer(1000), key, occurredAt.Format(time.RFC3339Nano))
+			mustCatalogue(t, err)
+			if string(ack) != `{"accepted":true,"remote":false}` {
+				t.Fatalf("%s: provider failure changed system acknowledgement", tc.name)
+			}
+			page, err := history.List(actor, 1, 24, "server")
+			mustCatalogue(t, err)
+			if page.Total != 1 || len(page.List) != 1 {
+				t.Fatalf("%s: provider failure lost the canonical row", tc.name)
+			}
+			row := page.List[0]
+			if row.ItemToken != seed.ItemToken || row.Completed != tc.wantCompleted || row.Position != tc.position || row.UpdatedAt != occurredAt.UnixMilli() {
+				t.Fatalf("%s: watched/position/occurrence changed: %+v", tc.name, row)
+			}
+			if attempt == 1 && row.Revision != revision {
+				t.Fatalf("%s: duplicate occurrence wrote a newer revision", tc.name)
+			}
+			revision = row.Revision
+			var upstream struct {
+				ConnectionID   string   `json:"connectionId"`
+				ItemID         string   `json:"itemId"`
+				SegmentID      string   `json:"segmentId"`
+				VersionID      string   `json:"versionId"`
+				Event          string   `json:"event"`
+				Position       float64  `json:"positionSeconds"`
+				Duration       *float64 `json:"durationSeconds"`
+				IdempotencyKey string   `json:"idempotencyKey"`
+				OccurredAt     string   `json:"occurredAt"`
+			}
+			decoder := json.NewDecoder(strings.NewReader(string(providerRequest)))
+			decoder.DisallowUnknownFields()
+			mustCatalogue(t, decoder.Decode(&upstream))
+			if upstream.ConnectionID != id || upstream.ItemID != "work:1" || upstream.SegmentID != "main:1" || upstream.VersionID != "full" || upstream.Event != tc.event || upstream.Position != tc.position || upstream.Duration == nil || *upstream.Duration != 1000 || upstream.IdempotencyKey != key || upstream.OccurredAt != occurredAt.Format(time.RFC3339Nano) {
+				t.Fatalf("%s: provider lifecycle/identity/occurrence changed: %+v", tc.name, upstream)
+			}
+		}
+	}
+	if r.count("playback.progress_sync") != len(cases)*2 {
+		t.Fatal("declared provider operation was not preserved")
 	}
 	response, _ := catalogueResponse(ctx, "site.detail", nil)
 	var work contract.MediaWork

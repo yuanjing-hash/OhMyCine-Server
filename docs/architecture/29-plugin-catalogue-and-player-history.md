@@ -14,6 +14,23 @@ Server 自动为启用的在线插件媒体库维护分类与首屏目录。SQLi
 
 `POST /api/v1/player/online-libraries/:libraryId/items/:workId/progress` 先保存当前系统用户的观看记录。插件声明 `playback.progress_sync` 时才另调用上游；上游失败不撤销本地系统事实。没有该能力仍返回兼容的 `{ "accepted": true, "remote": false }`。该 ACK 不遍历整个历史或请求全部海报；同步增量由既有 `/player/history/sync` 提供。
 
+v1 进度请求用 `completed` 布尔值表达已看完，与 `event` 播放生命周期分开：
+
+```json
+{
+  "segmentId": "episode:1",
+  "versionId": "full",
+  "event": "progress",
+  "completed": true,
+  "positionSeconds": 925,
+  "durationSeconds": 1000,
+  "idempotencyKey": "playback-occurrence-1",
+  "occurredAt": "2026-10-20T08:00:00.123Z"
+}
+```
+
+系统历史保存 `completed || event == "completed"`。接近片尾已看完时仍可发送普通 `progress`，手动停止仍发送 `stopped`；只有真正正常播完才发送终止事件 `completed`。重新开始观看可明确发送 `completed: false`，按原时间冲突规则更新。`occurredAt` 是这次实际播放事实的发生时间，原样用于历史的毫秒更新时间；相同事实重试保留相同发生时间与幂等键，不能在等待本地保存后另生成一个较新的未看完事实。可选插件调用保留原始 event、位置、发生时间与幂等键，不向严格插件 DTO 添加系统历史字段 `completed`，也不因已看完提前结束提供方播放会话。
+
 身份严格使用 `online-version|encodeURIComponent(libraryId)|encodeURIComponent(workId)|encodeURIComponent(segmentId)|encodeURIComponent(versionId)`，canonical sync key 是该完整 token 的 SHA256。Server 在当前来源 scope 下用权威 detail 校验具体分集和版本，并覆盖客户端标题、海报和集数猜测；空 variants 可由实时播放再解析。未提供官方集数的彩蛋不生成普通 episodeNumber，版本与彩蛋身份不合并。可选 `MediaWork.defaultSegmentId` 必须精确属于 segments，并不重排官方顺序。
 
 零进度 `started` 必须已有该用户成功获得的、当前 scope 且 Host 资产归属有效的实时播放方案。失败播放不能产生观看记录；正进度加有效 detail 允许已经在本地离线播放的记录同步。detail proof 24 小时有效，最多每库 4000 / 全局 16000 条；播放开始凭证 24 小时，最多每用户 4096 / 全局 16384 条。它们只证明身份或成功开始，不代表未来播放权益。用户历史比临时 proof 长寿；升级、重新登录或 proof 淘汰不会删除用户完成状态与续播位置。已有本人 canonical 记录的 tombstone 在当前在线读取 scope 下不依赖 provider 可用或新的 detail proof；凭空删除其他身份被拒绝。

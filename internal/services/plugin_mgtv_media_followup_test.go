@@ -187,7 +187,7 @@ func TestMangoWASMFollowupPagedDetailPlaybackScopedAssetsAndSystemHistory(t *tes
 			t.Fatal("actual guest offline HLS topology missing")
 		}
 	}
-	_, err = s.SyncOnlineProgress(ctx, actor, id, "clip:687100", "video:22025165", "mgtv:687100:22025165", "progress", 10, floatPointer(1000), "fixture-system-progress", time.Now().Format(time.RFC3339Nano))
+	_, err = s.SyncOnlineProgress(ctx, actor, id, "clip:687100", "video:22025165", "mgtv:687100:22025165", "progress", false, 10, floatPointer(1000), "fixture-system-progress", time.Now().Format(time.RFC3339Nano))
 	mustCatalogue(t, err)
 	page, err := history.List(actor, 1, 24, "server")
 	mustCatalogue(t, err)

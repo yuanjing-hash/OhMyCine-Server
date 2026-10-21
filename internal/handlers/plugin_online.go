@@ -207,6 +207,7 @@ func (a *API) PlayerOnlineProgress(c *gin.Context) {
 		SegmentID      string   `json:"segmentId"`
 		VersionID      string   `json:"versionId"`
 		Event          string   `json:"event"`
+		Completed      bool     `json:"completed"`
 		Position       float64  `json:"positionSeconds"`
 		Duration       *float64 `json:"durationSeconds"`
 		IdempotencyKey string   `json:"idempotencyKey"`
@@ -217,7 +218,7 @@ func (a *API) PlayerOnlineProgress(c *gin.Context) {
 		return
 	}
 	a.playerOnlineInvoke(c, func(actor services.Actor) (json.RawMessage, error) {
-		return a.pluginRepositories.SyncOnlineProgress(c.Request.Context(), actor, c.Param("id"), c.Param("itemId"), input.SegmentID, input.VersionID, input.Event, input.Position, input.Duration, input.IdempotencyKey, input.OccurredAt)
+		return a.pluginRepositories.SyncOnlineProgress(c.Request.Context(), actor, c.Param("id"), c.Param("itemId"), input.SegmentID, input.VersionID, input.Event, input.Completed, input.Position, input.Duration, input.IdempotencyKey, input.OccurredAt)
 	})
 }
 
