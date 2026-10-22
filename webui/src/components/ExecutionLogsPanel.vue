@@ -5,12 +5,12 @@ import { Permissions } from '@/auth/generated-permissions'
 import { createLatestRequest } from '@/latest-request'
 import { useAuthStore } from '@/stores/auth'
 import {
-  deduplicateLogEntries, executionLogError, executionScopeKey, executionStatusLabel, executionTriggerLabel, filterReasonRows,
+  deduplicateLogEntries, executionLogError, executionScopeKey, executionStatusLabel, executionTriggerLabel, filterReasonRows, followCoverageWaitingLabel, isFollowCoverageWaiting,
   getExecutionLogs, logFactRows, logLevelLabel, logOperationLabel, logOutcomeLabel, logStageLabel,
   type ExecutionLogEntry, type ExecutionLogPage, type ExecutionLogScope, type ExecutionSummary,
 } from '@/execution-logs'
 
-const props = defineProps<{ scope: ExecutionLogScope; active?: boolean; attemptCount?: number; fallbackSummary?: ExecutionSummary }>()
+const props = defineProps<{ scope: ExecutionLogScope; active?: boolean; attemptCount?: number; fallbackSummary?: ExecutionSummary; coverageRecheckAt?: string }>()
 const auth = useAuthStore()
 const request = createLatestRequest()
 const result = ref<ExecutionLogPage | null>(null), entries = ref<ExecutionLogEntry[]>([])
@@ -23,6 +23,7 @@ let alive = true, timer: number | undefined
 // historical snapshot). A live parent projection must not fill that omission.
 const summary = computed(() => !auth.user || denied.value ? undefined : result.value ? result.value.summary : attempt.value || snapshot.value || pageIndex.value > 0 ? undefined : props.fallbackSummary)
 const filterRows = computed(() => filterReasonRows(summary.value?.filter_summary))
+const coverageWaiting = computed(() => props.scope.kind === 'follow' && isFollowCoverageWaiting(summary.value))
 const duration = computed(() => {
   if (!summary.value?.started_at || !summary.value?.finished_at) return ''
   const seconds = (new Date(summary.value.finished_at).getTime() - new Date(summary.value.started_at).getTime()) / 1000
@@ -86,9 +87,10 @@ onBeforeUnmount(() => { alive = false; request.cancel(); window.clearInterval(ti
   <section class="execution-logs" aria-label="本轮执行过程">
     <section v-if="summary" class="semantic-inset execution-summary" aria-label="本轮结果">
       <h3>本轮结果</h3>
-      <p class="execution-summary__outcome" :class="summary.status === 'failed' || summary.error_code ? 'semantic-danger-text' : ''">{{ summary.error_code === 'follow_submit_partial' ? '部分下载已提交，其余提交失败' : executionStatusLabel(summary.status) }}</p>
+      <p class="execution-summary__outcome" :class="!coverageWaiting && (summary.status === 'failed' || summary.error_code) ? 'semantic-danger-text' : ''">{{ coverageWaiting ? followCoverageWaitingLabel : summary.error_code === 'follow_submit_partial' ? '部分下载已提交，其余提交失败' : executionStatusLabel(summary.status) }}</p>
       <p v-if="summary.title" class="text-muted">{{ summary.title }}</p>
-      <p v-if="summary.error_message" class="semantic-danger-text">{{ summary.error_message }}</p>
+      <p v-if="summary.error_message" :class="coverageWaiting ? 'text-muted' : 'semantic-danger-text'">{{ summary.error_message }}</p>
+      <p v-if="coverageWaiting && coverageRecheckAt" class="text-muted text-sm" role="status">订阅将按计划复查，下次检查 {{ formatTime(coverageRecheckAt) }}。</p>
       <p v-if="summary.status === 'no_match'" class="text-muted text-sm">可能是未找到资源、筛选未通过或站点查询失败，请查看下方过程中的具体原因。</p>
       <dl class="execution-counts">
         <template v-if="hasCount(summary.searched_names_count)"><dt>查询名称数</dt><dd>{{ summary.searched_names_count }}</dd></template>

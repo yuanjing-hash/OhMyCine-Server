@@ -108,6 +108,9 @@ func (w *FollowSearchWorker) recordRunEnd(ctx context.Context, runtime JobRuntim
 			outcome, message = "cancelled", "本轮追更已停止，已接受的独立下载任务保持原状态"
 		case models.FollowRunFailed:
 			message = "本轮追更失败：" + followBusinessFailure(persisted.ErrorCode)
+			if persisted.ErrorCode == "follow_coverage_unknown" {
+				outcome, message = "waiting", "等待媒体库扫描或剧集播出信息完善，本轮未搜索或提交下载；订阅将按计划重新检查"
+			}
 		}
 		if outcome == "finished" && (persisted.ErrorCode != "" || reasons["site_error"] > 0 || reasons["site_incomplete"] > 0 || reasons["search_incomplete"] > 0) {
 			outcome = "partial"
@@ -127,6 +130,9 @@ func (w *FollowSearchWorker) recordRunEnd(ctx context.Context, runtime JobRuntim
 		if reasons["reservation_failed"] > 0 {
 			outcome = "partial"
 			message += "；部分资源无法保留季集占用，未提交"
+		}
+		if reasons["coverage_unknown"] > 0 {
+			message += fmt.Sprintf("；另有 %d 集状态尚未确认，已跳过并保留后续检查", reasons["coverage_unknown"])
 		}
 		if outcome == "finished" && persisted.FinishedAt != nil && result.ErrorCode == "" && result.RetryAt == nil && ctx.Err() == nil {
 			progress, processed, total := float64(100), int64(4), int64(4)
@@ -168,7 +174,8 @@ func followBusinessFailure(code string) string {
 
 var followRejectionLabels = map[string]string{
 	"episode_unproven": "无法确认所选季或集号", "include_keyword": "未包含要求的关键词", "exclude_keyword": "命中排除关键词",
-	"resolution": "分辨率不符", "video_codec": "视频编码不符", "quality": "资源质量不符", "release_group": "制作组不符", "excluded_release_group": "制作组被排除",
+	"episode_not_confirmed": "资源包含未播或状态未确认的剧集，不能整包下载",
+	"resolution":            "分辨率不符", "video_codec": "视频编码不符", "quality": "资源质量不符", "release_group": "制作组不符", "excluded_release_group": "制作组被排除",
 	"seeders": "做种人数不足或未知", "size": "大小不符或未知", "age": "发布时间超限或未知", "duplicate": "同一资源重复返回", "no_missing_coverage": "未覆盖本轮缺集",
 	"identity_mismatch": "作品身份或所选季不符", "claim_unavailable": "搜索结果凭据不可用", "identity_bind_failed": "无法绑定已确认的作品身份",
 }

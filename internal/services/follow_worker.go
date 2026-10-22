@@ -26,13 +26,15 @@ type FollowEpisodeCoordinate struct {
 }
 
 type followCandidate struct {
-	SiteID       uint
-	SitePriority int
-	Item         SiteSearchResult
-	Season       int
-	Episodes     []int
-	Fingerprint  string
-	QualityRank  int
+	SiteID                uint
+	SitePriority          int
+	Item                  SiteSearchResult
+	Season                int
+	Episodes              []int
+	CompleteSeason        bool
+	EpisodeBoundsDeclared bool
+	Fingerprint           string
+	QualityRank           int
 }
 
 type FollowSearchWorker struct {
@@ -40,7 +42,9 @@ type FollowSearchWorker struct {
 	sites   *SiteService
 }
 
-var followEpisodeRangePattern = regexp.MustCompile(`(?i)S(\d{1,3})E(\d{1,4})(?:[-~]E?|E)(\d{1,4})`)
+var followEpisodeRangePattern = regexp.MustCompile(`(?i)S(\d+)E(\d+)(?:[-~～‐‑‒–—](?:S(\d+))?E?|E)(\d+)`)
+var followEpisodeMarkerPattern = regexp.MustCompile(`(?i)(?:S\s*\d+\s*[ ._-]*)?E(?:P(?:ISODES?)?)?\s*\d+|\d+x\d+|第\s*[0-9零〇一二两兩三四五六七八九十百千]{1,12}\s*[集话話]|S\s*\d+`)
+var followEpisodeContinuationPattern = regexp.MustCompile(`(?i)^\s*[-~～‐‑‒–—]\s*(?:S\d+\s*)?E?\s*\d+(?:[^[:alnum:]]|$)`)
 var followCompleteSeasonPattern = regexp.MustCompile(`(?i)(?:complete(?:[ ._-]*(?:season|pack))?|season[ ._-]*pack|全集|全季)`)
 
 func NewFollowSearchWorker(follows *FollowService, sites *SiteService) *FollowSearchWorker {
@@ -102,20 +106,20 @@ func (w *FollowSearchWorker) Run(ctx context.Context, runtime JobRuntime, job Cl
 		return w.stopRun(run, models.FollowRunCancelled, "follow_inactive", "订阅已暂停或删除")
 	}
 	if coverage.TV == nil {
-		return w.block(run, subscription, "follow_coverage_unknown", "媒体库覆盖率不可用")
+		return w.waitForCoverage(run, subscription, snapshot, "媒体库覆盖率暂不可用，将按计划重新检查", 0)
 	}
 	selectedSeasons := map[int]struct{}{}
 	for _, season := range snapshot.Seasons {
 		selectedSeasons[season] = struct{}{}
 	}
 	missing := map[[2]int]struct{}{}
-	seenSeasons := map[int]struct{}{}
+	seenSeasons := map[int]MediaCoverageSeason{}
 	target, present, unknown := 0, 0, 0
 	for _, season := range coverage.TV.Seasons {
 		if _, ok := selectedSeasons[season.SeasonNumber]; !ok {
 			continue
 		}
-		seenSeasons[season.SeasonNumber] = struct{}{}
+		seenSeasons[season.SeasonNumber] = season
 		for _, episode := range season.Episodes {
 			switch episode.Status {
 			case "present":
@@ -134,7 +138,7 @@ func (w *FollowSearchWorker) Run(ctx context.Context, runtime JobRuntime, job Cl
 		unknown += season.Counts.Unknown - countEpisodeStatus(season.Episodes, "unknown")
 	}
 	if len(seenSeasons) != len(selectedSeasons) {
-		return w.block(run, subscription, "follow_coverage_unknown", "所选季的 TMDB 信息不可用")
+		return w.waitForCoverage(run, subscription, snapshot, "所选季的 TMDB 信息暂不可用，将按计划重新检查", unknown)
 	}
 	missingBeforeClaims := len(missing)
 	missing, err = w.excludeClaimedDownloads(ctx, subscription.ID, missing)
@@ -158,21 +162,31 @@ func (w *FollowSearchWorker) Run(ctx context.Context, runtime JobRuntime, job Cl
 	}); err != nil {
 		return followPersistFailure()
 	}
-	if unknown > 0 {
-		return w.block(run, subscription, "follow_coverage_unknown", "所选季存在无法确认播出或缺失状态的剧集")
-	}
 	if len(missing) == 0 {
 		if target > present {
-			return w.finish(run, subscription, models.FollowRunSubmitted, models.FollowStatusActive, "", "", snapshot, 0, 0, map[string]int{"active_claims": target - present})
+			return w.finish(run, subscription, models.FollowRunSubmitted, models.FollowStatusActive, "", "", snapshot, 0, 0, map[string]int{"active_claims": target - present, "coverage_unknown": unknown})
+		}
+		if unknown > 0 {
+			message := "所选季仍有播出信息不完整的剧集，当前没有可独立搜索的明确缺集；等待剧集信息更新，将按计划重新检查"
+			if coverage.Freshness.LibraryScanState != "complete" {
+				message = "媒体库扫描尚不完整，无法确认未在库剧集是否缺失；等待扫描完成，将按计划重新检查"
+			}
+			return w.waitForCoverage(run, subscription, snapshot, message, unknown)
 		}
 		return w.finish(run, subscription, models.FollowRunCompleted, models.FollowStatusCompleted, "", "", snapshot, 0, 0, map[string]int{})
+	}
+	if unknown > 0 {
+		w.record(ctx, "follow.coverage_uncertain", "coverage", "skipped", fmt.Sprintf("另有 %d 集的播出或在库状态尚未确认，本轮跳过这些剧集，只搜索 %d 集明确缺集", unknown, len(missing)), map[string]any{"uncertain_count": unknown, "missing_count": len(missing)})
 	}
 	progress := float64(20)
 	processed, total := int64(1), int64(4)
 	_ = runtime.Heartbeat(&progress, &processed, &total, nil, nil)
 	_ = runtime.Checkpoint(map[string]any{"stage": "search", "missing": missingCoordinates})
 	searchCtx, stopSearch := context.WithTimeoutCause(context.WithValue(ctx, followSearchBudgetKey{}, true), w.sites.searchPolicyValue().Follow, errors.New(CodeSearchBudget))
-	candidates, queryNames, filterSummary := w.searchCandidates(searchCtx, actor, subscription, snapshot, missing)
+	candidates, queryNames, filterSummary := w.searchCandidates(searchCtx, actor, subscription, snapshot, missing, seenSeasons)
+	if unknown > 0 {
+		filterSummary["coverage_unknown"] = unknown
+	}
 	if searchCtx.Err() != nil && ctx.Err() == nil {
 		filterSummary["search_incomplete"]++
 	}
@@ -350,7 +364,7 @@ func isDefinitiveNoTaskRouteError(code string) bool {
 	}
 }
 
-func (w *FollowSearchWorker) searchCandidates(ctx context.Context, actor Actor, subscription models.FollowSubscription, snapshot FollowExecutionSnapshot, missing map[[2]int]struct{}) ([]followCandidate, int, map[string]int) {
+func (w *FollowSearchWorker) searchCandidates(ctx context.Context, actor Actor, subscription models.FollowSubscription, snapshot FollowExecutionSnapshot, missing map[[2]int]struct{}, coverage map[int]MediaCoverageSeason) ([]followCandidate, int, map[string]int) {
 	result := []followCandidate{}
 	summary := map[string]int{}
 	queryNames := 0
@@ -403,6 +417,12 @@ func (w *FollowSearchWorker) searchCandidates(ctx context.Context, actor Actor, 
 						rejections.add(reason, item.Title)
 						continue
 					}
+					candidate, ok = constrainFollowCandidateCoverage(candidate, coverage[season])
+					if !ok {
+						summary["episode_not_confirmed"]++
+						rejections.add("episode_not_confirmed", item.Title)
+						continue
+					}
 					candidateKey := candidate.Fingerprint
 					if isCloudShareSource(item.SourceKind) {
 						candidateKey = fmt.Sprintf("%s:%d", candidateKey, season)
@@ -437,18 +457,16 @@ func (w *FollowSearchWorker) searchCandidates(ctx context.Context, actor Actor, 
 
 func buildFollowCandidate(item SiteSearchResult, siteID uint, sitePriority, season int, snapshot FollowExecutionSnapshot) (followCandidate, string, bool) {
 	parsed, err := mediarecognition.Parse(mediarecognition.InputFacts{PackageName: item.Title, SourceKind: mediarecognition.SourceDownload, MediaTypeHint: mediarecognition.MediaTypeTV, SeasonHint: &season})
-	if err != nil || parsed.Season == nil || *parsed.Season != season {
+	if err != nil || parsed.Season == nil || *parsed.Season != season || !followEpisodeDeclarationIsUnambiguous(item.Title, season) {
 		return followCandidate{}, "episode_unproven", false
 	}
 	min, max := parsed.Episodes.EpisodeMin, parsed.Episodes.EpisodeMax
-	if match := followEpisodeRangePattern.FindStringSubmatch(item.Title); len(match) == 4 {
-		matchedSeason, seasonErr := strconv.Atoi(match[1])
-		episodeMin, minErr := strconv.Atoi(match[2])
-		episodeMax, maxErr := strconv.Atoi(match[3])
-		if seasonErr == nil && minErr == nil && maxErr == nil && matchedSeason == season {
-			min, max = &episodeMin, &episodeMax
-		}
-	} else if followCompleteSeasonPattern.MatchString(item.Title) {
+	completeSeason := followCompleteSeasonPattern.MatchString(item.Title)
+	if episodeMin, episodeMax, ok := explicitFollowEpisodeRange(item.Title, season); ok {
+		min, max = &episodeMin, &episodeMax
+	}
+	boundsDeclared := min != nil && max != nil
+	if !boundsDeclared && completeSeason {
 		episodeMin, episodeMax := 1, 200
 		min, max = &episodeMin, &episodeMax
 	}
@@ -501,7 +519,79 @@ func buildFollowCandidate(item SiteSearchResult, siteID uint, sitePriority, seas
 	if fingerprint == "" {
 		fingerprint = followFingerprint(siteID, item.Title, item.SizeBytes, item.Published)
 	}
-	return followCandidate{SiteID: siteID, SitePriority: sitePriority, Item: item, Season: season, Episodes: episodes, Fingerprint: fingerprint, QualityRank: qualityPreferenceRank(item, snapshot)}, "", true
+	return followCandidate{SiteID: siteID, SitePriority: sitePriority, Item: item, Season: season, Episodes: episodes, CompleteSeason: completeSeason, EpisodeBoundsDeclared: boundsDeclared, Fingerprint: fingerprint, QualityRank: qualityPreferenceRank(item, snapshot)}, "", true
+}
+
+func explicitFollowEpisodeRange(title string, season int) (int, int, bool) {
+	match := followEpisodeRangePattern.FindStringSubmatch(title)
+	if len(match) != 5 {
+		return 0, 0, false
+	}
+	matchedSeason, seasonErr := strconv.Atoi(match[1])
+	first, firstErr := strconv.Atoi(match[2])
+	last, lastErr := strconv.Atoi(match[4])
+	if match[3] != "" {
+		lastSeason, err := strconv.Atoi(match[3])
+		if err != nil || lastSeason != season {
+			return 0, 0, false
+		}
+	}
+	return first, last, seasonErr == nil && firstErr == nil && lastErr == nil && matchedSeason == season
+}
+
+// The general recognizer intentionally projects one episode for some compound
+// names. Automation must reject extra declarations it cannot bound instead of
+// treating that first episode as the complete contents of a torrent or file.
+func followEpisodeDeclarationIsUnambiguous(title string, season int) bool {
+	if span := followEpisodeRangePattern.FindStringIndex(title); span != nil {
+		if _, _, ok := explicitFollowEpisodeRange(title, season); !ok {
+			return false
+		}
+		if followEpisodeContinuationPattern.MatchString(title[span[1]:]) {
+			return false
+		}
+		return !followEpisodeMarkerPattern.MatchString(title[:span[0]] + " " + title[span[1]:])
+	}
+	markers := followEpisodeMarkerPattern.FindAllStringIndex(title, -1)
+	if len(markers) > 1 {
+		return false
+	}
+	return len(markers) == 0 || !followEpisodeContinuationPattern.MatchString(title[markers[0][1]:])
+}
+
+// Torrent submissions cannot select individual files here. A range must not
+// smuggle unknown/future episodes alongside a known missing one. Cloud shares
+// instead prove and select each actual missing file in prepareFollowShare.
+func constrainFollowCandidateCoverage(candidate followCandidate, coverage MediaCoverageSeason) (followCandidate, bool) {
+	if isCloudShareSource(candidate.Item.SourceKind) {
+		return candidate, true
+	}
+	confirmed := make(map[int]struct{}, len(coverage.Episodes))
+	for _, episode := range coverage.Episodes {
+		if episode.Status == "present" || episode.Status == "missing" {
+			confirmed[episode.EpisodeNumber] = struct{}{}
+		}
+	}
+	// An explicit bound remains evidence even beside a complete-season label;
+	// replacing it first would silently erase out-of-snapshot episodes.
+	if !candidate.CompleteSeason || candidate.EpisodeBoundsDeclared {
+		for _, episode := range candidate.Episodes {
+			if _, ok := confirmed[episode]; !ok {
+				return followCandidate{}, false
+			}
+		}
+	}
+	if candidate.CompleteSeason {
+		if coverage.Counts.Unknown > 0 || coverage.Counts.Future > 0 || len(confirmed) == 0 || len(confirmed) != coverage.Counts.Total {
+			return followCandidate{}, false
+		}
+		candidate.Episodes = make([]int, 0, len(confirmed))
+		for episode := range confirmed {
+			candidate.Episodes = append(candidate.Episodes, episode)
+		}
+		sort.Ints(candidate.Episodes)
+	}
+	return candidate, true
 }
 
 func selectFollowCandidates(candidates []followCandidate, missing map[[2]int]struct{}, limit int) []followCandidate {
@@ -656,6 +746,16 @@ func (w *FollowSearchWorker) currentSubscription(id string) (models.FollowSubscr
 func (w *FollowSearchWorker) block(run models.FollowRun, subscription models.FollowSubscription, code, message string) WorkerResult {
 	return w.finish(run, subscription, models.FollowRunFailed, models.FollowStatusBlocked, code, message, FollowExecutionSnapshot{}, 0, 0, map[string]int{})
 }
+
+func (w *FollowSearchWorker) waitForCoverage(run models.FollowRun, subscription models.FollowSubscription, snapshot FollowExecutionSnapshot, message string, unknown int) WorkerResult {
+	// Uncertain metadata/absence is temporary. Keep the normal schedule active
+	// without claiming a successful search or marking the subscription complete.
+	summary := map[string]int{}
+	if unknown > 0 {
+		summary["coverage_unknown"] = unknown
+	}
+	return w.finish(run, subscription, models.FollowRunFailed, models.FollowStatusActive, "follow_coverage_unknown", message, snapshot, 0, 0, summary)
+}
 func (w *FollowSearchWorker) stopRun(run models.FollowRun, status, code, message string) WorkerResult {
 	now := w.follows.now()
 	if err := w.follows.db.Model(&run).Updates(map[string]any{"status": status, "error_code": code, "error_message": message, "finished_at": now, "updated_at": now}).Error; err != nil {
@@ -697,6 +797,8 @@ func (w *FollowSearchWorker) finish(run models.FollowRun, subscription models.Fo
 		eventType = "follow.submit_failed"
 		if code == "follow_search_incomplete" {
 			eventType = "follow.search_failed"
+		} else if code == "follow_coverage_unknown" {
+			eventType = "follow.coverage_waiting"
 		}
 	}
 	if eventType != "" {

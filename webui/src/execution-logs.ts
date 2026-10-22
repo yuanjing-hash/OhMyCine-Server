@@ -43,6 +43,8 @@ const statuses: Record<string, string> = {
   catalog_ready: '基础目录已发布', superseded: '已被新版本替代', retained: '按策略保留', seeding: '正在做种', kept: '保持原样',
 }
 export const executionStatusLabel = (value: string) => statuses[value] ?? '其他执行状态'
+export const followCoverageWaitingLabel = '等待媒体库扫描或剧集信息'
+export const isFollowCoverageWaiting = (summary?: { status: string; error_code?: string }) => summary?.status === 'failed' && summary.error_code === 'follow_coverage_unknown'
 export const executionTriggerLabel = (value: string) => ({ scheduled: '计划触发', manual: '手动触发', created: '新建订阅触发', event: '事件触发', retry: '重试触发' } as Record<string, string>)[value] ?? '其他触发方式'
 export const logLevelLabel = (value: string) => ({ debug: '调试', info: '信息', warn: '警告', error: '错误' } as Record<string, string>)[value] ?? '其他级别'
 
@@ -80,6 +82,7 @@ export const logOutcomeLabel = (value: string) => outcomes[value] ?? '其他执�
 const reasons: Record<string, string> = {
   identity: '作品不匹配', identity_mismatch: '作品不匹配', media_mismatch: '作品不匹配', season_mismatch: '季不匹配', season: '季不匹配',
   episode_unproven: '无法确认季集范围', episode: '不覆盖缺集', no_missing_coverage: '不覆盖缺集', already_present: '已在媒体库中',
+  episode_not_confirmed: '资源包含未播或状态未确认的剧集', coverage_unknown: '状态未确认、暂不下载的集数',
   already_in_library: '已在媒体库中', active_download: '已有下载任务', already_downloading: '已有下载任务', duplicate: '重复资源',
   include_keyword: '缺少要求的关键词', exclude_keyword: '命中排除关键词', resolution: '分辨率不符合', video_codec: '视频编码不符合',
   quality: '片源质量不符合', release_group: '发布组不符合', excluded_release_group: '命中排除发布组', seeders: '做种数不符合',
