@@ -42,6 +42,9 @@ type FollowSearchWorker struct {
 	sites   *SiteService
 }
 
+const maxFollowCandidateAttempts = 50
+const followCandidatePreparationTimeout = 2 * time.Minute
+
 var followEpisodeRangePattern = regexp.MustCompile(`(?i)S(\d+)E(\d+)(?:[-~～‐‑‒–—](?:S(\d+))?E?|E)(\d+)`)
 var followEpisodeMarkerPattern = regexp.MustCompile(`(?i)(?:S\s*\d+\s*[ ._-]*)?E(?:P(?:ISODES?)?)?\s*\d+|\d+x\d+|第\s*[0-9零〇一二两兩三四五六七八九十百千]{1,12}\s*[集话話]|S\s*\d+`)
 var followEpisodeContinuationPattern = regexp.MustCompile(`(?i)^\s*[-~～‐‑‒–—]\s*(?:S\d+\s*)?E?\s*\d+(?:[^[:alnum:]]|$)`)
@@ -194,12 +197,8 @@ func (w *FollowSearchWorker) Run(ctx context.Context, runtime JobRuntime, job Cl
 	if ctx.Err() != nil {
 		return w.stopRun(run, models.FollowRunCancelled, "follow_cancelled", "追更任务已取消")
 	}
-	selected := selectFollowCandidates(candidates, missing, snapshot.MaxResourcesPerRun)
-	stats.mu.Lock()
-	stats.chosen = len(selected)
-	stats.mu.Unlock()
-	w.record(ctx, "follow.selection", "selection", "confirmed", fmt.Sprintf("身份与订阅规则过滤后 %d 个可用候选，按缺集覆盖、站点顺序、质量偏好与做种等既有规则选中 %d 个资源", len(candidates), len(selected)), map[string]any{"candidates": len(candidates), "chosen": len(selected), "reason_counts": filterSummary})
-	if len(selected) == 0 {
+	w.record(ctx, "follow.selection", "selection", "confirmed", fmt.Sprintf("身份与订阅规则过滤后 %d 个候选；逐一核对路线与实际缺集文件，单轮最多接受 %d 个资源", len(candidates), snapshot.MaxResourcesPerRun), map[string]any{"candidates": len(candidates), "reason_counts": filterSummary})
+	if len(candidates) == 0 {
 		if filterSummary["site_error"] > 0 || filterSummary["site_incomplete"] > 0 || filterSummary["search_incomplete"] > 0 {
 			return w.finish(run, subscription, models.FollowRunFailed, models.FollowStatusActive, "follow_search_incomplete", "本轮部分或全部站点搜索未完成，不能确定没有匹配资源", snapshot, queryNames, len(candidates), filterSummary)
 		}
@@ -208,11 +207,43 @@ func (w *FollowSearchWorker) Run(ctx context.Context, runtime JobRuntime, job Cl
 	progress = 70
 	processed = 3
 	_ = runtime.Heartbeat(&progress, &processed, &total, nil, nil)
-	_ = runtime.Checkpoint(map[string]any{"stage": "submit", "missing": missingCoordinates, "selected": candidateFingerprints(selected)})
 	submitted := 0
 	submitFailures := 0
 	lastSubmitMessage := ""
-	for _, candidate := range selected {
+	pool := append([]followCandidate(nil), candidates...)
+	prepareCtx, stopPreparation := context.WithTimeout(ctx, followCandidatePreparationTimeout)
+	defer stopPreparation()
+	for attempted := 0; submitted < snapshot.MaxResourcesPerRun; attempted++ {
+		// The final failed preparation can exhaust the pool. Preserve a stop
+		// that occurred during that read before treating exhaustion as no match.
+		if ctx.Err() != nil {
+			return w.stopRun(run, models.FollowRunCancelled, "follow_cancelled", "追更任务已取消")
+		}
+		current, err := w.currentSubscription(subscription.ID)
+		if err != nil || !followRunExecutable(current, run.LifecycleRevision) {
+			return w.stopRun(run, models.FollowRunCancelled, "follow_inactive", "订阅已暂停或删除")
+		}
+		selected := selectFollowCandidates(pool, missing, 1)
+		if len(selected) == 0 {
+			break
+		}
+		if attempted >= maxFollowCandidateAttempts || prepareCtx.Err() != nil && ctx.Err() == nil {
+			filterSummary["candidate_budget"]++
+			submitFailures++
+			lastSubmitMessage = "本轮资源核验已达到预算，剩余候选将在后续追更中重新检查"
+			break
+		}
+		candidate := selected[0]
+		for index, item := range pool {
+			if item.Fingerprint == candidate.Fingerprint && item.Season == candidate.Season {
+				pool = append(pool[:index], pool[index+1:]...)
+				break
+			}
+		}
+		stats.mu.Lock()
+		stats.chosen++
+		stats.mu.Unlock()
+		_ = runtime.Checkpoint(map[string]any{"stage": "submit", "missing": coordinateList(missing), "selected": candidateFingerprints(selected)})
 		candidateCtx := serverlog.WithBusinessFields(ctx, map[string]any{"site_id": candidate.SiteID, "resource_name": candidate.Item.Title, "season": candidate.Season})
 		blocked, gateErr := followReadinessBlocked(w.follows.db, subscription.ID)
 		if gateErr != nil {
@@ -222,13 +253,6 @@ func (w *FollowSearchWorker) Run(ctx context.Context, runtime JobRuntime, job Cl
 			w.record(candidateCtx, "follow.wait", "submit", "waiting", "目标媒体库尚未准备好，保留本轮进度，暂不提交资源", map[string]any{"error_code": "media_library_not_ready"})
 			next := time.Now().UTC()
 			return WorkerResult{RetryAt: &next, ErrorCode: "media_library_not_ready", ErrorMessage: "等待目标媒体库准备好，已保留追更进度"}
-		}
-		if ctx.Err() != nil {
-			return w.stopRun(run, models.FollowRunCancelled, "follow_cancelled", "追更任务已取消")
-		}
-		current, err := w.currentSubscription(subscription.ID)
-		if err != nil || !followRunExecutable(current, run.LifecycleRevision) {
-			return w.stopRun(run, models.FollowRunCancelled, "follow_inactive", "订阅已暂停或删除")
 		}
 		episodes := candidateMissingEpisodes(candidate, missing)
 		if len(episodes) == 0 {
@@ -242,7 +266,7 @@ func (w *FollowSearchWorker) Run(ctx context.Context, runtime JobRuntime, job Cl
 		if err != nil {
 			return w.block(run, subscription, CodePermissionDenied, "订阅用户或权限不可用")
 		}
-		recommendation, routeErr := w.sites.RecommendSiteRoute(ctx, actor, SourceRouteRecommendationInput{ResultToken: candidate.Item.Token, MediaLibraryID: &libraryID})
+		recommendation, routeErr := w.sites.RecommendSiteRoute(prepareCtx, actor, SourceRouteRecommendationInput{ResultToken: candidate.Item.Token, MediaLibraryID: &libraryID})
 		if routeErr != nil || recommendation.Recommended == nil {
 			submitFailures++
 			filterSummary["submit_failed"]++
@@ -257,16 +281,17 @@ func (w *FollowSearchWorker) Run(ctx context.Context, runtime JobRuntime, job Cl
 		var selectedEntryTokens []string
 		if isCloudShareSource(candidate.Item.SourceKind) {
 			var selectionDigest string
-			previewToken, selectedEntryTokens, episodes, selectionDigest, err = w.sites.prepareFollowShare(ctx, actor, candidate.Item.Token, recommendation.Recommended.DownloaderID, candidate.Season, episodes)
+			previewToken, selectedEntryTokens, episodes, selectionDigest, err = w.sites.prepareFollowShare(prepareCtx, actor, candidate.Item.Token, recommendation.Recommended.DownloaderID, candidate.Season, episodes, candidate.Item.Title)
 			if err != nil {
 				submitFailures++
 				filterSummary["share_selection_failed"]++
 				lastSubmitMessage = safeErrorMessage(err, "无法核实分享中的本次缺集文件")
+				w.record(candidateCtx, "follow.share_selection_failed", "selection", "failed", "分享未能核实本次缺集文件，继续核对其他候选", map[string]any{"error_code": ErrorCode(err)})
 				continue
 			}
 			candidate.Fingerprint = followFingerprint(candidate.SiteID, fmt.Sprintf("%s:%d:%v:%s", candidate.Fingerprint, candidate.Season, episodes, selectionDigest), 0, nil)
 		}
-		claimed, err := w.reserveEpisodes(run, subscription.ID, candidate, episodes)
+		claimed, recovering, err := w.reserveEpisodes(run, subscription.ID, candidate, episodes)
 		if err != nil || !claimed {
 			reason, outcome, message := "active_claim", "skipped", "所选季集已有任务占用，未重复提交该资源"
 			if err != nil {
@@ -293,6 +318,7 @@ func (w *FollowSearchWorker) Run(ctx context.Context, runtime JobRuntime, job Cl
 			}
 		}
 		var download DownloadTaskSummary
+		handoffStarted := false
 		for index, downloaderID := range downloaders {
 			downloaderName, libraryName, routeLabel := "所选下载器", "所选媒体库", "已校验路线"
 			for _, choice := range recommendation.Choices {
@@ -308,6 +334,7 @@ func (w *FollowSearchWorker) Run(ctx context.Context, runtime JobRuntime, job Cl
 				if currentErr != nil || !followRunExecutable(current, run.LifecycleRevision) {
 					return appError(CodeConflict, "订阅已暂停或删除", currentErr)
 				}
+				handoffStarted = true
 				return nil
 			}, BeforePersist: func(tx *gorm.DB) error {
 				current, currentErr := w.follows.LockCurrentSubscription(tx, subscription.ID)
@@ -322,7 +349,13 @@ func (w *FollowSearchWorker) Run(ctx context.Context, runtime JobRuntime, job Cl
 			w.record(submitCtx, "follow.route_fallback", "submit", "retry", "公开 BT 资源被明确拒绝且未创建任务，按已有规则尝试下一兼容下载器", map[string]any{"error_code": ErrorCode(err)})
 		}
 		if err != nil {
-			w.releaseEpisodes(subscription.ID, run.ID, candidate.Fingerprint)
+			// BeforeSubmit runs after read-only source/preview work, immediately
+			// before the durable DownloadService handoff. Failure before that
+			// boundary proves no task was attempted by this candidate.
+			definitive := !recovering && (!handoffStarted || isDefinitiveNoTaskRouteError(ErrorCode(err)))
+			if definitive {
+				w.releaseEpisodes(subscription.ID, run.ID, candidate.Fingerprint)
+			}
 			current, currentErr := w.currentSubscription(subscription.ID)
 			if currentErr != nil || !followRunExecutable(current, run.LifecycleRevision) {
 				return w.stopRun(run, models.FollowRunCancelled, "follow_inactive", "订阅已暂停或删除")
@@ -333,7 +366,10 @@ func (w *FollowSearchWorker) Run(ctx context.Context, runtime JobRuntime, job Cl
 			filterSummary["submit_failed"]++
 			submitFailures++
 			lastSubmitMessage = safeErrorMessage(err, "资源提交失败")
-			w.record(candidateCtx, "follow.submit_failed", "submit", "failed", "资源未能提交；本条失败不会阻塞其他独立资源，未对不确定结果自动更换下载器", map[string]any{"error_code": ErrorCode(err)})
+			w.record(candidateCtx, "follow.submit_failed", "submit", "failed", "资源未能提交；只有明确未创建任务的拒绝才继续选择其他资源，不确定结果保留原资源占用", map[string]any{"error_code": ErrorCode(err)})
+			if !definitive {
+				break
+			}
 			continue
 		}
 		if err := w.attachDownload(subscription.ID, run.ID, candidate.Fingerprint, download.ID); err != nil {
@@ -341,6 +377,9 @@ func (w *FollowSearchWorker) Run(ctx context.Context, runtime JobRuntime, job Cl
 		}
 		w.follows.publish("follow.download_submitted", run.OwnerID, run.JobID, models.FollowRunSubmitted)
 		submitted++
+		for _, episode := range episodes {
+			delete(missing, [2]int{candidate.Season, episode})
+		}
 		w.record(candidateCtx, "follow.submitted", "submit", "accepted", "下载请求已接受，后续下载与入库请查看关联任务；本轮未提前确认入库完成", map[string]any{"related_task_id": download.ID, "related_job_id": download.JobID, "action": download.submissionOutcome})
 	}
 	if submitted == 0 {
@@ -653,9 +692,10 @@ func followCandidateLess(left, right followCandidate) bool {
 	return left.Fingerprint < right.Fingerprint
 }
 
-func (w *FollowSearchWorker) reserveEpisodes(run models.FollowRun, subscriptionID string, candidate followCandidate, episodes []int) (bool, error) {
+func (w *FollowSearchWorker) reserveEpisodes(run models.FollowRun, subscriptionID string, candidate followCandidate, episodes []int) (bool, bool, error) {
 	now := w.follows.now()
 	reserved := false
+	recovering := false
 	err := w.follows.db.Transaction(func(tx *gorm.DB) error {
 		record, err := w.follows.LockCurrentSubscription(tx, subscriptionID)
 		if err != nil {
@@ -668,7 +708,9 @@ func (w *FollowSearchWorker) reserveEpisodes(run models.FollowRun, subscriptionI
 		for _, episode := range episodes {
 			var claim models.FollowEpisodeClaim
 			err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&claim, "subscription_id = ? AND season_number = ? AND episode_number = ?", subscriptionID, candidate.Season, episode).Error
-			if err == nil && claim.DownloadTaskID != nil {
+			if err == nil && (claim.DownloadTaskID != nil || claim.State == "queued" && claim.ResourceFingerprint != candidate.Fingerprint) {
+				// A queued claim without a task can be an uncertain persistence
+				// result. Only its original fingerprint may retry idempotently.
 				return nil
 			}
 			if err != nil && err != gorm.ErrRecordNotFound {
@@ -676,6 +718,7 @@ func (w *FollowSearchWorker) reserveEpisodes(run models.FollowRun, subscriptionI
 			}
 			if err == nil {
 				existing[episode] = claim
+				recovering = recovering || claim.State == "queued"
 			}
 		}
 		for _, episode := range episodes {
@@ -694,7 +737,7 @@ func (w *FollowSearchWorker) reserveEpisodes(run models.FollowRun, subscriptionI
 		}
 		return nil
 	})
-	return reserved, err
+	return reserved, recovering, err
 }
 func (w *FollowSearchWorker) releaseEpisodes(subscriptionID, runID, fingerprint string) {
 	_ = w.follows.db.Model(&models.FollowEpisodeClaim{}).Where("subscription_id = ? AND run_id = ? AND resource_fingerprint = ? AND download_task_id IS NULL", subscriptionID, runID, fingerprint).Updates(map[string]any{"state": "failed", "updated_at": w.follows.now()}).Error
@@ -709,18 +752,29 @@ func (w *FollowSearchWorker) upsertImported(subscriptionID string, season, episo
 
 func (w *FollowSearchWorker) excludeClaimedDownloads(ctx context.Context, subscriptionID string, missing map[[2]int]struct{}) (map[[2]int]struct{}, error) {
 	var claims []models.FollowEpisodeClaim
-	if err := w.follows.db.Where("subscription_id = ? AND download_task_id IS NOT NULL", subscriptionID).Find(&claims).Error; err != nil {
+	if err := w.follows.db.Where("subscription_id = ? AND (download_task_id IS NOT NULL OR state = ?)", subscriptionID, "queued").Find(&claims).Error; err != nil {
 		return nil, err
 	}
 	for _, claim := range claims {
 		var task models.DownloadTask
-		if err := w.follows.db.First(&task, "id = ?", *claim.DownloadTaskID).Error; err != nil {
+		query := w.follows.db.Where("id = ?", claim.DownloadTaskID)
+		if claim.DownloadTaskID == nil {
+			// Recover the commit-before-claim-attachment window from the durable
+			// task identity, without fetching a new source or changing its route.
+			query = w.follows.db.Where("follow_subscription_id = ? AND follow_resource_fingerprint = ?", subscriptionID, claim.ResourceFingerprint)
+		}
+		if err := query.First(&task).Error; err != nil {
 			if err != gorm.ErrRecordNotFound {
 				return nil, err
 			}
 			continue
 		}
 		if task.Phase != models.DownloadTaskStatusFailed && task.Phase != models.DownloadTaskStatusCancelled {
+			if claim.DownloadTaskID == nil {
+				if err := w.follows.db.Model(&claim).Updates(map[string]any{"state": "downloading", "download_task_id": task.ID, "updated_at": w.follows.now()}).Error; err != nil {
+					return nil, err
+				}
+			}
 			if _, needed := missing[[2]int{claim.SeasonNumber, claim.EpisodeNumber}]; needed {
 				fields := map[string]any{"related_task_id": task.ID, "related_job_id": task.JobID, "season": claim.SeasonNumber}
 				if task.DownloaderID != nil {
