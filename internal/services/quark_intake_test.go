@@ -28,6 +28,7 @@ func quarkIntakeFixture(t *testing.T) (shareIngestFixture, uint, *ProviderObserv
 	saveQuarkTestBundle(t, c, connection.ID, func(bundle *quark.Credentials) {
 		bundle.TV = testQuarkAuthorization()
 		bundle.Agent = testQuarkAuthorization()
+		bundle.Proofs = []quark.SpaceProof{{Version: 1, Generation: 1, TVAccount: bundle.TV.AccountID, AgentAccount: bundle.Agent.AccountID, TVRoot: f.storage.RootPath, AgentRoot: "agent-storage", Path: f.storage.RootDisplayPath, ContentSHA256: fmt.Sprintf("%064x", 1), VerifiedAt: time.Now().UTC()}}
 	})
 	if err := f.db.Model(&f.storage).Updates(map[string]any{"type": models.StorageTypeQuark, "connection_id": connection.ID}).Error; err != nil {
 		t.Fatal(err)

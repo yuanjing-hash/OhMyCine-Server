@@ -128,7 +128,7 @@ func (s *SiteService) inspectResultShare(ctx context.Context, actor Actor, claim
 		return nil, "", validation, err
 	}
 	var selected models.Downloader
-	if err := s.db.WithContext(ctx).Select("type").First(&selected, "id = ?", downloaderID).Error; err != nil || !routeDownloaderApplicable(claimCloudSource(claim), selected) {
+	if err := s.db.WithContext(ctx).First(&selected, "id = ?", downloaderID).Error; err != nil || !routeDownloaderApplicable(claimCloudSource(claim), selected) {
 		return nil, "", validation, appError(CodeDownloadSourceInvalid, "所选接收器与分享网盘不一致", nil)
 	}
 	if s.downloads == nil || s.downloads.downloader == nil || s.downloads.downloader.connections == nil {
@@ -147,6 +147,13 @@ func (s *SiteService) inspectResultShare(ctx context.Context, actor Actor, claim
 		stage = "tree"
 	}
 	_, driver, err := s.downloads.downloader.connections.driver(connectionID)
+	if err == nil {
+		// Preserve the explicit operation's saved-authorization recovery before
+		// checking the current local root proof and receiving configuration.
+		if _, readinessErr := s.downloads.downloader.configuredShareReceiver(ctx, selected); readinessErr != nil {
+			return nil, "", validation, readinessErr
+		}
+	}
 	var entries []cloud.ShareTreeItem
 	if err == nil {
 		if full {

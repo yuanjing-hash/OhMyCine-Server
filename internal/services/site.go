@@ -1154,6 +1154,17 @@ func (s *SiteService) searchSite(ctx context.Context, actor Actor, record models
 	group.HasNext, group.Skipped = page.HasNext, page.Skipped
 	group.SnapshotID, group.SnapshotExpiresAt = page.SnapshotID, page.SnapshotExpiresAt
 	group.Partial, group.Truncated, group.Completion, group.Warnings, group.Scope = page.Partial, page.Truncated, page.Completion, page.Warnings, page.Scope
+	configuredProviders := map[string]bool{}
+	if record.Kind == pansou.Kind && mixedDiscovery(input.ClientCapabilities) {
+		types, _, err := s.panSouReceivingConfiguration(actor)
+		if err != nil {
+			group.Status, group.ErrorCode = "error", CodeSiteUnavailable
+			return group
+		}
+		for _, provider := range types {
+			configuredProviders[provider] = true
+		}
+	}
 	expires := s.now().Add(ptResultTTL)
 	for _, item := range page.Items {
 		// PanSou is mixed only under an explicit client capability. Its raw URI
@@ -1188,6 +1199,17 @@ func (s *SiteService) searchSite(ctx context.Context, actor Actor, record models
 		reason := ""
 		if !available {
 			reason = "该链接类型尚无原生接收器，可查看或复制链接"
+		}
+		// A supported share family alone does not imply a configured receiver.
+		// No target library is selected yet; route preview remains authoritative
+		// for target compatibility and live operation availability.
+		if record.Kind == pansou.Kind && mixedDiscovery(input.ClientCapabilities) {
+			if item.SourceKind == RouteSource115Share && !configuredProviders["115"] {
+				available, reason = false, "当前没有可用的 115 分享接收器，请配置并启用接收目录，或联系管理员授予使用权限"
+			}
+			if item.SourceKind == RouteSourceQuarkShare && !configuredProviders["quark"] {
+				available, reason = false, "当前没有可用的夸克分享接收器，请完成播放与管理授权、接收目录验证并启用接收器，或联系管理员授予使用权限"
+			}
 		}
 		var acquisition *bool
 		if record.Kind == pansou.Kind {

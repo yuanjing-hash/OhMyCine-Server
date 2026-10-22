@@ -39,10 +39,16 @@ func discoveryAuthorizationScope(actor Actor) string {
 }
 
 func (s *SiteService) panSouAutomaticTypes(actor Actor) ([]string, error) {
+	types, _, err := s.panSouReceivingConfiguration(actor)
+	return types, err
+}
+
+func (s *SiteService) panSouReceivingConfiguration(actor Actor) ([]string, string, error) {
 	providers := map[string]bool{"magnet": true}
+	configured := []string{}
 	var downloaders []models.Downloader
-	if err := s.db.Where("enabled = ?", true).Find(&downloaders).Error; err != nil {
-		return nil, err
+	if err := s.db.Where("enabled = ?", true).Order("sort_order, id").Find(&downloaders).Error; err != nil {
+		return nil, "", err
 	}
 	for _, row := range downloaders {
 		if !actor.CanResource(authz.PermissionDownloadsCreate, models.AuthorizationResourceDownloader, row.ID) {
@@ -55,62 +61,23 @@ func (s *SiteService) panSouAutomaticTypes(actor Actor) ([]string, error) {
 		if row.Type == models.DownloaderTypeQuarkShare {
 			provider = "quark"
 		}
-		if provider == "" || row.StorageID == nil {
+		if provider == "" || s.downloads == nil || s.downloads.downloader == nil {
 			continue
 		}
-		var storage models.Storage
-		if err := s.db.First(&storage, *row.StorageID).Error; err != nil || !storage.Enabled || storage.ConnectionID == nil {
+		key, err := s.downloads.downloader.configuredShareReceiver(context.Background(), row)
+		if err != nil {
 			continue
 		}
-		var connection models.Connection
-		if err := s.db.First(&connection, *storage.ConnectionID).Error; err == nil && connection.Enabled && panSouProviderName(connection.Provider) == provider {
-			providers[provider] = true
-		}
-	}
-	var libraries []models.MediaLibrary
-	if err := s.db.Where("enabled = ?", true).Find(&libraries).Error; err != nil {
-		return nil, err
-	}
-	for _, row := range libraries {
-		if !actor.CanResource(authz.PermissionMediaLibrariesRead, models.AuthorizationResourceMediaLibrary, uintID(row.ID)) && !actor.CanIngestLibrary(uintID(row.ID)) {
-			continue
-		}
-		var storage models.Storage
-		if err := s.db.First(&storage, row.StorageID).Error; err != nil || !storage.Enabled || storage.ConnectionID == nil {
-			continue
-		}
-		var connection models.Connection
-		if err := s.db.First(&connection, *storage.ConnectionID).Error; err == nil && connection.Enabled && panSouProviderName(connection.Provider) != "" {
-			providers[panSouProviderName(connection.Provider)] = true
-		}
-	}
-	// Connection managers may search their configured accounts before creating
-	// a first library. Ordinary users never need this management permission.
-	if actor.Can(authz.PermissionConnectionsRead) {
-		var connections []models.Connection
-		if err := s.db.Where("enabled = ? AND provider IN ?", true, []string{models.ConnectionProviderPan115, models.ConnectionProviderQuark}).Find(&connections).Error; err != nil {
-			return nil, err
-		}
-		for _, row := range connections {
-			providers[panSouProviderName(row.Provider)] = true
-		}
+		providers[provider] = true
+		configured = append(configured, key)
 	}
 	types := make([]string, 0, len(providers))
 	for provider := range providers {
 		types = append(types, provider)
 	}
 	sort.Strings(types)
-	return types, nil
-}
-
-func panSouProviderName(provider string) string {
-	switch provider {
-	case models.ConnectionProviderPan115:
-		return "115"
-	case models.ConnectionProviderQuark:
-		return "quark"
-	}
-	return ""
+	digest := sha256.Sum256([]byte(strings.Join(configured, ":")))
+	return types, hex.EncodeToString(digest[:]), nil
 }
 
 func (s *SiteService) SavedPanSouScope(ctx context.Context, actor Actor, id uint, refresh bool) (sitepkg.ChannelScope, error) {
@@ -138,16 +105,17 @@ func (s *SiteService) panSouQuery(actor Actor, record models.Site, config sitepk
 	if q.CloudTypes == nil {
 		q.CloudTypes = cfg.CloudTypes
 	}
+	automatic, receivingScope, err := s.panSouReceivingConfiguration(actor)
+	if err != nil {
+		return q, err
+	}
 	if !mixedDiscovery(input.ClientCapabilities) {
 		q.TypePolicy = "manual"
 		q.CloudTypes = []string{"115"}
 	} else if q.TypePolicy == "auto" {
-		q.CloudTypes, err = s.panSouAutomaticTypes(actor)
-		if err != nil {
-			return q, err
-		}
+		q.CloudTypes = automatic
 	}
-	q.ScopeKey = uintID(actor.User.ID) + ":" + uintID(record.ID) + ":" + stringifyRevision(record.Revision) + ":" + discoveryAuthorizationScope(actor) + ":" + strings.Join(input.ClientCapabilities, ",")
+	q.ScopeKey = uintID(actor.User.ID) + ":" + uintID(record.ID) + ":" + stringifyRevision(record.Revision) + ":" + discoveryAuthorizationScope(actor) + ":" + strings.Join(input.ClientCapabilities, ",") + ":" + receivingScope
 	return q, nil
 }
 

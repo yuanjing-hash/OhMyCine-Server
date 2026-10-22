@@ -56,14 +56,15 @@ func (s *SiteService) searchPanSouIdentitySite(ctx context.Context, actor Actor,
 		return failure
 	}
 	raw, _ := json.Marshal(struct {
-		Actor    string
-		Site     uint
-		Revision uint64
-		Input    MediaIdentitySearchInput
-		Names    []tmdb.SearchName
-		Policy   string
-		Types    []string
-	}{discoveryAuthorizationScope(actor), record.ID, record.Revision, keyInput, names, policy.TypePolicy, policy.CloudTypes})
+		Actor          string
+		Site           uint
+		Revision       uint64
+		Input          MediaIdentitySearchInput
+		Names          []tmdb.SearchName
+		Policy         string
+		Types          []string
+		ReceivingScope string
+	}{discoveryAuthorizationScope(actor), record.ID, record.Revision, keyInput, names, policy.TypePolicy, policy.CloudTypes, policy.ScopeKey})
 	sum := sha256.Sum256(raw)
 	key := hex.EncodeToString(sum[:])
 	s.vaultMu.Lock()

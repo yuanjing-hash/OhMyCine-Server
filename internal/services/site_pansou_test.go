@@ -20,22 +20,7 @@ func TestPanSouAutomaticTypesUseOrdinaryResourceRights(t *testing.T) {
 	s, _, admin, _, _, _ := siteFixture(t)
 	ids := map[string]string{}
 	for _, provider := range []string{models.ConnectionProviderPan115, models.ConnectionProviderQuark} {
-		connection := models.Connection{Name: "pansou-" + provider, NameNormalized: "pansou-" + provider, Provider: provider, Enabled: true, CredentialCiphertext: "fixture", LastHealthStatus: "offline"}
-		if err := s.db.Create(&connection).Error; err != nil {
-			t.Fatal(err)
-		}
-		storage := models.Storage{Name: provider, NameNormalized: provider, Type: provider, ConnectionID: &connection.ID, RootPath: "0", RootPathNormalized: provider + "-root", Enabled: true, Capabilities: `{}`}
-		if err := s.db.Create(&storage).Error; err != nil {
-			t.Fatal(err)
-		}
-		kind := models.DownloaderTypePan115Offline
-		if provider == models.ConnectionProviderQuark {
-			kind = models.DownloaderTypeQuarkShare
-		}
-		row := models.Downloader{ID: "receiver-" + provider, Name: provider, NameNormalized: "receiver-" + provider, Type: kind, StorageID: &storage.ID, ProviderDirectoryID: "0", Enabled: true, CapabilitiesJSON: `{}`, LastHealthStatus: "offline"}
-		if err := s.db.Create(&row).Error; err != nil {
-			t.Fatal(err)
-		}
+		row, _, _ := seedPanSouReceiver(t, s, provider)
 		ids[provider] = row.ID
 	}
 	for _, tt := range []struct {
