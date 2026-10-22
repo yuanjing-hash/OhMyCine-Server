@@ -2,11 +2,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { flushPromises, mount } from '@vue/test-utils'
 import QuarkConnectionPanel from '@/components/QuarkConnectionPanel.vue'
+import { APIError } from '@/api/client'
 import type { ConnectionSummary } from '@/types/api'
 import type { QuarkAuthSession, QuarkConnectionStatus } from '@/quark'
 
 const mocks = vi.hoisted(() => ({ api: vi.fn(), allowed: true }))
-vi.mock('@/api/client', () => ({ api: mocks.api }))
+vi.mock('@/api/client', async original => ({ ...await original<typeof import('@/api/client')>(), api: mocks.api }))
 vi.mock('@/stores/auth', () => ({ useAuthStore: () => ({ can: () => mocks.allowed }) }))
 
 const connection = { id: 1, name: '我的夸克', provider: 'quark', enabled: true, revision: 1 } as ConnectionSummary
@@ -64,16 +65,17 @@ describe('Quark authorization panel', () => {
     wrapper.unmount()
   })
 
-  it('does not create a storage when shared-root verification fails', async () => {
+  it('preserves the safe verification phase for connection_unavailable and does not create a storage', async () => {
+    const diagnostic = '夸克目录验证在“定位管理授权下的目录”阶段未完成：夸克未接受请求或未返回可用结果（HTTP 400）（提供方错误码 23018）'
     mocks.api.mockImplementation(async (path: string) => {
       if (path.endsWith('/status')) return status(1, true)
-      if (path.endsWith('/verify-root')) throw new Error('所选目录不属于共同范围')
+      if (path.endsWith('/verify-root')) throw new APIError(503, 'connection_unavailable', diagnostic)
       return {}
     })
     const wrapper = render(); await flushPromises()
     wrapper.getComponent({ name: 'DirectoryPickerDialog' }).vm.$emit('select', { path: '/媒体', token: 'opaque-directory' }); await flushPromises()
     await wrapper.findAll('button').find(button => button.text() === '验证目录并添加数据源')!.trigger('click'); await flushPromises()
-    expect(wrapper.get('[role="alert"]').text()).toContain('共同范围')
+    expect(wrapper.get('[role="alert"]').text()).toBe(diagnostic)
     expect(mocks.api.mock.calls.some(call => call[0] === '/api/v1/storages')).toBe(false)
     expect(mocks.api.mock.calls.find(call => call[0].endsWith('/verify-root'))?.[1].body).toBe('{"provider_picker_token":"opaque-directory"}')
     wrapper.unmount()

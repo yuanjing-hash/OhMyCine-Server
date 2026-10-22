@@ -6,6 +6,7 @@ import (
 	"crypto/cipher"
 	"crypto/rand"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -79,6 +80,9 @@ func (s *nodeQuarkReceiptStore) Load(ctx context.Context, id string) (cloud.Oper
 	var revision uint64
 	var binding string
 	e := s.store.db.QueryRowContext(ctx, `SELECT revision,binding,ciphertext FROM cloud_operation_receipts WHERE paired_server_id=? AND operation_key=? AND receipt_id=?`, s.serverID, s.operationKey, id).Scan(&revision, &binding, &ciphertext)
+	if errors.Is(e, sql.ErrNoRows) {
+		return cloud.OperationReceipt{}, cloud.ErrOperationNotFound
+	}
 	if e != nil {
 		return cloud.OperationReceipt{}, e
 	}

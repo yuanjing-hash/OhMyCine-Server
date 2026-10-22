@@ -83,7 +83,7 @@ func (s *liveCreationStore) Load(_ context.Context, id string) (cloud.OperationR
 	defer s.mu.Unlock()
 	r, ok := s.state.Operations[id]
 	if !ok {
-		return r, os.ErrNotExist
+		return r, cloud.ErrOperationNotFound
 	}
 	r.Payload = append(json.RawMessage(nil), r.Payload...)
 	return r, nil

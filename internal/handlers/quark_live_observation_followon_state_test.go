@@ -375,7 +375,7 @@ func (s *followStore) Load(_ context.Context, id string) (cloud.OperationReceipt
 		return r, observationError()
 	}
 	if !ok {
-		return r, os.ErrNotExist
+		return r, cloud.ErrOperationNotFound
 	}
 	r.Payload = append(json.RawMessage(nil), r.Payload...)
 	return r, nil
