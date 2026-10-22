@@ -50,7 +50,7 @@ func lifecycleDownloadFixture(t *testing.T) (*SiteService, Actor, models.Site, m
 }
 
 func TestPluginLifecycleFinalTransactionRejectsResolvedChanges(t *testing.T) {
-	for _, change := range []string{"disable", "disable-reenable", "connection-revision", "active-package", "site-disabled"} {
+	for _, change := range []string{"disable", "disable-reenable", "connection-revision", "active-package", "site-disabled", "site-disabled-during-enqueue"} {
 		t.Run(change, func(t *testing.T) {
 			s, actor, site, installation, connection, input, claimID := lifecycleDownloadFixture(t)
 			input.BeforeSubmit = func() error {
@@ -77,15 +77,28 @@ func TestPluginLifecycleFinalTransactionRejectsResolvedChanges(t *testing.T) {
 				}
 				return nil
 			}
-			if _, err := s.Download(context.Background(), actor, input, RequestContext{}); ErrorCode(err) != CodeSiteResultExpired {
-				t.Fatalf("change=%s err=%v", change, err)
+			if change == "site-disabled-during-enqueue" {
+				input.BeforePersist = func(tx *gorm.DB) error {
+					return tx.Model(&models.Site{}).Where("id = ?", site.ID).Update("enabled", false).Error
+				}
+			}
+			expectedCode := CodeSiteResultExpired
+			if change == "site-disabled" {
+				// The refreshed site check rejects this case before the claim-consuming
+				// enqueue transaction; other lifecycle changes reach its final fence.
+				expectedCode = CodeSiteUnavailable
+			}
+			if _, err := s.Download(context.Background(), actor, input, RequestContext{}); ErrorCode(err) != expectedCode {
+				t.Fatalf("change=%s expected=%s code=%s err=%v", change, expectedCode, ErrorCode(err), err)
 			}
 			var claims models.PluginResourceClaim
 			if err := s.db.First(&claims, "id = ?", claimID).Error; err != nil || claims.ConsumedAt != nil {
 				t.Fatalf("failed transaction consumed claim: %+v err=%v", claims, err)
 			}
 			var count int64
-			s.db.Model(&models.DownloadTask{}).Where("plugin_resource_claim_id = ?", claimID).Count(&count)
+			if err := s.db.Model(&models.DownloadTask{}).Where("plugin_resource_claim_id = ?", claimID).Count(&count).Error; err != nil {
+				t.Fatal(err)
+			}
 			if count != 0 {
 				t.Fatal("changed lifecycle enqueued", count)
 			}
