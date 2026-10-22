@@ -339,11 +339,16 @@ func validateCancelledStructurePermitTx(tx *gorm.DB, permit CatalogPhysicalWrite
 	if stored.JobID == nil || *stored.JobID != proof.JobID || stored.PlanJSON != repair.PlanJSON || stored.LibraryID != repair.LibraryID {
 		return ErrCatalogFence
 	}
-	if catalogPhysicalDigest(catalogPhysicalDigest(stored.PlanJSON, stored.RuleFingerprint, stored.Scope, stored.WorkKey), uintID(stored.LibraryID), uintID(stored.OwnerID)) != proof.OwnerDigest {
+	if catalogPhysicalDigest(structureRepairOwnerDigest(stored), uintID(stored.LibraryID), uintID(stored.OwnerID)) != proof.OwnerDigest {
 		return ErrCatalogFence
 	}
 	var payload mediaLibraryRepairJobPayload
-	if job.JobType != JobTypeMediaLibraryRepair || json.Unmarshal([]byte(job.PayloadJSON), &payload) != nil || payload.RepairID != repair.ID {
+	var state structureCatalogRepairState
+	if json.Unmarshal([]byte(stored.StateJSON), &state) == nil && state.ParentTransferID != "" {
+		if _, err := quarkStructureParentTx(tx, stored, state.ParentTransferID); err != nil {
+			return err
+		}
+	} else if job.JobType != JobTypeMediaLibraryRepair || json.Unmarshal([]byte(job.PayloadJSON), &payload) != nil || payload.RepairID != repair.ID {
 		return ErrCatalogFence
 	}
 	library, storage, profile, err := catalogConversionContextTx(tx, repair.LibraryID)
@@ -364,6 +369,13 @@ func validateCancelledStructurePermitTx(tx *gorm.DB, permit CatalogPhysicalWrite
 // errors and replacement files never become absence or permission to settle.
 func structureFileObserver(ctx context.Context, boundary StructureBoundary, backend MediaLibraryStructureBackend) (func(string, string, int64, int64) (bool, bool, error), error) {
 	var index *providerStructureDirectoryIndex
+	if boundary.Storage.Type == models.StorageTypeQuark {
+		provider, ok := backend.(quarkMediaLibraryStructureBackend)
+		if !ok || provider.execution == nil {
+			return nil, ErrCatalogFence
+		}
+		index = newProviderStructureDirectoryIndex(cloudpkg.WithReadClass(ctx, cloudpkg.ReadClassPipeline), provider.execution.driver, boundary.Library.ProviderRootID)
+	}
 	if boundary.Storage.Type == models.StorageTypePan115 {
 		provider, ok := backend.(pan115MediaLibraryStructureBackend)
 		if !ok || provider.driver == nil || boundary.Storage.ConnectionID == nil {

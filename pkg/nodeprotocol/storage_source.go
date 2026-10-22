@@ -7,9 +7,11 @@ import (
 	"encoding/json"
 	"errors"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud/quark"
 	"net/url"
 	"regexp"
 	"strings"
+	"time"
 )
 
 const (
@@ -17,12 +19,14 @@ const (
 	StorageSourceKindPan115OfflineMagnet  = "pan115_offline_magnet"
 	StorageSourceKindPan115Share          = "pan115_share"
 	StorageSourceKindPan115ShareSelected  = "pan115_share_selected_v1"
+	StorageSourceKindQuarkShareSelected   = "quark_share_selected_v2"
 	// StorageSourceKindPan115OfflineURL is a route-preview value only in v1.
 	// A plain URL has no stable provider task identity, so Node plans reject it
 	// instead of discovering the idempotency gap after an external mutation.
 	StorageSourceKindPan115OfflineURL = "pan115_offline_url"
 	StorageSourceTargetLocal          = "local"
 	StorageSourceTargetPan115         = "pan115"
+	StorageSourceTargetQuark          = "quark"
 
 	StorageSourceActionMaterialize  = "materialize"
 	StorageSourceGrantOfflineSubmit = "offline_submit"
@@ -45,20 +49,25 @@ const (
 // StorageSourcePlan contains only immutable routing facts. The source URI and
 // Cookie are deliberately absent and travel only in a sealed credential grant.
 type StorageSourcePlan struct {
-	StorageID            string `json:"storage_id"`
-	ProviderType         string `json:"provider_type"`
-	SourceKind           string `json:"source_kind"`
-	TargetKind           string `json:"target_kind"`
-	SourceIdentityDigest string `json:"source_identity_digest"`
-	TargetIdentityDigest string `json:"target_identity_digest"`
-	SourceContentDigest  string `json:"source_content_digest"`
-	OfflineDestinationID string `json:"offline_destination_id"`
+	DigestVersion           int    `json:"digest_version,omitempty"`
+	TaskDirectoryName       string `json:"task_directory_name,omitempty"`
+	StorageID               string `json:"storage_id"`
+	ProviderType            string `json:"provider_type"`
+	SourceKind              string `json:"source_kind"`
+	TargetKind              string `json:"target_kind"`
+	SourceIdentityDigest    string `json:"source_identity_digest"`
+	TargetIdentityDigest    string `json:"target_identity_digest"`
+	SourceContentDigest     string `json:"source_content_digest"`
+	OfflineDestinationID    string `json:"offline_destination_id"`
+	DestinationRelativePath string `json:"destination_relative_path,omitempty"`
 }
 
 type StorageSourceCredential struct {
-	ProviderType string `json:"provider_type"`
-	Cookie       string `json:"cookie"`
-	SourceURI    string `json:"source_uri,omitempty"`
+	ProviderType string          `json:"provider_type"`
+	Cookie       string          `json:"cookie"`
+	SourceURI    string          `json:"source_uri,omitempty"`
+	Quark        json.RawMessage `json:"quark,omitempty"`
+	RootID       string          `json:"root_id,omitempty"`
 }
 
 type StorageSourceActionRequest struct {
@@ -74,18 +83,20 @@ type StorageSourceActionRequest struct {
 // StorageSourceActionResponse is summary-only. Provider files are exposed
 // only through the existing paginated FileExport protocol after verification.
 type StorageSourceActionResponse struct {
-	RequestID       string             `json:"request_id"`
-	OperationKey    string             `json:"operation_key"`
-	PlanDigest      string             `json:"plan_digest"`
-	Status          string             `json:"status"`
-	ProviderStatus  string             `json:"provider_status,omitempty"`
-	Progress        *float64           `json:"progress,omitempty"`
-	TotalFiles      int64              `json:"total_files"`
-	DownloadedFiles int64              `json:"downloaded_files"`
-	TotalBytes      int64              `json:"total_bytes"`
-	DownloadedBytes int64              `json:"downloaded_bytes"`
-	FileExport      *FileExportSummary `json:"file_export,omitempty"`
-	ErrorCode       string             `json:"error_code,omitempty"`
+	CredentialExpiresAt *time.Time         `json:"credential_expires_at,omitempty"`
+	OutputRootID        string             `json:"output_root_id,omitempty"`
+	RequestID           string             `json:"request_id"`
+	OperationKey        string             `json:"operation_key"`
+	PlanDigest          string             `json:"plan_digest"`
+	Status              string             `json:"status"`
+	ProviderStatus      string             `json:"provider_status,omitempty"`
+	Progress            *float64           `json:"progress,omitempty"`
+	TotalFiles          int64              `json:"total_files"`
+	DownloadedFiles     int64              `json:"downloaded_files"`
+	TotalBytes          int64              `json:"total_bytes"`
+	DownloadedBytes     int64              `json:"downloaded_bytes"`
+	FileExport          *FileExportSummary `json:"file_export,omitempty"`
+	ErrorCode           string             `json:"error_code,omitempty"`
 }
 
 type StorageSourceCleanupRequest struct {
@@ -104,7 +115,14 @@ type StorageSourceCleanupResponse struct {
 }
 
 func (plan StorageSourcePlan) Validate() error {
-	if !validID(plan.StorageID) || plan.ProviderType != StorageProviderPan115 || !StorageSourceKindSupported(plan.SourceKind) || !ValidDigest(plan.SourceIdentityDigest) || !ValidDigest(plan.SourceContentDigest) || !validProviderItemID(plan.OfflineDestinationID) {
+	if plan.ProviderType == StorageProviderQuark {
+		if plan.SourceKind != StorageSourceKindQuarkShareSelected || plan.DigestVersion != 2 || !strings.HasPrefix(plan.TaskDirectoryName, "omc-") || !validID(plan.TaskDirectoryName) || len(plan.TaskDirectoryName) > 64 || plan.DestinationRelativePath != "" && !ValidStorageDirectoryRelativePath(plan.DestinationRelativePath) {
+			return errors.New("node_storage_source_plan_invalid")
+		}
+	} else if plan.ProviderType != StorageProviderPan115 || plan.DigestVersion != 0 || plan.TaskDirectoryName != "" || plan.DestinationRelativePath != "" || plan.SourceKind == StorageSourceKindQuarkShareSelected {
+		return errors.New("node_storage_source_plan_invalid")
+	}
+	if !validID(plan.StorageID) || !StorageSourceKindSupported(plan.SourceKind) || !ValidDigest(plan.SourceIdentityDigest) || !ValidDigest(plan.SourceContentDigest) || !validProviderItemID(plan.OfflineDestinationID) {
 		return errors.New("node_storage_source_plan_invalid")
 	}
 	switch plan.TargetKind {
@@ -112,7 +130,7 @@ func (plan StorageSourcePlan) Validate() error {
 		if plan.TargetIdentityDigest != "" {
 			return errors.New("node_storage_source_plan_invalid")
 		}
-	case StorageSourceTargetPan115:
+	case StorageSourceTargetPan115, StorageSourceTargetQuark:
 		if !ValidDigest(plan.TargetIdentityDigest) || plan.SourceIdentityDigest == plan.TargetIdentityDigest {
 			return errors.New("node_storage_source_plan_invalid")
 		}
@@ -130,7 +148,7 @@ func StorageSourceKindSupported(kind string) bool {
 }
 
 func StorageSourceIsShare(kind string) bool {
-	return kind == StorageSourceKindPan115Share || kind == StorageSourceKindPan115ShareSelected
+	return kind == StorageSourceKindPan115Share || kind == StorageSourceKindPan115ShareSelected || kind == StorageSourceKindQuarkShareSelected
 }
 
 var storageShareCodePattern = regexp.MustCompile(`^[A-Za-z0-9_-]{4,128}$`)
@@ -139,6 +157,18 @@ var storageShareCodePattern = regexp.MustCompile(`^[A-Za-z0-9_-]{4,128}$`)
 // used to make a provider submission recoverable. Display names, trackers and
 // a rotated 115 receive code do not change the underlying source identity.
 func CanonicalStorageSourceIdentity(kind, rawURI string) (string, error) {
+	if kind == StorageSourceKindQuarkShareSelected {
+		source, e := cloud.DecodeSelectedShareSource(rawURI)
+		if e != nil {
+			return "", e
+		}
+		_, id, e := quark.NormalizeShareLink(source.URL, "")
+		if e != nil {
+			return "", e
+		}
+		digest, e := source.Selection.Digest()
+		return "quark:" + id + ":" + digest, e
+	}
 	if kind == StorageSourceKindPan115ShareSelected {
 		source, err := cloud.DecodeSelectedShareSource(rawURI)
 		if err != nil {
@@ -224,7 +254,7 @@ func StorageSourceContentDigest(kind, rawURI string) (string, error) {
 // target account identities. Node cannot derive a connection identity from a
 // scoped Cookie, so it enforces the signed digests are valid and different.
 func StorageIdentityDigest(providerType, stableIdentity string) (string, error) {
-	if providerType != StorageProviderPan115 || !validID(stableIdentity) {
+	if (providerType != StorageProviderPan115 && providerType != StorageProviderQuark) || !validID(stableIdentity) {
 		return "", errors.New("node_storage_identity_invalid")
 	}
 	sum := sha256.Sum256([]byte("ohmycine-storage-identity-v1\n" + providerType + "\n" + stableIdentity))
@@ -273,7 +303,11 @@ func (request StorageSourceCleanupRequest) Digest() (string, error) {
 }
 
 func ValidateStorageSourceCredential(credential StorageSourceCredential, requireURI bool) error {
-	if credential.ProviderType != StorageProviderPan115 || strings.TrimSpace(credential.Cookie) == "" || strings.ContainsAny(credential.Cookie, "\r\n") || len(credential.Cookie) > MaxCredentialGrantBytes {
+	if credential.ProviderType == StorageProviderQuark {
+		if credential.Cookie != "" || len(credential.Quark) == 0 || len(credential.Quark) > MaxCredentialGrantBytes || !json.Valid(credential.Quark) || !validProviderItemID(credential.RootID) {
+			return errors.New("node_storage_source_credential_invalid")
+		}
+	} else if credential.ProviderType != StorageProviderPan115 || strings.TrimSpace(credential.Cookie) == "" || strings.ContainsAny(credential.Cookie, "\r\n") || len(credential.Cookie) > MaxCredentialGrantBytes || len(credential.Quark) > 0 {
 		return errors.New("node_storage_source_credential_invalid")
 	}
 	uri := strings.TrimSpace(credential.SourceURI)

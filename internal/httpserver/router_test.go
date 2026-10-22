@@ -305,6 +305,10 @@ func (routerCloudDriver) Rename(context.Context, string, string) error { return 
 func (routerCloudDriver) Recycle(context.Context, string) error        { return nil }
 
 func newTestClient(t *testing.T, cloudDrivers ...cloudpkg.Driver) *testClient {
+	return newTestClientWithSiteAdapters(t, []sitepkg.Adapter{routerSiteAdapter{}}, cloudDrivers...)
+}
+
+func newTestClientWithSiteAdapters(t *testing.T, siteAdapters []sitepkg.Adapter, cloudDrivers ...cloudpkg.Driver) *testClient {
 	t.Helper()
 	testRoot := t.TempDir()
 	cfg := config.Config{Host: "127.0.0.1", Port: 3000, DatabasePath: filepath.Join(testRoot, "server.db"), LogDirectory: filepath.Join(testRoot, "logs"), CredentialKeyFile: filepath.Join(testRoot, "credentials.key"), Environment: "test", PublicOrigin: "http://localhost:3000", SessionIdleTTL: 2 * time.Hour, SessionMaxTTL: 7 * 24 * time.Hour}
@@ -432,7 +436,7 @@ func newTestClient(t *testing.T, cloudDrivers ...cloudpkg.Driver) *testClient {
 	follows.SetDownloadService(downloads)
 	downloads.SetMetadataSettings(metadataSettings)
 	downloads.SetSeedingSettings(seedingSettings)
-	sites := services.NewSiteServiceWithAdapters(db, audit, credentialStore, downloads, []sitepkg.Adapter{routerSiteAdapter{}}, log)
+	sites := services.NewSiteServiceWithAdapters(db, audit, credentialStore, downloads, siteAdapters, log)
 	sites.SetMetadataSettings(metadataSettings)
 	api.SetSiteService(sites)
 	api.SetAcquisitionService(services.NewAcquisitionService(db))

@@ -16,6 +16,7 @@ import (
 	cloudpkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud"
 	downloadpkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/downloader"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/nodeprotocol"
+	"gorm.io/gorm"
 )
 
 type DownloadRoutePreviewInput struct {
@@ -109,7 +110,7 @@ func (s *DownloadService) PreviewRoutes(ctx context.Context, actor Actor, input 
 			option.RouteLabel = transferRouteLabel(target.RouteKind)
 			option.RequiresManagedStaging = target.RouteKind == models.TransferRouteCrossSource
 			option.RequiresServerStaging = option.RequiresManagedStaging && (location != models.NodeLocationRemote || target.StorageType == models.StorageTypeLocal)
-			option.RequiresNodeStaging = option.RequiresManagedStaging && location == models.NodeLocationRemote && downloader.Type == models.DownloaderTypePan115Offline
+			option.RequiresNodeStaging = option.RequiresManagedStaging && location == models.NodeLocationRemote && isCloudShareDownloader(downloader.Type)
 			if option.RequiresServerStaging {
 				if spaceErr := s.applyManagedStagingPreview(ctx, downloader.Type, input.ExpectedBytes, &option); spaceErr != nil {
 					option.ReasonCode = ErrorCode(spaceErr)
@@ -224,7 +225,7 @@ func safeErrorMessage(err error, fallback string) string {
 
 func isPreviewSourceKind(kind string) bool {
 	switch kind {
-	case downloadpkg.SourceURL, downloadpkg.SourceTorrent, downloadpkg.SourcePan115Share:
+	case downloadpkg.SourceURL, downloadpkg.SourceTorrent, downloadpkg.SourcePan115Share, downloadpkg.SourceQuarkShare:
 		return true
 	default:
 		return false
@@ -232,6 +233,9 @@ func isPreviewSourceKind(kind string) bool {
 }
 
 func (s *DownloadService) validatePreviewSource(downloader models.Downloader, sourceKind string, siteID *uint) error {
+	if sourceKind == downloadpkg.SourceQuarkShare && downloader.Type != models.DownloaderTypeQuarkShare || downloader.Type == models.DownloaderTypeQuarkShare && sourceKind != downloadpkg.SourceQuarkShare {
+		return appError(CodeDownloadSourceInvalid, "夸克分享只能通过夸克分享接收器转存，不支持离线下载", nil)
+	}
 	if sourceKind == downloadpkg.SourcePan115Share && downloader.Type != models.DownloaderTypePan115Offline {
 		return appError(CodeDownloadSourceInvalid, "所选下载器不支持 115 分享转存", nil)
 	}
@@ -245,7 +249,7 @@ func (s *DownloadService) validatePreviewSource(downloader models.Downloader, so
 			return err
 		}
 		source, _ := routeSourceForSite(site)
-		authoritativeBT = source == RouteSourceBT
+		authoritativeBT = source == RouteSourceBT || site.Kind == "pansou_tg" && sourceKind == downloadpkg.SourceURL
 	}
 	if sourceKind == downloadpkg.SourceTorrent && downloader.Type == models.DownloaderTypePan115Offline && !authoritativeBT {
 		return appError(CodeDownloadSourceInvalid, "种子文件只能提交到非网盘 BT 下载器；公开 BT 站点会先安全转换为磁力链接", nil)
@@ -261,9 +265,19 @@ func validateSiteDownloadSource(downloader models.Downloader, sourceKind string,
 		return appError(CodeSiteUnavailable, "站点不存在或已停用", nil)
 	}
 	source, err := routeSourceForSite(site)
-	if source == RouteSource115Share {
-		if sourceKind != downloadpkg.SourcePan115Share || downloader.Type != models.DownloaderTypePan115Offline {
-			return appError(CodeDownloadSourceInvalid, "网盘分享资源只能通过 115 分享转存", nil)
+	if site.Kind == "pansou_tg" {
+		switch sourceKind {
+		case downloadpkg.SourcePan115Share, downloadpkg.SourceQuarkShare:
+			source, err = sourceKind, nil
+		case downloadpkg.SourceURL:
+			source, err = RouteSourceBT, nil
+		default:
+			return appError(CodeDownloadSourceInvalid, "盘搜资源类型不支持入库", nil)
+		}
+	}
+	if isCloudShareSource(source) {
+		if sourceKind != source || !routeDownloaderApplicable(source, downloader) {
+			return appError(CodeDownloadSourceInvalid, "网盘分享资源只能通过对应网盘转存", nil)
 		}
 		return nil
 	}
@@ -303,33 +317,33 @@ func (s *DownloadService) buildDownloadTargetSnapshot(ctx context.Context, downl
 		if routeKind == models.TransferRouteCrossSource && library.TransferMode == models.MediaLibraryTransferSymlink {
 			return nil, models.MediaClassificationProfile{}, appError(CodeTransferRouteUnsupported, "跨数据源入库不能使用软链接", nil)
 		}
-	case models.StorageTypePan115:
+	case models.StorageTypePan115, models.StorageTypeQuark:
 		if targetStorage.ConnectionID == nil || strings.TrimSpace(library.ProviderRootID) == "" || s.downloader == nil || s.downloader.connections == nil {
-			return nil, models.MediaClassificationProfile{}, appError(CodeMediaLibraryStorageUnavailable, "115 目标媒体库连接不可用", nil)
+			return nil, models.MediaClassificationProfile{}, appError(CodeMediaLibraryStorageUnavailable, "网盘目标媒体库连接不可用", nil)
 		}
 		if library.TransferMode != models.MediaLibraryTransferMove && library.TransferMode != models.MediaLibraryTransferCopy {
-			return nil, models.MediaClassificationProfile{}, appError(CodeTransferRouteUnsupported, "115 媒体库仅支持移动或复制入库", nil)
+			return nil, models.MediaClassificationProfile{}, appError(CodeTransferRouteUnsupported, "网盘媒体库仅支持移动或复制入库", nil)
 		}
 		_, driver, driverErr := s.downloader.connections.driver(*targetStorage.ConnectionID)
 		if driverErr != nil {
-			return nil, models.MediaClassificationProfile{}, appError(CodeMediaLibraryStorageUnavailable, "115 目标连接不可用", driverErr)
+			return nil, models.MediaClassificationProfile{}, appError(CodeMediaLibraryStorageUnavailable, "网盘目标连接不可用", driverErr)
 		}
 		capabilities := driver.Capabilities()
 		if routeKind == models.TransferRouteSameSourceProvider {
 			_, ok := driver.(cloudpkg.MutationDriver)
-			if !ok || !capabilities.CreateDirectory || !capabilities.Rename || !capabilities.Recycle || library.TransferMode == models.MediaLibraryTransferMove && !capabilities.Move || library.TransferMode == models.MediaLibraryTransferCopy && !capabilities.Copy {
-				return nil, models.MediaClassificationProfile{}, appError(CodeTransferRouteUnsupported, "115 目标缺少所需的同源云端整理能力", nil)
+			if !ok || !capabilities.CreateDirectory || !capabilities.Rename || targetStorage.Type == models.StorageTypePan115 && !capabilities.Recycle || library.TransferMode == models.MediaLibraryTransferMove && !capabilities.Move || library.TransferMode == models.MediaLibraryTransferCopy && !capabilities.Copy {
+				return nil, models.MediaClassificationProfile{}, appError(CodeTransferRouteUnsupported, "网盘目标缺少所需的同源云端整理能力", nil)
 			}
 		} else {
 			_, ok := driver.(cloudpkg.UploadDriver)
-			if !ok || !capabilities.FileUpload || !capabilities.CreateDirectory || !capabilities.Recycle {
-				return nil, models.MediaClassificationProfile{}, appError(CodeTransferRouteUnsupported, "115 目标缺少跨数据源文件上传能力", nil)
+			if !ok || !capabilities.FileUpload || !capabilities.CreateDirectory || targetStorage.Type == models.StorageTypePan115 && !capabilities.Recycle {
+				return nil, models.MediaClassificationProfile{}, appError(CodeTransferRouteUnsupported, "网盘目标缺少跨数据源文件上传能力", nil)
 			}
 		}
 		if validateProviderRoots {
-			root, rootErr := providerItemWithinRoot(cloudpkg.WithReadClass(ctx, cloudpkg.ReadClassPipeline), driver, library.ProviderRootID, targetStorage.RootPath)
+			root, rootErr := providerDirectoryWithinStorage(cloudpkg.WithReadClass(ctx, cloudpkg.ReadClassPipeline), driver, targetStorage, library.RelativeRoot, library.ProviderRootID)
 			if rootErr != nil || !root.IsDir {
-				return nil, models.MediaClassificationProfile{}, appError(CodeMediaLibraryPathInvalid, "115 目标媒体库目录不可用", rootErr)
+				return nil, models.MediaClassificationProfile{}, appError(CodeMediaLibraryPathInvalid, "网盘目标媒体库目录不可用", rootErr)
 			}
 		}
 		value := *targetStorage.ConnectionID
@@ -346,20 +360,23 @@ func (s *DownloadService) buildDownloadTargetSnapshot(ctx context.Context, downl
 		if driverErr != nil {
 			return nil, models.MediaClassificationProfile{}, appError(CodeDownloaderStorageUnavailable, "下载器来源连接不可用", driverErr)
 		}
+		if sourceStorage.Type == models.StorageTypeQuark && routeKind == models.TransferRouteCrossSource && library.TransferMode == models.MediaLibraryTransferMove && !sourceDriver.Capabilities().Recycle {
+			return nil, models.MediaClassificationProfile{}, appError(CodeTransferRouteUnsupported, "夸克来源尚不支持跨盘移动所需的源文件回收；请将目标库设置为复制入库，来源文件会保留", nil)
+		}
 		_, readable := sourceDriver.(cloudpkg.ReadDriver)
 		serverMaterializesSource := normalizeExecutionLocation(downloader.ExecutionLocation) != models.NodeLocationRemote
 		if routeKind == models.TransferRouteCrossSource && serverMaterializesSource && (!readable || !sourceDriver.Capabilities().TemporaryDirectURL) {
 			return nil, models.MediaClassificationProfile{}, appError(CodeTransferRouteUnsupported, "来源网盘不支持安全下载到 Server 暂存区", nil)
 		}
-		if sourceKind == downloadpkg.SourcePan115Share || sourceKind == downloadpkg.SourceProviderItem {
+		if isCloudShareSource(sourceKind) || sourceKind == downloadpkg.SourceProviderItem {
 			ingestProviderRootID = strings.TrimSpace(downloader.ProviderDirectoryID)
 			if ingestProviderRootID == "" {
-				return nil, models.MediaClassificationProfile{}, appError(CodeDownloaderStorageUnavailable, "115 下载器目录不可用", nil)
+				return nil, models.MediaClassificationProfile{}, appError(CodeDownloaderStorageUnavailable, "网盘下载器目录不可用", nil)
 			}
 			if validateProviderRoots {
-				ingestRoot, rootErr := providerItemWithinRoot(cloudpkg.WithReadClass(ctx, cloudpkg.ReadClassPipeline), sourceDriver, ingestProviderRootID, sourceStorage.RootPath)
+				ingestRoot, rootErr := providerDirectoryWithinStorage(cloudpkg.WithReadClass(ctx, cloudpkg.ReadClassPipeline), sourceDriver, *sourceStorage, downloader.ProviderDirectoryPath, ingestProviderRootID)
 				if rootErr != nil || !ingestRoot.IsDir {
-					return nil, models.MediaClassificationProfile{}, appError(CodeMediaLibraryPathInvalid, "115 下载目录不可用", rootErr)
+					return nil, models.MediaClassificationProfile{}, appError(CodeMediaLibraryPathInvalid, "网盘下载目录不可用", rootErr)
 				}
 			}
 		}
@@ -368,9 +385,12 @@ func (s *DownloadService) buildDownloadTargetSnapshot(ctx context.Context, downl
 		if downloader.NodeID == nil || s.downloader == nil || s.downloader.transferNodes == nil {
 			return nil, models.MediaClassificationProfile{}, appError(CodeDownloaderUnavailable, "下载器的传输节点绑定不完整", nil)
 		}
-		node, nodeErr := s.downloader.prepareNodeStorageDownloader(*downloader.NodeID)
+		var node models.TransferNode
+		var nodeErr error
 		if downloader.Type == models.DownloaderTypeQBittorrent {
 			_, node, nodeErr = s.downloader.transferNodes.nodeClient(*downloader.NodeID)
+		} else {
+			node, nodeErr = s.downloader.prepareNodeStorageDownloader(*downloader.NodeID, downloader.Type)
 		}
 		if nodeErr != nil {
 			return nil, models.MediaClassificationProfile{}, nodeErr
@@ -381,6 +401,9 @@ func (s *DownloadService) buildDownloadTargetSnapshot(ctx context.Context, downl
 		}
 		if downloader.Type == models.DownloaderTypeQBittorrent && !nodeCapabilities.Has(nodeprotocol.CapabilityQBittorrentControl) {
 			return nil, models.MediaClassificationProfile{}, appError(CodeDownloaderUnavailable, "所选节点不支持 qBittorrent", nil)
+		}
+		if err := validateQuarkNodeRouteCapabilities(downloader.Type, targetStorage.Type, routeKind, nodeCapabilities); err != nil {
+			return nil, models.MediaClassificationProfile{}, err
 		}
 		if downloader.Type == models.DownloaderTypePan115Offline && routeKind == models.TransferRouteSameSourceProvider {
 			return nil, models.MediaClassificationProfile{}, appError(CodeTransferRouteUnsupported, "同一 115 数据源请使用主 Server 原生云端整理，无需经过传输节点", nil)
@@ -422,16 +445,52 @@ func (s *DownloadService) buildDownloadTargetSnapshot(ctx context.Context, downl
 	}, profile, nil
 }
 
+// Keep the admission contract shared by preview, submission and the final
+// persistence fence. A node can lose an advertised capability after preview;
+// that must not create an unusable task or silently send it to the Server.
+func validateQuarkNodeRouteCapabilities(downloaderType, targetStorageType, routeKind string, capabilities nodeprotocol.Capabilities) error {
+	if downloaderType == models.DownloaderTypeQuarkShare {
+		if !nodeprotocol.QuarkShareSupported(capabilities) {
+			return appError(CodeDownloaderUnavailable, "请升级节点：需要夸克分享接收、原文件读取、完整文件校验与受控导出能力", nil)
+		}
+		if routeKind == models.TransferRouteSameSourceProvider {
+			return appError(CodeTransferRouteUnsupported, "同一夸克数据源请使用主 Server 原生云端整理，无需经过传输节点", nil)
+		}
+	}
+	if targetStorageType == models.StorageTypeQuark && routeKind == models.TransferRouteCrossSource && !nodeprotocol.QuarkUploadSupported(capabilities) {
+		return appError(CodeTransferRouteUnsupported, "请升级节点：上传到夸克需要文件上传、完整文件校验与受控导出能力", nil)
+	}
+	return nil
+}
+
+func validateQuarkNodeTaskAdmission(tx *gorm.DB, downloader models.Downloader, task models.DownloadTask) error {
+	if downloader.Type != models.DownloaderTypeQuarkShare && task.TargetStorageType != models.StorageTypeQuark {
+		return nil
+	}
+	if task.NodeID == nil {
+		return appError(CodeDownloaderUnavailable, "下载器的传输节点绑定不完整", nil)
+	}
+	var node models.TransferNode
+	if err := tx.First(&node, "id = ?", *task.NodeID).Error; err != nil || node.Status != models.NodeStatusOnline {
+		return appError(CodeDownloaderUnavailable, "所选传输节点当前不可用", err)
+	}
+	var capabilities nodeprotocol.Capabilities
+	if err := json.Unmarshal([]byte(node.CapabilitiesJSON), &capabilities); err != nil {
+		return appError(CodeDownloaderUnavailable, "无法确认节点能力，请重新测试或升级节点", err)
+	}
+	return validateQuarkNodeRouteCapabilities(downloader.Type, task.TargetStorageType, task.TransferRouteKind, capabilities)
+}
+
 func (s *DownloadService) downloaderDataSourceIdentity(ctx context.Context, downloader models.Downloader) (models.DataSourceIdentity, *models.Storage, error) {
-	if downloader.Type == models.DownloaderTypePan115Offline {
+	if isCloudShareDownloader(downloader.Type) {
 		if downloader.StorageID == nil {
-			return models.DataSourceIdentity{}, nil, appError(CodeDownloaderStorageUnavailable, "115 下载器 Storage 不可用", nil)
+			return models.DataSourceIdentity{}, nil, appError(CodeDownloaderStorageUnavailable, "网盘下载器 Storage 不可用", nil)
 		}
 		var storage models.Storage
-		if err := s.db.WithContext(ctx).First(&storage, *downloader.StorageID).Error; err != nil || !storage.Enabled || storage.Type != models.StorageTypePan115 || storage.ConnectionID == nil {
-			return models.DataSourceIdentity{}, nil, appError(CodeDownloaderStorageUnavailable, "115 下载器 Storage 不可用", err)
+		if err := s.db.WithContext(ctx).First(&storage, *downloader.StorageID).Error; err != nil || !storage.Enabled || storage.Type != shareStorageType(downloader.Type) || storage.ConnectionID == nil {
+			return models.DataSourceIdentity{}, nil, appError(CodeDownloaderStorageUnavailable, "网盘下载器 Storage 不可用", err)
 		}
-		return models.DataSourceIdentity{Kind: models.DataSourceKindProvider, ProviderType: models.StorageTypePan115, ConnectionIdentity: strconv.FormatUint(uint64(*storage.ConnectionID), 10), StorageScope: strconv.FormatUint(uint64(storage.ID), 10)}, &storage, nil
+		return models.DataSourceIdentity{Kind: models.DataSourceKindProvider, ProviderType: storage.Type, ConnectionIdentity: strconv.FormatUint(uint64(*storage.ConnectionID), 10), StorageScope: strconv.FormatUint(uint64(storage.ID), 10)}, &storage, nil
 	}
 	if downloader.Type == models.DownloaderTypePluginHTTP {
 		return localDataSourceIdentity(), nil, nil
@@ -451,11 +510,11 @@ func mediaLibraryDataSourceIdentity(storage models.Storage) (models.DataSourceId
 	switch storage.Type {
 	case models.StorageTypeLocal:
 		return localDataSourceIdentity(), nil
-	case models.StorageTypePan115:
+	case models.StorageTypePan115, models.StorageTypeQuark:
 		if storage.ConnectionID == nil {
 			return models.DataSourceIdentity{}, appError(CodeMediaLibraryStorageUnavailable, "115 媒体库连接不可用", nil)
 		}
-		return models.DataSourceIdentity{Kind: models.DataSourceKindProvider, ProviderType: models.StorageTypePan115, ConnectionIdentity: strconv.FormatUint(uint64(*storage.ConnectionID), 10), StorageScope: strconv.FormatUint(uint64(storage.ID), 10)}, nil
+		return models.DataSourceIdentity{Kind: models.DataSourceKindProvider, ProviderType: storage.Type, ConnectionIdentity: strconv.FormatUint(uint64(*storage.ConnectionID), 10), StorageScope: strconv.FormatUint(uint64(storage.ID), 10)}, nil
 	default:
 		return models.DataSourceIdentity{}, appError(CodeMediaLibraryStorageUnavailable, "目标媒体库 Storage 类型不受支持", nil)
 	}

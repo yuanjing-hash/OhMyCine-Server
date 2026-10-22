@@ -78,6 +78,9 @@ func (s *TransferNodeService) sealDownloaderGrant(ctx context.Context, node mode
 }
 
 func (s *TransferNodeService) sealStorageGrant(ctx context.Context, node models.TransferNode, storage models.Storage, taskID, operationKey string, actions []string) (nodeprotocol.CredentialGrantEnvelope, error) {
+	if storage.Type == models.StorageTypeQuark {
+		return s.sealQuarkStorageGrant(ctx, node, storage, taskID, operationKey, actions)
+	}
 	if storage.Type != models.StorageTypePan115 || storage.ConnectionID == nil || storage.ID == 0 || strings.TrimSpace(taskID) == "" || strings.TrimSpace(operationKey) == "" {
 		return nodeprotocol.CredentialGrantEnvelope{}, appError(CodeTransferRouteUnsupported, "目标存储不支持节点直传", nil)
 	}

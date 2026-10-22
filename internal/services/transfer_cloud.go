@@ -16,6 +16,7 @@ import (
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
 	cloudpkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud"
 	downloadpkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/downloader"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/nodeprotocol"
 	"gorm.io/gorm"
 )
 
@@ -57,18 +58,24 @@ func cloudDirectoryAttemptFromContext(ctx context.Context) *cloudDirectoryAttemp
 }
 
 type materializedItemState struct {
-	RelativePath string `json:"relative_path"`
-	Size         int64  `json:"size"`
-	SHA1         string `json:"sha1,omitempty"`
-	Status       string `json:"status"`
+	RelativePath     string     `json:"relative_path"`
+	Size             int64      `json:"size"`
+	SHA1             string     `json:"sha1,omitempty"`
+	Status           string     `json:"status"`
+	DigestVersion    int        `json:"digest_version,omitempty"`
+	DigestAlgorithm  string     `json:"digest_algorithm,omitempty"`
+	DigestValue      string     `json:"digest_value,omitempty"`
+	SourceRevision   string     `json:"source_revision,omitempty"`
+	SourceModifiedAt *time.Time `json:"source_modified_at,omitempty"`
 }
 
 type cloudTransferItemState struct {
-	SourceID       string `json:"source_id"`
-	CurrentID      string `json:"current_id,omitempty"`
-	TargetParentID string `json:"target_parent_id,omitempty"`
-	TargetName     string `json:"target_name,omitempty"`
-	Status         string `json:"status"`
+	SourceID       string                      `json:"source_id"`
+	CurrentID      string                      `json:"current_id,omitempty"`
+	TargetParentID string                      `json:"target_parent_id,omitempty"`
+	TargetName     string                      `json:"target_name,omitempty"`
+	Status         string                      `json:"status"`
+	ContentDigest  *nodeprotocol.ContentDigest `json:"content_digest,omitempty"`
 }
 
 // cloudTransferBatchIntent is private durable state. Provider identities and
@@ -111,19 +118,23 @@ func (w *TransferWorker) runCloudTransfer(ctx context.Context, runtime JobRuntim
 	if w.service.connections == nil || download.TargetConnectionID == nil || download.TargetStorageID == nil || download.StagingStorageID == nil || strings.TrimSpace(download.TargetProviderRootID) == "" {
 		return w.cloudFailure(task, cloudTransferError("cloud_transfer_snapshot_invalid", false, nil))
 	}
-	if download.ProviderType != models.DownloaderTypePan115Offline || (download.TransferMode != models.MediaLibraryTransferMove && download.TransferMode != models.MediaLibraryTransferCopy) {
+	if (download.ProviderType != models.DownloaderTypePan115Offline && download.ProviderType != models.DownloaderTypeQuarkShare) || (download.TransferMode != models.MediaLibraryTransferMove && download.TransferMode != models.MediaLibraryTransferCopy) {
 		return w.cloudFailure(task, cloudTransferError("cloud_transfer_mode_invalid", false, nil))
 	}
 	connection, driver, err := w.service.connections.driver(*download.TargetConnectionID)
 	if err != nil {
 		return w.cloudFailure(task, err)
 	}
+	driver, err = transferCloudDriver(driver, task.ID)
+	if err != nil {
+		return w.cloudFailure(task, err)
+	}
 	mutations, ok := driver.(cloudpkg.MutationDriver)
-	if !ok || connection.Provider != cloudpkg.ProviderPan115 {
+	if !ok || (connection.Provider != cloudpkg.ProviderPan115 && connection.Provider != cloudpkg.ProviderQuark) {
 		return w.cloudFailure(task, cloudTransferError("cloud_transfer_capability_missing", false, nil))
 	}
 	capabilities := mutations.Capabilities()
-	if !capabilities.CreateDirectory || !capabilities.Rename || !capabilities.Recycle || (download.TransferMode == models.MediaLibraryTransferMove && !capabilities.Move) || (download.TransferMode == models.MediaLibraryTransferCopy && !capabilities.Copy) {
+	if !capabilities.CreateDirectory || !capabilities.Rename || (connection.Provider == cloudpkg.ProviderPan115 && !capabilities.Recycle) || (download.TransferMode == models.MediaLibraryTransferMove && !capabilities.Move) || (download.TransferMode == models.MediaLibraryTransferCopy && !capabilities.Copy) {
 		return w.cloudFailure(task, cloudTransferError("cloud_transfer_capability_missing", false, nil))
 	}
 	batchMutations, _ := driver.(cloudpkg.BatchMutationDriver)
@@ -135,7 +146,7 @@ func (w *TransferWorker) runCloudTransfer(ctx context.Context, runtime JobRuntim
 	if err := w.service.db.First(&targetStorage, *download.TargetStorageID).Error; err != nil {
 		return w.cloudFailure(task, cloudTransferError("cloud_transfer_target_missing", false, err))
 	}
-	if sourceStorage.Type != models.StorageTypePan115 || targetStorage.Type != models.StorageTypePan115 || sourceStorage.ConnectionID == nil || targetStorage.ConnectionID == nil || *sourceStorage.ConnectionID != *download.TargetConnectionID || *targetStorage.ConnectionID != *download.TargetConnectionID {
+	if sourceStorage.Type != connection.Provider || targetStorage.Type != connection.Provider || sourceStorage.ConnectionID == nil || targetStorage.ConnectionID == nil || *sourceStorage.ConnectionID != *download.TargetConnectionID || *targetStorage.ConnectionID != *download.TargetConnectionID {
 		return w.cloudFailure(task, cloudTransferError("cloud_transfer_boundary_invalid", false, nil))
 	}
 	targetBasePath, _ := joinProviderPath(targetStorage.RootDisplayPath, download.TargetRelativeRoot)
@@ -177,7 +188,7 @@ func (w *TransferWorker) runCloudTransfer(ctx context.Context, runtime JobRuntim
 	if err := w.persistCloudState(&task, state, models.TransferTaskStatusCheckingDirectories, completedCloudItems(state), &encodedSummary); err != nil {
 		return w.cloudFailure(task, cloudTransferError("transfer_state_persist_failed", true, err))
 	}
-	serverlog.OperationPan115CloudTransfer.Event(w.service.log.Info()).Str("task_id", task.ID).Uint("library_id", task.LibraryID).Int("files", len(targets)).Msg(serverlog.OperationPan115CloudTransfer.Message("已完成命名规划，开始检查目标目录"))
+	serverlog.OperationMediaTransfer.Event(w.service.log.Info()).Str("task_id", task.ID).Uint("library_id", task.LibraryID).Int("files", len(targets)).Msg(serverlog.OperationMediaTransfer.Message("已完成命名规划，开始检查目标目录"))
 
 	for _, target := range targets {
 		if err := validateCloudTargetItem(target); err != nil {
@@ -214,8 +225,11 @@ func (w *TransferWorker) runCloudTransfer(ctx context.Context, runtime JobRuntim
 		return w.cloudFailure(task, err)
 	}
 	if len(conflicts) > 0 && policy == models.MediaLibraryConflictAsk {
-		serverlog.OperationPan115CloudTransfer.Event(w.service.log.Info()).Str("task_id", task.ID).Uint("library_id", task.LibraryID).Int("conflicts", len(conflicts)).Msg(serverlog.OperationPan115CloudTransfer.Message("等待处理云端同名文件"))
-		return WorkerResult{Wait: &WaitForAction{ActionType: "transfer_conflict", Prompt: "目标媒体库存在同名文件，请选择处理方式", Options: []string{models.MediaLibraryConflictOverwrite, models.MediaLibraryConflictSkip, models.MediaLibraryConflictRename}, Preview: map[string]string{"媒体库": task.LibraryName, "冲突文件": strconv.Itoa(len(conflicts))}, Checkpoint: map[string]any{"conflict_count": len(conflicts)}}}
+		serverlog.OperationMediaTransfer.Event(w.service.log.Info()).Str("task_id", task.ID).Uint("library_id", task.LibraryID).Int("conflicts", len(conflicts)).Msg(serverlog.OperationMediaTransfer.Message("等待处理云端同名文件"))
+		return WorkerResult{Wait: &WaitForAction{ActionType: "transfer_conflict", Prompt: "目标媒体库存在同名文件，请选择处理方式", Options: cloudTransferConflictOptions(capabilities.Recycle), Preview: map[string]string{"媒体库": task.LibraryName, "冲突文件": strconv.Itoa(len(conflicts))}, Checkpoint: map[string]any{"conflict_count": len(conflicts)}}}
+	}
+	if policy == models.MediaLibraryConflictOverwrite && len(conflicts) > 0 && !capabilities.Recycle {
+		return w.cloudFailure(task, cloudTransferError("cloud_overwrite_capability_missing", false, nil))
 	}
 	if policy == models.MediaLibraryConflictRename && len(conflicts) > 0 {
 		if err := w.renameCloudConflictGroups(ctx, driver, targets, state, conflicts); err != nil {
@@ -456,7 +470,7 @@ func (w *TransferWorker) runCloudTransfer(ctx context.Context, runtime JobRuntim
 		if err := SettleCatalogPhysicalWriteTx(tx, permit, &job); err != nil {
 			return err
 		}
-		return w.service.audit.Record(tx, &task.OwnerID, "transfer.complete", "transfer_task", task.ID, "success", map[string]any{"download_task_id": task.DownloadTaskID, "media_library_id": task.LibraryID, "mode": download.TransferMode, "files": len(targets), "provider": cloudpkg.ProviderPan115}, RequestContext{})
+		return w.service.audit.Record(tx, &task.OwnerID, "transfer.complete", "transfer_task", task.ID, "success", map[string]any{"download_task_id": task.DownloadTaskID, "media_library_id": task.LibraryID, "mode": download.TransferMode, "files": len(targets), "provider": connection.Provider}, RequestContext{})
 	})
 	if errors.Is(err, context.Canceled) {
 		return WorkerResult{}
@@ -467,11 +481,11 @@ func (w *TransferWorker) runCloudTransfer(ctx context.Context, runtime JobRuntim
 	task.Phase = models.TransferTaskStatusCompleted
 	result := w.finishCompletedTransfer(ctx, task)
 	timing := timings.Snapshot()
-	serverlog.OperationPan115CloudTransfer.Event(w.service.log.Info()).Str("task_id", task.ID).Uint("library_id", task.LibraryID).Str("transfer_mode", download.TransferMode).Int("files", len(targets)).
+	serverlog.OperationMediaTransfer.Event(w.service.log.Info()).Str("task_id", task.ID).Uint("library_id", task.LibraryID).Str("transfer_mode", download.TransferMode).Int("files", len(targets)).
 		Int64("duration_ms", time.Since(started).Milliseconds()).Int("provider_wait_calls", timing.ProviderWaitCalls).Int64("provider_wait_ms", timing.ProviderWait.Milliseconds()).
 		Int("provider_call_calls", timing.ProviderCallCalls).Int64("provider_call_ms", timing.ProviderCall.Milliseconds()).Int("target_list_calls", timing.TargetListCalls).
 		Int64("target_list_ms", timing.TargetList.Milliseconds()).Int("batch_mutation_calls", timing.BatchMutationCalls).Int64("batch_mutation_ms", timing.BatchMutation.Milliseconds()).
-		Int("db_checkpoint_calls", timing.DBCheckpointCalls).Int64("db_checkpoint_ms", timing.DBCheckpoint.Milliseconds()).Msg(serverlog.OperationPan115CloudTransfer.Message("完成"))
+		Int("db_checkpoint_calls", timing.DBCheckpointCalls).Int64("db_checkpoint_ms", timing.DBCheckpoint.Milliseconds()).Msg(serverlog.OperationMediaTransfer.Message("完成"))
 	return result
 }
 
@@ -1857,22 +1871,22 @@ func (w *TransferWorker) cloudFailure(task models.TransferTask, err error) Worke
 		code, retryable = failure.code, failure.retryable
 	}
 	code = safeLabel(code, 96)
-	message := "115 云端整理失败"
+	message := "云端整理失败"
 	if retryable {
 		phase := task.Phase
 		if code == cloudpkg.CodeRateLimited {
 			phase = models.TransferTaskStatusRiskBackoff
-			message = "115 触发接口风控，云端整理将自动重试"
+			message = "网盘触发接口限流，云端整理将自动重试"
 		} else {
-			message = "115 暂时不可用，云端整理将自动重试"
+			message = "网盘暂时不可用，云端整理将自动重试"
 		}
 		_ = w.service.db.Model(&task).Updates(map[string]any{"phase": phase, "last_error_code": code, "updated_at": time.Now().UTC()}).Error
 		next := time.Now().UTC().Add(15 * time.Second)
-		serverlog.OperationPan115CloudTransfer.Event(w.service.log.Warn()).Str("task_id", task.ID).Uint("library_id", task.LibraryID).Str("error_code", code).Time("retry_at", next).Msg(serverlog.OperationPan115CloudTransfer.Message("暂时失败，已安排自动重试"))
+		serverlog.OperationMediaTransfer.Event(w.service.log.Warn()).Str("task_id", task.ID).Uint("library_id", task.LibraryID).Str("error_code", code).Time("retry_at", next).Msg(serverlog.OperationMediaTransfer.Message("暂时失败，已安排自动重试"))
 		return WorkerResult{RetryAt: &next, ErrorCode: code, ErrorMessage: message}
 	}
 	_ = w.service.db.Model(&task).Updates(map[string]any{"phase": models.TransferTaskStatusFailed, "last_error_code": code, "updated_at": time.Now().UTC()}).Error
-	serverlog.OperationPan115CloudTransfer.Event(w.service.log.Error()).Str("task_id", task.ID).Uint("library_id", task.LibraryID).Str("error_code", code).Msg(serverlog.OperationPan115CloudTransfer.Message("失败"))
+	serverlog.OperationMediaTransfer.Event(w.service.log.Error()).Str("task_id", task.ID).Uint("library_id", task.LibraryID).Str("error_code", code).Msg(serverlog.OperationMediaTransfer.Message("失败"))
 	return WorkerResult{ErrorCode: code, ErrorMessage: message}
 }
 

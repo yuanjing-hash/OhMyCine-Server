@@ -11,7 +11,7 @@ interface SearchOptions {
   searched: Ref<boolean>
   scope: () => number[]
   siteName: (id: number) => string
-  url: (stream: boolean, scope: number[], page: number) => string
+  url: (stream: boolean, scope: number[], page: number, refresh: boolean) => string
   media: (value: unknown) => void
 }
 interface Activity extends TorrentSearchSiteDetail { receivedAt: number }
@@ -215,7 +215,7 @@ export function useSiteSearch(options: SearchOptions) {
     outcome.value = 'idle'
   }
 
-  function start(scope: number[], page = 1) {
+  function start(scope: number[], page = 1, refresh = false) {
     const allowed = options.scope()
     if (!scope.length || scope.length > 64 || new Set(scope).size !== scope.length || scope.some(id => !count(id) || id === 0 || !allowed.includes(id)) || !count(page) || page < 1 || page > 20) {
       options.error.value = '搜索站点或页码不在本次选择范围内，请重新选择'
@@ -241,7 +241,7 @@ export function useSiteSearch(options: SearchOptions) {
     attempt.timer = window.setTimeout(() => interrupt(attempt, 'search_budget_exceeded'), requestLimitMs)
     if (typeof EventSource === 'undefined') {
       mergeProgress({ total: scope.length, pending: 0, running: scope.length, completed: 0, succeeded: 0, failed: 0, result_count: 0 }, scope)
-      void api<TorrentSearchResponse>(options.url(false, scope, page), { signal: attempt.controller.signal }).then(response => {
+      void api<TorrentSearchResponse>(options.url(false, scope, page, refresh), { signal: attempt.controller.signal }).then(response => {
         if (!owns(attempt)) return
         if (!Array.isArray(response.groups) || response.groups.length !== scope.length || new Set(response.groups.map(group => group.site_id)).size !== scope.length) throw new Error('站点搜索结果不完整，请重试')
         for (const group of response.groups) if (!acceptGroup(attempt, group)) throw new Error('站点搜索结果不完整，请重试')
@@ -262,7 +262,7 @@ export function useSiteSearch(options: SearchOptions) {
       return
     }
     try {
-      const url = new URL(options.url(true, scope, page), window.location.origin)
+      const url = new URL(options.url(true, scope, page, refresh), window.location.origin)
       url.searchParams.set('progress_version', '2')
       const source = new EventSource(`${url.pathname}${url.search}`)
       attempt.source = source

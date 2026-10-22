@@ -58,7 +58,11 @@ func (c *StorageSourceClient) Test(ctx context.Context) (downloadpkg.Health, err
 	if err != nil {
 		return downloadpkg.Health{}, remoteDownloaderError(err, nodeprotocol.ErrorNodeOffline)
 	}
-	if !health.Capabilities.Has(nodeprotocol.CapabilityPan115Offline) || !health.Capabilities.Has(nodeprotocol.CapabilityPan115Read) || !health.Capabilities.Has(nodeprotocol.CapabilityRangeExport) || nodeprotocol.StorageSourceIsShare(c.sourceKind) && !health.Capabilities.Has(nodeprotocol.CapabilityPan115ShareReceive) {
+	valid := health.Capabilities.Has(nodeprotocol.CapabilityPan115Offline) && health.Capabilities.Has(nodeprotocol.CapabilityPan115Read) && health.Capabilities.Has(nodeprotocol.CapabilityRangeExport) && (!nodeprotocol.StorageSourceIsShare(c.sourceKind) || health.Capabilities.Has(nodeprotocol.CapabilityPan115ShareReceive))
+	if c.basePlan.ProviderType == nodeprotocol.StorageProviderQuark {
+		valid = nodeprotocol.QuarkShareSupported(health.Capabilities)
+	}
+	if !valid {
 		return downloadpkg.Health{}, downloadpkg.Error(nodeprotocol.ErrorCapabilityMissing, false, nil)
 	}
 	return downloadpkg.Health{Version: health.AgentVersion}, nil
@@ -187,7 +191,8 @@ func (c *StorageSourceClient) execute(ctx context.Context, forceAction bool) (no
 	requestID := operation.Plan.OperationKey
 	response, resultErr := c.node.StorageSourceActionResult(ctx, requestID, c.taskID, operation.Plan.OperationKey)
 	staleExport := response.Status == nodeprotocol.StorageSourceCompleted && (response.FileExport == nil || !response.FileExport.ExpiresAt.After(time.Now().UTC().Add(2*time.Minute)))
-	if resultErr == nil && !forceAction && response.Status != nodeprotocol.StorageSourceWaitingCredentials && !staleExport && strings.TrimSpace(response.ErrorCode) == "" {
+	renewQuark := c.basePlan.ProviderType == nodeprotocol.StorageProviderQuark && response.Status != nodeprotocol.StorageSourceCompleted && (response.CredentialExpiresAt == nil || response.CredentialExpiresAt.Before(time.Now().UTC().Add(2*time.Minute)))
+	if resultErr == nil && !forceAction && response.Status != nodeprotocol.StorageSourceWaitingCredentials && !staleExport && !renewQuark && strings.TrimSpace(response.ErrorCode) == "" {
 		if err := c.validateResponse(operation, response); err != nil {
 			return nodeprotocol.StorageSourceActionResponse{}, err
 		}
@@ -281,6 +286,9 @@ func (c *StorageSourceClient) ensureOperation(ctx context.Context) (StorageSourc
 }
 
 func (c *StorageSourceClient) validateResponse(operation StorageSourceOperation, response nodeprotocol.StorageSourceActionResponse) error {
+	if c.basePlan.ProviderType == nodeprotocol.StorageProviderQuark && response.Status == nodeprotocol.StorageSourceCompleted && (response.OutputRootID == "" || response.OutputRootID == c.basePlan.OfflineDestinationID) {
+		return downloadpkg.Error(nodeprotocol.ErrorPlanConflict, false, nil)
+	}
 	if response.RequestID != operation.Plan.OperationKey || response.OperationKey != operation.Plan.OperationKey || response.PlanDigest != operation.PlanDigest || response.TotalFiles < 0 || response.DownloadedFiles < 0 || response.DownloadedFiles > response.TotalFiles || response.TotalBytes < 0 || response.DownloadedBytes < 0 || response.DownloadedBytes > response.TotalBytes {
 		return downloadpkg.Error(nodeprotocol.ErrorPlanConflict, false, nil)
 	}
@@ -296,8 +304,12 @@ func (c *StorageSourceClient) matchesSource(source downloadpkg.Source) bool {
 	if c.sourceKind == nodeprotocol.StorageSourceKindPan115OfflineMagnet {
 		return source.Kind == downloadpkg.SourceURL && strings.TrimSpace(source.URL) == c.sourceURI
 	}
-	if c.sourceKind == nodeprotocol.StorageSourceKindPan115ShareSelected {
-		if source.Kind != downloadpkg.SourcePan115Share || source.ShareSelection == nil {
+	if c.sourceKind == nodeprotocol.StorageSourceKindPan115ShareSelected || c.sourceKind == nodeprotocol.StorageSourceKindQuarkShareSelected {
+		expected := downloadpkg.SourcePan115Share
+		if c.sourceKind == nodeprotocol.StorageSourceKindQuarkShareSelected {
+			expected = downloadpkg.SourceQuarkShare
+		}
+		if source.Kind != expected || source.ShareSelection == nil {
 			return false
 		}
 		raw, err := cloud.EncodeSelectedShareSource(source.URL, *source.ShareSelection)
@@ -318,6 +330,9 @@ func (c *StorageSourceClient) storageSourceTask(response nodeprotocol.StorageSou
 		progress = &value
 	}
 	task := downloadpkg.Task{ID: response.OperationKey, Name: response.OperationKey, Status: response.ProviderStatus, Progress: progress, BytesCompleted: &response.DownloadedBytes, BytesTotal: &response.TotalBytes, ErrorCode: response.ErrorCode, OutputItemID: c.basePlan.OfflineDestinationID}
+	if c.basePlan.ProviderType == nodeprotocol.StorageProviderQuark {
+		task.OutputItemID = response.OutputRootID
+	}
 	if response.Status == nodeprotocol.StorageSourceCompleted {
 		task.Completed = true
 		task.Status = "completed"
@@ -344,7 +359,7 @@ func storageSourceResponseError(response nodeprotocol.StorageSourceActionRespons
 	switch code {
 	case nodeprotocol.ErrorSourceShareExpired, nodeprotocol.ErrorSourceSharePassword:
 		return downloadpkg.Error(code, false, nil)
-	case nodeprotocol.ErrorSourceRateLimited, nodeprotocol.ErrorLeaseExpired, "node_source_unavailable":
+	case nodeprotocol.ErrorSourceRateLimited, nodeprotocol.ErrorLeaseExpired, "node_source_unavailable", "node_source_pending":
 		return downloadpkg.Error(code, true, nil)
 	case nodeprotocol.ErrorPlanConflict, nodeprotocol.ErrorChecksumMismatch, nodeprotocol.ErrorCapabilityMissing, nodeprotocol.ErrorReconciliationNeeded, "node_source_offline_invalid", "node_source_offline_quota_exhausted", "node_source_offline_failed":
 		return downloadpkg.Error(code, false, nil)

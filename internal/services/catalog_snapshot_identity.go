@@ -148,6 +148,9 @@ func (s *CatalogSnapshotStore) resolveCatalogIdentityBatch(ctx context.Context, 
 			if err != nil {
 				return err
 			}
+			if err = appendObservationRecoveryIdentityEvidence(ctx, tx, candidate, kind, existingIDs, evidence); err != nil {
+				return err
+			}
 			pending := make([]models.CatalogIdentity, 0)
 			newKeys := make([]string, 0)
 			newKeySet := make(map[string]bool)

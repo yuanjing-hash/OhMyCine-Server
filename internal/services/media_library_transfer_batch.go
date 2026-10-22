@@ -92,6 +92,15 @@ func (s *MediaLibraryService) ReconcileTransferBatch(ctx context.Context, taskID
 		return err
 	}
 	expected, proofErr := transferBatchExpectedFiles(task, storage.Type)
+	if models.IsNativeCloudStorage(storage.Type) && (normalizeExecutionLocation(task.ExecutionLocation) == models.NodeLocationRemote || normalizeExecutionLocation(download.ExecutionLocation) == models.NodeLocationRemote) {
+		// Node uploads persist private RemoteUploadFile receipts, not the
+		// Server executor's CloudStateJSON. Keep their authority distinct.
+		proofErr = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			var err error
+			expected, err = remoteUploadBatchEvidenceTx(tx, task, download, storage, items)
+			return err
+		})
+	}
 	if proofErr != nil || expected != len(items) {
 		return errors.New("transfer batch successful target evidence is incomplete")
 	}

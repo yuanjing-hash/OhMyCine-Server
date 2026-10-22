@@ -89,7 +89,7 @@ func (s *DownloadSettingsService) Update(ctx context.Context, actor Actor, input
 var errDownloadStagingNotConfigured = errors.New("download staging not configured")
 
 func (s *DownloadSettingsService) Snapshot(ctx context.Context, providerType string) (DownloadStagingSnapshot, error) {
-	if providerType == models.DownloaderTypeFake || providerType == models.DownloaderTypePan115Offline {
+	if providerType == models.DownloaderTypeFake || isCloudShareDownloader(providerType) {
 		return DownloadStagingSnapshot{}, nil
 	}
 	var record models.DownloadSettings
@@ -123,7 +123,7 @@ func (s *DownloadSettingsService) SnapshotForRoute(ctx context.Context, provider
 }
 
 func (s *DownloadSettingsService) ResolveSnapshot(ctx context.Context, providerType, absolute string, storageID *uint, relative string) (string, error) {
-	if providerType == models.DownloaderTypeFake || providerType == models.DownloaderTypePan115Offline {
+	if providerType == models.DownloaderTypeFake || isCloudShareDownloader(providerType) {
 		return "", nil
 	}
 	if absolute != "" {

@@ -14,7 +14,14 @@ const { apiMock, routeMock } = vi.hoisted(() => ({
 
 vi.mock('@/api/client', async importOriginal => ({
   ...await importOriginal<typeof import('@/api/client')>(),
-  api: apiMock,
+  api: (path: string, options?: RequestInit) => {
+    // Availability is refreshed independently on mount and for each search.
+    // Keep that request out of the deferred search-response queue below.
+    if (path === '/api/v1/discovery/search-options' && options?.signal) {
+      return Promise.resolve({ list: [7, 8].map(id => ({ id, name: `测试站点 ${id}`, searchable: true })) })
+    }
+    return apiMock(path, options)
+  },
 }))
 vi.mock('vue-router', () => ({ useRoute: () => routeMock, useRouter: () => ({ replace: vi.fn(), push: vi.fn() }) }))
 vi.mock('@/search-result-recognition', async () => {

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -24,6 +25,10 @@ type mediaServerRefreshFixture struct {
 	actor       Actor
 	library     models.MediaLibrary
 }
+
+// Wall-clock formatting does not provide uniqueness on every platform. Keep
+// test identities independent of the timer's precision and scheduling speed.
+var mediaServerRefreshFixtureSequence atomic.Uint64
 
 func newMediaServerRefreshFixture(t *testing.T) mediaServerRefreshFixture {
 	t.Helper()
@@ -71,7 +76,7 @@ func newMediaServerRefreshFixture(t *testing.T) mediaServerRefreshFixture {
 func (f mediaServerRefreshFixture) createConnection(t *testing.T, endpoint string) uint {
 	t.Helper()
 	created, err := f.connections.Create(f.actor, ConnectionInput{
-		Name:     "Media Server " + time.Now().UTC().Format("150405.000000000"),
+		Name:     "Media Server " + strconv.FormatUint(mediaServerRefreshFixtureSequence.Add(1), 10),
 		Provider: models.ConnectionProviderJellyfin, Endpoint: endpoint, APIKey: "private-management-key", Enabled: true,
 	}, RequestContext{})
 	if err != nil {
@@ -84,7 +89,7 @@ func (f mediaServerRefreshFixture) createTarget(t *testing.T, connectionID uint,
 	t.Helper()
 	now := time.Now().UTC()
 	target := models.MediaServerRefreshTarget{
-		LibraryID: f.library.ID, ConnectionID: connectionID, UpstreamLibraryID: "stable-library-id-" + time.Now().UTC().Format("150405.000000000"),
+		LibraryID: f.library.ID, ConnectionID: connectionID, UpstreamLibraryID: "stable-library-id-" + strconv.FormatUint(mediaServerRefreshFixtureSequence.Add(1), 10),
 		UpstreamLibraryName: "电影", Enabled: true, DesiredRevision: desired,
 		LastStatus: "idle", Revision: 1, CreatedAt: now, UpdatedAt: now,
 	}

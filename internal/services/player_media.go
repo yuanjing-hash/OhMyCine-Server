@@ -224,7 +224,7 @@ func (s *MediaLibraryService) playerLibrariesTx(tx *gorm.DB, actor Actor) ([]Pla
 	}
 	result := make([]PlayerMediaLibrary, 0, len(rows))
 	for _, row := range rows {
-		directStream := row.StorageType == models.StorageTypeLocal || row.StorageType == models.StorageTypePan115 && row.STRMEnabled && row.SignedProxyEnabled
+		directStream := row.StorageType == models.StorageTypeLocal || models.IsNativeCloudStorage(row.StorageType) && row.STRMEnabled && row.SignedProxyEnabled
 		artworkURL := playerLibraryArtworkURL(row.StorageType)
 		result = append(result, PlayerMediaLibrary{ID: row.ID, Name: row.Name, StorageType: row.StorageType, SortOrder: row.SortOrder, Status: row.Status, EntryCount: row.EntryCount, WorkCount: row.WorkCount, DirectStream: directStream, STRMEnabled: row.STRMEnabled, ArtworkURL: artworkURL, ArtworkRevision: fallbackArtworkRevision(artworkURL), ArtworkSource: "fallback", LastSuccessful: row.LastSuccessfulScanAt})
 	}
@@ -409,7 +409,7 @@ func (s *MediaLibraryService) PlayerCatalogDetail(ctx context.Context, actor Act
 				deliveryKind = playerDeliveryServerStream
 				_ = file.Close()
 			}
-		case models.StorageTypePan115:
+		case models.StorageTypePan115, models.StorageTypeQuark:
 			if strings.TrimSpace(entry.ProviderID) != "" {
 				playable = true
 				deliveryKind = playerDeliveryServerRedirect
@@ -508,8 +508,8 @@ func playerDirectStreamModeTx(tx *gorm.DB, libraryID uint) (string, error) {
 	if item.StorageType == models.StorageTypeLocal {
 		return models.StorageTypeLocal, nil
 	}
-	if item.StorageType == models.StorageTypePan115 && item.ConnectionID > 0 {
-		return models.StorageTypePan115, nil
+	if models.IsNativeCloudStorage(item.StorageType) && item.ConnectionID > 0 {
+		return item.StorageType, nil
 	}
 	return "", nil
 }
@@ -836,6 +836,49 @@ func (s *SignedProxyService) revalidatePlayerStreamSource(ctx context.Context, a
 	return nil
 }
 
+const PlayerHTTPReadProfileBoundedRangesV1 = "bounded_ranges_v1"
+
+// PlayerPlaybackCheck exposes only a fixed client transport profile. It never
+// includes a provider URL, credentials, or arbitrary native-engine options.
+type PlayerPlaybackCheck struct {
+	Ready           bool   `json:"ready"`
+	Version         int    `json:"version"`
+	HTTPReadProfile string `json:"http_read_profile,omitempty"`
+}
+
+// CheckPlayerEntry is a metadata-only preflight. It shares the Quark resolver
+// and its credential/file/client-bound URL cache with the subsequent stream.
+// Other providers retain their existing playback behavior; no file is opened
+// and no provider request is made for them. Readiness is only a point-in-time check.
+func (s *SignedProxyService) CheckPlayerEntry(ctx context.Context, actor Actor, entryID uint, userAgent, remoteAddr string) error {
+	_, err := s.CheckPlayerEntryDetails(ctx, actor, entryID, userAgent, remoteAddr)
+	return err
+}
+
+// CheckPlayerEntryDetails returns a point-in-time authorized recommendation.
+// The following stream request still performs its own authorization and source
+// checks. A bounded Range profile changes only the client's HTTP request span;
+// the original-file redirect and the Server's zero-media-body behavior remain.
+func (s *SignedProxyService) CheckPlayerEntryDetails(ctx context.Context, actor Actor, entryID uint, userAgent, remoteAddr string) (PlayerPlaybackCheck, error) {
+	if !actor.HasPermission(authz.PermissionMediaLibrariesRead) {
+		return PlayerPlaybackCheck{}, appError(CodePermissionDenied, "无权播放该媒体", nil)
+	}
+	source, err := s.playerStreamSource(ctx, actor, entryID)
+	if err != nil {
+		return PlayerPlaybackCheck{}, err
+	}
+	if source.Storage.Type != models.StorageTypeQuark {
+		if err := s.revalidatePlayerStreamSource(ctx, actor, source); err != nil {
+			return PlayerPlaybackCheck{}, err
+		}
+		return PlayerPlaybackCheck{Ready: true, Version: 1}, nil
+	}
+	if _, err := s.resolveQuarkPlayerEntry(ctx, actor, source, userAgent, remoteAddr, true); err != nil {
+		return PlayerPlaybackCheck{}, err
+	}
+	return PlayerPlaybackCheck{Ready: true, Version: 1, HTTPReadProfile: PlayerHTTPReadProfileBoundedRangesV1}, nil
+}
+
 func (s *SignedProxyService) ResolvePlayerEntry(ctx context.Context, actor Actor, entryID uint, userAgent, remoteAddr string) (PlayerStreamResolution, error) {
 	if !actor.HasPermission(authz.PermissionMediaLibrariesRead) {
 		return PlayerStreamResolution{}, appError(CodePermissionDenied, "无权播放该媒体", nil)
@@ -843,6 +886,13 @@ func (s *SignedProxyService) ResolvePlayerEntry(ctx context.Context, actor Actor
 	source, err := s.playerStreamSource(ctx, actor, entryID)
 	if err != nil {
 		return PlayerStreamResolution{}, err
+	}
+	return s.resolvePlayerEntrySource(ctx, actor, source, userAgent, remoteAddr)
+}
+
+func (s *SignedProxyService) resolvePlayerEntrySource(ctx context.Context, actor Actor, source playerStreamSource, userAgent, remoteAddr string) (PlayerStreamResolution, error) {
+	if source.Storage.Type == models.StorageTypeQuark {
+		return s.resolveQuarkPlayerEntry(ctx, actor, source, userAgent, remoteAddr, false)
 	}
 	entry, library, storage := source.Entry, source.Library, source.Storage
 	if storage.Type == models.StorageTypeLocal {
@@ -856,30 +906,32 @@ func (s *SignedProxyService) ResolvePlayerEntry(ctx context.Context, actor Actor
 		}
 		return PlayerStreamResolution{Kind: playerStreamKindLocal, File: file, Name: filepath.Base(filepath.FromSlash(entry.RelativePath)), ModifiedAt: info.ModTime()}, nil
 	}
-	if storage.Type != models.StorageTypePan115 || storage.ConnectionID == nil || *storage.ConnectionID == 0 || strings.TrimSpace(entry.ProviderID) == "" || s.connections == nil {
+	if !models.IsNativeCloudStorage(storage.Type) || storage.ConnectionID == nil || *storage.ConnectionID == 0 || strings.TrimSpace(entry.ProviderID) == "" || s.connections == nil {
 		return PlayerStreamResolution{}, appError(CodeProxyTargetUnavailable, "播放目标不可用", nil)
 	}
 	_, driver, err := s.connections.driver(*storage.ConnectionID)
+	if mapped := quarkPlaybackError(storage.Type, err); mapped != nil {
+		return PlayerStreamResolution{}, mapped
+	}
 	if err != nil || !driver.Capabilities().TemporaryDirectURL {
 		return PlayerStreamResolution{}, appError(CodeProxyTargetUnavailable, "播放目标不可用", err)
 	}
 	readCtx := cloudpkg.WithReadClass(ctx, cloudpkg.ReadClassInteractive)
-	item, err := driver.Stat(readCtx, entry.ProviderID)
-	if err != nil || item.IsDir || item.ID != entry.ProviderID || strings.TrimSpace(item.PickCode) == "" {
-		return PlayerStreamResolution{}, appError(CodeProxyTargetUnavailable, "播放目标不可用", err)
-	}
 	rootID := strings.TrimSpace(library.ProviderRootID)
 	if rootID == "" {
 		rootID = strings.TrimSpace(storage.RootPath)
 	}
-	within, err := providerParentWithinRoot(readCtx, driver, item.ParentID, rootID)
-	if err != nil || !within {
+	item, err := resolvePlaybackItem(readCtx, driver, storage.Type, rootID, entry.RelativePath, entry.ProviderID)
+	if mapped := quarkPlaybackError(storage.Type, err); mapped != nil {
+		return PlayerStreamResolution{}, mapped
+	}
+	if err != nil || (storage.Type == models.StorageTypePan115 && strings.TrimSpace(item.PickCode) == "") {
 		return PlayerStreamResolution{}, appError(CodeProxyTargetUnavailable, "播放目标不可用", err)
 	}
 	if err := s.revalidatePlayerStreamSource(ctx, actor, source); err != nil {
 		return PlayerStreamResolution{}, err
 	}
-	target := signedProxyTarget{LibraryID: library.ID, ConnectionID: *storage.ConnectionID, ProviderItemID: item.ID, StorageType: storage.Type, LibraryEnabled: true, StorageEnabled: true}
+	target := signedProxyTarget{LibraryID: library.ID, ConnectionID: *storage.ConnectionID, ProviderItemID: item.ID, StorageType: storage.Type, ProviderRootID: rootID, LibraryEnabled: true, StorageEnabled: true}
 	redirect, err := s.resolveTargetWithItem(ctx, playerEntryProxyIdentity(library.ID, entry.ID, item.ID), target, userAgent, playbackClientFingerprint(remoteAddr, userAgent), &item)
 	if err != nil {
 		return PlayerStreamResolution{}, err

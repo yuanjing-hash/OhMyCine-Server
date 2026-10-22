@@ -15,6 +15,7 @@
 | 08 | [Server Web UI 设计](08-server-web-ui-design.md) | 管理端导航、顶栏、混合型仪表盘、权限可见性与响应式规则 |
 | 09 | [可靠性与管理闭环](09-server-reliability.md) | 多版本、任务授权、历史图片、分页管理与性能边界 |
 | 10 | [升级恢复方案](10-upgrade-recovery-design.md) | 仅设计：一致性备份、密钥匹配、程序回退与数据恢复 |
+| 夸克 | [原生连接与媒体同步](quark-native.md) | TV 原文件 302、聚合授权、变化观察、操作收据与任务边界 |
 | 28 | [插件原生离线下载](28-plugin-native-offline.md) | op20、设备授权、HLS 控制展开和只读账号摘要 |
 | 29 | [在线目录缓存与 Player 系统历史](29-plugin-catalogue-and-player-history.md) | 持久预热、scope 失效、精确在线历史与版本能力 |
 | 30 | [慢速站点搜索与渐进结果](30-progressive-site-search.md) | 搜索预算、同站累计快照、细进度、兼容与部分结果保留 |

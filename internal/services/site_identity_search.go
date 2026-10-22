@@ -16,19 +16,26 @@ import (
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/mediarecognition"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/metadata/tmdb"
+	sitepkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/site"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/site/builtin"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/site/pansou"
 	"golang.org/x/text/cases"
 	"golang.org/x/text/unicode/norm"
 )
 
 type MediaIdentitySearchInput struct {
-	ProgressVersion int
-	MediaType       string
-	TMDBID          int64
-	Season          *int
-	Page            int
-	SiteID          *uint
-	SiteIDs         []uint
+	MediaType          string
+	TMDBID             int64
+	Season             *int
+	Page               int
+	SiteID             *uint
+	SiteIDs            []uint
+	ClientCapabilities []string
+	TypePolicy         string
+	CloudTypes         []string
+	SnapshotID         string
+	Refresh            bool
+	ProgressVersion    int
 }
 
 type MediaIdentitySearchResult struct {
@@ -124,6 +131,13 @@ func (s *SiteService) SearchMediaIdentityEachProgress(ctx context.Context, actor
 }
 
 func (s *SiteService) searchMediaIdentitySite(ctx context.Context, actor Actor, input MediaIdentitySearchInput, verified tmdb.Match, names []tmdb.SearchName, record models.Site) SiteSearchGroup {
+	if record.Kind == pansou.Kind {
+		return s.searchPanSouIdentitySite(ctx, actor, input, verified, names, record)
+	}
+	return s.searchMediaIdentitySitePage(ctx, actor, input, verified, names, record)
+}
+
+func (s *SiteService) searchMediaIdentitySitePage(ctx context.Context, actor Actor, input MediaIdentitySearchInput, verified tmdb.Match, names []tmdb.SearchName, record models.Site) SiteSearchGroup {
 	var target *SiteSearchGroup
 	privateKeys := make(map[string]int)
 	ctx = serverlog.WithBusinessFields(ctx, map[string]any{"site_id": record.ID, "site_name": record.Name, "user_id": actor.User.ID})
@@ -138,7 +152,7 @@ func (s *SiteService) searchMediaIdentitySite(ctx context.Context, actor Actor, 
 			break
 		}
 		reportSearchQuery(ctx, queryIndex+1, len(names), name.Value)
-		group := s.searchSite(ctx, actor, record, SiteSearchInput{Keyword: name.Value, MediaType: input.MediaType, SearchBy: "title", Year: identitySearchYear(input.MediaType, verified.ReleaseYear), TMDBID: &input.TMDBID, Page: input.Page, SiteID: &record.ID})
+		group := s.searchSite(ctx, actor, record, SiteSearchInput{ClientCapabilities: input.ClientCapabilities, TypePolicy: input.TypePolicy, CloudTypes: input.CloudTypes, Refresh: input.Refresh, ProgressVersion: input.ProgressVersion, Keyword: name.Value, MediaType: input.MediaType, SearchBy: "title", Year: identitySearchYear(input.MediaType, verified.ReleaseYear), TMDBID: &input.TMDBID, Page: input.Page, SiteID: &record.ID})
 		aliasCtx := serverlog.WithBusinessFields(ctx, map[string]any{"query_name": name.Value})
 		rejections := newFollowRejections()
 		kept, replaced := 0, 0
@@ -152,6 +166,23 @@ func (s *SiteService) searchMediaIdentitySite(ctx context.Context, actor Actor, 
 		}
 		target.HasNext = target.HasNext || group.HasNext
 		target.Skipped += group.Skipped
+		target.Partial = target.Partial || group.Partial
+		target.Truncated = target.Truncated || group.Truncated
+		if group.Completion != "" {
+			target.Completion = group.Completion
+		}
+		for _, warning := range group.Warnings {
+			present := false
+			for _, saved := range target.Warnings {
+				if saved.Code == warning.Code {
+					present = true
+					break
+				}
+			}
+			if !present {
+				target.Warnings = append(target.Warnings, warning)
+			}
+		}
 		if group.Partial {
 			target.Partial, target.IncompleteReason = true, group.IncompleteReason
 		}
@@ -181,12 +212,12 @@ func (s *SiteService) searchMediaIdentitySite(ctx context.Context, actor Actor, 
 				continue
 			}
 			identity := claim.TorrentID
-			if item.SourceKind == "115_share" && item.ResourceFingerprint != "" {
+			if (isCloudShareSource(item.SourceKind) || item.SourceKind == RouteSourceBT) && item.ResourceFingerprint != "" {
 				identity = item.ResourceFingerprint
 			}
 			key := strconv.FormatUint(uint64(group.SiteID), 10) + ":" + identity
 			index, duplicate := privateKeys[key]
-			if duplicate && (item.SourceKind != "115_share" || compareOptionalTime(item.Published, target.Items[index].Published) <= 0) {
+			if duplicate && (!isCloudShareSource(item.SourceKind) || compareOptionalTime(item.Published, target.Items[index].Published) <= 0) {
 				s.deleteClaim(item.Token)
 				rejections.add("duplicate", item.Title)
 				continue
@@ -213,11 +244,16 @@ func (s *SiteService) searchMediaIdentitySite(ctx context.Context, actor Actor, 
 		if group.Status == "success" {
 			s.recordSearch(aliasCtx, "site.identity.finish", "identity", "confirmed", fmt.Sprintf("名称“%s”返回 %d 条可用结果，作品与季集验证、去重后新增 %d 条，替换同分享较旧帖子 %d 条，当前站点合计 %d 条", serverlog.BusinessDisplayName(name.Value), len(group.Items), kept, replaced, len(target.Items)), map[string]any{"result_count": len(group.Items), "identity_kept": kept, "updated_count": replaced, "deduplicated_count": len(target.Items)})
 		}
-		snapshot := cloneSearchGroup(*target)
-		sortIdentitySearchItems(snapshot.Items)
-		if !publishSearchSnapshot(ctx, snapshot) {
-			target.Partial, target.IncompleteReason = true, CodeSearchResultLimit
-			break
+		// PanSou builds one bounded multi-alias snapshot across its cached pages.
+		// Internal pages are not the requested client page and must not be emitted
+		// as cumulative SSE rows. The coordinator publishes its final projection.
+		if record.Kind != pansou.Kind {
+			snapshot := cloneSearchGroup(*target)
+			sortIdentitySearchItems(snapshot.Items)
+			if !publishSearchSnapshot(ctx, snapshot) {
+				target.Partial, target.IncompleteReason = true, CodeSearchResultLimit
+				break
+			}
 		}
 		if group.ErrorCode == CodeSearchRateWait || group.ErrorCode == CodeSearchCancelled || ctx.Err() != nil {
 			break
@@ -226,6 +262,10 @@ func (s *SiteService) searchMediaIdentitySite(ctx context.Context, actor Actor, 
 	if target == nil {
 		definition, _ := builtin.DefinitionForKey(record.Kind)
 		return SiteSearchGroup{SiteID: record.ID, SiteName: record.Name, SiteType: definition.SiteType, Status: "error", ErrorCode: CodeSiteUnavailable, Page: input.Page, Items: []SiteSearchResult{}}
+	}
+	if record.Kind == pansou.Kind && target.ErrorCount > 0 && target.Status == "success" {
+		target.Partial = true
+		target.Warnings = append(target.Warnings, sitepkg.SearchWarning{Code: "pansou_alias_search_incomplete", Message: "部分作品名称搜索未完成，已保留成功返回的结果"})
 	}
 	if target.QueriesCompleted < target.QueriesTotal {
 		target.Partial = target.QueriesCompleted > 0

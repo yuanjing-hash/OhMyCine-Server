@@ -2,6 +2,8 @@ package services
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"path"
@@ -40,6 +42,7 @@ type providerDirectoryClaims struct {
 	Purpose       string `json:"purpose"`
 	Offset        int64  `json:"offset,omitempty"`
 	ExpiresAt     int64  `json:"expires_at"`
+	Binding       string `json:"binding,omitempty"`
 }
 
 type ProviderDirectorySelection struct {
@@ -67,9 +70,26 @@ func (s *ProviderDirectoryService) Browse(ctx context.Context, actor Actor, conn
 	if resolved.ItemID != "" {
 		claims = resolved
 	}
-	_, driver, err := s.connections.Driver(actor, connectionID)
+	record, driver, err := s.connections.Driver(actor, connectionID)
 	if err != nil {
 		return DirectoryListing{}, err
+	}
+	if record.Provider == models.ConnectionProviderQuark && claims.Binding == "" {
+		claims.Binding, err = s.quarkDirectoryBinding(ctx, connectionID)
+		if err != nil {
+			return DirectoryListing{}, err
+		}
+		// Quark namespaces every resource, including the account root. Do not
+		// mix its qualified parent identity with the legacy 115 root alias.
+		resolver, ok := driver.(cloudpkg.DirectoryPathResolver)
+		if !ok {
+			return DirectoryListing{}, appError(CodeDirectoryUnavailable, "网盘目录定位不可用", nil)
+		}
+		root, resolveErr := resolver.ResolveDirectory(ctx, "/")
+		if resolveErr != nil || !root.IsDir || root.ID == "" {
+			return DirectoryListing{}, providerDirectoryError(resolveErr)
+		}
+		claims.ItemID = root.ID
 	}
 	return s.browse(ctx, actor, driver, claims)
 }
@@ -94,6 +114,12 @@ func (s *ProviderDirectoryService) BrowseStorage(ctx context.Context, actor Acto
 	}
 	if resolved.ItemID != "" {
 		claims = resolved
+	}
+	if storage.Type == models.StorageTypeQuark && claims.Binding == "" {
+		claims.Binding, err = s.quarkDirectoryBinding(ctx, *storage.ConnectionID)
+		if err != nil {
+			return DirectoryListing{}, err
+		}
 	}
 	_, driver, err := s.connections.driver(*storage.ConnectionID)
 	if err != nil {
@@ -236,7 +262,7 @@ func (s *ProviderDirectoryService) browse(ctx context.Context, actor Actor, driv
 		return DirectoryListing{}, err
 	}
 	listing := DirectoryListing{
-		Platform:              cloudpkg.ProviderPan115,
+		Platform:              driver.Provider(),
 		Location:              claims.DisplayPath,
 		CurrentToken:          currentBrowse,
 		CurrentSelectionToken: currentSelect,
@@ -250,7 +276,7 @@ func (s *ProviderDirectoryService) browse(ctx context.Context, actor Actor, driv
 			return DirectoryListing{}, err
 		}
 	}
-	if claims.ItemID != "0" && (claims.StorageID == 0 || claims.ItemID != claims.StorageRootID) {
+	if claims.DisplayPath != "/" && claims.ItemID != "0" && (claims.StorageID == 0 || claims.ItemID != claims.StorageRootID) {
 		parentDisplay := path.Dir(claims.DisplayPath)
 		listing.ParentToken, _ = s.sign(claims.scoped(actor.User.ID, claims.ParentID, "", parentDisplay, tokenPurposeBrowse, 0))
 	}
@@ -325,7 +351,7 @@ func (s *ProviderDirectoryService) providerStorage(storageID uint) (models.Stora
 	if err := s.connections.db.First(&storage, storageID).Error; err != nil {
 		return storage, storageNotFound(err)
 	}
-	if storage.Type != models.StorageTypePan115 || storage.ConnectionID == nil || strings.TrimSpace(storage.RootPath) == "" {
+	if !isNativeCloudProvider(storage.Type) || storage.ConnectionID == nil || strings.TrimSpace(storage.RootPath) == "" {
 		return storage, appError(CodeStorageTypeUnsupported, "该 Storage 不支持网盘目录浏览", nil)
 	}
 	return storage, nil
@@ -346,7 +372,7 @@ func (s *ProviderDirectoryService) ensureWithinStorage(ctx context.Context, driv
 			return appError(CodeMediaLibraryPathInvalid, "所选网盘目录不在 Storage 范围内", nil)
 		}
 		if _, exists := visited[current]; exists {
-			return appError(CodeDirectoryUnavailable, "115 目录暂时不可用", nil)
+			return appError(CodeDirectoryUnavailable, "网盘目录暂时不可用", nil)
 		}
 		visited[current] = struct{}{}
 		item, err := driver.Stat(ctx, current)
@@ -370,7 +396,7 @@ func (s *ProviderDirectoryService) sign(claims providerDirectoryClaims) (string,
 
 func (claims providerDirectoryClaims) scoped(actorID uint, itemID, parentID, displayPath, purpose string, offset int64) providerDirectoryClaims {
 	return providerDirectoryClaims{
-		ActorID: actorID, ConnectionID: claims.ConnectionID, StorageID: claims.StorageID, StorageRootID: claims.StorageRootID,
+		ActorID: actorID, ConnectionID: claims.ConnectionID, StorageID: claims.StorageID, StorageRootID: claims.StorageRootID, Binding: claims.Binding,
 		ItemID: itemID, ParentID: parentID, DisplayPath: displayPath, Purpose: purpose, Offset: offset,
 	}
 }
@@ -396,7 +422,32 @@ func (s *ProviderDirectoryService) resolve(actor Actor, token, purpose string) (
 	if s.now().Unix() >= claims.ExpiresAt {
 		return providerDirectoryClaims{}, appError(CodeDirectoryTokenExpired, "目录令牌已过期，请重新选择", nil)
 	}
+	var connection models.Connection
+	if err := s.connections.db.Select("id", "provider").First(&connection, claims.ConnectionID).Error; err != nil {
+		return providerDirectoryClaims{}, appError(CodeDirectoryTokenInvalid, "目录所属连接已变化，请重新选择", nil)
+	}
+	if connection.Provider == models.ConnectionProviderQuark {
+		current, err := s.quarkDirectoryBinding(context.Background(), claims.ConnectionID)
+		if err != nil || claims.Binding == "" || claims.Binding != current {
+			return providerDirectoryClaims{}, appError(CodeDirectoryTokenInvalid, "连接授权或配置已变化，请重新选择目录", nil)
+		}
+	}
 	return claims, nil
+}
+
+func (s *ProviderDirectoryService) quarkDirectoryBinding(ctx context.Context, id uint) (string, error) {
+	record, bundle, err := s.connections.quarkCredentials(ctx, id)
+	if err != nil {
+		return "", err
+	}
+	if !record.Enabled || bundle.TV == nil || !bundle.TV.IdentityVerified || bundle.TV.AccountID == "" {
+		return "", appError(CodeDirectoryUnavailable, "请先完成原画播放授权", nil)
+	}
+	// Token refresh preserves a verified identity. Account or configuration
+	// changes require a fresh picker selection, without exposing either ID.
+	raw, _ := json.Marshal([]any{record.ID, record.Revision, bundle.TV.AccountID})
+	digest := sha256.Sum256(raw)
+	return hex.EncodeToString(digest[:]), nil
 }
 
 func normalizeProviderRelativePath(value string) (string, error) {
@@ -431,7 +482,7 @@ func providerDirectoryError(err error) error {
 		return appError(CodeDirectoryNotFound, "网盘目录不存在或已失效", nil)
 	}
 	if code == cloudpkg.CodeRateLimited {
-		return appError(CodeDirectoryRateLimited, "115 请求受到限速，请稍后重试", nil)
+		return appError(CodeDirectoryRateLimited, "网盘请求受到限速，请稍后重试", nil)
 	}
-	return appError(CodeDirectoryUnavailable, "115 目录暂时不可用", err)
+	return appError(CodeDirectoryUnavailable, "网盘目录暂时不可用", err)
 }

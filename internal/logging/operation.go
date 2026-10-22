@@ -33,6 +33,7 @@ var (
 	OperationRuntimeLogging                 = Operation{"runtime_logging", "运行日志"}
 	OperationConnectionProbe                = Operation{"connection_probe", "连接检测"}
 	OperationProviderLifeEvent              = Operation{"provider_life_event", "115生活事件"}
+	OperationProviderObservation            = Operation{"provider_observation", "网盘目录巡检"}
 	OperationLibraryInitialScan             = Operation{"library_initial_scan", "媒体库首次扫描"}
 	OperationLibraryIncrementalScan         = Operation{"library_incremental_scan", "媒体库增量扫描"}
 	OperationLibraryFullScan                = Operation{"library_full_scan", "媒体库全量扫描"}
@@ -57,7 +58,9 @@ var (
 	OperationDownloadClassification         = Operation{"download_classification", "下载预分类"}
 	OperationPan115OfflineDownload          = Operation{"pan115_offline_download", "115离线下载"}
 	OperationPan115ShareIngest              = Operation{"pan115_share_ingest", "115分享摄取"}
+	OperationQuarkShareIngest               = Operation{"quark_share_ingest", "夸克分享入库"}
 	OperationPan115CloudTransfer            = Operation{"pan115_cloud_transfer", "115云端整理"}
+	OperationCloudTransfer                  = Operation{"cloud_transfer", "网盘文件传输"}
 	OperationMediaTransfer                  = Operation{"media_transfer", "媒体整理"}
 	OperationMediaReorganization            = Operation{"media_reorganization", "修正识别与重新整理"}
 	OperationSeedingManagement              = Operation{"seeding_management", "做种管理"}

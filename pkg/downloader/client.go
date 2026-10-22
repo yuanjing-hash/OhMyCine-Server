@@ -15,6 +15,7 @@ const (
 	SourceURL                       = "url"
 	SourceTorrent                   = "torrent"
 	SourcePan115Share               = "115_share"
+	SourceQuarkShare                = "quark_share"
 	SourceProviderItem              = "provider_item"
 	OutputConstraintNone            = "none"
 	OutputConstraintLocalStaging    = "local_staging"
@@ -36,12 +37,17 @@ type Capabilities struct {
 }
 
 type Config struct {
-	BaseURL               string
-	Username              string
-	Password              string
-	CloudDriver           cloud.NativeOfflineDriver
+	BaseURL     string
+	Username    string
+	Password    string
+	CloudDriver cloud.NativeOfflineDriver
+	// ShareDriver supports native share receivers without requiring offline download.
+	ShareDriver           cloud.ShareBrowseDriver
 	ProviderStorageRootID string
 	ProviderDirectoryID   string
+	// Local-only frozen locators; they are not provider IDs or Node wire grants.
+	ProviderStorageRootPath string
+	ProviderDirectoryPath   string
 }
 
 type Source struct {

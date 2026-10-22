@@ -143,6 +143,15 @@ func (s *MediaReorganizationService) Preview(ctx context.Context, actor Actor, i
 	if err != nil {
 		return MediaReorganizationPreviewResult{}, err
 	}
+	if storage.Type == models.StorageTypeQuark {
+		versioned, err := s.reorganizationCatalogMode(ctx, library.ID)
+		if err != nil || !versioned {
+			return MediaReorganizationPreviewResult{}, appError(CodeReorganizationUnavailable, "夸克重新整理需要已初始化的版本化媒体目录", nil)
+		}
+		if _, _, err := s.reorganizationCloudDriver(ctx, library, storage, ""); err != nil {
+			return MediaReorganizationPreviewResult{}, appError(CodeReorganizationUnavailable, "夸克管理授权或当前媒体库的共同空间验证不可用", nil)
+		}
+	}
 	if s.metadata == nil {
 		return MediaReorganizationPreviewResult{}, appError(CodeTMDBUnavailable, "TMDB 未配置", nil)
 	}
@@ -603,16 +612,16 @@ func (s *MediaReorganizationService) reorganizationTargetExists(ctx context.Cont
 		}
 		return false, appError(CodeReorganizationUnavailable, "重新整理目标不可用", nil)
 	}
-	if storage.Type != models.StorageTypePan115 || storage.ConnectionID == nil || s.connections == nil || library.ProviderRootID == "" {
+	if storage.Type != models.StorageTypePan115 && storage.Type != models.StorageTypeQuark || storage.ConnectionID == nil || s.connections == nil || library.ProviderRootID == "" {
 		return false, appError(CodeReorganizationUnavailable, "当前存储类型不支持重新整理", nil)
 	}
-	connection, driver, err := s.connections.driver(*storage.ConnectionID)
-	if err != nil || connection.Provider != cloudpkg.ProviderPan115 {
-		return false, appError(CodeReorganizationUnavailable, "115 连接不可用", nil)
+	driver, _, err := s.reorganizationCloudDriver(ctx, library, storage, "")
+	if err != nil {
+		return false, appError(CodeReorganizationUnavailable, "网盘连接或文件管理授权不可用", nil)
 	}
 	root, err := providerItemWithinRoot(ctx, driver, library.ProviderRootID, storage.RootPath)
 	if err != nil || !root.IsDir {
-		return false, appError(CodeReorganizationBoundaryChanged, "115 媒体库边界已变化", nil)
+		return false, appError(CodeReorganizationBoundaryChanged, "网盘媒体库边界已变化", nil)
 	}
 	parent := root.ID
 	for _, segment := range strings.Split(pathpkg.Dir(relative), "/") {
@@ -628,7 +637,7 @@ func (s *MediaReorganizationService) reorganizationTargetExists(ctx context.Cont
 			return false, nil
 		}
 		if len(matches) != 1 || !matches[0].IsDir {
-			return false, appError(CodeReorganizationConflict, "115 目标目录存在冲突", nil)
+			return false, appError(CodeReorganizationConflict, "网盘目标目录存在冲突", nil)
 		}
 		parent = matches[0].ID
 	}

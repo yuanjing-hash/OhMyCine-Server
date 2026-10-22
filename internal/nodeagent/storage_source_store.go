@@ -105,8 +105,17 @@ func (s *Store) SaveStorageSourceFileBatch(ctx context.Context, operationKey str
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
+	allowSHA256Only := false
+	var raw string
+	if e := tx.QueryRowContext(ctx, `SELECT plan_json FROM operations WHERE operation_key=?`, operationKey).Scan(&raw); e == nil {
+		var op nodeprotocol.OperationPlan
+		var plan nodeprotocol.StorageSourcePlan
+		if json.Unmarshal([]byte(raw), &op) == nil && json.Unmarshal(op.Payload, &plan) == nil && op.Kind == nodeprotocol.OperationKindStorageSourceMaterialize && plan.ProviderType == nodeprotocol.StorageProviderQuark && plan.DigestVersion == 2 && plan.Validate() == nil {
+			allowSHA256Only = true
+		}
+	}
 	for _, file := range files {
-		if file.OperationKey != operationKey || file.Ordinal < 0 || !validStorageSourceProviderID(file.ProviderFileID) || normalizedExportPath(file.RelativePath) != file.RelativePath || file.Size <= 0 || !validSHA1(file.SourceSHA1) || file.ChunkCount < 1 {
+		if file.OperationKey != operationKey || file.Ordinal < 0 || !validStorageSourceProviderID(file.ProviderFileID) || normalizedExportPath(file.RelativePath) != file.RelativePath || file.Size <= 0 || (!validSHA1(file.SourceSHA1) && !(allowSHA256Only && file.SourceSHA1 == "")) || file.ChunkCount < 1 {
 			return errors.New("node_storage_source_manifest_invalid")
 		}
 		result, err := tx.ExecContext(ctx, `INSERT INTO storage_source_files(operation_key,ordinal,provider_file_id,relative_path,relative_key,size,source_sha1,status,chunk_count,updated_at) VALUES(?,?,?,?,?,?,?,'pending',?,?) ON CONFLICT(operation_key,ordinal) DO NOTHING`, operationKey, file.Ordinal, file.ProviderFileID, file.RelativePath, strings.ToLower(file.RelativePath), file.Size, strings.ToUpper(file.SourceSHA1), file.ChunkCount, now.UTC())

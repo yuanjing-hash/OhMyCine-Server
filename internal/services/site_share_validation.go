@@ -30,7 +30,7 @@ type siteShareValidationEntry struct {
 }
 
 func shareSourceDigest(raw string) string {
-	normalized, _, err := pan115.NormalizeShareLink(raw, "")
+	normalized, _, _, err := normalizeCloudShare(raw)
 	if err != nil {
 		return ""
 	}
@@ -127,6 +127,10 @@ func (s *SiteService) inspectResultShare(ctx context.Context, actor Actor, claim
 	if err != nil {
 		return nil, "", validation, err
 	}
+	var selected models.Downloader
+	if err := s.db.WithContext(ctx).Select("type").First(&selected, "id = ?", downloaderID).Error; err != nil || !routeDownloaderApplicable(claimCloudSource(claim), selected) {
+		return nil, "", validation, appError(CodeDownloadSourceInvalid, "所选接收器与分享网盘不一致", nil)
+	}
 	if s.downloads == nil || s.downloads.downloader == nil || s.downloads.downloader.connections == nil {
 		return nil, "", validation, appError(CodeDownloaderUnavailable, "下载服务不可用", nil)
 	}
@@ -187,8 +191,8 @@ func (s *SiteService) inspectResultShare(ctx context.Context, actor Actor, claim
 	if err == nil {
 		status = 200
 	}
-	_, shareID, _ := pan115.NormalizeShareLink(raw, "")
-	fingerprint := sha256.Sum256([]byte("115:" + shareID))
+	_, provider, shareID, _ := normalizeCloudShare(raw)
+	fingerprint := sha256.Sum256([]byte(provider + ":" + shareID))
 	event := s.log.Info()
 	if err != nil {
 		event = s.log.Warn()

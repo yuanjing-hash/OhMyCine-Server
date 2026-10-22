@@ -40,11 +40,11 @@ func (w *TransferWorker) planRemoteNodeUpload(ctx context.Context, download mode
 		return nil, 0, err
 	}
 	capabilities := driver.Capabilities()
-	if connection.Provider != cloudpkg.ProviderPan115 || !capabilities.DirectoryList || !capabilities.FileUpload || !capabilities.CreateDirectory || !capabilities.Recycle {
+	if !models.IsNativeCloudStorage(connection.Provider) || connection.Provider != download.TargetStorageType || !capabilities.DirectoryList || !capabilities.FileUpload || !capabilities.CreateDirectory {
 		return nil, 0, cloudTransferError("cloud_upload_capability_missing", false, nil)
 	}
 	var storage models.Storage
-	if err := w.service.db.WithContext(ctx).First(&storage, *download.TargetStorageID).Error; err != nil || storage.Type != models.StorageTypePan115 || storage.ConnectionID == nil || *storage.ConnectionID != *download.TargetConnectionID {
+	if err := w.service.db.WithContext(ctx).First(&storage, *download.TargetStorageID).Error; err != nil || storage.Type != download.TargetStorageType || storage.ConnectionID == nil || *storage.ConnectionID != *download.TargetConnectionID {
 		return nil, 0, cloudTransferError("cloud_transfer_boundary_invalid", false, err)
 	}
 	targetBasePath, _ := joinProviderPath(storage.RootDisplayPath, download.TargetRelativeRoot)
@@ -104,6 +104,9 @@ func (w *TransferWorker) planRemoteNodeUpload(ctx context.Context, download mode
 		case models.MediaLibraryConflictSkip:
 			planned.ConflictAction = remoteUploadSkipIfExists
 		case models.MediaLibraryConflictOverwrite:
+			if !capabilities.Recycle {
+				return nil, 0, cloudTransferError("cloud_upload_replace_unavailable", false, nil)
+			}
 			if matches[0].IsDir {
 				return nil, 0, cloudTransferError("cloud_transfer_target_type_conflict", false, nil)
 			}
@@ -187,8 +190,14 @@ func availableFrozenRemoteUploadName(name string, items []cloudpkg.Item, reserve
 }
 
 func (w *TransferWorker) loadRemoteUploadFiles(ctx context.Context, task models.TransferTask, download models.DownloadTask, manifest downloadpkg.Manifest) ([]models.RemoteUploadFile, bool, error) {
+	return loadRemoteUploadFilesTx(w.service.db.WithContext(ctx), task, download, manifest)
+}
+
+// The terminal publisher uses the same immutable-file checks as the executor;
+// it must not reconstruct a second, weaker completion manifest from summaries.
+func loadRemoteUploadFilesTx(tx *gorm.DB, task models.TransferTask, download models.DownloadTask, manifest downloadpkg.Manifest) ([]models.RemoteUploadFile, bool, error) {
 	var rows []models.RemoteUploadFile
-	if err := w.service.db.WithContext(ctx).Where("transfer_task_id = ?", task.ID).Order("ordinal ASC").Find(&rows).Error; err != nil {
+	if err := tx.Where("transfer_task_id = ?", task.ID).Order("ordinal ASC").Find(&rows).Error; err != nil {
 		return nil, false, err
 	}
 	if len(rows) == 0 {
@@ -214,6 +223,9 @@ func (w *TransferWorker) loadRemoteUploadFiles(ctx context.Context, task models.
 	}
 	seen := make(map[string]struct{}, len(rows))
 	for index, row := range rows {
+		if download.TargetStorageType == models.StorageTypeQuark && (row.Status == nodeprotocol.StorageFileCompleted || row.Status == nodeprotocol.StorageFileReused) && !validRemoteQuarkDigest(row.TargetDigestJSON, row.SHA256) {
+			return nil, true, errors.New("quark remote upload receipt has no verified content digest")
+		}
 		file, ok := byToken[row.SourceFileToken]
 		if !ok || row.Ordinal != index || row.TransferTaskID != task.ID || row.DownloadTaskID != task.DownloadTaskID || row.SourceRelative != file.RelativePath || row.Size != file.Size || row.SHA256 != file.SHA256 || !validRemoteUploadConflictAction(row.ConflictAction) {
 			return nil, true, errors.New("remote upload plan conflicts with frozen manifest")

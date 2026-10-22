@@ -1,6 +1,19 @@
-import type { DownloadTaskSummary } from '@/types/api'
+import type { DownloaderSummary, DownloadTaskSummary, TransferNodeSummary } from '@/types/api'
 
 export type DownloadSourceMode = 'url' | 'torrent' | 'share'
+export function isCloudShareSource(kind?: string): kind is '115_share' | 'quark_share' { return kind === '115_share' || kind === 'quark_share' }
+export function isCloudDownloader(type?: string): boolean { return type === 'pan115_offline' || type === 'quark_share' }
+export function cloudShareDownloaderType(source?: string): 'pan115_offline' | 'quark_share' { return source === 'quark_share' ? 'quark_share' : 'pan115_offline' }
+export function downloadSourceKind(mode: DownloadSourceMode, downloaderType?: string): string { return mode === 'share' ? (downloaderType === 'quark_share' ? 'quark_share' : '115_share') : mode }
+export function nodeSupportsDownloader(node: Pick<TransferNodeSummary, 'status' | 'capabilities'>, type: DownloaderSummary['type']): boolean {
+  if (node.status !== 'online') return false
+  const required: Partial<Record<DownloaderSummary['type'], string[]>> = {
+    qbittorrent: ['qbittorrent_control', 'range_export'],
+    pan115_offline: ['pan115_offline', 'pan115_read', 'pan115_share_receive', 'range_export'],
+    quark_share: ['quark_tv_read_v2', 'quark_share_receive_v2', 'content_digest_v2', 'range_export'],
+  }
+  return required[type]?.every(code => node.capabilities.codes.includes(code)) ?? false
+}
 export type DownloadManagementSection = 'active' | 'history' | 'create' | 'seeding' | 'downloaders' | 'nodes'
 export interface DownloaderTaskStats { active: number; total: number; downloadSpeed: number | null; uploadSpeed: number | null; averageProgress: number | null }
 export interface DownloadRetryPresentationState { errorFingerprint: string; taskUpdatedAt: string; observedActive: boolean }

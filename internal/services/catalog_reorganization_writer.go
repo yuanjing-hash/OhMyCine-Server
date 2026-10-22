@@ -36,6 +36,11 @@ type reorganizationCatalogState struct {
 	ArtifactGeneration       uint64                `json:"artifact_generation,omitempty"`
 	ExecutionProofVersion    int                   `json:"execution_proof_version,omitempty"`
 	ExecutionStarted         bool                  `json:"execution_started,omitempty"`
+	// Retained across asynchronous waits, cancellation and process restart. Only
+	// the transaction publishing the verified result may release this hold.
+	ObservationHoldVersion int                          `json:"observation_hold_version,omitempty"`
+	QuarkMutation          *quarkReorganizationMutation `json:"quark_mutation,omitempty"`
+	VerifiedFacts          map[string]ObservationFact   `json:"verified_facts,omitempty"`
 }
 
 func (s reorganizationCatalogState) binding(f reorganizationCatalogFence) CatalogSnapshotBinding {
@@ -334,6 +339,9 @@ func (w *MediaReorganizationWorker) reorganizationMutationFacts(ctx context.Cont
 					fact := *match
 					fact.SnapshotID = ""
 					fact.RelativePath = "/" + target
+					if verified, ok := state.Catalog.VerifiedFacts[item.ProviderItemID]; plan.StorageType == models.StorageTypeQuark && ok {
+						fact.ModifiedAt = verified.ModifiedAt
+					}
 					fact.UpdatedAt = time.Now().UTC()
 					out.Entries = append(out.Entries, fact)
 				} else {
@@ -359,6 +367,9 @@ func (w *MediaReorganizationWorker) reorganizationMutationFacts(ctx context.Cont
 						}
 					}
 					fact.Name = pathpkg.Base(target)
+					if verified, ok := state.Catalog.VerifiedFacts[item.ProviderItemID]; plan.StorageType == models.StorageTypeQuark && ok {
+						fact.ModifiedAt = verified.ModifiedAt
+					}
 					fact.Extension = strings.ToLower(pathpkg.Ext(target))
 					out.SourceAssets = append(out.SourceAssets, fact)
 				}

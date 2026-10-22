@@ -63,7 +63,8 @@ export function supportsSTRM(storage: StorageSummary | undefined): boolean {
 }
 
 export function supportsSidecarUpload(storage: StorageSummary | undefined): boolean {
-  return Boolean(storage && storage.type !== 'local' && storage.capabilities.small_file_upload)
+  // General upload support does not establish safe cloud-side projection.
+  return Boolean(storage && storage.type !== 'local' && storage.type !== 'quark' && storage.capabilities.small_file_upload)
 }
 
 export function payloadFromDraft(draft: MediaLibraryDraft, storage: StorageSummary | undefined): MediaLibraryWritePayload {
@@ -78,7 +79,7 @@ export function payloadFromDraft(draft: MediaLibraryDraft, storage: StorageSumma
     metadata_artifacts_enabled: draft.metadata_artifacts_enabled,
     upload_sidecars: supportsSidecarUpload(storage) && !draft.strm_enabled && draft.metadata_artifacts_enabled && draft.upload_sidecars,
     cloud_empty_cleanup_enabled: storage?.type === 'pan115' && Boolean(draft.cloud_empty_cleanup_enabled),
-    transfer_mode: storage?.type === 'pan115' && draft.transfer_mode === 'symlink' ? 'move' : draft.transfer_mode,
+    transfer_mode: ['pan115', 'quark'].includes(storage?.type ?? '') && draft.transfer_mode === 'symlink' ? 'move' : draft.transfer_mode,
     conflict_policy: draft.conflict_policy,
     movie_directory_template: draft.movie_directory_template, movie_filename_template: draft.movie_filename_template,
     tv_directory_template: draft.tv_directory_template, tv_filename_template: draft.tv_filename_template,

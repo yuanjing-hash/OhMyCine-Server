@@ -16,8 +16,7 @@ import (
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/authz"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud"
-	"github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud/pan115"
-	downloadpkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/downloader"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud/quark"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/site/builtin"
 	"gorm.io/gorm"
 )
@@ -52,16 +51,16 @@ func sharePreviewExpired() error {
 // Bind only relevant configuration, excluding probe timestamps and health updates.
 func sharePreviewConfig(db *gorm.DB, downloaderID string) (string, uint, error) {
 	var d models.Downloader
-	if err := db.First(&d, "id = ?", downloaderID).Error; err != nil || !d.Enabled || d.Type != models.DownloaderTypePan115Offline || d.StorageID == nil {
-		return "", 0, appError(CodeDownloaderUnavailable, "请选择已启用的 115 下载器", nil)
+	if err := db.First(&d, "id = ?", downloaderID).Error; err != nil || !d.Enabled || !isCloudShareDownloader(d.Type) || d.StorageID == nil {
+		return "", 0, appError(CodeDownloaderUnavailable, "请选择已启用的网盘分享接收器", nil)
 	}
 	var storage models.Storage
-	if err := db.First(&storage, *d.StorageID).Error; err != nil || !storage.Enabled || storage.Type != models.StorageTypePan115 || storage.ConnectionID == nil {
-		return "", 0, appError(CodeDownloaderStorageUnavailable, "下载器的 115 数据源不可用", nil)
+	if err := db.First(&storage, *d.StorageID).Error; err != nil || !storage.Enabled || storage.Type != shareStorageType(d.Type) || storage.ConnectionID == nil {
+		return "", 0, appError(CodeDownloaderStorageUnavailable, "下载器的网盘数据源不可用", nil)
 	}
 	var connection models.Connection
-	if err := db.First(&connection, *storage.ConnectionID).Error; err != nil || !connection.Enabled || connection.Provider != cloud.ProviderPan115 {
-		return "", 0, appError(CodeConnectionUnavailable, "下载器绑定的 115 连接不可用", nil)
+	if err := db.First(&connection, *storage.ConnectionID).Error; err != nil || !connection.Enabled || connection.Provider != storage.Type {
+		return "", 0, appError(CodeConnectionUnavailable, "下载器绑定的网盘连接不可用", nil)
 	}
 	raw, _ := json.Marshal([]any{d.ID, d.OwnerID, d.ExecutionLocation, d.NodeID, d.ProviderDirectoryID, storage.ID, storage.RootPath, connection.ID, connection.Revision})
 	sum := sha256.Sum256(raw)
@@ -116,9 +115,12 @@ func (s *SiteService) PreviewShare(ctx context.Context, actor Actor, resultToken
 	if err != nil {
 		return summary, err
 	}
-	raw, _, err := pan115.NormalizeShareLink(claim.TorrentID, "")
+	raw, provider, _, err := normalizeCloudShare(claim.TorrentID)
 	if err != nil {
 		return summary, appError(CodeDownloadSourceInvalid, "分享地址无效", nil)
+	}
+	if provider+"_share" != claimCloudSource(claim) {
+		return summary, appError(CodeDownloadSourceInvalid, "分享来源凭证不一致", nil)
 	}
 	request := RequestContext{}
 	if len(requests) > 0 {
@@ -184,7 +186,7 @@ func (s *SiteService) PreviewShare(ctx context.Context, actor Actor, resultToken
 }
 func sharePreviewProviderError(err error) error {
 	code, _ := cloud.ErrorInfo(err)
-	message := "暂时无法读取 115 分享，请稍后重试"
+	message := "暂时无法读取网盘分享，请稍后重试"
 	switch code {
 	case cloud.CodeShareExpired:
 		message = "分享已失效或已被取消"
@@ -202,6 +204,18 @@ func sharePreviewProviderError(err error) error {
 		message = "分享内没有可读取的文件"
 	case cloud.CodeShareTooLarge:
 		message = "分享内容过多，暂时无法完整预览，请选择更小的分享"
+	case quark.CodeAuth:
+		message = "夸克授权已失效，请在连接管理中重新授权"
+	case quark.CodeLimited:
+		message = "夸克请求受到限制，正在冷却，请稍后重试"
+	case quark.CodeProof, quark.CodeIdentity:
+		message = "夸克授权与受管目录无法对应，请重新验证连接的共同目录"
+	case quark.CodeInvalid, quark.CodeIncomplete, "quark_share_invalid":
+		message = "夸克分享返回的内容不完整，暂时无法安全预览"
+	case "quark_share_password_invalid":
+		message = "夸克分享提取码无效，请核对原帖"
+	case "quark_share_too_large":
+		message = "夸克分享内容过多，请选择更小的分享"
 	}
 	return appError(code, message, nil)
 }
@@ -256,7 +270,7 @@ func (s *SiteService) resolveShareSelection(ctx context.Context, actor Actor, in
 	s.vaultMu.Lock()
 	preview, ok := s.sharePreviews[input.PreviewToken]
 	s.vaultMu.Unlock()
-	if !ok || preview.ActorID != actor.User.ID || preview.ResultToken != strings.TrimSpace(input.ResultToken) || preview.DownloaderID != input.DownloaderID || preview.URL != source.URL || !preview.ExpiresAt.After(s.now()) || source.Kind != downloadpkg.SourcePan115Share {
+	if !ok || preview.ActorID != actor.User.ID || preview.ResultToken != strings.TrimSpace(input.ResultToken) || preview.DownloaderID != input.DownloaderID || preview.URL != source.URL || !preview.ExpiresAt.After(s.now()) || !isCloudShareSource(source.Kind) {
 		return selection, nil, sharePreviewExpired()
 	}
 	if len(input.SelectedEntryTokens) == 0 || len(input.SelectedEntryTokens) > cloud.MaxSharePreviewEntries {
@@ -332,6 +346,11 @@ func selectedSharePackages(selection cloud.ShareSelection) []cloud.ShareSelectio
 }
 func (s *SiteService) submitShareSelection(ctx context.Context, actor Actor, previewToken string, input SubmitDownloadInput, request RequestContext) (DownloadTaskSummary, error) {
 	packages := selectedSharePackages(*input.Source.ShareSelection)
+	// A follow claim covers precisely these episode files in one resumable
+	// package. Splitting it would attach every episode to only the first child.
+	if input.FollowSubscriptionID != "" && len(packages) > 0 {
+		packages = []cloud.ShareSelection{*input.Source.ShareSelection}
+	}
 	if len(packages) == 0 {
 		return DownloadTaskSummary{}, appError(CodeInvalidRequest, "请至少选择一个视频文件；字幕等附属文件可一并勾选", nil)
 	}
@@ -376,7 +395,9 @@ func (s *SiteService) submitShareSelection(ctx context.Context, actor Actor, pre
 		child := input
 		child.Source.ShareSelection = &group
 		child.DisplayName = path.Base(group.Files[0].RelativePath)
-		child.RecognitionOverride = nil
+		if input.FollowSubscriptionID == "" {
+			child.RecognitionOverride = nil
+		}
 		created, err := s.downloads.submit(ctx, actor.User.ID, child, request, models.DownloadSourceOriginShare, key, "")
 		if err != nil {
 			lastErr = err

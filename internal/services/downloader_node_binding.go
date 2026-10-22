@@ -57,7 +57,7 @@ func (s *DownloaderService) prepareNodeBinding(downloaderID, nodeID, baseURL, us
 	return models.NodeDownloaderBinding{ID: uuid.NewString(), DownloaderID: downloaderID, NodeID: node.ID, BaseURL: baseURL, UsernameCiphertext: usernameCiphertext, PasswordCiphertext: passwordCiphertext, DownloaderSaveRoot: downloaderSaveRoot, NodeMountRoot: nodeMountRoot, Revision: 1, CreatedAt: now, UpdatedAt: now}, nil
 }
 
-func (s *DownloaderService) prepareNodeStorageDownloader(nodeID string) (models.TransferNode, error) {
+func (s *DownloaderService) prepareNodeStorageDownloader(nodeID string, provider ...string) (models.TransferNode, error) {
 	nodeID = strings.TrimSpace(nodeID)
 	if nodeID == "" || s.transferNodes == nil {
 		return models.TransferNode{}, appError(CodeInvalidRequest, "请选择传输节点", nil)
@@ -67,6 +67,12 @@ func (s *DownloaderService) prepareNodeStorageDownloader(nodeID string) (models.
 		return models.TransferNode{}, err
 	}
 	var capabilities nodeprotocol.Capabilities
+	if len(provider) > 0 && provider[0] == models.DownloaderTypeQuarkShare {
+		if json.Unmarshal([]byte(node.CapabilitiesJSON), &capabilities) != nil || !nodeprotocol.QuarkShareSupported(capabilities) {
+			return models.TransferNode{}, appError(CodeDownloaderUnavailable, "请升级节点：需要夸克分享接收、原文件读取与完整文件校验能力", nil)
+		}
+		return node, nil
+	}
 	if json.Unmarshal([]byte(node.CapabilitiesJSON), &capabilities) != nil ||
 		!capabilities.Has(nodeprotocol.CapabilityPan115Offline) ||
 		!capabilities.Has(nodeprotocol.CapabilityPan115ShareReceive) ||
@@ -141,10 +147,17 @@ func (s *DownloaderService) clientForTask(ctx context.Context, record models.Dow
 		if revision != task.RoutePlanRevision || digest != task.RoutePlanDigest {
 			return nil, appError(CodeDownloaderUnavailable, "下载器的传输节点或路径映射已变化，已阻止任务漂移", nil)
 		}
-		if record.Type == models.DownloaderTypePan115Offline {
+		if isCloudShareDownloader(record.Type) {
 			return s.nodeStorageSourceClient(ctx, record, task)
 		}
 		return s.nodeDownloaderClientWithBinding(record, binding, localRoot, task.ID)
+	}
+	if record.Type == models.DownloaderTypeQuarkShare && task.StagingProviderDirectoryID != "" {
+		if task.StagingStorageID == nil || record.StorageID == nil || *task.StagingStorageID != *record.StorageID {
+			return nil, appError(CodeDownloaderUnavailable, "下载任务冻结的夸克接收 Storage 已变化", nil)
+		}
+		record.ProviderDirectoryID = task.StagingProviderDirectoryID
+		record.ProviderDirectoryPath = task.StagingRelativePath
 	}
 	return s.clientFor(record)
 }
@@ -203,16 +216,23 @@ func nodeDownloaderBinding(db *gorm.DB, record models.Downloader) (models.NodeDo
 }
 
 func nodeTaskRoutePlan(db *gorm.DB, record models.Downloader, localRoot string, targetLibraryID uint) (models.NodeDownloaderBinding, uint64, string, error) {
-	if record.Type == models.DownloaderTypePan115Offline {
+	if isCloudShareDownloader(record.Type) {
 		if db == nil || record.NodeID == nil || record.StorageID == nil || strings.TrimSpace(record.ProviderDirectoryID) == "" || targetLibraryID == 0 {
 			return models.NodeDownloaderBinding{}, 0, "", appError(CodeDownloaderUnavailable, "节点 115 下载器的远端路线快照不完整", nil)
 		}
 		var storage models.Storage
-		if err := db.Select("id", "type", "connection_id", "root_path").First(&storage, *record.StorageID).Error; err != nil || storage.Type != models.StorageTypePan115 || storage.ConnectionID == nil {
+		expected := models.StorageTypePan115
+		if record.Type == models.DownloaderTypeQuarkShare {
+			expected = models.StorageTypeQuark
+		}
+		if err := db.Select("id", "type", "connection_id", "root_path").First(&storage, *record.StorageID).Error; err != nil || storage.Type != expected || storage.ConnectionID == nil {
 			return models.NodeDownloaderBinding{}, 0, "", appError(CodeDownloaderStorageUnavailable, "节点 115 下载器的来源 Storage 不可用", err)
 		}
 		const routePlanRevision = 1
 		payload := fmt.Sprintf("remote-storage-source-v1\x00%s\x00%s\x00%d\x00%d\x00%d\x00%s\x00%s", *record.NodeID, record.ID, targetLibraryID, storage.ID, *storage.ConnectionID, storage.RootPath, record.ProviderDirectoryID)
+		if expected == models.StorageTypeQuark {
+			payload = "quark-v2\x00" + payload
+		}
 		digest := sha256.Sum256([]byte(payload))
 		return models.NodeDownloaderBinding{}, routePlanRevision, fmt.Sprintf("%x", digest[:]), nil
 	}
@@ -248,7 +268,7 @@ func (s *DownloaderService) saveNodeBindingUpdate(tx *gorm.DB, binding *models.N
 }
 
 func (s *DownloaderService) updateNodeDownloader(ctx context.Context, actor Actor, record models.Downloader, input UpdateDownloaderInput, request RequestContext) (DownloaderSummary, error) {
-	if record.Type == models.DownloaderTypePan115Offline {
+	if isCloudShareDownloader(record.Type) {
 		return s.updateNodeStorageDownloader(ctx, actor, record, input, request)
 	}
 	var existing models.NodeDownloaderBinding
@@ -345,7 +365,7 @@ func (s *DownloaderService) updateNodeDownloader(ctx context.Context, actor Acto
 }
 
 func (s *DownloaderService) updateNodeStorageDownloader(ctx context.Context, actor Actor, record models.Downloader, input UpdateDownloaderInput, request RequestContext) (DownloaderSummary, error) {
-	if record.Type != models.DownloaderTypePan115Offline || record.NodeID == nil {
+	if !isCloudShareDownloader(record.Type) || record.NodeID == nil {
 		return DownloaderSummary{}, appError(CodeDownloaderUnavailable, "节点 115 下载器配置不完整", nil)
 	}
 	nodeID := *record.NodeID
@@ -378,7 +398,7 @@ func (s *DownloaderService) updateNodeStorageDownloader(ctx context.Context, act
 	if err := ensureNodeStorageDownloaderRouteMutable(s.db.WithContext(ctx), record.ID, routeChanged); err != nil {
 		return DownloaderSummary{}, err
 	}
-	node, err := s.prepareNodeStorageDownloader(nodeID)
+	node, err := s.prepareNodeStorageDownloader(nodeID, record.Type)
 	if err != nil {
 		return DownloaderSummary{}, err
 	}

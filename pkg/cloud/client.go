@@ -2,6 +2,7 @@ package cloud
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -12,6 +13,7 @@ import (
 )
 
 const ProviderPan115 = "pan115"
+const ProviderQuark = "quark"
 
 type Capabilities struct {
 	NetworkDrive          bool `json:"network_drive"`
@@ -35,6 +37,14 @@ type Config struct {
 	ConnectionID    uint
 	Cookie          string
 	RecyclePassword string
+	// Credentials is a provider-specific, decrypted-in-memory bundle. Owners
+	// encrypt it before storage and never include it in public connection DTOs.
+	Credentials json.RawMessage
+	// PersistCredentials performs compare-and-swap against the bundle revision.
+	// A rotated token is checkpointed before any subsequent identity probe.
+	PersistCredentials func(context.Context, uint64, json.RawMessage) error
+	LoadCredentials    func(context.Context) (json.RawMessage, error)
+	Operations         OperationStore
 	// Optional connection-owner lifecycle hooks. They carry no credentials and
 	// let adapters fence a saved credential before I/O and report safe outcomes.
 	BeforeCall   func(context.Context) error
@@ -59,6 +69,8 @@ type Item struct {
 	PickCode   string
 	CreatedAt  time.Time
 	ModifiedAt time.Time
+	// Revision is supplied by the provider, never synthesized from a poll time.
+	Revision string
 }
 
 type PageRequest struct {
@@ -70,6 +82,9 @@ type Page struct {
 	Items   []Item
 	Offset  int64
 	HasMore bool
+	// Total is nil if the provider does not report it. Pagination is not an
+	// atomic snapshot; even a terminal page alone never proves deletions.
+	Total *int64
 }
 
 // TreeEntry is a provider-relative item returned by an optional bulk tree
@@ -273,6 +288,9 @@ type ShareSnapshot struct {
 	ReceiveCode string
 	Title       string
 	Items       []ShareItem
+	// Private contains provider-scoped guest tokens/selection evidence. It is
+	// encrypted with the owning task and never copied to an API response.
+	Private json.RawMessage
 }
 
 // ShareReceiveDriver is an optional cloud capability. Providers own URL

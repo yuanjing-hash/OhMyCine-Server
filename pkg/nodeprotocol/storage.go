@@ -14,6 +14,7 @@ const (
 	ResourceKindStorage        = "storage"
 
 	StorageProviderPan115 = "pan115"
+	StorageProviderQuark  = "quark"
 	StorageActionUpload   = "upload"
 	StorageActionReplace  = "replace"
 
@@ -41,18 +42,22 @@ const (
 // StorageCredential is sealed inside a task-bound CredentialGrant. It must
 // never be persisted after decryption or copied into an operation plan.
 type StorageCredential struct {
-	ProviderType string `json:"provider_type"`
-	Cookie       string `json:"cookie,omitempty"`
+	ProviderType string          `json:"provider_type"`
+	Cookie       string          `json:"cookie,omitempty"`
+	Quark        json.RawMessage `json:"quark,omitempty"`
+	RootID       string          `json:"root_id,omitempty"`
 }
 
 // StorageUploadPlan is immutable operation payload. All names and conflict
 // decisions are made by the Server; the Node only executes these exact paths.
 type StorageUploadPlan struct {
+	DigestVersion            int                 `json:"digest_version,omitempty"`
 	StorageID                string              `json:"storage_id"`
 	ProviderType             string              `json:"provider_type"`
 	SourceExportOperationKey string              `json:"source_export_operation_key"`
 	SourceManifestDigest     string              `json:"source_manifest_digest"`
 	TargetRootID             string              `json:"target_root_id"`
+	TargetRootRelativePath   string              `json:"target_root_relative_path,omitempty"`
 	Files                    []StorageUploadFile `json:"files"`
 }
 
@@ -75,13 +80,14 @@ type StorageActionRequest struct {
 }
 
 type StorageUploadFileResult struct {
-	SourceFileToken string `json:"source_file_token"`
-	TargetParentID  string `json:"target_parent_id,omitempty"`
-	TargetName      string `json:"target_name,omitempty"`
-	TargetItemID    string `json:"target_item_id,omitempty"`
-	Status          string `json:"status"`
-	Size            int64  `json:"size"`
-	SHA1            string `json:"sha1,omitempty"`
+	SourceFileToken string         `json:"source_file_token"`
+	TargetParentID  string         `json:"target_parent_id,omitempty"`
+	TargetName      string         `json:"target_name,omitempty"`
+	TargetItemID    string         `json:"target_item_id,omitempty"`
+	Status          string         `json:"status"`
+	Size            int64          `json:"size"`
+	SHA1            string         `json:"sha1,omitempty"`
+	ContentDigest   *ContentDigest `json:"content_digest,omitempty"`
 }
 
 type StorageActionResponse struct {
@@ -96,6 +102,18 @@ type StorageActionResponse struct {
 }
 
 func (plan StorageUploadPlan) Validate() error {
+	if plan.ProviderType == StorageProviderQuark {
+		if plan.DigestVersion != 2 || plan.TargetRootRelativePath != "" && !ValidStorageDirectoryRelativePath(plan.TargetRootRelativePath) {
+			return errors.New("node_storage_digest_version_invalid")
+		}
+		for _, f := range plan.Files {
+			if f.ConflictAction == StorageConflictReplace {
+				return errors.New(ErrorCapabilityMissing)
+			}
+		}
+	} else if plan.ProviderType != StorageProviderPan115 || plan.DigestVersion != 0 || plan.TargetRootRelativePath != "" {
+		return errors.New("node_storage_plan_invalid")
+	}
 	if !validID(plan.StorageID) || !validID(plan.ProviderType) || !validID(plan.SourceExportOperationKey) || !ValidDigest(plan.SourceManifestDigest) || !validProviderItemID(plan.TargetRootID) || len(plan.Files) == 0 || len(plan.Files) > MaxStorageUploadFiles {
 		return errors.New("node_storage_plan_invalid")
 	}
@@ -159,6 +177,12 @@ func normalizeStorageRelativePath(value string) string {
 		}
 	}
 	return clean
+}
+
+// ValidStorageDirectoryRelativePath accepts a frozen path below the granted
+// Storage root. The leading slash is scope-relative, never an account root.
+func ValidStorageDirectoryRelativePath(value string) bool {
+	return value == "/" || strings.HasPrefix(value, "/") && normalizeStorageRelativePath(strings.TrimPrefix(value, "/")) == strings.TrimPrefix(value, "/") && len(value) > 1
 }
 
 func validProviderItemID(value string) bool {

@@ -19,24 +19,27 @@ import (
 	"time"
 
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/buildinfo"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud/quark"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/nodeprotocol"
 )
 
 type Agent struct {
-	config            Config
-	store             *Store
-	sealingPrivateKey *ecdh.PrivateKey
-	sealingPublicKey  string
-	now               func() time.Time
-	exportMu          sync.Mutex
-	exports           map[string]struct{}
-	storageMu         sync.Mutex
-	storageRuns       map[string]struct{}
-	storageFactory    storageDriverFactory
-	sourceMu          sync.Mutex
-	sourceRuns        map[string]struct{}
-	sourceFactory     storageSourceDriverFactory
-	httpStarted       time.Time
+	config             Config
+	store              *Store
+	sealingPrivateKey  *ecdh.PrivateKey
+	sealingPublicKey   string
+	now                func() time.Time
+	exportMu           sync.Mutex
+	exports            map[string]struct{}
+	storageMu          sync.Mutex
+	storageRuns        map[string]struct{}
+	storageFactory     storageDriverFactory
+	quarkClientFactory func(cloud.Config) (*quark.Client, error)
+	sourceMu           sync.Mutex
+	sourceRuns         map[string]struct{}
+	sourceFactory      storageSourceDriverFactory
+	httpStarted        time.Time
 }
 
 func New(config Config, store *Store) (*Agent, error) {

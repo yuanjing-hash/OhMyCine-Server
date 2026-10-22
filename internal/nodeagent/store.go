@@ -96,6 +96,9 @@ func (s *Store) migrate(ctx context.Context) error {
 			`CREATE TABLE http_request_nonces (nonce TEXT PRIMARY KEY, expires_at DATETIME NOT NULL)`,
 			`CREATE INDEX idx_http_request_nonces_expiry ON http_request_nonces(expires_at)`,
 		}},
+		{8, []string{
+			`CREATE TABLE cloud_operation_receipts (paired_server_id TEXT NOT NULL, operation_key TEXT NOT NULL, receipt_id TEXT NOT NULL, revision INTEGER NOT NULL, binding TEXT NOT NULL, ciphertext BLOB NOT NULL, PRIMARY KEY(paired_server_id,operation_key,receipt_id))`,
+		}},
 	}
 	for _, migration := range migrations {
 		var applied int

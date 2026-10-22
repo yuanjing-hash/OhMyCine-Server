@@ -16,6 +16,7 @@ import (
 
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud/pan115"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud/quark"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/nodeprotocol"
 )
 
@@ -185,7 +186,14 @@ func (a *Agent) storageCredential(ctx context.Context, serverID string, input no
 	var credential nodeprotocol.StorageCredential
 	decoder := json.NewDecoder(bytes.NewReader(grant.Credential))
 	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&credential); err != nil || credential.ProviderType != plan.ProviderType || credential.ProviderType != nodeprotocol.StorageProviderPan115 || strings.TrimSpace(credential.Cookie) == "" {
+	if err := decoder.Decode(&credential); err != nil || credential.ProviderType != plan.ProviderType {
+		return nodeprotocol.CredentialGrant{}, nodeprotocol.StorageCredential{}, errors.New("node_credential_payload_invalid")
+	}
+	if plan.ProviderType == nodeprotocol.StorageProviderQuark {
+		if _, err := validateQuarkGrant(credential); err != nil {
+			return nodeprotocol.CredentialGrant{}, nodeprotocol.StorageCredential{}, err
+		}
+	} else if credential.ProviderType != nodeprotocol.StorageProviderPan115 || strings.TrimSpace(credential.Cookie) == "" || len(credential.Quark) > 0 {
 		return nodeprotocol.CredentialGrant{}, nodeprotocol.StorageCredential{}, errors.New("node_credential_payload_invalid")
 	}
 	return grant, credential, nil
@@ -224,7 +232,18 @@ func (a *Agent) runStorageUpload(ctx context.Context, serverID string, input nod
 		}
 		return err
 	}
-	driver, err := a.storageFactory(credential, guard)
+	var driver storageUploadDriver
+	var err error
+	if plan.ProviderType == nodeprotocol.StorageProviderQuark {
+		state := a.newQuarkGrantState(serverID, input.PlanDigest, grant, credential)
+		guard = state.check
+		driver, err = a.newQuarkUploadDriver(ctx, serverID, input, credential, state)
+		if err == nil {
+			err = configureQuarkDirectoryLocator(driver.(*nodeQuarkUploadDriver).Client, credential, plan.TargetRootRelativePath, plan.TargetRootID)
+		}
+	} else {
+		driver, err = a.storageFactory(credential, guard)
+	}
 	if err != nil {
 		a.pauseStorageUpload(ctx, serverID, input, response, err)
 		return
@@ -268,6 +287,9 @@ func (a *Agent) runStorageUpload(ctx context.Context, serverID string, input nod
 }
 
 func (a *Agent) uploadStorageFile(ctx context.Context, serverID string, input nodeprotocol.StorageActionRequest, plan nodeprotocol.StorageUploadPlan, filePlan nodeprotocol.StorageUploadFile, driver storageUploadDriver, guard func(context.Context) error) (nodeprotocol.StorageUploadFileResult, error) {
+	if plan.ProviderType == nodeprotocol.StorageProviderQuark {
+		return a.uploadQuarkStorageFile(ctx, serverID, input, plan, filePlan, driver, guard)
+	}
 	result := nodeprotocol.StorageUploadFileResult{SourceFileToken: filePlan.SourceFileToken, TargetName: path.Base(filePlan.TargetRelativePath), Size: filePlan.Size, Status: nodeprotocol.StorageFilePending}
 	checkpoint, err := a.store.PrepareStorageUploadFile(ctx, input.OperationKey, filePlan.SourceFileToken, input.PlanDigest, filePlan.Size, a.now())
 	if err != nil {
@@ -552,13 +574,13 @@ func storageErrorCode(err error) string {
 	}
 	code, _ := cloud.ErrorInfo(err)
 	switch code {
-	case cloud.CodeAuthExpired, cloud.CodeCookieInvalid:
+	case cloud.CodeAuthExpired, cloud.CodeCookieInvalid, quark.CodeAuth:
 		return nodeprotocol.ErrorCredentialExpired
-	case cloud.CodeRateLimited:
+	case cloud.CodeRateLimited, quark.CodeLimited:
 		return nodeprotocol.ErrorTargetRateLimited
-	case cloud.CodeMutationUnknown:
+	case cloud.CodeMutationUnknown, quark.CodePending:
 		return nodeprotocol.ErrorReconciliationNeeded
-	case cloud.CodeResponseInvalid:
+	case cloud.CodeResponseInvalid, quark.CodeInvalid:
 		return nodeprotocol.ErrorChecksumMismatch
 	default:
 		return "node_target_unavailable"

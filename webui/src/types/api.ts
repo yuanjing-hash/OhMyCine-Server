@@ -223,7 +223,15 @@ export interface MediaClassificationProfileDetail extends MediaClassificationPro
 }
 
 export type MediaLibraryStatus = 'disabled' | 'initializing' | 'attaching_listener' | 'catch_up_reconciliation' | 'listening' | 'initialization_failed'
+export interface ProviderSynchronization {
+  pending_publications?: number; path_repairs?: number; pending_confirmations?: number
+  error_code?: string; next_retry_at?: string | null
+  mode: string; last_complete_at: string | null; pending_directories: number; missing_candidates: number
+  cooldown_until: string | null; estimated_coverage_at: string | null; estimate_is_lower_bound: boolean
+  oldest_pending_at: string | null; delayed: boolean
+}
 export interface MediaLibraryDetail {
+  synchronization?: ProviderSynchronization
   ready?: boolean; readiness_status?: 'ready' | 'disabled' | 'unavailable' | 'credentials_required' | 'repairing' | 'repair_failed' | 'busy' | 'initializing' | 'checking'
 	retirement?: { status: 'deleting'; job_id: string; error_code?: string }
   id: number; name: string; storage_id: number; storage_name: string; profile_id: number; profile_name: string
@@ -355,7 +363,7 @@ export interface DownloaderCapabilities {
   share_receive: boolean
 }
 export interface DownloaderSummary {
-  id: string; name: string; type: 'fake' | 'qbittorrent' | 'pan115_offline'; base_url: string; enabled: boolean
+  id: string; name: string; type: 'fake' | 'qbittorrent' | 'pan115_offline' | 'quark_share'; base_url: string; enabled: boolean
   sort_order: number
   execution_location: 'server' | 'node'; node_id?: string; node_name?: string
   downloader_save_root?: string; node_mount_root?: string

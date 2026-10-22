@@ -33,7 +33,7 @@ func normalizeCloudSite(kind string, cfg *sitepkg.CloudConfig, credential *siteC
 	credential.APIKey = ""
 	normalized, err := pansou.NormalizeConfig(cfg)
 	if err != nil {
-		return nil, appError(CodeInvalidRequest, "请选择 115 网盘并填写 1–100 个有效的 TG 公开频道", nil)
+		return nil, appError(CodeInvalidRequest, "PanSou来源、类型或频道范围无效；TG仅自定义须填写有效公开频道，去重后最多1024个", nil)
 	}
 	credential.Username = strings.TrimSpace(credential.Username)
 	if normalized.AuthEnabled && (credential.Username == "" || credential.Password == "") {

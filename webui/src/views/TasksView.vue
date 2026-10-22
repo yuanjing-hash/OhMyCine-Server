@@ -14,6 +14,7 @@ import {
   getAttempts,
   getJob,
   getTimeline,
+  jobActionLabel,
   listJobs,
   reorderLane,
   respondAction,
@@ -493,7 +494,7 @@ onBeforeUnmount(() => { alive = false; listRequest.cancel(); detailRequest.cance
               :disabled="!canRespond"
               @click="respond(selected, option)"
             >
-              {{ option }}
+              {{ jobActionLabel(option) }}
             </button>
           </div>
         </section>

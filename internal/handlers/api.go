@@ -549,7 +549,7 @@ func (a *API) CreateStorage(c *gin.Context) {
 	rootDisplayPath := input.RootPath
 	if input.ProviderPickerToken != "" {
 		if input.ConnectionID == nil {
-			writeError(c, a.log, invalid("请选择 115 账号", nil))
+			writeError(c, a.log, invalid("请选择网盘账号", nil))
 			return
 		}
 		selection, err := a.providerDirectory.ResolveSelection(c.Request.Context(), actor, *input.ConnectionID, input.ProviderPickerToken)
@@ -601,7 +601,7 @@ func (a *API) UpdateStorage(c *gin.Context) {
 	var rootDisplayPath *string
 	if input.ProviderPickerToken != nil {
 		if input.ConnectionID == nil {
-			writeError(c, a.log, invalid("请选择 115 账号", nil))
+			writeError(c, a.log, invalid("请选择网盘账号", nil))
 			return
 		}
 		selection, err := a.providerDirectory.ResolveSelection(c.Request.Context(), actor, *input.ConnectionID, *input.ProviderPickerToken)

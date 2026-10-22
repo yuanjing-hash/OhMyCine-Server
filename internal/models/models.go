@@ -150,22 +150,23 @@ func (RemoteTransferFile) TableName() string { return "remote_transfer_files" }
 // result checkpoint for one Node-side storage upload. Rows are dispatched in
 // bounded protocol batches, while the owning transfer has no file-count cap.
 type RemoteUploadFile struct {
-	ID              uint      `gorm:"primaryKey" json:"-"`
-	TransferTaskID  string    `gorm:"size:36;not null;uniqueIndex:idx_remote_upload_ordinal;uniqueIndex:idx_remote_upload_source" json:"-"`
-	DownloadTaskID  string    `gorm:"size:36;not null;index" json:"-"`
-	Ordinal         int       `gorm:"not null;uniqueIndex:idx_remote_upload_ordinal" json:"-"`
-	SourceFileToken string    `gorm:"size:128;not null;uniqueIndex:idx_remote_upload_source" json:"-"`
-	SourceRelative  string    `gorm:"size:2048;not null" json:"-"`
-	TargetRelative  string    `gorm:"size:2048;not null" json:"-"`
-	Size            int64     `gorm:"not null" json:"-"`
-	SHA256          string    `gorm:"size:64;not null" json:"-"`
-	ConflictAction  string    `gorm:"size:32;not null" json:"-"`
-	Status          string    `gorm:"size:24;not null;default:'pending';index" json:"-"`
-	TargetParentID  string    `gorm:"size:128;not null;default:''" json:"-"`
-	TargetItemID    string    `gorm:"size:128;not null;default:''" json:"-"`
-	TargetSHA1      string    `gorm:"size:40;not null;default:''" json:"-"`
-	CreatedAt       time.Time `gorm:"not null" json:"-"`
-	UpdatedAt       time.Time `gorm:"not null" json:"-"`
+	ID               uint      `gorm:"primaryKey" json:"-"`
+	TransferTaskID   string    `gorm:"size:36;not null;uniqueIndex:idx_remote_upload_ordinal;uniqueIndex:idx_remote_upload_source" json:"-"`
+	DownloadTaskID   string    `gorm:"size:36;not null;index" json:"-"`
+	Ordinal          int       `gorm:"not null;uniqueIndex:idx_remote_upload_ordinal" json:"-"`
+	SourceFileToken  string    `gorm:"size:128;not null;uniqueIndex:idx_remote_upload_source" json:"-"`
+	SourceRelative   string    `gorm:"size:2048;not null" json:"-"`
+	TargetRelative   string    `gorm:"size:2048;not null" json:"-"`
+	Size             int64     `gorm:"not null" json:"-"`
+	SHA256           string    `gorm:"size:64;not null" json:"-"`
+	ConflictAction   string    `gorm:"size:32;not null" json:"-"`
+	Status           string    `gorm:"size:24;not null;default:'pending';index" json:"-"`
+	TargetParentID   string    `gorm:"size:128;not null;default:''" json:"-"`
+	TargetItemID     string    `gorm:"size:128;not null;default:''" json:"-"`
+	TargetSHA1       string    `gorm:"size:40;not null;default:''" json:"-"`
+	TargetDigestJSON string    `gorm:"type:text;not null;default:''" json:"-"`
+	CreatedAt        time.Time `gorm:"not null" json:"-"`
+	UpdatedAt        time.Time `gorm:"not null" json:"-"`
 }
 
 func (RemoteUploadFile) TableName() string { return "remote_upload_files" }

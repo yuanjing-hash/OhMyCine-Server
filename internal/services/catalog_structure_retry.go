@@ -46,6 +46,7 @@ func (s *MediaLibraryStructureService) rebindPartialStructureRetry(ctx context.C
 			return err
 		}
 		next = structureCatalogRepairState{Version: 1, Fence: fence, BoundRevision: binding.Head.Revision, Layers: binding.Layers, Stage: "queued", SourceRevision: state.SourceRevision, SelectionBound: state.SelectionBound, DiagnosisJobID: state.DiagnosisJobID, DiagnosisGeneration: state.DiagnosisGeneration, RetryCheckpointBefore: time.Now().UTC()}
+		next.ParentTransferID = state.ParentTransferID
 		return persistCatalogStructureStateTx(tx, repair.ID, next, map[string]any{"phase": "queued", "last_error_code": "", "finished_at": nil})
 	})
 	if err == nil {

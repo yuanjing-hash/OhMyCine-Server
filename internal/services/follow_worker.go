@@ -221,11 +221,6 @@ func (w *FollowSearchWorker) Run(ctx context.Context, runtime JobRuntime, job Cl
 			w.record(candidateCtx, "follow.coverage_changed", "selection", "skipped", "该资源已不覆盖本轮剩余缺集，未提交下载", nil)
 			continue
 		}
-		// An evolving share can contain new episodes under the same share code.
-		// Keep retry identity stable for this missing set, not for the whole share.
-		if candidate.Item.SourceKind == "115_share" {
-			candidate.Fingerprint = followFingerprint(candidate.SiteID, fmt.Sprintf("%s:%d:%v", candidate.Fingerprint, candidate.Season, episodes), 0, nil)
-		}
 		libraryID := snapshot.MediaLibraryID
 		// Search may outlive an authorization edit. Each new resource submission
 		// uses the owner's current authority; accepted tasks retain their plan.
@@ -233,7 +228,7 @@ func (w *FollowSearchWorker) Run(ctx context.Context, runtime JobRuntime, job Cl
 		if err != nil {
 			return w.block(run, subscription, CodePermissionDenied, "订阅用户或权限不可用")
 		}
-		recommendation, routeErr := w.follows.downloads.RecommendSourceRoute(ctx, actor, candidate.SiteID, &libraryID)
+		recommendation, routeErr := w.sites.RecommendSiteRoute(ctx, actor, SourceRouteRecommendationInput{ResultToken: candidate.Item.Token, MediaLibraryID: &libraryID})
 		if routeErr != nil || recommendation.Recommended == nil {
 			submitFailures++
 			filterSummary["submit_failed"]++
@@ -243,6 +238,19 @@ func (w *FollowSearchWorker) Run(ctx context.Context, runtime JobRuntime, job Cl
 			}
 			w.record(candidateCtx, "follow.route_unavailable", "route", "failed", "资源未提交：没有可用的下载器与目标媒体库路线", map[string]any{"error_code": ErrorCode(routeErr)})
 			continue
+		}
+		previewToken := ""
+		var selectedEntryTokens []string
+		if isCloudShareSource(candidate.Item.SourceKind) {
+			var selectionDigest string
+			previewToken, selectedEntryTokens, episodes, selectionDigest, err = w.sites.prepareFollowShare(ctx, actor, candidate.Item.Token, recommendation.Recommended.DownloaderID, candidate.Season, episodes)
+			if err != nil {
+				submitFailures++
+				filterSummary["share_selection_failed"]++
+				lastSubmitMessage = safeErrorMessage(err, "无法核实分享中的本次缺集文件")
+				continue
+			}
+			candidate.Fingerprint = followFingerprint(candidate.SiteID, fmt.Sprintf("%s:%d:%v:%s", candidate.Fingerprint, candidate.Season, episodes, selectionDigest), 0, nil)
 		}
 		claimed, err := w.reserveEpisodes(run, subscription.ID, candidate, episodes)
 		if err != nil || !claimed {
@@ -281,7 +289,7 @@ func (w *FollowSearchWorker) Run(ctx context.Context, runtime JobRuntime, job Cl
 			}
 			submitCtx := serverlog.WithBusinessFields(candidateCtx, map[string]any{"downloader_id": downloaderID, "downloader_name": downloaderName, "library_name": libraryName})
 			w.record(submitCtx, "follow.route", "route", "planned", fmt.Sprintf("选择资源 %s，下载器：%s，目标媒体库：%s；%s，覆盖本轮 %d 集", serverlog.BusinessDisplayName(candidate.Item.Title), serverlog.BusinessDisplayName(downloaderName), serverlog.BusinessDisplayName(libraryName), serverlog.BusinessDisplayName(routeLabel), len(episodes)), map[string]any{"episode_count": len(episodes)})
-			download, err = w.sites.Download(submitCtx, actor, SiteDownloadInput{ResultToken: candidate.Item.Token, DownloaderID: downloaderID, MediaLibraryID: &libraryID, Priority: snapshot.DownloadPriority, FollowSubscriptionID: subscription.ID, FollowResourceFingerprint: candidate.Fingerprint, Season: &season, Episode: singleEpisode, BeforeSubmit: func() error {
+			download, err = w.sites.Download(submitCtx, actor, SiteDownloadInput{PreviewToken: previewToken, SelectedEntryTokens: selectedEntryTokens, ResultToken: candidate.Item.Token, DownloaderID: downloaderID, MediaLibraryID: &libraryID, Priority: snapshot.DownloadPriority, FollowSubscriptionID: subscription.ID, FollowResourceFingerprint: candidate.Fingerprint, Season: &season, Episode: singleEpisode, BeforeSubmit: func() error {
 				current, currentErr := w.currentSubscription(subscription.ID)
 				if currentErr != nil || !followRunExecutable(current, run.LifecycleRevision) {
 					return appError(CodeConflict, "订阅已暂停或删除", currentErr)
@@ -364,7 +372,7 @@ func (w *FollowSearchWorker) searchCandidates(ctx context.Context, actor Actor, 
 				continue
 			}
 			searchCtx := serverlog.WithBusinessFields(ctx, map[string]any{"site_id": siteID, "season": season})
-			grouped, err := w.sites.SearchMediaIdentity(searchCtx, actor, MediaIdentitySearchInput{MediaType: "tv", TMDBID: subscription.TMDBID, Season: &season, Page: 1, SiteID: &siteID})
+			grouped, err := w.sites.SearchMediaIdentity(searchCtx, actor, MediaIdentitySearchInput{MediaType: "tv", TMDBID: subscription.TMDBID, Season: &season, Page: 1, SiteID: &siteID, ClientCapabilities: []string{MixedDiscoveryCapability}, Refresh: true})
 			if err != nil {
 				summary["site_error"]++
 				w.record(searchCtx, "follow.search_preflight_failed", "search", "failed", "该站搜索未能完成预检或执行，不把它计为零结果", map[string]any{"error_code": ErrorCode(err)})
@@ -396,7 +404,7 @@ func (w *FollowSearchWorker) searchCandidates(ctx context.Context, actor Actor, 
 						continue
 					}
 					candidateKey := candidate.Fingerprint
-					if item.SourceKind == "115_share" {
+					if isCloudShareSource(item.SourceKind) {
 						candidateKey = fmt.Sprintf("%s:%d", candidateKey, season)
 					}
 					if _, duplicate := seen[candidateKey]; duplicate {
@@ -474,7 +482,7 @@ func buildFollowCandidate(item SiteSearchResult, siteID uint, sitePriority, seas
 	if matchesAllowed(spec.ReleaseGroup, snapshot.Filters.ExcludeReleaseGroups) {
 		return followCandidate{}, "excluded_release_group", false
 	}
-	if item.SourceKind != "115_share" && snapshot.Filters.MinSeeders > 0 && (item.Seeders == nil || *item.Seeders < snapshot.Filters.MinSeeders) {
+	if !isCloudShareSource(item.SourceKind) && snapshot.Filters.MinSeeders > 0 && (item.Seeders == nil || *item.Seeders < snapshot.Filters.MinSeeders) {
 		return followCandidate{}, "seeders", false
 	}
 	if (snapshot.Filters.MinSizeBytes != nil || snapshot.Filters.MaxSizeBytes != nil) && item.SizeBytes <= 0 {

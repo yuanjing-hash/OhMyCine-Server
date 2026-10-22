@@ -1931,9 +1931,9 @@ Server 可生成 Linux bash 或 Windows PowerShell 完整命令；命令先校�
 
 摘要沿用列表的诊断任务、诊断代数和来源版本边界，不使用随后普通扫描的代数去替换诊断快照。跳过只保存在该用户本次诊断中，重载仍能从已处理列表撤销；原始诊断发现数不代表尚待用户处理的数量。读取失败返回错误，客户端必须显示不可用，不能替换成健康的零计数。概览仅为当前选中库读取小页摘要，不为每张媒体库卡产生额外查询。
 
-## TG 网盘站点
+## PanSou 网盘与磁力站点
 
-新增原生 `pansou_tg` 适配器，站点类型为 `cloud_share`。一个站点保存一种网盘类型和多个公开 TG 频道；当前通过 PanSou 搜索 115 分享，统一进入搜索、订阅和现有分享转存入库链路。网盘账号、接收目录、执行位置沿用 115 下载器，协议和配置方式见 [TG 网盘站点](../deployment/tg-cloud-sites.md)。
+原生 `pansou_tg` 保留 `cloud_share` 站点身份，默认聚合 TG 和实例已启用插件。频道支持仅自定义或默认追加；当前用户可用网盘决定自动类型集合，始终包含磁力。每条结果分别保存真实的分享或 BT 来源，推荐、预览、订阅和最终提交共同使用该事实；夸克只提供分享转存，不提供云离线。搜索使用有界结果快照翻页，旧客户端通过能力协商继续接收可识别类型。配置与接口详见 [PanSou 网盘与磁力](../deployment/tg-cloud-sites.md)。
 
 ## 来源感知下载路由
 
@@ -1941,7 +1941,7 @@ Server 可生成 Linux bash 或 Windows PowerShell 完整命令；命令先校�
 
 Server 管理网页调用 `POST /api/v1/sites/routes/recommend` 和 `POST /api/v1/follows/routes/preview`；Player 使用 `POST /api/v1/player/discovery/routes/recommend` 和 `POST /api/v1/player/discovery/follows/routes/preview`。推荐只返回当前用户可见的安全路线信息，不返回站点凭据或下载来源；最终提交再次校验。管理员可通过 `PUT /api/v1/downloaders/order` 提交完整下载器顺序。新的订阅写入使用版本 2 的 `routing_policy=source_priority`，旧版固定 `downloader_id` 写入收到明确的升级错误。
 
-Torznab 站点可单独使用 HTTP 或 HTTPS，其他站点仍按原有 HTTPS 规则。连接测试对根地址先探测 `/api`，仅在 404 时回退到 Jackett 的 Torznab 汇总路径。搜索时，根地址及显式 Jackett 全部索引器地址优先访问与 Jackett 网页相同的 `/api/v2.0/indexers/all/results` 手动搜索接口，按上游顺序分成每页 100 条；该接口不存在（404/405）才走原 Torznab XML 接口。其他显式 Torznab/Prowlarr API 路径维持原状。Jackett 网页自身可能返回不相关标题，因此此模式保留原始结果；通用 Torznab XML 仍按标题过滤。下载地址继续限制为同协议、同主机，来源中的 API Key 不保留在结果身份内，取种时使用已加密配置中的 Key。HTTP 的 API Key 会明文传输，站点表单向管理员提示这一点。
+可配置的 Torznab 和 PanSou 服务地址支持 HTTP/HTTPS、Docker 服务名、IP 与自定义端口；HTTPS 仍校验证书。其他适配器继续执行各自已有的来源合同。连接测试对根地址先探测 `/api`，仅在 404 时回退到 Jackett 的 Torznab 汇总路径。搜索时，根地址及显式 Jackett 全部索引器地址优先访问与 Jackett 网页相同的 `/api/v2.0/indexers/all/results` 手动搜索接口，按上游顺序分成每页 100 条；该接口不存在（404/405）才走原 Torznab XML 接口。其他显式 Torznab/Prowlarr API 路径维持原状。Jackett 网页自身可能返回不相关标题，因此此模式保留原始结果；通用 Torznab XML 仍按标题过滤。下载地址继续限制为同协议、同主机，来源中的 API Key 不保留在结果身份内，取种时使用已加密配置中的 Key。HTTP 的 API Key 会明文传输，站点表单向管理员提示这一点。
 
 ## 插件原生本地离线合同
 

@@ -31,9 +31,11 @@ import (
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/updater"
 	cloudpkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud/pan115"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud/quark"
 	downloadpkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/downloader"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/downloader/pan115offline"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/downloader/qbittorrent"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/downloader/quarkshare"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/mediatool"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/metadata/tmdb"
 	sitepkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/site"
@@ -152,6 +154,9 @@ func main() {
 	if err := cloudRegistry.Register(cloudpkg.ProviderPan115, pan115.New); err != nil {
 		logging.OperationServerLifecycle.Event(log.Fatal()).Err(err).Str("error_code", "pan115_provider_registration_failed").Msg(logging.OperationServerLifecycle.Message("115 驱动注册失败"))
 	}
+	if err := cloudRegistry.Register(cloudpkg.ProviderQuark, quark.New); err != nil {
+		logging.OperationServerLifecycle.Event(log.Fatal()).Str("error_code", "quark_provider_registration_failed").Msg(logging.OperationServerLifecycle.Message("夸克驱动注册失败"))
+	}
 	connections := services.NewConnectionService(db, audit, credentialStore, cloudRegistry, logManager.Logger("connection", "pan115"))
 	credentialReveal := services.NewCredentialRevealService(db, audit, credentialStore)
 	signedProxy, err := services.NewSignedProxyService(db, credentialStore, connections, cfg.PublicOrigin, logManager.Logger("proxy", "signed_strm"))
@@ -179,6 +184,8 @@ func main() {
 	directories.SetProviderDirectoryService(providerDirectories)
 	profiles := services.NewMediaClassificationProfileService(db, audit, nil)
 	libraries := services.NewMediaLibraryService(db, audit, logManager.Logger("media_library", "supervisor"))
+	observations := services.NewProviderObservationService(db)
+	libraries.SetProviderObservationService(observations)
 	libraries.SetCatalogSnapshotStore(catalogStore)
 	libraries.SetConnectionService(connections)
 	profiles.SetReferences(libraries)
@@ -214,6 +221,9 @@ func main() {
 	}
 	if err := providerRegistry.Register(models.DownloaderTypePan115Offline, pan115offline.Capabilities, func(config downloadpkg.Config) (downloadpkg.Client, error) { return pan115offline.New(config) }); err != nil {
 		logging.OperationServerLifecycle.Event(log.Fatal()).Err(err).Str("error_code", "pan115_downloader_registration_failed").Msg(logging.OperationServerLifecycle.Message("115 离线下载驱动注册失败"))
+	}
+	if err := providerRegistry.Register(models.DownloaderTypeQuarkShare, quarkshare.Capabilities, quarkshare.New); err != nil {
+		logging.OperationServerLifecycle.Event(log.Fatal()).Err(err).Str("error_code", "quark_downloader_registration_failed").Msg(logging.OperationServerLifecycle.Message("夸克分享接收驱动注册失败"))
 	}
 	if cfg.Environment != "production" {
 		fakeClient := downloadpkg.NewFakeClient()
@@ -463,6 +473,10 @@ func main() {
 		})
 	}()
 	defer func() { stopCatalogMaintenance(); <-catalogMaintenanceDone }()
+	observationContext, stopObservations := context.WithCancel(context.Background())
+	observationDone := make(chan struct{})
+	go func() { defer close(observationDone); observations.Run(observationContext) }()
+	defer func() { stopObservations(); <-observationDone }()
 	if err := libraries.Start(context.Background()); err != nil {
 		logging.OperationServerLifecycle.Event(log.Fatal()).Err(err).Str("error_code", "media_library_supervisor_start_failed").Msg(logging.OperationServerLifecycle.Message("媒体库监听启动失败"))
 	}

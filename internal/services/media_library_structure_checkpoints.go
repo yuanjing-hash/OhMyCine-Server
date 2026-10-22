@@ -472,6 +472,12 @@ func (s *MediaLibraryStructureService) executeStructureRepairItems(ctx context.C
 			if operationErr != nil {
 				code, safeMessage, global, retryAt := structureRepairFailure(ctx, operationErr)
 				status := structureRepairItemFailed
+				if boundary.Storage.Type == models.StorageTypeQuark && ctx.Err() == nil {
+					if waiting, ok := quarkStructureWaitResult(operationErr); ok {
+						code, safeMessage, global, retryAt = waiting.ErrorCode, waiting.ErrorMessage, true, waiting.RetryAt
+						status = structureRepairItemPending
+					}
+				}
 				if retryAt != nil {
 					status = structureRepairItemPending
 				}

@@ -25,6 +25,10 @@ const (
 	CapabilityPan115ShareReceive = "pan115_share_receive"
 	CapabilityPan115Read         = "pan115_read"
 	CapabilityPan115Upload       = "pan115_upload"
+	CapabilityQuarkReadV2        = "quark_tv_read_v2"
+	CapabilityQuarkUploadV2      = "quark_agent_upload_v2"
+	CapabilityQuarkShareV2       = "quark_share_receive_v2"
+	CapabilityContentDigestV2    = "content_digest_v2"
 	CapabilityRangeExport        = "range_export"
 
 	OperationPending   = "pending"

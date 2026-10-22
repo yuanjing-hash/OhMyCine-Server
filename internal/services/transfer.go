@@ -22,7 +22,6 @@ import (
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/mediarecognition"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/plugins/contract"
-	cloudpkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud"
 	downloadpkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/downloader"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/metadata/releaseversion"
 	"gorm.io/gorm"
@@ -183,8 +182,8 @@ func (s *TransferService) EnqueuePackage(download models.DownloadTask, manifest,
 	record := models.TransferTask{ID: id, OwnerID: download.OwnerID, DownloadTaskID: download.ID, ExecutionLocation: normalizeExecutionLocation(download.ExecutionLocation), NodeID: download.NodeID, NodeName: download.NodeName, LibraryID: *download.TargetLibraryID, LibraryName: download.TargetLibraryName, ManifestJSON: string(raw), SourceManifestJSON: string(sourceRaw), SourceDataSourceJSON: download.SourceDataSourceJSON, TargetDataSourceJSON: download.TargetDataSourceJSON, RouteKind: download.TransferRouteKind, RouteVersion: download.TransferRouteVersion, Phase: models.TransferTaskStatusQueued, CleanupStatus: models.TransferCleanupPending, TotalFiles: len(manifest.Files), CreatedAt: now, UpdatedAt: now}
 	provider := models.StorageTypeLocal
 	resourceKey := "library:" + strconv.FormatUint(uint64(*download.TargetLibraryID), 10)
-	if download.TargetStorageType == models.StorageTypePan115 && download.TargetConnectionID != nil {
-		provider = cloudpkg.ProviderPan115
+	if transferCloudProvider(download.TargetStorageType) && download.TargetConnectionID != nil {
+		provider = download.TargetStorageType
 		resourceKey = "connection:" + strconv.FormatUint(uint64(*download.TargetConnectionID), 10)
 	}
 	if download.TransferRouteVersion == models.TransferRouteVersionCurrent && download.TransferRouteKind == models.TransferRouteCrossSource {
@@ -345,7 +344,11 @@ func (w *TransferWorker) Run(ctx context.Context, runtime JobRuntime, job Claime
 		task.TotalFiles = len(verifiedManifest.Files)
 	}
 	if w.service.structure != nil && download.ScrapeTMDBID != nil {
-		if err := w.service.structure.EnsureWorkLayout(ctx, task.OwnerID, task.LibraryID, *download.ScrapeTMDBID, download.ScrapeMediaType); err != nil {
+		if err := w.service.structure.EnsureWorkLayout(ctx, task.OwnerID, task.LibraryID, *download.ScrapeTMDBID, download.ScrapeMediaType, &job); err != nil {
+			var waiting *structureRepairWaitError
+			if errors.As(err, &waiting) {
+				return waiting.result
+			}
 			return w.fail(task, CodeMediaLibraryStructureApplyFailed, "已有作品目录修复失败，未继续写入新内容")
 		}
 	}

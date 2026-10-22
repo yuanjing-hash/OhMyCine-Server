@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"net/url"
 	"strings"
@@ -18,6 +19,7 @@ import (
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
 	cloudpkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud/pan115"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud/quark"
 	mediaserverpkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/mediaserver"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/mediaserver/emby"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/mediaserver/jellyfin"
@@ -27,16 +29,19 @@ import (
 )
 
 type ConnectionService struct {
-	db              *gorm.DB
-	catalogStore    *CatalogSnapshotStore
-	changes         *MediaChangeService
-	audit           *AuditService
-	credentials     *credential.Store
-	registry        *cloudpkg.Registry
-	log             zerolog.Logger
-	mu              sync.Mutex
-	drivers         map[uint]cloudpkg.Driver
-	driverRevisions map[uint]uint64
+	db                 *gorm.DB
+	catalogStore       *CatalogSnapshotStore
+	changes            *MediaChangeService
+	audit              *AuditService
+	credentials        *credential.Store
+	registry           *cloudpkg.Registry
+	log                zerolog.Logger
+	mu                 sync.Mutex
+	drivers            map[uint]cloudpkg.Driver
+	driverRevisions    map[uint]uint64
+	quarkAuthMu        sync.Mutex
+	quarkSessions      map[string]*quarkAuthSession
+	quarkAuthenticator quarkAuthenticator
 }
 
 func NewConnectionService(db *gorm.DB, audit *AuditService, credentials *credential.Store, registry *cloudpkg.Registry, log zerolog.Logger) *ConnectionService {
@@ -125,7 +130,7 @@ func (s *ConnectionService) List(actor Actor, providers ...string) ([]Connection
 	query := s.db.Order("name_normalized,id")
 	if len(providers) > 0 && strings.TrimSpace(providers[0]) != "" {
 		provider := strings.ToLower(strings.TrimSpace(providers[0]))
-		if provider != cloudpkg.ProviderPan115 && !isMediaServerProvider(provider) {
+		if !isNativeCloudProvider(provider) && !isMediaServerProvider(provider) {
 			return nil, appError(CodeConnectionProviderUnsupported, "当前 Server 不支持该连接类型", nil)
 		}
 		query = query.Where("provider = ?", provider)
@@ -193,7 +198,7 @@ func (s *ConnectionService) Create(actor Actor, input ConnectionInput, request R
 		return ConnectionSummary{}, err
 	}
 	provider := strings.ToLower(strings.TrimSpace(input.Provider))
-	if provider != cloudpkg.ProviderPan115 && !isMediaServerProvider(provider) {
+	if !isNativeCloudProvider(provider) && !isMediaServerProvider(provider) {
 		return ConnectionSummary{}, appError(CodeConnectionProviderUnsupported, "当前 Server 不支持该连接类型", nil)
 	}
 	if provider != models.ConnectionProviderPan115 && (strings.TrimSpace(input.RecyclePassword) != "" || input.RecycleCleanupEnabled || strings.TrimSpace(input.RecycleCleanupCron) != "" || input.RecycleCleanupConfirmed) {
@@ -287,6 +292,9 @@ func (s *ConnectionService) UpdateContext(ctx context.Context, actor Actor, id u
 	}
 	if input.Revision == 0 || input.Revision != record.Revision {
 		return ConnectionSummary{}, appError(CodeConflict, "连接配置已变化，请刷新后重试", nil)
+	}
+	if record.Provider == cloudpkg.ProviderQuark && (input.Cookie != nil || input.APIKey != nil || input.Endpoint != nil) {
+		return ConnectionSummary{}, appError(CodeInvalidRequest, "夸克账号请通过授权登录更新，不接受手动凭据", nil)
 	}
 	previous := record
 	credentialChanged := false
@@ -438,7 +446,7 @@ func (s *ConnectionService) UpdateContext(ctx context.Context, actor Actor, id u
 	} else {
 		record.RecycleCleanupNextRunAt = nil
 	}
-	if record.Provider != models.ConnectionProviderPan115 {
+	if !isNativeCloudProvider(record.Provider) {
 		record.LastHealthStatus, record.LastHealthErrorCode, record.LastHealthCheckedAt = "unknown", "", nil
 		record.AccountID, record.AccountName, record.AccountVIP = "", "", false
 		record.QuotaUsedBytes, record.QuotaTotalBytes = nil, nil
@@ -447,51 +455,70 @@ func (s *ConnectionService) UpdateContext(ctx context.Context, actor Actor, id u
 		record.LastHealthStatus, record.LastHealthErrorCode, record.LastHealthCheckedAt = "online", "", &now
 	}
 	record.Revision++
-	if err := s.writeCatalogConnection(func(tx *gorm.DB) error {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		var current models.Connection
-		if err := tx.First(&current, id).Error; err != nil {
-			return connectionNotFound(err)
-		}
-		if current.Revision != previous.Revision || current.AccountID != previous.AccountID {
-			return appError(CodeConflict, "连接配置或账号信息已变化，请刷新后重试", nil)
-		}
-		if record.Provider == models.ConnectionProviderPan115 && !sameAccountRotation {
-			// A provider call may have confirmed expiry since this edit began.
-			// Cosmetic/recycle edits must not revive that same credential.
-			record.LastHealthStatus, record.LastHealthErrorCode, record.LastHealthCheckedAt = current.LastHealthStatus, current.LastHealthErrorCode, current.LastHealthCheckedAt
-			record.AccountName, record.AccountVIP = current.AccountName, current.AccountVIP
-			record.QuotaUsedBytes, record.QuotaTotalBytes = current.QuotaUsedBytes, current.QuotaTotalBytes
-		}
-		if err := s.applyCatalogConnectionChangeTx(tx, previous, record, credentialChanged && !sameAccountRotation); err != nil {
-			return err
-		}
-		result := tx.Model(&models.Connection{}).Where("id = ? AND revision = ?", id, input.Revision).Updates(map[string]any{
-			"name": record.Name, "name_normalized": record.NameNormalized, "endpoint": record.Endpoint, "credential_ciphertext": record.CredentialCiphertext, "recycle_credential_ciphertext": record.RecycleCredentialCiphertext,
-			"recycle_cleanup_enabled": record.RecycleCleanupEnabled, "recycle_cleanup_cron": record.RecycleCleanupCron, "recycle_cleanup_next_run_at": record.RecycleCleanupNextRunAt,
-			"enabled": record.Enabled, "account_id": record.AccountID, "account_name": record.AccountName, "account_vip": record.AccountVIP,
-			"quota_used_bytes": record.QuotaUsedBytes, "quota_total_bytes": record.QuotaTotalBytes, "last_health_status": record.LastHealthStatus,
-			"last_health_error_code": record.LastHealthErrorCode, "last_health_checked_at": record.LastHealthCheckedAt, "revision": record.Revision, "updated_at": time.Now().UTC(),
-		})
-		if result.Error != nil {
-			return result.Error
-		}
-		if result.RowsAffected != 1 {
-			return appError(CodeConflict, "连接配置已变化，请刷新后重试", nil)
-		}
-		if record.Provider == models.ConnectionProviderEmby {
-			if err := tx.Model(&models.EmbyProxyGateway{}).Where("connection_id = ?", id).Updates(map[string]any{"enabled": false, "policy_revision": gorm.Expr("policy_revision + 1"), "updated_at": time.Now().UTC()}).Error; err != nil {
+	writeConfiguration := func() error {
+		return s.writeCatalogConnection(func(tx *gorm.DB) error {
+			if err := ctx.Err(); err != nil {
 				return err
 			}
-		}
-		overwriteSchedule := input.Enabled != nil || input.RecycleCleanupEnabled != nil || input.RecycleCleanupCron != nil
-		if err := syncPan115RecycleSchedule(tx, actor.User.ID, record, overwriteSchedule); err != nil {
-			return err
-		}
-		return s.audit.Record(tx, &actor.User.ID, "connection.update", "connection", uintID(id), "success", map[string]any{"provider": record.Provider, "enabled": record.Enabled}, request)
-	}); err != nil {
+			var current models.Connection
+			if err := tx.First(&current, id).Error; err != nil {
+				return connectionNotFound(err)
+			}
+			if current.Revision != previous.Revision || current.AccountID != previous.AccountID {
+				return appError(CodeConflict, "连接配置或账号信息已变化，请刷新后重试", nil)
+			}
+			if record.Provider == cloudpkg.ProviderQuark {
+				// A background refresh may replace the encrypted bundle without changing
+				// administrator configuration. A cosmetic save must never roll it back.
+				record.CredentialCiphertext = current.CredentialCiphertext
+				record.AccountName, record.AccountVIP = current.AccountName, current.AccountVIP
+				record.LastHealthStatus, record.LastHealthErrorCode, record.LastHealthCheckedAt = current.LastHealthStatus, current.LastHealthErrorCode, current.LastHealthCheckedAt
+			}
+			if record.Provider == models.ConnectionProviderPan115 && !sameAccountRotation {
+				// A provider call may have confirmed expiry since this edit began.
+				// Cosmetic/recycle edits must not revive that same credential.
+				record.LastHealthStatus, record.LastHealthErrorCode, record.LastHealthCheckedAt = current.LastHealthStatus, current.LastHealthErrorCode, current.LastHealthCheckedAt
+				record.AccountName, record.AccountVIP = current.AccountName, current.AccountVIP
+				record.QuotaUsedBytes, record.QuotaTotalBytes = current.QuotaUsedBytes, current.QuotaTotalBytes
+			}
+			if err := s.applyCatalogConnectionChangeTx(tx, previous, record, credentialChanged && !sameAccountRotation); err != nil {
+				return err
+			}
+			result := tx.Model(&models.Connection{}).Where("id = ? AND revision = ?", id, input.Revision).Updates(map[string]any{
+				"name": record.Name, "name_normalized": record.NameNormalized, "endpoint": record.Endpoint, "credential_ciphertext": record.CredentialCiphertext, "recycle_credential_ciphertext": record.RecycleCredentialCiphertext,
+				"recycle_cleanup_enabled": record.RecycleCleanupEnabled, "recycle_cleanup_cron": record.RecycleCleanupCron, "recycle_cleanup_next_run_at": record.RecycleCleanupNextRunAt,
+				"enabled": record.Enabled, "account_id": record.AccountID, "account_name": record.AccountName, "account_vip": record.AccountVIP,
+				"quota_used_bytes": record.QuotaUsedBytes, "quota_total_bytes": record.QuotaTotalBytes, "last_health_status": record.LastHealthStatus,
+				"last_health_error_code": record.LastHealthErrorCode, "last_health_checked_at": record.LastHealthCheckedAt, "revision": record.Revision, "updated_at": time.Now().UTC(),
+			})
+			if result.Error != nil {
+				return result.Error
+			}
+			if result.RowsAffected != 1 {
+				return appError(CodeConflict, "连接配置已变化，请刷新后重试", nil)
+			}
+			if record.Provider == models.ConnectionProviderEmby {
+				if err := tx.Model(&models.EmbyProxyGateway{}).Where("connection_id = ?", id).Updates(map[string]any{"enabled": false, "policy_revision": gorm.Expr("policy_revision + 1"), "updated_at": time.Now().UTC()}).Error; err != nil {
+					return err
+				}
+			}
+			overwriteSchedule := input.Enabled != nil || input.RecycleCleanupEnabled != nil || input.RecycleCleanupCron != nil
+			if err := syncPan115RecycleSchedule(tx, actor.User.ID, record, overwriteSchedule); err != nil {
+				return err
+			}
+			return s.audit.Record(tx, &actor.User.ID, "connection.update", "connection", uintID(id), "success", map[string]any{"provider": record.Provider, "enabled": record.Enabled}, request)
+		})
+	}
+	var writeErr error
+	if record.Provider == cloudpkg.ProviderQuark {
+		// Let an already consumed token reach its encrypted checkpoint before a
+		// rename/disable advances the configuration fence. No provider I/O occurs
+		// inside this callback and all existing CAS/disabled checks remain intact.
+		writeErr = quark.WithCredentialUpdate(ctx, id, writeConfiguration)
+	} else {
+		writeErr = writeConfiguration()
+	}
+	if err := writeErr; err != nil {
 		if conflict := connectionConstraintError(err); conflict != nil {
 			return ConnectionSummary{}, conflict
 		}
@@ -518,6 +545,9 @@ func (s *ConnectionService) Test(ctx context.Context, actor Actor, id uint, requ
 	}
 	var record models.Connection
 	err := s.db.First(&record, id).Error
+	if err == nil && record.Provider == cloudpkg.ProviderQuark {
+		return s.testQuarkConnection(ctx, actor, record, request)
+	}
 	now := time.Now().UTC()
 	status, errorCode, outcome := "offline", cloudpkg.CodeUnavailable, "failure"
 	var account cloudpkg.Account
@@ -640,6 +670,32 @@ func (s *ConnectionService) Driver(actor Actor, id uint) (models.Connection, clo
 }
 
 func (s *ConnectionService) driver(id uint) (models.Connection, cloudpkg.Driver, error) {
+	record, driver, err := s.cachedDriver(id)
+	if err != nil {
+		return record, driver, err
+	}
+	if resumable, ok := driver.(interface{ ResumeAuthorizations(context.Context) error }); ok && record.Provider == cloudpkg.ProviderQuark {
+		// Capability consumers must see recovered identity checkpoints before
+		// deciding a route is unavailable. Do not hold the cache mutex during
+		// provider I/O: the credential persister invalidates that same cache.
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		_ = resumable.ResumeAuthorizations(ctx)
+		cancel()
+		var current models.Connection
+		if err = s.db.First(&current, id).Error; err != nil {
+			return record, nil, connectionNotFound(err)
+		}
+		if !current.Enabled || current.Revision != record.Revision || current.Provider != record.Provider {
+			return current, nil, appError(CodeConnectionUnavailable, "连接配置已变化，请重试", nil)
+		}
+		// An unavailable Agent route must not block a healthy TV playback route.
+		// Each actual operation returns its route-specific authorization error.
+		return current, driver, nil
+	}
+	return record, driver, nil
+}
+
+func (s *ConnectionService) cachedDriver(id uint) (models.Connection, cloudpkg.Driver, error) {
 	// Serialize construction with invalidation. Builders only parse local config;
 	// Probe and all other provider I/O occur after this lock is released.
 	s.mu.Lock()
@@ -651,7 +707,7 @@ func (s *ConnectionService) driver(id uint) (models.Connection, cloudpkg.Driver,
 	if !record.Enabled {
 		return record, nil, appError(CodeConnectionUnavailable, "连接已停用", nil)
 	}
-	if record.Provider != cloudpkg.ProviderPan115 {
+	if !isNativeCloudProvider(record.Provider) {
 		return record, nil, appError(CodeConnectionProviderUnsupported, "该连接不是存储驱动", nil)
 	}
 	cached := s.drivers[id]
@@ -669,10 +725,31 @@ func (s *ConnectionService) driver(id uint) (models.Connection, cloudpkg.Driver,
 			return record, nil, err
 		}
 	}
-	driver, err := s.registry.Build(record.Provider, cloudpkg.Config{ConnectionID: id, Cookie: cookie, RecyclePassword: recyclePassword,
+	config := cloudpkg.Config{ConnectionID: id, Cookie: cookie, RecyclePassword: recyclePassword,
 		BeforeCall:   func(ctx context.Context) error { return s.guardConnectionCredential(ctx, record.ID, record.Revision) },
 		OnCallResult: func(err error) { s.recordConnectionCredentialFailure(record.ID, record.Revision, err) },
-	})
+	}
+	if record.Provider == cloudpkg.ProviderQuark {
+		config.Cookie = ""
+		config.Credentials = json.RawMessage(cookie)
+		config.Operations = NewQuarkOperationStore(s.db, s.credentials, id)
+		config.BeforeCall = func(ctx context.Context) error { return s.guardQuarkRequest(ctx, record.ID, record.Revision) }
+		// Authorization health stays route-scoped, while rate-limit cooldown is
+		// shared by observation, interactive browsing and playback resolution.
+		config.OnCallResult = func(err error) { RecordQuarkAccountCooldown(s.db, record.ID, record.AccountID, err) }
+		config.PersistCredentials = s.quarkCredentialPersister(record.ID, record.Revision)
+		config.LoadCredentials = func(ctx context.Context) (json.RawMessage, error) {
+			current, bundle, err := s.quarkCredentials(ctx, id)
+			if err != nil {
+				return nil, err
+			}
+			if !current.Enabled || current.Revision != record.Revision {
+				return nil, cloudpkg.Error(cloudpkg.CodeUnavailable, false, nil)
+			}
+			return json.Marshal(bundle)
+		}
+	}
+	driver, err := s.registry.Build(record.Provider, config)
 	if err != nil {
 		return record, nil, connectionProviderError(err)
 	}
@@ -720,6 +797,9 @@ func connectionPurpose(id uint, providers ...string) string {
 	if isMediaServerProvider(provider) {
 		return "connection:" + uintID(id) + ":" + provider + ":api-key"
 	}
+	if provider == cloudpkg.ProviderQuark {
+		return "connection:" + uintID(id) + ":quark:authorizations:v1"
+	}
 	return "connection:" + uintID(id) + ":pan115:cookie"
 }
 
@@ -760,6 +840,9 @@ func nextRecycleCleanup(expression string, after time.Time) (time.Time, error) {
 }
 
 func connectionTestMessage(provider, code string) string {
+	if provider == cloudpkg.ProviderQuark {
+		return quarkErrorMessage(code)
+	}
 	if isMediaServerProvider(provider) {
 		if code == CodeEmbyEndpointInvalid {
 			return "媒体服务器地址无效"
@@ -779,6 +862,12 @@ func connectionTestMessage(provider, code string) string {
 }
 
 func (s *ConnectionService) validateCreateConfig(provider string, input ConnectionInput) (string, string, error) {
+	if provider == cloudpkg.ProviderQuark {
+		if input.Cookie != "" || input.APIKey != "" || input.Endpoint != "" {
+			return "", "", appError(CodeInvalidRequest, "夸克账号请使用授权登录", nil)
+		}
+		return "", `{"version":1,"revision":1}`, nil
+	}
 	if isMediaServerProvider(provider) {
 		parsed, err := mediaServerEndpoint(provider, input.Endpoint)
 		if err != nil {
@@ -801,6 +890,10 @@ func (s *ConnectionService) validateCreateConfig(provider string, input Connecti
 		return "", "", connectionProviderError(err)
 	}
 	return "", normalized, nil
+}
+
+func isNativeCloudProvider(provider string) bool {
+	return provider == cloudpkg.ProviderPan115 || provider == cloudpkg.ProviderQuark
 }
 
 func isMediaServerProvider(provider string) bool {

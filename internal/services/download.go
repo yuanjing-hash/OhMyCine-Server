@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud/quark"
 	"net/url"
 	"os"
 	"path"
@@ -205,6 +206,9 @@ type SubmitDownloadInput struct {
 	// orchestrators. It runs after the download Job has acquired SQLite's write
 	// transaction and immediately before the DownloadTask is inserted.
 	BeforePersist func(*gorm.DB) error
+	// AfterPersist binds an internal observation claim in the same transaction.
+	// It may only write database records and is never part of public input.
+	AfterPersist func(*gorm.DB, models.DownloadTask) error
 }
 
 const maxBatchDownloadSources = 50
@@ -237,7 +241,7 @@ type SubmitDownloadBatchResult struct {
 // download. Partial success is explicit and indexed; source URLs are never
 // echoed back because they may contain private tracker or share material.
 func (s *DownloadService) SubmitBatch(ctx context.Context, actor Actor, input SubmitDownloadBatchInput, request RequestContext) (SubmitDownloadBatchResult, error) {
-	if input.SourceKind != downloadpkg.SourceURL && input.SourceKind != downloadpkg.SourcePan115Share {
+	if input.SourceKind != downloadpkg.SourceURL && !isCloudShareSource(input.SourceKind) {
 		return SubmitDownloadBatchResult{}, appError(CodeDownloadSourceInvalid, "批量下载仅支持链接或 115 分享来源", nil)
 	}
 	if len(input.Sources) == 0 || len(input.Sources) > maxBatchDownloadSources {
@@ -463,7 +467,7 @@ func (s *DownloadService) submit(ctx context.Context, ownerID uint, input Submit
 			return DownloadTaskSummary{}, err
 		}
 	}
-	if source.Kind == downloadpkg.SourcePan115Share {
+	if isCloudShareSource(source.Kind) {
 		sourceOrigin = models.DownloadSourceOriginShare
 	}
 	if normalizeExecutionLocation(downloaderRecord.ExecutionLocation) == models.NodeLocationRemote && downloaderRecord.Type == models.DownloaderTypePan115Offline && source.Kind == downloadpkg.SourceURL && !strings.HasPrefix(strings.ToLower(source.URL), "magnet:") {
@@ -473,12 +477,18 @@ func (s *DownloadService) submit(ctx context.Context, ownerID uint, input Submit
 		return DownloadTaskSummary{}, appError(CodeMediaLibraryStorageUnavailable, "传输节点下载必须选择唯一的最终媒体库", nil)
 	}
 	capabilities, capabilitiesKnown := s.downloader.registry.Capabilities(downloaderRecord.Type)
+	if source.Kind == downloadpkg.SourceQuarkShare && downloaderRecord.Type != models.DownloaderTypeQuarkShare || downloaderRecord.Type == models.DownloaderTypeQuarkShare && source.Kind != downloadpkg.SourceQuarkShare && source.Kind != downloadpkg.SourceProviderItem {
+		return DownloadTaskSummary{}, appError(CodeDownloadSourceInvalid, "夸克分享接收器只接收夸克分享，不支持离线下载", nil)
+	}
+	if normalizeExecutionLocation(downloaderRecord.ExecutionLocation) == models.NodeLocationRemote && downloaderRecord.Type == models.DownloaderTypeQuarkShare && (source.Kind != downloadpkg.SourceQuarkShare || source.ShareSelection == nil) {
+		return DownloadTaskSummary{}, appError(CodeDownloadSourceInvalid, "节点夸克转存需要先预览分享并选择文件，不能直接提交未确认的分享或接管目录", nil)
+	}
 	if source.Kind == downloadpkg.SourcePan115Share && (!capabilitiesKnown || !capabilities.ShareReceive || downloaderRecord.Type != models.DownloaderTypePan115Offline) {
 		return DownloadTaskSummary{}, appError(CodeDownloadSourceInvalid, "所选下载器不支持 115 分享转存", nil)
 	}
 	var profile models.MediaClassificationProfile
 	var target *downloadTargetSnapshot
-	if input.MediaLibraryID != nil || source.Kind == downloadpkg.SourcePan115Share || source.Kind == downloadpkg.SourceProviderItem {
+	if input.MediaLibraryID != nil || isCloudShareSource(source.Kind) || source.Kind == downloadpkg.SourceProviderItem {
 		requested := uint(0)
 		if input.MediaLibraryID != nil {
 			requested = *input.MediaLibraryID
@@ -591,9 +601,16 @@ func (s *DownloadService) submit(ctx context.Context, ownerID uint, input Submit
 			record.IdentitySnapshotJSON = string(rawIdentity)
 		}
 	}
-	if downloaderRecord.Type == models.DownloaderTypePan115Offline {
+	if isCloudShareDownloader(downloaderRecord.Type) {
 		record.StagingStorageID = downloaderRecord.StorageID
 		record.StagingRelativePath = "/"
+		if downloaderRecord.Type == models.DownloaderTypeQuarkShare {
+			record.StagingRelativePath = downloaderRecord.ProviderDirectoryPath
+			if record.StagingRelativePath == "" {
+				record.StagingRelativePath = "/"
+			}
+			record.StagingProviderDirectoryID = strings.TrimSpace(downloaderRecord.ProviderDirectoryID)
+		}
 		if executionLocation == models.NodeLocationRemote {
 			record.StagingProviderDirectoryID = strings.TrimSpace(downloaderRecord.ProviderDirectoryID)
 		}
@@ -602,7 +619,7 @@ func (s *DownloadService) submit(ctx context.Context, ownerID uint, input Submit
 		// The media-library intake directory is an override only for share
 		// receive and internally adopted provider items. Ordinary 115 offline
 		// downloads must keep using the downloader's own configured directory.
-		if executionLocation != models.NodeLocationRemote && (source.Kind == downloadpkg.SourcePan115Share || source.Kind == downloadpkg.SourceProviderItem) {
+		if executionLocation != models.NodeLocationRemote && (isCloudShareSource(source.Kind) || source.Kind == downloadpkg.SourceProviderItem) {
 			record.StagingProviderDirectoryID = target.IngestProviderRootID
 		}
 		record.TargetLibraryID = &target.LibraryID
@@ -654,6 +671,9 @@ func (s *DownloadService) submit(ctx context.Context, ownerID uint, input Submit
 			}
 		}
 		if executionLocation == models.NodeLocationRemote {
+			if err := validateQuarkNodeTaskAdmission(tx, downloaderRecord, record); err != nil {
+				return err
+			}
 			_, revision, digest, routeErr := nodeTaskRoutePlan(tx, downloaderRecord, record.StagingAbsolutePath, requestedTargetID(record.TargetLibraryID))
 			if routeErr != nil {
 				return routeErr
@@ -665,6 +685,11 @@ func (s *DownloadService) submit(ctx context.Context, ownerID uint, input Submit
 		record.JobID = job.ID
 		if err := tx.Create(&record).Error; err != nil {
 			return err
+		}
+		if input.AfterPersist != nil {
+			if err := input.AfterPersist(tx, record); err != nil {
+				return err
+			}
 		}
 		metadata := map[string]any{"downloader_id": downloaderRecord.ID, "provider_type": downloaderRecord.Type, "source_kind": source.Kind}
 		if record.TargetLibraryID != nil {
@@ -1522,7 +1547,7 @@ func normalizeDownloadSource(input DownloadSourceInput, requestedName string) (d
 	kind := strings.ToLower(strings.TrimSpace(input.Kind))
 	source := downloadSourceEnvelope{Kind: kind}
 	if input.ShareSelection != nil {
-		if kind != downloadpkg.SourcePan115Share {
+		if !isCloudShareSource(kind) {
 			return source, "", appError(CodeDownloadSourceInvalid, "文件选择只适用于分享转存", nil)
 		}
 		raw, err := cloud.EncodeSelectedShareSource(input.URL, *input.ShareSelection)
@@ -1561,6 +1586,12 @@ func normalizeDownloadSource(input DownloadSourceInput, requestedName string) (d
 			return source, "", appError(CodeDownloadSourceInvalid, "115 分享链接无效", err)
 		}
 		source.URL = raw
+	case downloadpkg.SourceQuarkShare:
+		normalized, _, err := quark.NormalizeShareLink(input.URL, "")
+		if err != nil {
+			return source, "", appError(CodeDownloadSourceInvalid, "夸克分享链接无效", nil)
+		}
+		source.URL = normalized
 	case downloadpkg.SourceTorrent:
 		filename := filepath.Base(strings.ReplaceAll(strings.TrimSpace(input.Filename), "\\", "/"))
 		if len(input.Torrent) == 0 || len(input.Torrent) > downloadpkg.MaxTorrentBytes || !strings.EqualFold(filepath.Ext(filename), ".torrent") || input.Torrent[0] != 'd' {
@@ -1574,6 +1605,9 @@ func normalizeDownloadSource(input DownloadSourceInput, requestedName string) (d
 	fallbackName := "URL 下载"
 	if source.Kind == downloadpkg.SourcePan115Share {
 		fallbackName = "115 分享转存"
+	}
+	if source.Kind == downloadpkg.SourceQuarkShare {
+		fallbackName = "夸克分享转存"
 	}
 	name := strings.Join(strings.Fields(requestedName), " ")
 	if name == "" {
@@ -2962,6 +2996,16 @@ func (w *DownloadWorker) transferEnqueueFailure(task models.DownloadTask, err er
 
 func downloadFailureMessage(code string, retryable bool) string {
 	switch code {
+	case "downloader_share_result_unknown", quark.CodePending:
+		return "夸克已接收操作，正在核对原任务输出；不会重复提交转存"
+	case "downloader_submit_unknown":
+		return "云端提交结果尚未确认，已保留原操作凭证；请核对原任务，不要重新转存"
+	case quark.CodeIdentity, quark.CodeProof:
+		return "夸克授权与受管目录无法对应，请在连接管理中重新验证共同目录"
+	case "quark_share_changed", "quark_share_selection_invalid":
+		return "夸克分享内容已变化，原选择无法安全转存，请重新预览"
+	case quark.CodeIncomplete, quark.CodeInvalid:
+		return "夸克返回的目录或文件信息不完整，已停止本次处理"
 	case "downloader_share_expired", "node_source_share_expired":
 		return "115 分享已失效或已被取消，请重新选择资源"
 	case "downloader_share_password_invalid", "node_source_share_password_invalid":
@@ -3007,6 +3051,9 @@ func downloadFailureMessage(code string, retryable bool) string {
 }
 
 func downloadOperation(providerType, sourceOrigin string) serverlog.Operation {
+	if providerType == models.DownloaderTypeQuarkShare {
+		return serverlog.OperationQuarkShareIngest
+	}
 	if sourceOrigin == models.DownloadSourceOriginShare || sourceOrigin == models.DownloadSourceOriginProviderIngest {
 		return serverlog.OperationPan115ShareIngest
 	}

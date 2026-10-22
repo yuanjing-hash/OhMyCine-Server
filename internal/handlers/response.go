@@ -26,6 +26,14 @@ func writeError(c *gin.Context, log zerolog.Logger, err error) {
 	status := http.StatusInternalServerError
 	code := services.ErrorCode(err)
 	switch code {
+	case "quark_rate_limited":
+		status = http.StatusTooManyRequests
+	case "quark_auth_expired", "quark_unavailable", "quark_capability_unavailable":
+		status = http.StatusServiceUnavailable
+	case "quark_response_invalid", "quark_directory_incomplete":
+		status = http.StatusBadGateway
+	case "quark_identity_mismatch", "quark_shared_space_unverified":
+		status = http.StatusConflict
 	case "pan115_share_expired":
 		status = http.StatusGone
 	case "pan115_share_password_invalid", "pan115_share_invalid", "pan115_share_empty", "pan115_share_too_large":

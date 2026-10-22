@@ -14,7 +14,7 @@ import (
 func captureCloudManagedItems(tx *gorm.DB, task models.TransferTask, download models.DownloadTask, targets []transferTargetItem, state cloudTransferState) error {
 	for _, target := range targets {
 		key := normalizedManifestPath(target.File.RelativePath)
-		if _, uploaded := state.Items[key]; !uploaded && download.ProviderType == models.DownloaderTypePan115Offline {
+		if _, uploaded := state.Items[key]; !uploaded && (download.ProviderType == models.DownloaderTypePan115Offline || download.ProviderType == models.DownloaderTypeQuarkShare) {
 			key = strings.TrimSpace(target.File.ProviderItemID)
 		}
 		item := state.Items[key]

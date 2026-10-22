@@ -904,7 +904,10 @@ func (s *MediaArtifactService) finishArtifactGeneration(ctx context.Context, cla
 	}); err != nil {
 		return WorkerResult{ErrorCode: "artifact_write_settlement_failed", ErrorMessage: "媒体产物文件操作完成确认失败，保留恢复记录"}
 	}
-	if policy.ScanPartial && policy.ScopeVersion != 1 {
+	// A versioned catalog binding is an exact committed change set. Its
+	// incremental scan is partial by design, but completed bound artifacts can
+	// publish readiness without pretending the whole provider tree was scanned.
+	if policy.ScanPartial && policy.ScopeVersion != 1 && policy.CatalogBindingID == "" {
 		return WorkerResult{}
 	}
 	return s.publishGenerationReady(run.LibraryID, run.Generation, policy, ctx)
@@ -934,7 +937,7 @@ func (s *MediaArtifactService) publishGenerationReady(libraryID uint, generation
 	if s.changes == nil {
 		return WorkerResult{}
 	}
-	if policy.ScanPartial && policy.ScopeVersion != 1 {
+	if policy.ScanPartial && policy.ScopeVersion != 1 && policy.CatalogBindingID == "" {
 		return WorkerResult{}
 	}
 	var readied []models.MediaLibraryChange

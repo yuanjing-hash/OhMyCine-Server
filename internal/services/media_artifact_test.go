@@ -262,6 +262,9 @@ func TestMediaArtifactWorkerGeneratesManagedSTRMAndPreservesUnmanagedFile(t *tes
 	}
 	proxyNow := now
 	proxy.now = func() time.Time { return proxyNow }
+	// Lease generations advance the proxy clock by hours/months. Provider URL
+	// leases must use that same test clock, not the real wall clock.
+	driver.directURLNow = proxy.now
 	var businessLog bytes.Buffer
 	artifacts := NewMediaArtifactService(db, queue, proxy, zerolog.New(zerolog.SyncWriter(&businessLog)).With().Timestamp().Logger())
 	artifacts.SetConnectionService(connections)
@@ -518,6 +521,16 @@ func TestMediaArtifactWorkerGeneratesManagedSTRMAndPreservesUnmanagedFile(t *tes
 	}
 	if _, err := proxy.ResolveArtifact(context.Background(), movieArtifact.OpaqueID, "Lease-Test"); err != nil || len(driver.directFileIDs) == 0 || driver.directFileIDs[len(driver.directFileIDs)-1] != "movie-file-rebound" {
 		t.Fatalf("rebound resolver ids=%v err=%v", driver.directFileIDs, err)
+	}
+	// Keep the actual expiry rule covered: a fresh acquisition that is already
+	// expired must fail and must not poison a subsequent valid acquisition.
+	driver.directURLNow = func() time.Time { return proxyNow.Add(-2 * time.Minute) }
+	if _, err := proxy.ResolveArtifact(context.Background(), movieArtifact.OpaqueID, "Lease-Test-Expired"); ErrorCode(err) != CodeProxyUpstreamUnavailable {
+		t.Fatalf("expired provider URL accepted: %v", err)
+	}
+	driver.directURLNow = proxy.now
+	if redirect, err := proxy.ResolveArtifact(context.Background(), movieArtifact.OpaqueID, "Lease-Test-Expired"); err != nil || !redirect.ExpiresAt.Equal(proxyNow.Add(time.Minute)) {
+		t.Fatalf("valid provider URL after expired acquisition: expires=%v err=%v", redirect.ExpiresAt, err)
 	}
 
 	// Entering the renewal window updates only the two managed STRM files once;

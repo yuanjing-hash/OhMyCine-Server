@@ -28,6 +28,9 @@ const (
 )
 
 func (w *TransferWorker) materializePan115Source(ctx context.Context, runtime JobRuntime, task models.TransferTask, download models.DownloadTask, manifest downloadpkg.Manifest) (models.TransferTask, string, error) {
+	if download.ProviderType == models.DownloaderTypeQuarkShare {
+		return w.materializeQuarkSource(ctx, runtime, task, download, manifest)
+	}
 	if w.service.connections == nil || download.StagingStorageID == nil || strings.TrimSpace(download.ProviderOutputID) == "" {
 		return task, "", cloudTransferError("cross_source_snapshot_invalid", false, nil)
 	}

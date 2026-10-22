@@ -104,7 +104,7 @@ func (c Config) Validate() error {
 }
 
 func (c Config) Capabilities(freeBytes *int64) nodeprotocol.Capabilities {
-	return nodeprotocol.Capabilities{Codes: []string{nodeprotocol.CapabilityQBittorrentControl, nodeprotocol.CapabilityRangeExport, nodeprotocol.CapabilityPan115Offline, nodeprotocol.CapabilityPan115ShareReceive, nodeprotocol.CapabilityPan115Read, nodeprotocol.CapabilityPan115Upload}, MaxConcurrent: c.MaxConcurrentOperations, ManagedFreeBytes: freeBytes, ManagedFreeBytesKnown: freeBytes != nil}.Canonical()
+	return nodeprotocol.Capabilities{Codes: []string{nodeprotocol.CapabilityQBittorrentControl, nodeprotocol.CapabilityRangeExport, nodeprotocol.CapabilityPan115Offline, nodeprotocol.CapabilityPan115ShareReceive, nodeprotocol.CapabilityPan115Read, nodeprotocol.CapabilityPan115Upload, nodeprotocol.CapabilityQuarkReadV2, nodeprotocol.CapabilityQuarkShareV2, nodeprotocol.CapabilityQuarkUploadV2, nodeprotocol.CapabilityContentDigestV2}, MaxConcurrent: c.MaxConcurrentOperations, ManagedFreeBytes: freeBytes, ManagedFreeBytesKnown: freeBytes != nil}.Canonical()
 }
 
 func Platform() (string, string) { return runtime.GOOS, runtime.GOARCH }

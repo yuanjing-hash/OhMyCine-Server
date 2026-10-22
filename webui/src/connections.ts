@@ -6,7 +6,7 @@ export interface EmbyConnectionDraft {
   enabled: boolean
 }
 
-export function connectionListPath(provider: 'pan115' | 'emby' | 'jellyfin') {
+export function connectionListPath(provider: 'pan115' | 'quark' | 'emby' | 'jellyfin') {
   return `/api/v1/connections?provider=${provider}`
 }
 

@@ -29,7 +29,7 @@ func TestSearchScopeAuthenticationAndLatestShare(t *testing.T) {
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			t.Error(err)
 		}
-		if strings.Join(body.Channels, ",") != "movies" || strings.Join(body.Clouds, ",") != "115" || body.Source != "tg" {
+		if strings.Join(body.Channels, ",") != "movies" || strings.Join(body.Clouds, ",") != "115,quark" || body.Source != "tg" {
 			t.Errorf("unexpected scope: %+v", body)
 		}
 		if r.Header.Get("Authorization") == "Bearer token-1" {
@@ -45,7 +45,7 @@ func TestSearchScopeAuthenticationAndLatestShare(t *testing.T) {
   ]}}`)
 	}))
 	defer server.Close()
-	cfg := site.Config{BaseURL: server.URL, Cloud: &site.CloudConfig{Provider: "115", Channels: []string{"@Movies", "https://t.me/s/movies"}, AuthEnabled: true}, Username: "user", Password: "secret"}
+	cfg := site.Config{BaseURL: server.URL, Cloud: &site.CloudConfig{Provider: "115", Channels: []string{"@Movies", "https://t.me/s/movies"}, AuthEnabled: true, SourceScope: "tg", TypePolicy: "manual", CloudTypes: []string{"115", "quark"}}, Username: "user", Password: "secret"}
 	adapter := NewForTest(server.Client())
 	page, err := adapter.Search(context.Background(), cfg, site.Query{Keyword: "Show", Page: 1})
 	if err != nil || len(page.Items) != 1 || logins != 2 || searches != 2 {
@@ -91,5 +91,45 @@ func TestSearchRejectsInvalidResponsesAndCancellation(t *testing.T) {
 	cancel()
 	if _, err := adapter.Search(ctx, cfg, site.Query{Keyword: "Show", Page: 1}); err == nil || requests != 1 {
 		t.Fatalf("cancelled request sent: %d %v", requests, err)
+	}
+}
+
+func TestHTTPPanSouSeparatesActualCloudProviders(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Clouds []string `json:"cloud_types"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if strings.Join(body.Clouds, ",") != "115,quark" {
+			t.Error("provider types not requested")
+		}
+		fmt.Fprint(w, `{"code":0,"data":{"total":3,"results":[{"channel":"movies","title":"Show","links":[{"type":"115","url":"https://115.com/s/same?password=abcd"},{"type":"quark","url":"https://pan.quark.cn/s/same","password":"abcd"},{"type":"quark","url":"https://115.com/s/wrong?password=abcd"}]}]}}`)
+	}))
+	defer server.Close()
+	a := NewForTest(server.Client())
+	config := site.Config{BaseURL: server.URL, Cloud: &site.CloudConfig{Provider: "115", Channels: []string{"movies"}, TypePolicy: "manual", CloudTypes: []string{"115", "quark"}}}
+	p, e := a.Search(context.Background(), config, site.Query{Keyword: "Show", Page: 1})
+	if e != nil || len(p.Items) != 2 {
+		t.Fatalf("items %+v error %v", p.Items, e)
+	}
+	seen := map[string]bool{}
+	fingerprints := map[string]bool{}
+	for _, item := range p.Items {
+		seen[item.SourceKind] = true
+		if fingerprints[item.Fingerprint] {
+			t.Fatal("cross-provider fingerprint collision")
+		}
+		fingerprints[item.Fingerprint] = true
+		source, e := a.ResolveSource(context.Background(), config, item.TorrentID)
+		if e != nil || source.CloudProvider+"_share" != item.SourceKind {
+			t.Fatal("resolved provider drift", e)
+		}
+		raw, _ := json.Marshal(item)
+		if strings.Contains(string(raw), "pwd=") || strings.Contains(string(raw), "password=") {
+			t.Fatal("share credential leaked")
+		}
+	}
+	if !seen["115_share"] || !seen["quark_share"] {
+		t.Fatal("missing provider")
 	}
 }

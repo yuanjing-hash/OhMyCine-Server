@@ -179,13 +179,13 @@ describe('automatic result recognition', () => {
   it('automatically enriches restored cards without a detect button or share requests', async () => {
     const state = { input: { keyword: '作品', mediaType: '', siteIDs: [1], searchBy: 'title' as const }, groups: [{ site_id: 1, site_name: '盘搜', site_type: 'cloud_share' as const, status: 'success' as const, page: 1, has_next: false, skipped: 0, items: [{ ...item('card'), source_kind: '115_share' as const }] }], recognitions: {}, searched: true, savedAt: Date.now() }
     saveTorrentSearchSession(sessionStorage, state)
-    vi.mocked(api).mockImplementation(path => Promise.resolve(path === torrentRecognitionPath ? matched() : present))
+    vi.mocked(api).mockImplementation(path => Promise.resolve(path === '/api/v1/discovery/search-options' ? { list: [{ id: 1, name: '盘搜', searchable: true }] } : path === torrentRecognitionPath ? matched() : present))
     const wrapper = mount(ExploreView, { global: { stubs: { RouterLink: true } } })
     cleanup.push(() => wrapper.unmount())
     await flushPromises()
     expect(wrapper.text()).toContain('库内：已入库')
     expect(wrapper.findAll('button').some(button => button.text() === '检测')).toBe(false)
     expect(wrapper.findAll('button').some(button => button.text() === '手动检测')).toBe(true)
-    expect(vi.mocked(api).mock.calls.map(([path]) => path)).toEqual([torrentRecognitionPath, '/api/v1/discovery/media/movie/1/coverage'])
+    expect(vi.mocked(api).mock.calls.map(([path]) => path)).toEqual(['/api/v1/discovery/search-options', torrentRecognitionPath, '/api/v1/discovery/media/movie/1/coverage'])
   })
 })
