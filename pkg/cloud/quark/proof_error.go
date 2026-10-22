@@ -17,6 +17,13 @@ type OperationError struct {
 func (e *OperationError) Error() string { return "quark_operation_failed" }
 func (e *OperationError) Unwrap() error { return e.Cause }
 
+// Only code before http.Client.Do may construct this evidence. A transport
+// error, HTTP response, missing part or absent file is never proof of no send.
+type requestNotDispatchedError struct{ Cause error }
+
+func (e *requestNotDispatchedError) Error() string { return "quark_request_not_dispatched" }
+func (e *requestNotDispatchedError) Unwrap() error { return e.Cause }
+
 func operationError(stage string, err error) error {
 	if err == nil {
 		return nil

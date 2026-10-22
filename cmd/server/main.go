@@ -334,6 +334,7 @@ func main() {
 	}
 	api := handlers.NewAPI(cfg, auth, admin, audit, storages, directories, profiles, log)
 	acquisition := services.NewAcquisitionService(db)
+	acquisition.SetCatalogSnapshotStore(catalogStore)
 	api.SetAcquisitionService(acquisition)
 	api.SetUpdateService(updateService)
 	api.SetConnectionService(connections)

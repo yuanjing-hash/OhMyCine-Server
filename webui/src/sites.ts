@@ -1,4 +1,5 @@
 import type { ShareValidation } from '@/share-preview'
+import { parseShareContentAnalysis } from '@/share-content'
 
 export const defaultPanSouBaseURL = 'https://so.252035.xyz'
 
@@ -71,7 +72,14 @@ export function safeDiscoveryPostURL(value?: string) {
 }
 export function discoveryOrigins(item: Pick<PTSearchResult, 'origins' | 'channel' | 'post_url'>): DiscoveryOrigin[] {
   const origins: DiscoveryOrigin[] = Array.isArray(item.origins) && item.origins.length ? item.origins : typeof item.channel === 'string' && item.channel ? [{ kind: 'tg', name: item.channel, post_url: item.post_url }] : []
-  return origins.filter(origin => origin && (origin.kind === 'tg' || origin.kind === 'plugin') && typeof origin.name === 'string' && origin.name.length > 0 && origin.name.length <= 128 && !hasDiscoveryControl(origin.name)).map(origin => ({ kind: origin.kind, name: origin.name, post_url: origin.kind === 'tg' ? safeDiscoveryPostURL(origin.post_url) : undefined }))
+  const seen = new Set<string>()
+  return origins.filter(origin => {
+    if (!origin || (origin.kind !== 'tg' && origin.kind !== 'plugin') || typeof origin.name !== 'string' || !origin.name || origin.name.length > 128 || hasDiscoveryControl(origin.name)) return false
+    const key = `${origin.kind}:${origin.name}`
+    if (seen.has(key)) return false
+    seen.add(key)
+    return true
+  }).map(origin => ({ kind: origin.kind, name: origin.name, post_url: origin.kind === 'tg' ? safeDiscoveryPostURL(origin.post_url) : undefined }))
 }
 function hasDiscoveryControl(value: string, rejectSpace = false) { return Array.from(value).some(character => character.charCodeAt(0) <= (rejectSpace ? 32 : 31) || character.charCodeAt(0) === 127) }
 export function safeDiscoveryLink(value: unknown): string | undefined {
@@ -253,9 +261,10 @@ export interface PTRecognitionEpisodeFacts {
   count?: number
 }
 
-export const ptRecognitionEngineVersion = 'nextgen-domain-v12'
+export const ptRecognitionEngineVersion = 'nextgen-domain-v13'
 
 export interface PTRecognitionResult {
+  share_analysis?: import('@/share-content').ShareContentAnalysis
   engine_version: string
   status: 'matched' | 'unrecognized'
   manual_override?: boolean
@@ -626,7 +635,7 @@ function restoreTorrentRecognition(value: unknown): TorrentRecognitionResult | n
   const candidate = value as Partial<TorrentRecognitionResult>
   if (candidate.engine_version !== ptRecognitionEngineVersion || (candidate.status !== 'matched' && candidate.status !== 'unrecognized') || typeof candidate.title !== 'string' || !candidate.specifications || typeof candidate.specifications !== 'object') return null
   const episodes = restoreEpisodeFacts(candidate.episodes)
-  return { ...candidate, engine_version: candidate.engine_version, status: candidate.status, manual_override: candidate.manual_override === true || undefined, title: candidate.title.slice(0, 512), specifications: candidate.specifications, episodes } as TorrentRecognitionResult
+  return { ...candidate, engine_version: candidate.engine_version, status: candidate.status, manual_override: candidate.manual_override === true || undefined, title: candidate.title.slice(0, 512), specifications: candidate.specifications, episodes, share_analysis: parseShareContentAnalysis(candidate.share_analysis) } as TorrentRecognitionResult
 }
 
 function restoreEpisodeFacts(value: unknown): PTRecognitionEpisodeFacts | undefined {

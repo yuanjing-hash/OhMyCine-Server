@@ -5,9 +5,10 @@ import { formatBytes, cloudShareDownloaderType, isCloudShareSource } from '@/dow
 import { isShareVideo, shareEntryFiles, toggleShareEntry, type SharePreview, type SharePreviewEntry, type ShareSelection, type ShareValidation } from '@/share-preview'
 import type { TorrentRecognitionResult } from '@/sites'
 import type { DownloaderSummary } from '@/types/api'
+import { parseShareContentAnalysis, type ShareContentAnalysis } from '@/share-content'
 
 const props = defineProps<{ resultToken: string; title: string; sourceKind?: string; downloaders: DownloaderSummary[] }>()
-const emit = defineEmits<{ close: []; select: [selection: ShareSelection]; validation: [resultToken: string, validation: ShareValidation] }>()
+const emit = defineEmits<{ close: []; select: [selection: ShareSelection]; validation: [resultToken: string, validation: ShareValidation]; analysis: [resultToken: string, analysis: ShareContentAnalysis] }>()
 // Omitted source kind is the legacy 115 dialog contract; an explicit other source
 // must never inherit that fallback. Readiness comes from the current Server DTO.
 const sourceKind = computed(() => props.sourceKind ?? '115_share')
@@ -60,6 +61,8 @@ async function load() {
   if (controller.signal.aborted || closed || request !== controller || context !== previewContext.value) return
   acceptedContext = context
   preview.value = result
+  const analysis = parseShareContentAnalysis(result.share_analysis)
+  if (analysis) emit('analysis', resultToken, analysis)
   if (result.share_validation) emit('validation', resultToken, result.share_validation)
  } catch (reason) {
   if (request === controller && !closed && context === previewContext.value) {

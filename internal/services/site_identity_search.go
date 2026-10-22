@@ -205,7 +205,8 @@ func (s *SiteService) searchMediaIdentitySitePage(ctx context.Context, actor Act
 				rejections.add("claim_unavailable", item.Title)
 				continue
 			}
-			if !mediaIdentityResultMatches(item.Title, names, input.MediaType, verified.ReleaseYear, input.Season) {
+			cloudShare := isCloudShareSource(item.SourceKind)
+			if !cloudShare && !mediaIdentityResultMatches(item.Title, names, input.MediaType, verified.ReleaseYear, input.Season) {
 				s.deleteClaim(item.Token)
 				target.Skipped++
 				rejections.add("identity_mismatch", item.Title)
@@ -222,7 +223,13 @@ func (s *SiteService) searchMediaIdentitySitePage(ctx context.Context, actor Act
 				rejections.add("duplicate", item.Title)
 				continue
 			}
-			if bindErr := s.bindClaimRecognition(item.Token, actor.User.ID, input.TMDBID, input.MediaType, mediaIdentitySourceDirectID, mediaIdentityStatusVerified, false); bindErr != nil {
+			var bindErr error
+			if cloudShare {
+				bindErr = s.bindShareSearchIdentity(item.Token, actor.User.ID, siteShareIdentity{TMDBID: input.TMDBID, MediaType: input.MediaType, Title: verified.Title, Names: names, Season: cloneInt(input.Season), Year: cloneInt(verified.ReleaseYear), SeasonCount: verified.Snapshot.SeasonCount})
+			} else {
+				bindErr = s.bindClaimRecognition(item.Token, actor.User.ID, input.TMDBID, input.MediaType, mediaIdentitySourceDirectID, mediaIdentityStatusVerified, false)
+			}
+			if bindErr != nil {
 				s.deleteClaim(item.Token)
 				rejections.add("identity_bind_failed", item.Title)
 				continue

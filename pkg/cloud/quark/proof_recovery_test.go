@@ -121,6 +121,8 @@ func (f *proofRecoveryFixture) api(r *http.Request) (*http.Response, error) {
 			return nil, errors.New("lost acknowledgement")
 		}
 		return envelope(r, map[string]any{"fid": id, "finish": true}), nil
+	case "/open/v1/file/list_uploaded_parts":
+		return envelope(r, map[string]any{"finish_status": 0, "uploaded_parts": []any{}}), nil
 	case "/open/v1/file/delete":
 		f.deletes++
 		var body struct {

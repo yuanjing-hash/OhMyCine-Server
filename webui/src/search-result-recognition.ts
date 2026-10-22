@@ -2,6 +2,7 @@ import { ref, watch, type Ref } from 'vue'
 import { api } from '@/api/client'
 import { discoveryCoveragePath, normalizeMediaCoverage, coverageStatusLabel, type MediaCoverage } from '@/discovery'
 import { torrentRecognitionPath, type TorrentRecognitionResult, type TorrentSearchResult } from '@/sites'
+import { isCloudContentResult, parseShareContentAnalysis, type ShareContentAnalysis } from '@/share-content'
 
 type LibraryState = { label: string; detail: string; present: boolean }
 type Attempt = { controller: AbortController; generation: number; revision: number; cancel: () => void }
@@ -9,7 +10,7 @@ type Attempt = { controller: AbortController; generation: number; revision: numb
 const concurrentRecognitions = 2
 const recognitionDeadlineMs = 30000
 
-// Each page owns its queue. No share contents are requested by title recognition.
+// Each page owns its bounded queue. Server inspects cloud files; BT uses titles.
 export function useSearchResultRecognition(items: Ref<TorrentSearchResult[]>, canReadLibrary: () => boolean) {
   const recognitions = ref<Record<string, TorrentRecognitionResult>>({})
   const recognitionErrors = ref<Record<string, string>>({})
@@ -83,11 +84,14 @@ export function useSearchResultRecognition(items: Ref<TorrentSearchResult[]>, ca
     recognizingTokens.value = [...active.keys()]
 
     const work = (async () => {
-      const result = recognitions.value[item.token] ?? await api<TorrentRecognitionResult>(torrentRecognitionPath, {
+      const saved = recognitions.value[item.token]
+      const result = saved && (!isCloudContentResult(item) || parseShareContentAnalysis(saved.share_analysis)) ? saved : await api<TorrentRecognitionResult>(torrentRecognitionPath, {
         method: 'POST', body: JSON.stringify({ result_token: item.token }), signal: controller.signal,
       })
       if (!isCurrent(item, attempt)) return
-      recognitions.value[item.token] = result
+      const analysis = parseShareContentAnalysis(result.share_analysis)
+      if (result.share_analysis !== undefined && !analysis) throw new Error('分享文件分析无效或已过期，请重新检测')
+      recognitions.value[item.token] = { ...result, share_analysis: analysis }
       libraryStates.value[item.token] = { label: '正在查询库内状态…', detail: '', present: false }
       const state = await readCoverage(result)
       if (isCurrent(item, attempt)) libraryStates.value[item.token] = state
@@ -96,7 +100,7 @@ export function useSearchResultRecognition(items: Ref<TorrentSearchResult[]>, ca
     })
 
     let timeout: number | undefined
-    const deadline = new Promise<'timeout'>(resolve => { timeout = window.setTimeout(() => resolve('timeout'), recognitionDeadlineMs) })
+    const deadline = new Promise<'timeout'>(resolve => { timeout = window.setTimeout(() => resolve('timeout'), isCloudContentResult(item) ? 65000 : recognitionDeadlineMs) })
     void (async () => {
       try {
         const outcome = await Promise.race([work.then(() => 'done' as const), deadline, cancelled])
@@ -104,7 +108,7 @@ export function useSearchResultRecognition(items: Ref<TorrentSearchResult[]>, ca
           controller.abort()
           recognitionErrors.value[item.token] = recognitions.value[item.token]
             ? '库内状态查询超时，请重新检测'
-            : '作品自动识别超时，请重新检测或使用手动检测'
+            : isCloudContentResult(item) ? '分享文件读取超时，请重新检测；尚未确认实际集数' : '作品自动识别超时，请重新检测或使用手动检测'
           if (libraryStates.value[item.token]?.label === '正在查询库内状态…') {
             libraryStates.value[item.token] = { label: '库内状态暂不可用', detail: '查询超时，不代表未入库', present: false }
           }
@@ -184,6 +188,14 @@ export function useSearchResultRecognition(items: Ref<TorrentSearchResult[]>, ca
     pump()
   }
 
+  function acceptShareAnalysis(token: string, analysis: ShareContentAnalysis) {
+    const item = items.value.find(candidate => candidate.token === token)
+    const parsed = parseShareContentAnalysis(analysis)
+    if (stopped || !item || !parsed || !isCloudContentResult(item)) return
+    const saved = recognitions.value[token]
+    acceptManual(token, { ...(saved ?? { engine_version: '', status: 'unrecognized', title: item.title, specifications: {} }), share_analysis: parsed })
+  }
+
   function reset() {
     generation++
     for (const token of active.keys()) invalidate(token)
@@ -198,5 +210,5 @@ export function useSearchResultRecognition(items: Ref<TorrentSearchResult[]>, ca
     libraryStates.value = {}
   }
   function dispose() { stopped = true; stopWatch(); reset() }
-  return { recognitions, recognitionErrors, recognizingTokens, libraryStates, retry, acceptManual, reset, dispose }
+  return { recognitions, recognitionErrors, recognizingTokens, libraryStates, retry, acceptManual, acceptShareAnalysis, reset, dispose }
 }

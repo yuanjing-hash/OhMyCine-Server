@@ -151,7 +151,8 @@ func (a *cloudFixtureAdapter) Search(_ context.Context, _ sitepkg.Config, q site
 
 func TestCloudFollowReusesShareForNewEpisodes(t *testing.T) {
 	f := newShareIngestFixture(t)
-	f.downloads.downloader.connections.drivers[*f.storage.ConnectionID] = &previewFixtureDriver{f.driver}
+	shareDriver := &evolvingCloudShareFixtureDriver{previewFixtureDriver: &previewFixtureDriver{f.driver}, episodes: 1}
+	f.downloads.downloader.connections.drivers[*f.storage.ConnectionID] = shareDriver
 	now := time.Now().UTC()
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -240,6 +241,7 @@ func TestCloudFollowReusesShareForNewEpisodes(t *testing.T) {
 	}
 	run()
 	adapter.searchTitle = "Fixture.Show.S01E01-E02.1080p.WEB-DL"
+	shareDriver.episodes = 2 // The directory evolves; the title is only an advertisement.
 	if _, err := follows.Enqueue(context.Background(), actor, subscription.ID, "manual", RequestContext{}); err != nil {
 		t.Fatal(err)
 	}

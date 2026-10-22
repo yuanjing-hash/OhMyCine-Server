@@ -2553,6 +2553,9 @@ func (s *MediaLibraryService) reconcile(ctx context.Context, id uint, kind strin
 		run.Phase = "completed"
 		run.CatalogPublishedAt = &finished
 		run.FinishedAt = &finished
+		if err := stampAcquisitionPublicationTx(tx, &run); err != nil {
+			return err
+		}
 		if run.Partial && s.artifacts != nil {
 			if err := freezeBatchArtifactCheckpointTx(tx, &run); err != nil {
 				return err

@@ -462,6 +462,17 @@ func (w *FollowSearchWorker) searchCandidates(ctx context.Context, actor Actor, 
 						rejections.add("episode_not_confirmed", item.Title)
 						continue
 					}
+					if isCloudShareSource(item.SourceKind) {
+						// This is a bounded inspection candidate, not title-based coverage.
+						// Only actual analyzed leaves may later reserve these missing keys.
+						candidate.Episodes = nil
+						for key := range missing {
+							if key[0] == season {
+								candidate.Episodes = append(candidate.Episodes, key[1])
+							}
+						}
+						sort.Ints(candidate.Episodes)
+					}
 					candidateKey := candidate.Fingerprint
 					if isCloudShareSource(item.SourceKind) {
 						candidateKey = fmt.Sprintf("%s:%d", candidateKey, season)
@@ -496,7 +507,8 @@ func (w *FollowSearchWorker) searchCandidates(ctx context.Context, actor Actor, 
 
 func buildFollowCandidate(item SiteSearchResult, siteID uint, sitePriority, season int, snapshot FollowExecutionSnapshot) (followCandidate, string, bool) {
 	parsed, err := mediarecognition.Parse(mediarecognition.InputFacts{PackageName: item.Title, SourceKind: mediarecognition.SourceDownload, MediaTypeHint: mediarecognition.MediaTypeTV, SeasonHint: &season})
-	if err != nil || parsed.Season == nil || *parsed.Season != season || !followEpisodeDeclarationIsUnambiguous(item.Title, season) {
+	cloudShare := isCloudShareSource(item.SourceKind)
+	if !cloudShare && (err != nil || parsed.Season == nil || *parsed.Season != season || !followEpisodeDeclarationIsUnambiguous(item.Title, season)) {
 		return followCandidate{}, "episode_unproven", false
 	}
 	min, max := parsed.Episodes.EpisodeMin, parsed.Episodes.EpisodeMax
@@ -505,6 +517,10 @@ func buildFollowCandidate(item SiteSearchResult, siteID uint, sitePriority, seas
 		min, max = &episodeMin, &episodeMax
 	}
 	boundsDeclared := min != nil && max != nil
+	if cloudShare {
+		first, last := 1, 200
+		min, max, boundsDeclared, completeSeason = &first, &last, false, false
+	}
 	if !boundsDeclared && completeSeason {
 		episodeMin, episodeMax := 1, 200
 		min, max = &episodeMin, &episodeMax

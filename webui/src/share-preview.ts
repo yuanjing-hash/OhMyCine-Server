@@ -20,7 +20,7 @@ export function shareValidationLabel(value: ShareValidation | undefined, now = D
 }
 
 export interface SharePreviewEntry { token: string; path: string; name: string; is_dir: boolean; size: number }
-export interface SharePreview { share_validation?: ShareValidation; token: string; entries: SharePreviewEntry[]; total_size: number; file_count: number; expires_at: string }
+export interface SharePreview { share_analysis?: import('@/share-content').ShareContentAnalysis; share_validation?: ShareValidation; token: string; entries: SharePreviewEntry[]; total_size: number; file_count: number; expires_at: string }
 export interface ShareSelection { previewToken: string; entryTokens: string[]; downloaderID: string; fileCount: number; totalSize: number; expiresAt: string }
 export function isShareVideo(entry: SharePreviewEntry) { return !entry.is_dir && /\.(mkv|mp4|avi|mov|m4v|ts|m2ts|wmv|iso|mpg|mpeg|webm)$/i.test(entry.name) }
 export function shareEntryFiles(entries: SharePreviewEntry[], entry: SharePreviewEntry) { return entry.is_dir ? entries.filter(item => !item.is_dir && item.path.startsWith(entry.path + '/')) : [entry] }

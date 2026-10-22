@@ -4,6 +4,8 @@ import { useRoute, useRouter } from 'vue-router'
 import { api, APIError } from '@/api/client'
 import { Permissions } from '@/auth/generated-permissions'
 import SharePreviewDialog from '@/components/SharePreviewDialog.vue'
+import ShareContentSummary from '@/components/ShareContentSummary.vue'
+import { isCloudContentResult } from '@/share-content'
 import { shareValidationLabel, type ShareSelection, type ShareValidation } from '@/share-preview'
 import { previewDownloadRoutes, recommendDownloadRoute, routeTargetByID, type DownloadRouteChoice, type DownloadRoutePreview, type DownloadRouteRecommendation } from '@/download-routes'
 import { formatBytes, isCloudShareSource, cloudShareDownloaderType } from '@/downloads'
@@ -741,14 +743,15 @@ onBeforeUnmount(() => {
                 <h2 class="mt-3 break-words text-base font-750">{{ entry.item.title }}</h2>
                 <p v-if="entry.item.subtitle" class="text-subtle mb-0 mt-1 line-clamp-2 text-xs">{{ entry.item.subtitle }}</p>
                 <div class="text-subtle mt-3 flex flex-wrap gap-x-4 gap-y-1 text-xs"><span>{{ formatBytes(entry.item.size_bytes ?? null) }}</span><span>{{ formatTime(entry.item.published_at) }}</span><strong>做种 {{ count(entry.item.seeders) }}</strong><span>下载 {{ count(entry.item.leechers) }}</span><span>完成 {{ count(entry.item.completed) }}</span></div>
-                <div v-if="recognitions[entry.item.token]" class="semantic-inset mt-3 p-3 text-sm"><div class="flex flex-wrap items-center gap-2"><strong>{{ recognitions[entry.item.token].title }}</strong><span :class="recognitions[entry.item.token].status === 'matched' ? 'status-chip status-chip--ready' : 'status-chip status-chip--warning'">{{ recognitions[entry.item.token].manual_override ? '已人工确认' : recognitions[entry.item.token].status === 'matched' ? '标题预识别成功' : '标题预识别未命中' }}</span><span class="status-chip">{{ mediaTypeLabel(recognitions[entry.item.token].media_type) }}</span><span v-if="recognitions[entry.item.token].year" class="status-chip">{{ recognitions[entry.item.token].year }}</span></div><p v-if="ptRecognitionEpisodeLabel(recognitions[entry.item.token])" class="mb-0 mt-2">{{ ptRecognitionEpisodeLabel(recognitions[entry.item.token]) }}</p><p v-if="recognitions[entry.item.token].error_code" class="text-subtle mb-0 mt-2 text-xs">{{ ptRecognitionErrorLabel(recognitions[entry.item.token].error_code) }}</p></div>
-                <p v-if="!recognitions[entry.item.token] && !recognitionErrors[entry.item.token]" class="text-subtle mt-3 text-xs" role="status">{{ recognizingTokens.includes(entry.item.token) ? '正在自动识别作品…' : '等待自动识别…' }}</p>
+                <div v-if="recognitions[entry.item.token]" class="semantic-inset mt-3 p-3 text-sm"><div class="flex flex-wrap items-center gap-2"><strong>{{ recognitions[entry.item.token].title }}</strong><span :class="recognitions[entry.item.token].status === 'matched' ? 'status-chip status-chip--ready' : 'status-chip status-chip--warning'">{{ recognitions[entry.item.token].manual_override ? '已人工确认' : isCloudContentResult(entry.item) ? recognitions[entry.item.token].share_analysis?.complete ? recognitions[entry.item.token].status === 'matched' ? '文件识别成功' : '分享内作品待确认' : '标题线索，仅供参考' : recognitions[entry.item.token].status === 'matched' ? 'BT 标题识别成功' : 'BT 标题待确认' }}</span><span class="status-chip">{{ mediaTypeLabel(recognitions[entry.item.token].media_type) }}</span><span v-if="recognitions[entry.item.token].year" class="status-chip">{{ recognitions[entry.item.token].year }}</span></div><p v-if="!isCloudContentResult(entry.item) && ptRecognitionEpisodeLabel(recognitions[entry.item.token])" class="mb-0 mt-2">{{ ptRecognitionEpisodeLabel(recognitions[entry.item.token]) }}</p><p v-if="recognitions[entry.item.token].error_code" class="text-subtle mb-0 mt-2 text-xs">{{ ptRecognitionErrorLabel(recognitions[entry.item.token].error_code) }}</p></div>
+                <ShareContentSummary v-if="isCloudContentResult(entry.item)" :analysis="recognitions[entry.item.token]?.share_analysis" :loading="recognizingTokens.includes(entry.item.token)" :received="!!recognitions[entry.item.token]" :error="recognitionErrors[entry.item.token]" />
+                <p v-else-if="!recognitions[entry.item.token] && !recognitionErrors[entry.item.token]" class="text-subtle mt-3 text-xs" role="status">{{ recognizingTokens.includes(entry.item.token) ? '正在识别 BT 标题…' : '等待识别 BT 标题…' }}</p>
                 <p v-if="libraryStates[entry.item.token]" class="mt-3 text-xs" role="status" :title="libraryStates[entry.item.token].detail"><span class="status-chip" :class="libraryStates[entry.item.token].present ? 'status-chip--ready' : ''">库内：{{ libraryStates[entry.item.token].label }}</span><span class="text-subtle ml-2">当前可见媒体库 · 作品级</span></p>
-                <p v-if="recognitionErrors[entry.item.token]" class="semantic-warning mb-0 mt-3 p-3 text-xs">{{ recognitionErrors[entry.item.token] }}</p>
+                <p v-if="recognitionErrors[entry.item.token] && !isCloudContentResult(entry.item)" class="semantic-warning mb-0 mt-3 p-3 text-xs">{{ recognitionErrors[entry.item.token] }}</p>
                 <p v-if="resultExpired(entry.item) && recognitionErrors[entry.item.token] !== '搜索结果已过期，请重新搜索'" class="semantic-warning mb-0 mt-3 p-3 text-xs">搜索结果已过期，请重新搜索</p>
               </div>
             </div>
-            <p v-if="isCloudShareSource(entry.item.source_kind)" class="text-subtle mt-3 text-xs" role="status" :title="shareValidation(entry.item)?.message">
+            <p v-if="isCloudShareSource(entry.item.source_kind) && shareValidation(entry.item)" class="text-subtle mt-3 text-xs" role="status" :title="shareValidation(entry.item)?.message">
               {{ shareValidationLabel(shareValidation(entry.item), validationClock) }}
               <span v-if="shareValidation(entry.item)"> · {{ formatTime(shareValidation(entry.item)?.checked_at) }}</span>
               <span v-if="shareValidation(entry.item)?.status === 'unavailable'"> · {{ shareValidation(entry.item)?.message }}</span>
@@ -802,7 +805,7 @@ onBeforeUnmount(() => {
       </form>
     </div>
 
-    <SharePreviewDialog v-if="sharePreviewDialog" :result-token="sharePreviewDialog.token" :title="sharePreviewDialog.title" :source-kind="sharePreviewDialog.source_kind" :downloaders="downloaders" @close="sharePreviewDialog = null" @select="acceptShareSelection" @validation="rememberShareValidation" />
+    <SharePreviewDialog v-if="sharePreviewDialog" :result-token="sharePreviewDialog.token" :title="sharePreviewDialog.title" :source-kind="sharePreviewDialog.source_kind" :downloaders="downloaders" @close="sharePreviewDialog = null" @select="acceptShareSelection" @validation="rememberShareValidation" @analysis="resultRecognition.acceptShareAnalysis" />
     <div v-if="downloadDialog" class="modal-backdrop fixed inset-0 z-50 flex items-center justify-center p-4" @click.self="!submitting && (downloadDialog = null)">
       <form class="panel max-h-[90vh] w-full max-w-xl overflow-y-auto" role="dialog" aria-modal="true" aria-labelledby="pt-download-title" @submit.prevent="submitDownload">
         <div class="flex items-start justify-between gap-3"><div><h2 id="pt-download-title" class="m-0 text-xl">{{ isCloudShareSource(downloadDialog.source_kind) ? '转存到媒体库' : '创建下载任务' }}</h2><p class="page-description mt-1 line-clamp-2 text-sm">{{ downloadDialog.title }}</p></div><button class="btn-secondary" type="button" :disabled="submitting" @click="downloadDialog = null">关闭</button></div>
