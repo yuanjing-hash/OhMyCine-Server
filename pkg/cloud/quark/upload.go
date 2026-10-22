@@ -54,6 +54,7 @@ type uploadPayload struct {
 	Target        *operationTarget        `json:"target,omitempty"`
 	Mapping       *operationMapping       `json:"mapping,omitempty"`
 	SubmitFailure *operationSubmitFailure `json:"submit_failure,omitempty"`
+	Observation   *uploadTaskObservation  `json:"task_observation,omitempty"`
 }
 type contextReader struct {
 	ctx context.Context
@@ -113,7 +114,7 @@ func (d *Client) uploadPre(ctx context.Context, a Authorization, p uploadPayload
 	signature := sha256.Sum256([]byte("POST&" + path + "&" + timestamp + "&" + agentSignKey))
 	proof, e := uploadProof(reader, p.Size, a.AccountID, hex.EncodeToString(signature[:]))
 	if e != nil {
-		return nil, e
+		return nil, &requestNotDispatchedError{Cause: e}
 	}
 	body := map[string]any{"file_name": p.Name, "size": p.Size, "sha1": p.SHA1, "md5": p.MD5, "pdir_fid": p.Parent, "format_type": "application/octet-stream", "parallel_upload": true, "hash_update": false}
 	if p.Size <= 8*1024*1024 {
@@ -156,7 +157,10 @@ func (d *Client) saveUpload(ctx context.Context, r *cloud.OperationReceipt, p up
 func (d *Client) Upload(ctx context.Context, request cloud.UploadRequest) (cloud.Item, error) {
 	return d.upload(ctx, operationID(ctx), request, false)
 }
-func (d *Client) upload(ctx context.Context, id string, request cloud.UploadRequest, challenge bool) (cloud.Item, error) {
+func (d *Client) upload(ctx context.Context, id string, request cloud.UploadRequest, challenge bool) (result cloud.Item, resultErr error) {
+	var p uploadPayload
+	var r cloud.OperationReceipt
+	defer func() { resultErr = withUploadDiagnostic(r, p, resultErr) }()
 	if d.config.Operations == nil || !scalar(id, 128) || !filename(request.Name) || request.Size <= 0 || request.Reader == nil {
 		return cloud.Item{}, failure(CodeInvalid)
 	}
@@ -185,11 +189,16 @@ func (d *Client) upload(ctx context.Context, id string, request cloud.UploadRequ
 	if e != nil {
 		return cloud.Item{}, e
 	}
-	p := uploadPayload{Parent: parent, Name: request.Name, Size: request.Size, MD5: md, SHA1: sh, SHA256: sha, Phase: "prepare"}
-	r, e := d.config.Operations.Load(ctx, id)
+	p = uploadPayload{Parent: parent, Name: request.Name, Size: request.Size, MD5: md, SHA1: sh, SHA256: sha, Phase: "prepare"}
+	r, e = d.config.Operations.Load(ctx, id)
 	if e == nil {
 		if r.Provider != cloud.ProviderQuark || r.Route != string(RouteAgent) || r.AccountID != a.AccountID || r.Kind != "upload" || json.Unmarshal(r.Payload, &p) != nil || !sameAgent(p.Parent, parent) || p.Name != request.Name || p.Size != request.Size || p.SHA256 != sha {
 			return cloud.Item{}, failure(CodeIdentity)
+		}
+		if challenge {
+			if e = d.restoreChallengeTarget(ctx, &r, &p); e != nil {
+				return cloud.Item{}, e
+			}
 		}
 		if r.State == "confirmed" && p.Output != nil {
 			return *p.Output, nil
@@ -257,6 +266,14 @@ func (d *Client) upload(ctx context.Context, id string, request cloud.UploadRequ
 		}
 		raw, e := d.uploadPre(ctx, current, p, h, request.Reader)
 		if e != nil {
+			var unsent *requestNotDispatchedError
+			if errors.As(e, &unsent) {
+				p.Phase = "prepare"
+				if err := d.saveUpload(ctx, &r, p, "prepared", true); err != nil {
+					return cloud.Item{}, err
+				}
+				return cloud.Item{}, operationError("upload_prepare", e)
+			}
 			p.SubmitFailure = uploadSubmitFailure(e)
 			_ = d.saveUpload(ctx, &r, p, "unknown", true)
 			return cloud.Item{}, uploadUnknownError(p)
@@ -298,6 +315,10 @@ func (d *Client) upload(ctx context.Context, id string, request cloud.UploadRequ
 			if e = d.recoverUploadedPart(ctx, &r, &p); e != nil {
 				return cloud.Item{}, e
 			}
+			if p.Handle != "" {
+				result, err := d.confirmUpload(ctx, &r, p)
+				return result, operationError("upload_output_confirmation", err)
+			}
 		}
 		total := 1 + (p.Size-1)/p.PartSize
 		if total > 10000 {
@@ -328,13 +349,26 @@ func (d *Client) upload(ctx context.Context, id string, request cloud.UploadRequ
 			if e != nil {
 				return cloud.Item{}, e
 			}
+			partRequest, e := prepareUploadPartRequest(ctx, dest, p.Headers, request.Reader, size, current)
+			if e != nil {
+				return cloud.Item{}, operationError("upload_part_prepare", e)
+			}
+			previousPhase := p.Phase
 			p.InFlightPart = n
 			p.Phase = "put_inflight"
 			if e = d.saveUpload(ctx, &r, p, "accepted", false); e != nil {
 				return cloud.Item{}, e
 			}
-			etag, e := d.putPart(ctx, dest, p.Headers, request.Reader, size, current)
+			etag, e := d.sendUploadPart(ctx, partRequest)
 			if e != nil {
+				var unsent *requestNotDispatchedError
+				if errors.As(e, &unsent) {
+					p.InFlightPart, p.Phase = 0, previousPhase
+					if err := d.saveUpload(ctx, &r, p, "accepted", true); err != nil {
+						return cloud.Item{}, err
+					}
+					return cloud.Item{}, operationError("upload_part_prepare", e)
+				}
 				p.SubmitFailure = uploadSubmitFailure(e)
 				_ = d.saveUpload(ctx, &r, p, "unknown", true)
 				return cloud.Item{}, uploadUnknownError(p)
@@ -356,6 +390,14 @@ func (d *Client) upload(ctx context.Context, id string, request cloud.UploadRequ
 		}
 		raw, e := d.api.agent(ctx, current, http.MethodPost, "/open/v1/file/upload_finish", nil, map[string]any{"task_id": p.TaskID, "part_info_list": p.Parts})
 		if e != nil {
+			var unsent *requestNotDispatchedError
+			if errors.As(e, &unsent) {
+				p.Phase = "put_received"
+				if err := d.saveUpload(ctx, &r, p, "accepted", true); err != nil {
+					return cloud.Item{}, err
+				}
+				return cloud.Item{}, operationError("upload_finish", e)
+			}
 			p.SubmitFailure = uploadSubmitFailure(e)
 			_ = d.saveUpload(ctx, &r, p, "unknown", true)
 			return cloud.Item{}, uploadUnknownError(p)
@@ -365,7 +407,7 @@ func (d *Client) upload(ctx context.Context, id string, request cloud.UploadRequ
 			Finish json.RawMessage `json:"finish"`
 		}
 		if json.Unmarshal(raw, &out) != nil || !scalar(out.ID, 4096) || string(out.Finish) != "true" && string(out.Finish) != "1" {
-			return cloud.Item{}, failure(cloud.CodeMutationUnknown)
+			return cloud.Item{}, operationError("upload_finish_response", failure(cloud.CodeMutationUnknown))
 		}
 		p.Handle = out.ID
 		p.Phase = "finish_received"
@@ -373,7 +415,7 @@ func (d *Client) upload(ctx context.Context, id string, request cloud.UploadRequ
 			return cloud.Item{}, e
 		}
 	}
-	result, e := d.confirmUpload(ctx, &r, p)
+	result, e = d.confirmUpload(ctx, &r, p)
 	return result, operationError("upload_output_confirmation", e)
 }
 
@@ -393,21 +435,42 @@ func (d *Client) uploadAuthorization(ctx context.Context, expected Authorization
 // Querying an upload never sends another byte or repeats upload_finish. A
 // saved provider output handle is sufficient to resume metadata confirmation;
 // missing acknowledgements remain explicit unknown outcomes.
-func (d *Client) queryUpload(ctx context.Context, r cloud.OperationReceipt) (cloud.OperationResult, error) {
+func (d *Client) queryUpload(ctx context.Context, r cloud.OperationReceipt) (result cloud.OperationResult, resultErr error) {
 	var p uploadPayload
+	defer func() { resultErr = withUploadDiagnostic(r, p, resultErr) }()
 	if json.Unmarshal(r.Payload, &p) != nil {
 		return cloud.OperationResult{Receipt: r}, failure(CodeInvalid)
+	}
+	if p.Target == nil && p.Size == 32 && IsVerificationName(p.Name) && strings.HasSuffix(r.ID, "/upload") {
+		if err := d.restoreChallengeTarget(ctx, &r, &p); err != nil {
+			return cloud.OperationResult{Receipt: r}, err
+		}
 	}
 	if r.State == "confirmed" && p.Output != nil {
 		return cloud.OperationResult{Receipt: r, Items: []cloud.Item{*p.Output}, Complete: true}, nil
 	}
 	if r.State != "accepted" && r.State != "unknown" || p.Handle == "" {
-		if p.Target != nil && p.Target.Challenge {
+		if p.Target != nil && p.Target.Challenge && (p.Phase == "pre_inflight" || p.Phase == "finish_inflight") {
 			item, err := d.recoverChallengeUpload(ctx, &r, p)
 			if err != nil {
 				return cloud.OperationResult{Receipt: r}, err
 			}
 			return cloud.OperationResult{Receipt: r, Items: []cloud.Item{item}, Complete: true}, nil
+		}
+		if p.TaskID != "" && (r.State == "accepted" || r.State == "unknown") {
+			status, err := d.readUploadTask(ctx, &p)
+			if err != nil {
+				return cloud.OperationResult{Receipt: r}, err
+			}
+			if status.Handle != "" {
+				p.Handle, p.InFlightPart, p.Phase = status.Handle, 0, "finish_received"
+				if err = d.saveUpload(ctx, &r, p, "accepted", false); err != nil {
+					return cloud.OperationResult{Receipt: r}, err
+				}
+				item, err := d.confirmUpload(ctx, &r, p)
+				return cloud.OperationResult{Receipt: r, Items: []cloud.Item{item}, Complete: err == nil}, operationError("upload_output_confirmation", err)
+			}
+			return cloud.OperationResult{Receipt: r}, operationError("upload_part_recovery", uploadUnknownFailure(p))
 		}
 		return cloud.OperationResult{Receipt: r}, uploadUnknownError(p)
 	}
@@ -463,15 +526,13 @@ func (d *Client) confirmUpload(ctx context.Context, r *cloud.OperationReceipt, p
 }
 
 func (d *Client) recoverUploadedPart(ctx context.Context, r *cloud.OperationReceipt, p *uploadPayload) error {
-	raw, e := d.agentRead(ctx, http.MethodPost, "/open/v1/file/list_uploaded_parts", nil, map[string]string{"task_id": p.TaskID})
-	if e != nil {
-		return e
+	out, err := d.readUploadTask(ctx, p)
+	if err != nil {
+		return err
 	}
-	var out struct {
-		Parts []uploadPart `json:"uploaded_parts"`
-	}
-	if json.Unmarshal(raw, &out) != nil {
-		return failure(CodeInvalid)
+	if out.Handle != "" {
+		p.Handle, p.InFlightPart, p.Phase = out.Handle, 0, "finish_received"
+		return d.saveUpload(ctx, r, *p, "accepted", false)
 	}
 	for _, part := range out.Parts {
 		if part.Number == p.InFlightPart && scalar(part.ETag, 1024) {
@@ -482,7 +543,7 @@ func (d *Client) recoverUploadedPart(ctx context.Context, r *cloud.OperationRece
 		}
 	}
 	// An incomplete or eventually consistent query cannot authorize another PUT.
-	return failure(cloud.CodeMutationUnknown)
+	return operationError("upload_part_recovery", uploadUnknownFailure(*p))
 }
 func (d *Client) uploadPartURL(ctx context.Context, a Authorization, p *uploadPayload, n int, reader io.ReadSeeker) (uploadDestination, error) {
 	return d.uploadPartURLWithPrefix(ctx, a, p, n, newUploadPrefixSHA1(reader))
@@ -523,9 +584,17 @@ func (d *Client) uploadPartURLWithPrefix(ctx context.Context, a Authorization, p
 	return out.URLs[0], nil
 }
 func (d *Client) putPart(ctx context.Context, destination uploadDestination, common map[string]string, reader io.Reader, size int64, a Authorization) (string, error) {
+	request, err := prepareUploadPartRequest(ctx, destination, common, reader, size, a)
+	if err != nil {
+		return "", err
+	}
+	return d.sendUploadPart(ctx, request)
+}
+
+func prepareUploadPartRequest(ctx context.Context, destination uploadDestination, common map[string]string, reader io.Reader, size int64, a Authorization) (*http.Request, error) {
 	u, e := directURL(destination.URL)
-	if e != nil || u.Scheme != "https" || !scalar(destination.Signature.Value, 8192) || len(common) > 32 {
-		return "", failure(CodeInvalid)
+	if e != nil || !scalar(destination.Signature.Value, 8192) || len(common) > 32 {
+		return nil, failure(CodeInvalid)
 	}
 	// Upload credentials belong only to the provider-issued object endpoint.
 	// Reject core account credentials, cookies and control/signature headers.
@@ -533,29 +602,36 @@ func (d *Client) putPart(ctx context.Context, destination uploadDestination, com
 	for k, v := range common {
 		lower := strings.ToLower(k)
 		if !httpguts.ValidHeaderFieldName(k) || !httpguts.ValidHeaderFieldValue(v) || len(v) > 8192 {
-			return "", failure(CodeInvalid)
+			return nil, failure(CodeInvalid)
 		}
 		switch lower {
 		case "cookie", "authorization", "proxy-authorization", "host", "x-pan-token", "x-pan-client-id", "x-agent-id", "content-length", "connection", "transfer-encoding":
-			return "", failure(CodeInvalid)
+			return nil, failure(CodeInvalid)
 		}
 		if a.AccessToken != "" && strings.Contains(v, a.AccessToken) || a.RefreshToken != "" && strings.Contains(v, a.RefreshToken) {
-			return "", failure(CodeInvalid)
+			return nil, failure(CodeInvalid)
 		}
 		headers.Set(k, v)
 	}
 	if a.AccessToken != "" && strings.Contains(destination.Signature.Value, a.AccessToken) || a.RefreshToken != "" && strings.Contains(destination.Signature.Value, a.RefreshToken) {
-		return "", failure(CodeInvalid)
+		return nil, failure(CodeInvalid)
 	}
 	headers.Set("Authorization", destination.Signature.Value)
 	headers.Set("Accept-Encoding", "identity")
 	request, e := http.NewRequestWithContext(ctx, http.MethodPut, u.String(), io.LimitReader(contextReader{ctx, reader}, size))
 	if e != nil {
-		return "", failure(CodeInvalid)
+		return nil, failure(CodeInvalid)
 	}
 	request.Header = headers
 	request.ContentLength = size
 	request.GetBody = nil
+	return request, nil
+}
+
+func (d *Client) sendUploadPart(ctx context.Context, request *http.Request) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", &requestNotDispatchedError{Cause: err}
+	}
 	client := &http.Client{Transport: d.mediaTransport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	response, e := client.Do(request)
 	if e != nil {

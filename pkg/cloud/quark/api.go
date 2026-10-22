@@ -58,9 +58,12 @@ func newAPI(config cloud.Config) *apiClient {
 	return &apiClient{http: &http.Client{Transport: tr, Timeout: 30 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}, clock: time.Now, config: config, gate: gate}
 }
 func (a *apiClient) call(ctx context.Context, r *http.Request) (raw json.RawMessage, err error) {
+	if e := ctx.Err(); e != nil {
+		return nil, &requestNotDispatchedError{Cause: e}
+	}
 	if a.config.BeforeCall != nil {
 		if e := a.config.BeforeCall(ctx); e != nil {
-			return nil, e
+			return nil, &requestNotDispatchedError{Cause: e}
 		}
 	}
 	if a.config.OnCallResult != nil {
@@ -70,7 +73,10 @@ func (a *apiClient) call(ctx context.Context, r *http.Request) (raw json.RawMess
 	until := a.gate.until
 	a.gate.mu.Unlock()
 	if wait := until.Sub(a.clock()); wait > 0 {
-		return nil, &Failure{Code: CodeLimited, RetryAfter: wait}
+		return nil, &requestNotDispatchedError{Cause: &Failure{Code: CodeLimited, RetryAfter: wait}}
+	}
+	if e := ctx.Err(); e != nil {
+		return nil, &requestNotDispatchedError{Cause: e}
 	}
 	r.GetBody = nil
 	response, e := a.http.Do(r.WithContext(ctx))

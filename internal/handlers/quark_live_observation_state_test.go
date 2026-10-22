@@ -287,6 +287,16 @@ func (s *observationStore) persist(_ context.Context, expected uint64, raw json.
 func (s *observationStore) count() int { s.mu.Lock(); defer s.mu.Unlock(); return s.state.Requests }
 
 func openObservationStore(dir string, a *observationAgentState, tv *liveTVStore) (*observationStore, error) {
+	return openObservationStoreMode(dir, a, tv, false)
+}
+
+// A completed donor is evidence only. It must never be initialized when its
+// journal disappears before the lock is acquired or the wrong directory is used.
+func openObservationStoreReadOnly(dir string, a *observationAgentState, tv *liveTVStore) (*observationStore, error) {
+	return openObservationStoreMode(dir, a, tv, true)
+}
+
+func openObservationStoreMode(dir string, a *observationAgentState, tv *liveTVStore, readOnly bool) (*observationStore, error) {
 	if !filepath.IsAbs(dir) || strings.EqualFold(filepath.Clean(dir), filepath.Clean(tv.dir)) {
 		return nil, observationError()
 	}
@@ -313,6 +323,9 @@ func openObservationStore(dir string, a *observationAgentState, tv *liveTVStore)
 		return nil, observationError()
 	}
 	if len(journal) > 0 && len(key) == 0 {
+		return nil, observationError()
+	}
+	if readOnly && (len(journal) == 0 || len(key) == 0) {
 		return nil, observationError()
 	}
 	if len(journal) == 0 {

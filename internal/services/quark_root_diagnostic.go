@@ -29,7 +29,12 @@ var quarkRootStages = map[string]string{
 	"challenge_upload":           "上传目录验证文件",
 	"upload_prepare":             "申请验证文件上传",
 	"upload_part":                "写入验证文件内容",
+	"upload_part_prepare":        "准备验证文件内容请求",
+	"upload_task_query":          "读取原验证文件上传任务",
+	"upload_part_recovery":       "核对原验证文件分片",
+	"upload_legacy_recovery":     "恢复原验证文件范围",
 	"upload_finish":              "确认验证文件上传",
+	"upload_finish_response":     "读取验证文件上传完成响应",
 	"upload_output_confirmation": "核对验证文件上传结果",
 	"challenge_directory":        "从播放授权定位验证文件",
 	"challenge_readback":         "从播放授权读取验证文件",
@@ -101,6 +106,16 @@ func (s *ConnectionService) quarkRootFailure(id uint, fallback string, err error
 	}
 	if errno != 0 {
 		event = event.Int("provider_errno", errno)
+	}
+	if upload, ok := quark.UploadDiagnosticFromError(err); ok {
+		event = event.Str("upload_phase", upload.Phase).Str("upload_receipt_state", upload.State).
+			Bool("upload_has_task", upload.HasTask).Bool("upload_has_output", upload.HasOutput).
+			Bool("upload_target_recorded", upload.TargetRecorded).Bool("upload_not_dispatched", upload.NotDispatched).
+			Int("upload_inflight_part", upload.InFlightPart).Int("upload_confirmed_parts", upload.ConfirmedParts).
+			Int("upload_task_pages", upload.TaskPages).Bool("upload_task_listing_complete", upload.TaskListingComplete)
+		if upload.TaskFinishStatus != nil {
+			event = event.Int("upload_task_finish_status", *upload.TaskFinishStatus)
+		}
 	}
 	event.Msg(serverlog.OperationConnectionManagement.Message(message))
 	return appError(appCode, message, nil)

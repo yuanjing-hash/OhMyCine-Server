@@ -110,6 +110,8 @@ func TestQuarkRootVerificationNativePersistentRecovery(t *testing.T) {
 			// The cloud committed, but no acknowledgement/handle was received.
 			http.Error(w, "fixture lost finish acknowledgement", http.StatusServiceUnavailable)
 			return
+		case "/open/v1/file/list_uploaded_parts":
+			data = map[string]any{"finish_status": 0, "uploaded_parts": []any{}}
 		case "/open/v1/file/info":
 			data = file(r.URL.Query().Get("fid"), "listed|root", name, false)
 		case "/open/v1/file/delete":

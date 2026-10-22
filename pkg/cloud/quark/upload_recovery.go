@@ -33,18 +33,44 @@ func uploadUnknownError(p uploadPayload) error {
 	case "finish_inflight", "finish_received":
 		stage = "upload_finish"
 	}
+	return operationError(stage, uploadUnknownFailure(p))
+}
+
+func uploadUnknownFailure(p uploadPayload) error {
 	f := &Failure{Code: cloud.CodeMutationUnknown, UnknownOutcome: true}
 	if p.SubmitFailure != nil {
 		f.HTTPStatus, f.Errno = p.SubmitFailure.HTTPStatus, p.SubmitFailure.Errno
 	}
-	return operationError(stage, f)
+	return f
+}
+
+// Older challenge receipts can lack the mapping target. Reconstruct only from
+// the original private proof (same account, root, name and all random bytes),
+// then validate the current root before saving it to the same upload receipt.
+func (d *Client) restoreChallengeTarget(ctx context.Context, r *cloud.OperationReceipt, p *uploadPayload) error {
+	if p.Target != nil {
+		return nil
+	}
+	if p.Size != 32 || !IsVerificationName(p.Name) || p.Mapping != nil {
+		return failure(CodeIdentity)
+	}
+	target, err := d.freezeChallengeTarget(ctx, r.ID, p.Parent, p.Name, p.SHA256)
+	if err != nil {
+		return operationError("upload_legacy_recovery", err)
+	}
+	if _, err = d.creationTarget(ctx, target); err != nil {
+		return operationError("upload_legacy_recovery", err)
+	}
+	p.Target = target
+	return d.saveUpload(ctx, r, *p, r.State, false)
 }
 
 // A random challenge has stronger ownership evidence than an ordinary upload:
 // its private receipt froze both the unpredictable name and all 32 bytes before
 // submission. Recover only that exact artifact, with independent complete TV
 // readback and fresh Agent metadata. Absence never permits another upload.
-func (d *Client) recoverChallengeUpload(ctx context.Context, r *cloud.OperationReceipt, p uploadPayload) (cloud.Item, error) {
+func (d *Client) recoverChallengeUpload(ctx context.Context, r *cloud.OperationReceipt, p uploadPayload) (result cloud.Item, resultErr error) {
+	defer func() { resultErr = withUploadDiagnostic(*r, p, resultErr) }()
 	if p.Target == nil || !p.Target.Challenge || p.Size != 32 || !IsVerificationName(p.Name) || !strings.HasSuffix(r.ID, "/upload") || r.ID != p.Target.Proof.ReceiptID+"/upload" || p.Phase != "pre_inflight" && p.Phase != "finish_inflight" {
 		return cloud.Item{}, uploadUnknownError(p)
 	}
@@ -58,6 +84,19 @@ func (d *Client) recoverChallengeUpload(ctx context.Context, r *cloud.OperationR
 	if _, err = d.creationTarget(ctx, target); err != nil {
 		return cloud.Item{}, operationError("upload_output_confirmation", err)
 	}
+	var taskErr error
+	if p.TaskID != "" {
+		var status uploadTaskStatus
+		status, taskErr = d.readUploadTask(ctx, &p)
+		if taskErr == nil && status.Handle != "" {
+			p.Handle, p.InFlightPart, p.Phase = status.Handle, 0, "finish_received"
+			if err = d.saveUpload(ctx, r, p, "accepted", false); err != nil {
+				return cloud.Item{}, err
+			}
+			item, err := d.confirmUpload(ctx, r, p)
+			return item, operationError("upload_output_confirmation", err)
+		}
+	}
 	entries, err := d.agentDirectory(ctx, p.Parent)
 	if err != nil {
 		return cloud.Item{}, operationError("upload_output_confirmation", err)
@@ -70,6 +109,9 @@ func (d *Client) recoverChallengeUpload(ctx context.Context, r *cloud.OperationR
 		}
 	}
 	if count == 0 {
+		if taskErr != nil {
+			return cloud.Item{}, taskErr
+		}
 		return cloud.Item{}, uploadUnknownError(p)
 	}
 	if count != 1 || found.Dir || found.Size != p.Size || !sameAgent(found.Parent, p.Parent) {
