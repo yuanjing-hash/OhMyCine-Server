@@ -48,6 +48,9 @@ func TestQuarkNodeReceiptsEncryptedBoundAndCAS(t *testing.T) {
 	if e != nil {
 		t.Fatal(e)
 	}
+	if _, e = s.Load(ctx, "missing"); !errors.Is(e, cloud.ErrOperationNotFound) {
+		t.Fatal("a missing native receipt must use the absence sentinel", e)
+	}
 	r := cloud.OperationReceipt{ID: "receipt-1", Provider: cloud.ProviderQuark, Route: "agent", AccountID: "private-account", Kind: "upload", Revision: 1, State: "prepared", Payload: json.RawMessage(`{"upload_url":"https://upload.example/?secret=private-upload-token"}`), UpdatedAt: time.Now()}
 	if e = s.Create(ctx, r); e != nil {
 		t.Fatal(e)
@@ -93,8 +96,22 @@ func TestQuarkNodeReceiptsEncryptedBoundAndCAS(t *testing.T) {
 	if _, e = a.store.db.Exec(`UPDATE cloud_operation_receipts SET revision=3`); e != nil {
 		t.Fatal(e)
 	}
-	if _, e = s.Load(ctx, r.ID); e == nil {
+	if _, e = s.Load(ctx, r.ID); e == nil || errors.Is(e, cloud.ErrOperationNotFound) {
 		t.Fatal("AAD revision tamper accepted")
+	}
+}
+
+func TestQuarkNodeReceiptStorageFailureIsNotAbsence(t *testing.T) {
+	a := newQuarkNodeTestAgent(t)
+	s, err := a.quarkReceipts("server-1", "operation-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = a.store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.Load(context.Background(), "missing"); err == nil || errors.Is(err, cloud.ErrOperationNotFound) {
+		t.Fatal("closed receipt storage was treated as an absent operation")
 	}
 }
 

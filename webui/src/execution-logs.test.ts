@@ -31,12 +31,24 @@ function findButton(wrapper: VueWrapper, name: string) { return wrapper.findAll(
 afterEach(() => { wrappers.splice(0).forEach(wrapper => wrapper.unmount()); apiMock.mockReset(); vi.useRealTimers(); vi.restoreAllMocks() })
 
 describe('readable scoped execution logs', () => {
+  it.each(['follow_coverage_unknown', 'follow_submit_failed'])('renders the exact coverage wait without hiding other failures (%s)', async code => {
+    const ctx = await context()
+    apiMock.mockResolvedValue(result({ summary: { title: '等待中的订阅', status: 'failed', error_code: code, error_message: '当前运行说明', filter_summary: { coverage_unknown: 9 } } }))
+    const wrapper = mount(ExecutionLogsPanel, { props: { scope: { kind: 'follow', followId: 'f-1', runId: 'r-1' } }, global: { plugins: ctx.plugins } }); wrappers.push(wrapper)
+    await flushPromises()
+    const outcome = wrapper.get('.execution-summary__outcome')
+    expect(outcome.text()).toBe(code === 'follow_coverage_unknown' ? '等待媒体库扫描或剧集信息' : '本轮执行失败')
+    expect(outcome.classes().includes('semantic-danger-text')).toBe(code !== 'follow_coverage_unknown')
+    expect(wrapper.text()).toContain('状态未确认、暂不下载的集数 9')
+  })
+
   it('serializes only scoped filters and gives unknown enums a safe Chinese fallback', () => {
     const path = executionLogPath({ kind: 'follow', followId: 'f/1', runId: 'r?2' }, { limit: 999, attempt: 2, keyword: '  柯南  ', level: 'warn', cursor: 'cursor-1', snapshot_to: snapshot })
     const [base, query] = path.split('?')
     expect(base).toBe('/api/v1/follows/f%2F1/runs/r%3F2/execution-logs')
     expect(Object.fromEntries(new URLSearchParams(query))).toEqual({ limit: '200', attempt: '2', keyword: '柯南', level: 'warn', cursor: 'cursor-1', snapshot_to: snapshot })
     expect(filterReasonRows({ resolution: 3, submit_failed: 1, future_reason: 2, invalid: -1 })).toEqual([{ code: 'resolution', label: '分辨率不符合', count: 3 }, { code: 'submit_failed', label: '提交下载失败', count: 1 }, { code: 'future_reason', label: '其他原因', count: 2 }])
+    expect(filterReasonRows({ episode_not_confirmed: 2, coverage_unknown: 9 })).toEqual([{ code: 'episode_not_confirmed', label: '资源包含未播或状态未确认的剧集', count: 2 }, { code: 'coverage_unknown', label: '状态未确认、暂不下载的集数', count: 9 }])
     expect(logFieldText('size_bytes', 1.25 * 1024 ** 3)).toBe('1.25 GiB')
     expect(logFieldText('reason_code', 'private-provider-failure')).toBe('其他原因')
     expect(executionStatusLabel('no_match')).toBe('本轮没有可提交资源')
@@ -141,6 +153,30 @@ describe('readable scoped execution logs', () => {
 })
 
 describe('existing domain log entry points', () => {
+  it('shows an active uncertain follow as a scheduled wait in both run list and details', async () => {
+    const ctx = await context()
+    const follow = { id: 'f-wait', owner_id: 7, title: '等待中的订阅', tmdb_id: 1, media_type: 'tv', status: 'active', revision: 1, snapshot: { seasons: [1], site_ids: [2], schedule: { minutes: 60 } }, progress_target: 15, progress_present: 15, progress_missing: 0, last_error_code: 'follow_coverage_unknown', last_error_message: '当前没有明确缺集', next_run_at: '2026-10-22T15:00:00Z' }
+    const run = { id: 'r-wait', job_id: 'job-wait', status: 'failed', trigger: 'scheduled', subscription_revision: 1, searched_names_count: 0, candidates: 0, selected: 0, filter_summary: { coverage_unknown: 9 }, created_at: '2026-10-22T14:00:00Z', error_code: 'follow_coverage_unknown', error_message: '等待信息完善' }
+    apiMock.mockImplementation((path: string) => {
+      if (path.startsWith('/api/v1/follows?')) return Promise.resolve({ list: [follow], total: 1 })
+      if (path.endsWith('/runs')) return Promise.resolve({ list: [run] })
+      if (path.includes('/execution-logs')) return Promise.resolve(result({ summary: { title: follow.title, status: run.status, error_code: run.error_code, error_message: run.error_message, filter_summary: run.filter_summary } }))
+      throw new Error('unexpected route')
+    })
+    const wrapper = mount(FollowsView, { global: { plugins: ctx.plugins, stubs: { FollowEditorDialog: true, ClearHistoryButton: true } } }); wrappers.push(wrapper)
+    await flushPromises(); await findButton(wrapper, '运行记录').trigger('click'); await flushPromises()
+    expect(wrapper.text()).toContain('等待媒体库扫描或剧集信息')
+    expect(wrapper.text()).toContain('将按计划复查')
+    expect(wrapper.text()).not.toContain('执行受阻')
+    expect(wrapper.findAll('.semantic-danger-text')).toHaveLength(0)
+    await findButton(wrapper, '查看本轮过程').trigger('click'); await flushPromises()
+    const drawer = wrapper.get('[role="dialog"]')
+    expect(drawer.text()).toContain('等待媒体库扫描或剧集信息')
+    expect(drawer.text()).toContain('将按计划复查')
+    expect(drawer.text()).toContain('状态未确认、暂不下载的集数 9')
+    expect(drawer.findAll('.semantic-danger-text')).toHaveLength(0)
+  })
+
   it.each([['list', 401], ['list', 403], ['runs', 401], ['runs', 403], ['runs', 404]] as const)('closes an open follow log when %s refresh is denied with %s', async (endpoint, status) => {
     const ctx = await context()
     const follow = { id: 'f-1', owner_id: 7, title: '已撤权订阅', tmdb_id: 1, media_type: 'tv', status: 'active', revision: 1, snapshot: { seasons: [1], site_ids: [2], schedule: { minutes: 60 } }, progress_target: 4, progress_present: 2, progress_missing: 2 }

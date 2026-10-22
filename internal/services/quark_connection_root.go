@@ -51,7 +51,7 @@ func (s *ConnectionService) ensureQuarkRootProof(ctx context.Context, actor Acto
 	}
 	current, err := resolver.ResolveDirectory(ctx, clean)
 	if err != nil {
-		return quarkServiceError(err)
+		return s.quarkRootFailure(id, "playback_directory", err)
 	}
 	if !current.IsDir || current.ID != tvRoot {
 		return appError(CodeConflict, "目录位置已变化，请重新选择", nil)
@@ -66,14 +66,14 @@ func (s *ConnectionService) ensureQuarkRootProof(ctx context.Context, actor Acto
 	receiptID := "quark-space-" + hex.EncodeToString(fingerprint[:])
 	proof, err := verifier.VerifyCommonSpace(ctx, receiptID, clean)
 	if err != nil {
-		return quarkServiceError(err)
+		return s.quarkRootFailure(id, "verification_input", err)
 	}
 	if proof.TVRoot != tvRoot || proof.Path != clean || proof.TVAccount != bundle.TV.AccountID || proof.AgentAccount != bundle.Agent.AccountID {
 		return appError(CodeConflict, "目录或授权身份发生变化，请重新读取状态", nil)
 	}
 	_, saved, err := s.quarkCredentials(ctx, id)
 	if err != nil {
-		return err
+		return s.quarkRootFailure(id, "proof_credentials_save", err)
 	}
 	if !saved.HasProof(proof.TVRoot, proof.AgentRoot) {
 		return appError(CodeConnectionUnavailable, "目录验证尚未保存，请稍后重试", nil)

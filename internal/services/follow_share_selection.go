@@ -21,7 +21,7 @@ func selectFollowShareFiles(entries []SiteSharePreviewEntry, season int, wanted 
 	selected := []string{}
 	stems := map[string][]string{}
 	for _, entry := range entries {
-		if entry.IsDir || !isVideoFile(entry.Path) {
+		if entry.IsDir || !isVideoFile(entry.Path) || !followEpisodeDeclarationIsUnambiguous(path.Base(entry.Path), season) {
 			continue
 		}
 		facts := mediarecognition.InputFacts{PackageName: path.Base(entry.Path), SourceKind: mediarecognition.SourceDownload, MediaTypeHint: mediarecognition.MediaTypeTV}
@@ -34,6 +34,9 @@ func selectFollowShareFiles(entries []SiteSharePreviewEntry, season int, wanted 
 			continue
 		}
 		lo, hi := *parsed.Episodes.EpisodeMin, *parsed.Episodes.EpisodeMax
+		if first, last, ok := explicitFollowEpisodeRange(path.Base(entry.Path), season); ok {
+			lo, hi = first, last
+		}
 		if lo < 1 || hi < lo || hi-lo > 200 {
 			continue
 		}

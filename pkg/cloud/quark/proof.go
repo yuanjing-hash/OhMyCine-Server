@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"strings"
 
@@ -28,7 +29,9 @@ type proofPayload struct {
 // It does NOT claim account IDs from different applications are equivalent.
 // The fixed receipt ID must survive retries. Uncertain upload outcomes block
 // new creation; verified challenge files remain excluded from scans/adoption.
-func (d *Client) VerifyCommonSpace(ctx context.Context, id, path string) (SpaceProof, error) {
+func (d *Client) VerifyCommonSpace(ctx context.Context, id, path string) (result SpaceProof, resultErr error) {
+	stage := "verification_input"
+	defer func() { resultErr = operationError(stage, resultErr) }()
 	if d.config.Operations == nil || d.config.PersistCredentials == nil || !scalar(id, 96) {
 		return SpaceProof{}, failure(CodeUnsupported)
 	}
@@ -37,18 +40,22 @@ func (d *Client) VerifyCommonSpace(ctx context.Context, id, path string) (SpaceP
 		return SpaceProof{}, e
 	}
 	path = "/" + strings.Join(parts, "/")
+	stage = "playback_authorization"
 	tvAuth, e := d.authorization(ctx, RouteTV)
 	if e != nil {
 		return SpaceProof{}, e
 	}
+	stage = "management_authorization"
 	agentAuth, e := d.authorization(ctx, RouteAgent)
 	if e != nil {
 		return SpaceProof{}, e
 	}
+	stage = "playback_directory"
 	tv, e := d.resolveTV(ctx, path)
 	if e != nil {
 		return SpaceProof{}, e
 	}
+	stage = "management_directory"
 	agent, e := d.resolveAgent(ctx, path)
 	if e != nil {
 		return SpaceProof{}, e
@@ -58,6 +65,7 @@ func (d *Client) VerifyCommonSpace(ctx context.Context, id, path string) (SpaceP
 	}
 	agentRoot := QualifyID(RouteAgent, agentAuth.AccountID, agent.ID)
 	p := proofPayload{Path: path, TVRoot: tv.ID, AgentRoot: agentRoot, TVAccount: tvAuth.AccountID}
+	stage = "proof_receipt_load"
 	r, e := d.config.Operations.Load(ctx, id)
 	if e == nil {
 		if r.Provider != cloud.ProviderQuark || r.Route != string(RouteAgent) || r.AccountID != agentAuth.AccountID || r.Kind != "space_proof" || json.Unmarshal(r.Payload, &p) != nil || p.Path != path || p.TVRoot != tv.ID || !qualifiedAgentMatches(p.AgentRoot, agentAuth.AccountID, agent.ID) || p.TVAccount != tvAuth.AccountID || len(p.Bytes) != 32 {
@@ -66,9 +74,16 @@ func (d *Client) VerifyCommonSpace(ctx context.Context, id, path string) (SpaceP
 		// Retain the original receipt's handle for the frozen upload request.
 		agentRoot = p.AgentRoot
 		if r.State == "confirmed" && p.Proof != nil {
+			stage = "proof_credentials_save"
 			return *p.Proof, d.persistProof(ctx, *p.Proof)
 		}
 	} else {
+		// A failed or unreadable checkpoint is not affirmative absence. Never
+		// manufacture a replacement challenge when the original is unresolved.
+		if !errors.Is(e, cloud.ErrOperationNotFound) {
+			return SpaceProof{}, e
+		}
+		stage = "proof_challenge_prepare"
 		p.Name = ".omc-verify-" + randomID()
 		p.Bytes = make([]byte, 32)
 		if _, e = rand.Read(p.Bytes); e != nil {
@@ -76,16 +91,19 @@ func (d *Client) VerifyCommonSpace(ctx context.Context, id, path string) (SpaceP
 		}
 		r = cloud.OperationReceipt{ID: id, Provider: cloud.ProviderQuark, Route: string(RouteAgent), AccountID: agentAuth.AccountID, Kind: "space_proof", Revision: 1, State: "prepared", UpdatedAt: d.api.clock()}
 		r.Payload, _ = json.Marshal(p)
+		stage = "proof_receipt_create"
 		if e = d.config.Operations.Create(ctx, r); e != nil {
 			return SpaceProof{}, e
 		}
 	}
 	// Exactly one upload receipt is permanently bound to this proof attempt.
+	stage = "challenge_upload"
 	_, e = d.upload(ctx, id+"/upload", cloud.UploadRequest{ParentID: p.AgentRoot, Name: p.Name, Size: 32, Reader: bytes.NewReader(p.Bytes)}, true)
 	if e != nil {
 		return SpaceProof{}, e
 	}
 	if r.State == "prepared" {
+		stage = "proof_receipt_save"
 		next := r
 		next.State = "accepted"
 		next.Revision++
@@ -95,6 +113,7 @@ func (d *Client) VerifyCommonSpace(ctx context.Context, id, path string) (SpaceP
 		}
 		r = next
 	}
+	stage = "challenge_directory"
 	entries, e := d.tvDirectory(ctx, tv.ID)
 	if e != nil {
 		return SpaceProof{}, e
@@ -110,6 +129,7 @@ func (d *Client) VerifyCommonSpace(ctx context.Context, id, path string) (SpaceP
 	if count != 1 || found.IsDir || found.Size != 32 {
 		return SpaceProof{}, failure(CodePending)
 	}
+	stage = "challenge_readback"
 	read, e := d.OpenRead(ctx, cloud.ReadRequest{FileID: found.ID})
 	if e != nil {
 		return SpaceProof{}, e
@@ -127,9 +147,11 @@ func (d *Client) VerifyCommonSpace(ctx context.Context, id, path string) (SpaceP
 	next.State = "confirmed"
 	next.UpdatedAt = d.api.clock()
 	next.Payload, _ = json.Marshal(p)
+	stage = "proof_receipt_save"
 	if e = d.config.Operations.Update(ctx, r.Revision, next); e != nil {
 		return SpaceProof{}, e
 	}
+	stage = "proof_credentials_save"
 	if e = d.persistProof(ctx, proof); e != nil {
 		return proof, e
 	}

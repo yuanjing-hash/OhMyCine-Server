@@ -228,7 +228,7 @@ func (s *observationStore) Load(_ context.Context, id string) (cloud.OperationRe
 	}
 	r, ok := s.state.Operations[id]
 	if !ok {
-		return r, os.ErrNotExist
+		return r, cloud.ErrOperationNotFound
 	}
 	r.Payload = append(json.RawMessage(nil), r.Payload...)
 	return r, nil

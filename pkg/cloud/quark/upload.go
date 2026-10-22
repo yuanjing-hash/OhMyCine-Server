@@ -11,6 +11,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -145,7 +146,7 @@ func (d *Client) saveUpload(ctx context.Context, r *cloud.OperationReceipt, p up
 		ctx = c
 	}
 	if e := d.config.Operations.Update(ctx, r.Revision, next); e != nil {
-		return e
+		return operationError("upload_receipt_save", e)
 	}
 	*r = next
 	return nil
@@ -196,6 +197,9 @@ func (d *Client) upload(ctx context.Context, id string, request cloud.UploadRequ
 			return cloud.Item{}, failure(cloud.CodeMutationUnknown)
 		}
 	} else {
+		if !errors.Is(e, cloud.ErrOperationNotFound) {
+			return cloud.Item{}, operationError("upload_receipt_load", e)
+		}
 		entries, e := d.agentDirectory(ctx, parent)
 		if e != nil {
 			return cloud.Item{}, e
@@ -223,7 +227,7 @@ func (d *Client) upload(ctx context.Context, id string, request cloud.UploadRequ
 		r = cloud.OperationReceipt{ID: id, Provider: cloud.ProviderQuark, Route: string(RouteAgent), AccountID: a.AccountID, Kind: "upload", Revision: 1, State: "prepared", UpdatedAt: d.api.clock()}
 		r.Payload, _ = json.Marshal(p)
 		if e = d.config.Operations.Create(ctx, r); e != nil {
-			return cloud.Item{}, e
+			return cloud.Item{}, operationError("upload_receipt_create", e)
 		}
 		p.Phase = "pre_inflight"
 		if e = d.saveUpload(ctx, &r, p, "submitting", false); e != nil {
@@ -232,7 +236,7 @@ func (d *Client) upload(ctx context.Context, id string, request cloud.UploadRequ
 		raw, e := d.uploadPre(ctx, current, p, h, request.Reader)
 		if e != nil {
 			_ = d.saveUpload(ctx, &r, p, "unknown", true)
-			return cloud.Item{}, failure(cloud.CodeMutationUnknown)
+			return cloud.Item{}, operationError("upload_prepare", unknownUploadOutcome(e))
 		}
 		var out struct {
 			ID       string              `json:"fid"`
@@ -309,7 +313,7 @@ func (d *Client) upload(ctx context.Context, id string, request cloud.UploadRequ
 			etag, e := d.putPart(ctx, dest, p.Headers, request.Reader, size, current)
 			if e != nil {
 				_ = d.saveUpload(ctx, &r, p, "unknown", true)
-				return cloud.Item{}, failure(cloud.CodeMutationUnknown)
+				return cloud.Item{}, operationError("upload_part", unknownUploadOutcome(e))
 			}
 			p.Parts = append(p.Parts, uploadPart{Number: n, ETag: etag})
 			p.InFlightPart = 0
@@ -329,7 +333,7 @@ func (d *Client) upload(ctx context.Context, id string, request cloud.UploadRequ
 		raw, e := d.api.agent(ctx, current, http.MethodPost, "/open/v1/file/upload_finish", nil, map[string]any{"task_id": p.TaskID, "part_info_list": p.Parts})
 		if e != nil {
 			_ = d.saveUpload(ctx, &r, p, "unknown", true)
-			return cloud.Item{}, failure(cloud.CodeMutationUnknown)
+			return cloud.Item{}, operationError("upload_finish", unknownUploadOutcome(e))
 		}
 		var out struct {
 			ID     string          `json:"fid"`
@@ -344,7 +348,8 @@ func (d *Client) upload(ctx context.Context, id string, request cloud.UploadRequ
 			return cloud.Item{}, e
 		}
 	}
-	return d.confirmUpload(ctx, &r, p)
+	result, e := d.confirmUpload(ctx, &r, p)
+	return result, operationError("upload_output_confirmation", e)
 }
 
 // Long uploads must not finish with the authorization captured before hashing
@@ -526,7 +531,7 @@ func (d *Client) putPart(ctx context.Context, destination uploadDestination, com
 	}
 	defer response.Body.Close()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return "", failure(CodeUnavailable)
+		return "", &Failure{Code: CodeUnavailable, HTTPStatus: response.StatusCode}
 	}
 	n, e := io.Copy(io.Discard, io.LimitReader(response.Body, apiLimit+1))
 	if e != nil || n > apiLimit {

@@ -202,9 +202,14 @@ func TestCommonSpaceProofIndependentReadAndRetry(t *testing.T) {
 	d.config.Operations = store
 	current := d.Credentials()
 	d.config.LoadCredentials = func(context.Context) (json.RawMessage, error) { return json.Marshal(current) }
+	persistErr := errors.New("synthetic private credential storage failure")
+	failProofSave := true
 	d.config.PersistCredentials = func(_ context.Context, expected uint64, raw json.RawMessage) error {
 		if current.Revision != expected {
 			t.Fatal("proof CAS")
+		}
+		if failProofSave {
+			return persistErr
 		}
 		return json.Unmarshal(raw, &current)
 	}
@@ -221,6 +226,15 @@ func TestCommonSpaceProofIndependentReadAndRetry(t *testing.T) {
 		return &http.Response{StatusCode: 200, ContentLength: 32, Header: http.Header{}, Body: io.NopCloser(bytes.NewReader(content))}, nil
 	})
 	proof, e := d.VerifyCommonSpace(context.Background(), "proof-attempt", "/library")
+	if !errors.Is(e, persistErr) || current.HasProof(proof.TVRoot, proof.AgentRoot) || store.receipts["proof-attempt"].State != "confirmed" {
+		t.Fatal("credential save failure did not retain the confirmed proof")
+	}
+	var phase *OperationError
+	if !errors.As(e, &phase) || phase.Stage != "proof_credentials_save" {
+		t.Fatal("credential persistence failure lost its phase")
+	}
+	failProofSave = false
+	proof, e = d.VerifyCommonSpace(context.Background(), "proof-attempt", "/library")
 	if e != nil || !current.HasProof(proof.TVRoot, proof.AgentRoot) || len(content) != 32 || pre != 1 || puts != 1 || gets != 2 {
 		t.Fatalf("proof failed %v pre=%d puts=%d gets=%d", e, pre, puts, gets)
 	}
