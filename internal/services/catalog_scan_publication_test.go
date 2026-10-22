@@ -3,6 +3,7 @@ package services
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -62,11 +63,13 @@ func TestCatalogScanFullAndPartialPreserveVersionsAndStableIdentity(t *testing.T
 		t.Run(map[bool]string{false: "local", true: "115"}[provider], func(t *testing.T) {
 			service, library, storage, profile, entries := catalogScanFixture(t, provider)
 			library, run := catalogScanRun(t, service, library.ID, storage, profile)
+			markTransferPublicationScan(t, service.db, &run)
 			result := medialibrary.Result{Files: []medialibrary.File{scanFile(entries[0]), scanFile(entries[1])}, Assets: []medialibrary.SourceAsset{{RelativePath: "Show/poster.jpg", ProviderID: "poster", Name: "poster.jpg", Extension: ".jpg", Size: 10}}}
 			published, err := service.publishCatalogScan(context.Background(), library, storage, profile, run, result, provider, service.catalogScanCommit)
 			if err != nil {
 				t.Fatal(err)
 			}
+			assertAcquisitionPublicationScope(t, service.db, published)
 			if published.Status != "success" || published.Added != 0 || published.Removed != 0 {
 				t.Fatalf("full run: %+v", published)
 			}
@@ -369,10 +372,12 @@ func TestCatalogScanNoopPartialDoesNotConsumeDeltaLayers(t *testing.T) {
 	input.Partial = true
 	for range CatalogMaxDeltas + 2 {
 		library, run = catalogScanRun(t, service, library.ID, storage, profile)
+		markTransferPublicationScan(t, service.db, &run)
 		published, err := service.publishCatalogScan(context.Background(), library, storage, profile, run, input, true, hook)
 		if err != nil {
 			t.Fatal(err)
 		}
+		assertAcquisitionPublicationScope(t, service.db, published)
 		if published.Status != "success" || published.Added != 0 || published.Updated != 0 || published.Removed != 0 {
 			t.Fatalf("noop run: %+v", published)
 		}
@@ -392,6 +397,7 @@ func TestCatalogScanNoopPartialDoesNotConsumeDeltaLayers(t *testing.T) {
 func TestCatalogScanHookSeesFinalLogicalStateAndFailureRollsItBack(t *testing.T) {
 	service, library, storage, profile, entries := catalogScanFixture(t, true)
 	library, run := catalogScanRun(t, service, library.ID, storage, profile)
+	markTransferPublicationScan(t, service.db, &run)
 	failure := errors.New("fixture bind rollback")
 	checked := false
 	hook := func(tx *gorm.DB, p CatalogScanPublication) error {
@@ -406,6 +412,7 @@ func TestCatalogScanHookSeesFinalLogicalStateAndFailureRollsItBack(t *testing.T)
 		if current.DirtyGeneration != p.Run.Generation || current.BaselineGeneration != p.Run.Generation || stored.Status != p.Run.Status || stored.Phase != p.Run.Phase {
 			t.Fatalf("hook saw old logical state: library=%+v run=%+v payload=%+v", current, stored, p)
 		}
+		assertAcquisitionPublicationScope(t, tx, stored)
 		checked = true
 		return failure
 	}
@@ -420,6 +427,9 @@ func TestCatalogScanHookSeesFinalLogicalStateAndFailureRollsItBack(t *testing.T)
 	var stored models.MediaLibraryScanRun
 	if err := service.db.First(&stored, run.ID).Error; err != nil {
 		t.Fatal(err)
+	}
+	if strings.Contains(stored.CheckpointJSON, "acquisition_publication_scope") {
+		t.Fatal("failed transaction persisted publication proof")
 	}
 	if current.DirtyGeneration != library.DirtyGeneration || current.BaselineGeneration != library.BaselineGeneration || stored.Status != "running" {
 		t.Fatal("failed binding left logical scan committed")

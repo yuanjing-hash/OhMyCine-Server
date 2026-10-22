@@ -2,6 +2,7 @@ package services
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
@@ -81,6 +82,11 @@ func TestTransferBatchPublishesOnlySuccessfulTargetsWithoutProviderEnumeration(t
 	if after != runs || f.driver.statCalls != stats {
 		t.Fatal("completed batch was reprocessed")
 	}
+	var publication models.MediaLibraryScanRun
+	if err := f.queue.db.Where("library_id=? AND kind=?", f.library.ID, "transfer_batch").First(&publication).Error; err != nil {
+		t.Fatal(err)
+	}
+	assertAcquisitionPublicationScope(t, f.queue.db, publication)
 	// Lost receipt after durable publication reuses the same scan/batch.
 	if err := f.queue.db.Model(&models.TransferTask{}).Where("id = ?", task.ID).Update("catalog_published_at", nil).Error; err != nil {
 		t.Fatal(err)
@@ -146,5 +152,39 @@ func TestTransferBatchMissingTargetDoesNotFallBackToScan(t *testing.T) {
 	}
 	if task.CatalogPublishedAt != nil {
 		t.Fatal("failed batch acknowledged")
+	}
+}
+
+func assertAcquisitionPublicationScope(t *testing.T, db *gorm.DB, run models.MediaLibraryScanRun) {
+	t.Helper()
+	var checkpoint struct {
+		Scope acquisitionPublicationScope `json:"acquisition_publication_scope"`
+	}
+	if err := json.Unmarshal([]byte(run.CheckpointJSON), &checkpoint); err != nil {
+		t.Fatal(err)
+	}
+	scope := checkpoint.Scope
+	if scope.Version == nil || *scope.Version != 1 || scope.LibraryID == nil || *scope.LibraryID != run.LibraryID || scope.SourceEpoch == nil || scope.RootGeneration == nil || scope.SourceFingerprint == nil {
+		t.Fatalf("actual publication lacks complete scope: %s", run.CheckpointJSON)
+	}
+	library, storage, _, err := catalogConversionContextTx(db, run.LibraryID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var epoch uint64
+	if err := db.Model(&models.CatalogHead{}).Where("library_id=?", run.LibraryID).Select("source_epoch").Scan(&epoch).Error; err != nil {
+		t.Fatal(err)
+	}
+	if *scope.SourceEpoch != epoch || *scope.RootGeneration != library.ExclusionEpoch || *scope.SourceFingerprint != catalogSourceFingerprint(library, storage) {
+		t.Fatalf("actual publication scope is not its transaction source: %s", run.CheckpointJSON)
+	}
+}
+
+func markTransferPublicationScan(t *testing.T, db *gorm.DB, run *models.MediaLibraryScanRun) {
+	t.Helper()
+	run.Kind = "transfer_batch"
+	run.CheckpointJSON = `{"transfer_batch_id":"actual-publisher-fixture"}`
+	if err := db.Model(run).Updates(map[string]any{"kind": run.Kind, "checkpoint_json": run.CheckpointJSON}).Error; err != nil {
+		t.Fatal(err)
 	}
 }

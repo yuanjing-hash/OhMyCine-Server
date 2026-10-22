@@ -551,6 +551,46 @@ func TestPlayerAcquisitionListRequiresDeviceAuthScopesOwnerAndValidatesInput(t *
 	if items[346].ID != "owner-acquisition" || items[65733].DownloadTaskID != directDownload.ID || items[65733].Status != models.DownloadTaskStatusDownloading {
 		t.Fatalf("acquisition items=%+v", items)
 	}
+
+	// HTTP navigation uses an authorized current work independently of queued intake state.
+	storage := models.Storage{Name: "Acquisition HTTP", NameNormalized: "acquisition-http", Type: models.StorageTypeLocal, RootPath: t.TempDir(), RootPathNormalized: "private-http-root", Enabled: true, Capabilities: `{}`}
+	if err := client.db.Create(&storage).Error; err != nil {
+		t.Fatal(err)
+	}
+	var profile models.MediaClassificationProfile
+	if err := client.db.Where("code=?", "default-v1").First(&profile).Error; err != nil {
+		t.Fatal(err)
+	}
+	library := models.MediaLibrary{Name: "Acquisition HTTP", NameNormalized: "acquisition-http", StorageID: storage.ID, ProfileID: profile.ID, ProfileRevision: profile.Revision, RelativeRoot: "/", Enabled: true, VideoExtensionsJSON: `[]`, STRMAssetExtraExtensionsJSON: `[]`, IgnorePatternsJSON: `[]`, CreatedAt: now, UpdatedAt: now}
+	if err := client.db.Create(&library).Error; err != nil {
+		t.Fatal(err)
+	}
+	tmdbID := int64(346)
+	entry := models.MediaLibraryEntry{LibraryID: library.ID, RelativePath: "private-name.mkv", ProviderID: "private-provider-id", Size: 100, MediaType: "movie", Title: "Seven Samurai", WorkKey: "movie:tmdb:346", TMDBID: &tmdbID, MatchStatus: "matched", CreatedAt: now, UpdatedAt: now}
+	if err := client.db.Create(&entry).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := client.db.Model(&models.MediaAcquisition{}).Where("id=?", "owner-acquisition").Update("target_library_id", library.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{"/api/v1/player/discovery/media/movie/346/acquisition", "/api/v1/player/discovery/acquisitions?page=1&page_size=10"} {
+		status, envelope, headers = client.playerRequest(t, http.MethodGet, path, login.AccessToken, nil)
+		if status != http.StatusOK || headers.Get("Cache-Control") != "no-store" || !bytes.Contains(envelope.Data, []byte(`"catalog_target"`)) || bytes.Contains(envelope.Data, []byte("private-name")) || bytes.Contains(envelope.Data, []byte("private-provider-id")) || bytes.Contains(envelope.Data, []byte("acquisition_publication_scope")) {
+			t.Fatalf("unsafe catalog target HTTP=%d data=%s", status, envelope.Data)
+		}
+	}
+	status, envelope, _ = client.playerRequest(t, http.MethodGet, "/api/v1/player/discovery/media/movie/346/acquisition", login.AccessToken, nil)
+	var current services.AcquisitionStatus
+	if err := json.Unmarshal(envelope.Data, &current); err != nil || current.Status != "queued" || current.CatalogTarget == nil || current.CatalogTarget.LibraryID != library.ID || current.CatalogTarget.WorkToken != "bW92aWU6dG1kYjozNDY" {
+		t.Fatalf("target changed latest task: %+v %v", current, err)
+	}
+	if err := client.db.Model(&library).Update("enabled", false).Error; err != nil {
+		t.Fatal(err)
+	}
+	status, envelope, _ = client.playerRequest(t, http.MethodGet, "/api/v1/player/discovery/media/movie/346/acquisition", login.AccessToken, nil)
+	if status != http.StatusOK || bytes.Contains(envelope.Data, []byte(`"catalog_target"`)) {
+		t.Fatalf("disabled library target: HTTP=%d data=%s", status, envelope.Data)
+	}
 	for _, path := range []string{
 		"/api/v1/player/discovery/acquisitions?page=zero&page_size=10",
 		"/api/v1/player/discovery/acquisitions?page=1&page_size=101",

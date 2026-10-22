@@ -269,6 +269,9 @@ func (s *MediaLibraryService) finishCatalogScanTx(tx *gorm.DB, profile models.Me
 	if run.RecognitionTotal > 0 {
 		run.Status, run.Phase, run.FinishedAt = "catalog_ready", "recognition_queued", nil
 	}
+	if err := stampAcquisitionPublicationTx(tx, run); err != nil {
+		return err
+	}
 	publication.Run = *run
 	libraryUpdates := map[string]any{"last_scan_at": finished, "last_successful_scan_at": finished, "profile_revision": profile.Revision, "reclassification_due": false, "status_error_code": "", "next_retry_at": nil}
 	if !publication.PreserveGeneration {
