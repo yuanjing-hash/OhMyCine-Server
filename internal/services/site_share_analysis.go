@@ -218,8 +218,12 @@ func shareFileFacts(entry SiteSharePreviewEntry, claim siteResultClaim) (siteSha
 	if file.Year == nil {
 		file.Year = cloneInt(parsed.SeasonYear)
 	}
+	// Orphaned separators before the extension do not change a bare episode
+	// number ("14..mp4"). Trim only the suffix, preserving internal decimal or
+	// range separators and the original path. The existing numeric bounds and
+	// real-parent/identity/season checks below still supply the authority.
+	stem := strings.TrimRight(strings.TrimSuffix(base, path.Ext(base)), " ._-")
 	// A bare number cannot establish a movie/work identity (including "1917").
-	stem := strings.TrimSuffix(base, path.Ext(base))
 	_, numericErr := strconv.Atoi(stem)
 	numeric := numericErr == nil
 	if numeric {
