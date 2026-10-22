@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 	"sync"
@@ -14,6 +15,7 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/authz"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/database"
+	serverlog "github.com/yuanjing-hash/OhMyCine-Server/internal/logging"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
 	"gorm.io/gorm"
 )
@@ -70,6 +72,7 @@ type UnifiedScheduleService struct {
 	cookieCloud    *CookieCloudService
 	recycleCleanup *Pan115RecycleCleanupService
 	log            zerolog.Logger
+	readinessLog   map[string]bool // guarded by pollMu; observation only
 	now            func() time.Time
 	tick           time.Duration
 	pollMu         sync.Mutex
@@ -518,6 +521,12 @@ func (s *UnifiedScheduleService) Close() {
 func (s *UnifiedScheduleService) Poll(ctx context.Context) error {
 	s.pollMu.Lock()
 	defer s.pollMu.Unlock()
+	omittedReadiness := 0
+	defer func() {
+		if omittedReadiness > 0 {
+			serverlog.RecordBusiness(ctx, s.log, serverlog.OperationUnifiedSchedule, serverlog.BusinessEvent{Code: "schedule.waiting.summary", Stage: "trigger", Outcome: "waiting", Message: fmt.Sprintf("本轮另有 %d 个计划等待依赖准备，等待明细已合并为此汇总；各计划保留原执行策略", omittedReadiness), Fields: map[string]any{"omitted_count": omittedReadiness, "reason": "dependency_not_ready"}})
+		}
+	}()
 	now := s.now()
 	var cursorTime time.Time
 	var cursorID string
@@ -540,8 +549,18 @@ func (s *UnifiedScheduleService) Poll(ctx context.Context) error {
 				return gateErr
 			}
 			if blocked {
+				if s.readinessLog == nil {
+					s.readinessLog = map[string]bool{}
+				}
+				if !s.readinessLog[row.ID] && len(s.readinessLog) < 1024 {
+					serverlog.RecordBusiness(ctx, s.log, serverlog.OperationUnifiedSchedule, serverlog.BusinessEvent{Code: "schedule.waiting", Stage: "trigger", Outcome: "waiting", Message: "计划“" + serverlog.BusinessDisplayName(row.Name) + "”的依赖资源尚未准备好，本次暂不入队；保留原计划，等待后续轮询重新检查", Fields: map[string]any{"title": row.Name, "action": row.ActionType, "reason": "dependency_not_ready"}})
+					s.readinessLog[row.ID] = true
+				} else if !s.readinessLog[row.ID] {
+					omittedReadiness++
+				}
 				continue
 			}
+			delete(s.readinessLog, row.ID)
 			scheduledAt := *row.NextRunAt
 			// run_once merges all missed occurrences into this one run. Computing
 			// from the old due time leaves the definition overdue and replays every
@@ -549,6 +568,7 @@ func (s *UnifiedScheduleService) Poll(ctx context.Context) error {
 			next, err := PreviewSchedule(row.CronExpression, row.Timezone, 1, now)
 			if err != nil {
 				s.db.Model(&row).Updates(map[string]any{"enabled": false, "last_status": "failed", "last_error_code": CodeInvalidRequest, "next_run_at": nil})
+				serverlog.RecordBusiness(ctx, s.log, serverlog.OperationUnifiedSchedule, serverlog.BusinessEvent{Code: "schedule.invalid", Stage: "trigger", Outcome: "failed", Message: "计划“" + serverlog.BusinessDisplayName(row.Name) + "”的时间表达式无法解析，已跳过本次触发并尝试停用该计划", Fields: map[string]any{"title": row.Name, "error_code": "invalid_schedule"}})
 				continue
 			}
 			if row.MisfirePolicy == "skip" && now.Sub(scheduledAt) > time.Minute {
@@ -570,6 +590,7 @@ func (s *UnifiedScheduleService) Poll(ctx context.Context) error {
 				}); err != nil {
 					return err
 				}
+				serverlog.RecordBusiness(ctx, s.log, serverlog.OperationUnifiedSchedule, serverlog.BusinessEvent{Code: "schedule.skipped", Stage: "trigger", Outcome: "skipped", Message: "计划“" + serverlog.BusinessDisplayName(row.Name) + "”错过触发时间，按跳过策略等待下一次计划时间", Fields: map[string]any{"title": row.Name, "reason": "misfire", "action": row.ActionType}})
 				continue
 			}
 			var active int64
@@ -593,10 +614,11 @@ func (s *UnifiedScheduleService) Poll(ctx context.Context) error {
 				}); err != nil {
 					return err
 				}
+				serverlog.RecordBusiness(ctx, s.log, serverlog.OperationUnifiedSchedule, serverlog.BusinessEvent{Code: "schedule.skipped", Stage: "trigger", Outcome: "skipped", Message: "计划“" + serverlog.BusinessDisplayName(row.Name) + "”已有执行中的任务，按重叠策略跳过本次触发", Fields: map[string]any{"title": row.Name, "reason": "overlap", "action": row.ActionType}})
 				continue
 			}
 			runID := uuid.NewString()
-			_, err = s.queue.EnqueueWith(EnqueueJobInput{OwnerID: row.OwnerID, JobType: JobTypeUnifiedSchedule, DisplayName: "计划任务 · " + row.Name, Provider: "scheduler", ResourceKey: "schedule:" + row.ID, Payload: scheduleJobPayload{RunID: runID, DefinitionID: row.ID, Revision: row.Revision}}, func(tx *gorm.DB, job models.Job) error {
+			queued, err := s.queue.EnqueueWith(EnqueueJobInput{OwnerID: row.OwnerID, JobType: JobTypeUnifiedSchedule, DisplayName: "计划任务 · " + row.Name, Provider: "scheduler", ResourceKey: "schedule:" + row.ID, Payload: scheduleJobPayload{RunID: runID, DefinitionID: row.ID, Revision: row.Revision}}, func(tx *gorm.DB, job models.Job) error {
 				run := models.ScheduleRun{ID: runID, ScheduleID: row.ID, JobID: job.ID, ScheduledAt: scheduledAt, Status: "queued", Attempt: 1, CreatedAt: now, UpdatedAt: now}
 				if err := tx.Create(&run).Error; err != nil {
 					return err
@@ -606,6 +628,7 @@ func (s *UnifiedScheduleService) Poll(ctx context.Context) error {
 			if err != nil {
 				return err
 			}
+			serverlog.RecordBusiness(ctx, s.log, serverlog.OperationUnifiedSchedule, serverlog.BusinessEvent{Code: "schedule.queued", Stage: "trigger", Outcome: "accepted", Message: "计划“" + serverlog.BusinessDisplayName(row.Name) + "”已触发并进入任务队列，后续动作尚未执行", Fields: map[string]any{"title": row.Name, "job_id": queued.ID, "action": row.ActionType, "created_count": 1}})
 		}
 		if len(rows) < 100 {
 			return nil
@@ -615,7 +638,21 @@ func (s *UnifiedScheduleService) Poll(ctx context.Context) error {
 
 func NewUnifiedScheduleWorker(service *UnifiedScheduleService) Worker { return WorkerFunc(service.run) }
 
-func (s *UnifiedScheduleService) run(ctx context.Context, _ JobRuntime, claimed ClaimedJob) WorkerResult {
+func (s *UnifiedScheduleService) run(ctx context.Context, _ JobRuntime, claimed ClaimedJob) (result WorkerResult) {
+	observedAt := time.Now()
+	label, outcome, terminal := "计划任务", "finished", "本次触发动作已返回，后续任务的完成情况请查看关联任务"
+	fields := map[string]any{"job_id": claimed.Job.ID}
+	defer func() {
+		fields["duration_ms"] = time.Since(observedAt).Milliseconds()
+		if result.ErrorCode != "" {
+			outcome, terminal = "failed", label+"执行失败："+remainingFailureReason(strings.ToLower(result.ErrorCode))
+			fields["error_code"] = result.ErrorCode
+		}
+		if result.RetryAt != nil {
+			outcome, terminal = "retry", label+"暂未执行完成，已按原策略安排重试"
+		}
+		serverlog.RecordBusiness(ctx, s.log, serverlog.OperationUnifiedSchedule, serverlog.BusinessEvent{Code: "schedule.finish", Stage: "execute", Outcome: outcome, Message: terminal, Fields: fields})
+	}()
 	var payload scheduleJobPayload
 	if json.Unmarshal([]byte(claimed.Job.PayloadJSON), &payload) != nil || payload.RunID == "" {
 		return WorkerResult{ErrorCode: CodeInvalidRequest, ErrorMessage: "计划任务参数无效"}
@@ -624,7 +661,10 @@ func (s *UnifiedScheduleService) run(ctx context.Context, _ JobRuntime, claimed 
 	if err := s.db.First(&definition, "id = ?", payload.DefinitionID).Error; err != nil {
 		return s.finishRun(payload.RunID, "failed", CodeNotFound)
 	}
+	label = "计划“" + serverlog.BusinessDisplayName(definition.Name) + "”"
+	fields["title"], fields["action"] = definition.Name, definition.ActionType
 	if definition.Revision != payload.Revision || !definition.Enabled {
+		outcome, terminal = "skipped", label+"的配置已变化或已停用，本次未调用业务动作"
 		return s.finishRun(payload.RunID, "cancelled", "schedule_definition_changed")
 	}
 	actor, err := s.authorization.Resolve(definition.OwnerID)
@@ -640,6 +680,13 @@ func (s *UnifiedScheduleService) run(ctx context.Context, _ JobRuntime, claimed 
 	runCtx, cancel := context.WithTimeout(ctx, time.Duration(definition.MaxRuntimeSeconds)*time.Second)
 	defer cancel()
 	targetID, _ := strconv.ParseUint(definition.TargetID, 10, 64)
+	if definition.TargetType == "media_library" {
+		fields["library_id"] = uint(targetID)
+	}
+	if definition.TargetType == "follow" {
+		fields["follow_id"] = definition.TargetID
+	}
+	serverlog.RecordBusiness(ctx, s.log, serverlog.OperationUnifiedSchedule, serverlog.BusinessEvent{Code: "schedule.start", Stage: "execute", Outcome: "started", Message: label + "开始执行“" + scheduleActions[definition.ActionType] + "”", Fields: fields})
 	if (strings.HasPrefix(definition.ActionType, "media_library_") && !actor.CanResource(authz.PermissionMediaLibrariesScan, models.AuthorizationResourceMediaLibrary, definition.TargetID)) || (definition.ActionType == "strm_reconcile" && !actor.CanResource(authz.PermissionSTRMRunsCreate, models.AuthorizationResourceMediaLibrary, definition.TargetID)) || (definition.ActionType == "follow_search" && !actor.HasPermission(authz.PermissionFollowsExecuteOwn) && !actor.Can(authz.PermissionFollowsExecuteAll)) || (definition.ActionType == "cookiecloud_sync" && !actor.Can(authz.PermissionSitesUpdate)) {
 		return s.finishRun(payload.RunID, "failed", CodePermissionDenied)
 	}
@@ -648,22 +695,41 @@ func (s *UnifiedScheduleService) run(ctx context.Context, _ JobRuntime, claimed 
 		// Scheduled reconciliation is an explicit full provider comparison. The
 		// publication layer computes exact before/after deltas and only queues
 		// artifacts for changed entries; unchanged cloud objects are skipped.
-		_, err = s.libraries.Scan(runCtx, actor, uint(targetID), "full")
+		var scan models.MediaLibraryScanRun
+		scan, err = s.libraries.Scan(runCtx, actor, uint(targetID), "full")
+		if err == nil {
+			fields["scan_run_id"] = scan.ID
+			terminal = fmt.Sprintf("%s全量核对调用已返回，扫描状态：%s；后续产物和通知以对应任务为准", label, serverlog.BusinessDisplayName(scan.Status))
+		}
 	case "media_library_structure_diagnose":
-		_, err = s.structure.Diagnose(runCtx, uint(targetID), "")
+		var diagnosis MediaLibraryStructureDiagnostics
+		diagnosis, err = s.structure.Diagnose(runCtx, uint(targetID), "")
+		fields["related_job_id"] = diagnosis.JobID
 	case "media_library_structure_repair":
-		_, err = s.structure.EnqueueRepair(runCtx, actor, uint(targetID), "", RequestContext{})
+		var repair models.MediaLibraryStructureRepair
+		repair, err = s.structure.EnqueueRepair(runCtx, actor, uint(targetID), "", RequestContext{})
+		if repair.JobID != nil {
+			fields["related_job_id"] = *repair.JobID
+		}
 	case "strm_reconcile":
-		_, err = s.strm.RequestReconcile(actor, uint(targetID), "incremental")
+		var child JobDTO
+		child, err = s.strm.RequestReconcile(actor, uint(targetID), "incremental")
+		fields["related_job_id"] = child.ID
 	case "follow_search":
-		_, err = s.follows.Enqueue(runCtx, actor, definition.TargetID, "schedule", RequestContext{})
+		fields["related_job_id"], err = s.follows.Enqueue(runCtx, actor, definition.TargetID, "schedule", RequestContext{})
 	case "cookiecloud_sync":
-		_, err = s.cookieCloud.Sync(runCtx, actor, RequestContext{})
+		var synced CookieCloudSyncSummary
+		synced, err = s.cookieCloud.Sync(runCtx, actor, RequestContext{})
+		if err == nil {
+			terminal = fmt.Sprintf("%s同步调用已返回：新建 %d 个站点，更新 %d 个，跳过 %d 个，失败 %d 个", label, synced.Created, synced.Updated, synced.Skipped, synced.Failed)
+		}
 	case "pan115_recycle_cleanup":
 		if !actor.Can(authz.PermissionConnectionsUpdate) || s.recycleCleanup == nil {
 			err = appError(CodePermissionDenied, "无权执行 115 回收站清理", nil)
 		} else {
-			_, err = s.recycleCleanup.EnqueueConnection(uint(targetID))
+			var child JobDTO
+			child, err = s.recycleCleanup.EnqueueConnection(uint(targetID))
+			fields["related_job_id"] = child.ID
 		}
 	default:
 		err = appError(CodeInvalidRequest, "计划任务动作无效", nil)

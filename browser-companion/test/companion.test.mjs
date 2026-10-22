@@ -61,6 +61,60 @@ test('reload preserves the owned session and refuses another identity', async t 
   assert.equal(reloads, 1);
   assert.equal(runtime.session.id, created.sessionId);
 });
+
+test('a dead browser is evicted before any request and can be recreated', async t => {
+  let alive = true, closed = 0, requests = 0;
+  const runtime = await fixture(t, { opener: async () => ({ alive: () => alive,
+    request: async () => { requests++; return {}; }, close: async () => { closed++; } }) });
+  runtime.state = 'ready';
+  const created = await runtime.dispatch('/v1/session/create', { identity: 'owner', origin: 'https://example.com' });
+  alive = false;
+  await assert.rejects(runtime.dispatch('/v1/session/request', { sessionId: created.sessionId,
+    identity: 'owner', method: 'GET', url: 'https://example.com/search' }), /session_unavailable/);
+  assert.equal(runtime.session, null);
+  assert.equal(requests, 0);
+  assert.equal(closed, 1);
+  alive = true;
+  await runtime.dispatch('/v1/session/create', { identity: 'replacement', origin: 'https://example.com' });
+});
+
+test('request cancellation closes the context and ignores a late response', async t => {
+  let resolveRequest, started;
+  const ready = new Promise(resolve => { started = resolve; });
+  let closed = 0, requests = 0;
+  const runtime = await fixture(t, { opener: async () => ({ request: () => {
+    requests++; started(); return new Promise(resolve => { resolveRequest = resolve; });
+  }, close: async () => { closed++; } }) });
+  runtime.state = 'ready';
+  const created = await runtime.dispatch('/v1/session/create', { identity: 'owner', origin: 'https://example.com' });
+  const controller = new AbortController();
+  const pending = runtime.dispatch('/v1/session/request', { sessionId: created.sessionId,
+    identity: 'owner', method: 'POST', url: 'https://example.com/login' }, { signal: controller.signal });
+  await ready;
+  controller.abort();
+  await assert.rejects(pending, /request_cancelled/);
+  assert.equal(runtime.session, null);
+  assert.equal(closed, 1);
+  assert.equal(requests, 1);
+  resolveRequest({ status: 200 });
+  await Promise.resolve();
+  assert.equal(runtime.session, null);
+  assert.equal(closed, 1);
+});
+
+test('hard request deadline evicts the closed browser without replay', async t => {
+  let closed = 0, requests = 0;
+  const runtime = await fixture(t, { opener: async () => ({ request: async () => {
+    requests++; throw new Fault('browser_request_timeout', 504);
+  }, close: async () => { closed++; } }) });
+  runtime.state = 'ready';
+  const created = await runtime.dispatch('/v1/session/create', { identity: 'owner', origin: 'https://example.com' });
+  await assert.rejects(runtime.dispatch('/v1/session/request', { sessionId: created.sessionId,
+    identity: 'owner', method: 'POST', url: 'https://example.com/login' }), /browser_request_timeout/);
+  assert.equal(runtime.session, null);
+  assert.equal(closed, 1);
+  assert.equal(requests, 1);
+});
 test('license refusal never starts installer; explicit install persists only private metadata', async t => {
   let installs = 0;
   const runtime = await fixture(t);
@@ -215,4 +269,34 @@ test('launch failure preserves installation but status reports failure and allow
   assert.equal(runtime.status().runtimeError, 'browser_launch_failed');
   fail = false; await runtime.dispatch('/v1/session/create', input);
   assert.equal(runtime.status().state, 'ready'); assert.equal(runtime.status().runtimeError, '');
+});
+
+test('finite startup reasons survive Runtime and status polling never retries', async t => {
+  for (const code of ['browser_sandbox_unavailable', 'browser_dependencies_missing', 'browser_executable_unavailable', 'browser_launch_timeout', 'browser_profile_unavailable']) {
+    let opened = 0;
+    const runtime = await fixture(t, { opener: async () => { opened++; throw new Fault(code); } });
+    runtime.state = 'ready'; runtime.executablePath = '/synthetic';
+    const input = { identity: 'owner', origin: 'https://example.com' };
+    await assert.rejects(runtime.dispatch('/v1/session/create', input), error => error.code === code && error.message === code);
+    for (let i = 0; i < 3; i++) {
+      const status = await runtime.dispatch('/v1/status', {});
+      assert.equal(status.runtimeError, code); assert.equal(status.installed, true); assert.equal(status.state, 'launch_failed');
+    }
+    assert.equal(opened, 1); assert.equal(runtime.session, null);
+    runtime.opener = async () => ({ close: async () => {} });
+    await runtime.dispatch('/v1/session/create', input);
+    assert.equal(runtime.status().runtimeError, '');
+  }
+});
+
+test('cancelled failing launch does not replace component health with a launch error', async t => {
+  let rejectOpen;
+  const runtime = await fixture(t, { opener: () => new Promise((_, reject) => { rejectOpen = reject; }) });
+  runtime.state = 'ready';
+  const controller = new AbortController();
+  const pending = runtime.dispatch('/v1/session/create', { identity: 'owner', origin: 'https://example.com' }, { signal: controller.signal });
+  await Promise.resolve(); controller.abort(); rejectOpen(new Fault('browser_sandbox_unavailable'));
+  await assert.rejects(pending, /^Error: request_cancelled$/);
+  assert.equal(runtime.status().state, 'ready'); assert.equal(runtime.status().runtimeError, '');
+  assert.equal(runtime.busy, false); assert.equal(runtime.session, null);
 });

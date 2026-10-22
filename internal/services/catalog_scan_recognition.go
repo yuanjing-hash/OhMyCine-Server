@@ -3,8 +3,10 @@ package services
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
+	serverlog "github.com/yuanjing-hash/OhMyCine-Server/internal/logging"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/medialibrary"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
 	"gorm.io/gorm"
@@ -154,6 +156,8 @@ func (s *MediaLibraryService) completeCatalogRecognition(ctx context.Context, ru
 		if err := s.catalogScanProgress(ctx, run.ID, "catalog_ready", map[string]any{"phase": "recognition_running", "recognition_total": run.RecognitionTotal}); err != nil {
 			return err
 		}
+		ctx = serverlog.WithBusinessFields(ctx, map[string]any{"library_id": library.ID, "library_name": library.Name, "scan_run_id": run.ID})
+		recordMediaBusiness(ctx, s.log, serverlog.OperationMediaRecognition, "library.recognition.batch_start", "recognition", "started", fmt.Sprintf("开始本批 %d 个媒体单元的身份与元数据核对，剩余待处理 %d；复用现有缓存，不重新枚举媒体源", len(units), remaining), map[string]any{"batch_count": len(units), "total_count": remaining})
 		// Recognizer/cache/TMDB work is outside every pinned DB transaction.
 		recognized, err := s.recognizeLibraryUnitsWithExisting(ctx, library, profile, units, baseline.recognitions)
 		if err != nil {
@@ -226,6 +230,18 @@ func (s *MediaLibraryService) completeCatalogRecognition(ctx context.Context, ru
 			}
 			return err
 		}
+		matched, unrecognized, cacheHits := 0, 0, 0
+		for _, item := range recognized {
+			if item.Result.Status == mediaRecognitionStatusMatched {
+				matched++
+			} else {
+				unrecognized++
+			}
+			if item.CacheHit {
+				cacheHits++
+			}
+		}
+		recordMediaBusiness(ctx, s.log, serverlog.OperationMediaRecognition, "library.recognition.batch_published", "publishing", "confirmed", fmt.Sprintf("本批识别结果已发布：匹配 %d，未识别 %d，缓存复用 %d；目录状态已提交，元数据产物按后续任务生成", matched, unrecognized, cacheHits), map[string]any{"matched_count": matched, "unrecognized_count": unrecognized, "cache_hit_count": cacheHits, "batch_count": len(recognized)})
 		fenceFailures = 0
 	}
 }

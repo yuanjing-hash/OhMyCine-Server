@@ -20,6 +20,10 @@ func TestExclusiveRuntimeBindsExactDatabaseAndLifetime(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = r.Close() }()
+	lockInfo, err := os.Stat(path + ".runtime.lock")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
 		t.Fatal("lock created database before compatibility guard")
 	}
@@ -80,7 +84,7 @@ func TestExclusiveRuntimeBindsExactDatabaseAndLifetime(t *testing.T) {
 	if _, err := ExclusiveRuntimeID(bound); !errors.Is(err, ErrExclusiveRuntime) {
 		t.Fatal("released lock retained capability")
 	}
-	if _, err := os.Stat(path + ".runtime.lock"); err != nil {
+	if current, err := os.Stat(path + ".runtime.lock"); err != nil || !os.SameFile(lockInfo, current) {
 		t.Fatal("lock inode removed")
 	}
 	next, err := AcquireExclusiveRuntime(path)
@@ -90,6 +94,22 @@ func TestExclusiveRuntimeBindsExactDatabaseAndLifetime(t *testing.T) {
 	defer func() { _ = next.Close() }()
 	if next.id == id {
 		t.Fatal("restart reused runtime identity")
+	}
+	if current, err := os.Stat(path + ".runtime.lock"); err != nil || !os.SameFile(lockInfo, current) {
+		t.Fatal("restart replaced lock inode")
+	}
+	nextBound, err := next.Bind(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := next.file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := next.Close(); !errors.Is(err, os.ErrClosed) {
+		t.Fatalf("already-closed handle should report its close error: %v", err)
+	}
+	if _, err := ExclusiveRuntimeID(nextBound); !errors.Is(err, ErrExclusiveRuntime) {
+		t.Fatal("failed Close retained capability")
 	}
 }
 
@@ -118,6 +138,76 @@ func TestExclusiveRuntimeRejectsHardlinksAndInvalidPaths(t *testing.T) {
 			_ = r.Close()
 			t.Fatal("hardlinked DB bypasses sidecar lock identity")
 		}
+	}
+	t.Run("lock_file_hardlinks", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "catalog.db")
+		if err := os.WriteFile(path+".runtime.lock", nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Link(path+".runtime.lock", path+".lock-alias"); err != nil {
+			t.Fatal(err)
+		}
+		if r, err := AcquireExclusiveRuntime(path); err == nil {
+			_ = r.Close()
+			t.Fatal("hardlinked lock file accepted")
+		}
+	})
+	t.Run("hardlink_added_before_bind", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "catalog.db")
+		r, err := AcquireExclusiveRuntime(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = r.Close() }()
+		db, err := Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pool, _ := db.DB()
+		defer func() { _ = pool.Close() }()
+		if err := os.Link(path, path+".alias"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := r.Bind(db); !errors.Is(err, ErrExclusiveRuntime) {
+			t.Fatal("Bind accepted a new database hardlink")
+		}
+	})
+	for _, lockFile := range []bool{false, true} {
+		name := "database"
+		if lockFile {
+			name = "lock_file"
+		}
+		t.Run(name+"_nonordinary", func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "catalog.db")
+			target := path
+			if lockFile {
+				target += ".runtime.lock"
+			}
+			if err := os.Mkdir(target, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if r, err := AcquireExclusiveRuntime(path); err == nil {
+				_ = r.Close()
+				t.Fatal("nonordinary file accepted")
+			}
+		})
+		t.Run(name+"_symlink", func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "catalog.db")
+			if err := os.WriteFile(path+".target", nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			target := path
+			if lockFile {
+				target += ".runtime.lock"
+			}
+			if err := os.Symlink(path+".target", target); err != nil {
+				t.Skipf("symlink unavailable: %v", err)
+			}
+			if r, err := AcquireExclusiveRuntime(path); err == nil {
+				_ = r.Close()
+				t.Fatal("symlink file accepted")
+			}
+		})
 	}
 }
 

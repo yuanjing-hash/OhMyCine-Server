@@ -57,16 +57,9 @@ func runtimeOrdinaryFile(path string, allowMissing bool) error {
 	if err != nil || !info.Mode().IsRegular() || storage.IsReparsePoint(path, info) {
 		return ErrExclusiveRuntime
 	}
-	f, err := os.Open(path)
-	if err != nil {
-		return ErrExclusiveRuntime
-	}
-	defer func() { _ = f.Close() }()
-	actual, err := f.Stat()
-	if err != nil || !os.SameFile(info, actual) {
-		return ErrExclusiveRuntime
-	}
-	return runtimeSingleLink(f)
+	// Unix validation must not open/close another descriptor for a live
+	// SQLite file: close would discard all of this process's POSIX locks.
+	return runtimeVerifyOrdinaryFile(path, info)
 }
 
 // AcquireExclusiveRuntime runs before opening/migrating the database or

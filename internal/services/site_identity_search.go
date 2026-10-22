@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"sort"
 	"strconv"
 	"strings"
@@ -11,6 +12,7 @@ import (
 	"unicode"
 
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/authz"
+	serverlog "github.com/yuanjing-hash/OhMyCine-Server/internal/logging"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/mediarecognition"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/metadata/tmdb"
@@ -33,6 +35,7 @@ type MediaIdentitySearchInput struct {
 	CloudTypes         []string
 	SnapshotID         string
 	Refresh            bool
+	ProgressVersion    int
 }
 
 type MediaIdentitySearchResult struct {
@@ -50,12 +53,13 @@ type MediaIdentitySearchResult struct {
 func (s *SiteService) SearchMediaIdentity(ctx context.Context, actor Actor, input MediaIdentitySearchInput) (MediaIdentitySearchResult, error) {
 	result := MediaIdentitySearchResult{}
 	groups := []SiteSearchGroup{}
+	input.ProgressVersion = 0 // JSON and Follow receive terminal groups only.
 	err := s.SearchMediaIdentityEach(ctx, actor, input, func(metadata MediaIdentitySearchResult) {
 		result = metadata
 	}, func(group SiteSearchGroup) {
 		groups = append(groups, group)
 	})
-	if err != nil {
+	if err != nil && (ErrorCode(err) != CodeSearchBudget || len(groups) == 0) {
 		return MediaIdentitySearchResult{}, err
 	}
 	priorities := s.sitePriorityMap(input.SiteID, input.SiteIDs)
@@ -79,6 +83,9 @@ func (s *SiteService) SearchMediaIdentityEach(ctx context.Context, actor Actor, 
 }
 
 func (s *SiteService) SearchMediaIdentityEachProgress(ctx context.Context, actor Actor, input MediaIdentitySearchInput, emitMetadata func(MediaIdentitySearchResult), emit func(SiteSearchGroup), emitProgress func(SiteSearchProgress)) error {
+	ctx, cancel := s.searchRunContext(ctx)
+	defer cancel()
+	ctx = context.WithValue(ctx, detailedSearchKey{}, input.ProgressVersion == 2)
 	if !actor.HasPermission(authz.PermissionDiscoveryRead) {
 		return appError(CodePermissionDenied, "无权搜索种子资源", nil)
 	}
@@ -95,6 +102,9 @@ func (s *SiteService) SearchMediaIdentityEachProgress(ctx context.Context, actor
 	if input.Page < 1 || input.Page > 20 {
 		return appError(CodeInvalidRequest, "种子资源搜索页码无效", nil)
 	}
+	if input.ProgressVersion == 2 && emitProgress != nil {
+		emitProgress(SiteSearchProgress{ProgressVersion: 2, Phase: "preparing_media"})
+	}
 	client, err := s.metadata.Client()
 	if err != nil {
 		return appError(CodeTMDBUnavailable, "TMDB 详情服务暂时不可用", nil)
@@ -107,6 +117,7 @@ func (s *SiteService) SearchMediaIdentityEachProgress(ctx context.Context, actor
 		return appError(CodeTMDBUnavailable, "TMDB 作品没有可用搜索名称", nil)
 	}
 	metadata := MediaIdentitySearchResult{MediaType: input.MediaType, TMDBID: input.TMDBID, Title: verified.Title, Year: cloneInt(verified.ReleaseYear), QueryNames: names, Groups: []SiteSearchGroup{}}
+	ctx = context.WithValue(ctx, searchPageKey{}, input.Page)
 	records, err := s.searchSiteRecords(actor, input.SiteID, input.SiteIDs)
 	if err != nil {
 		return err
@@ -129,16 +140,28 @@ func (s *SiteService) searchMediaIdentitySite(ctx context.Context, actor Actor, 
 func (s *SiteService) searchMediaIdentitySitePage(ctx context.Context, actor Actor, input MediaIdentitySearchInput, verified tmdb.Match, names []tmdb.SearchName, record models.Site) SiteSearchGroup {
 	var target *SiteSearchGroup
 	privateKeys := make(map[string]int)
-	for _, name := range names {
+	ctx = serverlog.WithBusinessFields(ctx, map[string]any{"site_id": record.ID, "site_name": record.Name, "user_id": actor.User.ID})
+	if input.Season != nil {
+		ctx = serverlog.WithBusinessFields(ctx, map[string]any{"season": *input.Season})
+	}
+	if err := s.prepareSiteSearch(ctx, record); err != nil {
+		return searchPreparationFailure(record, input.Page, len(names), err)
+	}
+	for queryIndex, name := range names {
 		if ctx.Err() != nil {
 			break
 		}
-		group := s.searchSite(ctx, actor, record, SiteSearchInput{Keyword: name.Value, MediaType: input.MediaType, SearchBy: "title", Year: identitySearchYear(input.MediaType, verified.ReleaseYear), TMDBID: &input.TMDBID, Page: input.Page, SiteID: &record.ID, ClientCapabilities: input.ClientCapabilities, TypePolicy: input.TypePolicy, CloudTypes: input.CloudTypes, Refresh: input.Refresh})
+		reportSearchQuery(ctx, queryIndex+1, len(names), name.Value)
+		group := s.searchSite(ctx, actor, record, SiteSearchInput{ClientCapabilities: input.ClientCapabilities, TypePolicy: input.TypePolicy, CloudTypes: input.CloudTypes, Refresh: input.Refresh, ProgressVersion: input.ProgressVersion, Keyword: name.Value, MediaType: input.MediaType, SearchBy: "title", Year: identitySearchYear(input.MediaType, verified.ReleaseYear), TMDBID: &input.TMDBID, Page: input.Page, SiteID: &record.ID})
+		aliasCtx := serverlog.WithBusinessFields(ctx, map[string]any{"query_name": name.Value})
+		rejections := newFollowRejections()
+		kept, replaced := 0, 0
 		if target == nil {
 			copy := group
 			copy.Items = []SiteSearchResult{}
 			copy.Skipped = 0
 			copy.HasNext = false
+			copy.QueriesTotal = len(names)
 			target = &copy
 		}
 		target.HasNext = target.HasNext || group.HasNext
@@ -160,10 +183,18 @@ func (s *SiteService) searchMediaIdentitySitePage(ctx context.Context, actor Act
 				target.Warnings = append(target.Warnings, warning)
 			}
 		}
+		if group.Partial {
+			target.Partial, target.IncompleteReason = true, group.IncompleteReason
+		}
 		if group.Status == "success" {
+			target.QueriesCompleted++
 			target.Status, target.ErrorCode = "success", ""
 		} else {
 			target.ErrorCount++
+			if group.QueryAttempted {
+				target.QueriesFailed++
+			}
+			target.IncompleteReason = group.ErrorCode
 			if target.Status != "success" {
 				target.Status, target.ErrorCode = group.Status, group.ErrorCode
 			}
@@ -171,11 +202,13 @@ func (s *SiteService) searchMediaIdentitySitePage(ctx context.Context, actor Act
 		for _, item := range group.Items {
 			claim, claimErr := s.resolveAvailableClaim(item.Token, actor.User.ID)
 			if claimErr != nil {
+				rejections.add("claim_unavailable", item.Title)
 				continue
 			}
 			if !mediaIdentityResultMatches(item.Title, names, input.MediaType, verified.ReleaseYear, input.Season) {
 				s.deleteClaim(item.Token)
 				target.Skipped++
+				rejections.add("identity_mismatch", item.Title)
 				continue
 			}
 			identity := claim.TorrentID
@@ -186,10 +219,12 @@ func (s *SiteService) searchMediaIdentitySitePage(ctx context.Context, actor Act
 			index, duplicate := privateKeys[key]
 			if duplicate && (!isCloudShareSource(item.SourceKind) || compareOptionalTime(item.Published, target.Items[index].Published) <= 0) {
 				s.deleteClaim(item.Token)
+				rejections.add("duplicate", item.Title)
 				continue
 			}
 			if bindErr := s.bindClaimRecognition(item.Token, actor.User.ID, input.TMDBID, input.MediaType, mediaIdentitySourceDirectID, mediaIdentityStatusVerified, false); bindErr != nil {
 				s.deleteClaim(item.Token)
+				rejections.add("identity_bind_failed", item.Title)
 				continue
 			}
 			item.MatchedName = name.Value
@@ -198,10 +233,30 @@ func (s *SiteService) searchMediaIdentitySitePage(ctx context.Context, actor Act
 				// Another language query may find a newer post for the same evolving share.
 				s.deleteClaim(target.Items[index].Token)
 				target.Items[index] = item
+				replaced++
 			} else {
 				privateKeys[key] = len(target.Items)
 				target.Items = append(target.Items, item)
+				kept++
 			}
+		}
+		rejections.record(aliasCtx, s.recordSearch)
+		if group.Status == "success" {
+			s.recordSearch(aliasCtx, "site.identity.finish", "identity", "confirmed", fmt.Sprintf("名称“%s”返回 %d 条可用结果，作品与季集验证、去重后新增 %d 条，替换同分享较旧帖子 %d 条，当前站点合计 %d 条", serverlog.BusinessDisplayName(name.Value), len(group.Items), kept, replaced, len(target.Items)), map[string]any{"result_count": len(group.Items), "identity_kept": kept, "updated_count": replaced, "deduplicated_count": len(target.Items)})
+		}
+		// PanSou builds one bounded multi-alias snapshot across its cached pages.
+		// Internal pages are not the requested client page and must not be emitted
+		// as cumulative SSE rows. The coordinator publishes its final projection.
+		if record.Kind != pansou.Kind {
+			snapshot := cloneSearchGroup(*target)
+			sortIdentitySearchItems(snapshot.Items)
+			if !publishSearchSnapshot(ctx, snapshot) {
+				target.Partial, target.IncompleteReason = true, CodeSearchResultLimit
+				break
+			}
+		}
+		if group.ErrorCode == CodeSearchRateWait || group.ErrorCode == CodeSearchCancelled || ctx.Err() != nil {
+			break
 		}
 	}
 	if target == nil {
@@ -212,25 +267,38 @@ func (s *SiteService) searchMediaIdentitySitePage(ctx context.Context, actor Act
 		target.Partial = true
 		target.Warnings = append(target.Warnings, sitepkg.SearchWarning{Code: "pansou_alias_search_incomplete", Message: "部分作品名称搜索未完成，已保留成功返回的结果"})
 	}
-	sort.SliceStable(target.Items, func(left, right int) bool {
-		leftSeeders, rightSeeders := intValue(target.Items[left].Seeders), intValue(target.Items[right].Seeders)
-		if leftSeeders != rightSeeders {
-			return leftSeeders > rightSeeders
+	if target.QueriesCompleted < target.QueriesTotal {
+		target.Partial = target.QueriesCompleted > 0
+		if ctx.Err() != nil {
+			target.IncompleteReason = searchContextError(ctx, CodeSearchSiteBudget)
 		}
-		if compared := compareOptionalTime(target.Items[left].Published, target.Items[right].Published); compared != 0 {
-			return compared > 0
+		if target.IncompleteReason == "" {
+			target.IncompleteReason = CodeSearchSiteBudget
 		}
-		if target.Items[left].SizeBytes != target.Items[right].SizeBytes {
-			return target.Items[left].SizeBytes > target.Items[right].SizeBytes
-		}
-		return target.Items[left].Title < target.Items[right].Title
-	})
+	}
+	sortIdentitySearchItems(target.Items)
 	return *target
 }
 
 func privateResultFingerprint(siteID uint, torrentID string) string {
 	sum := sha256.Sum256([]byte(strconv.FormatUint(uint64(siteID), 10) + "\x00" + torrentID))
 	return hex.EncodeToString(sum[:])
+}
+
+func sortIdentitySearchItems(items []SiteSearchResult) {
+	sort.SliceStable(items, func(left, right int) bool {
+		leftSeeders, rightSeeders := intValue(items[left].Seeders), intValue(items[right].Seeders)
+		if leftSeeders != rightSeeders {
+			return leftSeeders > rightSeeders
+		}
+		if compared := compareOptionalTime(items[left].Published, items[right].Published); compared != 0 {
+			return compared > 0
+		}
+		if items[left].SizeBytes != items[right].SizeBytes {
+			return items[left].SizeBytes > items[right].SizeBytes
+		}
+		return items[left].Title < items[right].Title
+	})
 }
 
 func identitySearchYear(mediaType string, year *int) *int {
@@ -279,7 +347,9 @@ func identitySearchKey(value string) string {
 
 func (s *SiteService) deleteClaim(token string) {
 	s.vaultMu.Lock()
-	delete(s.vault, token)
+	if claim, ok := s.vault[token]; ok && !claim.Published && !claim.InFlight {
+		delete(s.vault, token)
+	}
 	s.vaultMu.Unlock()
 }
 

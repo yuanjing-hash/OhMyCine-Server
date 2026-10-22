@@ -156,10 +156,36 @@ func (s *PluginRepositoryService) prepareBrowserLocked(ctx context.Context, owne
 		ExpiresAt time.Time `json:"expiresAt"`
 	}
 	if err := s.browser.Call(ctx, "session/create", map[string]any{"identity": identity, "origin": strings.TrimRight(connection.EntryOrigin, "/"), "cookies": cookies}, &created); err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		switch code := browsercompanion.ErrorCode(err); code {
+		case "browser_sandbox_unavailable":
+			return appError("resource_"+code, "Server 浏览器沙箱不可用，请检查 Docker 浏览器安全配置与宿主机用户命名空间支持", nil)
+		case "browser_dependencies_missing":
+			return appError("resource_"+code, "Server 浏览器缺少运行依赖，请更新完整安装目录或镜像", nil)
+		case "browser_executable_unavailable":
+			return appError("resource_"+code, "Server 浏览器文件不可执行，请检查组件文件和执行权限", nil)
+		case "browser_profile_unavailable":
+			return appError("resource_"+code, "Server 浏览器私有临时目录不可用，请检查服务器可写空间和权限", nil)
+		case "browser_launch_timeout":
+			return appError("resource_"+code, "Server 浏览器启动超时，请检查资源后重试登录", nil)
+		}
 		return appError("resource_browser_start_failed", "浏览器启动失败，请在系统设置中查看运行状态", nil)
 	}
 	if created.SessionID == "" || !created.ExpiresAt.After(time.Now()) || created.ExpiresAt.After(time.Now().Add(31*time.Minute)) {
+		if created.SessionID != "" {
+			s.closeBrowserHandle(ctx, created.SessionID, identity)
+		}
 		return browserFailure()
+	}
+	if err := ctx.Err(); err != nil {
+		s.closeBrowserHandle(ctx, created.SessionID, identity)
+		return err
+	}
+	if _, currentBinding, err := s.browserBinding(pluginID, connectionID); err != nil || currentBinding != fingerprint {
+		s.closeBrowserHandle(ctx, created.SessionID, identity)
+		return appError("resource_browser_session_expired", "浏览器启动期间连接配置已变化，请重新检查", nil)
 	}
 	s.browserSession = &resourceBrowserSession{ID: created.SessionID, Identity: identity, PluginID: pluginID, ConnectionID: connectionID, Origin: connection.EntryOrigin, Fingerprint: fingerprint, Owner: owner, Expires: created.ExpiresAt}
 	return nil
@@ -191,10 +217,19 @@ func (s *PluginRepositoryService) BrowserCredentialCommitted(ctx context.Context
 }
 
 func (s *PluginRepositoryService) saveBrowserState(ctx context.Context, connectionID string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	s.browserMu.Lock()
 	defer s.browserMu.Unlock()
 	session := s.browserSession
 	if session == nil || session.ConnectionID != connectionID {
+		if scope, ok := ctx.Value(browserStateKey{}).(browserAuthScope); ok && scope.ConnectionID == connectionID {
+			return appError("resource_browser_session_expired", "浏览器会话已变化，请重新检查", nil)
+		}
+		if scope, ok := ctx.Value(browserAuthKey{}).(browserAuthScope); ok && scope.ConnectionID == connectionID {
+			return appError("resource_browser_session_expired", "浏览器会话已变化，请重新确认", nil)
+		}
 		return nil
 	}
 	auth, ok := ctx.Value(browserAuthKey{}).(browserAuthScope)
@@ -248,9 +283,6 @@ func (s *PluginRepositoryService) saveBrowserState(ctx context.Context, connecti
 }
 
 func (s *PluginRepositoryService) hasBrowserState(connectionID string) bool {
-	if s.browser == nil {
-		return false
-	}
 	var connection models.PluginConnection
 	var state models.PluginBrowserState
 	if s.db.First(&connection, "id = ? AND enabled = ?", connectionID, true).Error != nil || s.db.First(&state, "connection_id = ?", connectionID).Error != nil {
@@ -263,6 +295,9 @@ func (s *PluginRepositoryService) hasBrowserState(connectionID string) bool {
 // Cold browser startup is outside the WASM/Host per-request time budget.
 func (s *PluginRepositoryService) restoreResourceBrowser(ctx context.Context, connectionID string) error {
 	if s.browser == nil {
+		if s.hasBrowserState(connectionID) {
+			return browserFailure()
+		}
 		return nil
 	}
 	s.browserMu.Lock()
@@ -299,11 +334,11 @@ func (s *PluginRepositoryService) BrowserComponent(ctx context.Context, actor Ac
 		return nil, appError(CodeInvalidRequest, "浏览器操作无效", nil)
 	}
 	var result struct {
-		State            string `json:"state"`
-		Supported        *bool  `json:"supported"`
-		Installed        bool   `json:"installed"`
-		RuntimeError     string `json:"runtimeError"`
-		ProtocolVersion  int    `json:"protocolVersion"`
+		State           string `json:"state"`
+		Supported       *bool  `json:"supported"`
+		Installed       bool   `json:"installed"`
+		RuntimeError    string `json:"runtimeError"`
+		ProtocolVersion int    `json:"protocolVersion"`
 	}
 	if err := s.browser.Call(ctx, operation, map[string]bool{"licenseAccepted": input.LicenseAccepted}, &result); err != nil {
 		if operation == "status" {
@@ -314,5 +349,10 @@ func (s *PluginRepositoryService) BrowserComponent(ctx context.Context, actor Ac
 	if result.Supported != nil && !*result.Supported {
 		result.State = "platform_unsupported"
 	}
-	return map[string]any{"state": result.State, "installed": result.Installed, "runtime_error": result.RuntimeError, "protocol_version": result.ProtocolVersion, "supported": result.Supported}, nil
+	switch result.State {
+	case "not_installed", "installing", "ready", "install_failed", "launch_failed", "platform_unsupported":
+	default:
+		result.State = "unavailable"
+	}
+	return map[string]any{"state": result.State, "installed": result.Installed, "runtime_error": browsercompanion.SafeErrorCode(result.RuntimeError), "protocol_version": result.ProtocolVersion, "supported": result.Supported}, nil
 }

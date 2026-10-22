@@ -124,11 +124,7 @@ func (a *Adapter) request(ctx context.Context, c site.Config, method, path strin
 	return nil
 }
 func boundedContext(ctx context.Context, c site.Config) (context.Context, context.CancelFunc) {
-	timeout := c.Timeout
-	if timeout < 3*time.Second || timeout > 120*time.Second {
-		timeout = 30 * time.Second
-	}
-	return context.WithTimeout(ctx, timeout)
+	return context.WithTimeout(ctx, site.RequestTimeout(c, 30*time.Second))
 }
 
 type linkReply struct {

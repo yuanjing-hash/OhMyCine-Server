@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"regexp"
 	"sort"
@@ -12,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	serverlog "github.com/yuanjing-hash/OhMyCine-Server/internal/logging"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/mediarecognition"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
 	"gorm.io/gorm"
@@ -45,7 +47,7 @@ func NewFollowSearchWorker(follows *FollowService, sites *SiteService) *FollowSe
 	return &FollowSearchWorker{follows: follows, sites: sites}
 }
 
-func (w *FollowSearchWorker) Run(ctx context.Context, runtime JobRuntime, job ClaimedJob) WorkerResult {
+func (w *FollowSearchWorker) Run(ctx context.Context, runtime JobRuntime, job ClaimedJob) (result WorkerResult) {
 	var payload followJobPayload
 	if err := json.Unmarshal([]byte(job.Job.PayloadJSON), &payload); err != nil || payload.RunID == "" || payload.SubscriptionID == "" {
 		return WorkerResult{ErrorCode: CodeInvalidRequest, ErrorMessage: "追更任务参数无效"}
@@ -61,6 +63,12 @@ func (w *FollowSearchWorker) Run(ctx context.Context, runtime JobRuntime, job Cl
 		return WorkerResult{ErrorCode: CodeFollowNotFound, ErrorMessage: "追更运行记录不存在"}
 	}
 	start := w.follows.now()
+	started := time.Now()
+	stats := &followBusinessStats{sites: map[uint]bool{}}
+	ctx = context.WithValue(ctx, followBusinessStatsKey{}, stats)
+	ctx = serverlog.WithBusinessFields(ctx, map[string]any{"job_id": job.Job.ID, "user_id": run.OwnerID, "follow_id": run.SubscriptionID, "follow_run_id": run.ID})
+	defer func() { w.recordRunEnd(ctx, runtime, run, started, stats, result) }()
+	w.record(ctx, "follow.start", "start", "started", "开始本轮追更，先检查当前权限、目标库与已播季集覆盖状态", map[string]any{"trigger": run.Trigger})
 	if err := w.follows.db.Model(&run).Updates(map[string]any{"status": models.FollowRunRunning, "started_at": start, "updated_at": start}).Error; err != nil {
 		return followPersistFailure()
 	}
@@ -83,6 +91,8 @@ func (w *FollowSearchWorker) Run(ctx context.Context, runtime JobRuntime, job Cl
 	if snapshot, _, err = w.follows.validateSnapshotWithRoutes(actor, subscription.TMDBID, snapshot, false); err != nil {
 		return w.block(run, subscription, ErrorCode(err), ErrorMessage(err))
 	}
+	ctx = serverlog.WithBusinessFields(ctx, map[string]any{"library_id": snapshot.MediaLibraryID})
+	w.record(ctx, "follow.plan", "coverage", "planned", fmt.Sprintf("追更作品：%s；配置 %d 个站点、%d 个季，单轮最多选择 %d 个资源；先核对缺集后再查询站点", serverlog.BusinessDisplayName(subscription.Title), len(snapshot.SiteIDs), len(snapshot.Seasons), snapshot.MaxResourcesPerRun), map[string]any{"title": subscription.Title, "planned_sites_count": len(snapshot.SiteIDs)})
 	coverage, err := w.follows.coverage.Coverage(ctx, actor, "tv", subscription.TMDBID)
 	if err != nil {
 		return w.block(run, subscription, ErrorCode(err), ErrorMessage(err))
@@ -126,11 +136,13 @@ func (w *FollowSearchWorker) Run(ctx context.Context, runtime JobRuntime, job Cl
 	if len(seenSeasons) != len(selectedSeasons) {
 		return w.block(run, subscription, "follow_coverage_unknown", "所选季的 TMDB 信息不可用")
 	}
-	missing, err = w.excludeClaimedDownloads(subscription.ID, missing)
+	missingBeforeClaims := len(missing)
+	missing, err = w.excludeClaimedDownloads(ctx, subscription.ID, missing)
 	if err != nil {
 		return followPersistFailure()
 	}
 	missingCoordinates := coordinateList(missing)
+	w.record(ctx, "follow.coverage", "coverage", "confirmed", fmt.Sprintf("覆盖检查：已播目标 %d 集，在库 %d 集，已有下载占用 %d 集，明确待补 %d 集，未知 %d 集；本轮待补：%s", target, present, missingBeforeClaims-len(missing), len(missing), unknown, followEpisodeDisplay(missingCoordinates)), map[string]any{"total_count": target, "present_count": present, "active_count": missingBeforeClaims - len(missing), "missing_count": len(missing), "uncertain_count": unknown})
 	if len(missingCoordinates) > 0 {
 		w.follows.publish("follow.missing_found", run.OwnerID, run.JobID, models.FollowRunRunning)
 	}
@@ -159,12 +171,24 @@ func (w *FollowSearchWorker) Run(ctx context.Context, runtime JobRuntime, job Cl
 	processed, total := int64(1), int64(4)
 	_ = runtime.Heartbeat(&progress, &processed, &total, nil, nil)
 	_ = runtime.Checkpoint(map[string]any{"stage": "search", "missing": missingCoordinates})
-	candidates, queryNames, filterSummary := w.searchCandidates(ctx, actor, subscription, snapshot, missing)
+	searchCtx, stopSearch := context.WithTimeoutCause(context.WithValue(ctx, followSearchBudgetKey{}, true), w.sites.searchPolicyValue().Follow, errors.New(CodeSearchBudget))
+	candidates, queryNames, filterSummary := w.searchCandidates(searchCtx, actor, subscription, snapshot, missing)
+	if searchCtx.Err() != nil && ctx.Err() == nil {
+		filterSummary["search_incomplete"]++
+	}
+	stopSearch()
 	if ctx.Err() != nil {
 		return w.stopRun(run, models.FollowRunCancelled, "follow_cancelled", "追更任务已取消")
 	}
 	selected := selectFollowCandidates(candidates, missing, snapshot.MaxResourcesPerRun)
+	stats.mu.Lock()
+	stats.chosen = len(selected)
+	stats.mu.Unlock()
+	w.record(ctx, "follow.selection", "selection", "confirmed", fmt.Sprintf("身份与订阅规则过滤后 %d 个可用候选，按缺集覆盖、站点顺序、质量偏好与做种等既有规则选中 %d 个资源", len(candidates), len(selected)), map[string]any{"candidates": len(candidates), "chosen": len(selected), "reason_counts": filterSummary})
 	if len(selected) == 0 {
+		if filterSummary["site_error"] > 0 || filterSummary["site_incomplete"] > 0 || filterSummary["search_incomplete"] > 0 {
+			return w.finish(run, subscription, models.FollowRunFailed, models.FollowStatusActive, "follow_search_incomplete", "本轮部分或全部站点搜索未完成，不能确定没有匹配资源", snapshot, queryNames, len(candidates), filterSummary)
+		}
 		return w.finish(run, subscription, models.FollowRunNoMatch, models.FollowStatusActive, "", "", snapshot, queryNames, len(candidates), filterSummary)
 	}
 	progress = 70
@@ -175,11 +199,13 @@ func (w *FollowSearchWorker) Run(ctx context.Context, runtime JobRuntime, job Cl
 	submitFailures := 0
 	lastSubmitMessage := ""
 	for _, candidate := range selected {
+		candidateCtx := serverlog.WithBusinessFields(ctx, map[string]any{"site_id": candidate.SiteID, "resource_name": candidate.Item.Title, "season": candidate.Season})
 		blocked, gateErr := followReadinessBlocked(w.follows.db, subscription.ID)
 		if gateErr != nil {
 			return WorkerResult{ErrorCode: CodeConflict, ErrorMessage: "无法确认目标媒体库是否准备好"}
 		}
 		if blocked {
+			w.record(candidateCtx, "follow.wait", "submit", "waiting", "目标媒体库尚未准备好，保留本轮进度，暂不提交资源", map[string]any{"error_code": "media_library_not_ready"})
 			next := time.Now().UTC()
 			return WorkerResult{RetryAt: &next, ErrorCode: "media_library_not_ready", ErrorMessage: "等待目标媒体库准备好，已保留追更进度"}
 		}
@@ -192,6 +218,7 @@ func (w *FollowSearchWorker) Run(ctx context.Context, runtime JobRuntime, job Cl
 		}
 		episodes := candidateMissingEpisodes(candidate, missing)
 		if len(episodes) == 0 {
+			w.record(candidateCtx, "follow.coverage_changed", "selection", "skipped", "该资源已不覆盖本轮剩余缺集，未提交下载", nil)
 			continue
 		}
 		libraryID := snapshot.MediaLibraryID
@@ -209,6 +236,7 @@ func (w *FollowSearchWorker) Run(ctx context.Context, runtime JobRuntime, job Cl
 			if routeErr != nil {
 				lastSubmitMessage = safeErrorMessage(routeErr, lastSubmitMessage)
 			}
+			w.record(candidateCtx, "follow.route_unavailable", "route", "failed", "资源未提交：没有可用的下载器与目标媒体库路线", map[string]any{"error_code": ErrorCode(routeErr)})
 			continue
 		}
 		previewToken := ""
@@ -226,6 +254,14 @@ func (w *FollowSearchWorker) Run(ctx context.Context, runtime JobRuntime, job Cl
 		}
 		claimed, err := w.reserveEpisodes(run, subscription.ID, candidate, episodes)
 		if err != nil || !claimed {
+			reason, outcome, message := "active_claim", "skipped", "所选季集已有任务占用，未重复提交该资源"
+			if err != nil {
+				reason, outcome, message = "reservation_failed", "failed", "无法保留本轮季集占用，未提交该资源"
+				stats.mu.Lock()
+				stats.reservationFailures++
+				stats.mu.Unlock()
+			}
+			w.record(candidateCtx, "follow.reservation", "reserve", outcome, message, map[string]any{"reason": reason, "episode_count": len(episodes)})
 			continue
 		}
 		season := candidate.Season
@@ -244,7 +280,16 @@ func (w *FollowSearchWorker) Run(ctx context.Context, runtime JobRuntime, job Cl
 		}
 		var download DownloadTaskSummary
 		for index, downloaderID := range downloaders {
-			download, err = w.sites.Download(ctx, actor, SiteDownloadInput{PreviewToken: previewToken, SelectedEntryTokens: selectedEntryTokens, ResultToken: candidate.Item.Token, DownloaderID: downloaderID, MediaLibraryID: &libraryID, Priority: snapshot.DownloadPriority, FollowSubscriptionID: subscription.ID, FollowResourceFingerprint: candidate.Fingerprint, Season: &season, Episode: singleEpisode, BeforeSubmit: func() error {
+			downloaderName, libraryName, routeLabel := "所选下载器", "所选媒体库", "已校验路线"
+			for _, choice := range recommendation.Choices {
+				if choice.DownloaderID == downloaderID && choice.MediaLibraryID == libraryID {
+					downloaderName, libraryName, routeLabel = choice.DownloaderName, choice.LibraryName, choice.RouteLabel
+					break
+				}
+			}
+			submitCtx := serverlog.WithBusinessFields(candidateCtx, map[string]any{"downloader_id": downloaderID, "downloader_name": downloaderName, "library_name": libraryName})
+			w.record(submitCtx, "follow.route", "route", "planned", fmt.Sprintf("选择资源 %s，下载器：%s，目标媒体库：%s；%s，覆盖本轮 %d 集", serverlog.BusinessDisplayName(candidate.Item.Title), serverlog.BusinessDisplayName(downloaderName), serverlog.BusinessDisplayName(libraryName), serverlog.BusinessDisplayName(routeLabel), len(episodes)), map[string]any{"episode_count": len(episodes)})
+			download, err = w.sites.Download(submitCtx, actor, SiteDownloadInput{PreviewToken: previewToken, SelectedEntryTokens: selectedEntryTokens, ResultToken: candidate.Item.Token, DownloaderID: downloaderID, MediaLibraryID: &libraryID, Priority: snapshot.DownloadPriority, FollowSubscriptionID: subscription.ID, FollowResourceFingerprint: candidate.Fingerprint, Season: &season, Episode: singleEpisode, BeforeSubmit: func() error {
 				current, currentErr := w.currentSubscription(subscription.ID)
 				if currentErr != nil || !followRunExecutable(current, run.LifecycleRevision) {
 					return appError(CodeConflict, "订阅已暂停或删除", currentErr)
@@ -260,6 +305,7 @@ func (w *FollowSearchWorker) Run(ctx context.Context, runtime JobRuntime, job Cl
 			if err == nil || index+1 == len(downloaders) || !isDefinitiveNoTaskRouteError(ErrorCode(err)) {
 				break
 			}
+			w.record(submitCtx, "follow.route_fallback", "submit", "retry", "公开 BT 资源被明确拒绝且未创建任务，按已有规则尝试下一兼容下载器", map[string]any{"error_code": ErrorCode(err)})
 		}
 		if err != nil {
 			w.releaseEpisodes(subscription.ID, run.ID, candidate.Fingerprint)
@@ -273,6 +319,7 @@ func (w *FollowSearchWorker) Run(ctx context.Context, runtime JobRuntime, job Cl
 			filterSummary["submit_failed"]++
 			submitFailures++
 			lastSubmitMessage = safeErrorMessage(err, "资源提交失败")
+			w.record(candidateCtx, "follow.submit_failed", "submit", "failed", "资源未能提交；本条失败不会阻塞其他独立资源，未对不确定结果自动更换下载器", map[string]any{"error_code": ErrorCode(err)})
 			continue
 		}
 		if err := w.attachDownload(subscription.ID, run.ID, candidate.Fingerprint, download.ID); err != nil {
@@ -280,6 +327,7 @@ func (w *FollowSearchWorker) Run(ctx context.Context, runtime JobRuntime, job Cl
 		}
 		w.follows.publish("follow.download_submitted", run.OwnerID, run.JobID, models.FollowRunSubmitted)
 		submitted++
+		w.record(candidateCtx, "follow.submitted", "submit", "accepted", "下载请求已接受，后续下载与入库请查看关联任务；本轮未提前确认入库完成", map[string]any{"related_task_id": download.ID, "related_job_id": download.JobID, "action": download.submissionOutcome})
 	}
 	if submitted == 0 {
 		if submitFailures > 0 {
@@ -287,9 +335,6 @@ func (w *FollowSearchWorker) Run(ctx context.Context, runtime JobRuntime, job Cl
 		}
 		return w.finish(run, subscription, models.FollowRunNoMatch, models.FollowStatusActive, "", "", snapshot, queryNames, len(candidates), filterSummary)
 	}
-	progress = 100
-	processed = 4
-	_ = runtime.Heartbeat(&progress, &processed, &total, nil, nil)
 	if submitFailures > 0 {
 		return w.finish(run, subscription, models.FollowRunSubmitted, models.FollowStatusActive, "follow_submit_partial", lastSubmitMessage, snapshot, queryNames, len(candidates), filterSummary, submitted)
 	}
@@ -312,6 +357,10 @@ func (w *FollowSearchWorker) searchCandidates(ctx context.Context, actor Actor, 
 	seen := map[string]struct{}{}
 	for sitePriority, siteID := range snapshot.SiteIDs {
 		for _, season := range snapshot.Seasons {
+			if ctx.Err() != nil {
+				summary["search_incomplete"]++
+				return result, queryNames, summary
+			}
 			hasMissing := false
 			for key := range missing {
 				if key[0] == season {
@@ -322,15 +371,22 @@ func (w *FollowSearchWorker) searchCandidates(ctx context.Context, actor Actor, 
 			if !hasMissing {
 				continue
 			}
-			grouped, err := w.sites.SearchMediaIdentity(ctx, actor, MediaIdentitySearchInput{MediaType: "tv", TMDBID: subscription.TMDBID, Season: &season, Page: 1, SiteID: &siteID, ClientCapabilities: []string{MixedDiscoveryCapability}, Refresh: true})
+			searchCtx := serverlog.WithBusinessFields(ctx, map[string]any{"site_id": siteID, "season": season})
+			grouped, err := w.sites.SearchMediaIdentity(searchCtx, actor, MediaIdentitySearchInput{MediaType: "tv", TMDBID: subscription.TMDBID, Season: &season, Page: 1, SiteID: &siteID, ClientCapabilities: []string{MixedDiscoveryCapability}, Refresh: true})
 			if err != nil {
 				summary["site_error"]++
+				w.record(searchCtx, "follow.search_preflight_failed", "search", "failed", "该站搜索未能完成预检或执行，不把它计为零结果", map[string]any{"error_code": ErrorCode(err)})
 				continue
 			}
 			if queryNames == 0 {
 				queryNames = len(grouped.QueryNames)
 			}
 			for _, group := range grouped.Groups {
+				groupCtx := serverlog.WithBusinessFields(searchCtx, map[string]any{"site_name": group.SiteName})
+				rejections := newFollowRejections()
+				if group.Partial {
+					summary["site_incomplete"]++
+				}
 				if group.ErrorCount > 0 {
 					summary["site_error"] += group.ErrorCount
 				}
@@ -344,6 +400,7 @@ func (w *FollowSearchWorker) searchCandidates(ctx context.Context, actor Actor, 
 					candidate, reason, ok := buildFollowCandidate(item, group.SiteID, sitePriority, season, snapshot)
 					if !ok {
 						summary[reason]++
+						rejections.add(reason, item.Title)
 						continue
 					}
 					candidateKey := candidate.Fingerprint
@@ -352,6 +409,7 @@ func (w *FollowSearchWorker) searchCandidates(ctx context.Context, actor Actor, 
 					}
 					if _, duplicate := seen[candidateKey]; duplicate {
 						summary["duplicate"]++
+						rejections.add("duplicate", item.Title)
 						continue
 					}
 					seen[candidateKey] = struct{}{}
@@ -364,10 +422,12 @@ func (w *FollowSearchWorker) searchCandidates(ctx context.Context, actor Actor, 
 					}
 					if !covers {
 						summary["no_missing_coverage"]++
+						rejections.add("no_missing_coverage", item.Title)
 						continue
 					}
 					result = append(result, candidate)
 				}
+				rejections.record(groupCtx, w.record)
 			}
 		}
 	}
@@ -557,7 +617,7 @@ func (w *FollowSearchWorker) upsertImported(subscriptionID string, season, episo
 	return w.follows.db.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "subscription_id"}, {Name: "season_number"}, {Name: "episode_number"}}, DoUpdates: clause.Assignments(map[string]any{"state": "imported", "updated_at": now})}).Create(&models.FollowEpisodeClaim{SubscriptionID: subscriptionID, SeasonNumber: season, EpisodeNumber: episode, State: "imported", UpdatedAt: now}).Error
 }
 
-func (w *FollowSearchWorker) excludeClaimedDownloads(subscriptionID string, missing map[[2]int]struct{}) (map[[2]int]struct{}, error) {
+func (w *FollowSearchWorker) excludeClaimedDownloads(ctx context.Context, subscriptionID string, missing map[[2]int]struct{}) (map[[2]int]struct{}, error) {
 	var claims []models.FollowEpisodeClaim
 	if err := w.follows.db.Where("subscription_id = ? AND download_task_id IS NOT NULL", subscriptionID).Find(&claims).Error; err != nil {
 		return nil, err
@@ -571,6 +631,13 @@ func (w *FollowSearchWorker) excludeClaimedDownloads(subscriptionID string, miss
 			continue
 		}
 		if task.Phase != models.DownloadTaskStatusFailed && task.Phase != models.DownloadTaskStatusCancelled {
+			if _, needed := missing[[2]int{claim.SeasonNumber, claim.EpisodeNumber}]; needed {
+				fields := map[string]any{"related_task_id": task.ID, "related_job_id": task.JobID, "season": claim.SeasonNumber}
+				if task.DownloaderID != nil {
+					fields["downloader_id"] = *task.DownloaderID
+				}
+				w.record(ctx, "follow.active_claim", "coverage", "skipped", fmt.Sprintf("S%02dE%02d 已由原下载任务占用，本轮不重复下载", claim.SeasonNumber, claim.EpisodeNumber), fields)
+			}
 			delete(missing, [2]int{claim.SeasonNumber, claim.EpisodeNumber})
 		} else {
 			if err := w.follows.db.Model(&claim).Updates(map[string]any{"state": "failed", "download_task_id": nil, "updated_at": w.follows.now()}).Error; err != nil {
@@ -628,6 +695,9 @@ func (w *FollowSearchWorker) finish(run models.FollowRun, subscription models.Fo
 	eventType := map[string]string{models.FollowRunNoMatch: "follow.no_match", models.FollowRunCompleted: "follow.completed", models.FollowRunFailed: "follow.blocked"}[runStatus]
 	if runStatus == models.FollowRunFailed && subscriptionStatus == models.FollowStatusActive {
 		eventType = "follow.submit_failed"
+		if code == "follow_search_incomplete" {
+			eventType = "follow.search_failed"
+		}
 	}
 	if eventType != "" {
 		w.follows.publish(eventType, run.OwnerID, run.JobID, runStatus)

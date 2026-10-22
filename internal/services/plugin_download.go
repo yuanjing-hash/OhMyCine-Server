@@ -176,12 +176,16 @@ func (e *PluginDownloadExecutor) activePluginVersion(pluginID string) (string, e
 }
 
 func (e *PluginDownloadExecutor) hasActivePermission(pluginID string, kind contract.PermissionKind) bool {
+	return pluginHasActivePermission(e.downloads.db, pluginID, kind)
+}
+
+func pluginHasActivePermission(db *gorm.DB, pluginID string, kind contract.PermissionKind) bool {
 	var installation models.PluginInstallation
-	if e.downloads.db.Select("active_package_id", "status").First(&installation, "plugin_id = ?", pluginID).Error != nil || installation.Status != models.PluginInstallationEnabled {
+	if db.Select("active_package_id", "status").First(&installation, "plugin_id = ?", pluginID).Error != nil || installation.Status != models.PluginInstallationEnabled {
 		return false
 	}
 	var grants []models.PluginPermissionGrant
-	if e.downloads.db.Where("plugin_id = ? AND plugin_package_id = ?", pluginID, installation.ActivePackageID).Find(&grants).Error != nil {
+	if db.Where("plugin_id = ? AND plugin_package_id = ?", pluginID, installation.ActivePackageID).Find(&grants).Error != nil {
 		return false
 	}
 	for _, grant := range grants {

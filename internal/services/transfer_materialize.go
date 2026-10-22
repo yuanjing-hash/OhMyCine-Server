@@ -72,6 +72,8 @@ func (w *TransferWorker) materializePan115Source(ctx context.Context, runtime Jo
 	if err := requireMaterializationSpace(managedRoot, remaining, manifestTotalBytes(manifest)); err != nil {
 		return task, "", err
 	}
+	ctx = withFileDisplayNames(ctx, sourceStorage.Name, "Server 受控暂存区")
+	w.transferEvent(ctx, task, "transfer.materialize.start", "materialize", "started", "开始跨数据源读取已确认的下载包，先保存到受控暂存区；这一阶段不代表媒体已入库", map[string]any{"total_count": len(manifest.Files)})
 
 	for _, file := range manifest.Files {
 		if err := ctx.Err(); err != nil {
@@ -105,8 +107,12 @@ func (w *TransferWorker) materializePan115Source(ctx context.Context, runtime Jo
 			return task, "", cloudTransferError("transfer_state_persist_failed", true, err)
 		}
 		if err := materializeProviderFile(ctx, runtime, reader, file, managedRoot, destination); err != nil {
+			display := relativeFileDisplay(file.RelativePath, file.RelativePath, file.Size)
+			w.transferEvent(ctx, task, "transfer.materialize.file_failed", "materialize", "failed", "跨数据源文件读取或校验未完成，不作为入库成功："+display.description(), display.fields())
 			return task, "", err
 		}
+		display := relativeFileDisplay(file.RelativePath, file.RelativePath, file.Size)
+		w.transferEvent(ctx, task, "transfer.materialize.file", "materialize", "confirmed", "文件已接收到受控暂存并通过既有内容校验，后续整理仍待执行："+display.description(), display.fields())
 		state.Materialized[key] = materializedItemState{RelativePath: key, Size: file.Size, SHA1: file.SHA1, Status: "completed"}
 		if err := w.persistCloudState(&task, state, models.TransferTaskStatusTransferring, completedMaterializedItems(state), nil); err != nil {
 			return task, "", cloudTransferError("transfer_state_persist_failed", true, err)
@@ -117,6 +123,7 @@ func (w *TransferWorker) materializePan115Source(ctx context.Context, runtime Jo
 			return task, "", cloudTransferError(CodeQueueLeaseInvalid, true, err)
 		}
 	}
+	w.transferEvent(ctx, task, "transfer.materialize.finish", "materialize", "finished", "跨数据源接收阶段已完成，继续按原入库路线整理；未将暂存副本记为最终媒体库文件", map[string]any{"total_count": len(manifest.Files)})
 	return task, managedRoot, nil
 }
 

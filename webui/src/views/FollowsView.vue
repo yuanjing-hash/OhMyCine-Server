@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onBeforeUnmount, ref, watch } from 'vue'
+import { nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api, APIError } from '@/api/client'
 import { createLatestRequest } from '@/latest-request'
@@ -7,6 +7,8 @@ import { useJobLiveRefresh } from '@/use-job-live-refresh'
 import { Permissions } from '@/auth/generated-permissions'
 import FollowEditorDialog from '@/components/FollowEditorDialog.vue'
 import ClearHistoryButton from '@/components/ClearHistoryButton.vue'
+import ExecutionLogsPanel from '@/components/ExecutionLogsPanel.vue'
+import { filterReasonRows, type ExecutionSummary } from '@/execution-logs'
 import { deleteFollow, followAction, followPath, followRunStatusLabel, followStatusLabel, type FollowPage, type FollowRunSummary, type FollowSummary } from '@/follows'
 import { useAuthStore } from '@/stores/auth'
 import { notify } from '@/toast'
@@ -18,6 +20,8 @@ const route = useRoute(), router = useRouter()
 const page = ref(1), total = ref(0), pageSize = 100
 const listRequest = createLatestRequest(), runRequest = createLatestRequest()
 const runLoading = ref(false), runError = ref('')
+const selectedRun = ref<{ followId: string; title: string; run: FollowRunSummary } | null>(null)
+let runTrigger: HTMLElement | null = null
 let alive = true
 async function load(quiet = false) {
   const request = listRequest.begin()
@@ -31,10 +35,11 @@ async function load(quiet = false) {
     items.value = result.list
     total.value = result.total
     if (expanded.value && !result.list.some(item => item.id === expanded.value)) closeRuns()
+    if (selectedRun.value && !result.list.some(item => item.id === selectedRun.value!.followId)) closeRunLog()
   } catch (reason) {
     if (!request.isCurrent()) return
     error.value = reason instanceof Error ? reason.message : '订阅加载失败'
-    if (reason instanceof APIError && [401, 403].includes(reason.status)) { items.value = []; closeRuns(); runs.value = {}; editing.value = null }
+    if (reason instanceof APIError && [401, 403].includes(reason.status)) { items.value = []; closeRuns(); closeRunLog(); runs.value = {}; editing.value = null }
   } finally {
     if (request.isCurrent()) loading.value = false
     request.finish()
@@ -47,11 +52,14 @@ async function loadRuns(id: string, quiet = false) {
   if (!quiet) runLoading.value = true
   try {
     const result = await api<{ list: FollowRunSummary[] }>(`${followPath(id)}/runs`, { signal: request.signal })
-    if (request.isCurrent()) runs.value = { [id]: result.list }
+    if (request.isCurrent()) {
+      runs.value = { [id]: result.list }
+      if (selectedRun.value?.followId === id) { const latest = result.list.find(run => run.id === selectedRun.value!.run.id); if (latest) selectedRun.value = { ...selectedRun.value, run: latest } }
+    }
   } catch (reason) {
     if (!request.isCurrent()) return
     runError.value = reason instanceof Error ? reason.message : '运行记录读取失败'
-    if (reason instanceof APIError && [401, 403, 404].includes(reason.status)) runs.value = {}
+    if (reason instanceof APIError && [401, 403, 404].includes(reason.status)) { runs.value = {}; if (selectedRun.value?.followId === id) closeRunLog() }
   } finally {
     if (request.isCurrent()) runLoading.value = false
     request.finish()
@@ -86,7 +94,7 @@ watch(() => route.fullPath, () => {
   closeRuns()
   void load()
 }, { immediate: true })
-useJobLiveRefresh(async () => { if (!listRequest.pending && !runRequest.pending && !busy.value) await refresh() })
+useJobLiveRefresh(async () => { if (!listRequest.pending && !runRequest.pending && !busy.value) await refresh() }, () => !!auth.user, () => auth.canAny([Permissions.JobsReadOwn, Permissions.JobsReadAll]))
 async function action(item: FollowSummary, name: 'pause' | 'resume' | 'search') { busy.value = `${item.id}:${name}`; try { await followAction(item.id, name); if (!alive) return; notify(name === 'search' ? '已排队立即搜索。' : name === 'pause' ? '订阅已暂停；已提交下载不会被取消。' : '订阅已恢复。', 'success'); await refresh() } catch (reason) { if (alive) notify(reason instanceof Error ? reason.message : '操作失败', 'error') } finally { if (alive) busy.value = '' } }
 async function remove(item: FollowSummary) { if (!window.confirm(`删除《${item.title}》订阅？已提交下载和媒体文件不会被删除。`)) return; busy.value = `${item.id}:delete`; try { await deleteFollow(item.id); if (!alive) return; notify('订阅配置已删除，现有下载和媒体保持不变。', 'success'); await refresh() } catch (reason) { if (alive) notify(reason instanceof Error ? reason.message : '删除失败', 'error') } finally { if (alive) busy.value = '' } }
 function saved() { editing.value = null; notify('订阅策略新 revision 已保存，将从下一次运行生效。', 'success'); void refresh() }
@@ -96,7 +104,27 @@ function canUpdate(item: FollowSummary) { return auth.can(Permissions.FollowsUpd
 function canDelete(item: FollowSummary) { return auth.can(Permissions.FollowsDeleteAll) || (owns(item) && auth.can(Permissions.FollowsDeleteOwn)) }
 function canExecute(item: FollowSummary) { return auth.can(Permissions.FollowsExecuteAll) || (owns(item) && auth.can(Permissions.FollowsExecuteOwn)) }
 function canReadJob(item: FollowSummary) { return auth.can(Permissions.JobsReadAll) || (owns(item) && auth.can(Permissions.JobsReadOwn)) }
-onBeforeUnmount(() => { alive = false; listRequest.cancel(); runRequest.cancel() })
+function summaryForRun(run: FollowRunSummary, title: string): ExecutionSummary { return { title, status: run.status, trigger: run.trigger, searched_names_count: run.searched_names_count, candidates: run.candidates, accepted_submissions: run.selected, filter_summary: run.filter_summary, error_code: run.error_code, error_message: run.error_message, started_at: run.started_at, finished_at: run.finished_at } }
+function openRunLog(item: FollowSummary, run: FollowRunSummary) {
+  runTrigger = document.activeElement instanceof HTMLElement ? document.activeElement : null
+  selectedRun.value = { followId: item.id, title: item.title, run }
+  void nextTick(() => document.querySelector<HTMLElement>('.follow-run-drawer .icon-button')?.focus())
+}
+function closeRunLog() { selectedRun.value = null; void nextTick(() => { if (alive) runTrigger?.focus() }) }
+function handleRunKeys(event: KeyboardEvent) {
+  if (!selectedRun.value) return
+  if (event.key === 'Escape') { closeRunLog(); return }
+  if (event.key !== 'Tab') return
+  const drawer = document.querySelector<HTMLElement>('.follow-run-drawer')
+  const controls = Array.from(drawer?.querySelectorAll<HTMLElement>('button:not(:disabled), a[href], input:not(:disabled), select:not(:disabled), summary, [tabindex="0"]') ?? []).filter(element => element.getClientRects().length > 0)
+  const first = controls[0], last = controls[controls.length - 1]
+  if (!first || !last) return
+  if (!drawer?.contains(document.activeElement) || (!event.shiftKey && document.activeElement === last)) { event.preventDefault(); first.focus() }
+  else if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus() }
+}
+watch(() => `${auth.user?.id ?? ''}:${auth.user?.permissions?.join(',') ?? ''}`, (current, previous) => { if (current !== previous) { listRequest.cancel(); closeRuns(); selectedRun.value = null; items.value = []; runs.value = {}; editing.value = null; if (auth.user && auth.canAny([Permissions.FollowsReadOwn, Permissions.FollowsReadAll])) void load() } })
+onMounted(() => window.addEventListener('keydown', handleRunKeys))
+onBeforeUnmount(() => { alive = false; listRequest.cancel(); runRequest.cancel(); window.removeEventListener('keydown', handleRunKeys) })
 </script>
 
 <template>
@@ -114,13 +142,19 @@ onBeforeUnmount(() => { alive = false; listRequest.cancel(); runRequest.cancel()
         <div v-if="!runLoading && !runError && !runs[item.id]?.length" class="mt-3 text-sm text-muted">暂无运行记录。</div>
         <div v-if="!runLoading" class="mt-3 space-y-2">
           <div v-for="run in runs[item.id]" :key="run.id" class="semantic-inset flex flex-wrap items-center justify-between gap-3 p-3">
-            <div><strong>{{ followRunStatusLabel(run.status) }}</strong><p class="mb-0 mt-1 text-xs text-muted">revision {{ run.subscription_revision }} · 查询名 {{ run.searched_names_count }} · 候选 {{ run.candidates }} · 提交 {{ run.selected }} · {{ formatTime(run.created_at) }}</p><p v-if="run.error_message" class="semantic-danger-text mb-0 mt-1 text-xs">{{ run.error_message }}</p></div>
-            <RouterLink v-if="canReadJob(item)" class="semantic-link text-sm" :to="`/automation/tasks?job_type=follow-search&job_id=${encodeURIComponent(run.job_id)}`">查看任务</RouterLink>
+            <div class="min-w-0"><strong>{{ run.error_code === 'follow_submit_partial' ? '部分下载已提交，其余提交失败' : followRunStatusLabel(run.status) }}</strong><p class="mb-0 mt-1 text-xs text-muted">revision {{ run.subscription_revision }} · 查询名称数 {{ run.searched_names_count }} · 筛选后候选 {{ run.candidates }} · 已接受提交 {{ run.selected }} · {{ formatTime(run.created_at) }}</p><p class="mb-0 mt-1 text-xs text-muted">提交可能包含复用的任务，不代表媒体已入库。</p><ul v-if="filterReasonRows(run.filter_summary).length" class="run-reasons"><li v-for="reason in filterReasonRows(run.filter_summary)" :key="reason.code">{{ reason.label }} {{ reason.count }}</li></ul><p v-if="run.error_message" class="semantic-danger-text mb-0 mt-1 text-xs">{{ run.error_message }}</p></div>
+            <div class="flex flex-wrap items-center gap-3"><button class="btn-secondary" @click="openRunLog(item, run)">查看本轮过程</button><RouterLink v-if="canReadJob(item)" class="semantic-link text-sm" :to="`/automation/tasks?job_type=follow-search&job_id=${encodeURIComponent(run.job_id)}`">查看队列任务</RouterLink></div>
           </div>
         </div>
       </div>
     </article>
     <FollowEditorDialog v-if="editing" :tmdb-id="editing.tmdb_id" :title="editing.title" :year="editing.year" :poster-ref="editing.poster_ref" :follow="editing" @close="editing = null" @saved="saved" />
+    <div v-if="selectedRun" class="task-drawer-backdrop" @click.self="closeRunLog">
+      <aside class="task-drawer follow-run-drawer" role="dialog" aria-modal="true" :aria-label="`${selectedRun.title} 本轮执行过程`">
+        <header><div><small class="text-muted">自动追更 · 单轮记录</small><h2>{{ selectedRun.title }}</h2></div><button class="icon-button" aria-label="关闭本轮过程" @click="closeRunLog">×</button></header>
+        <div class="p-4"><ExecutionLogsPanel :key="`${selectedRun.followId}:${selectedRun.run.id}`" :scope="{ kind: 'follow', followId: selectedRun.followId, runId: selectedRun.run.id }" :active="['queued', 'running'].includes(selectedRun.run.status)" :fallback-summary="summaryForRun(selectedRun.run, selectedRun.title)" /></div>
+      </aside>
+    </div>
     <footer v-if="!loading && (total || page > 1)" class="flex items-center gap-3 text-sm text-muted">
       <span>共 {{ total }} 条 · 第 {{ page }} 页</span>
       <button class="btn-secondary" :disabled="page <= 1" @click="changePage(page - 1)">上一页</button>
@@ -132,4 +166,5 @@ onBeforeUnmount(() => { alive = false; listRequest.cancel(); runRequest.cancel()
 <style scoped>
 .detail-poster-mini { display: grid; aspect-ratio: 2 / 3; place-items: center; overflow: hidden; border: 1px solid var(--border); border-radius: var(--radius-md); background: var(--surface-muted); color: var(--text-subtle); font-size: .7rem; }
 .detail-poster-mini img { width: 100%; height: 100%; object-fit: cover; }
+.run-reasons{display:flex;flex-wrap:wrap;gap:.3rem .8rem;list-style:none;margin:.5rem 0 0;padding:0;font-size:.75rem;color:var(--text-muted)}
 </style>

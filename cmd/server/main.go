@@ -200,6 +200,7 @@ func main() {
 	storages.SetMediaChangeService(mediaChanges)
 	connections.SetMediaChangeService(mediaChanges)
 	mediaServerRefresh := services.NewMediaServerRefreshService(db, queue, audit, connections)
+	mediaServerRefresh.SetLogger(logManager.Logger("media-server", "refresh"))
 	mediaChanges.SetReadyHandler(mediaServerRefresh.EnqueueLibrary)
 	libraries.SetMediaChangeService(mediaChanges)
 	artifacts := services.NewMediaArtifactService(db, queue, signedProxy, logManager.Logger("media_artifact", "worker"))
@@ -262,6 +263,8 @@ func main() {
 	sites.SetAIRecognitionSettings(aiRecognitionSettings)
 	follows := services.NewFollowService(db, audit, queue, mediaCoverage, authorization)
 	follows.SetDownloadService(downloads)
+	follows.SetLogger(logManager.Logger("follow", "worker"))
+	runtimeLogs.SetExecutionServices(queue, follows)
 	cookieCloud := services.NewCookieCloudService(db, audit, credentialStore, sites, logManager.Logger("site", "cookiecloud"))
 	unifiedSchedules := services.NewUnifiedScheduleService(db, queue, authorization, libraries, libraryStructure, strmManagement, follows, cookieCloud, logManager.Logger("scheduler", "unified"))
 	unifiedSchedules.SetRecycleCleanup(recycleCleanup)
@@ -285,7 +288,8 @@ func main() {
 	pluginHost.SetCapabilityHost(pluginHostAPI)
 	browserManager := browsercompanion.New()
 	defer browserManager.Close()
-	pluginRepositories := services.NewPluginRepositoryService(db, audit, pluginrepository.NewGitHubClient(nil), logManager.Logger("plugin", "repository"), services.WithPluginRoot(cfg.PluginDirectory), services.WithPluginRuntimeHost(pluginHost), services.WithPluginArtworkGateway(pluginHostAPI), services.WithPluginCredentialStore(credentialStore), services.WithPluginBrowser(browserManager))
+	pluginRepositories := services.NewPluginRepositoryService(db, audit, pluginrepository.NewGitHubClient(nil), logManager.Logger("plugin", "repository"), services.WithPluginRoot(cfg.PluginDirectory), services.WithPluginRuntimeHost(pluginHost), services.WithPluginArtworkGateway(pluginHostAPI), services.WithPluginOfflineGateway(pluginHostAPI), services.WithPluginCredentialStore(credentialStore), services.WithPluginBrowser(browserManager))
+	playerHistory.SetPluginService(pluginRepositories)
 	pluginHostAPI.SetBrowserRequest(pluginRepositories.BrowserRequest)
 	pluginHostAPI.SetBrowserCommit(pluginRepositories.BrowserCredentialCommitted)
 	browserContext, stopBrowserMonitor := context.WithCancel(context.Background())
@@ -304,11 +308,13 @@ func main() {
 	if err := pluginRepositories.RestorePlugins(context.Background()); err != nil {
 		logging.OperationPluginRuntime.Event(log.Fatal()).Str("error_code", services.ErrorCode(err)).Msg(logging.OperationPluginRuntime.Message("插件运行时恢复失败"))
 	}
+	pluginRepositories.StartOnlineCatalogue(context.Background())
 	if err := libraryArtwork.Start(context.Background()); err != nil {
 		logging.OperationServerLifecycle.Event(log.Fatal()).Err(err).Str("error_code", "library_artwork_start_failed").Msg(logging.OperationServerLifecycle.Message("媒体库分类封面服务启动失败"))
 	}
 	defer libraryArtwork.Close()
 	defer func() {
+		pluginRepositories.CloseOnlineCatalogue()
 		if err := pluginRepositories.ClosePlugins(context.Background()); err != nil {
 			logging.OperationPluginRuntime.Event(log.Error()).Str("error_code", services.ErrorCode(err)).Msg(logging.OperationPluginRuntime.Message("插件运行时关闭失败"))
 		}

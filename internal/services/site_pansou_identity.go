@@ -44,6 +44,7 @@ func (s *SiteService) searchPanSouIdentitySite(ctx context.Context, actor Actor,
 	keyInput.Page = 0
 	keyInput.SnapshotID = ""
 	keyInput.Refresh = false
+	keyInput.ProgressVersion = 0 // Transport progress does not change result identity.
 	config, configErr := s.config(record)
 	if configErr != nil {
 		failure.ErrorCode = CodeSiteCredentialInvalid

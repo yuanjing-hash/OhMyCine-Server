@@ -164,7 +164,6 @@ describe('PT discovery contracts', () => {
     expect(sitesView).not.toContain('选择 Nyaa 等内建公开索引')
     expect(exploreView).toContain('lockedSiteID')
     expect(exploreView).toContain('当前处于单站搜索模式')
-    expect(exploreView).toContain('void searchJSON(lockedSiteID.value, 1, true)')
 		expect(sitesView).toContain("site.site_type === 'bt_resource'")
 		expect(sitesView).toContain('前往插件连接管理')
 		expect(sitesView).toContain('<template v-else>')

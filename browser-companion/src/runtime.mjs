@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { Fault, requireThat, originURL } from './policy.mjs';
 import { openBrowser } from './browser.mjs';
 import { validateCookies } from './cookies.mjs';
+import { STARTUP_CODES } from './startup.mjs';
 
 export const SESSION_TTL = 30 * 60_000;
 export function supportedPlatform(platform = process.platform, arch = process.arch) {
@@ -100,9 +101,10 @@ export class Runtime {
         const origin = originURL(input.origin);
         const cookies = validateCookies(input.cookies ?? [], origin);
         let browser;
-        try { browser = await this.opener(this.executablePath, origin, { cookies }); }
+        try { browser = await this.opener(this.executablePath, origin, { cookies, signal }); }
         catch (error) {
-          const codes = ['browser_launch_failed', 'browser_navigation_failed', 'network_denied', 'network_timeout'];
+          if (this.stopping || signal?.aborted) throw new Fault(this.stopping ? 'browser_stopping' : 'request_cancelled', 503);
+          const codes = [...STARTUP_CODES, 'browser_navigation_failed', 'network_denied', 'network_timeout'];
           this.runtimeError = error instanceof Fault && codes.includes(error.code) ? error.code : 'browser_launch_failed';
           this.state = 'launch_failed';
           throw new Fault(this.runtimeError, 503);
@@ -119,18 +121,49 @@ export class Runtime {
       const session = this.session;
       requireThat(session && input.sessionId === session.id && input.identity === session.identity,
         'session_unavailable', 404);
+      if (session.browser.alive?.() === false) {
+        this.session = null;
+        await session.browser.close();
+        throw new Fault('session_unavailable', 404);
+      }
       switch (route) {
         case '/v1/session/snapshot': return await session.browser.snapshot();
         case '/v1/session/reload': return await session.browser.reload();
         case '/v1/session/input': return await session.browser.input(input);
         case '/v1/session/navigate': return await session.browser.navigate(input);
-        case '/v1/session/request': return await session.browser.request(input);
+        case '/v1/session/request': return await this.request(session, input, signal);
         case '/v1/session/cookies': return { cookies: await session.browser.cookies() };
         case '/v1/session/close':
           this.session = null; await session.browser.close(); return {};
         default: throw new Fault('not_found', 404);
       }
     } finally { this.busy = false; }
+  }
+  async request(session, input, signal) {
+    let abort, closing;
+    const release = () => {
+      if (this.session === session) this.session = null;
+      return closing ??= Promise.resolve().then(() => session.browser.close());
+    };
+    const cancelled = new Promise((_, reject) => {
+      abort = () => {
+        release().catch(() => {});
+        reject(new Fault('request_cancelled', 503));
+      };
+      signal?.addEventListener('abort', abort, { once: true });
+      if (signal?.aborted) abort();
+    });
+    try {
+      const pending = Promise.resolve().then(() => {
+        requireThat(!signal?.aborted, 'request_cancelled', 503);
+        return session.browser.request(input);
+      });
+      return await Promise.race([pending, cancelled]);
+    } catch (error) {
+      if (signal?.aborted || error?.code === 'browser_request_timeout' || session.browser.alive?.() === false)
+        await release().catch(() => {});
+      throw error;
+    } finally { signal?.removeEventListener('abort', abort); }
   }
   async close() {
     this.stopping = true;

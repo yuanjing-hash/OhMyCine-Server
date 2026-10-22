@@ -3,6 +3,7 @@ package services
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 
@@ -72,7 +73,7 @@ func (m *ProviderEventMonitor) Start(ctx context.Context) error {
 		m.mu.Unlock()
 		return err
 	}
-	serverlog.OperationProviderLifeEvent.Event(m.log.Info()).Msg(serverlog.OperationProviderLifeEvent.Message("监听器已启动"))
+	serverlog.RecordBusiness(ctx, m.log, serverlog.OperationProviderLifeEvent, serverlog.BusinessEvent{Code: "provider.listener.start", Stage: "listen", Outcome: "started", Message: "115 生活事件监听器已启动，将按已配置连接拉取并分发新增事件"})
 	m.wg.Add(1)
 	go m.runCoordinator()
 	return nil
@@ -93,7 +94,7 @@ func (m *ProviderEventMonitor) Close() {
 	}
 	m.mu.Unlock()
 	m.wg.Wait()
-	serverlog.OperationProviderLifeEvent.Event(m.log.Info()).Msg(serverlog.OperationProviderLifeEvent.Message("监听器已停止"))
+	serverlog.RecordBusiness(context.Background(), m.log, serverlog.OperationProviderLifeEvent, serverlog.BusinessEvent{Code: "provider.listener.stop", Stage: "listen", Outcome: "finished", Message: "115 生活事件监听器已停止，现有事件及任务状态保留"})
 }
 
 func (m *ProviderEventMonitor) runCoordinator() {
@@ -165,13 +166,16 @@ func (m *ProviderEventMonitor) poll(ctx context.Context, connectionID uint) {
 	started := time.Now()
 	inserted, processed := 0, 0
 	errorCode := ""
-	_, driver, err := m.connections.driver(connectionID)
+	record, driver, err := m.connections.driver(connectionID)
+	stage := "connect"
 	if err == nil {
 		source, ok := driver.(cloudpkg.ChangeSource)
 		if !ok || !driver.Capabilities().ChangeCursor {
+			stage = "validate"
 			err = errors.New("provider change cursor is unavailable")
 			errorCode = "provider_event_unsupported"
 		} else {
+			stage = "poll"
 			for page := 0; page < m.maxPages; page++ {
 				var count int
 				var more bool
@@ -190,15 +194,19 @@ func (m *ProviderEventMonitor) poll(ctx context.Context, connectionID uint) {
 		if err == nil {
 			err = processErr
 			errorCode = "provider_event_notification_failed"
+			stage = "dispatch"
 		}
 	} else {
 		processed = count
 	}
 	fields := m.log.With().Uint("connection_id", connectionID).Str("error_code", errorCode).Int("received_events", inserted).Int("processed_events", processed).Int("event_count", inserted+processed).Int64("duration_ms", time.Since(started).Milliseconds()).Logger()
 	if err != nil {
-		serverlog.OperationProviderLifeEvent.Event(fields.Error()).Msg(serverlog.OperationProviderLifeEvent.Message("拉取或分发失败，将按周期重试"))
+		if errorCode == "" {
+			errorCode = "provider_event_unavailable"
+		}
+		serverlog.RecordBusiness(ctx, m.log, serverlog.OperationProviderLifeEvent, serverlog.BusinessEvent{Code: "provider.poll.failed", Stage: stage, Outcome: "failed", Message: "115 连接“" + serverlog.BusinessDisplayName(record.Name) + "”生活事件拉取或分发未完成：" + remainingFailureReason(errorCode) + "；已持久化与已处理数量分别保留，按原周期重试", Fields: map[string]any{"connection_id": connectionID, "connection_name": record.Name, "created_count": inserted, "processed_count": processed, "duration_ms": time.Since(started).Milliseconds(), "error_code": errorCode}})
 	} else if inserted+processed > 0 {
-		serverlog.OperationProviderLifeEvent.Event(fields.Info()).Msg(serverlog.OperationProviderLifeEvent.Message("增量事件已拉取并分发"))
+		serverlog.RecordBusiness(ctx, m.log, serverlog.OperationProviderLifeEvent, serverlog.BusinessEvent{Code: "provider.poll.finish", Stage: "dispatch", Outcome: "finished", Message: fmt.Sprintf("115 连接“%s”本轮持久化 %d 条新生活事件，已分发并确认处理 %d 条；后续扫描、下载或整理以实际业务任务为准", serverlog.BusinessDisplayName(record.Name), inserted, processed), Fields: map[string]any{"connection_id": connectionID, "connection_name": record.Name, "created_count": inserted, "processed_count": processed, "duration_ms": time.Since(started).Milliseconds()}})
 	} else {
 		serverlog.OperationProviderLifeEvent.Event(fields.Debug()).Msg(serverlog.OperationProviderLifeEvent.Message("本轮没有新事件"))
 	}

@@ -109,6 +109,50 @@ func (a *API) PlayerOnlinePlayback(c *gin.Context) {
 	})
 }
 
+// PlayerOnlineOfflinePlan is private native transport state. It is never
+// cached, persisted by Server or included in ordinary library DTOs.
+func (a *API) PlayerOnlineOfflinePlan(c *gin.Context) {
+	c.Header("Cache-Control", "no-store")
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 4<<10)
+	var input struct {
+		SegmentID string `json:"segmentId"`
+		VersionID string `json:"versionId"`
+		VariantID string `json:"variantId"`
+	}
+	if err := strictJSON(c, &input); err != nil {
+		writeError(c, a.log, invalid("本地下载选择无效", nil))
+		return
+	}
+	actor, _ := middleware.ActorFrom(c)
+	plan, err := a.pluginRepositories.OnlineOfflinePlan(c.Request.Context(), actor, c.Param("id"), c.Param("itemId"), input.SegmentID, input.VersionID, input.VariantID)
+	if err != nil {
+		writeError(c, a.log, err)
+		return
+	}
+	success(c, http.StatusOK, plan)
+}
+
+func (a *API) PlayerOnlineOfflineAsset(c *gin.Context) {
+	c.Header("Cache-Control", "no-store")
+	actor, _ := middleware.ActorFrom(c)
+	stream, err := a.pluginRepositories.OpenOnlineOfflineAsset(c.Request.Context(), actor, c.Param("id"), c.Param("opaque"), c.Request.Method, c.GetHeader("Range"))
+	if err != nil {
+		writeError(c, a.log, err)
+		return
+	}
+	defer stream.Body.Close()
+	for name, values := range stream.Header {
+		for _, value := range values {
+			c.Writer.Header().Add(name, value)
+		}
+	}
+	c.Header("Cache-Control", "no-store")
+	c.Status(stream.StatusCode)
+	if c.Request.Method != http.MethodHead && stream.StatusCode != http.StatusRequestedRangeNotSatisfiable {
+		_, _ = io.Copy(c.Writer, stream.Body)
+	}
+}
+
 func (a *API) PlayerOnlineAction(c *gin.Context) {
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 32<<10)
 	var input struct {
@@ -163,6 +207,7 @@ func (a *API) PlayerOnlineProgress(c *gin.Context) {
 		SegmentID      string   `json:"segmentId"`
 		VersionID      string   `json:"versionId"`
 		Event          string   `json:"event"`
+		Completed      bool     `json:"completed"`
 		Position       float64  `json:"positionSeconds"`
 		Duration       *float64 `json:"durationSeconds"`
 		IdempotencyKey string   `json:"idempotencyKey"`
@@ -173,7 +218,7 @@ func (a *API) PlayerOnlineProgress(c *gin.Context) {
 		return
 	}
 	a.playerOnlineInvoke(c, func(actor services.Actor) (json.RawMessage, error) {
-		return a.pluginRepositories.SyncOnlineProgress(c.Request.Context(), actor, c.Param("id"), c.Param("itemId"), input.SegmentID, input.VersionID, input.Event, input.Position, input.Duration, input.IdempotencyKey, input.OccurredAt)
+		return a.pluginRepositories.SyncOnlineProgress(c.Request.Context(), actor, c.Param("id"), c.Param("itemId"), input.SegmentID, input.VersionID, input.Event, input.Completed, input.Position, input.Duration, input.IdempotencyKey, input.OccurredAt)
 	})
 }
 

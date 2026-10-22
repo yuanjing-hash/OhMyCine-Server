@@ -89,18 +89,32 @@ func (a *API) ExportRuntimeLogs(c *gin.Context) {
 		StorageID    string   `json:"storage_id"`
 		DownloaderID string   `json:"downloader_id"`
 		ScanRunID    string   `json:"scan_run_id"`
+		JobID        string   `json:"job_id"`
+		FollowID     string   `json:"follow_id"`
+		FollowRunID  string   `json:"follow_run_id"`
+		Attempt      string   `json:"attempt"`
+		Direction    string   `json:"direction"`
+		SnapshotTo   string   `json:"snapshot_to"`
 	}
 	if err := c.ShouldBindJSON(&input); err != nil {
 		writeError(c, a.log, invalid("运行日志导出条件无效", err))
 		return
 	}
-	filter, err := filterFromValues(input.From, input.To, input.Levels, input.Modules, input.Components, input.Operations, input.PluginIDs, input.Keyword, input.RequestID, input.TaskID, input.LibraryID, input.ConnectionID, input.StorageID, input.DownloaderID, input.ScanRunID, logging.MaxQueryLimit, "")
+	toRaw := input.To
+	if input.SnapshotTo != "" {
+		toRaw = input.SnapshotTo
+	}
+	filter, err := filterFromValues(input.From, toRaw, input.Levels, input.Modules, input.Components, input.Operations, input.PluginIDs, input.Keyword, input.RequestID, input.TaskID, input.LibraryID, input.ConnectionID, input.StorageID, input.DownloaderID, input.ScanRunID, logging.MaxQueryLimit, "")
 	if err != nil {
 		writeError(c, a.log, err)
 		return
 	}
+	if err := extendedRuntimeFilter(&filter, input.JobID, input.FollowID, input.FollowRunID, input.Attempt, input.Direction, input.SnapshotTo); err != nil {
+		writeError(c, a.log, err)
+		return
+	}
 	actor, _ := middleware.ActorFrom(c)
-	payload, count, err := a.runtimeLogs.Export(c.Request.Context(), actor, filter, middleware.RequestContextFrom(c))
+	payload, count, partial, err := a.runtimeLogs.ExportWithCoverage(c.Request.Context(), actor, filter, middleware.RequestContextFrom(c))
 	if err != nil {
 		writeError(c, a.log, err)
 		return
@@ -108,6 +122,7 @@ func (a *API) ExportRuntimeLogs(c *gin.Context) {
 	c.Header("Content-Type", "application/gzip")
 	c.Header("Content-Disposition", `attachment; filename="ohmycine-runtime-logs.jsonl.gz"`)
 	c.Header("X-Log-Entry-Count", strconv.Itoa(count))
+	c.Header("X-Log-Partial", strconv.FormatBool(partial))
 	c.Data(http.StatusOK, "application/gzip", payload)
 }
 
@@ -120,7 +135,31 @@ func runtimeLogFilter(c *gin.Context) (logging.Filter, error) {
 		}
 		limit = value
 	}
-	return filterFromValues(c.Query("from"), c.Query("to"), splitValues(c.QueryArray("level")), splitValues(c.QueryArray("module")), splitValues(c.QueryArray("component")), splitValues(c.QueryArray("operation")), splitValues(c.QueryArray("plugin_id")), c.Query("keyword"), c.Query("request_id"), c.Query("task_id"), c.Query("library_id"), c.Query("connection_id"), c.Query("storage_id"), c.Query("downloader_id"), c.Query("scan_run_id"), limit, c.Query("cursor"))
+	toRaw := c.Query("to")
+	if snapshot := c.Query("snapshot_to"); snapshot != "" {
+		toRaw = snapshot
+	}
+	filter, err := filterFromValues(c.Query("from"), toRaw, splitValues(c.QueryArray("level")), splitValues(c.QueryArray("module")), splitValues(c.QueryArray("component")), splitValues(c.QueryArray("operation")), splitValues(c.QueryArray("plugin_id")), c.Query("keyword"), c.Query("request_id"), c.Query("task_id"), c.Query("library_id"), c.Query("connection_id"), c.Query("storage_id"), c.Query("downloader_id"), c.Query("scan_run_id"), limit, c.Query("cursor"))
+	if err != nil {
+		return filter, err
+	}
+	err = extendedRuntimeFilter(&filter, c.Query("job_id"), c.Query("follow_id"), c.Query("follow_run_id"), c.Query("attempt"), c.Query("direction"), c.Query("snapshot_to"))
+	return filter, err
+}
+
+func extendedRuntimeFilter(filter *logging.Filter, jobID, followID, followRunID, attempt, direction, snapshot string) error {
+	filter.JobID, filter.FollowID, filter.FollowRunID, filter.Attempt, filter.Direction = strings.TrimSpace(jobID), strings.TrimSpace(followID), strings.TrimSpace(followRunID), attempt, direction
+	if snapshot != "" {
+		value, err := time.Parse(time.RFC3339Nano, snapshot)
+		if err != nil {
+			return runtimeFilterError(err)
+		}
+		filter.To = value
+	}
+	if err := filter.Normalize(time.Now().UTC()); err != nil {
+		return runtimeFilterError(err)
+	}
+	return nil
 }
 
 func filterFromValues(fromRaw, toRaw string, levels, modules, components, operations, plugins []string, keyword, requestID, taskID, libraryID, connectionID, storageID, downloaderID, scanRunID string, limit int, cursor string) (logging.Filter, error) {

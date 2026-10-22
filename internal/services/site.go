@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/url"
 	"sort"
 	"strconv"
@@ -50,6 +51,7 @@ type SiteService struct {
 	aiRecognition   *AIRecognitionSettingsService
 	renderedFetcher sitepkg.RenderedFetcher
 	searchSlots     chan struct{}
+	searchPolicy    *siteSearchPolicy
 	pluginResources PluginResourceBridge
 
 	limitMu           sync.Mutex
@@ -92,9 +94,11 @@ type siteResultClaim struct {
 	RecognitionSource         string
 	RecognitionStatus         string
 	RecognitionLocked         bool
+	Published                 bool
 }
 
 type SiteInput struct {
+	SearchTimeoutSeconds                                                       *int
 	CloudConfig                                                                *sitepkg.CloudConfig
 	Username, Password                                                         string
 	Name, Kind, BaseURL, Cookie, Passkey, APIKey, UserAgent, BrowserServiceURL string
@@ -103,6 +107,7 @@ type SiteInput struct {
 	Priority, TimeoutSeconds, RateLimitPerMinute                               int
 }
 type SiteUpdateInput struct {
+	SearchTimeoutSeconds                                                 *int
 	CloudConfig                                                          *sitepkg.CloudConfig
 	Username, Password                                                   *string
 	ClearPassword                                                        bool
@@ -121,34 +126,36 @@ type SiteHealthSummary struct {
 	CheckedAt *time.Time `json:"checked_at,omitempty"`
 }
 type SiteSummary struct {
-	CloudConfig              *sitepkg.CloudConfig `json:"cloud_config,omitempty"`
-	LoginUsername            string               `json:"login_username,omitempty"`
-	PasswordConfigured       bool                 `json:"password_configured"`
-	ID                       uint                 `json:"id"`
-	Name                     string               `json:"name"`
-	Kind                     string               `json:"kind"`
-	SiteType                 string               `json:"site_type"`
-	CredentialKind           string               `json:"credential_kind"`
-	Capabilities             SiteCapabilities     `json:"capabilities"`
-	BaseURL                  string               `json:"base_url"`
-	UserAgent                string               `json:"user_agent"`
-	BrowserEmulation         bool                 `json:"browser_emulation"`
-	BrowserServiceConfigured bool                 `json:"browser_service_configured"`
-	Enabled                  bool                 `json:"enabled"`
-	EffectiveEnabled         bool                 `json:"effective_enabled"`
-	UnavailableCode          string               `json:"unavailable_code,omitempty"`
-	UnavailableReason        string               `json:"unavailable_reason,omitempty"`
-	Priority                 int                  `json:"priority"`
-	TimeoutSeconds           int                  `json:"timeout_seconds"`
-	RateLimitPerMinute       int                  `json:"rate_limit_per_minute"`
-	CredentialConfigured     bool                 `json:"credential_configured"`
-	CookieConfigured         bool                 `json:"cookie_configured"`
-	PasskeyConfigured        bool                 `json:"passkey_configured"`
-	APIKeyConfigured         bool                 `json:"api_key_configured"`
-	Health                   SiteHealthSummary    `json:"health"`
-	Revision                 uint64               `json:"revision"`
-	CreatedAt                time.Time            `json:"created_at"`
-	UpdatedAt                time.Time            `json:"updated_at"`
+	CloudConfig                   *sitepkg.CloudConfig `json:"cloud_config,omitempty"`
+	LoginUsername                 string               `json:"login_username,omitempty"`
+	PasswordConfigured            bool                 `json:"password_configured"`
+	ID                            uint                 `json:"id"`
+	Name                          string               `json:"name"`
+	Kind                          string               `json:"kind"`
+	SiteType                      string               `json:"site_type"`
+	CredentialKind                string               `json:"credential_kind"`
+	Capabilities                  SiteCapabilities     `json:"capabilities"`
+	BaseURL                       string               `json:"base_url"`
+	UserAgent                     string               `json:"user_agent"`
+	BrowserEmulation              bool                 `json:"browser_emulation"`
+	BrowserServiceConfigured      bool                 `json:"browser_service_configured"`
+	Enabled                       bool                 `json:"enabled"`
+	EffectiveEnabled              bool                 `json:"effective_enabled"`
+	UnavailableCode               string               `json:"unavailable_code,omitempty"`
+	UnavailableReason             string               `json:"unavailable_reason,omitempty"`
+	Priority                      int                  `json:"priority"`
+	TimeoutSeconds                int                  `json:"timeout_seconds"`
+	RateLimitPerMinute            int                  `json:"rate_limit_per_minute"`
+	CredentialConfigured          bool                 `json:"credential_configured"`
+	CookieConfigured              bool                 `json:"cookie_configured"`
+	PasskeyConfigured             bool                 `json:"passkey_configured"`
+	APIKeyConfigured              bool                 `json:"api_key_configured"`
+	Health                        SiteHealthSummary    `json:"health"`
+	Revision                      uint64               `json:"revision"`
+	CreatedAt                     time.Time            `json:"created_at"`
+	UpdatedAt                     time.Time            `json:"updated_at"`
+	SearchTimeoutSeconds          *int                 `json:"search_timeout_seconds"`
+	EffectiveSearchTimeoutSeconds int                  `json:"effective_search_timeout_seconds"`
 }
 type SiteCapabilities struct {
 	Search   bool `json:"search"`
@@ -173,6 +180,7 @@ type SiteResolutionSummary struct {
 	Capabilities     SiteCapabilities `json:"capabilities"`
 }
 type SiteSearchInput struct {
+	ProgressVersion              int
 	Keyword, MediaType, SearchBy string
 	Year                         *int
 	TMDBID                       *int64
@@ -237,19 +245,45 @@ type SiteSearchGroup struct {
 	HasNext           bool                    `json:"has_next"`
 	Skipped           int                     `json:"skipped"`
 	Items             []SiteSearchResult      `json:"items"`
+	ProgressVersion   int                     `json:"progress_version,omitempty"`
+	Complete          *bool                   `json:"complete,omitempty"`
+	Revision          uint64                  `json:"revision,omitempty"`
+	IncompleteReason  string                  `json:"incomplete_reason,omitempty"`
+	QueriesCompleted  int                     `json:"queries_completed"`
+	QueriesFailed     int                     `json:"queries_failed"`
+	QueriesTotal      int                     `json:"queries_total"`
+	QueryAttempted    bool                    `json:"-"`
 }
 type SiteSearchProgress struct {
-	Total       int    `json:"total"`
-	Pending     int    `json:"pending"`
-	Running     int    `json:"running"`
-	Completed   int    `json:"completed"`
-	Succeeded   int    `json:"succeeded"`
-	Failed      int    `json:"failed"`
-	ResultCount int    `json:"result_count"`
-	SiteID      uint   `json:"site_id,omitempty"`
-	SiteName    string `json:"site_name,omitempty"`
-	SiteStatus  string `json:"site_status,omitempty"`
-	ErrorCode   string `json:"error_code,omitempty"`
+	ProgressVersion int               `json:"progress_version,omitempty"`
+	EventSequence   uint64            `json:"event_sequence,omitempty"`
+	Phase           string            `json:"phase,omitempty"`
+	SiteDetail      *SiteSearchDetail `json:"site_detail,omitempty"`
+	Total           int               `json:"total"`
+	Pending         int               `json:"pending"`
+	Running         int               `json:"running"`
+	Completed       int               `json:"completed"`
+	Succeeded       int               `json:"succeeded"`
+	Failed          int               `json:"failed"`
+	ResultCount     int               `json:"result_count"`
+	SiteID          uint              `json:"site_id,omitempty"`
+	SiteName        string            `json:"site_name,omitempty"`
+	SiteStatus      string            `json:"site_status,omitempty"`
+	ErrorCode       string            `json:"error_code,omitempty"`
+}
+
+type SiteSearchDetail struct {
+	SiteID           uint   `json:"site_id"`
+	SiteName         string `json:"site_name"`
+	Phase            string `json:"phase"`
+	QueryName        string `json:"query_name,omitempty"`
+	QueryIndex       int    `json:"query_index,omitempty"`
+	QueriesCompleted int    `json:"queries_completed"`
+	QueriesFailed    int    `json:"queries_failed"`
+	QueriesTotal     int    `json:"queries_total"`
+	ResultCount      int    `json:"result_count"`
+	ElapsedMS        int64  `json:"elapsed_ms"`
+	Revision         uint64 `json:"revision"`
 }
 type SiteDownloadInput struct {
 	PreviewToken              string
@@ -431,6 +465,10 @@ func (s *SiteService) Create(ctx context.Context, actor Actor, input SiteInput, 
 	if err != nil {
 		return SiteSummary{}, err
 	}
+	searchTimeout, err := normalizeSearchTimeout(input.SearchTimeoutSeconds)
+	if err != nil {
+		return SiteSummary{}, err
+	}
 	priority, timeout, limit, userAgent, err := normalizeSitePolicy(input.Priority, input.TimeoutSeconds, input.RateLimitPerMinute, input.UserAgent)
 	if err != nil {
 		return SiteSummary{}, err
@@ -451,7 +489,7 @@ func (s *SiteService) Create(ctx context.Context, actor Actor, input SiteInput, 
 		return SiteSummary{}, err
 	}
 	now := s.now()
-	record := models.Site{CloudConfigJSON: cloudConfigJSON(cloudConfig), Name: name, NameNormalized: normalized, Kind: kind, BaseURL: baseURL, CredentialCiphertext: ciphertext, UserAgent: userAgent, BrowserEmulation: input.BrowserEmulation, BrowserServiceURL: browserURL, Enabled: input.Enabled, Priority: priority, TimeoutSeconds: timeout, RateLimitPerMinute: limit, LastHealthStatus: "online", LastHealthUsername: safeLabel(health.Username, 128), LastHealthCheckedAt: &now, Revision: 1, CreatedAt: now, UpdatedAt: now}
+	record := models.Site{CloudConfigJSON: cloudConfigJSON(cloudConfig), Name: name, NameNormalized: normalized, Kind: kind, BaseURL: baseURL, CredentialCiphertext: ciphertext, UserAgent: userAgent, BrowserEmulation: input.BrowserEmulation, BrowserServiceURL: browserURL, Enabled: input.Enabled, Priority: priority, TimeoutSeconds: timeout, SearchTimeoutSeconds: searchTimeout, RateLimitPerMinute: limit, LastHealthStatus: "online", LastHealthUsername: safeLabel(health.Username, 128), LastHealthCheckedAt: &now, Revision: 1, CreatedAt: now, UpdatedAt: now}
 	err = s.db.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Create(&record).Error; err != nil {
 			return err
@@ -641,6 +679,12 @@ func (s *SiteService) Update(ctx context.Context, actor Actor, id uint, input Si
 	if err != nil {
 		return SiteSummary{}, err
 	}
+	if input.SearchTimeoutSeconds != nil {
+		record.SearchTimeoutSeconds, err = normalizeSearchTimeout(input.SearchTimeoutSeconds)
+		if err != nil {
+			return SiteSummary{}, err
+		}
+	}
 	priority, timeout, limit := record.Priority, record.TimeoutSeconds, record.RateLimitPerMinute
 	if input.Priority != nil {
 		priority = *input.Priority
@@ -687,7 +731,7 @@ func (s *SiteService) Update(ctx context.Context, actor Actor, id uint, input Si
 	}
 	now := s.now()
 	nextRevision := record.Revision + 1
-	updates := map[string]any{"cloud_config_json": record.CloudConfigJSON, "name": record.Name, "name_normalized": record.NameNormalized, "base_url": record.BaseURL, "credential_ciphertext": ciphertext, "user_agent": userAgent, "browser_emulation": browserEmulation, "browser_service_url": browserURL, "enabled": record.Enabled, "priority": priority, "timeout_seconds": timeout, "rate_limit_per_minute": limit, "last_health_status": "online", "last_health_error_code": "", "last_health_username": safeLabel(health.Username, 128), "last_health_checked_at": now, "revision": nextRevision, "updated_at": now}
+	updates := map[string]any{"cloud_config_json": record.CloudConfigJSON, "name": record.Name, "name_normalized": record.NameNormalized, "base_url": record.BaseURL, "credential_ciphertext": ciphertext, "user_agent": userAgent, "browser_emulation": browserEmulation, "browser_service_url": browserURL, "enabled": record.Enabled, "priority": priority, "timeout_seconds": timeout, "search_timeout_seconds": record.SearchTimeoutSeconds, "rate_limit_per_minute": limit, "last_health_status": "online", "last_health_error_code": "", "last_health_username": safeLabel(health.Username, 128), "last_health_checked_at": now, "revision": nextRevision, "updated_at": now}
 	err = s.db.Transaction(func(tx *gorm.DB) error {
 		result := tx.Model(&models.Site{}).Where("id = ? AND revision = ?", id, input.Revision).Updates(updates)
 		if result.Error != nil {
@@ -715,7 +759,7 @@ func siteUpdateDisablesOnly(input SiteUpdateInput) bool {
 	return input.CloudConfig == nil && input.Username == nil && input.Password == nil && !input.ClearPassword && input.Enabled != nil && !*input.Enabled &&
 		input.Name == nil && input.BaseURL == nil && input.Cookie == nil && input.Passkey == nil && input.APIKey == nil &&
 		!input.ClearPasskey && !input.ClearAPIKey && input.UserAgent == nil && input.Priority == nil &&
-		input.TimeoutSeconds == nil && input.RateLimitPerMinute == nil && input.BrowserEmulation == nil && input.BrowserServiceURL == nil
+		input.SearchTimeoutSeconds == nil && input.TimeoutSeconds == nil && input.RateLimitPerMinute == nil && input.BrowserEmulation == nil && input.BrowserServiceURL == nil
 }
 
 func (s *SiteService) Test(ctx context.Context, actor Actor, id uint, request RequestContext) (SiteSummary, error) {
@@ -787,6 +831,7 @@ func (s *SiteService) Delete(actor Actor, id uint, request RequestContext) error
 
 func (s *SiteService) Search(ctx context.Context, actor Actor, input SiteSearchInput) ([]SiteSearchGroup, error) {
 	groups := []SiteSearchGroup{}
+	input.ProgressVersion = 0 // JSON collects terminal groups only.
 	var mu sync.Mutex
 	err := s.SearchEach(ctx, actor, input, func(group SiteSearchGroup) { mu.Lock(); groups = append(groups, group); mu.Unlock() })
 	priorities := s.sitePriorityMap(input.SiteID, input.SiteIDs)
@@ -797,6 +842,9 @@ func (s *SiteService) Search(ctx context.Context, actor Actor, input SiteSearchI
 		}
 		return groups[left].SiteID < groups[right].SiteID
 	})
+	if ErrorCode(err) == CodeSearchBudget && len(groups) > 0 {
+		err = nil
+	}
 	return groups, err
 }
 
@@ -878,6 +926,9 @@ func (s *SiteService) searchSiteRecords(actor Actor, siteID *uint, siteIDs []uin
 		}
 		filtered = append(filtered, record)
 	}
+	if len(filtered) > maxSiteSearchScope {
+		return nil, appError(CodeInvalidRequest, "一次最多搜索 64 个站点，请明确选择范围", nil)
+	}
 	return filtered, nil
 }
 
@@ -935,16 +986,6 @@ func (s *SiteService) pluginResourceSearchAvailability(record models.Site) (bool
 	if _, _, err := s.pluginResources.ResourceProvenance(record.PluginConnectionID); err != nil {
 		return false, "resource_entry_unavailable", "所选资源站插件已停用、卸载或连接不可用"
 	}
-	switch record.LastHealthStatus {
-	case "healthy":
-		// Continue with the authoritative lifecycle check below.
-	case "auth_required", "auth_pending":
-		return false, "resource_auth_required", "所选资源站尚未登录或登录已失效，请到插件连接页重新登录"
-	case "rate_limited":
-		return false, "resource_rate_limited", "所选资源站正在限流或安全验证中，请稍后重试"
-	default:
-		return false, "resource_entry_unavailable", "所选资源站入口不可用，请到插件连接页检查"
-	}
 	return true, "", ""
 }
 
@@ -991,6 +1032,9 @@ func (s *SiteService) BindExpectedIdentity(ctx context.Context, actor Actor, res
 // concurrently, so HTTP writers and native clients never receive overlapping
 // events.
 func (s *SiteService) SearchEachProgress(ctx context.Context, actor Actor, input SiteSearchInput, emit func(SiteSearchGroup), emitProgress func(SiteSearchProgress)) error {
+	ctx, cancel := s.searchRunContext(ctx)
+	defer cancel()
+	ctx = context.WithValue(ctx, detailedSearchKey{}, input.ProgressVersion == 2)
 	if !actor.HasPermission(authz.PermissionDiscoveryRead) {
 		return appError(CodePermissionDenied, "无权搜索种子资源", nil)
 	}
@@ -1005,6 +1049,9 @@ func (s *SiteService) SearchEachProgress(ctx context.Context, actor Actor, input
 	if input.SearchBy == "tmdb_id" {
 		if input.TMDBID == nil || *input.TMDBID <= 0 || s.metadata == nil || (input.MediaType != "movie" && input.MediaType != "tv") {
 			return appError(CodeInvalidRequest, "TMDB 搜索身份无效", nil)
+		}
+		if input.ProgressVersion == 2 && emitProgress != nil {
+			emitProgress(SiteSearchProgress{ProgressVersion: 2, Phase: "preparing_media"})
 		}
 		client, err := s.metadata.Client()
 		if err != nil {
@@ -1026,34 +1073,39 @@ func (s *SiteService) SearchEachProgress(ctx context.Context, actor Actor, input
 	if input.Page < 1 || input.Page > 20 {
 		return appError(CodeInvalidRequest, "种子资源搜索页码无效", nil)
 	}
+	ctx = context.WithValue(ctx, searchPageKey{}, input.Page)
 	records, err := s.searchSiteRecords(actor, input.SiteID, input.SiteIDs)
 	if err != nil {
 		return err
 	}
-	if len(records) == 0 {
-		if emitProgress != nil {
-			emitProgress(SiteSearchProgress{})
-		}
-		return nil
-	}
 	return s.runSiteSearches(ctx, records, func(siteCtx context.Context, record models.Site) SiteSearchGroup {
-		return s.searchSite(siteCtx, actor, record, input)
+		reportSearchQuery(siteCtx, 1, 1, input.Keyword)
+		if err := s.prepareSiteSearch(siteCtx, record); err != nil {
+			return searchPreparationFailure(record, input.Page, 1, err)
+		}
+		group := s.searchSite(siteCtx, actor, record, input)
+		group.QueriesTotal = 1
+		if group.Status == "success" {
+			group.QueriesCompleted = 1
+		} else if group.QueryAttempted {
+			group.QueriesFailed = 1
+		}
+		return group
 	}, emit, emitProgress)
 }
 
-func (s *SiteService) searchSite(ctx context.Context, actor Actor, record models.Site, input SiteSearchInput) SiteSearchGroup {
+func (s *SiteService) searchSite(ctx context.Context, actor Actor, record models.Site, input SiteSearchInput) (group SiteSearchGroup) {
+	ctx = serverlog.WithBusinessFields(ctx, map[string]any{"site_id": record.ID, "site_name": record.Name, "query_name": input.Keyword, "user_id": actor.User.ID})
 	if record.SourceType == "plugin" && record.Kind == pluginResourceKind {
 		return s.searchPluginResource(ctx, actor, record, input)
 	}
+	started, stage, requested, rawCount := time.Now(), "prepare", false, 0
+	defer func() { s.recordSearchResult(ctx, group, started, stage, requested, rawCount) }()
 	definition, _ := builtin.DefinitionForKey(record.Kind)
-	group := SiteSearchGroup{SiteID: record.ID, SiteName: record.Name, SiteType: definition.SiteType, Status: "success", Page: input.Page, Items: []SiteSearchResult{}}
+	group = SiteSearchGroup{SiteID: record.ID, SiteName: record.Name, SiteType: definition.SiteType, Status: "success", Page: input.Page, Items: []SiteSearchResult{}}
 	config, err := s.config(record)
 	if err != nil {
 		group.Status, group.ErrorCode = "error", CodeSiteCredentialInvalid
-		return group
-	}
-	if err := s.waitLimit(ctx, record); err != nil {
-		group.Status, group.ErrorCode = "error", ErrorCode(err)
 		return group
 	}
 	query := sitepkg.Query{Keyword: input.Keyword, MediaType: input.MediaType, Year: input.Year, TMDBID: input.TMDBID, Page: input.Page}
@@ -1064,10 +1116,40 @@ func (s *SiteService) searchSite(ctx context.Context, actor Actor, record models
 			return group
 		}
 	}
-	page, err := s.adapters[record.Kind].Search(ctx, config, query)
+	// PanSou pages with a frozen snapshot never contact the upstream service.
+	// Repeated local projections must not consume its shared request budget.
+	cachedPage := record.Kind == pansou.Kind && !query.Refresh && (query.Page > 1 || query.SnapshotID != "")
+	if !cachedPage {
+		stage = "limit"
+		ReportResourceSearchPhase(ctx, "waiting_rate_limit")
+		if err := s.waitSearchLimit(ctx, record); err != nil {
+			group.Status, group.ErrorCode = "error", ErrorCode(err)
+			return group
+		}
+	}
+	queryCtx, cancel := context.WithTimeoutCause(ctx, s.queryTimeout(record), errors.New(CodeSearchRequestTimeout))
+	defer cancel()
+	config.SearchTimeout, config.Timeout = s.queryTimeout(record), s.queryTimeout(record)
+	if cachedPage {
+		stage = "snapshot"
+		ReportResourceSearchPhase(ctx, "processing_results")
+	} else {
+		stage, requested, group.QueryAttempted = "query", true, true
+		ReportResourceSearchPhase(ctx, "querying")
+		observeFollowRequest(ctx, record.ID)
+		s.recordSearch(ctx, "site.query.start", "query", "started", fmt.Sprintf("站点 %s：使用名称“%s”查询第 %d 页", serverlog.BusinessDisplayName(record.Name), serverlog.BusinessDisplayName(input.Keyword), input.Page), nil)
+	}
+	page, err := s.adapters[record.Kind].Search(queryCtx, config, query)
 	if err != nil {
-		group.Status, group.ErrorCode = "error", siteErrorCode(err)
+		group.Status, group.ErrorCode = "error", searchRequestError(queryCtx, err)
 		return group
+	}
+	ReportResourceSearchPhase(ctx, "processing_results")
+	rawCount = len(page.Items)
+	if stats := followStats(ctx); stats != nil {
+		stats.mu.Lock()
+		stats.raw += rawCount
+		stats.mu.Unlock()
 	}
 	group.HasNext, group.Skipped = page.HasNext, page.Skipped
 	group.SnapshotID, group.SnapshotExpiresAt = page.SnapshotID, page.SnapshotExpiresAt
@@ -1095,6 +1177,7 @@ func (s *SiteService) searchSite(ctx context.Context, actor Actor, record models
 			ExpiresAt:          expires,
 		})
 		if tokenErr != nil {
+			group.Partial, group.IncompleteReason = true, CodeSearchResultLimit
 			continue
 		}
 		specifications := SiteRecognitionSpecifications{}
@@ -1112,12 +1195,13 @@ func (s *SiteService) searchSite(ctx context.Context, actor Actor, record models
 		}
 		group.Items = append(group.Items, SiteSearchResult{ResultType: item.ResultType, Origins: item.Origins, AcquisitionAvailable: acquisition, AcquisitionReason: reason, ShareValidation: s.cachedShareValidation(ctx, actor, item.TorrentID), SourceKind: item.SourceKind, CloudProvider: item.CloudProvider, Channel: item.Channel, PostURL: item.PostURL, ResourceFingerprint: item.Fingerprint, Token: token, Title: item.Title, Subtitle: item.Subtitle, SizeBytes: item.SizeBytes, Published: item.Published, Seeders: item.Seeders, Leechers: item.Leechers, Completed: item.Completed, Promotion: item.Promotion, Quality: item.Quality, Tags: item.Tags, Specifications: specifications, ExpiresAt: expires})
 	}
-	serverlog.OperationDiscoverySearch.Event(s.log.Info()).Uint("site_id", record.ID).Str("site_type", group.SiteType).Int("results", len(group.Items)).Int("skipped", group.Skipped).Msg(serverlog.OperationDiscoverySearch.Message("站点资源搜索完成"))
 	return group
 }
 
-func (s *SiteService) searchPluginResource(ctx context.Context, actor Actor, record models.Site, input SiteSearchInput) SiteSearchGroup {
-	group := SiteSearchGroup{SiteID: record.ID, SiteName: record.Name, SiteType: "bt_resource", Status: "success", Page: input.Page, Items: []SiteSearchResult{}}
+func (s *SiteService) searchPluginResource(ctx context.Context, actor Actor, record models.Site, input SiteSearchInput) (group SiteSearchGroup) {
+	started, requested, rawCount := time.Now(), false, 0
+	defer func() { s.recordSearchResult(ctx, group, started, "query", requested, rawCount) }()
+	group = SiteSearchGroup{SiteID: record.ID, SiteName: record.Name, SiteType: "bt_resource", Status: "success", Page: input.Page, Items: []SiteSearchResult{}}
 	if s.pluginResources == nil {
 		group.Status, group.ErrorCode = "error", "resource_entry_unavailable"
 		return group
@@ -1126,10 +1210,21 @@ func (s *SiteService) searchPluginResource(ctx context.Context, actor Actor, rec
 	// bounded batch while new claims are being produced so an always-on Server
 	// cannot grow this short-lived vault without limit.
 	_ = s.cleanupExpiredPluginResourceClaims(pluginResourceClaimCleanupBatch)
+	requested, group.QueryAttempted = true, true
+	ReportResourceSearchPhase(ctx, "querying")
+	observeFollowRequest(ctx, record.ID)
+	s.recordSearch(ctx, "site.query.start", "query", "started", fmt.Sprintf("通过站点插件 %s 搜索“%s”，第 %d 页", serverlog.BusinessDisplayName(record.Name), serverlog.BusinessDisplayName(input.Keyword), input.Page), nil)
 	page, err := s.pluginResources.SearchResource(ctx, PluginResourceSearchInput{ConnectionID: record.PluginConnectionID, Query: input.Keyword, Kind: input.MediaType, Year: input.Year, Page: input.Page})
 	if err != nil {
-		group.Status, group.ErrorCode = "error", ErrorCode(err)
+		group.Status, group.ErrorCode = "error", searchContextError(ctx, ErrorCode(err))
 		return group
+	}
+	ReportResourceSearchPhase(ctx, "processing_results")
+	rawCount = len(page.Items)
+	if stats := followStats(ctx); stats != nil {
+		stats.mu.Lock()
+		stats.raw += rawCount
+		stats.mu.Unlock()
 	}
 	pluginID, pluginVersion, provenanceErr := s.pluginResources.ResourceProvenance(record.PluginConnectionID)
 	if provenanceErr != nil {
@@ -1141,6 +1236,7 @@ func (s *SiteService) searchPluginResource(ctx context.Context, actor Actor, rec
 	for _, item := range page.Items {
 		token, tokenErr := s.issueClaim(siteResultClaim{ActorID: actor.User.ID, SiteID: record.ID, TorrentID: item.ID, Title: item.Title, MediaTypeHint: safeRecognitionMediaTypeHint(input.MediaType), ExpiresAt: expires})
 		if tokenErr != nil {
+			group.Partial, group.IncompleteReason = true, CodeSearchResultLimit
 			continue
 		}
 		claimID := uuid.NewString()
@@ -1537,7 +1633,7 @@ func siteRecognitionSpecifications(specifications []string, releaseGroup string)
 	return result
 }
 
-func (s *SiteService) Download(ctx context.Context, actor Actor, input SiteDownloadInput, request RequestContext) (DownloadTaskSummary, error) {
+func (s *SiteService) Download(ctx context.Context, actor Actor, input SiteDownloadInput, request RequestContext) (result DownloadTaskSummary, resultErr error) {
 	if !actor.Can(authz.PermissionDownloadsCreate) {
 		return DownloadTaskSummary{}, appError(CodePermissionDenied, "无权创建下载任务", nil)
 	}
@@ -1546,6 +1642,13 @@ func (s *SiteService) Download(ctx context.Context, actor Actor, input SiteDownl
 	if err != nil {
 		return DownloadTaskSummary{}, err
 	}
+	stage, started := "prepare", time.Now()
+	ctx = serverlog.WithBusinessFields(ctx, map[string]any{"site_id": claim.SiteID, "user_id": actor.User.ID, "downloader_id": input.DownloaderID})
+	defer func() {
+		if resultErr != nil {
+			s.recordSearch(ctx, "site.download.failed", stage, "failed", "资源转交下载未完成：当前阶段未获接受；未将读取、校验或提交失败视为入库完成", map[string]any{"error_code": ErrorCode(resultErr), "duration_ms": time.Since(started).Milliseconds()})
+		}
+	}()
 	completed := false
 	defer func() { s.finishClaim(token, completed) }()
 	if claim.SourceKind == "external_link" {
@@ -1568,22 +1671,31 @@ func (s *SiteService) Download(ctx context.Context, actor Actor, input SiteDownl
 		return DownloadTaskSummary{}, appError(CodePermissionDenied, "无权向这个媒体库入库", nil)
 	}
 	var claimedSite models.Site
-	if err := s.db.Select("id", "kind", "source_type", "plugin_id", "plugin_connection_id", "enabled", "revision").First(&claimedSite, claim.SiteID).Error; err != nil {
+	if err := s.db.WithContext(ctx).First(&claimedSite, claim.SiteID).Error; err != nil {
 		return DownloadTaskSummary{}, siteNotFound(err)
 	}
 	if !actor.CanResource(authz.PermissionDiscoveryRead, models.AuthorizationResourceSite, uintID(claimedSite.ID)) {
 		return DownloadTaskSummary{}, appError(CodePermissionDenied, "无权使用这个站点的搜索结果", nil)
 	}
+	ctx = serverlog.WithBusinessFields(ctx, map[string]any{"site_name": claimedSite.Name, "resource_name": claim.Title, "downloader_name": selectedDownloader.Name})
+	if input.MediaLibraryID != nil {
+		ctx = serverlog.WithBusinessFields(ctx, map[string]any{"library_id": *input.MediaLibraryID})
+	}
+	s.recordSearch(ctx, "site.download.start", "prepare", "started", fmt.Sprintf("准备将站点 %s 的资源 %s 交给下载器 %s；先核对实际来源和当前权限", serverlog.BusinessDisplayName(claimedSite.Name), serverlog.BusinessDisplayName(claim.Title), serverlog.BusinessDisplayName(selectedDownloader.Name)), nil)
 	definition, definitionFound := builtin.DefinitionForKey(claimedSite.Kind)
 	isPluginResource := claimedSite.SourceType == "plugin" && claimedSite.Kind == pluginResourceKind
+	routeSource, routeErr := routeSourceForSite(claimedSite)
 	claimSource := claimCloudSource(claim)
 	if claimedSite.Kind == pansou.Kind && claim.SourceKind == RouteSourceBT {
 		claimSource = RouteSourceBT
 	}
+	if claimedSite.Kind == pansou.Kind {
+		routeSource, routeErr = claimSource, nil
+	}
 	if definitionFound && definition.SiteType == builtin.SiteTypeCloud && !routeDownloaderApplicable(claimSource, selectedDownloader) {
 		return DownloadTaskSummary{}, appError(CodeDownloadSourceInvalid, "网盘分享资源只能通过对应网盘转存", nil)
 	}
-	if selectedDownloader.Type == models.DownloaderTypePan115Offline && !isPluginResource && (!definitionFound || (definition.SiteType != builtin.SiteTypeBT && definition.SiteType != builtin.SiteTypeCloud)) {
+	if selectedDownloader.Type == models.DownloaderTypePan115Offline && (routeErr != nil || (routeSource != RouteSourceBT && routeSource != RouteSource115Share)) {
 		return DownloadTaskSummary{}, appError(CodeDownloadSourceInvalid, "只有已确认的公开 BT 资源可以提交到 115 离线下载", nil)
 	}
 	record := claimedSite
@@ -1605,6 +1717,7 @@ func (s *SiteService) Download(ctx context.Context, actor Actor, input SiteDownl
 		return DownloadTaskSummary{}, err
 	}
 	var source DownloadSourceInput
+	stage = "source"
 	var pluginID, pluginVersion, pluginConnectionID string
 	var resolvedLifecycle string
 	if isPluginResource {
@@ -1619,7 +1732,7 @@ func (s *SiteService) Download(ctx context.Context, actor Actor, input SiteDownl
 		if err != nil {
 			return DownloadTaskSummary{}, err
 		}
-		if resourceClaim.PluginID != pluginID || resourceClaim.PluginVersion != pluginVersion || resourceClaim.PluginConnectionID != record.PluginConnectionID || resourceClaim.ResourceID != claim.TorrentID {
+		if resourceClaim.PluginID != pluginID || record.PluginID != pluginID || resourceClaim.PluginVersion != pluginVersion || resourceClaim.PluginConnectionID != record.PluginConnectionID || resourceClaim.ResourceID != claim.TorrentID {
 			return DownloadTaskSummary{}, appError(CodeSiteResultExpired, "资源站插件或镜像已变化，请重新搜索", nil)
 		}
 		resolvedLifecycle, err = pluginResourceLifecycle(s.db, record, pluginID, pluginVersion)
@@ -1682,6 +1795,7 @@ func (s *SiteService) Download(ctx context.Context, actor Actor, input SiteDownl
 	}
 
 	var previewGuard func(*gorm.DB) error
+	stage = "share_check"
 	if input.PreviewToken != "" || len(input.SelectedEntryTokens) > 0 {
 		selection, guard, selectionErr := s.resolveShareSelection(ctx, actor, input, claim, source)
 		if selectionErr != nil {
@@ -1784,7 +1898,7 @@ func (s *SiteService) Download(ctx context.Context, actor Actor, input SiteDownl
 		}
 	}
 	submitInput := SubmitDownloadInput{SourceSiteID: claimedSite.ID, DownloaderID: input.DownloaderID, MediaLibraryID: input.MediaLibraryID, ProfileID: input.ProfileID, DisplayName: claim.Title, Priority: input.Priority, Source: source, PluginID: pluginID, PluginVersion: pluginVersion, PluginConnectionID: pluginConnectionID, PluginResourceClaimID: resourceClaimID, RecognitionOverride: recognitionOverride, FollowSubscriptionID: input.FollowSubscriptionID, FollowResourceFingerprint: input.FollowResourceFingerprint, ForceRecognitionOverride: input.FollowSubscriptionID != "", BeforePersist: beforePersist}
-	var result DownloadTaskSummary
+	stage = "enqueue"
 	if source.ShareSelection != nil {
 		result, err = s.submitShareSelection(ctx, actor, input.PreviewToken, submitInput, request)
 	} else {
@@ -1796,7 +1910,11 @@ func (s *SiteService) Download(ctx context.Context, actor Actor, input SiteDownl
 	result.ShareValidation = shareValidation
 	completed = result.SelectionPending == 0
 	_ = s.audit.Record(s.db, &actor.User.ID, "site.download", "site", uintID(record.ID), "success", map[string]any{"download_task_id": result.ID}, request)
-	serverlog.OperationDiscoverySearch.Event(s.log.Info()).Uint("site_id", record.ID).Str("download_task_id", result.ID).Msg(serverlog.OperationDiscoverySearch.Message("种子资源搜索结果已提交下载"))
+	outcome, message := "accepted", "资源已转交持久下载任务，后续下载、转存与入库结果请查看关联任务"
+	if result.SelectionPending > 0 {
+		outcome, message = "partial", "所选内容仅有部分任务获接受，仍有选择待处理；已接受的任务不会重复创建"
+	}
+	s.recordSearch(ctx, "site.download.accepted", "enqueue", outcome, message, map[string]any{"related_task_id": result.ID, "related_job_id": result.JobID, "duration_ms": time.Since(started).Milliseconds()})
 	return result, nil
 }
 
@@ -1890,9 +2008,15 @@ func (s *SiteService) issueClaim(claim siteResultClaim) (string, error) {
 		oldestKey := ""
 		var oldest time.Time
 		for key, item := range s.vault {
+			if item.Published || item.InFlight {
+				continue
+			}
 			if oldestKey == "" || item.ExpiresAt.Before(oldest) {
 				oldestKey, oldest = key, item.ExpiresAt
 			}
+		}
+		if oldestKey == "" {
+			return "", appError(CodeSearchResultLimit, "搜索结果已达到容量上限，请稍后重试", nil)
 		}
 		delete(s.vault, oldestKey)
 	}
@@ -2124,7 +2248,7 @@ func normalizeBrowserService(enabled bool, raw string) (string, error) {
 func (s *SiteService) siteSummary(record models.Site) SiteSummary {
 	if record.SourceType == "plugin" && record.Kind == pluginResourceKind {
 		available, code, reason := s.pluginResourceSearchAvailability(record)
-		return SiteSummary{ID: record.ID, Name: record.Name, Kind: record.Kind, SiteType: "bt_resource", CredentialKind: "plugin", Capabilities: SiteCapabilities{Search: available, Download: available}, BaseURL: record.BaseURL, Enabled: record.Enabled, EffectiveEnabled: available, UnavailableCode: code, UnavailableReason: reason, Priority: record.Priority, TimeoutSeconds: record.TimeoutSeconds, RateLimitPerMinute: record.RateLimitPerMinute, Health: SiteHealthSummary{Status: record.LastHealthStatus, ErrorCode: record.LastHealthErrorCode, Username: record.LastHealthUsername, CheckedAt: record.LastHealthCheckedAt}, Revision: record.Revision, CreatedAt: record.CreatedAt, UpdatedAt: record.UpdatedAt}
+		return SiteSummary{ID: record.ID, Name: record.Name, Kind: record.Kind, SiteType: "bt_resource", CredentialKind: "plugin", Capabilities: SiteCapabilities{Search: available, Download: available}, BaseURL: record.BaseURL, Enabled: record.Enabled, EffectiveEnabled: available, UnavailableCode: code, UnavailableReason: reason, Priority: record.Priority, TimeoutSeconds: record.TimeoutSeconds, SearchTimeoutSeconds: cloneInt(record.SearchTimeoutSeconds), EffectiveSearchTimeoutSeconds: effectiveSearchTimeout(record), RateLimitPerMinute: record.RateLimitPerMinute, Health: SiteHealthSummary{Status: record.LastHealthStatus, ErrorCode: record.LastHealthErrorCode, Username: record.LastHealthUsername, CheckedAt: record.LastHealthCheckedAt}, Revision: record.Revision, CreatedAt: record.CreatedAt, UpdatedAt: record.UpdatedAt}
 	}
 	definition, _ := builtin.DefinitionForKey(record.Kind)
 	var configured siteCredentialEnvelope
@@ -2133,7 +2257,7 @@ func (s *SiteService) siteSummary(record models.Site) SiteSummary {
 			_ = json.Unmarshal([]byte(raw), &configured)
 		}
 	}
-	return SiteSummary{EffectiveEnabled: record.Enabled, CloudConfig: cloudSiteConfig(record), LoginUsername: configured.Username, PasswordConfigured: configured.Password != "", ID: record.ID, Name: record.Name, Kind: record.Kind, SiteType: definition.SiteType, CredentialKind: definition.CredentialKind, Capabilities: capabilitiesForDefinition(definition), BaseURL: record.BaseURL, UserAgent: record.UserAgent, BrowserEmulation: record.BrowserEmulation, BrowserServiceConfigured: record.BrowserServiceURL != "", Enabled: record.Enabled, Priority: record.Priority, TimeoutSeconds: record.TimeoutSeconds, RateLimitPerMinute: record.RateLimitPerMinute, CredentialConfigured: (definition.CredentialKind != builtin.CredentialNone && record.CredentialCiphertext != "") || configured.Password != "", CookieConfigured: configured.Cookie != "", PasskeyConfigured: configured.Passkey != "", APIKeyConfigured: configured.APIKey != "", Health: SiteHealthSummary{Status: record.LastHealthStatus, ErrorCode: record.LastHealthErrorCode, Username: record.LastHealthUsername, CheckedAt: record.LastHealthCheckedAt}, Revision: record.Revision, CreatedAt: record.CreatedAt, UpdatedAt: record.UpdatedAt}
+	return SiteSummary{EffectiveEnabled: record.Enabled, CloudConfig: cloudSiteConfig(record), LoginUsername: configured.Username, PasswordConfigured: configured.Password != "", ID: record.ID, Name: record.Name, Kind: record.Kind, SiteType: definition.SiteType, CredentialKind: definition.CredentialKind, Capabilities: capabilitiesForDefinition(definition), BaseURL: record.BaseURL, UserAgent: record.UserAgent, BrowserEmulation: record.BrowserEmulation, BrowserServiceConfigured: record.BrowserServiceURL != "", Enabled: record.Enabled, Priority: record.Priority, TimeoutSeconds: record.TimeoutSeconds, SearchTimeoutSeconds: cloneInt(record.SearchTimeoutSeconds), EffectiveSearchTimeoutSeconds: effectiveSearchTimeout(record), RateLimitPerMinute: record.RateLimitPerMinute, CredentialConfigured: (definition.CredentialKind != builtin.CredentialNone && record.CredentialCiphertext != "") || configured.Password != "", CookieConfigured: configured.Cookie != "", PasskeyConfigured: configured.Passkey != "", APIKeyConfigured: configured.APIKey != "", Health: SiteHealthSummary{Status: record.LastHealthStatus, ErrorCode: record.LastHealthErrorCode, Username: record.LastHealthUsername, CheckedAt: record.LastHealthCheckedAt}, Revision: record.Revision, CreatedAt: record.CreatedAt, UpdatedAt: record.UpdatedAt}
 }
 
 func capabilitiesForDefinition(definition builtin.Definition) SiteCapabilities {

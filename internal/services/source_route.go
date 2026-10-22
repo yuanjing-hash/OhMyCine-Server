@@ -68,7 +68,10 @@ type FollowRoutePreview struct {
 }
 
 func routeSourceForSite(site models.Site) (string, error) {
-	if site.SourceType == "plugin" && site.Kind == pluginResourceKind {
+	if site.SourceType == "plugin" {
+		if site.Kind != pluginResourceKind || strings.TrimSpace(site.PluginID) == "" || strings.TrimSpace(site.PluginConnectionID) == "" {
+			return "", appError(CodeSiteKindUnsupported, "站点来源无法确认", nil)
+		}
 		return RouteSourceBT, nil
 	}
 	definition, ok := builtin.DefinitionForKey(site.Kind)
@@ -228,11 +231,11 @@ func (s *DownloadService) recommendSourceRoute(ctx context.Context, actor Actor,
 	}
 	result := SourceRouteRecommendation{SourceKind: source, Choices: make([]SourceRouteChoice, 0, len(visibleLibraries)*len(visibleDownloaders))}
 	choiceByDownloader := make(map[string]map[uint]SourceRouteChoice, len(visibleDownloaders))
-	previewSourceKind, previewSiteID := routeSourceDownloadKind(source), &siteID
+	previewSourceKind := routeSourceDownloadKind(source)
 	if site.SourceType == "plugin" && site.Kind == pluginResourceKind {
 		// A plugin resource resolves directly to a magnet. SiteService.Download
 		// verifies its saved plugin provenance before accepting a 115 route.
-		previewSourceKind, previewSiteID = downloadpkg.SourceURL, nil
+		previewSourceKind = downloadpkg.SourceURL
 	}
 	if site.Kind == pansou.Kind && source == RouteSourceBT {
 		previewSourceKind = downloadpkg.SourceURL
@@ -242,7 +245,7 @@ func (s *DownloadService) recommendSourceRoute(ctx context.Context, actor Actor,
 			continue
 		}
 		byLibrary := make(map[uint]SourceRouteChoice, len(visibleLibraries))
-		preview, previewErr := s.PreviewRoutes(ctx, actor, DownloadRoutePreviewInput{DownloaderID: downloader.ID, SourceKind: previewSourceKind, SiteID: previewSiteID, ExpectedBytes: size})
+		preview, previewErr := s.PreviewRoutes(ctx, actor, DownloadRoutePreviewInput{DownloaderID: downloader.ID, SourceKind: previewSourceKind, SiteID: &siteID, ExpectedBytes: size})
 		for _, library := range visibleLibraries {
 			choice := SourceRouteChoice{DownloaderID: downloader.ID, DownloaderName: downloader.Name, DownloaderType: downloader.Type, MediaLibraryID: library.ID, LibraryName: library.Name}
 			if previewErr != nil {

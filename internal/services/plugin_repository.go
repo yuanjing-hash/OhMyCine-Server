@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"regexp"
 	"sort"
@@ -26,7 +27,7 @@ import (
 	sqlite3 "modernc.org/sqlite/lib"
 )
 
-const CurrentServerVersion = "0.1.0"
+const CurrentServerVersion = "0.1.1"
 
 var pluginCommitSHAPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
 
@@ -78,6 +79,7 @@ type PluginRepositoryService struct {
 	browserMu      sync.Mutex
 	browserAuthMu  sync.Mutex
 	browserSession *resourceBrowserSession
+	recovery       resourceRecoveryState
 	db             *gorm.DB
 	audit          *AuditService
 	fetcher        PluginRegistryFetcher
@@ -86,10 +88,14 @@ type PluginRepositoryService struct {
 	assets         PluginAssetFetcher
 	runtime        PluginRuntimeHost
 	artwork        PluginArtworkGateway
+	offline        PluginOfflineGateway
 	credentials    *credential.Store
 	pluginRoot     string
 	lifecycleMu    sync.Mutex
 	navigationKey  [32]byte
+	catalogueOnce  sync.Once
+	catalogue      *pluginCatalogueCache
+	history        *PlayerHistoryService
 }
 
 type PluginRepositorySummary struct {
@@ -357,7 +363,7 @@ func (s *PluginRepositoryService) Refresh(ctx context.Context, actor Actor, id u
 		return PluginRepositorySummary{}, pluginRepositoryNotFound(err)
 	}
 	started := time.Now()
-	serverlog.OperationPluginRepository.Event(s.log.Info()).Uint("repository_id", id).Msg(serverlog.OperationPluginRepository.Message("开始刷新"))
+	serverlog.RecordBusiness(ctx, s.log, serverlog.OperationPluginRepository, serverlog.BusinessEvent{Code: "plugin.repository.start", Stage: "refresh", Outcome: "started", Message: "开始刷新仓库“" + serverlog.BusinessDisplayName(record.Name) + "”的插件清单", Fields: map[string]any{"resource_name": record.Name, "user_id": actor.User.ID, "request_id": request.RequestID}})
 	source := contract.GitHubRepository{Owner: record.GitHubOwner, Name: record.GitHubRepo}
 	snapshot, fetchErr := s.fetcher.Fetch(ctx, source)
 	var canonical []byte
@@ -375,10 +381,10 @@ func (s *PluginRepositoryService) Refresh(ctx context.Context, actor Actor, id u
 	if fetchErr != nil {
 		code := pluginrepository.ErrorCode(fetchErr)
 		if err := s.recordRefreshFailure(actor, record, code, request); err != nil {
-			s.logRefreshTerminal(id, started, false, ErrorCode(err), 0)
+			s.logRefreshTerminal(ctx, record.Name, id, started, false, ErrorCode(err), 0)
 			return PluginRepositorySummary{}, err
 		}
-		s.logRefreshTerminal(id, started, false, code, 0)
+		s.logRefreshTerminal(ctx, record.Name, id, started, false, code, 0)
 		return PluginRepositorySummary{}, pluginRepositoryRefreshError(code, fetchErr)
 	}
 	now := time.Now().UTC()
@@ -395,14 +401,14 @@ func (s *PluginRepositoryService) Refresh(ctx context.Context, actor Actor, id u
 		return s.audit.Record(tx, &actor.User.ID, "plugin_repository.refresh", "plugin_repository", uintID(id), "success", map[string]any{"plugin_count": len(snapshot.Registry.Plugins)}, request)
 	})
 	if err != nil {
-		s.logRefreshTerminal(id, started, false, ErrorCode(err), 0)
+		s.logRefreshTerminal(ctx, record.Name, id, started, false, ErrorCode(err), 0)
 		return PluginRepositorySummary{}, err
 	}
 	if err := s.db.First(&record, id).Error; err != nil {
-		s.logRefreshTerminal(id, started, false, ErrorCode(err), 0)
+		s.logRefreshTerminal(ctx, record.Name, id, started, false, ErrorCode(err), 0)
 		return PluginRepositorySummary{}, err
 	}
-	s.logRefreshTerminal(id, started, true, "", len(snapshot.Registry.Plugins))
+	s.logRefreshTerminal(ctx, record.Name, id, started, true, "", len(snapshot.Registry.Plugins))
 	return pluginRepositorySummary(record), nil
 }
 
@@ -503,15 +509,15 @@ func (s *PluginRepositoryService) recordRefreshFailure(actor Actor, record model
 	})
 }
 
-func (s *PluginRepositoryService) logRefreshTerminal(repositoryID uint, started time.Time, success bool, code string, pluginCount int) {
+func (s *PluginRepositoryService) logRefreshTerminal(ctx context.Context, repositoryName string, repositoryID uint, started time.Time, success bool, code string, pluginCount int) {
 	if success {
-		serverlog.OperationPluginRepository.Event(s.log.Info()).Uint("repository_id", repositoryID).Int("plugin_count", pluginCount).Int64("duration_ms", time.Since(started).Milliseconds()).Msg(serverlog.OperationPluginRepository.Message("刷新完成"))
+		serverlog.RecordBusiness(ctx, s.log, serverlog.OperationPluginRepository, serverlog.BusinessEvent{Code: "plugin.repository.finish", Stage: "refresh", Outcome: "finished", Message: fmt.Sprintf("刷新完成：仓库“%s”已校验并缓存 %d 个插件的清单", serverlog.BusinessDisplayName(repositoryName), pluginCount), Fields: map[string]any{"resource_name": repositoryName, "result_count": pluginCount, "duration_ms": time.Since(started).Milliseconds()}})
 		return
 	}
 	if strings.TrimSpace(code) == "" {
 		code = "INTERNAL_ERROR"
 	}
-	serverlog.OperationPluginRepository.Event(s.log.Warn()).Uint("repository_id", repositoryID).Str("error_code", safeLabel(code, 96)).Int64("duration_ms", time.Since(started).Milliseconds()).Msg(serverlog.OperationPluginRepository.Message("刷新失败"))
+	serverlog.RecordBusiness(ctx, s.log, serverlog.OperationPluginRepository, serverlog.BusinessEvent{Code: "plugin.repository.finish", Stage: "refresh", Outcome: "failed", Message: "刷新失败：仓库“" + serverlog.BusinessDisplayName(repositoryName) + "”" + remainingFailureReason(code) + "，未用本次失败结果替换缓存", Fields: map[string]any{"resource_name": repositoryName, "error_code": code, "duration_ms": time.Since(started).Milliseconds()}})
 }
 
 func pluginRepositorySummary(record models.PluginRepository) PluginRepositorySummary {

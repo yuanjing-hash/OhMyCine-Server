@@ -8,8 +8,8 @@ import (
 	"gorm.io/gorm"
 )
 
-// seedNormalUserRole runs in the authorization seed transaction. A custom role
-// with the same code is an administrator's template and must stay untouched.
+// seedNormalUserRole runs in the authorization seed transaction. Its code is
+// distinct from the legacy custom "user" template, whose grants stay untouched.
 func seedNormalUserRole(tx *gorm.DB) error {
 	var role models.Role
 	result := tx.Where("code = ?", authz.RoleUser).Limit(1).Find(&role)
@@ -44,6 +44,7 @@ func seedNormalUserRole(tx *gorm.DB) error {
 		authz.PermissionFollowsUpdateOwn,
 		authz.PermissionJobsControlOwn,
 		authz.PermissionJobsReadOwn,
+		authz.PermissionMediaLibrariesRead,
 		authz.PermissionTransfersReadOwn,
 	}
 	now := time.Now().UTC()

@@ -73,6 +73,8 @@ func (w *TransferWorker) materializeRemoteNodeSource(ctx context.Context, runtim
 	if err != nil {
 		return task, "", err
 	}
+	ctx = withFileDisplayNames(ctx, firstNonEmpty(download.NodeName, "传输节点"), "Server 受控暂存区")
+	w.transferEvent(ctx, task, "node.receive.start", "materialize", "started", "开始接收所选节点已导出的文件，仅记录主 Server 已确认的接收与校验阶段", map[string]any{"total_count": len(manifest.Files)})
 	for _, file := range manifest.Files {
 		if err := ctx.Err(); err != nil {
 			return task, "", err
@@ -105,14 +107,19 @@ func (w *TransferWorker) materializeRemoteNodeSource(ctx context.Context, runtim
 			}
 		}
 		if err := w.pullRemoteFile(ctx, runtime, reader, manifest, file, chunks, managedRoot, destination, &checkpoint); err != nil {
+			display := relativeFileDisplay(file.RelativePath, file.RelativePath, file.Size)
+			w.transferEvent(ctx, task, "node.receive.file_failed", "materialize", "failed", "节点文件尚未完整接收或校验，保留现有断点；未确认入库："+display.description(), display.fields())
 			return task, "", err
 		}
+		display := relativeFileDisplay(file.RelativePath, file.RelativePath, file.Size)
+		w.transferEvent(ctx, task, "node.receive.file", "materialize", "confirmed", "主 Server 已确认节点文件接收与摘要校验，继续原整理流程："+display.description(), display.fields())
 		processed, total := int64(completedRemoteTransferFiles(w.service.db, task.ID)), int64(len(manifest.Files))
 		progress := float64(processed) * 100 / float64(total)
 		if err := runtime.Heartbeat(&progress, &processed, &total, nil, nil); err != nil {
 			return task, "", cloudTransferError(CodeQueueLeaseInvalid, true, err)
 		}
 	}
+	w.transferEvent(ctx, task, "node.receive.finish", "materialize", "finished", "所选节点文件已完成本地接收阶段，后续媒体库放置与入库结果分别记录", map[string]any{"total_count": len(manifest.Files)})
 	return task, managedRoot, nil
 }
 

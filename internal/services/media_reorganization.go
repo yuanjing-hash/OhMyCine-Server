@@ -666,7 +666,7 @@ func NewMediaReorganizationWorker(service *MediaReorganizationService) *MediaReo
 	return &MediaReorganizationWorker{service: service}
 }
 
-func (w *MediaReorganizationWorker) Run(ctx context.Context, runtime JobRuntime, job ClaimedJob) WorkerResult {
+func (w *MediaReorganizationWorker) Run(ctx context.Context, runtime JobRuntime, job ClaimedJob) (result WorkerResult) {
 	var payload mediaReorganizationJobPayload
 	if json.Unmarshal([]byte(job.Job.PayloadJSON), &payload) != nil || payload.ReorganizationTaskID == "" {
 		return WorkerResult{ErrorCode: "media_reorganization_payload_invalid", ErrorMessage: "重新整理任务参数无效"}
@@ -675,6 +675,10 @@ func (w *MediaReorganizationWorker) Run(ctx context.Context, runtime JobRuntime,
 	if w.service.db.First(&task, "id = ?", payload.ReorganizationTaskID).Error != nil {
 		return WorkerResult{ErrorCode: "media_reorganization_task_missing", ErrorMessage: "重新整理任务不存在"}
 	}
+	started := time.Now()
+	ctx = serverlog.WithBusinessFields(ctx, map[string]any{"job_id": task.JobID, "task_id": task.ID, "user_id": task.OwnerID, "library_id": task.LibraryID})
+	w.reorganizationEvent(ctx, task, "reorganization.start", "start", "started", "开始按已确认的重新整理计划核对托管文件、目标命名与目录边界", map[string]any{"total_count": task.TotalItems})
+	defer func() { w.recordReorganizationEnd(ctx, task, started, result) }()
 	if task.Phase == models.MediaReorganizationPhaseCompleted {
 		return WorkerResult{}
 	}
@@ -691,6 +695,7 @@ func (w *MediaReorganizationWorker) Run(ctx context.Context, runtime JobRuntime,
 	if w.service.db.First(&library, task.LibraryID).Error != nil || w.service.db.First(&storage, library.StorageID).Error != nil || w.service.db.First(&transfer, "id = ?", task.TransferTaskID).Error != nil || w.service.db.First(&download, "id = ?", transfer.DownloadTaskID).Error != nil {
 		return w.fail(task, CodeReorganizationUnavailable, "重新整理边界不可用")
 	}
+	ctx = serverlog.WithBusinessFields(ctx, map[string]any{"library_name": library.Name, "source_name": library.Name, "target_name": library.Name, "storage_id": storage.ID})
 	if (state.Catalog == nil || state.Catalog.Stage != "reconciling") && (library.ProfileRevision != task.RuleRevision || libraryRuleFingerprint(library) != plan.RuleFingerprint || download.IdentityRevision != task.SourceIdentityRevision) {
 		return w.fail(task, CodeReorganizationBoundaryChanged, "媒体身份或规则已变化，请重新预览")
 	}
@@ -729,8 +734,14 @@ func (w *MediaReorganizationWorker) Run(ctx context.Context, runtime JobRuntime,
 	// NFO/JPG/STRM manifests, stale-artifact cleanup and downstream refresh all
 	// keep their existing ownership and rate-limit contracts.
 	if w.service.libraries != nil {
-		if _, scanErr := w.service.libraries.reconcile(ctx, library.ID, "reorganization"); scanErr != nil {
+		scanRun, scanErr := w.service.libraries.reconcile(ctx, library.ID, "reorganization")
+		fields := map[string]any{"scan_run_id": scanRun.ID}
+		if scanErr != nil {
+			fields["error_code"] = ErrorCode(scanErr)
+			w.reorganizationEvent(ctx, task, "reorganization.reconcile", "reconcile", "partial", "文件调整已完成，媒体目录或产物核对尚未全部完成；后续扫描按原有流程继续", fields)
 			serverlog.OperationMediaReorganization.Event(w.service.log.Warn()).Str("task_id", task.ID).Uint("library_id", task.LibraryID).Str("error_code", ErrorCode(scanErr)).Msg(serverlog.OperationMediaReorganization.Message("文件已安全重整，媒体产物刷新将在后续扫描重试"))
+		} else {
+			w.reorganizationEvent(ctx, task, "reorganization.reconcile", "reconcile", "finished", "本次媒体目录核对调用已完成；产物与下游刷新结果以其独立阶段为准", fields)
 		}
 	}
 	serverlog.OperationMediaReorganization.Event(w.service.log.Info()).Str("task_id", task.ID).Uint("library_id", task.LibraryID).Int("items", task.TotalItems).Msg(serverlog.OperationMediaReorganization.Message("重新整理完成"))
@@ -760,7 +771,13 @@ func (w *MediaReorganizationWorker) validatePlanBoundary(task models.MediaReorga
 	return nil
 }
 
-func (w *MediaReorganizationWorker) runLocal(ctx context.Context, runtime JobRuntime, task *models.MediaReorganizationTask, library models.MediaLibrary, storage models.Storage, plan reorganizationPlan, state *reorganizationState) error {
+func (w *MediaReorganizationWorker) runLocal(ctx context.Context, runtime JobRuntime, task *models.MediaReorganizationTask, library models.MediaLibrary, storage models.Storage, plan reorganizationPlan, state *reorganizationState) (err error) {
+	var active *reorganizationPlanItem
+	defer func() {
+		if err != nil && active != nil {
+			recordReorganizationFile(ctx, w.service.log, *active, "failed", "本文件重新整理阶段未完成，已确认的前序动作保留")
+		}
+	}()
 	root, err := medialibrary.ResolveRoot(storage.RootPath, library.RelativeRoot)
 	if err != nil {
 		return appError(CodeReorganizationBoundaryChanged, "媒体库目录无效", nil)
@@ -777,6 +794,7 @@ func (w *MediaReorganizationWorker) runLocal(ctx context.Context, runtime JobRun
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		active = &item
 		oldPath, newPath := filepath.Join(root, filepath.FromSlash(item.OldRelativePath)), filepath.Join(root, filepath.FromSlash(item.NewRelativePath))
 		if ensureWithin(root, oldPath) != nil || ensureWithin(root, newPath) != nil || ensureSafeDirectoryPath(root, filepath.Dir(oldPath), false) != nil || ensureSafeDirectoryPath(root, filepath.Dir(newPath), true) != nil {
 			return appError(CodeReorganizationBoundaryChanged, "托管文件路径越界", nil)
@@ -797,6 +815,7 @@ func (w *MediaReorganizationWorker) runLocal(ctx context.Context, runtime JobRun
 			if err := os.Rename(oldPath, newPath); err != nil {
 				return appError(CodeReorganizationUnavailable, "移动托管文件失败", nil)
 			}
+			recordReorganizationFile(ctx, w.service.log, item, "confirmed", "本地移动与新文件名已确认")
 		}
 		state.Completed[item.ManagedItemID] = true
 		if err := w.persistProgress(task, state, item.ManagedItemID, item.NewRelativePath, "", ""); err != nil {
@@ -809,7 +828,13 @@ func (w *MediaReorganizationWorker) runLocal(ctx context.Context, runtime JobRun
 	return nil
 }
 
-func (w *MediaReorganizationWorker) runCloud(ctx context.Context, runtime JobRuntime, task *models.MediaReorganizationTask, library models.MediaLibrary, storage models.Storage, plan reorganizationPlan, state *reorganizationState) error {
+func (w *MediaReorganizationWorker) runCloud(ctx context.Context, runtime JobRuntime, task *models.MediaReorganizationTask, library models.MediaLibrary, storage models.Storage, plan reorganizationPlan, state *reorganizationState) (err error) {
+	var active *reorganizationPlanItem
+	defer func() {
+		if err != nil && active != nil {
+			recordReorganizationFile(ctx, w.service.log, *active, "partial", "云端重新整理未全部确认；移动、命名与目录恢复仍按原流程核对")
+		}
+	}()
 	if storage.ConnectionID == nil || w.service.connections == nil || library.ProviderRootID == "" {
 		return appError(CodeReorganizationUnavailable, "115 重新整理边界不可用", nil)
 	}
@@ -831,6 +856,7 @@ func (w *MediaReorganizationWorker) runCloud(ctx context.Context, runtime JobRun
 			state.Completed[item.ManagedItemID] = true
 			continue
 		}
+		active = &item
 		current, err := providerItemWithinRoot(ctx, driver, item.ProviderItemID, root.ID)
 		if err != nil || cloudReorganizationSourceChanged(item, current) {
 			return appError(CodeReorganizationBoundaryChanged, "115 托管文件已变化", nil)
@@ -850,15 +876,20 @@ func (w *MediaReorganizationWorker) runCloud(ctx context.Context, runtime JobRun
 			if err := mutations.Move(ctx, current.ID, parentID); err != nil {
 				return appError(CodeReorganizationUnavailable, "115 移动失败", nil)
 			}
+			recordReorganizationFile(ctx, w.service.log, item, "accepted", "云端移动请求已受理，尚待现有状态读取确认")
 		}
 		current, err = driver.Stat(ctx, current.ID)
 		if err != nil {
 			return appError(CodeReorganizationUnavailable, "115 移动对账失败", nil)
 		}
+		if current.ParentID == parentID {
+			recordReorganizationFile(ctx, w.service.log, item, "confirmed", "已有状态读取确认文件到达目标目录，文件名仍需单独处理")
+		}
 		if current.Name != name {
 			if err := mutations.Rename(ctx, current.ID, name); err != nil {
 				return appError(CodeReorganizationUnavailable, "115 重命名失败", nil)
 			}
+			recordReorganizationFile(ctx, w.service.log, item, "accepted", "云端重命名请求已受理，最终目录结果由后续流程确认")
 		}
 		state.Completed[item.ManagedItemID] = true
 		if err := w.persistProgress(task, state, item.ManagedItemID, item.NewRelativePath, current.ID, parentID); err != nil {

@@ -59,6 +59,8 @@ func TestSeedingWorkerUsesModeSpecificCleanup(t *testing.T) {
 	}{{models.MediaLibraryTransferCopy, true}, {models.MediaLibraryTransferSymlink, false}} {
 		t.Run(test.mode, func(t *testing.T) {
 			service, queue, _, client, download := seedingFixture(t, test.mode, true)
+			logManager, logger := captureRemainingBusiness(t, "seeding")
+			service.log = logger
 			cleanupCalls := 0
 			service.SetStagingCleanup(func(_ context.Context, downloadTaskID string, deleteData bool) error {
 				cleanupCalls++
@@ -92,6 +94,12 @@ func TestSeedingWorkerUsesModeSpecificCleanup(t *testing.T) {
 			}
 			if task.Phase != models.SeedingTaskStatusCompleted || task.Ratio == nil || *task.Ratio != ratio {
 				t.Fatalf("task=%+v", task)
+			}
+			entries := remainingBusinessEntries(t, logManager)
+			requireRemainingBusinessEvent(t, entries, "seeding.provider.accepted", "accepted")
+			finished := requireRemainingBusinessEvent(t, entries, "seeding.finish", "finished")
+			if finished.Fields["mode"] != test.mode || finished.Fields["downloader_name"] != task.DownloaderName {
+				t.Fatalf("cleanup narrative lost actual mode/downloader: %+v", finished)
 			}
 		})
 	}

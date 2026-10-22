@@ -1,6 +1,7 @@
 package services
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
@@ -9,9 +10,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/rs/zerolog"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/authz"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/metadata/tmdb"
+	sitepkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/site"
 )
 
 func TestFollowSnapshotValidationAndRunSnapshotAreStable(t *testing.T) {
@@ -368,6 +371,9 @@ func TestFollowWorkerUsesCoverageIdentitySearchAndDownloadPipeline(t *testing.T)
 	defer upstream.Close()
 
 	sites, adapter, fixtureActor, store, downloads, downloaders := siteFixture(t)
+	var businessLog bytes.Buffer
+	logger := zerolog.New(zerolog.SyncWriter(&businessLog)).With().Timestamp().Logger()
+	sites.log, downloads.log = logger, logger
 	queue := downloads.queue
 	metadata := NewMetadataSettingsService(queue.db, queue.audit, store, tmdb.Credential{Kind: tmdb.CredentialKindReadAccessToken, Value: "test-token"})
 	metadata.clientFactory = func(tmdb.Credential, string, string) (*tmdb.Client, error) {
@@ -424,6 +430,7 @@ func TestFollowWorkerUsesCoverageIdentitySearchAndDownloadPipeline(t *testing.T)
 	coverage := NewMediaCoverageService(queue.db, metadata)
 	coverage.now = func() time.Time { return current }
 	follows := NewFollowService(queue.db, queue.audit, queue, coverage, NewAuthorizationService(queue.db))
+	follows.SetLogger(logger)
 	follows.now = func() time.Time { return current }
 	follows.SetDownloadService(downloads)
 	snapshot := FollowExecutionSnapshot{
@@ -462,7 +469,8 @@ func TestFollowWorkerUsesCoverageIdentitySearchAndDownloadPipeline(t *testing.T)
 		if claimErr != nil || claimed == nil {
 			t.Fatalf("claim=%+v err=%v", claimed, claimErr)
 		}
-		result := worker.Run(context.Background(), &providerWakeRuntime{}, *claimed)
+		runtime := &followProgressRuntime{}
+		result := worker.Run(context.Background(), runtime, *claimed)
 		if result.ErrorCode != "" || result.ErrorMessage != "" {
 			t.Fatalf("worker result=%+v", result)
 		}
@@ -472,6 +480,17 @@ func TestFollowWorkerUsesCoverageIdentitySearchAndDownloadPipeline(t *testing.T)
 		var run models.FollowRun
 		if err := queue.db.First(&run, "job_id = ?", claimed.Job.ID).Error; err != nil {
 			t.Fatal(err)
+		}
+		var filters map[string]int
+		_ = json.Unmarshal([]byte(run.FilterSummaryJSON), &filters)
+		if run.Status != models.FollowRunFailed && run.ErrorCode == "" && filters["site_error"] == 0 && filters["reservation_failed"] == 0 && (runtime.lastProgress != 100 || runtime.lastProcessed != 4 || runtime.lastTotal != 4) {
+			t.Fatalf("normal terminal execution left stale stage progress: %v %d/%d run=%s", runtime.lastProgress, runtime.lastProcessed, runtime.lastTotal, run.Status)
+		}
+		if run.Status == models.FollowRunFailed && runtime.lastProgress == 100 {
+			t.Fatal("failed run was marked fully successful")
+		}
+		if filters["site_error"] > 0 && runtime.lastProgress == 100 {
+			t.Fatal("partial or failed search was marked fully successful")
 		}
 		return run
 	}
@@ -531,6 +550,29 @@ func TestFollowWorkerUsesCoverageIdentitySearchAndDownloadPipeline(t *testing.T)
 	if task.TargetLibraryID == nil || *task.TargetLibraryID != library.ID || task.RecognitionOverrideTMDBID == nil || *task.RecognitionOverrideTMDBID != 100 || task.RecognitionOverrideSeason == nil || *task.RecognitionOverrideSeason != 1 || task.RecognitionOverrideEpisode == nil || *task.RecognitionOverrideEpisode != 2 {
 		t.Fatalf("follow download lost pipeline identity/target: %+v", task)
 	}
+	firstRecords := businessRecords(t, &businessLog, "follow_run_id", firstRun.ID)
+	queryEvents, terminalEvents := 0, 0
+	for _, event := range firstRecords {
+		switch event["event_code"] {
+		case "site.query.start":
+			queryEvents++
+		case "follow.finish":
+			terminalEvents++
+			if event["candidates"] != float64(firstRun.Candidates) || event["accepted_submissions"] != float64(firstRun.Selected) || event["created"] != float64(1) || event["reused"] != float64(0) || event["alias_requests"] != float64(queryEvents) {
+				t.Fatalf("count semantics or actual requests changed: %+v", event)
+			}
+		}
+	}
+	if queryEvents < 1 || terminalEvents != 1 {
+		t.Fatalf("missing actual site/terminal narrative: queries=%d terminals=%d", queryEvents, terminalEvents)
+	}
+	reused, reuseErr := downloads.Submit(context.Background(), actor, SubmitDownloadInput{DownloaderID: *task.DownloaderID, MediaLibraryID: task.TargetLibraryID, FollowSubscriptionID: task.FollowSubscriptionID, FollowResourceFingerprint: task.FollowResourceFingerprint}, RequestContext{})
+	if reuseErr != nil || reused.ID != task.ID || reused.submissionOutcome != "reused" {
+		t.Fatalf("existing download outcome was not observed at idempotency branch: %+v %v", reused, reuseErr)
+	}
+	if len(businessRecords(t, &businessLog, "event_code", "download.task.reused")) != 1 {
+		t.Fatal("idempotent reuse was presented as new creation")
+	}
 	var claim models.FollowEpisodeClaim
 	if err := queue.db.First(&claim, "subscription_id = ? AND season_number = ? AND episode_number = ?", subscription.ID, 1, 2).Error; err != nil || claim.DownloadTaskID == nil || *claim.DownloadTaskID != task.ID {
 		t.Fatalf("claim=%+v err=%v", claim, err)
@@ -576,6 +618,42 @@ func TestFollowWorkerUsesCoverageIdentitySearchAndDownloadPipeline(t *testing.T)
 	var downloadCount int64
 	if err := queue.db.Model(&models.DownloadTask{}).Where("follow_subscription_id = ?", subscription.ID).Count(&downloadCount).Error; err != nil || downloadCount != 1 {
 		t.Fatalf("download count=%d err=%v", downloadCount, err)
+	}
+	adapter.searchErr["https://follow-worker.example.test"] = sitepkg.ErrUnavailable
+	if _, err := follows.Enqueue(context.Background(), actor, subscription.ID, "manual", RequestContext{}); err != nil {
+		t.Fatal(err)
+	}
+	failedSearch := runNext()
+	if failedSearch.Status != models.FollowRunFailed || failedSearch.ErrorCode != "follow_search_incomplete" || failedSearch.Selected != 0 {
+		t.Fatalf("incomplete search was confused with authoritative no-match: %+v", failedSearch)
+	}
+	failedRecords := businessRecords(t, &businessLog, "follow_run_id", failedSearch.ID)
+	foundFailedSearch := false
+	for _, event := range failedRecords {
+		if event["event_code"] == "follow.finish" && event["outcome"] == "failed" && event["error_code"] == "follow_search_incomplete" {
+			foundFailedSearch = true
+		}
+	}
+	if !foundFailedSearch {
+		t.Fatal("all-site search failure lacked the truthful failed execution outcome")
+	}
+	delete(adapter.searchErr, "https://follow-worker.example.test")
+	adapter.searchTitle = "Fixture.Show.S01E03.1080p.WEB-DL.HEVC-GROUP"
+	adapter.downloadErr = sitepkg.ErrUnavailable
+	if _, err := follows.Enqueue(context.Background(), actor, subscription.ID, "manual", RequestContext{}); err != nil {
+		t.Fatal(err)
+	}
+	failedSubmission := runNext()
+	if failedSubmission.Status != models.FollowRunFailed || failedSubmission.ErrorCode != "follow_submit_failed" || failedSubmission.Candidates != 1 || failedSubmission.Selected != 0 {
+		t.Fatalf("submission failure confused with no matches: %+v", failedSubmission)
+	}
+	if err := queue.db.Model(&models.DownloadTask{}).Where("follow_subscription_id = ?", subscription.ID).Count(&downloadCount).Error; err != nil || downloadCount != 1 {
+		t.Fatalf("rejected source created another download: count=%d err=%v", downloadCount, err)
+	}
+	for _, forbidden := range []string{"server-only-secret", "passkey-server-only", "test-token", "https://follow-worker.example.test", root} {
+		if strings.Contains(businessLog.String(), forbidden) {
+			t.Fatalf("business logs leaked protected data %q", forbidden)
+		}
 	}
 	if _, err := follows.Enqueue(context.Background(), actor, subscription.ID, "manual", RequestContext{}); err != nil {
 		t.Fatal(err)

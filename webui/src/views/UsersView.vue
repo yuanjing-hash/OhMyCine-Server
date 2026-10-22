@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
-import { api } from '@/api/client'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { api, clearCSRFToken } from '@/api/client'
 import { Permissions } from '@/auth/generated-permissions'
 import SecretInput from '@/components/SecretInput.vue'
 import UserResourceAccessPanel from '@/components/UserResourceAccessPanel.vue'
@@ -15,12 +15,21 @@ const createOpen = ref(false); const createForm = ref({ username: '', displayNam
 const editDisplayName = ref(''); const editRoleIDs = ref<number[]>([]); const resetPassword = ref(''); const currentPassword = ref('')
 const permissionCatalog = ref<PermissionDefinition[]>([]); const editRules = ref<AuthorizationRule[]>([])
 const resourceOptions = ref<ResourceAccessOptions | null>(null); const resourceRefreshKey = ref(0)
+const selfPasswordSaved = ref(false)
+const selectionVersion = ref(0)
+const passwordSavingVersion = ref<number | null>(null)
+let disposed = false
 const selected = computed(() => users.value.find(user => user.id === selectedID.value) ?? null)
 const canEditAuthorization = computed(() => auth.can(Permissions.RolesAssign) && Boolean(selected.value) && !selected.value?.is_owner && selected.value?.id !== auth.user?.id)
+const canResetPassword = computed(() => auth.can(Permissions.UsersUpdate) && Boolean(selected.value) && (!selected.value?.is_owner || selected.value.id === auth.user?.id))
+const passwordInputsLocked = computed(() => saving.value && passwordSavingVersion.value === selectionVersion.value)
 const authorizationReadOnlyReason = computed(() => selected.value?.is_owner ? 'Owner 的授权受到保护，此处仅供查看。' : selected.value?.id === auth.user?.id ? '不能修改自己的授权，请由其他管理员调整。' : !auth.can(Permissions.RolesAssign) ? '当前账户仅可查看用户权限。' : '')
 
-watch(selected, user => { editDisplayName.value = user?.display_name ?? ''; editRoleIDs.value = user?.roles.map(role => role.id) ?? []; editRules.value = (user?.authorization_rules ?? []).map(rule => ({ ...rule })); resetPassword.value = ''; currentPassword.value = '' }, { immediate: true })
-watch(selectedID, () => { resourceOptions.value = null })
+watch(selected, user => { editDisplayName.value = user?.display_name ?? ''; editRoleIDs.value = user?.roles.map(role => role.id) ?? []; editRules.value = (user?.authorization_rules ?? []).map(rule => ({ ...rule })); if (!user) clearPasswordDraft() }, { immediate: true })
+watch(selectedID, () => { selectionVersion.value++; clearPasswordDraft(); resourceOptions.value = null; error.value = ''; notice.value = '' }, { flush: 'sync' })
+
+function clearPasswordDraft() { resetPassword.value = ''; currentPassword.value = '' }
+function roleLabel(role: RoleSummary) { return `${role.name} · ${role.kind === 'system' ? '系统模板' : '自定义模板'}` }
 
 async function load() {
   loading.value = users.value.length === 0; error.value = ''
@@ -34,14 +43,21 @@ async function load() {
 }
 
 async function createUser() {
-  saving.value = true; error.value = ''
+  saving.value = true; error.value = ''; notice.value = ''
   try {
     await api('/api/v1/users', { method: 'POST', body: JSON.stringify({ username: createForm.value.username, display_name: createForm.value.displayName, password: createForm.value.password, role_ids: createForm.value.roleIDs }) })
     createForm.value = { username: '', displayName: '', password: '', roleIDs: [] }; createOpen.value = false; notice.value = '用户已创建'; await load()
   } catch (reason) { error.value = message(reason) } finally { saving.value = false }
 }
 
-async function saveProfile() { if (!selected.value) return; await run(async () => { await api(`/api/v1/users/${selected.value?.id}`, { method: 'PATCH', body: JSON.stringify({ display_name: editDisplayName.value }) }); notice.value = '用户资料已保存' }) }
+async function saveProfile() {
+  if (!selected.value || saving.value || !auth.can(Permissions.UsersUpdate)) return
+  const userID = selected.value.id; const version = selectionVersion.value
+  await run(async () => {
+    await api(`/api/v1/users/${userID}`, { method: 'PATCH', body: JSON.stringify({ display_name: editDisplayName.value }) })
+    if (!disposed && selectedID.value === userID && version === selectionVersion.value) notice.value = '用户资料已保存'
+  })
+}
 async function saveRoles() { if (!selected.value || !canEditAuthorization.value) return; const userID = selected.value.id; await run(async () => { await api(`/api/v1/users/${userID}/roles`, { method: 'PUT', body: JSON.stringify({ role_ids: editRoleIDs.value }) }); notice.value = '角色分配已更新'; if (selectedID.value === userID) resourceRefreshKey.value++ }) }
 function addAuthorizationRule() { const code = permissionCatalog.value[0]?.code; if (!code) return; editRules.value.push({ permission_code: code, effect: 'allow', resource_type: '', resource_id: '' }) }
 function removeAuthorizationRule(index: number) { editRules.value.splice(index, 1) }
@@ -51,35 +67,65 @@ function ruleOptions(rule: AuthorizationRule) { return rule.resource_type ? auth
 function changeRuleResourceType(rule: AuthorizationRule) { rule.resource_id = '' }
 function canChooseRuleResource(rule: AuthorizationRule, id: string, deleted: boolean, status: string) { return id === rule.resource_id || (!deleted && !['restricted', 'unavailable'].includes(status)) }
 async function toggleEnabled() { if (!selected.value) return; const action = selected.value.status === 'active' ? 'disable' : 'enable'; await run(async () => { await api(`/api/v1/users/${selected.value?.id}/${action}`, { method: 'POST', body: '{}' }); notice.value = action === 'disable' ? '用户已停用' : '用户已启用' }) }
-async function resetUserPassword() { if (!selected.value || !resetPassword.value) return; await run(async () => { await api(`/api/v1/users/${selected.value?.id}/reset-password`, { method: 'POST', body: JSON.stringify({ password: resetPassword.value, current_password: currentPassword.value }) }); notice.value = '密码已重置，目标用户现有会话已撤销'; resetPassword.value = ''; currentPassword.value = '' }) }
+async function resetUserPassword() {
+  if (!selected.value || !canResetPassword.value || saving.value || !resetPassword.value || !currentPassword.value) return
+  const userID = selected.value.id; const version = selectionVersion.value; const actorID = auth.user?.id
+  const isCurrentTarget = () => !disposed && selectedID.value === userID && version === selectionVersion.value
+  saving.value = true; passwordSavingVersion.value = version; error.value = ''; notice.value = ''
+  try {
+    await api(`/api/v1/users/${userID}/reset-password`, { method: 'POST', body: JSON.stringify({ password: resetPassword.value, current_password: currentPassword.value }) })
+    if (userID === actorID && (!auth.user || auth.user.id === actorID)) {
+      auth.user = null; clearCSRFToken()
+      if (!disposed) { clearPasswordDraft(); createForm.value.password = ''; selfPasswordSaved.value = true }
+      return
+    }
+    if (isCurrentTarget()) {
+      clearPasswordDraft()
+      notice.value = '新密码已保存，目标用户现有会话已撤销'
+    }
+  } catch (reason) { if (isCurrentTarget()) error.value = message(reason) }
+  finally { passwordSavingVersion.value = null; if (!disposed) saving.value = false }
+}
 async function deleteUser() { if (!selected.value || !window.confirm(`确认删除用户 ${selected.value.username}？此操作不可撤销。`)) return; const id = selected.value.id; await run(async () => { await api(`/api/v1/users/${id}`, { method: 'DELETE', body: '{}' }); selectedID.value = null; notice.value = '用户已删除' }) }
 
-async function run(action: () => Promise<void>) { saving.value = true; error.value = ''; try { await action(); await load() } catch (reason) { error.value = message(reason) } finally { saving.value = false } }
+async function run(action: () => Promise<void>) { saving.value = true; error.value = ''; notice.value = ''; try { await action(); if (!disposed) await load() } catch (reason) { if (!disposed) error.value = message(reason) } finally { if (!disposed) saving.value = false } }
 function message(reason: unknown) { return reason instanceof Error ? reason.message : '操作失败' }
 onMounted(load)
+onBeforeUnmount(() => { disposed = true; selectionVersion.value++; clearPasswordDraft(); createForm.value.password = '' })
 </script>
 
 <template>
-  <section>
+  <section v-if="selfPasswordSaved" class="panel" role="status"><h2 class="mt-0">新密码已保存</h2><p class="text-muted">你的现有会话已撤销，请使用新密码重新登录。</p><a class="btn-primary" href="/login">重新登录</a></section>
+  <section v-else>
     <div class="flex flex-wrap items-end justify-between gap-4"><div><h2 class="m-0 text-2xl font-800">账户</h2><p class="page-description mt-2">选择用户后，可单独调整角色、资源名单和直接授权。新用户默认全部资源开放，仍需具备相应功能权限。</p></div><button v-if="auth.can(Permissions.UsersCreate)" class="btn-primary" @click="createOpen = !createOpen">{{ createOpen ? '取消创建' : '创建用户' }}</button></div>
     <p v-if="error" class="semantic-error mt-5 p-3 text-sm" role="alert">{{ error }}</p><p v-if="notice" class="semantic-success mt-5 p-3 text-sm" role="status">{{ notice }}</p>
     <form v-if="createOpen" class="panel mt-6 grid gap-4 md:grid-cols-2 xl:grid-cols-4" @submit.prevent="createUser">
       <div><label class="label">用户名</label><input v-model="createForm.username" class="input" required minlength="3" maxlength="64" /></div>
       <div><label class="label">显示名称</label><input v-model="createForm.displayName" class="input" maxlength="128" /></div>
       <div><label class="label">初始密码</label><SecretInput v-model="createForm.password" class="input" required minlength="8" maxlength="128" autocomplete="new-password" /></div>
-      <div><label class="label">角色</label><select v-if="auth.can(Permissions.RolesRead)" v-model="createForm.roleIDs" class="input min-h-11" multiple><option v-for="role in roles.filter(item => item.active)" :key="role.id" :value="role.id">{{ role.name }}</option></select><p v-else class="text-subtle m-0 text-sm">未授予角色查看权限时，新账户使用默认只读角色。</p></div>
+      <div><label class="label">角色</label><select v-if="auth.can(Permissions.RolesRead)" v-model="createForm.roleIDs" class="input min-h-11" multiple><option v-for="role in roles.filter(item => item.active)" :key="role.id" :value="role.id">{{ roleLabel(role) }}</option></select><p v-else class="text-subtle m-0 text-sm">未授予角色查看权限时，新账户使用默认只读角色。</p></div>
       <button class="btn-primary md:col-span-2 xl:col-span-4" :disabled="saving">创建账户</button>
     </form>
     <div v-if="loading" class="text-subtle mt-8">正在加载用户…</div>
     <div v-else-if="users.length === 0" class="text-subtle panel mt-8">尚无用户。</div>
     <div v-else class="mt-7 grid gap-5 xl:grid-cols-[minmax(16rem,.55fr)_minmax(32rem,1.45fr)]">
-      <div class="panel p-2"><button v-for="user in users" :key="user.id" class="semantic-list-item mb-1 w-full p-3 text-left" :class="{ 'semantic-list-item--selected': selectedID === user.id }" @click="selectedID = user.id"><div class="flex items-center justify-between gap-3"><strong>{{ user.display_name }}</strong><span class="status-chip" :class="user.status === 'active' ? 'status-chip--ready' : ''">{{ user.is_owner ? 'OWNER' : user.status }}</span></div><div class="text-subtle mt-1 text-xs">@{{ user.username }} · {{ user.roles.map(role => role.name).join('、') || '无角色' }}</div></button></div>
+      <div class="panel p-2"><button v-for="user in users" :key="user.id" class="semantic-list-item mb-1 w-full p-3 text-left" :class="{ 'semantic-list-item--selected': selectedID === user.id }" @click="selectedID = user.id"><div class="flex items-center justify-between gap-3"><strong>{{ user.display_name }}</strong><span class="status-chip" :class="user.status === 'active' ? 'status-chip--ready' : ''">{{ user.is_owner ? 'OWNER' : user.status }}</span></div><div class="text-subtle mt-1 text-xs">@{{ user.username }} · {{ user.roles.map(roleLabel).join('、') || '无角色' }}</div></button></div>
       <section v-if="selected" class="panel">
         <div class="flex items-start justify-between gap-4"><div><h2 class="m-0">{{ selected.display_name }}</h2><p class="text-subtle mt-1 text-sm">@{{ selected.username }} · 创建于 {{ new Date(selected.created_at).toLocaleString() }}</p></div><span v-if="selected.is_owner" class="status-chip status-chip--planned">实例 Owner</span></div>
         <div class="mt-6 grid gap-5 md:grid-cols-2">
-          <form class="space-y-3" @submit.prevent="saveProfile"><div><label class="label">显示名称</label><input v-model="editDisplayName" class="input" :disabled="!auth.can(Permissions.UsersUpdate)" /></div><button v-if="auth.can(Permissions.UsersUpdate)" class="btn-secondary w-full" :disabled="saving">保存资料</button></form>
-          <form v-if="auth.can(Permissions.RolesRead)" class="space-y-3" @submit.prevent="saveRoles"><div><label class="label">角色（功能权限并集）</label><select v-model="editRoleIDs" class="input min-h-28" multiple :disabled="!canEditAuthorization || saving"><option v-for="role in roles.filter(item => item.active)" :key="role.id" :value="role.id">{{ role.name }} · {{ role.code }}</option></select></div><button v-if="auth.can(Permissions.RolesAssign)" class="btn-secondary w-full" :disabled="saving || !canEditAuthorization">保存角色</button></form>
+          <form class="space-y-3" @submit.prevent="saveProfile"><div><label class="label" for="user-display-name">显示名称</label><input id="user-display-name" v-model="editDisplayName" class="input" :disabled="!auth.can(Permissions.UsersUpdate) || saving" /></div><p class="text-subtle m-0 text-xs">保存资料仅更新显示名称，修改密码请点击下方“保存新密码”。</p><button v-if="auth.can(Permissions.UsersUpdate)" class="btn-secondary w-full" :disabled="saving">保存资料</button></form>
+          <form v-if="auth.can(Permissions.RolesRead)" class="space-y-3" @submit.prevent="saveRoles"><div><label class="label">角色（功能权限并集）</label><select v-model="editRoleIDs" class="input min-h-28" multiple :disabled="!canEditAuthorization || saving"><option v-for="role in roles.filter(item => item.active)" :key="role.id" :value="role.id">{{ roleLabel(role) }} · {{ role.code }}</option></select></div><button v-if="auth.can(Permissions.RolesAssign)" class="btn-secondary w-full" :disabled="saving || !canEditAuthorization">保存角色</button></form>
         </div>
+        <form v-if="canResetPassword" class="semantic-divider mt-6 border-t pt-5" aria-labelledby="user-password-title" @submit.prevent="resetUserPassword">
+          <h3 id="user-password-title" class="mt-0 text-sm">修改密码</h3>
+          <p class="text-subtle text-xs">请输入当前操作者自己的密码完成认证。保存后，该用户的现有登录会话会被撤销。</p>
+          <div class="grid gap-3 md:grid-cols-2">
+            <div><label class="label" for="user-new-password">新密码</label><SecretInput id="user-new-password" v-model="resetPassword" class="input" minlength="8" maxlength="128" required autocomplete="new-password" placeholder="至少 8 位新密码" :disabled="passwordInputsLocked" :reset-key="selectionVersion" /></div>
+            <div><label class="label" for="user-current-password">当前操作者密码（重新认证）</label><SecretInput id="user-current-password" v-model="currentPassword" class="input" required autocomplete="current-password" :disabled="passwordInputsLocked" :reset-key="selectionVersion" /></div>
+          </div>
+          <p v-if="resetPassword || currentPassword" class="text-muted mb-0 mt-3 text-xs" role="status">新密码尚未保存，请点击“保存新密码”。</p>
+          <button class="btn-primary mt-3" :disabled="saving">保存新密码</button>
+        </form>
         <section class="semantic-divider mt-6 border-t pt-5" aria-labelledby="user-permissions-title">
           <h3 id="user-permissions-title" class="mb-4 mt-0 text-lg">权限设置</h3>
           <UserResourceAccessPanel :key="selected.id" :user-id="selected.id" :editable="canEditAuthorization" :read-only-reason="authorizationReadOnlyReason" :refresh-key="resourceRefreshKey" :busy="saving" @options="onResourceOptions" />
@@ -99,7 +145,6 @@ onMounted(load)
           </div><p v-else class="text-subtle mt-4 text-sm">未配置直接规则，完全继承角色权限。</p>
           <button v-if="auth.can(Permissions.RolesAssign)" class="btn-secondary mt-4" :disabled="saving || !canEditAuthorization || editRules.some(rule => Boolean(rule.resource_type) && !rule.resource_id)">保存直接授权</button>
         </form>
-        <form v-if="auth.can(Permissions.UsersUpdate) && (!selected.is_owner || selected.id === auth.user?.id)" class="semantic-divider mt-6 border-t pt-5" @submit.prevent="resetUserPassword"><h3 class="mt-0 text-sm">重置密码</h3><div class="grid gap-3 md:grid-cols-2"><SecretInput v-model="resetPassword" class="input" minlength="8" maxlength="128" required autocomplete="new-password" placeholder="至少 8 位新密码" /><SecretInput v-model="currentPassword" class="input" required autocomplete="current-password" placeholder="当前操作者密码（重新认证）" /></div><button class="btn-secondary mt-3" :disabled="saving">重置并撤销目标会话</button></form>
         <div class="semantic-divider mt-6 flex flex-wrap gap-3 border-t pt-5"><button v-if="selected.status === 'active' && auth.can(Permissions.UsersDisable)" class="btn-danger" :disabled="saving || selected.is_owner || selected.id === auth.user?.id" @click="toggleEnabled">停用账户</button><button v-else-if="selected.status === 'disabled' && auth.can(Permissions.UsersUpdate)" class="btn-secondary" :disabled="saving || selected.id === auth.user?.id" @click="toggleEnabled">启用账户</button><button v-if="auth.can(Permissions.UsersDelete)" class="btn-danger" :disabled="saving || selected.is_owner || selected.id === auth.user?.id" @click="deleteUser">删除账户</button></div>
       </section>
     </div>

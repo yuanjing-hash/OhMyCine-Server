@@ -49,6 +49,7 @@ var (
 	OperationEmbyProxyGateway               = Operation{"emby_proxy_gateway", "Emby302网关"}
 	OperationPan115SidecarUpload            = Operation{"pan115_sidecar_upload", "115旁挂上传"}
 	OperationPan115MultiDevicePlayback      = Operation{"pan115_multi_device_playback", "115多设备播放"}
+	OperationPan115RecycleCleanup           = Operation{"pan115_recycle_cleanup", "115回收站清理"}
 	OperationPan115PlaybackCleanup          = Operation{"pan115_playback_cleanup", "115临时副本清理"}
 	OperationArtifactCleanup                = Operation{"artifact_cleanup", "产物清理"}
 	OperationDownloadStagingCleanup         = Operation{"download_staging_cleanup", "下载暂存清理"}
@@ -64,6 +65,9 @@ var (
 	OperationMediaReorganization            = Operation{"media_reorganization", "修正识别与重新整理"}
 	OperationSeedingManagement              = Operation{"seeding_management", "做种管理"}
 	OperationTaskQueue                      = Operation{"task_queue", "系统任务队列"}
+	OperationFollowSearch                   = Operation{"follow_search", "自动追更"}
+	OperationMediaServerRefresh             = Operation{"media_server_refresh", "媒体服务器刷新"}
+	OperationUnifiedSchedule                = Operation{"unified_schedule", "计划任务"}
 	OperationPluginRepository               = Operation{"plugin_repository", "插件仓库"}
 	OperationPluginRuntime                  = Operation{"plugin_runtime", "插件运行时"}
 	OperationDiscoveryRecommendation        = Operation{"discovery_recommendation", "影视推荐"}
@@ -117,6 +121,10 @@ func OperationForHTTPRoute(route string) Operation {
 		return OperationMediaLibraryManagement
 	case strings.HasPrefix(route, "/jobs"), strings.HasPrefix(route, "/job-lanes"), strings.HasPrefix(route, "/queue"):
 		return OperationTaskQueue
+	case strings.HasPrefix(route, "/follows"), strings.HasPrefix(route, "/discovery/follows"):
+		return OperationFollowSearch
+	case strings.HasPrefix(route, "/schedules"):
+		return OperationUnifiedSchedule
 	case strings.HasPrefix(route, "/transfers"):
 		return OperationMediaTransfer
 	case strings.HasPrefix(route, "/media/reorganizations"):

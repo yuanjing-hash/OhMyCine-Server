@@ -9,7 +9,7 @@ import { APIError } from './api/client'
 
 const mocks = vi.hoisted(() => ({ list: vi.fn(), detail: vi.fn(), attempts: vi.fn(), timeline: vi.fn(), api: vi.fn(), followAction: vi.fn() }))
 vi.mock('@/follows', async original => ({ ...await original<object>(), followAction: mocks.followAction }))
-vi.mock('@/stores/auth', () => ({ useAuthStore: () => ({ user: { id: 1 }, can: () => true, canAny: () => true }) }))
+vi.mock('@/stores/auth', () => ({ useAuthStore: () => ({ user: { id: 1, permissions: [] }, can: () => true, canAny: () => true }) }))
 vi.mock('@/jobs', async original => ({ ...await original<object>(), listJobs: mocks.list, getJob: mocks.detail, getAttempts: mocks.attempts, getTimeline: mocks.timeline }))
 vi.mock('@/api/client', async original => ({ ...await original<object>(), api: mocks.api }))
 
@@ -35,6 +35,7 @@ const wrappers: VueWrapper[] = []
 async function open(path = '/automation/tasks') {
   const router = createRouter({ history: createMemoryHistory(), routes: [
     { path: '/automation/tasks', component: TasksView }, { path: '/subscriptions/manage', component: FollowsView },
+    { path: '/logs/runtime', component: { template: '<div />' } },
   ] })
   await router.push(path)
   await router.isReady()
@@ -46,6 +47,7 @@ async function open(path = '/automation/tasks') {
 beforeEach(() => {
   vi.clearAllMocks()
   mocks.api.mockReset()
+  mocks.api.mockResolvedValue({ list: [], snapshot_to: '2026-09-05T00:01:00Z', partial: false, availability: 'unavailable' })
   mocks.followAction.mockResolvedValue(undefined)
   Socket.instances = []
   vi.stubGlobal('WebSocket', Socket)

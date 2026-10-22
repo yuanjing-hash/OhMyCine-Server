@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"strings"
 	"time"
@@ -321,7 +322,7 @@ func (s *SeedingService) List(actor Actor, limit int) ([]SeedingTaskSummary, err
 
 // Stop is an explicit destructive operation. copy tasks delete provider data;
 // symlink tasks never do so because the library link depends on that source.
-func (s *SeedingService) Stop(ctx context.Context, actor Actor, id string, request RequestContext) (SeedingTaskSummary, error) {
+func (s *SeedingService) Stop(ctx context.Context, actor Actor, id string, request RequestContext) (summary SeedingTaskSummary, resultErr error) {
 	var task models.SeedingTask
 	if err := s.db.First(&task, "id = ?", strings.TrimSpace(id)).Error; err != nil {
 		return SeedingTaskSummary{}, downloadTaskNotFound(err)
@@ -329,6 +330,13 @@ func (s *SeedingService) Stop(ctx context.Context, actor Actor, id string, reque
 	if !actor.Can(authz.PermissionDownloadsManageAll) && (task.OwnerID != actor.User.ID || !actor.Can(authz.PermissionJobsControlOwn)) {
 		return SeedingTaskSummary{}, appError(CodePermissionDenied, "无权停止该做种任务", nil)
 	}
+	started := time.Now()
+	ctx = serverlog.WithBusinessFields(ctx, seedingBusinessFields(task))
+	defer func() {
+		fields := seedingBusinessFields(task)
+		fields["user_id"], fields["request_id"] = actor.User.ID, request.RequestID
+		remainingBusinessResult(ctx, s.log, serverlog.OperationSeedingManagement, "seeding.manual.finish", "cleanup", "手动结束做种流程已返回，管理记录已结束；任务移除和数据保留策略见本次处理记录", "手动结束做种流程未完成", started, fields, resultErr)
+	}()
 	if task.Phase != models.SeedingTaskStatusCompleted {
 		if err := s.cleanupProvider(ctx, &task); err != nil && !providerTaskMissing(err) {
 			return SeedingTaskSummary{}, appError(CodeDownloaderUnavailable, "下载器未能停止做种，请稍后重试", nil)
@@ -373,7 +381,42 @@ func (s *SeedingService) cleanupProvider(ctx context.Context, task *models.Seedi
 	if err != nil {
 		return err
 	}
-	return client.Cancel(ctx, task.ProviderTaskID, task.DeleteData)
+	policy := "仅移除下载器任务，保留下载数据"
+	if task.DeleteData {
+		policy = "移除下载器任务并请求删除下载数据"
+	}
+	fields := seedingBusinessFields(*task)
+	fields["resource_name"] = download.DisplayName
+	serverlog.RecordBusiness(ctx, s.log, serverlog.OperationSeedingManagement, serverlog.BusinessEvent{Code: "seeding.cleanup.start", Stage: "cleanup", Outcome: "started", Message: "开始处理“" + serverlog.BusinessDisplayName(download.DisplayName) + "”：" + policy, Fields: fields})
+	err = client.Cancel(ctx, task.ProviderTaskID, task.DeleteData)
+	if err == nil || providerTaskMissing(err) {
+		serverlog.RecordBusiness(ctx, s.log, serverlog.OperationSeedingManagement, serverlog.BusinessEvent{Code: "seeding.provider.accepted", Stage: "cleanup", Outcome: "accepted", Message: "下载器“" + serverlog.BusinessDisplayName(task.DownloaderName) + "”已接受任务移除或确认任务已不存在；策略：" + policy + "，后续还需处理暂存清理和管理记录", Fields: fields})
+	}
+	return err
+}
+
+func seedingBusinessFields(task models.SeedingTask) map[string]any {
+	fields := map[string]any{"job_id": task.JobID, "task_id": task.ID, "downloader_name": task.DownloaderName, "mode": task.TransferMode}
+	if task.DownloaderID != nil {
+		fields["downloader_id"] = *task.DownloaderID
+	}
+	if task.DeleteData {
+		fields["action"] = "remove_task_and_data"
+	} else {
+		fields["action"] = "remove_task_keep_data"
+	}
+	return fields
+}
+
+func seedingProgressMessage(task models.SeedingTask) string {
+	timeText, ratioText := "未知", "未知"
+	if task.SeededSeconds != nil {
+		timeText = fmt.Sprintf("%d 分钟", *task.SeededSeconds/60)
+	}
+	if task.Ratio != nil {
+		ratioText = fmt.Sprintf("%.2f", *task.Ratio)
+	}
+	return "当前做种时长 " + timeText + "，分享率 " + ratioText
 }
 
 func (s *SeedingService) enforceSafeDeleteData(task *models.SeedingTask) {
@@ -414,6 +457,7 @@ func NewSeedingWorker(service *SeedingService) *SeedingWorker {
 // DeleteData flag before the queue acknowledges cancellation.
 func (w *SeedingWorker) Interrupt(ctx context.Context, job ClaimedJob, action string) error {
 	if action == "pause" {
+		serverlog.RecordBusiness(ctx, w.service.log, serverlog.OperationSeedingManagement, serverlog.BusinessEvent{Code: "seeding.monitor.paused", Stage: "monitor", Outcome: "confirmed", Message: "本次做种监测已停止，下载器中的做种任务和数据保持原状，恢复监测后继续采样", Fields: map[string]any{"job_id": job.Job.ID, "resource_name": job.Job.DisplayName}})
 		return nil
 	}
 	if action != "cancel" {
@@ -439,7 +483,11 @@ func (w *SeedingWorker) Interrupt(ctx context.Context, job ClaimedJob, action st
 			return err
 		}
 	}
-	return w.service.finish(task, nil, "task_center", RequestContext{})
+	if err := w.service.finish(task, nil, "task_center", RequestContext{}); err != nil {
+		return err
+	}
+	serverlog.RecordBusiness(ctx, w.service.log, serverlog.OperationSeedingManagement, serverlog.BusinessEvent{Code: "seeding.control.finish", Stage: "cleanup", Outcome: "finished", Message: "任务中心请求的做种清理流程已返回，做种管理记录已结束", Fields: seedingBusinessFields(task)})
+	return nil
 }
 
 func (w *SeedingWorker) Run(ctx context.Context, _ JobRuntime, job ClaimedJob) WorkerResult {
@@ -452,41 +500,49 @@ func (w *SeedingWorker) Run(ctx context.Context, _ JobRuntime, job ClaimedJob) W
 		return WorkerResult{ErrorCode: "seeding_task_missing", ErrorMessage: "做种任务不存在"}
 	}
 	w.service.enforceSafeDeleteData(&task)
-	serverlog.OperationSeedingManagement.Event(w.service.log.Info()).Str("task_id", task.ID).Msg(serverlog.OperationSeedingManagement.Message("开始检查做种状态"))
+	ctx = serverlog.WithBusinessFields(ctx, seedingBusinessFields(task))
+	serverlog.OperationSeedingManagement.Event(w.service.log.Debug()).Str("task_id", task.ID).Msg(serverlog.OperationSeedingManagement.Message("检查做种状态"))
 	if task.Phase == models.SeedingTaskStatusCompleted {
+		serverlog.RecordBusiness(ctx, w.service.log, serverlog.OperationSeedingManagement, serverlog.BusinessEvent{Code: "seeding.skip", Stage: "monitor", Outcome: "skipped", Message: "做种管理记录已经结束，本次不重复清理"})
 		return WorkerResult{}
 	}
 	if task.DownloaderID == nil {
-		return w.fail(task, "seeding_downloader_missing", "原下载器配置已不存在")
+		return w.fail(task, "seeding_downloader_missing", "原下载器配置已不存在", ctx)
 	}
 	var download models.DownloadTask
 	if err := w.service.db.First(&download, "id = ?", task.DownloadTaskID).Error; err != nil {
-		return w.fail(task, "seeding_download_missing", "原下载任务不存在")
+		return w.fail(task, "seeding_download_missing", "原下载任务不存在", ctx)
+	}
+	ctx = serverlog.WithBusinessFields(ctx, map[string]any{"resource_name": download.DisplayName})
+	if task.LastSampledAt == nil {
+		serverlog.RecordBusiness(ctx, w.service.log, serverlog.OperationSeedingManagement, serverlog.BusinessEvent{Code: "seeding.start", Stage: "monitor", Outcome: "started", Message: "开始检查“" + serverlog.BusinessDisplayName(download.DisplayName) + "”在下载器“" + serverlog.BusinessDisplayName(task.DownloaderName) + "”的做种状态"})
 	}
 	client, err := w.service.downloaders.clientForDownloadTask(ctx, download)
 	if err != nil {
-		return w.retry(task, "seeding_downloader_unavailable", "暂时无法连接下载器")
+		return w.retry(task, "seeding_downloader_unavailable", "暂时无法连接下载器", ctx)
 	}
 	provider, err := client.Get(ctx, task.ProviderTaskID)
 	if err != nil {
 		if providerTaskMissing(err) {
 			if w.service.stagingCleanup != nil {
 				if cleanupErr := w.service.stagingCleanup(ctx, task.DownloadTaskID, task.DeleteData); cleanupErr != nil {
-					return w.retry(task, "download_staging_cleanup_failed", "下载暂存清理失败")
+					return w.retry(task, "download_staging_cleanup_failed", "下载暂存清理失败", ctx)
 				}
 			}
 			if err := w.service.finish(task, nil, "provider_missing", RequestContext{}); err != nil {
 				return WorkerResult{ErrorCode: "seeding_state_persist_failed", ErrorMessage: "做种清理结果保存失败"}
 			}
+			serverlog.RecordBusiness(ctx, w.service.log, serverlog.OperationSeedingManagement, serverlog.BusinessEvent{Code: "seeding.finish", Stage: "cleanup", Outcome: "finished", Message: "下载器已无此任务，暂存清理已返回，做种管理记录已结束", Fields: map[string]any{"reason": "provider_missing"}})
 			return WorkerResult{}
 		}
 		code, retryable := downloadpkg.ErrorInfo(err)
 		if retryable {
-			return w.retry(task, code, "暂时无法读取做种状态")
+			return w.retry(task, code, "暂时无法读取做种状态", ctx)
 		}
-		return w.fail(task, code, "下载器拒绝读取做种状态")
+		return w.fail(task, code, "下载器拒绝读取做种状态", ctx)
 	}
 	now := time.Now().UTC()
+	previousPhase := task.Phase
 	phase := models.SeedingTaskStatusSeeding
 	if !task.CleanupEnabled {
 		phase = models.SeedingTaskStatusRetained
@@ -498,29 +554,40 @@ func (w *SeedingWorker) Run(ctx context.Context, _ JobRuntime, job ClaimedJob) W
 	task.Ratio, task.SeededSeconds, task.UploadedBytes = provider.Ratio, provider.SeededSeconds, provider.UploadedBytes
 	if !task.CleanupEnabled {
 		next := now.Add(seedingSampleInterval)
+		if previousPhase != phase {
+			serverlog.RecordBusiness(ctx, w.service.log, serverlog.OperationSeedingManagement, serverlog.BusinessEvent{Code: "seeding.retained", Stage: "monitor", Outcome: "skipped", Message: "“" + serverlog.BusinessDisplayName(download.DisplayName) + "”未启用自动做种清理，保留下载器任务和数据，后续仅定期采样", Fields: map[string]any{"reason": "cleanup_disabled"}})
+		}
 		serverlog.OperationSeedingManagement.Event(w.service.log.Debug()).Str("task_id", task.ID).Str("phase", phase).Time("next_sample_at", next).Msg(serverlog.OperationSeedingManagement.Message("保留任务，等待下次采样"))
 		return WorkerResult{RetryAt: &next}
 	}
 	if !seedingThresholdReached(task) {
 		next := now.Add(seedingSampleInterval)
+		if previousPhase != phase {
+			serverlog.RecordBusiness(ctx, w.service.log, serverlog.OperationSeedingManagement, serverlog.BusinessEvent{Code: "seeding.wait", Stage: "monitor", Outcome: "waiting", Message: fmt.Sprintf("“%s”尚未达到做种清理条件，将继续采样；%s；目标时间 %d 分钟、目标分享率 %.2f，组合规则 %s", serverlog.BusinessDisplayName(download.DisplayName), seedingProgressMessage(task), task.MinimumSeedMinutes, task.MinimumRatio, map[string]string{models.SeedingCompletionAll: "全部满足", models.SeedingCompletionAny: "满足任一"}[task.CompletionMode]), Fields: map[string]any{"reason": "threshold_not_reached"}})
+		}
 		serverlog.OperationSeedingManagement.Event(w.service.log.Debug()).Str("task_id", task.ID).Str("phase", phase).Time("next_sample_at", next).Msg(serverlog.OperationSeedingManagement.Message("尚未达到清理条件"))
 		return WorkerResult{RetryAt: &next}
 	}
-	serverlog.OperationSeedingManagement.Event(w.service.log.Info()).Str("task_id", task.ID).Bool("delete_data", task.DeleteData).Msg(serverlog.OperationSeedingManagement.Message("已达到条件，开始清理下载器任务"))
+	cleanupPolicy := "仅移除下载器任务，保留下载数据"
+	if task.DeleteData {
+		cleanupPolicy = "移除下载器任务并请求删除下载数据"
+	}
+	serverlog.RecordBusiness(ctx, w.service.log, serverlog.OperationSeedingManagement, serverlog.BusinessEvent{Code: "seeding.cleanup.start", Stage: "cleanup", Outcome: "started", Message: "“" + serverlog.BusinessDisplayName(download.DisplayName) + "”已达到做种条件，" + seedingProgressMessage(task) + "；本次策略：" + cleanupPolicy})
 	_ = w.service.db.Model(&task).Updates(map[string]any{"phase": models.SeedingTaskStatusCleanup, "updated_at": now}).Error
 	if err := client.Cancel(ctx, task.ProviderTaskID, task.DeleteData); err != nil && !providerTaskMissing(err) {
 		code, _ := downloadpkg.ErrorInfo(err)
-		return w.retry(task, code, "下载器暂时无法完成做种清理")
+		return w.retry(task, code, "下载器暂时无法完成做种清理", ctx)
 	}
+	serverlog.RecordBusiness(ctx, w.service.log, serverlog.OperationSeedingManagement, serverlog.BusinessEvent{Code: "seeding.provider.accepted", Stage: "cleanup", Outcome: "accepted", Message: "下载器已接受任务移除或确认任务已不存在，继续处理受管暂存清理；此记录不证明所有下载数据已删除"})
 	if w.service.stagingCleanup != nil {
 		if err := w.service.stagingCleanup(ctx, task.DownloadTaskID, task.DeleteData); err != nil {
-			return w.retry(task, "download_staging_cleanup_failed", "下载暂存清理失败")
+			return w.retry(task, "download_staging_cleanup_failed", "下载暂存清理失败", ctx)
 		}
 	}
 	if err := w.service.finish(task, nil, "threshold", RequestContext{}); err != nil {
 		return WorkerResult{ErrorCode: "seeding_state_persist_failed", ErrorMessage: "做种清理结果保存失败"}
 	}
-	serverlog.OperationSeedingManagement.Event(w.service.log.Info()).Str("task_id", task.ID).Bool("delete_data", task.DeleteData).Msg(serverlog.OperationSeedingManagement.Message("清理完成"))
+	serverlog.RecordBusiness(ctx, w.service.log, serverlog.OperationSeedingManagement, serverlog.BusinessEvent{Code: "seeding.finish", Stage: "cleanup", Outcome: "finished", Message: "“" + serverlog.BusinessDisplayName(download.DisplayName) + "”的任务移除请求与暂存清理流程已返回，做种管理记录已结束"})
 	return WorkerResult{}
 }
 
@@ -534,7 +601,7 @@ func seedingThresholdReached(task models.SeedingTask) bool {
 	return (!timeEnabled || timeReached) && (!ratioEnabled || ratioReached) && (timeEnabled || ratioEnabled)
 }
 
-func (w *SeedingWorker) retry(task models.SeedingTask, code, message string) WorkerResult {
+func (w *SeedingWorker) retry(task models.SeedingTask, code, message string, contexts ...context.Context) WorkerResult {
 	now := time.Now().UTC()
 	next := now.Add(seedingSampleInterval)
 	phase := models.SeedingTaskStatusSeeding
@@ -542,12 +609,24 @@ func (w *SeedingWorker) retry(task models.SeedingTask, code, message string) Wor
 		phase = models.SeedingTaskStatusRetained
 	}
 	_ = w.service.db.Model(&task).Updates(map[string]any{"phase": phase, "last_error_code": safeLabel(code, 96), "updated_at": now}).Error
-	serverlog.OperationSeedingManagement.Event(w.service.log.Warn()).Str("task_id", task.ID).Str("error_code", safeLabel(code, 96)).Time("retry_at", next).Msg(serverlog.OperationSeedingManagement.Message("状态读取或清理暂时失败，将自动重试"))
+	fields := seedingBusinessFields(task)
+	fields["error_code"] = code
+	ctx := context.Background()
+	if len(contexts) > 0 {
+		ctx = contexts[0]
+	}
+	serverlog.RecordBusiness(ctx, w.service.log, serverlog.OperationSeedingManagement, serverlog.BusinessEvent{Code: "seeding.retry", Stage: "monitor", Outcome: "retry", Message: "下载器“" + serverlog.BusinessDisplayName(task.DownloaderName) + "”的做种状态读取或清理未完成：" + message + "，将按原采样策略重试", Fields: fields})
 	return WorkerResult{RetryAt: &next, ErrorCode: safeLabel(code, 96), ErrorMessage: message}
 }
 
-func (w *SeedingWorker) fail(task models.SeedingTask, code, message string) WorkerResult {
+func (w *SeedingWorker) fail(task models.SeedingTask, code, message string, contexts ...context.Context) WorkerResult {
 	_ = w.service.db.Model(&task).Updates(map[string]any{"phase": models.SeedingTaskStatusFailed, "last_error_code": safeLabel(code, 96), "updated_at": time.Now().UTC()}).Error
-	serverlog.OperationSeedingManagement.Event(w.service.log.Error()).Str("task_id", task.ID).Str("error_code", safeLabel(code, 96)).Msg(serverlog.OperationSeedingManagement.Message("失败"))
+	fields := seedingBusinessFields(task)
+	fields["error_code"] = code
+	ctx := context.Background()
+	if len(contexts) > 0 {
+		ctx = contexts[0]
+	}
+	serverlog.RecordBusiness(ctx, w.service.log, serverlog.OperationSeedingManagement, serverlog.BusinessEvent{Code: "seeding.failed", Stage: "monitor", Outcome: "failed", Message: "下载器“" + serverlog.BusinessDisplayName(task.DownloaderName) + "”的做种管理未能完成：" + message, Fields: fields})
 	return WorkerResult{ErrorCode: safeLabel(code, 96), ErrorMessage: message}
 }

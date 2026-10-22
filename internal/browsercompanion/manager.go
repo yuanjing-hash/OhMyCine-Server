@@ -28,9 +28,25 @@ func (e *Failure) Error() string { return e.Code }
 func ErrorCode(err error) string {
 	var failure *Failure
 	if errors.As(err, &failure) {
-		return failure.Code
+		return SafeErrorCode(failure.Code)
 	}
 	return "browser_component_unavailable"
+}
+
+// SafeErrorCode is the finite companion diagnostic vocabulary exposed to callers.
+// Unknown values can contain launch argv, profile paths or credentials.
+func SafeErrorCode(code string) string {
+	switch code {
+	case "", "browser_component_unavailable", "browser_companion_missing", "browser_node_missing",
+		"browser_request_failed", "browser_request_timeout", "browser_not_installed", "license_required",
+		"browser_launch_failed", "browser_sandbox_unavailable", "browser_dependencies_missing",
+		"browser_executable_unavailable", "browser_launch_timeout", "browser_profile_unavailable",
+		"browser_navigation_failed", "browser_reload_post_denied", "network_denied", "network_timeout",
+		"resource_network_denied", "resource_network_timeout", "resource_network_failed", "resource_limit_exceeded", "session_expired", "session_unavailable":
+		return code
+	default:
+		return "browser_launch_failed"
+	}
 }
 
 type Caller interface {
@@ -199,8 +215,7 @@ func (m *Manager) call(ctx context.Context, operation string, input, output any)
 			Error string `json:"error"`
 		}
 		if json.Unmarshal(body, &failure) == nil {
-			switch failure.Error {
-			case "browser_request_failed", "browser_request_timeout", "browser_not_installed", "license_required", "browser_launch_failed", "browser_navigation_failed", "browser_reload_post_denied", "network_denied", "network_timeout", "resource_network_denied", "resource_network_timeout", "resource_network_failed", "resource_limit_exceeded", "session_expired":
+			if failure.Error != "" && SafeErrorCode(failure.Error) == failure.Error {
 				return &Failure{Code: failure.Error}
 			}
 		}

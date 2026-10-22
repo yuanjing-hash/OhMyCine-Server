@@ -76,7 +76,7 @@ func migrateQuarkAccountBudgets(db *gorm.DB) error {
 			}
 			if merged.LeaseUntil.After(now) {
 				// Old runtime tokens must not release the merged admission row.
-				merged.LeaseToken = "quark-budget-migration-119"
+				merged.LeaseToken = "quark-budget-migration-121"
 			}
 			if err := db.Save(&merged).Error; err != nil {
 				return err

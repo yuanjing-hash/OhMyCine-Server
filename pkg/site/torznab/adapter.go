@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/xml"
+	"errors"
 	"io"
 	"net/http"
 	"net/url"
@@ -65,6 +66,11 @@ func (a *Adapter) Test(ctx context.Context, config site.Config) (site.Health, er
 }
 
 func (a *Adapter) Search(ctx context.Context, config site.Config, query site.Query) (site.Page, error) {
+	if config.SearchTimeout < 3*time.Second || config.SearchTimeout > 180*time.Second {
+		config.SearchTimeout = 120 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(ctx, config.SearchTimeout)
+	defer cancel()
 	keyword := strings.TrimSpace(query.Keyword)
 	if keyword == "" || len([]rune(keyword)) > 160 || query.Page < 1 || query.Page > 20 {
 		return site.Page{}, site.ErrInvalidReply
@@ -289,7 +295,7 @@ func requestTarget(ctx context.Context, client *http.Client, target *url.URL, ac
 	request.Header.Set("Accept", accept)
 	response, err := client.Do(request)
 	if err != nil {
-		return nil, 0, site.ErrUnavailable
+		return nil, 0, errors.Join(site.ErrUnavailable, err)
 	}
 	defer func() { _ = response.Body.Close() }()
 	if response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden {
@@ -319,10 +325,7 @@ func controlledClient(config site.Config) (*http.Client, *url.URL, error) {
 	if err != nil || (base.Scheme != "http" && base.Scheme != "https") || base.Host == "" || base.User != nil || base.RawQuery != "" || base.Fragment != "" {
 		return nil, nil, site.ErrUnavailable
 	}
-	timeout := config.Timeout
-	if timeout < 3*time.Second || timeout > 30*time.Second {
-		timeout = 12 * time.Second
-	}
+	timeout := site.RequestTimeout(config, 12*time.Second)
 	client := &http.Client{Timeout: timeout, CheckRedirect: func(next *http.Request, via []*http.Request) error {
 		if len(via) >= 2 || next.URL.Scheme != base.Scheme || !strings.EqualFold(next.URL.Host, base.Host) {
 			return http.ErrUseLastResponse

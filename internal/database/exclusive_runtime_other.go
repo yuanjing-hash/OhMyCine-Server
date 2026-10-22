@@ -4,5 +4,6 @@ package database
 
 import "os"
 
-func lockRuntimeFile(*os.File) error   { return ErrExclusiveRuntime }
-func runtimeSingleLink(*os.File) error { return ErrExclusiveRuntime }
+func lockRuntimeFile(*os.File) error                      { return ErrExclusiveRuntime }
+func runtimeSingleLink(*os.File) error                    { return ErrExclusiveRuntime }
+func runtimeVerifyOrdinaryFile(string, os.FileInfo) error { return ErrExclusiveRuntime }

@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/url"
 	"path/filepath"
 	"strconv"
@@ -485,17 +486,12 @@ func (s *MediaLibraryService) publishFastPan115Scan(ctx context.Context, library
 		}
 		changedTotal++
 		if changedSamples < 20 {
-			operation.Event(s.log.Info()).Uint("library_id", run.LibraryID).Uint("scan_run_id", run.ID).Uint64("generation", run.Generation).
-				Str("scan_kind", run.Kind).Str("phase", "publishing").Str("action", item.Action).
-				Str("media_display_name", safeMediaDisplayName(item.Title)).Str("media_type", item.MediaType).
-				Msg(operation.Message("媒体目录变更"))
+			recordMediaBusiness(ctx, s.log, operation, "library.catalog.changed", "publishing", "confirmed", fmt.Sprintf("媒体目录%s：%s；仅为已提交的目录记录变化，源文件未由扫描移动或删除", mediaScanActionLabel(item.Action), serverlog.BusinessDisplayName(item.Title)), map[string]any{"library_id": run.LibraryID, "scan_run_id": run.ID, "action": item.Action, "media_display_name": item.Title, "media_type": item.MediaType})
 			changedSamples++
 		}
 	}
 	if changedTotal > changedSamples {
-		operation.Event(s.log.Info()).Uint("library_id", run.LibraryID).Uint("scan_run_id", run.ID).Uint64("generation", run.Generation).
-			Str("scan_kind", run.Kind).Str("phase", "publishing").Int("sampled", changedSamples).Int("remaining", changedTotal-changedSamples).
-			Msg(operation.Message("其余媒体目录变更已汇总，debug 级别可查看逐条明细"))
+		recordMediaBusiness(ctx, s.log, operation, "library.catalog.samples", "publishing", "confirmed", fmt.Sprintf("目录实际变更 %d 条，默认级别展示 %d 条样本，另 %d 条仅计入汇总", changedTotal, changedSamples, changedTotal-changedSamples), map[string]any{"sample_count": changedSamples, "omitted_count": changedTotal - changedSamples, "total_count": changedTotal})
 	}
 	if committedChange.State == models.MediaLibraryChangeReady && s.changes != nil {
 		s.changes.NotifyCommitted(committedChange.LibraryID, committedChange.Revision)
@@ -674,7 +670,7 @@ func NewMediaLibraryRecognitionWorker(service *MediaLibraryService) *MediaLibrar
 	return &MediaLibraryRecognitionWorker{service: service}
 }
 
-func (w *MediaLibraryRecognitionWorker) Run(ctx context.Context, runtime JobRuntime, job ClaimedJob) WorkerResult {
+func (w *MediaLibraryRecognitionWorker) Run(ctx context.Context, runtime JobRuntime, job ClaimedJob) (result WorkerResult) {
 	if w == nil || w.service == nil {
 		return WorkerResult{ErrorCode: "media_library_recognition_unavailable", ErrorMessage: "媒体库识别服务不可用"}
 	}
@@ -682,6 +678,31 @@ func (w *MediaLibraryRecognitionWorker) Run(ctx context.Context, runtime JobRunt
 	if err := json.Unmarshal([]byte(job.Job.PayloadJSON), &payload); err != nil || payload.LibraryID == 0 || payload.ScanRunID == 0 || payload.Generation == 0 {
 		return WorkerResult{ErrorCode: "media_library_recognition_payload_invalid", ErrorMessage: "媒体库识别任务参数无效"}
 	}
+	ctx = serverlog.WithBusinessFields(ctx, map[string]any{"job_id": job.Job.ID, "library_id": payload.LibraryID, "scan_run_id": payload.ScanRunID, "generation": payload.Generation})
+	started := time.Now()
+	recordMediaBusiness(ctx, w.service.log, serverlog.OperationMediaRecognition, "library.background_recognition.start", "recognition", "started", "开始后台识别已发布的媒体目录；沿用当前目录版本和识别规则，不重新移动源文件", nil)
+	defer func() {
+		fields := map[string]any{"duration_ms": time.Since(started).Milliseconds()}
+		outcome, message := "finished", "本轮后台识别执行结束，产物与媒体服务器刷新分别处理"
+		var run models.MediaLibraryScanRun
+		if w.service.db.First(&run, payload.ScanRunID).Error == nil {
+			fields["matched_count"], fields["unrecognized_count"], fields["cache_hit_count"], fields["failed_count"] = run.Matched, run.Unrecognized, run.CacheHits, run.RecognitionFailed
+			message = fmt.Sprintf("后台识别本轮累计：匹配 %d，未识别 %d，缓存复用 %d，识别错误 %d；产物与媒体服务器刷新分别处理", run.Matched, run.Unrecognized, run.CacheHits, run.RecognitionFailed)
+			if run.Status == "superseded" {
+				outcome, message = "skipped", "后台识别对应的目录版本已被更新版本接管，本次没有继续覆盖新目录"
+			}
+		}
+		if result.ErrorCode != "" {
+			outcome, message, fields["error_code"] = "failed", "本轮后台识别未完成，基础媒体目录保持原有可用状态；请结合错误码检查", result.ErrorCode
+		}
+		if result.RetryAt != nil {
+			outcome, message = "waiting", "后台识别等待目录预算或执行边界恢复，保留原任务进度"
+		}
+		if ctx.Err() != nil {
+			outcome, message = "cancelled", "本轮后台识别已停止，未宣称全部媒体识别成功"
+		}
+		recordMediaBusiness(ctx, w.service.log, serverlog.OperationMediaRecognition, "library.background_recognition.finish", "finish", outcome, message, fields)
+	}()
 	if err := w.service.completeFastMediaLibraryRecognition(ctx, runtime, payload, job); err != nil {
 		if errors.Is(err, ErrCatalogBudget) {
 			retry := time.Now().UTC().Add(30 * time.Second)
@@ -698,6 +719,7 @@ func (s *MediaLibraryService) completeFastMediaLibraryRecognition(ctx context.Co
 	if err := s.db.WithContext(ctx).First(&library, payload.LibraryID).Error; err != nil {
 		return err
 	}
+	ctx = serverlog.WithBusinessFields(ctx, map[string]any{"library_name": library.Name})
 	var run models.MediaLibraryScanRun
 	if err := s.db.WithContext(ctx).First(&run, payload.ScanRunID).Error; err != nil {
 		return err

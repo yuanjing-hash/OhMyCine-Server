@@ -1,150 +1,149 @@
 package database
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
-	"fmt"
 	"reflect"
-	"strings"
 	"testing"
 	"time"
 
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
 )
 
-func TestMigrationQuarkAccountBudgetPreservesUsageCooldownAndObservationIdentity(t *testing.T) {
-	db, err := Open(t.TempDir() + "/budget-upgrade.db")
+func TestMigrationReleased118To121PreservesAuthorizationHistoryAndConfiguration(t *testing.T) {
+	db, err := Open(t.TempDir() + "/released118-upgrade.db")
 	if err != nil {
 		t.Fatal(err)
 	}
 	sqlDB, _ := db.DB()
 	t.Cleanup(func() { _ = sqlDB.Close() })
 	applyMigrationsThrough(t, db, 118)
-	now := time.Now().UTC().Truncate(time.Second)
-	account := "quark:" + strings.Repeat("a", 32)
-	connections := []models.Connection{
-		{ID: 1, Name: "one", NameNormalized: "one", Provider: "quark", AccountID: account, Enabled: true},
-		{ID: 2, Name: "two", NameNormalized: "two", Provider: "quark", AccountID: account, Enabled: true},
-		{ID: 3, Name: "expired", NameNormalized: "expired", Provider: "quark", AccountID: account},
-		{ID: 4, Name: "unknown", NameNormalized: "unknown", Provider: "quark", AccountID: ""},
-	}
-	if err := db.Create(&connections).Error; err != nil {
+	if err := seedAuthorization(db); err != nil {
 		t.Fatal(err)
 	}
-	legacyKey := func(id uint, value string) string {
-		sum := sha256.Sum256([]byte(fmt.Sprintf("quark:%d:%s", id, value)))
-		return hex.EncodeToString(sum[:])
-	}
-	canonical := models.QuarkObservationAccountKey(1, account)
-	unknownKey, historicalKey := legacyKey(4, ""), legacyKey(1, "quark:"+strings.Repeat("b", 32))
-	budgets := []models.ProviderObservationAccountBudget{
-		{AccountKey: canonical, WindowStart: now.Add(-5 * time.Minute), HotRequests: 50, ColdRequests: 10, UpdatedAt: now},
-		{AccountKey: legacyKey(1, account), WindowStart: now.Add(-40 * time.Minute), HotRequests: 100, ColdRequests: 20, CooldownUntil: now.Add(2 * time.Minute)},
-		{AccountKey: legacyKey(2, account), WindowStart: now.Add(-20 * time.Minute), HotRequests: 200, ColdRequests: 30, NextRequestAt: now.Add(5 * time.Second), LeaseToken: "inflight-one", LeaseUntil: now.Add(15 * time.Second)},
-		{AccountKey: legacyKey(3, account), WindowStart: now.Add(-2 * time.Hour), HotRequests: 900, ColdRequests: 900, CooldownUntil: now.Add(3 * time.Minute), LeaseToken: "inflight-two", LeaseUntil: now.Add(25 * time.Second)},
-		{AccountKey: unknownKey, WindowStart: now, HotRequests: 40, CooldownUntil: now.Add(4 * time.Minute)},
-		{AccountKey: historicalKey, WindowStart: now, HotRequests: 60, CooldownUntil: now.Add(6 * time.Minute)},
-	}
-	if err := db.Create(&budgets).Error; err != nil {
+	now := time.Now().UTC()
+	user := models.User{Username: "upgrade-user", UsernameNormalized: "upgrade-user", DisplayName: "Existing user", PasswordHash: "existing-password-hash", Status: "active", CreatedAt: now, UpdatedAt: now}
+	if err := db.Create(&user).Error; err != nil {
 		t.Fatal(err)
 	}
-	scopes := []models.ProviderObservationScope{
-		{ID: "keep-scope", LibraryID: 11, ConnectionID: 1, AccountKey: legacyKey(1, account), Provider: "quark", RootID: "tv:root", Fence: "same-fence", Enabled: true, CoverageRound: 7},
-		{ID: "unknown-scope", ConnectionID: 4, AccountKey: unknownKey, Provider: "quark"},
-		{ID: "history-scope", ConnectionID: 1, AccountKey: historicalKey, Provider: "quark"},
-	}
-	if err := db.Create(&scopes).Error; err != nil {
+	history := models.PlayerPlaybackHistory{UserID: user.ID, SyncKey: "existing-sync-key", HistoryIdentity: "server|existing-media", SourceKind: "server", SourceID: "existing-server", LibraryID: "existing-library", ItemToken: "existing-media", MediaIdentity: "existing-media", Title: "Existing history", Position: 123, ClientUpdatedAt: now.UnixMilli(), Revision: 4, CreatedAt: now, UpdatedAt: now}
+	if err := db.Create(&history).Error; err != nil {
 		t.Fatal(err)
 	}
-	batch := models.ProviderObservationBatch{ID: "keep-batch", ScopeID: scopes[0].ID, DirectoryID: "tv:root", Fence: "same-fence", State: "publishing", Revision: 4}
-	item := models.ProviderObservationItem{ScopeID: scopes[0].ID, ResourceID: "tv:file", Name: "keep.mkv", RelativePath: "/keep.mkv", Revision: 8, CatalogSourceEpoch: 3}
-	if err := db.Create(&batch).Error; err != nil {
+	site := models.Site{Name: "Existing Jackett", NameNormalized: "existing jackett", Kind: "torznab", BaseURL: "http://jackett:9117", CredentialCiphertext: "preserved-encrypted-api-key", TimeoutSeconds: 12, Enabled: true, Revision: 8, CreatedAt: now, UpdatedAt: now}
+	if err := db.Create(&site).Error; err != nil {
 		t.Fatal(err)
 	}
-	if err := db.Create(&item).Error; err != nil {
-		t.Fatal(err)
+	// Authorization seeds intentionally refresh timestamps and rebuild the
+	// builtin grant rows. Compare their effective grants, not those timestamps.
+	columns := map[string]string{
+		"users": "*", "player_playback_history": "*", "sites": "*",
+		"roles":            "id,code,name,description,kind,protected,active",
+		"permissions":      "code,module,name,description,risk",
+		"role_permissions": "role_id,permission_code",
 	}
-	if err := Migrate(db); err != nil {
-		t.Fatal(err)
-	}
-	var merged models.ProviderObservationAccountBudget
-	if err := db.First(&merged, "account_key = ?", canonical).Error; err != nil {
-		t.Fatal(err)
-	}
-	if merged.HotRequests != 350 || merged.ColdRequests != 60 || !merged.WindowStart.Equal(budgets[0].WindowStart) || !merged.CooldownUntil.Equal(budgets[3].CooldownUntil) || !merged.NextRequestAt.Equal(budgets[2].NextRequestAt) || !merged.LeaseUntil.Equal(budgets[3].LeaseUntil) || merged.LeaseToken == "" || merged.LeaseToken == "inflight-two" {
-		t.Fatalf("migration reset or weakened account admission: %+v", merged)
-	}
-	var actual models.ProviderObservationScope
-	if err := db.First(&actual, "id = ?", scopes[0].ID).Error; err != nil {
-		t.Fatal(err)
-	}
-	if actual.AccountKey != canonical || actual.Fence != scopes[0].Fence || actual.CoverageRound != 7 || actual.RootID != scopes[0].RootID || !actual.Enabled {
-		t.Fatal("scope identity/evidence was rebuilt")
-	}
-	var gotBatch models.ProviderObservationBatch
-	var gotItem models.ProviderObservationItem
-	if err := db.First(&gotBatch, "id = ?", batch.ID).Error; err != nil {
-		t.Fatal(err)
-	}
-	if err := db.First(&gotItem, "scope_id = ? AND resource_id = ?", item.ScopeID, item.ResourceID).Error; err != nil {
-		t.Fatal(err)
-	}
-	if !reflect.DeepEqual(batch, gotBatch) || !reflect.DeepEqual(item, gotItem) {
-		t.Fatal("batch or file identity changed")
-	}
-	for _, index := range []int{4, 5} {
-		var got models.ProviderObservationAccountBudget
-		if err := db.First(&got, "account_key = ?", budgets[index].AccountKey).Error; err != nil || !reflect.DeepEqual(got, budgets[index]) {
-			t.Fatalf("unknown/historical account was reinterpreted: %v", err)
+	before := map[string][]map[string]any{}
+	for table, selectColumns := range columns {
+		var rows []map[string]any
+		if err := db.Table(table).Select(selectColumns).Order("1,2").Find(&rows).Error; err != nil {
+			t.Fatal(err)
 		}
+		before[table] = rows
 	}
-	for _, scope := range scopes[1:] {
-		var got models.ProviderObservationScope
-		if err := db.First(&got, "id = ?", scope.ID).Error; err != nil || !reflect.DeepEqual(got, scope) {
-			t.Fatalf("unproven scope was rebound: %v", err)
+	for attempt := range 2 {
+		if err := Migrate(db); err != nil {
+			t.Fatal(err)
 		}
-	}
-	// Repeat the exact migration body as well as the versioned runner: merged
-	// usage must not be counted twice, reset, or have its window extended again.
-	if err := db.Transaction(migrateQuarkAccountBudgets); err != nil {
-		t.Fatal(err)
-	}
-	if err := Migrate(db); err != nil {
-		t.Fatal(err)
-	}
-	var repeated models.ProviderObservationAccountBudget
-	if err := db.First(&repeated, "account_key = ?", canonical).Error; err != nil || !reflect.DeepEqual(repeated, merged) {
-		t.Fatalf("migration was not idempotent: %v", err)
+		for table, want := range before {
+			var got []map[string]any
+			if err := db.Table(table).Select(columns[table]).Order("1,2").Find(&got).Error; err != nil || !reflect.DeepEqual(want, got) {
+				t.Fatalf("upgrade/restart %d changed %s: %v", attempt, table, err)
+			}
+		}
+		var versions []int
+		if err := db.Table("schema_migrations").Where("version >= ?", 116).Order("version").Pluck("version", &versions).Error; err != nil || !reflect.DeepEqual(versions, []int{116, 117, 118, 119, 120, 121}) {
+			t.Fatalf("released migration identities lost or new ones repeated: %v %v", versions, err)
+		}
+		for _, model := range []any{&models.ProviderObservationScope{}, &models.ProviderObservationBatch{}, &models.ProviderObservationItem{}} {
+			if !db.Migrator().HasTable(model) {
+				t.Fatalf("Quark observation schema missing: %T", model)
+			}
+		}
 	}
 }
 
-func TestMigrationQuarkAccountBudgetExpiredWindowRetainsFutureCooldown(t *testing.T) {
-	db, err := Open(t.TempDir() + "/expired-budget.db")
+func TestMigrationQuarkPreservesLegacyRowsConstraintsAndIdentity(t *testing.T) {
+	db, err := Open(t.TempDir() + "/quark-upgrade.db")
 	if err != nil {
 		t.Fatal(err)
 	}
 	sqlDB, _ := db.DB()
 	t.Cleanup(func() { _ = sqlDB.Close() })
 	applyMigrationsThrough(t, db, 118)
-	now := time.Now().UTC().Truncate(time.Second)
-	account := "quark:" + strings.Repeat("c", 32)
-	connection := models.Connection{ID: 1, Name: "expired", NameNormalized: "expired", Provider: "quark", AccountID: account}
+	connection := models.Connection{Name: "legacy", NameNormalized: "legacy", Provider: models.ConnectionProviderPan115, CredentialCiphertext: "unchanged-encrypted115", Enabled: true, Revision: 9}
 	if err := db.Create(&connection).Error; err != nil {
 		t.Fatal(err)
 	}
-	sum := sha256.Sum256([]byte(fmt.Sprintf("quark:%d:%s", connection.ID, account)))
-	old := models.ProviderObservationAccountBudget{AccountKey: hex.EncodeToString(sum[:]), WindowStart: now.Add(-2 * time.Hour), HotRequests: 600, CooldownUntil: now.Add(time.Hour), LeaseUntil: now.Add(-time.Minute), LeaseToken: "expired"}
-	if err := db.Create(&old).Error; err != nil {
+	storage := models.Storage{Name: "legacy", NameNormalized: "legacy", Type: models.StorageTypePan115, RootPath: "42", RootPathNormalized: "115:1:42", ConnectionID: &connection.ID, Enabled: true, Capabilities: "{}"}
+	if err := db.Create(&storage).Error; err != nil {
+		t.Fatal(err)
+	}
+	var before models.Storage
+	if err := db.First(&before, storage.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	// Retain identities already issued even if the highest row was removed.
+	if err := db.Exec("UPDATE sqlite_sequence SET seq=100 WHERE name='storages'").Error; err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if err := Migrate(db); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var after models.Storage
+	if err := db.First(&after, storage.ID).Error; err != nil || !reflect.DeepEqual(before, after) {
+		t.Fatalf("legacy storage changed: %v", err)
+	}
+	var gotConnection models.Connection
+	if err := db.First(&gotConnection, connection.ID).Error; err != nil || gotConnection.CredentialCiphertext != connection.CredentialCiphertext || gotConnection.Revision != 9 {
+		t.Fatalf("legacy credential/revision changed: %v", err)
+	}
+	quark := models.Storage{Name: "quark", NameNormalized: "quark", Type: models.StorageTypeQuark, RootPath: "tv:root", RootPathNormalized: "quark:1:root", ConnectionID: &connection.ID, Enabled: true, Capabilities: "{}"}
+	if err := db.Create(&quark).Error; err != nil || quark.ID <= 100 {
+		t.Fatalf("new provider/identity: %d %v", quark.ID, err)
+	}
+	if err := db.Model(&quark).Update("type", "unrecognized").Error; err == nil {
+		t.Fatal("unknown storage accepted")
+	}
+	if err := db.Delete(&connection).Error; err == nil {
+		t.Fatal("connection foreign key lost")
+	}
+	duplicate := quark
+	duplicate.ID = 0
+	if err := db.Create(&duplicate).Error; err == nil {
+		t.Fatal("unique storage identity lost")
+	}
+	var violations int64
+	if err := db.Raw("SELECT COUNT(*) FROM pragma_foreign_key_check").Scan(&violations).Error; err != nil || violations != 0 {
+		t.Fatalf("foreign key violations %d: %v", violations, err)
+	}
+}
+
+func TestMigrationQuarkRetainsSequenceAfterAllRowsWereDeleted(t *testing.T) {
+	db, err := Open(t.TempDir() + "/empty-upgrade.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sqlDB, _ := db.DB()
+	t.Cleanup(func() { _ = sqlDB.Close() })
+	applyMigrationsThrough(t, db, 118)
+	if err := db.Exec("INSERT INTO sqlite_sequence(name,seq) VALUES ('storages',812)").Error; err != nil {
 		t.Fatal(err)
 	}
 	if err := Migrate(db); err != nil {
 		t.Fatal(err)
 	}
-	var got models.ProviderObservationAccountBudget
-	if err := db.First(&got, "account_key = ?", models.QuarkObservationAccountKey(connection.ID, account)).Error; err != nil {
-		t.Fatal(err)
-	}
-	if got.HotRequests != 0 || got.ColdRequests != 0 || got.WindowStart.Before(now) || !got.CooldownUntil.Equal(old.CooldownUntil) || got.LeaseToken != "" {
-		t.Fatalf("expired window/cooldown lost: %+v", got)
+	row := models.Storage{Name: "local", NameNormalized: "local", Type: models.StorageTypeLocal, RootPath: "/media", RootPathNormalized: "/media", Enabled: true, Capabilities: "{}"}
+	if err := db.Create(&row).Error; err != nil || row.ID <= 812 {
+		t.Fatalf("retired ID reused: %d %v", row.ID, err)
 	}
 }

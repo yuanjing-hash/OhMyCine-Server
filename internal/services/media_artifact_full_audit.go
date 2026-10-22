@@ -1,6 +1,7 @@
 package services
 
 import (
+	"context"
 	"fmt"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
 	"path/filepath"
@@ -29,6 +30,11 @@ func (s *MediaArtifactService) filterLegacyFullArtifactWork(root string, run mod
 			key := artifactManifestKey(row.TargetKind, row.RelativePath)
 			manifest.rows[key] = row
 			manifest.dirty[key] = struct{}{}
+			ctx := context.Background()
+			if manifest.physical != nil && manifest.physical.ctx != nil {
+				ctx = manifest.physical.ctx
+			}
+			s.observeLocalArtifact(ctx, run, row.Kind, row.RelativePath, "skipped", "content_reused", -1, nil, false)
 		}
 	}
 	pendingEntries := make([]models.MediaLibraryEntry, 0)

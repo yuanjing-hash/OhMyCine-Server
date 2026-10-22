@@ -107,6 +107,8 @@ func TestUpdateServiceLinuxARM64UsesNativeUpdateButContainerRemainsManaged(t *te
 
 func TestUpdateServiceInstallStartsHelperThenRequestsShutdown(t *testing.T) {
 	service, client, store, executable := testUpdateService(t)
+	logManager, logger := captureRemainingBusiness(t, "update")
+	service.log = logger
 	status, err := service.Check(context.Background(), updateAdminActor(), RequestContext{})
 	if err != nil || !status.InstallEnabled {
 		t.Fatalf("check status=%+v err=%v", status, err)
@@ -146,6 +148,14 @@ func TestUpdateServiceInstallStartsHelperThenRequestsShutdown(t *testing.T) {
 	state, err := store.LoadState()
 	if err != nil || state.Phase != updater.PhaseWaitingForExit || state.LastCheckedAt == nil {
 		t.Fatalf("state=%+v err=%v", state, err)
+	}
+	logged := remainingBusinessEntries(t, logManager)
+	requireRemainingBusinessEvent(t, logged, "update.package.confirmed", "confirmed")
+	requireRemainingBusinessEvent(t, logged, "update.restart.waiting", "waiting")
+	for _, entry := range logged {
+		if entry.Fields["event_code"] == "update.result.confirmed" {
+			t.Fatalf("handoff advertised final update success: %+v", entry)
+		}
 	}
 }
 

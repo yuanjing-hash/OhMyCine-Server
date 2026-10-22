@@ -47,6 +47,18 @@ launch sets `launch_failed` with a safe `runtimeError`; explicit create retries
 without reinstalling. No raw exception text is returned. Input actions are
 click, text, key, scroll; key values are a fixed navigation/editing allowlist.
 No selectors, arbitrary script, raw CDP, file upload, public cookie dump or captcha solver.
+
+Startup reasons are the finite `browser_sandbox_unavailable`,
+`browser_profile_unavailable`, `browser_dependencies_missing`,
+`browser_executable_unavailable`, `browser_launch_timeout` or unknown
+`browser_launch_failed`. Classification reads at most64KiB transient exception
+text; no original exception/cause, launch argv, paths or URLs are retained.
+Status polling does not launch a browser, contact a site or reset a known error.
+On Linux each launch gets a private0700 temporary HOME/config/cache independent
+of the operator's environment. Launch/navigation failure, cancellation, explicit
+close and request-timeout cleanup dispose it together with browser/proxy resources.
+Windows keeps its platform environment. Installation/license records and the
+encrypted connection Cookie remain separate from these disposable directories.
 `identity` must be an opaque Server-owned binding to actor/plugin/version/connection
 and mirror revision, not a caller-chosen untrusted authorization assertion.
 

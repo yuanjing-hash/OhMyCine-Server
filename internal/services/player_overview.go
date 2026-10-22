@@ -330,10 +330,9 @@ func playerOverviewHistoryItems(page PlayerHistoryPage, allowedLibraries map[uin
 }
 
 func playerOverviewContinueEligible(item PlayerHistoryChange) bool {
-	if item.Deleted || item.Completed || item.Position <= 0 {
-		return false
-	}
-	return item.Duration == nil || *item.Duration <= 0 || item.Position / *item.Duration < 0.92
+	// Completion is an explicit playback fact. A renderer failure near the end
+	// must not disappear merely because its last confirmed position is high.
+	return !item.Deleted && !item.Completed && item.Position > 0
 }
 
 func playerOverviewCollectionItems(items []PlayerCollectionSummary, source string, err error) ([]PlayerCollectionSummary, bool, error) {

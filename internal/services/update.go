@@ -3,6 +3,7 @@ package services
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -164,7 +165,7 @@ func (s *UpdateService) Check(ctx context.Context, actor Actor, request RequestC
 	if err := s.store.SaveState(state); err != nil {
 		return UpdateStatus{}, updateAppError(err, "无法保存更新状态")
 	}
-	serverlog.OperationServerUpdate.Event(s.log.Info()).Str("channel", string(settings.Channel)).Msg(serverlog.OperationServerUpdate.Message("开始检查官方版本"))
+	serverlog.RecordBusiness(ctx, s.log, serverlog.OperationServerUpdate, serverlog.BusinessEvent{Code: "update.check.start", Stage: "check", Outcome: "started", Message: "开始检查官方 " + string(settings.Channel) + " 通道版本，当前版本 " + serverlog.BusinessDisplayName(s.info.Version), Fields: map[string]any{"mode": string(settings.Channel), "user_id": actor.User.ID, "request_id": request.RequestID}})
 	release, latestErr := s.client.Latest(ctx, settings.Channel, s.goos, s.goarch)
 	completed := s.now()
 	state.CompletedAt = &completed
@@ -178,7 +179,11 @@ func (s *UpdateService) Check(ctx context.Context, actor Actor, request RequestC
 		}
 		_ = s.store.SaveState(state)
 		s.record(actor, "server.update.check", "failed", map[string]any{"channel": string(settings.Channel), "error_code": code}, request)
-		serverlog.OperationServerUpdate.Event(s.log.Warn()).Str("channel", string(settings.Channel)).Str("error_code", code).Msg(serverlog.OperationServerUpdate.Message("检查官方版本失败"))
+		outcome, message := "failed", "官方 "+string(settings.Channel)+" 通道版本检查未完成："+remainingFailureReason(code)
+		if code == updater.CodeNoRelease {
+			outcome, message = "skipped", "官方 "+string(settings.Channel)+" 通道暂无可用发布，本次没有可安装版本"
+		}
+		serverlog.RecordBusiness(ctx, s.log, serverlog.OperationServerUpdate, serverlog.BusinessEvent{Code: "update.check.finish", Stage: "check", Outcome: outcome, Message: message, Fields: map[string]any{"mode": string(settings.Channel), "error_code": code}})
 		if code == updater.CodeNoRelease {
 			return s.status()
 		}
@@ -193,7 +198,11 @@ func (s *UpdateService) Check(ctx context.Context, actor Actor, request RequestC
 		return UpdateStatus{}, updateAppError(err, "无法保存更新状态")
 	}
 	s.record(actor, "server.update.check", "success", map[string]any{"channel": string(settings.Channel), "update_available": state.Phase == updater.PhaseAvailable, "target_version": state.TargetVersion}, request)
-	serverlog.OperationServerUpdate.Event(s.log.Info()).Str("channel", string(settings.Channel)).Str("target_version", state.TargetVersion).Bool("update_available", state.Phase == updater.PhaseAvailable).Msg(serverlog.OperationServerUpdate.Message("官方版本检查完成"))
+	message := "官方版本检查完成，当前版本已满足所选通道的最新发布"
+	if state.Phase == updater.PhaseAvailable {
+		message = fmt.Sprintf("官方版本检查完成：当前 %s，发现 %s 通道新版本 %s；等待管理员确认更新", serverlog.BusinessDisplayName(s.info.Version), settings.Channel, serverlog.BusinessDisplayName(state.TargetVersion))
+	}
+	serverlog.RecordBusiness(ctx, s.log, serverlog.OperationServerUpdate, serverlog.BusinessEvent{Code: "update.check.finish", Stage: "check", Outcome: "finished", Message: message, Fields: map[string]any{"mode": string(settings.Channel), "resource_name": state.TargetVersion, "status": string(state.Phase)}})
 	return s.status()
 }
 
@@ -223,7 +232,7 @@ func (s *UpdateService) UpdateSettings(actor Actor, input UpdateSettingsInput, r
 		return UpdateStatus{}, updateAppError(err, "无法保存更新状态")
 	}
 	s.record(actor, "server.update.settings", "success", map[string]any{"channel": string(channel), "revision": settings.Revision}, request)
-	serverlog.OperationServerUpdate.Event(s.log.Info()).Str("channel", string(channel)).Msg(serverlog.OperationServerUpdate.Message("更新通道已修改"))
+	serverlog.RecordBusiness(context.Background(), s.log, serverlog.OperationServerUpdate, serverlog.BusinessEvent{Code: "update.settings.confirmed", Stage: "configure", Outcome: "confirmed", Message: "Server 更新通道已保存为 " + string(channel) + "，安装前需要按此通道重新检查版本", Fields: map[string]any{"mode": string(channel), "user_id": actor.User.ID, "request_id": request.RequestID}})
 	return s.status()
 }
 
@@ -241,6 +250,7 @@ func (s *UpdateService) Install(actor Actor, input UpdateInstallInput, request R
 	}
 	managed, reason := s.deploymentManaged()
 	if managed {
+		serverlog.RecordBusiness(context.Background(), s.log, serverlog.OperationServerUpdate, serverlog.BusinessEvent{Code: "update.install.skipped", Stage: "validate", Outcome: "skipped", Message: "当前 Server 更新由部署环境管理：" + managedMessage(reason), Fields: map[string]any{"reason": reason, "user_id": actor.User.ID, "request_id": request.RequestID}})
 		return UpdateStatus{}, appError(CodeConflict, managedMessage(reason), nil)
 	}
 	if err := s.acquire("install"); err != nil {
@@ -269,7 +279,7 @@ func (s *UpdateService) Install(actor Actor, input UpdateInstallInput, request R
 		return UpdateStatus{}, updateAppError(err, "无法保存更新状态")
 	}
 	s.record(actor, "server.update.install", "requested", map[string]any{"channel": string(settings.Channel), "target_version": target}, request)
-	serverlog.OperationServerUpdate.Event(s.log.Info()).Str("channel", string(settings.Channel)).Str("target_version", target).Msg(serverlog.OperationServerUpdate.Message("更新安装已请求"))
+	serverlog.RecordBusiness(context.Background(), s.log, serverlog.OperationServerUpdate, serverlog.BusinessEvent{Code: "update.install.accepted", Stage: "download", Outcome: "accepted", Message: "Server 更新到版本 " + serverlog.BusinessDisplayName(target) + " 的请求已受理，开始准备官方更新包", Fields: map[string]any{"mode": string(settings.Channel), "resource_name": target, "user_id": actor.User.ID, "request_id": request.RequestID}})
 	go s.prepareAndHandoff(actor.User.ID, request, settings.Channel, target, now)
 	return s.status()
 }
@@ -281,6 +291,8 @@ func (s *UpdateService) prepareAndHandoff(actorID uint, request RequestContext, 
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
+	ctx = serverlog.WithBusinessFields(ctx, map[string]any{"user_id": actorID, "request_id": request.RequestID, "resource_name": target, "mode": string(channel)})
+	serverlog.RecordBusiness(ctx, s.log, serverlog.OperationServerUpdate, serverlog.BusinessEvent{Code: "update.prepare.start", Stage: "download", Outcome: "started", Message: "开始准备官方版本 " + serverlog.BusinessDisplayName(target) + " 的更新包，校验发布版本、签名和 SHA-256 摘要"})
 	release, err := s.client.Latest(ctx, channel, s.goos, s.goarch)
 	if err != nil || release.Version.String() != target {
 		if err == nil {
@@ -294,6 +306,7 @@ func (s *UpdateService) prepareAndHandoff(actorID uint, request RequestContext, 
 		s.failInstall(actorID, request, channel, target, started, err)
 		return
 	}
+	serverlog.RecordBusiness(ctx, s.log, serverlog.OperationServerUpdate, serverlog.BusinessEvent{Code: "update.package.confirmed", Stage: "verify", Outcome: "confirmed", Message: "官方版本 " + serverlog.BusinessDisplayName(target) + " 的更新包已准备并通过校验，继续保存交接计划和启动更新助手"})
 	previous, _ := s.store.LoadState()
 	ready := updater.State{Phase: updater.PhaseReady, CurrentVersion: s.info.Version, TargetVersion: target, Channel: channel, OperationID: prepared.OperationID, StartedAt: &started, LastCheckedAt: previous.LastCheckedAt}
 	if err := s.store.SaveState(ready); err != nil {
@@ -307,7 +320,7 @@ func (s *UpdateService) prepareAndHandoff(actorID uint, request RequestContext, 
 	waiting := ready
 	waiting.Phase = updater.PhaseWaitingForExit
 	_ = s.store.SaveState(waiting)
-	serverlog.OperationServerUpdate.Event(s.log.Info()).Str("target_version", target).Msg(serverlog.OperationServerUpdate.Message("更新包已校验，准备重启"))
+	serverlog.RecordBusiness(ctx, s.log, serverlog.OperationServerUpdate, serverlog.BusinessEvent{Code: "update.restart.waiting", Stage: "restart", Outcome: "waiting", Message: "版本 " + serverlog.BusinessDisplayName(target) + " 的更新包已校验，更新助手已启动；等待当前 Server 退出后继续替换、重启和健康检查"})
 	if s.requestShutdown != nil {
 		s.requestShutdown()
 	}
@@ -319,7 +332,7 @@ func (s *UpdateService) failInstall(actorID uint, request RequestContext, channe
 	previous, _ := s.store.LoadState()
 	_ = s.store.SaveState(updater.State{Phase: updater.PhaseFailed, CurrentVersion: s.info.Version, TargetVersion: target, Channel: channel, ErrorCode: code, StartedAt: &started, CompletedAt: &completed, LastCheckedAt: previous.LastCheckedAt})
 	s.recordID(&actorID, "server.update.install", target, "failed", map[string]any{"channel": string(channel), "target_version": target, "error_code": code}, request)
-	serverlog.OperationServerUpdate.Event(s.log.Error()).Str("target_version", target).Str("error_code", code).Msg(serverlog.OperationServerUpdate.Message("更新安装失败"))
+	serverlog.RecordBusiness(context.Background(), s.log, serverlog.OperationServerUpdate, serverlog.BusinessEvent{Code: "update.install.failed", Stage: "install", Outcome: "failed", Message: "Server 更新到版本 " + serverlog.BusinessDisplayName(target) + " 的准备或交接失败：" + remainingFailureReason(code), Fields: map[string]any{"resource_name": target, "mode": string(channel), "user_id": actorID, "request_id": request.RequestID, "error_code": code, "duration_ms": completed.Sub(started).Milliseconds()}})
 	s.release()
 }
 
@@ -440,11 +453,14 @@ func (s *UpdateService) reconcileTerminalState() {
 		metadata["error_code"] = state.ErrorCode
 	}
 	if s.audit.Record(nil, nil, "server.update.result", "server_update", state.OperationID, outcome, metadata, RequestContext{}) == nil {
-		event := serverlog.OperationServerUpdate.Event(s.log.Info()).Str("target_version", state.TargetVersion).Str("status", string(state.Phase))
-		if state.ErrorCode != "" {
-			event = event.Str("error_code", state.ErrorCode)
+		terminalOutcome, message := "finished", "Server 更新到版本 "+serverlog.BusinessDisplayName(state.TargetVersion)+" 的结果已由更新助手确认成功"
+		if state.Phase == updater.PhaseFailed {
+			terminalOutcome, message = "failed", "Server 更新未成功："+remainingFailureReason(state.ErrorCode)
 		}
-		event.Msg(serverlog.OperationServerUpdate.Message("更新结果已确认"))
+		if state.Phase == updater.PhaseRolledBack {
+			terminalOutcome, message = "partial", "Server 更新未通过检查，更新助手已确认回滚到原版本"
+		}
+		serverlog.RecordBusiness(context.Background(), s.log, serverlog.OperationServerUpdate, serverlog.BusinessEvent{Code: "update.result.confirmed", Stage: "reconcile", Outcome: terminalOutcome, Message: message, Fields: map[string]any{"resource_name": state.TargetVersion, "status": string(state.Phase), "error_code": state.ErrorCode}})
 	}
 }
 

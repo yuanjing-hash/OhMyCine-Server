@@ -51,6 +51,21 @@ func TestCompanionPreservesSafeNetworkFailure(t *testing.T) {
 	}
 }
 
+func TestCompanionPreservesLostSessionWithoutPrivateErrorText(t *testing.T) {
+	for _, code := range []string{"session_unavailable", "session_expired"} {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"error":"` + code + `"}`))
+		}))
+		manager := &Manager{address: server.URL, token: "synthetic"}
+		err := manager.call(context.Background(), "session/request", nil, nil)
+		server.Close()
+		if ErrorCode(err) != code {
+			t.Fatalf("lost-session code = %s", ErrorCode(err))
+		}
+	}
+}
+
 func TestCompanionProtocolTransport(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer synthetic-test-only" || r.Method != "POST" || r.URL.Path != "/v1/status" {
@@ -81,5 +96,34 @@ func TestCompanionDoesNotFollowRedirect(t *testing.T) {
 	manager := &Manager{address: server.URL, token: "synthetic"}
 	if manager.call(context.Background(), "status", nil, nil) == nil {
 		t.Fatal("redirect accepted")
+	}
+}
+
+func TestCompanionStartupCodeWhitelistAndUnknownFallback(t *testing.T) {
+	for _, code := range []string{"browser_sandbox_unavailable", "browser_dependencies_missing", "browser_executable_unavailable", "browser_launch_timeout", "browser_profile_unavailable", "browser_launch_failed"} {
+		t.Run(code, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": code, "details": "synthetic-cookie /private/path https://private.invalid/?token=synthetic"})
+			}))
+			defer server.Close()
+			manager := &Manager{address: server.URL, token: "synthetic"}
+			err := manager.call(context.Background(), "session/create", nil, nil)
+			if ErrorCode(err) != code || err.Error() != code {
+				t.Fatal("safe startup code lost or raw error escaped")
+			}
+		})
+	}
+	if ErrorCode(&Failure{Code: "secret-cookie /private/path"}) != "browser_launch_failed" {
+		t.Fatal("unsafe direct code escaped")
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"error":"secret-cookie /private/path"}`))
+	}))
+	defer server.Close()
+	manager := &Manager{address: server.URL, token: "synthetic"}
+	if ErrorCode(manager.call(context.Background(), "session/create", nil, nil)) != "browser_component_unavailable" {
+		t.Fatal("unknown IPC error not rejected")
 	}
 }

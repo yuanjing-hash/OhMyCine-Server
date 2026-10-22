@@ -1,6 +1,7 @@
 package services
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -1489,6 +1490,8 @@ func TestDownloadWorkerReconcilesExistingProviderTaskWithoutResubmit(t *testing.
 
 func TestDownloadWorkerWaitsForEstablishedQBittorrentWithoutNewAttempt(t *testing.T) {
 	downloads, downloaders, queue, actor, client := downloadFixture(t)
+	var businessLog bytes.Buffer
+	downloads.log = zerolog.New(zerolog.SyncWriter(&businessLog)).With().Timestamp().Logger()
 	root := t.TempDir()
 	storage := models.Storage{Name: "Reconnect staging", NameNormalized: "reconnect staging", Type: models.StorageTypeLocal, RootPath: root, RootPathNormalized: strings.ToLower(root), Enabled: true, Capabilities: `{}`, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()}
 	if err := queue.db.Create(&storage).Error; err != nil {
@@ -1543,6 +1546,18 @@ func TestDownloadWorkerWaitsForEstablishedQBittorrentWithoutNewAttempt(t *testin
 	client.mu.Unlock()
 	if job.AttemptCount != 1 || attempts != 1 || submits != 0 || task.LastErrorCode != "" || task.LastErrorMessage != "" {
 		t.Fatalf("job=%+v attempts=%d submits=%d task=%+v", job, attempts, submits, task)
+	}
+	if len(businessRecords(t, &businessLog, "event_code", "download.reconnect_wait")) != 1 || len(businessRecords(t, &businessLog, "event_code", "download.reconnected")) != 1 {
+		t.Fatal("reconnect narrative was missing or repeated every poll")
+	}
+	terminals := businessRecords(t, &businessLog, "event_code", "download.finish")
+	if len(terminals) != 1 || terminals[0]["outcome"] != "finished" || terminals[0]["job_id"] != created.JobID {
+		t.Fatalf("download terminal fact=%+v", terminals)
+	}
+	for _, forbidden := range []string{"provider-hash", "magnet:", root, "http://qbit.example.test", "媒体已入库"} {
+		if strings.Contains(businessLog.String(), forbidden) {
+			t.Fatalf("download log exposed private/fictional facts: %q", forbidden)
+		}
 	}
 }
 

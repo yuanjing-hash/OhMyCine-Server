@@ -113,6 +113,9 @@ jobs:
         run: |
           npm ci --omit=dev --ignore-scripts
 
+      - name: Validate browser deployment payload and sandbox profile
+        run: python3 .github/scripts/test_browser_packaging.py
+
       - name: Build embedded Web UI
         working-directory: webui
         run: |
@@ -263,6 +266,10 @@ jobs:
             cp browser-companion/package.json browser-companion/package-lock.json "${server_dir}/browser-companion/"
             cp -R browser-companion/src "${server_dir}/browser-companion/"
             cp docs/deployment/browser-companion.md "${server_dir}/BROWSER-SETUP.md"
+            cp docs/deployment/browser-seccomp.md "${server_dir}/browser-seccomp.md"
+            mkdir -p "${server_dir}/deploy/seccomp"
+            cp deploy/compose.server.yml "${server_dir}/deploy/"
+            cp deploy/seccomp/browser.json deploy/seccomp/moby-default.json deploy/seccomp/upstream.json deploy/seccomp/LICENSE.moby "${server_dir}/deploy/seccomp/"
           done
           for node_dir in "$node_windows_dir" "$node_linux_amd64_dir" "$node_linux_arm64_dir"; do
             cp LICENSE "${node_dir}/LICENSE"

@@ -27,18 +27,31 @@ type CloudConfig struct {
 }
 
 type Config struct {
-	Cloud             *CloudConfig
-	Username          string
-	Password          string
-	BaseURL           string
-	Cookie            string
-	Passkey           string
-	APIKey            string
-	UserAgent         string
-	Timeout           time.Duration
+	Cloud     *CloudConfig
+	Username  string
+	Password  string
+	BaseURL   string
+	Cookie    string
+	Passkey   string
+	APIKey    string
+	UserAgent string
+	Timeout   time.Duration
+	// SearchTimeout is set only for search. Probe and download clients retain
+	// their original bounds even when a slow-search policy is configured.
+	SearchTimeout     time.Duration
 	BrowserEmulation  bool
 	BrowserServiceURL string
 	RenderedFetcher   RenderedFetcher
+}
+
+func RequestTimeout(config Config, fallback time.Duration) time.Duration {
+	if config.SearchTimeout >= 3*time.Second && config.SearchTimeout <= 180*time.Second {
+		return config.SearchTimeout
+	}
+	if config.Timeout >= 3*time.Second && config.Timeout <= 30*time.Second {
+		return config.Timeout
+	}
+	return fallback
 }
 
 // Source is the server-only download material resolved from an opaque search

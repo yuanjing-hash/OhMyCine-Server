@@ -16,7 +16,6 @@ import (
 	cloudpkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud"
 	downloadpkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/downloader"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/nodeprotocol"
-	"github.com/yuanjing-hash/OhMyCine-Server/pkg/site/builtin"
 	"gorm.io/gorm"
 )
 
@@ -243,23 +242,47 @@ func (s *DownloadService) validatePreviewSource(downloader models.Downloader, so
 	authoritativeBT := false
 	if siteID != nil && *siteID != 0 {
 		var site models.Site
-		if err := s.db.Select("kind", "enabled").First(&site, *siteID).Error; err != nil || !site.Enabled {
+		if err := s.db.First(&site, *siteID).Error; err != nil || !site.Enabled {
 			return appError(CodeSiteUnavailable, "站点不存在或已停用", err)
 		}
-		definition, ok := builtin.DefinitionForKey(site.Kind)
-		if ok && definition.SiteType == builtin.SiteTypeCloud && !(site.Kind == "pansou_tg" && sourceKind == downloadpkg.SourceURL) {
-			if !isCloudShareSource(sourceKind) || !routeDownloaderApplicable(sourceKind, downloader) {
-				return appError(CodeDownloadSourceInvalid, "网盘分享资源只能通过对应网盘转存", nil)
-			}
-			return nil
+		if err := validateSiteDownloadSource(downloader, sourceKind, site); err != nil {
+			return err
 		}
-		authoritativeBT = ok && (definition.SiteType == builtin.SiteTypeBT || site.Kind == "pansou_tg" && sourceKind == downloadpkg.SourceURL)
-		if downloader.Type == models.DownloaderTypePan115Offline && !authoritativeBT {
-			return appError(CodeDownloadSourceInvalid, "PT 资源不能提交到 115 离线下载", nil)
-		}
+		source, _ := routeSourceForSite(site)
+		authoritativeBT = source == RouteSourceBT || site.Kind == "pansou_tg" && sourceKind == downloadpkg.SourceURL
 	}
 	if sourceKind == downloadpkg.SourceTorrent && downloader.Type == models.DownloaderTypePan115Offline && !authoritativeBT {
 		return appError(CodeDownloadSourceInvalid, "种子文件只能提交到非网盘 BT 下载器；公开 BT 站点会先安全转换为磁力链接", nil)
+	}
+	return nil
+}
+
+// The Site must come from the current database, never a caller's source label.
+// Plugin resource Sites share the public BT route; unknown provenance remains
+// ineligible for115 even when its resolved source happens to be a magnet.
+func validateSiteDownloadSource(downloader models.Downloader, sourceKind string, site models.Site) error {
+	if !site.Enabled {
+		return appError(CodeSiteUnavailable, "站点不存在或已停用", nil)
+	}
+	source, err := routeSourceForSite(site)
+	if site.Kind == "pansou_tg" {
+		switch sourceKind {
+		case downloadpkg.SourcePan115Share, downloadpkg.SourceQuarkShare:
+			source, err = sourceKind, nil
+		case downloadpkg.SourceURL:
+			source, err = RouteSourceBT, nil
+		default:
+			return appError(CodeDownloadSourceInvalid, "盘搜资源类型不支持入库", nil)
+		}
+	}
+	if isCloudShareSource(source) {
+		if sourceKind != source || !routeDownloaderApplicable(source, downloader) {
+			return appError(CodeDownloadSourceInvalid, "网盘分享资源只能通过对应网盘转存", nil)
+		}
+		return nil
+	}
+	if downloader.Type == models.DownloaderTypePan115Offline && (err != nil || source != RouteSourceBT) {
+		return appError(CodeDownloadSourceInvalid, "只有已确认的公开 BT 资源可以提交到 115 离线下载", nil)
 	}
 	return nil
 }

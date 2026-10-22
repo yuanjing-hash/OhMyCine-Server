@@ -49,6 +49,7 @@ type testClient struct {
 	libraries   *services.MediaLibraryService
 	history     *services.PlayerHistoryService
 	artworkRoot string
+	logManager  *logging.Manager
 }
 type testEnvelope struct {
 	Code    int             `json:"code"`
@@ -427,6 +428,7 @@ func newTestClientWithSiteAdapters(t *testing.T, siteAdapters []sitepkg.Adapter,
 	api.SetPlayerMediaStateService(playerMediaState)
 	api.SetPlayerOverviewService(services.NewPlayerOverviewService(playerHistory, playerMediaState, libraries))
 	follows := services.NewFollowService(db, audit, queue, coverage, authorization)
+	runtimeLogs.SetExecutionServices(queue, follows)
 	api.SetFollowService(follows)
 	libraries.SetMetadataSettingsService(metadataSettings)
 	storages.AddReferenceChecker(downloadSettings)
@@ -451,7 +453,7 @@ func newTestClientWithSiteAdapters(t *testing.T, siteAdapters []sitepkg.Adapter,
 	api.SetSeedingSettingsService(seedingSettings)
 	api.SetSeedingService(seeding)
 	api.SetPluginRepositoryService(services.NewPluginRepositoryService(db, audit, nil, log))
-	return &testClient{router: New(cfg, api, auth, log), queue: queue, queueEvents: events, db: db, connections: connections, signedProxy: signedProxy, embyGateway: embyGateway, changes: changes, sites: sites, libraries: libraries, history: playerHistory, artworkRoot: artworkRoot}
+	return &testClient{router: New(cfg, api, auth, log), queue: queue, queueEvents: events, db: db, connections: connections, signedProxy: signedProxy, embyGateway: embyGateway, changes: changes, sites: sites, libraries: libraries, history: playerHistory, artworkRoot: artworkRoot, logManager: logManager}
 }
 
 func TestTransferNodeRoutesAreNoStoreAndKeepEnrollmentSecretsOutOfLists(t *testing.T) {

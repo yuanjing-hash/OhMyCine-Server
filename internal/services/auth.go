@@ -212,6 +212,7 @@ func (s *AuthService) SetupOwner(input SetupInput, request RequestContext) (Acto
 	if err != nil {
 		return Actor{}, "", err
 	}
+	serverlog.RecordBusiness(context.Background(), s.log, serverlog.OperationAuthentication, serverlog.BusinessEvent{Code: "auth.setup.confirmed", Stage: "setup", Outcome: "confirmed", Message: "Server 首次设置完成，已建立所有者账号“" + serverlog.BusinessDisplayName(created.DisplayName) + "”并创建登录会话", Fields: map[string]any{"user_id": created.ID, "request_id": request.RequestID, "title": created.DisplayName}})
 	return actor, token, nil
 }
 
@@ -234,9 +235,11 @@ func (s *AuthService) Login(username, password, userAgent string, request Reques
 		return s.audit.Record(tx, &user.ID, "auth.login", "user", uintID(user.ID), "success", map[string]any{}, request)
 	})
 	if err != nil {
+		serverlog.RecordBusiness(context.Background(), s.log, serverlog.OperationAuthentication, serverlog.BusinessEvent{Code: "auth.login.failed", Stage: "session", Outcome: "failed", Message: "账号身份已验证，但登录会话或审计结果未能保存，本次登录未返回可用会话", Fields: map[string]any{"user_id": user.ID, "request_id": request.RequestID, "error_code": "session_persistence_failed"}})
 		return Actor{}, "", err
 	}
 	s.limiter.Success(key)
+	serverlog.RecordBusiness(context.Background(), s.log, serverlog.OperationAuthentication, serverlog.BusinessEvent{Code: "auth.login.confirmed", Stage: "session", Outcome: "confirmed", Message: "用户“" + serverlog.BusinessDisplayName(user.DisplayName) + "”已通过密码认证登录 Server，登录会话已保存", Fields: map[string]any{"user_id": user.ID, "title": user.DisplayName, "request_id": request.RequestID, "action": "browser_login"}})
 	return actor, token, nil
 }
 
@@ -244,6 +247,7 @@ func (s *AuthService) verifyLogin(username, password string, request RequestCont
 	key := request.IPHint + "|" + NormalizeUsername(username)
 	if !s.limiter.Allow(key) {
 		_ = s.audit.Record(nil, nil, auditAction, "user", NormalizeUsername(username), "rate_limited", map[string]any{}, request)
+		serverlog.RecordBusiness(context.Background(), s.log, serverlog.OperationAuthentication, serverlog.BusinessEvent{Code: "auth.login.limited", Stage: "verify", Outcome: "waiting", Message: "登录尝试已触发保护，暂不继续验证密码；请等待登录保护窗口结束后再试", Fields: map[string]any{"request_id": request.RequestID, "reason": "login_rate_limited", "action": auditAction}})
 		return models.User{}, Actor{}, key, appError(CodeLoginRateLimited, "登录尝试过多，请稍后再试", nil)
 	}
 	var user models.User
@@ -256,10 +260,12 @@ func (s *AuthService) verifyLogin(username, password string, request RequestCont
 	if err != nil || !passwordMatches || user.Status != models.UserStatusActive {
 		s.limiter.Failure(key)
 		_ = s.audit.Record(nil, nil, auditAction, "user", NormalizeUsername(username), "failure", map[string]any{}, request)
+		serverlog.RecordBusiness(context.Background(), s.log, serverlog.OperationAuthentication, serverlog.BusinessEvent{Code: "auth.login.rejected", Stage: "verify", Outcome: "failed", Message: "登录未通过：账号、密码或账号状态不符合登录条件，未创建登录会话", Fields: map[string]any{"request_id": request.RequestID, "reason": "invalid_credentials", "action": auditAction}})
 		return models.User{}, Actor{}, key, appError(CodeInvalidCredentials, "用户名或密码错误", nil)
 	}
 	actor, err := s.authz.Resolve(user.ID)
 	if err != nil {
+		serverlog.RecordBusiness(context.Background(), s.log, serverlog.OperationAuthentication, serverlog.BusinessEvent{Code: "auth.login.failed", Stage: "authorize", Outcome: "failed", Message: "登录身份已验证，但当前账号权限解析未完成，未创建登录会话", Fields: map[string]any{"user_id": user.ID, "request_id": request.RequestID, "error_code": "authorization_resolution_failed", "action": auditAction}})
 		return models.User{}, Actor{}, key, err
 	}
 	return user, actor, key, nil
@@ -316,6 +322,7 @@ func (s *AuthService) DeviceLogin(username, password, deviceID, deviceName strin
 		return Actor{}, "", models.DeviceToken{}, err
 	}
 	s.limiter.Success(key)
+	serverlog.RecordBusiness(context.Background(), s.log, serverlog.OperationAuthentication, serverlog.BusinessEvent{Code: "auth.device.confirmed", Stage: "session", Outcome: "confirmed", Message: "用户“" + serverlog.BusinessDisplayName(user.DisplayName) + "”已通过密码认证，Player 设备登录凭据已创建", Fields: map[string]any{"user_id": user.ID, "title": user.DisplayName, "request_id": request.RequestID, "action": "player_login"}})
 	return actor, rawToken, device, nil
 }
 
@@ -469,6 +476,7 @@ func (s *AuthService) Logout(token string, actor Actor, request RequestContext) 
 		return err
 	}
 	_ = s.audit.Record(nil, &actor.User.ID, "auth.logout", "session", "current", "success", map[string]any{}, request)
+	serverlog.RecordBusiness(context.Background(), s.log, serverlog.OperationAuthentication, serverlog.BusinessEvent{Code: "auth.logout.confirmed", Stage: "session", Outcome: "confirmed", Message: "用户“" + serverlog.BusinessDisplayName(actor.User.DisplayName) + "”已退出当前 Server 登录会话", Fields: map[string]any{"user_id": actor.User.ID, "title": actor.User.DisplayName, "request_id": request.RequestID}})
 	return nil
 }
 

@@ -97,6 +97,8 @@ export interface SiteSummary {
   unavailable_reason?: string
   priority: number
   timeout_seconds: number
+  search_timeout_seconds?: number | null
+  effective_search_timeout_seconds?: number
   rate_limit_per_minute: number
   browser_emulation: boolean
   browser_service_configured: boolean
@@ -222,6 +224,12 @@ export interface PTSearchGroup {
   completion?: 'received' | 'complete'
   warnings?: { code: string; message: string }[]
   scope?: PanSouScope
+  complete?: boolean
+  revision?: number
+  incomplete_reason?: string
+  queries_completed?: number
+  queries_failed?: number
+  queries_total?: number
 }
 
 export interface PTRecognitionSpecifications {
@@ -403,6 +411,22 @@ export interface TorrentSearchProgress {
   site_name?: string
   site_status?: 'queued' | 'running' | 'success' | 'error' | 'timeout' | 'cancelled' | string
   error_code?: string
+  event_sequence?: number
+  phase?: string
+  site_detail?: TorrentSearchSiteDetail
+}
+export interface TorrentSearchSiteDetail {
+  site_id: number
+  site_name: string
+  phase: string
+  query_name?: string
+  query_index?: number
+  queries_completed?: number
+  queries_failed?: number
+  queries_total?: number
+  result_count: number
+  elapsed_ms: number
+  revision?: number
 }
 export const buildTorrentSearchQuery = buildPTSearchQuery
 export const torrentSearchURL = ptSearchURL
@@ -414,6 +438,7 @@ const torrentSearchSessionMaxBytes = 512 * 1024
 const torrentSearchSessionMaxAgeMs = 30 * 60 * 1000
 
 export interface TorrentSearchSession {
+  actorID?: number
   input: { keyword: string; mediaType: string; year?: number; tmdbID?: number; searchBy: 'title' | 'tmdb_id'; siteID?: number; siteIDs?: number[]; typePolicy?: DiscoveryTypePolicy; cloudTypes?: string[] }
   groups: TorrentSearchGroup[]
   recognitions: Record<string, TorrentRecognitionResult>
@@ -570,6 +595,7 @@ export function readTorrentSearchSession(storage: SearchSessionStorage | undefin
       .map(([token, recognition]) => [token, restoreTorrentRecognition(recognition)] as const)
       .filter((entry): entry is readonly [string, TorrentRecognitionResult] => entry[1] !== null))
     return {
+      actorID: typeof value.actorID === 'number' && Number.isSafeInteger(value.actorID) && value.actorID > 0 ? value.actorID : undefined,
       input: {
         keyword: typeof value.input.keyword === 'string' ? value.input.keyword.slice(0, 160) : '',
         mediaType: typeof value.input.mediaType === 'string' ? value.input.mediaType : '',

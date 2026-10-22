@@ -54,13 +54,15 @@ Server 已完成管理基础与 Web UI v0.2 壳层：Go/Gin + SQLite/GORM、显�
 
 目录结构诊断同样从 catalog 发布事务中解耦：媒体库首次建立或 Storage/相对根/provider 根身份真正变化时生成新的来源版本，完整目录发布与后台识别收敛后只自动诊断一次；普通全量/增量扫描、服务重启、页面读取和人工识别不会对已完成来源版本重复触发，管理员仍可随时手动重新诊断。后台分批读取当前 generation，并用固定 128 个本地 worker 计算视频与伴随文件目标。缺少季集等信息项不进入默认处理列表，非法路径、模板不可用、重复视频目标和伴随文件冲突按完整问题与冲突成员正常化入库并由 Server 分页。确定性的目录/文件名不一致项（包括视频与 JPG、字幕等伴随文件）在全局或按类型预览时由 Server 跨页自动纳入，不需要逐项建立人工选择；冲突、识别失败、模板及非法路径仍等待明确决定。管理端显示排队、处理中、检查进度、分类计数和 scan-run 关联；诊断始终只读，只有终态问题结果才能生成冻结预览，并在用户再次确认后进入独立修复 Job。数据库、队列或代际基础设施故障才显示“目录结构诊断系统失败”，且不改变已发布 catalog 的成功状态。
 
-扫描日志复用统一 runtime log center，并用 `library_id + scan_run_id + generation + scan_kind` 串联枚举、128-worker 处理、staging、发布、识别和产物调度。info 级记录节流后的分页/批次进度、耗时、有效并发、结果和最多 20 个变更样本，debug 级才记录逐媒体安全动作；媒体名清除控制字符并拒绝 URL/绝对路径。Provider ID、物理/相对路径、Cookie、请求 URL、响应体、原始错误、SQL、checkpoint 与 source fingerprint 均不得进入控制台、JSONL、API 或 WebUI。
+扫描日志复用统一 runtime log center，并用 `library_id + scan_run_id + generation + scan_kind` 串联枚举、128-worker 处理、staging、发布、识别和产物调度。info 级记录节流后的分页/批次进度、耗时、有效并发、结果和最多 20 个变更样本，debug 级才记录逐媒体安全动作；媒体名清除控制字符并拒绝 URL/绝对路径。Provider ID、私有物理根、未经受控根验证的 provider 路径、Cookie、请求 URL、响应体、原始错误、SQL、checkpoint 与 source fingerprint 均不得进入控制台、JSONL、API 或 WebUI。业务执行记录仅允许“配置显示名＋已经验证的受控相对位置”，不放宽其它日志字段的脱敏规则。
 
 Server 管理端现将媒体库配置和内容浏览分开：原 `/system/media-libraries` 仅改名为“媒体库管理”，发现分组新增“媒体库”海报墙。单库继续使用现有 catalog；“全部库”在后端完成稳定身份去重和正确分页，只以媒体类型 + TMDB ID 合并可信匹配，未匹配作品保持库隔离。作品详情展示扫描事实中的真实文件与季集覆盖，并通过 opaque work token 组合现有 TMDB 候选、人工覆盖、清除覆盖和重新刮削；普通重新刮削不移动源文件。源文件删除使用独立 `media_libraries.media_delete` 权限和 preview/confirm：只作用于一个明确媒体库的当前作品，本地逐文件复核 canonical root/Reparse Point，115 逐项复核 Storage/库根 ancestry 与稳定身份后送入回收站；完成项持久 checkpoint，catalog 收敛后再调度产物、STRM 和媒体服务器刷新。
 
 Emby 不作为文件数据源展示，而进入独立“播放器管理”工作区。页面复用通用 Connection 记录和既有权限，以卡片展示真实探测状态、受控的服务器版本/媒体数量聚合摘要，以及默认关闭的签名 STRM 302 gateway。API Key 加密保存且永不回填；gateway 与 Web/API/STRM 共用 Server 主端口，复制地址只使用全局 `OMC_PUBLIC_ORIGIN`。默认监听 `0.0.0.0:3000` 与默认 advertised origin `http://127.0.0.1:3000` 明确分离，wildcard 地址不能进入持久 URL。为兼容不返回 CORS Header 的 115 CDN，网关修补 Emby Web 固定播放器资源中的远程 DirectPlay `crossOrigin` 赋值，并在固定 HTML 壳优先加载一个网关同源、不可配置的兜底脚本以覆盖旧模块缓存；同一固定脚本还可按网关开关提供设备适配的外部播放器入口和 Emby 背景图横向图库。外部播放器只接受本系统 PlaybackInfo 返回的短时 ticket，不传递 Emby/115 持久凭据或最终 CDN 地址；图库只使用当前 Emby 会话可见图片且无第三方前端依赖。其它 HTML/静态内容仍透明代理，不提供任意脚本注入。
 
 Player 现已通过独立 `ServerDataSource` 接入 Server 媒体目录。用户首次在 Player 输入 Server 用户名和密码，Server 只在该次验证后签发可撤销的 `omc_player_` device token；数据库仅保存 token 与设备 ID 的不可逆摘要，Player 密码不持久化，device token 进入 Player provider-specific 安全凭据库。`/api/v1/player/*` 使用独立 Bearer 中间件并注册在浏览器 Origin/CSRF 边界之外，Bearer 不能进入 Cookie 管理 API；停用用户、重置密码、同设备重新登录、登出或显式撤销都会使对应令牌失效。Player 专用 DTO 只返回安全媒体库、作品、版本和身份投影，不返回绝对路径、115 provider ID、Cookie、Emby API Key、signed STRM URL 或上游临时地址。
+
+当前物理媒体作品的 catalog、详情、搜索、收藏、合集与总览响应均提供 `added_at`：取作品当前可见源条目 `created_at` 的最大值，表示 Server 首次收录这些条目的时间；`modified_at` 继续表示源文件修改时间。重复扫描、重新识别和元数据刷新保留已有条目的 `created_at`，新增分集或版本才推进作品的 `added_at`。最近入库在分页前按 `added_at` 倒序、媒体库 ID 和作品身份排序；同批收录时使用后两项稳定决胜。Player 使用当前总览与 `added_at` 契约，不提供旧 Server 的名称或文件时间排序兜底，必须先更新 Server 再更新 Player。
 
 Player 图片契约在 `/api/v1/player` 的 device Bearer 边界内交付：catalog/详情作品沿用 `poster_url`、`backdrop_url`，新增最多八张 `still_urls`；`people[].profile_url`、`versions[].poster_url/backdrop_url/still_url/episode_still_url` 与历史 `episode_still_url` 均由当前 TMDB 快照安全图片身份生成 `/api/v1/player/discovery/images/tmdb/:token`。历史中的 Server 作品海报和背景也由 Server 当前快照重建，忽略客户端上传的外部图片；Emby/Jellyfin 自身图片仍由其服务器提供。浏览器管理端继续使用 Cookie 边界上的 `/api/v1/discovery/images/...`；媒体库及分类封面继续沿用现有受控静态资源路由。
 
@@ -91,6 +93,10 @@ v25 新增媒体库识别单元和安全缓存持久化，Entry 关联识别投�
 识别错误后的修正由受控的“预览 → 确认 → 幂等 Job”完成。下载历史、媒体整理历史和媒体详情均可发起修正；Server 先按当前媒体库 Profile revision 重新分类并展示旧位置到新位置、重命名、伴随文件和冲突预览。确认使用仅保存 SHA-256 的 256-bit 短期 opaque token，绑定 actor、Transfer、媒体库、identity revision、managed manifest 摘要、规则 revision、冲突策略和五分钟过期。执行只操作 Transfer 完成时登记的托管清单：本地重新校验根边界和 symlink/junction/Reparse Point，115 重新校验稳定 item ID 与 root ancestry；v50 前没有 ownership manifest 的旧任务安全拒绝自动重整。成功后重建 NFO/JPG/STRM，复用普通 reconciliation，并进入 Player 与 Emby/Jellyfin 刷新链；失败可重试且不会丢失旧 identity 或扩大文件操作集合。
 
 Server 运行日志已经形成独立基础设施：zerolog 事件在统一脱敏后同时写入 stdout 与本地 JSONL，默认按 20 MiB 切割、gzip 压缩，并以 10 个分片、30 天和 500 MiB 三项上限清理最旧历史。管理端顶栏日志中心通过 `logs.read` 查询并组合筛选模块、组件、插件和业务关联 ID；导出和策略修改分别由 `logs.export`、`logs.configure` 控制。运行日志与 SQLite 审计日志分域、分权、分开保留，日志文件故障时 Server 降级为 stdout 而不退出。
+
+业务执行日志复用这一个 JSONL 存储，统一记录中文对象、动作、原因和实际结果，用 `job_id`、`follow_run_id`、`attempt_number` 区分任务及执行轮次；`task_id` 继续表示业务任务。任务详情默认展示执行摘要与按发生顺序排列的过程，订阅运行记录提供“查看本轮过程”，原队列状态和执行尝试作为辅助信息保留。新增 `GET /api/v1/jobs/:id/execution-logs` 与 `GET /api/v1/follows/:id/runs/:run_id/execution-logs`：普通用户只看自己当前有权查看的执行，不需要全局 `logs.read`，每条返回前重新校验当前库、站点和下载器权限；资源权限撤销后不通过旧句子、样例或链接泄漏信息。
+
+追更的查询名称数、累计返回条目、筛选后候选、已接受提交、新建和复用任务各自保持真实单位。下载器受理不表示下载完成，移动确认不表示改名成功，媒体服务器受理刷新也不表示索引完成。日志为被动观测，不增加网盘请求、扫描或文件操作，不改变选路、幂等和重试策略。过程查询使用固定快照与有界分页；缺失、部分或降级历史明确说明，不能用日志缺失推断业务没有执行，也不回填旧版本事实。全局日志查询、筛选项和导出同样与当前库／站点／下载器范围取交集，不额外要求任务或 Follow 读权限；有资源限制时，无法证明关联的保护域旧记录整行隐藏并标记部分返回。已知不完整的 gzip 导出通过 `X-Log-Partial` 告知页面，原导出格式保持不变。
 
 下载器纵向切片现已接入真实持久队列：管理员可创建、编辑、测试和删除 qBittorrent 连接；qBittorrent 下载目录不再属于某个下载器或 Storage，而是在 `/system/settings` 通过全局 Server 目录选择器配置一份统一绝对暂存目录，支持 Server 可见 Windows 盘符/UNC 与 Linux 挂载点。115 原生离线下载器则受 provider 约束：复用一个 115 数据源的加密 Cookie，并通过 Storage-scoped 目录令牌选择该数据源根内任意子目录；数据库私有保存稳定 provider directory ID，管理 API 只显示数据源名和 Storage-relative 路径。115 离线任务以生活事件广播作为低延迟完成检查信号，事件到达后立即重新读取任务状态和输出清单；20 秒低频查询继续作为漏事件补偿，等待期间只刷新本地 Job lease，不把生活事件直接当作完成事实。管理端通过顶部页签切换进行中、历史记录、新建下载、做种管理和下载器管理，不再把所有区域纵向平铺；`GET /api/v1/downloads?scope=active|history|all` 按 download→transfer→seeding 完整流水线判定范围，失败或未收口的后续仍留在进行中。取消会先调用 provider `Cancel(taskID, false)` 删除下载器任务并保留文件，成功或 task-not-found 后才停止 OhMyCine 后续流水线、释放 Follow claim 并保留 cancelled 历史；provider 失败时不伪取消。failed/cancelled/completed 终态删除默认同样以 `delete_data=false` 删除 provider 任务、保留文件，再清理本地记录；只有用户显式勾选完全删除才传 `true` 删除源/临时文件。Submit 与取消竞态时，迟到 provider ID 会先持久化再立即用 `false` 清理，失败留下可诊断重试事实。保存和执行均重新校验路径、symlink 与 Reparse Point，下载任务入队时快照绝对路径、媒体分类 Profile revision、来源/目标数据源身份和 route version；旧 Storage-relative/无 route 快照任务只走旧兼容执行器，不会被升级后静默重路由。下载完成会同时持久化 provider 完整清单与安全入库清单，只有识别、转移和目标对账全部成功后才精确清理二者差集；任何 partial、非子集、路径/文件变化都会保留数据。qBittorrent `copy|symlink` 将该清理延后到做种收口，115 只按已验证稳定 item ID 送回收站，不递归猜测目录内容。TMDB 凭据按“用户 AES-GCM 自定义凭据 → 部署凭据 → 正式构建内置应用凭据”解析，并显式区分 v4 Read Access Token/Bearer 与 v3 API Key/`api_key` query；管理 API 只显示来源和类型，清除自定义凭据自动回到下一级。v11 前的 Token 密文不重写并继续按 Read Access Token 使用。默认 API 优先短域名且只在网络错误时回退旧域名，401/403 或其它 HTTP 响应不回退；自定义 API 与图片 HTTPS 前缀分别通过固定真实请求测试成功后才独立保存。裸磁力先获取 metadata、暂停并复用 `ParseFilename + TMDB + classification.Classify` 做轻量刮削，再把结果安全映射为暂存根内的 qBittorrent category 后恢复下载；缺少凭据、认证/网络失败、无结果或低置信时自动归入 `未识别`，不阻塞后续任务，完成后再次复核。qBittorrent 新旧 API 与 OMC tag 幂等接管和 115 原生离线下载均已覆盖。最终媒体库不再由下载器介质硬限制：local→local 与同一 115 Connection→同一 115 Connection 保留原生整理；local→115、115→local 和不同 115 Connection 之间使用统一受管暂存、空间预检、完整 SHA1 校验、上传/放置和目标对账，上传成功不会提前删除仍在做种的 qBittorrent 源。Transmission、OpenList/Alist 与 CloudDrive2 的具体写入 adapter 仍由后续切片实现。
 
@@ -1189,7 +1195,7 @@ users ──< user_roles >── roles ──< role_permissions >── permissi
 - `administrator`：受保护系统角色，授权器把它解析为完整 permission catalog。
 - `operator`：面向后续连接、目标、STRM Run 和媒体服务器刷新，不含用户/角色/秘密导出权限。
 - `viewer`：只读状态与后续脱敏业务摘要。
-- `user`（正常用户）：默认提供发现搜索、创建下载和追更、查看及控制自己任务的 12 项权限；不自动分配给已有用户。升级遇到同 code 的自定义角色时保留原配置。
+- `normal_user`（正常用户）：受保护、启用的系统模板，提供媒体库读取、发现搜索、创建下载和追更、查看及控制自己任务的 13 项权限，不含库、用户或系统设置管理。资源名单和直接拒绝仍限制实际访问；不自动分配给已有用户，普通启动保留独立的自定义 `user` 角色。
 - 自定义角色：只能组合 canonical permission code；非系统管理员只能授予自己已经拥有的权限，阻止委派式权限提升。
 - Router route meta、导航、按钮和 Gin API 使用相同 permission code。例如用户页面和 `GET /api/v1/users` 都要求 `users.read`，创建按钮和 `POST /api/v1/users` 都要求 `users.create`。
 - owner 不能被删除、停用或失去 `administrator`；所有用户/角色写操作在事务内校验变更后仍存在有效管理员。
@@ -1936,3 +1942,12 @@ Server 可生成 Linux bash 或 Windows PowerShell 完整命令；命令先校�
 Server 管理网页调用 `POST /api/v1/sites/routes/recommend` 和 `POST /api/v1/follows/routes/preview`；Player 使用 `POST /api/v1/player/discovery/routes/recommend` 和 `POST /api/v1/player/discovery/follows/routes/preview`。推荐只返回当前用户可见的安全路线信息，不返回站点凭据或下载来源；最终提交再次校验。管理员可通过 `PUT /api/v1/downloaders/order` 提交完整下载器顺序。新的订阅写入使用版本 2 的 `routing_policy=source_priority`，旧版固定 `downloader_id` 写入收到明确的升级错误。
 
 可配置的 Torznab 和 PanSou 服务地址支持 HTTP/HTTPS、Docker 服务名、IP 与自定义端口；HTTPS 仍校验证书。其他适配器继续执行各自已有的来源合同。连接测试对根地址先探测 `/api`，仅在 404 时回退到 Jackett 的 Torznab 汇总路径。搜索时，根地址及显式 Jackett 全部索引器地址优先访问与 Jackett 网页相同的 `/api/v2.0/indexers/all/results` 手动搜索接口，按上游顺序分成每页 100 条；该接口不存在（404/405）才走原 Torznab XML 接口。其他显式 Torznab/Prowlarr API 路径维持原状。Jackett 网页自身可能返回不相关标题，因此此模式保留原始结果；通用 Torznab XML 仍按标题过滤。下载地址继续限制为同协议、同主机，来源中的 API Key 不保留在结果身份内，取种时使用已加密配置中的 Key。HTTP 的 API Key 会明文传输，站点表单向管理员提示这一点。
+
+## 插件原生本地离线合同
+
+Server 0.1.1 新增 Runtime op20 和 Player offline-plan/offline-assets 路由，控制清单有界展开，媒体由 Player 下载到本地，不创建 Server 入库任务。详细请求、响应、授权及限制见 [插件原生离线下载](28-plugin-native-offline.md)。
+
+
+## 慢速站点与同站渐进结果
+
+搜索请求、限速等待、站点聚合及整轮搜索采用独立预算；历史连接超时保留，Torznab缺省搜索请求为120秒。网页与Player入库通过可选progress_version=2接收同一站点已校验的累计快照和真实阶段，晚期失败保留已发结果。未协商客户端、JSON及Follow每站只消费最终组；Follow搜索未完成不能保存正常no_match。配置迁移、SSE兼容字段、claim生命周期和字节上限见[慢速站点搜索与渐进结果](30-progressive-site-search.md)。

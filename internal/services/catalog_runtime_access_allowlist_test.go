@@ -9,6 +9,9 @@ package services
 // Batch review: event/baseline reads remain pinned. Legacy artifact scopes and
 // collection queries retain exact library/generation filters and mode gates.
 // Health/naming planners add no queries; retirement uses child-first batches.
+// Release integration review: upstream business-log calls and sample contexts
+// change nine function digests without adding E/R/A references or changing the
+// legacy/catalog gates, pinned facts, publication fences or write receivers.
 var catalogRuntimeAccessAllowlist = map[string]string{
 	// Quark review: initialization only counts legacy rows inside the fresh-library
 	// create transaction and refuses any existing facts; it is not a converter.
@@ -63,7 +66,7 @@ var catalogRuntimeAccessAllowlist = map[string]string{
 	"internal/services/media_library_events.go:MediaLibraryService.providerDeltaAlreadyApplied":           "model:A=2,model:E=2,query:Find:A=1,query:Find:E=1|7da3ea34396f24ac",
 	"internal/services/media_library_local_events.go:MediaLibraryService.knownLocalCatalogPaths":          "model:A=1,model:E=1,query:Find:A=1,query:Find:E=1|df629a97c376924c",
 	"internal/services/media_library_collections.go:reconcileTMDBCollectionsScopeTx":                      "model:E=2,model:R=2,query:Find:E=1,query:Find:R=2|39b9c72417930f42",
-	"internal/services/media_artifact_full_audit.go:MediaArtifactService.filterLegacyFullArtifactWork":    "model:A=3,model:E=4,model:R=3|9992418698a529f6",
+	"internal/services/media_artifact_full_audit.go:MediaArtifactService.filterLegacyFullArtifactWork":    "model:A=3,model:E=4,model:R=3|8ee8fb3ad7e823e9",
 	"internal/services/media_artifact_followup.go:freezeBatchArtifactCheckpointTx":                        "model:A=1,model:E=1,query:Model:A=1,query:Model:E=1|179444f02214c2e8",
 	"internal/services/catalog_scan_batch_baseline.go:loadLegacyBatchFactsTx":                             "model:A=3,model:E=3,query:Find:A=1,query:Find:E=1|7711b314e95d505a",
 	"internal/services/media_artifact_scope.go:MediaArtifactService.freezeLegacyArtifactScope":            "model:A=1,model:E=1,query:Find:E=1,query:Model:A=1|c97c1f7644fe2b57",
@@ -71,7 +74,7 @@ var catalogRuntimeAccessAllowlist = map[string]string{
 	"internal/services/catalog_scan_batch_baseline.go:MediaLibraryService.loadCatalogBatchBaseline":       "model:A=1,model:E=1,model:R=3,query:Find:A=1,query:Find:E=1,query:Find:R=2|f7afda5392c23032",
 	"internal/database/migration_structure_review.go:migrateStructureReviewWorkspace":                     "sql:R=1|f65867ba97727d6c",
 	"internal/services/catalog_artifact_worker.go:MediaArtifactService.generateBoundArtifacts":            "model:A=2,model:E=5,model:R=2,query:Find:E=1,query:Find:R=3|af61c87cc1220413",
-	"internal/services/catalog_artifact_worker.go:MediaArtifactService.prepareCatalogArtifactScope":       "model:A=2,model:E=4,model:R=2,query:Find:A=1,query:Find:E=2,query:Find:R=1|a699bbd5aa586075",
+	"internal/services/catalog_artifact_worker.go:MediaArtifactService.prepareCatalogArtifactScope":       "model:A=2,model:E=4,model:R=2,query:Find:A=1,query:Find:E=2,query:Find:R=1|ed1d9ef63e3d508e",
 	"internal/services/catalog_artifact_worker.go:MediaArtifactService.fullRecognitionArtifactsHealthy":   "model:E=1,model:R=1|bca8ad4c6cd85164",
 	"internal/services/catalog_artifact_worker.go:MediaArtifactService.catalogSTRMArtifactsHealthy":       "model:E=1|8d3a0905fac3d425",
 	"internal/services/catalog_collection_read.go:catalogCollectionMembers":                               "call:layerSQL=1,sql:E=1|04386d88affdf413",
@@ -99,7 +102,7 @@ var catalogRuntimeAccessAllowlist = map[string]string{
 	"internal/services/catalog_reorganization_writer.go:MediaReorganizationWorker.prepareReorganization":     "model:R=2,query:Find:R=1|ff045d6e6275b6ad",
 	"internal/services/catalog_scan_publication.go:MediaLibraryService.loadCatalogScanBaseline":              "model:A=1,model:E=1,model:R=1|30308740c95314ea",
 	"internal/services/catalog_scan_publication.go:MediaLibraryService.prepareCatalogScanAssets":             "model:A=8|823af9c330522bb6",
-	"internal/services/catalog_scan_publication.go:MediaLibraryService.prepareCatalogScanFacts":              "model:E=6,model:R=5|e0bbfb9cc56d1df4",
+	"internal/services/catalog_scan_publication.go:MediaLibraryService.prepareCatalogScanFacts":              "model:E=6,model:R=5|993d8b3f15873c58",
 	"internal/services/catalog_scan_publication.go:mediaLibraryRecognitionArtifactChanged":                   "model:R=1|115ab1d5b26c7d0c",
 	"internal/services/catalog_scan_publication.go:catalogScanEntry":                                         "model:E=2,model:R=1|f68047e0fcce0c7c",
 	"internal/services/catalog_scan_publication.go:declaration(catalogScanBaseline)":                         "model:A=1,model:E=1,model:R=1|8513ca1363eab390",
@@ -120,10 +123,10 @@ var catalogRuntimeAccessAllowlist = map[string]string{
 	"internal/services/catalog_structure_reader.go:loadStructureCatalogPages":                                "model:A=1,model:E=1,query:Find:A=2|870b833f1620d738",
 	"internal/services/library_artwork.go:mediaCategoryCandidatesTx":                                         "model:R=1,query:Find:R=1,sql:E=1,sql:R=3|b35a9ac7762ce1e1",
 	"internal/services/media_artifact.go:MediaArtifactService.generateArtifacts":                             "helper:generateArtifacts=1,model:A=1,model:E=2,model:R=1,query:Find:A=1,query:Find:E=1,query:Find:R=1,sql:E=1,sql:R=1|8a605be95587bfdb",
-	"internal/services/media_artifact.go:MediaArtifactService.writeNFO":                                      "model:E=1,model:R=1|0cad44abdceabb40",
+	"internal/services/media_artifact.go:MediaArtifactService.writeNFO":                                      "model:E=1,model:R=1|6c940e74308819d7",
 	"internal/services/media_artifact.go:MediaArtifactService.writeSTRM":                                     "model:E=1|8ec546daccc85410",
 	"internal/services/media_artifact.go:MediaArtifactService.writeSourceAsset":                              "model:A=1|72ecab2bca7060b9",
-	"internal/services/media_artifact.go:MediaArtifactWorker.Run":                                            "call:generateArtifacts=1|e4307e184ad81856",
+	"internal/services/media_artifact.go:MediaArtifactWorker.Run":                                            "call:generateArtifacts=1|11c809451fde239f",
 	"internal/services/media_artifact.go:nfoRelativePath":                                                    "model:E=1|c619a5d73b232599",
 	"internal/services/media_catalog.go:MediaLibraryService.aggregateCatalogTx":                              "sql:E=2|6f22d75fc1003f97",
 	"internal/services/media_catalog.go:MediaLibraryService.catalogDetailTx":                                 "model:E=1,query:Find:E=1|b94ca59841b85e67",
@@ -150,16 +153,16 @@ var catalogRuntimeAccessAllowlist = map[string]string{
 	"internal/services/media_library.go:MediaLibraryService.Update":                          "model:A=1,model:E=1,model:R=1,query:Delete:A=1,query:Delete:E=1,query:Delete:R=1|664ebb2bb9cffcf5",
 	// Quark enumeration is redirected to observation; verified outputs retain
 	// versioned-versus-legacy dispatch and commit their receipt in the same tx.
-	"internal/services/media_library.go:MediaLibraryService.reconcile":                                       "call:mergeScopedPan115Catalog=1,call:publishFastPan115Scan=1,call:recognizeLibraryUnits=1,call:reconcileTMDBCollectionsTx=1,call:stabilizeExistingRecognitionUnits=1,model:A=4,model:E=5,model:R=3,query:Delete:A=2,query:Delete:E=2,query:Delete:R=1,query:Find:A=1,query:Find:E=1,query:First:R=1,query:Save:A=1,query:Save:E=1,query:Save:R=1|981ded4c777db713",
+	"internal/services/media_library.go:MediaLibraryService.reconcile":                                       "call:mergeScopedPan115Catalog=1,call:publishFastPan115Scan=1,call:recognizeLibraryUnits=1,call:reconcileTMDBCollectionsTx=1,call:stabilizeExistingRecognitionUnits=1,model:A=4,model:E=5,model:R=3,query:Delete:A=2,query:Delete:E=2,query:Delete:R=1,query:Find:A=1,query:Find:E=1,query:First:R=1,query:Save:A=1,query:Save:E=1,query:Save:R=1|8ae918635093aaf8",
 	"internal/services/media_library.go:applyRecognitionEpisodeHints":                                        "model:E=1|7d763b9b7156f0fa",
 	"internal/services/media_library.go:mediaLibraryEntryProjectionChanged":                                  "model:E=1|256c6390a86c4f76",
 	"internal/services/media_library.go:mediaRecognitionProjectionChanged":                                   "model:R=1|67d93d5424dac75c",
 	"internal/services/media_library_collections.go:reconcileTMDBCollectionsTx":                              "helper:reconcileTMDBCollectionsTx=1|ce2cba09571aaca5",
 	"internal/services/media_library_events.go:MediaLibraryService.mergeScopedPan115Catalog":                 "helper:mergeScopedPan115Catalog=1,model:A=1,model:E=1,query:Find:A=1,query:Find:E=1|15c3ea763bb32a11",
 	"internal/services/media_library_events.go:mergeScopedPan115CatalogFacts":                                "model:A=1,model:E=1|73fdeb5e2befa544",
-	"internal/services/media_library_fast_scan.go:MediaLibraryRecognitionWorker.Run":                         "call:completeFastMediaLibraryRecognition=1|55cff3591199132b",
-	"internal/services/media_library_fast_scan.go:MediaLibraryService.completeFastMediaLibraryRecognition":   "call:recognizeLibraryUnits=1,call:reconcileTMDBCollectionsTx=1,helper:completeFastMediaLibraryRecognition=1,model:E=1,model:R=3,query:Delete:R=1,query:Find:E=1,query:First:R=1,query:Save:R=1|09d1c25d490755bf",
-	"internal/services/media_library_fast_scan.go:MediaLibraryService.publishFastPan115Scan":                 "call:deleteFastScanRows=5,call:reconcileTMDBCollectionsTx=2,call:stabilizeExistingRecognitionUnits=1,helper:publishFastPan115Scan=1,model:A=7,model:E=8,model:R=5,query:Delete:R=1,query:Find:A=1,query:Find:E=1,query:Find:R=1,query:Model:E=1,query:Model:R=1,query:Save:A=1,query:Save:E=1,sql:E=1,sql:R=1|f2ed2abdd5ba9402",
+	"internal/services/media_library_fast_scan.go:MediaLibraryRecognitionWorker.Run":                         "call:completeFastMediaLibraryRecognition=1|0c898379c9b5c395",
+	"internal/services/media_library_fast_scan.go:MediaLibraryService.completeFastMediaLibraryRecognition":   "call:recognizeLibraryUnits=1,call:reconcileTMDBCollectionsTx=1,helper:completeFastMediaLibraryRecognition=1,model:E=1,model:R=3,query:Delete:R=1,query:Find:E=1,query:First:R=1,query:Save:R=1|a8386f3b4edf9db0",
+	"internal/services/media_library_fast_scan.go:MediaLibraryService.publishFastPan115Scan":                 "call:deleteFastScanRows=5,call:reconcileTMDBCollectionsTx=2,call:stabilizeExistingRecognitionUnits=1,helper:publishFastPan115Scan=1,model:A=7,model:E=8,model:R=5,query:Delete:R=1,query:Find:A=1,query:Find:E=1,query:Find:R=1,query:Model:E=1,query:Model:R=1,query:Save:A=1,query:Save:E=1,sql:E=1,sql:R=1|4430a0ff24953133",
 	"internal/services/media_library_fast_scan.go:deleteFastScanRows":                                        "helper:deleteFastScanRows=1|35d8a5e3d730359f",
 	"internal/services/media_library_recognition.go:MediaLibraryService.recognizeLibraryUnits":               "helper:recognizeLibraryUnits=1,model:R=1,query:Find:R=1|ba309115a1d70b86",
 	"internal/services/media_library_recognition.go:MediaLibraryService.recognizeLibraryUnitsWithExisting":   "model:R=2|e6247e4bc3c7391f",

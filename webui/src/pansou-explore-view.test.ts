@@ -90,7 +90,8 @@ it('keeps explicit aggregate search refresh when the browser uses the JSON fallb
     const query = new URL(paths[0], 'http://local.test').searchParams
     expect(query.get('refresh')).toBe('true')
     expect(query.get('snapshot_id')).toBeNull()
-    expect(query.getAll('site_ids')).toEqual(['7'])
+    expect(query.get('site_id') ? [query.get('site_id')] : query.getAll('site_ids')).toEqual(['7'])
+    expect(query.has('site_id') && query.has('site_ids')).toBe(false)
   } finally { wrapper.unmount() }
 })
 

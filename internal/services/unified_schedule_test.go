@@ -94,6 +94,8 @@ func createDueSchedule(t *testing.T, service *UnifiedScheduleService, actor Acto
 
 func TestUnifiedSchedulePollSkipsMisfireAndDoesNotDuplicateAfterRestart(t *testing.T) {
 	service, _, actor, now := scheduleFixture(t)
+	logManager, logger := captureRemainingBusiness(t, "schedule")
+	service.log = logger
 	record := createDueSchedule(t, service, actor, now, "skip", "skip")
 	if err := service.Poll(context.Background()); err != nil {
 		t.Fatal(err)
@@ -115,6 +117,9 @@ func TestUnifiedSchedulePollSkipsMisfireAndDoesNotDuplicateAfterRestart(t *testi
 	if refreshed.NextRunAt == nil || !refreshed.NextRunAt.After(now) {
 		t.Fatalf("next_run_at=%v", refreshed.NextRunAt)
 	}
+	entries := remainingBusinessEntries(t, logManager)
+	if len(entries) != 1 { t.Fatalf("duplicate trigger logs: %+v", entries) }
+	requireRemainingBusinessEvent(t, entries, "schedule.skipped", "skipped")
 }
 
 func TestUnifiedSchedulePollAppliesOverlapPolicy(t *testing.T) {

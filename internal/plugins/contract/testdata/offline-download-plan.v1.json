@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "workId": "fixture-work",
+  "segmentId": "fixture-episode",
+  "versionId": "fixture-original",
+  "variantId": "fixture-1080p",
+  "suggestedFileName": "Fixture-1080p.mp4",
+  "format": "hls",
+  "assets": [
+    { "id": "video", "kind": "video", "urlRef": "10000000-0000-4000-8000-000000000001", "expectedContentType": "application/vnd.apple.mpegurl" },
+    { "id": "subtitle-zh", "kind": "subtitle", "urlRef": "10000000-0000-4000-8000-000000000002", "expectedContentType": "text/vtt" }
+  ]
+}

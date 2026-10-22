@@ -1542,7 +1542,7 @@ func TestSeedNormalUserRolePreservesExistingAccountsAndTemplateIdentity(t *testi
 	}
 }
 
-func TestSeedNormalUserRolePreservesCustomCollision(t *testing.T) {
+func TestSeedNormalUserRolePreservesCustomUserAlongsideSystemTemplate(t *testing.T) {
 	db, err := Open(filepath.Join(t.TempDir(), "custom-user.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -1552,7 +1552,7 @@ func TestSeedNormalUserRolePreservesCustomCollision(t *testing.T) {
 	if err := migrateAuthFoundation(db); err != nil {
 		t.Fatal(err)
 	}
-	role := models.Role{Code: authz.RoleUser, Name: "定制用户", Description: "保留我的设置", Kind: models.RoleKindCustom, Active: true}
+	role := models.Role{Code: "user", Name: "定制用户", Description: "保留我的设置", Kind: models.RoleKindCustom, Active: true}
 	if err := db.Create(&role).Error; err != nil {
 		t.Fatal(err)
 	}
@@ -1604,6 +1604,7 @@ func TestSeedNormalUserRolePreservesCustomCollision(t *testing.T) {
 		if !reflect.DeepEqual(before, read()) {
 			t.Fatal("seed changed a custom user role, its grants, account or assignment")
 		}
+		assertNormalUserTemplate(t, db)
 	}
 }
 
@@ -1613,7 +1614,7 @@ func assertNormalUserTemplate(t *testing.T, db *gorm.DB) models.Role {
 	if err := db.Where("code = ?", authz.RoleUser).First(&role).Error; err != nil {
 		t.Fatal(err)
 	}
-	if role.Name != "正常用户" || role.Description != "用户" || role.Kind != models.RoleKindSystem || !role.Protected || !role.Active {
+	if role.Code != "normal_user" || role.Name != "正常用户" || role.Description != "用户" || role.Kind != models.RoleKindSystem || !role.Protected || !role.Active {
 		t.Fatalf("normal-user template drifted: %+v", role)
 	}
 	var codes []string
@@ -1623,7 +1624,7 @@ func assertNormalUserTemplate(t *testing.T, db *gorm.DB) models.Role {
 	want := []string{
 		"dashboard.read", "discovery.read", "downloads.create", "downloads.read_own",
 		"follows.create", "follows.delete_own", "follows.execute_own", "follows.read_own", "follows.update_own",
-		"jobs.control_own", "jobs.read_own", "transfers.read_own",
+		"jobs.control_own", "jobs.read_own", "media_libraries.read", "transfers.read_own",
 	}
 	if !reflect.DeepEqual(codes, want) {
 		t.Fatalf("normal-user grants=%v, want exact confirmed grants %v", codes, want)

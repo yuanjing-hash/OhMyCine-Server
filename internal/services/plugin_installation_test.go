@@ -61,6 +61,8 @@ func (*fakePluginRuntime) Close(context.Context) error { return nil }
 
 func TestPluginInstallationLifecycleAndPermissionConfirmation(t *testing.T) {
 	service, actor, fetcher := pluginRepositoryFixture(t)
+	logManager, logger := captureRemainingBusiness(t, "plugin")
+	service.log = logger
 	runtime := &fakePluginRuntime{}
 	service.runtime = runtime
 	service.pluginRoot = filepath.Join(t.TempDir(), "plugins")
@@ -124,6 +126,13 @@ func TestPluginInstallationLifecycleAndPermissionConfirmation(t *testing.T) {
 	if err != nil || len(entries) != 0 {
 		t.Fatalf("package directory entries=%v err=%v", entries, err)
 	}
+	logged := remainingBusinessEntries(t, logManager)
+	requireRemainingBusinessEvent(t, logged, "plugin.prepare.finish", "finished")
+	requireRemainingBusinessEvent(t, logged, "plugin.install.finish", "finished")
+	requireRemainingBusinessEvent(t, logged, "plugin.install.finish", "failed")
+	requireRemainingBusinessEvent(t, logged, "plugin.state.finish", "finished")
+	requireRemainingBusinessEvent(t, logged, "plugin.rollback.finish", "finished")
+	requireRemainingBusinessEvent(t, logged, "plugin.uninstall.finish", "finished")
 }
 
 func TestPluginInstallPreviewSerializesEmptyPermissionDiffsAsArrays(t *testing.T) {
@@ -173,6 +182,8 @@ func TestPluginConfirmationRejectsPackageContentTampering(t *testing.T) {
 
 func TestPluginUpdateStartFailurePreservesOldVersion(t *testing.T) {
 	service, actor, fetcher := pluginRepositoryFixture(t)
+	logManager, logger := captureRemainingBusiness(t, "plugin")
+	service.log = logger
 	runtime := &fakePluginRuntime{}
 	service.runtime = runtime
 	service.pluginRoot = filepath.Join(t.TempDir(), "plugins")
@@ -194,6 +205,7 @@ func TestPluginUpdateStartFailurePreservesOldVersion(t *testing.T) {
 	if err != nil || current.Version != "0.1.0" || current.Status != models.PluginInstallationEnabled {
 		t.Fatalf("current=%+v err=%v", current, err)
 	}
+	requireRemainingBusinessEvent(t, remainingBusinessEntries(t, logManager), "plugin.update.compensated", "partial")
 }
 
 func TestPluginStopFailureMarksInstallationFailed(t *testing.T) {

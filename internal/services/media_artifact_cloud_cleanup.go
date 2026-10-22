@@ -270,7 +270,7 @@ func (s *MediaArtifactService) cleanupCloudEmptyDirectories(ctx context.Context,
 		// merely because a download will later need it to import. Existing
 		// prepared claims still receive read-only outcome reconciliation below.
 		if busy && receipt.ID == 0 {
-			serverlog.OperationMediaArtifact.Event(s.log.Info()).Uint("library_id", library.ID).Str("task_id", run.ID).Msg("【云端空目录】有下载或入库任务，本次保留目录")
+			recordMediaBusiness(ctx, s.log, serverlog.OperationMediaArtifact, "artifact.cloud_directory.skip", "cleanup", "skipped", "云端存在下载或入库任务，本次保留目录，未请求永久删除或回收", map[string]any{"library_id": library.ID, "task_id": run.ID, "reason": "active_download"})
 			continue
 		}
 		// Check the frozen ancestry against both the latest published fact and
@@ -376,11 +376,11 @@ func (s *MediaArtifactService) cleanupCloudEmptyDirectories(ctx context.Context,
 		}); err != nil {
 			return err
 		}
-		message := "【云端空目录】空目录已回收或确认不存在"
+		message, outcome := "云端空目录已收到回收确认，或已核对不存在；没有使用永久删除兜底", "confirmed"
 		if status == "kept" {
-			message = "【云端空目录】目录仍有文件或正在入库，已保留"
+			message, outcome = "云端目录仍有内容或正在入库，保持原样", "skipped"
 		}
-		serverlog.OperationMediaArtifact.Event(s.log.Info()).Uint("library_id", library.ID).Str("task_id", run.ID).Str("directory_name", safeLabel(path.Base(d.RelativePath), 128)).Msg(message)
+		recordMediaBusiness(ctx, s.log, serverlog.OperationMediaArtifact, "artifact.cloud_directory.finish", "cleanup", outcome, message+"："+serverlog.BusinessDisplayName(path.Base(d.RelativePath)), map[string]any{"library_id": library.ID, "task_id": run.ID, "file_name": path.Base(d.RelativePath), "status": status})
 	}
 	return nil
 }

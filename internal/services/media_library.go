@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -2019,7 +2020,7 @@ func nextRetryDelay(delay time.Duration) time.Duration {
 	return delay
 }
 
-func (s *MediaLibraryService) reconcile(ctx context.Context, id uint, kind string) (models.MediaLibraryScanRun, error) {
+func (s *MediaLibraryService) reconcile(ctx context.Context, id uint, kind string) (observedRun models.MediaLibraryScanRun, scanError error) {
 	started := time.Now()
 	operation := mediaLibraryScanOperation(kind)
 	providerScope, hasProviderScope := providerChangeScopeFromContext(ctx)
@@ -2045,6 +2046,30 @@ func (s *MediaLibraryService) reconcile(ctx context.Context, id uint, kind strin
 	if storage.Type == models.StorageTypeQuark && !isTransferBatch && (!hasProviderScope || providerScope.VerifiedResult == nil) {
 		return s.requestQuarkObservation(ctx, id, true)
 	}
+	ctx = serverlog.WithBusinessFields(ctx, map[string]any{"library_id": id, "library_name": library.Name, "storage_id": storage.ID, "storage_name": storage.Name})
+	recordMediaBusiness(ctx, s.log, operation, "library.scan.start", "start", "started", fmt.Sprintf("开始核对媒体库 %s，扫描方式：%s；先检查当前目录与执行边界，扫描本身不会移动源文件", serverlog.BusinessDisplayName(library.Name), mediaScanKindLabel(kind)), nil)
+	defer func() {
+		fields := map[string]any{"scan_run_id": observedRun.ID, "generation": observedRun.Generation, "duration_ms": time.Since(started).Milliseconds(), "enumerated_count": observedRun.Discovered, "created_count": observedRun.Added, "updated_count": observedRun.Updated, "deleted_count": observedRun.Removed, "matched_count": observedRun.Matched, "unrecognized_count": observedRun.Unrecognized, "cache_hit_count": observedRun.CacheHits, "status": observedRun.Status}
+		outcome, message := "finished", fmt.Sprintf("媒体库扫描阶段结束：发现 %d，新增目录记录 %d，更新 %d，移除目录记录 %d；这些是目录索引变化，不代表对源文件执行移动或删除", observedRun.Discovered, observedRun.Added, observedRun.Updated, observedRun.Removed)
+		if observedRun.Status == "catalog_ready" {
+			outcome, message = "accepted", "基础媒体目录已发布，后台识别、NFO/图片/STRM及媒体服务器刷新分别继续；未宣称后续处理全部完成"
+		}
+		if observedRun.Partial {
+			outcome = "partial"
+			message += "；本轮为受影响范围扫描，不把局部结果当作完整媒体库快照"
+		}
+		if scanError != nil {
+			outcome, message = "failed", "本轮媒体库扫描未完成，保留原目录及执行边界；请结合错误码检查"
+			fields["error_code"] = CodeMediaLibraryScanFailed
+		}
+		if errors.Is(scanError, errMediaLibraryEventReconcileDeferred) || errors.Is(scanError, errProviderChangeScopeUnproven) {
+			outcome, message = "waiting", "扫描范围或写入边界暂不可用，保留待处理事件，不自动扩大为全量扫描"
+		}
+		if ctx.Err() != nil {
+			outcome, message = "cancelled", "媒体库扫描已停止，没有把未完成的扫描当作完整目录发布"
+		}
+		recordMediaBusiness(ctx, s.log, operation, "library.scan.finish", "finish", outcome, message, fields)
+	}()
 	readiness, readinessErr := libraryReadiness(s.db.WithContext(ctx), id)
 	if readinessErr != nil {
 		return models.MediaLibraryScanRun{}, readinessErr
@@ -2103,6 +2128,8 @@ func (s *MediaLibraryService) reconcile(ctx context.Context, id uint, kind strin
 	if err := s.db.Create(&run).Error; err != nil {
 		return run, err
 	}
+	ctx = serverlog.WithBusinessFields(ctx, map[string]any{"scan_run_id": run.ID, "generation": generation})
+	recordMediaBusiness(ctx, s.log, operation, "library.scan.enumerate", "enumerating", "started", "开始从已确认的数据源范围枚举媒体和旁挂文件，后续按批处理、发布目录并识别", nil)
 	operation.Event(s.log.Info()).Uint("library_id", id).Uint("scan_run_id", run.ID).Uint64("generation", generation).
 		Str("scan_kind", kind).Str("phase", "enumerating").Msg(operation.Message("开始从数据源枚举媒体"))
 	if hasProviderScope {
@@ -2238,6 +2265,7 @@ func (s *MediaLibraryService) reconcile(ctx context.Context, id uint, kind strin
 	}
 	units := medialibrary.GroupRecognitionUnits(result.Files)
 	recognitionStarted := time.Now()
+	recordMediaBusiness(ctx, s.log, serverlog.OperationMediaRecognition, "library.recognition.start", "recognition", "started", fmt.Sprintf("枚举结果已按媒体包归组，本轮需要核对 %d 个作品单元；优先复用可信缓存", len(units)), map[string]any{"total_count": len(units)})
 	serverlog.OperationMediaRecognition.Event(s.log.Info()).Uint("library_id", id).Uint("scan_run_id", run.ID).Int("unit_count", len(units)).Msg(serverlog.OperationMediaRecognition.Message("开始"))
 	var recognitionErr error
 	var recognizedUnits []mediaLibraryRecognizedUnit
@@ -2276,6 +2304,7 @@ func (s *MediaLibraryService) reconcile(ctx context.Context, id uint, kind strin
 		}
 	}
 	serverlog.OperationMediaRecognition.Event(s.log.Info()).Uint("library_id", id).Uint("scan_run_id", run.ID).Int("unit_count", len(units)).Int("matched", run.Matched).Int("unrecognized", run.Unrecognized).Int("cache_hits", run.CacheHits).Int("recognition_failed", run.RecognitionFailed).Int64("duration_ms", time.Since(recognitionStarted).Milliseconds()).Msg(serverlog.OperationMediaRecognition.Message("完成"))
+	recordMediaBusiness(ctx, s.log, serverlog.OperationMediaRecognition, "library.recognition.finish", "recognition", "confirmed", fmt.Sprintf("媒体身份核对结束：匹配 %d，未识别 %d，缓存复用 %d，识别错误 %d；接下来提交媒体目录，尚未确认产物生成", run.Matched, run.Unrecognized, run.CacheHits, run.RecognitionFailed), map[string]any{"matched_count": run.Matched, "unrecognized_count": run.Unrecognized, "cache_hit_count": run.CacheHits, "failed_count": run.RecognitionFailed, "duration_ms": time.Since(recognitionStarted).Milliseconds()})
 	run.Discovered = len(result.Files)
 	run.Partial = result.Partial
 	finished = time.Now().UTC()

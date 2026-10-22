@@ -55,7 +55,7 @@ export function canSubmitFollow(defaults: FollowDefaults | null, snapshot: Follo
   return snapshot.site_ids.every(id => siteIDs.has(id))
 }
 export function followStatusLabel(status: FollowStatus) { return ({ active: '追更中', paused: '已暂停', completed: '当前已补齐', blocked: '需要处理' } as const)[status] }
-export function followRunStatusLabel(status: FollowRunSummary['status']) { return ({ queued: '等待执行', running: '正在搜索', no_match: '暂无匹配', submitted: '已提交下载', completed: '本次已补齐', failed: '执行受阻', cancelled: '已取消', stale: '已失效' } as const)[status] }
+export function followRunStatusLabel(status: FollowRunSummary['status']) { return ({ queued: '等待执行', running: '正在搜索', no_match: '本轮没有可提交资源', submitted: '已提交下载', completed: '本次已补齐', failed: '执行受阻', cancelled: '已取消', stale: '已失效' } as const)[status] }
 export function isFollowRevisionConflict(reason: unknown) { return reason instanceof APIError && reason.errorCode === 'follow_revision_conflict' }
 
 export async function loadFollowDefaults(tmdbID: number) { return api<FollowDefaults>(followDefaultsPath(tmdbID)) }

@@ -1,6 +1,7 @@
 package services
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -264,7 +265,8 @@ func TestMediaArtifactWorkerGeneratesManagedSTRMAndPreservesUnmanagedFile(t *tes
 	// Lease generations advance the proxy clock by hours/months. Provider URL
 	// leases must use that same test clock, not the real wall clock.
 	driver.directURLNow = proxy.now
-	artifacts := NewMediaArtifactService(db, queue, proxy, zerolog.Nop())
+	var businessLog bytes.Buffer
+	artifacts := NewMediaArtifactService(db, queue, proxy, zerolog.New(zerolog.SyncWriter(&businessLog)).With().Timestamp().Logger())
 	artifacts.SetConnectionService(connections)
 	changes := NewMediaChangeService(db)
 	artifacts.SetMediaChangeService(changes)
@@ -546,6 +548,23 @@ func TestMediaArtifactWorkerGeneratesManagedSTRMAndPreservesUnmanagedFile(t *tes
 	fifth := runGeneration(5)
 	if fifth.WrittenCount != 0 || fifth.UpdatedCount != 0 || fifth.SkippedCount != 1 || fifth.FailedCount != 0 {
 		t.Fatalf("post-renewal generation=%+v", fifth)
+	}
+	fileEvents := businessRecords(t, &businessLog, "event_code", "artifact.file")
+	generated, reused, unmanagedKept, replaced := false, false, false, false
+	for _, event := range fileEvents {
+		text, _ := event["message"].(string)
+		generated = generated || strings.Contains(text, "已生成 STRM")
+		replaced = replaced || strings.Contains(text, "已替换受管 STRM")
+		reused = reused || event["reason"] == "content_reused"
+		unmanagedKept = unmanagedKept || event["reason"] == "unmanaged_collision"
+	}
+	if !generated || !reused || !unmanagedKept || !replaced {
+		t.Fatalf("artifact outcomes conflated: generated=%t reused=%t unmanaged=%t replaced=%t", generated, reused, unmanagedKept, replaced)
+	}
+	for _, forbidden := range []string{"movie-file-rebound", "movie-file", "disc-file", "pickcode", testPan115Cookie, projection, assetServer.URL, "https://media.example.test"} {
+		if strings.Contains(businessLog.String(), forbidden) {
+			t.Fatalf("artifact event leaked private execution data: %q", forbidden)
+		}
 	}
 }
 

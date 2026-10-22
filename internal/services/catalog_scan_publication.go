@@ -3,6 +3,7 @@ package services
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"reflect"
 	"time"
@@ -347,6 +348,7 @@ func (s *MediaLibraryService) publishCatalogScan(ctx context.Context, library mo
 	}
 	operation := mediaLibraryScanOperation(run.Kind)
 	for attempt := 0; attempt < 3; attempt++ {
+		ctx := context.WithValue(ctx, mediaScanSamplesKey{}, &mediaScanSamples{})
 		if err := ctx.Err(); err != nil {
 			return run, err
 		}
@@ -426,6 +428,9 @@ func (s *MediaLibraryService) publishCatalogScan(ctx context.Context, library mo
 			if errors.Is(err, ErrCatalogFence) {
 				continue
 			}
+			if err == nil {
+				recordMediaBusiness(ctx, s.log, operation, "library.catalog.unchanged", "publishing", "reused", "受影响范围与已发布目录一致，复用现有目录版本；后续工作按已有调度处理，没有为日志重复枚举数据源", map[string]any{"library_id": library.ID, "scan_run_id": run.ID, "enumerated_count": preparedRun.Enumerated})
+			}
 			return preparedRun, err
 		}
 		if err == nil {
@@ -442,7 +447,9 @@ func (s *MediaLibraryService) publishCatalogScan(ctx context.Context, library mo
 			err = s.commitCatalogScan(ctx, candidate, token, library, profile, &preparedRun, metadataChanged, artifactChanges, hook)
 		}
 		if err == nil {
+			s.recordCatalogScanSamples(ctx, preparedRun)
 			operation.Event(s.log.Info()).Uint("library_id", library.ID).Uint("scan_run_id", run.ID).Str("phase", preparedRun.Phase).Int("added", preparedRun.Added).Int("updated", preparedRun.Updated).Int("removed", preparedRun.Removed).Int("recognition_total", preparedRun.RecognitionTotal).Msg(operation.Message("新目录已原子发布，后续工作由持久记录接续"))
+			recordMediaBusiness(ctx, s.log, operation, "library.catalog.published", "publishing", "confirmed", fmt.Sprintf("媒体目录已原子发布：新增 %d，更新 %d，移除索引 %d；待后台识别 %d 个单元，未把后续 NFO/图片/STRM生成或刷新当成已完成", preparedRun.Added, preparedRun.Updated, preparedRun.Removed, preparedRun.RecognitionTotal), map[string]any{"library_id": library.ID, "created_count": preparedRun.Added, "updated_count": preparedRun.Updated, "deleted_count": preparedRun.Removed, "total_count": preparedRun.RecognitionTotal, "scan_run_id": preparedRun.ID})
 			return preparedRun, nil
 		}
 		abandonCatalogScan(s.catalogStore, candidate.ID, token)
@@ -615,6 +622,7 @@ func (s *MediaLibraryService) prepareCatalogScanFacts(ctx context.Context, candi
 			action = "updated"
 		}
 		logFastScanMediaAction(s.log, mediaLibraryScanOperation(run.Kind), *run, "preparing", action, entry.Title, entry.MediaType)
+		observeCatalogScanSample(ctx, action, entry.Title, entry.MediaType)
 		if candidate.Kind == "delta" && !changed {
 			continue
 		}
@@ -652,6 +660,7 @@ func (s *MediaLibraryService) prepareCatalogScanFacts(ctx context.Context, candi
 		if !result.Partial || deleted[old.ProviderID] {
 			run.Removed++
 			logFastScanMediaAction(s.log, mediaLibraryScanOperation(run.Kind), *run, "preparing", "removed", old.Title, old.MediaType)
+			observeCatalogScanSample(ctx, "removed", old.Title, old.MediaType)
 			if candidate.Kind == "delta" {
 				fact := models.CatalogEntryFact{MediaLibraryEntry: old, Tombstone: true}
 				facts.Entries = append(facts.Entries, fact)

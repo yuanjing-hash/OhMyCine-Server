@@ -1,9 +1,12 @@
-import test from 'node:test';
+import test, { afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { openBrowser } from '../src/browser.mjs';
 import { pinnedProxy } from '../src/proxy.mjs';
 import { validateCookies, exportCookies } from '../src/cookies.mjs';
+
+const adapters = new Set();
+afterEach(async () => { for (const adapter of adapters) await adapter.close(); adapters.clear(); });
 
 async function fixture(cookies = [], network = {}) {
   const calls = {};
@@ -25,15 +28,26 @@ async function fixture(cookies = [], network = {}) {
     addCookies: async value => { calls.importedCookies = value; },
     route: async (_, fn) => { calls.route = fn; },
     routeWebSocket: async (_, fn) => { calls.socket = fn; }, newPage: async () => page };
-  const browser = { newContext: async options => { calls.context = options; return context; }, close: async () => {} };
+  const browser = { isConnected: () => calls.connected !== false,
+    newContext: async options => { calls.context = options; return context; }, close: async () => {} };
   const adapter = await openBrowser('/synthetic', 'https://example.com', {
     cookies,
     resolvePinnedAddress: async origin => { calls.resolution = { origin }; return network.address || '8.8.8.8'; },
     pinnedProxy: async (origin, address) => { calls.pinned = { origin, address }; return { url: 'http://127.0.0.1:12345', close: async () => {} }; },
     chromium: { launch: async options => { calls.launch = options; return browser; } },
   });
+  adapters.add(adapter);
   return { adapter, calls };
 }
+test('liveness reflects process disconnect and explicit close', async () => {
+  const { calls, adapter } = await fixture();
+  assert.equal(adapter.alive(), true);
+  calls.connected = false;
+  assert.equal(adapter.alive(), false);
+  calls.connected = true;
+  await adapter.close();
+  assert.equal(adapter.alive(), false);
+});
 test('browser retains sandbox, constrained proxy, no downloads/SW/WebSockets', async () => {
   const { calls, adapter } = await fixture();
   assert.equal(calls.launch.chromiumSandbox, true);

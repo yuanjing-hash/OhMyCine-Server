@@ -21,7 +21,7 @@ func TestQuarkAccountBudgetIndependentMigrationRollbackPreservesAliases(t *testi
 	}
 	sqlDB, _ := db.DB()
 	t.Cleanup(func() { _ = sqlDB.Close() })
-	applyMigrationsThrough(t, db, 118)
+	applyMigrationsThrough(t, db, 120)
 	now := time.Now().UTC().Truncate(time.Second)
 	account := "quark:" + strings.Repeat("d", 32)
 	canonical := models.QuarkObservationAccountKey(1, account)
@@ -75,7 +75,7 @@ func TestQuarkAccountBudgetIndependentMigrationRollbackPreservesAliases(t *testi
 		t.Fatal("failed migration partially consumed or rewrote budget/scope evidence")
 	}
 	var applied int64
-	if err := db.Table("schema_migrations").Where("version = 119").Count(&applied).Error; err != nil || applied != 0 {
+	if err := db.Table("schema_migrations").Where("version = 121").Count(&applied).Error; err != nil || applied != 0 {
 		t.Fatalf("failed migration recorded completion: count=%d err=%v", applied, err)
 	}
 	if err := db.Exec("DROP TRIGGER fail_budget_scope_rebind").Error; err != nil {

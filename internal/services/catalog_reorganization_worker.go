@@ -222,7 +222,14 @@ func (w *MediaReorganizationWorker) prepareReorganizationDirectories(ctx context
 	return nil
 }
 
-func (w *MediaReorganizationWorker) executeCatalogReorganization(ctx context.Context, runtime JobRuntime, task models.MediaReorganizationTask, library models.MediaLibrary, storage models.Storage, plan reorganizationPlan, state *reorganizationState, claim ClaimedJob, facts CatalogFactBatch) error {
+func (w *MediaReorganizationWorker) executeCatalogReorganization(ctx context.Context, runtime JobRuntime, task models.MediaReorganizationTask, library models.MediaLibrary, storage models.Storage, plan reorganizationPlan, state *reorganizationState, claim ClaimedJob, facts CatalogFactBatch) (err error) {
+	var active *reorganizationPlanItem
+	activeOutcome := "failed"
+	defer func() {
+		if err != nil && active != nil {
+			recordReorganizationFile(ctx, w.service.log, *active, activeOutcome, "本文件操作或后续核验未全部完成；已受理和已确认阶段以此前记录为准，不重复推断成功")
+		}
+	}()
 	modified := map[string]time.Time{}
 	for _, f := range facts.Entries {
 		modified[strings.TrimPrefix(f.RelativePath, "/")] = f.ModifiedAt
@@ -265,6 +272,12 @@ func (w *MediaReorganizationWorker) executeCatalogReorganization(ctx context.Con
 		if err := w.validateCatalogItemExecution(ctx, task, plan, *state, claim, item.ManagedItemID); err != nil {
 			return err
 		}
+		if item.OldRelativePath != item.NewRelativePath {
+			active = &item
+			activeOutcome = "failed"
+		} else {
+			active = nil
+		}
 		if storage.Type == models.StorageTypeLocal {
 			oldPath, newPath := filepath.Join(root, filepath.FromSlash(item.OldRelativePath)), filepath.Join(root, filepath.FromSlash(item.NewRelativePath))
 			if ensureWithin(root, oldPath) != nil || ensureWithin(root, newPath) != nil || ensureSafeDirectoryPath(root, filepath.Dir(oldPath), false) != nil || ensureSafeDirectoryPath(root, filepath.Dir(newPath), true) != nil {
@@ -297,6 +310,8 @@ func (w *MediaReorganizationWorker) executeCatalogReorganization(ctx context.Con
 				if err := os.Rename(oldPath, newPath); err != nil {
 					return appError(CodeReorganizationUnavailable, "移动托管文件失败", nil)
 				}
+				activeOutcome = "partial"
+				recordReorganizationFile(ctx, w.service.log, item, "confirmed", "本地移动与目标文件名已确认；后续只提交既有目录结果")
 			}
 		} else {
 			current, err := providerItemWithinRoot(ctx, driver, item.ProviderItemID, root)
@@ -338,6 +353,7 @@ func (w *MediaReorganizationWorker) executeCatalogReorganization(ctx context.Con
 					if err := w.beginQuarkReorganizationMutation(ctx, task, plan, state, claim, quarkReorganizationMutation{Kind: "move", ItemID: current.ID, ParentID: parent}); err != nil {
 						return err
 					}
+					activeOutcome = "uncertain"
 					if err := mutation.Move(ctx, current.ID, parent); err != nil {
 						if storage.Type == models.StorageTypeQuark {
 							return err
@@ -347,6 +363,8 @@ func (w *MediaReorganizationWorker) executeCatalogReorganization(ctx context.Con
 					if err := w.finishQuarkReorganizationMutation(ctx, task, plan, state, claim); err != nil {
 						return err
 					}
+					activeOutcome = "partial"
+					recordReorganizationFile(ctx, w.service.log, item, "accepted", "云端移动请求已受理；此时尚未读取最终位置，不能提前记为完整成功")
 				}
 				if err := w.validateCatalogItemExecution(ctx, task, plan, *state, claim, item.ManagedItemID); err != nil {
 					return err
@@ -357,6 +375,9 @@ func (w *MediaReorganizationWorker) executeCatalogReorganization(ctx context.Con
 					if err := w.beginQuarkReorganizationMutation(ctx, task, plan, state, claim, quarkReorganizationMutation{Kind: "rename", ItemID: current.ID, Name: name}); err != nil {
 						return err
 					}
+					if activeOutcome != "partial" {
+						activeOutcome = "uncertain"
+					}
 					if err := mutation.Rename(ctx, current.ID, name); err != nil {
 						if storage.Type == models.StorageTypeQuark {
 							return err
@@ -366,6 +387,7 @@ func (w *MediaReorganizationWorker) executeCatalogReorganization(ctx context.Con
 					if err := w.finishQuarkReorganizationMutation(ctx, task, plan, state, claim); err != nil {
 						return err
 					}
+					recordReorganizationFile(ctx, w.service.log, item, "accepted", "云端重命名请求已受理，继续既有最终状态核验")
 				}
 				current, err = driver.Stat(ctx, current.ID)
 				if err != nil {
@@ -374,6 +396,7 @@ func (w *MediaReorganizationWorker) executeCatalogReorganization(ctx context.Con
 				if current.ID != item.ProviderItemID || current.ParentID != parent || current.Name != name || cloudReorganizationSourceChanged(item, current) {
 					return ErrCatalogFence
 				}
+				recordReorganizationFile(ctx, w.service.log, item, "confirmed", "现有状态核验已确认云端目标目录、文件名、大小与内容身份")
 			}
 			if storage.Type == models.StorageTypeQuark {
 				rememberQuarkReorganizationFact(state, current)
@@ -489,6 +512,7 @@ func (w *MediaReorganizationWorker) finalizeCatalogReorganization(ctx context.Co
 		return err
 	}
 	p.Token = ""
+	w.reorganizationEvent(ctx, task, "reorganization.catalog.published", "publish", "confirmed", "受控文件调整已提交到媒体目录；元数据产物及媒体刷新仍按原有后续阶段处理", map[string]any{"published_count": len(plan.Items), "generation": generation})
 	return w.reconcileCatalogReorganization(ctx, task, library, storage, plan, state, claim, permit)
 }
 

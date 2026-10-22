@@ -17,6 +17,23 @@ function browserMock() {
   })
 }
 describe('unified browser login', () => {
+  it('checks an already logged-in page without replaying a pending password request', async () => {
+    browserMock()
+    const wrapper = mount(PluginBrowserLogin, { props }); await flushPromises()
+    vi.mocked(api).mockClear()
+    vi.mocked(api).mockResolvedValueOnce({ status: 'healthy', accountName: '用户' })
+    await wrapper.findAll('button').find(button => button.text() === '重新检查登录状态')!.trigger('click')
+    await flushPromises()
+    expect(vi.mocked(api).mock.calls).toHaveLength(1)
+    expect(vi.mocked(api).mock.calls[0]).toEqual([
+      '/api/v1/plugins/plugin/connections/connection/resource/health',
+      expect.objectContaining({ method: 'POST', body: '{}' }),
+    ])
+    expect(wrapper.emitted('result')?.[0]).toEqual([{ state: 'authenticated', accountName: '用户' }])
+    expect(wrapper.text()).not.toContain('需要手动完成站点验证')
+    wrapper.unmount()
+  })
+
   it.each([
     ['resource_browser_login_expired', '网页仍可使用'],
     ['resource_entry_unavailable', '站点响应不可用或无法识别'],
@@ -26,7 +43,7 @@ describe('unified browser login', () => {
     browserMock()
     const wrapper = mount(PluginBrowserLogin, { props }); await flushPromises()
     vi.mocked(api).mockRejectedValueOnce(new APIError(500, code, 'private-secret'))
-    await wrapper.findAll('button').find(b => b.text() === '验证完成，继续登录')!.trigger('click'); await flushPromises()
+    await wrapper.findAll('button').find(b => b.text() === '继续本次登录')!.trigger('click'); await flushPromises()
     expect(wrapper.text()).toContain(message)
     expect(wrapper.text()).not.toContain('private-secret')
     expect(wrapper.find('img').exists()).toBe(true)
@@ -147,7 +164,7 @@ describe('unified browser login', () => {
     await wrapper.findAll('button').find(b => b.text() === '输入到当前焦点')!.trigger('click'); await flushPromises()
     expect((wrapper.get('input').element as HTMLInputElement).value).toBe('')
     vi.mocked(api).mockResolvedValueOnce({ state: 'captcha_required' })
-    await wrapper.findAll('button').find(b => b.text() === '验证完成，继续登录')!.trigger('click'); await flushPromises()
+    await wrapper.findAll('button').find(b => b.text() === '继续本次登录')!.trigger('click'); await flushPromises()
     expect(wrapper.emitted('result')?.[0]).toEqual([{ state: 'captcha_required' }])
     wrapper.unmount()
   })
@@ -186,6 +203,29 @@ describe('unified browser login', () => {
     const wrapper = mount(ServerBrowserPanel, { props: { canInstall: true } }); await flushPromises()
     expect(wrapper.text()).toContain('站点连接超时')
     expect(wrapper.text()).not.toContain('运行依赖')
+    wrapper.unmount()
+  })
+  it.each([
+    ['browser_sandbox_unavailable', '沙箱不可用'], ['browser_dependencies_missing', '缺少运行依赖'],
+    ['browser_executable_unavailable', '无法执行'], ['browser_profile_unavailable', '私有临时目录'],
+    ['browser_launch_timeout', '启动超时'],
+  ])('renders safe startup reason %s without retrying on status', async (code, label) => {
+    vi.mocked(api).mockResolvedValue({ state: 'launch_failed', installed: true, runtime_error: code })
+    const wrapper = mount(ServerBrowserPanel, { props: { canInstall: true } }); await flushPromises()
+    expect(wrapper.text()).toContain(label)
+    expect(wrapper.text()).not.toContain('实际启动结果以登录时检查为准')
+    expect(api).toHaveBeenCalledTimes(1)
+    await wrapper.findAll('button').find(b => b.text() === '检查组件状态')!.trigger('click'); await flushPromises()
+    expect(api).toHaveBeenLastCalledWith('/api/v1/settings/browser/status', expect.anything())
+    wrapper.unmount()
+  })
+  it('shows a fixed sandbox diagnosis in plugin interaction without upstream details', async () => {
+    browserMock()
+    const wrapper = mount(PluginBrowserLogin, { props }); await flushPromises()
+    vi.mocked(api).mockRejectedValueOnce(new APIError(503, 'resource_browser_sandbox_unavailable', 'Cookie=synthetic /private/profile'))
+    await wrapper.findAll('button').find(b => b.text() === '更新画面')!.trigger('click'); await flushPromises()
+    expect(wrapper.text()).toContain('沙箱不可用')
+    expect(wrapper.text()).not.toContain('/private/profile')
     wrapper.unmount()
   })
 })
