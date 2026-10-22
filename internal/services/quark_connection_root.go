@@ -15,16 +15,38 @@ type quarkCommonSpaceVerifier interface {
 	VerifyCommonSpace(context.Context, string, string) (quark.SpaceProof, error)
 }
 type QuarkRootVerification struct {
-	Verified bool   `json:"verified"`
-	Path     string `json:"path"`
-	Message  string `json:"message"`
+	Verified       bool   `json:"verified"`
+	Path           string `json:"path"`
+	Message        string `json:"message"`
+	CleanupState   string `json:"cleanup_state,omitempty"`
+	CleanupMessage string `json:"cleanup_message,omitempty"`
 }
 
 func (s *ConnectionService) VerifyQuarkRoot(ctx context.Context, actor Actor, id uint, tvRoot, displayPath string, request RequestContext) (QuarkRootVerification, error) {
 	if err := s.ensureQuarkRootProof(ctx, actor, id, tvRoot, displayPath, request); err != nil {
 		return QuarkRootVerification{}, err
 	}
-	return QuarkRootVerification{Verified: true, Path: displayPath, Message: "播放与管理授权已在此目录完成共同访问验证"}, nil
+	result := QuarkRootVerification{Verified: true, Path: displayPath, Message: "播放与管理授权已在此目录完成共同访问验证"}
+	_, bundle, err := s.quarkCredentials(ctx, id)
+	if err != nil {
+		return result, nil
+	}
+	_, driver, err := s.driver(id)
+	if err != nil {
+		return result, nil
+	}
+	if cleanup, ok := driver.(quarkProofCleaner); ok {
+		for _, proof := range bundle.Proofs {
+			if proof.TVRoot == tvRoot && proof.Path == displayPath && bundle.HasProof(proof.TVRoot, proof.AgentRoot) {
+				result.CleanupState, err = cleanup.ProofCleanupState(ctx, proof.ReceiptID)
+				if err != nil || result.CleanupState != "complete" {
+					result.CleanupState, result.CleanupMessage = "pending", quarkCleanupPendingMessage
+				}
+				break
+			}
+		}
+	}
+	return result, nil
 }
 func (s *ConnectionService) ensureQuarkRootProof(ctx context.Context, actor Actor, id uint, tvRoot, displayPath string, request RequestContext) error {
 	if !actor.Can(authz.PermissionConnectionsRead) || !actor.Can(authz.PermissionStoragesBrowse) || (!actor.Can(authz.PermissionStoragesCreate) && !actor.Can(authz.PermissionStoragesUpdate)) {

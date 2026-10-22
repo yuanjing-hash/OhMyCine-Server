@@ -15,13 +15,15 @@ import (
 )
 
 type proofPayload struct {
-	Path      string      `json:"path"`
-	TVRoot    string      `json:"tv_root"`
-	AgentRoot string      `json:"agent_root"`
-	TVAccount string      `json:"tv_account"`
-	Name      string      `json:"name"`
-	Bytes     []byte      `json:"bytes"`
-	Proof     *SpaceProof `json:"proof,omitempty"`
+	Path      string        `json:"path"`
+	TVRoot    string        `json:"tv_root"`
+	AgentRoot string        `json:"agent_root"`
+	TVAccount string        `json:"tv_account"`
+	Name      string        `json:"name"`
+	Bytes     []byte        `json:"bytes"`
+	Proof     *SpaceProof   `json:"proof,omitempty"`
+	Challenge *cloud.Item   `json:"challenge,omitempty"`
+	Cleanup   *proofCleanup `json:"cleanup,omitempty"`
 }
 
 // VerifyCommonSpace proves access to one managed root using independent TV
@@ -75,7 +77,7 @@ func (d *Client) VerifyCommonSpace(ctx context.Context, id, path string) (result
 		agentRoot = p.AgentRoot
 		if r.State == "confirmed" && p.Proof != nil {
 			stage = "proof_credentials_save"
-			return *p.Proof, d.persistProof(ctx, *p.Proof)
+			return *p.Proof, d.finishProof(ctx, id, *p.Proof)
 		}
 	} else {
 		// A failed or unreadable checkpoint is not affirmative absence. Never
@@ -142,6 +144,7 @@ func (d *Client) VerifyCommonSpace(ctx context.Context, id, path string) (result
 	hash := sha256.Sum256(p.Bytes)
 	proof := SpaceProof{Version: 1, Generation: r.Revision, TVAccount: tvAuth.AccountID, AgentAccount: agentAuth.AccountID, TVRoot: tv.ID, AgentRoot: agentRoot, Path: path, ReceiptID: id, ContentSHA256: hex.EncodeToString(hash[:]), VerifiedAt: d.api.clock().UTC()}
 	p.Proof = &proof
+	p.Challenge = &found
 	next := r
 	next.Revision++
 	next.State = "confirmed"
@@ -152,10 +155,20 @@ func (d *Client) VerifyCommonSpace(ctx context.Context, id, path string) (result
 		return SpaceProof{}, e
 	}
 	stage = "proof_credentials_save"
-	if e = d.persistProof(ctx, proof); e != nil {
+	if e = d.finishProof(ctx, id, proof); e != nil {
 		return proof, e
 	}
 	return proof, nil
+}
+
+func (d *Client) finishProof(ctx context.Context, id string, proof SpaceProof) error {
+	if err := d.persistProof(ctx, proof); err != nil {
+		return err
+	}
+	// Cleanup failure is independent of the durable access proof. Its receipt
+	// remains pending and can be retried without replaying verification/upload.
+	_, _ = d.CleanupCommonSpace(ctx, id)
+	return nil
 }
 func (d *Client) persistProof(ctx context.Context, p SpaceProof) error {
 	// Proof I/O may itself refresh authorization, so only hold the shared lock

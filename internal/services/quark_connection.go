@@ -22,12 +22,13 @@ type QuarkAuthorizationStatus struct {
 	State      string `json:"state"`
 }
 type QuarkConnectionStatus struct {
-	ConnectionID  uint                     `json:"connection_id"`
-	Playback      QuarkAuthorizationStatus `json:"playback"`
-	Management    QuarkAuthorizationStatus `json:"management"`
-	Web           QuarkAuthorizationStatus `json:"additional_management"`
-	VerifiedRoots int                      `json:"verified_roots"`
-	Capabilities  cloud.Capabilities       `json:"capabilities"`
+	ConnectionID       uint                     `json:"connection_id"`
+	Playback           QuarkAuthorizationStatus `json:"playback"`
+	Management         QuarkAuthorizationStatus `json:"management"`
+	Web                QuarkAuthorizationStatus `json:"additional_management"`
+	VerifiedRoots      int                      `json:"verified_roots"`
+	RootCleanupPending int                      `json:"root_cleanup_pending"`
+	Capabilities       cloud.Capabilities       `json:"capabilities"`
 }
 
 func quarkAuthorizationStatus(a *quark.Authorization) QuarkAuthorizationStatus {
@@ -74,11 +75,24 @@ func (s *ConnectionService) QuarkStatus(ctx context.Context, actor Actor, id uin
 	for _, proof := range bundle.Proofs {
 		if bundle.HasProof(proof.TVRoot, proof.AgentRoot) {
 			result.VerifiedRoots++
+			// An unavailable driver must not turn unconfirmed cleanup into zero.
+			result.RootCleanupPending++
 		}
 	}
 	if record.Enabled {
 		if _, driver, err := s.driver(id); err == nil {
 			result.Capabilities = driver.Capabilities()
+			if cleaner, ok := driver.(quarkProofCleaner); ok {
+				for _, proof := range bundle.Proofs {
+					if !bundle.HasProof(proof.TVRoot, proof.AgentRoot) {
+						continue
+					}
+					state, err := cleaner.ProofCleanupState(ctx, proof.ReceiptID)
+					if err == nil && state == "complete" {
+						result.RootCleanupPending--
+					}
+				}
+			}
 		}
 	}
 	return result, nil

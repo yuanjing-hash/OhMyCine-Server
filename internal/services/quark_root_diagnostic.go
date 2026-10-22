@@ -34,6 +34,7 @@ var quarkRootStages = map[string]string{
 	"challenge_directory":        "从播放授权定位验证文件",
 	"challenge_readback":         "从播放授权读取验证文件",
 	"proof_credentials_save":     "保存共同访问验证结果",
+	"challenge_cleanup":          "清理目录验证文件",
 }
 
 func (s *ConnectionService) quarkRootFailure(id uint, fallback string, err error) error {
@@ -93,7 +94,7 @@ func (s *ConnectionService) quarkRootFailure(id uint, fallback string, err error
 		message += fmt.Sprintf("（提供方错误码 %d）", errno)
 	}
 	event := serverlog.OperationConnectionManagement.Event(s.log.Warn()).
-		Str("event_code", "connection.quark.root.verify.failed").
+		Str("reason", "connection.quark.root.verify.failed").
 		Uint("connection_id", id).Str("phase", stage).Str("error_code", code)
 	if status != 0 {
 		event = event.Int("provider_http_status", status)

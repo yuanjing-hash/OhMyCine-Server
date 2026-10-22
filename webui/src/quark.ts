@@ -10,7 +10,21 @@ export interface QuarkConnectionStatus {
   management: QuarkAuthorizationStatus
   additional_management: QuarkAuthorizationStatus
   verified_roots: number
+  root_cleanup_pending?: number
   capabilities: Record<string, boolean>
+}
+
+export interface QuarkRootVerification {
+  verified: boolean
+  path: string
+  message: string
+  cleanup_state?: 'pending' | 'complete'
+  cleanup_message?: string
+}
+
+export interface QuarkCleanupResult {
+  pending: number
+  message: string
 }
 
 export type QuarkAuthPurpose = 'playback' | 'management'

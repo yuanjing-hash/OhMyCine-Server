@@ -324,6 +324,7 @@ func New(cfg config.Config, api *handlers.API, auth *services.AuthService, log z
 	connectionAPI.POST("/connections/:id/quark/auth/:sessionID/poll", middleware.NoStore(), middleware.RequirePermission(authz.PermissionConnectionsUpdate), api.PollQuarkConnectionAuth)
 	connectionAPI.POST("/connections/:id/quark/auth/:sessionID/cancel", middleware.NoStore(), middleware.RequirePermission(authz.PermissionConnectionsUpdate), api.CancelQuarkConnectionAuth)
 	connectionAPI.POST("/connections/:id/quark/verify-root", middleware.NoStore(), middleware.RequirePermission(authz.PermissionConnectionsUpdate), middleware.RequirePermission(authz.PermissionStoragesBrowse), api.VerifyQuarkConnectionRoot)
+	connectionAPI.POST("/connections/:id/quark/cleanup", middleware.NoStore(), middleware.RequirePermission(authz.PermissionConnectionsUpdate), middleware.RequirePermission(authz.PermissionStoragesBrowse), api.RetryQuarkProofCleanup)
 	connectionAPI.GET("/connections/:id/emby-summary", middleware.RequirePermission(authz.PermissionConnectionsRead), api.EmbyManagementSummary)
 	connectionAPI.GET("/connections/:id/emby-gateway", middleware.RequirePermission(authz.PermissionConnectionsRead), api.EmbyGatewaySettings)
 	connectionAPI.PATCH("/connections/:id/emby-gateway", middleware.RequirePermission(authz.PermissionConnectionsUpdate), api.UpdateEmbyGatewaySettings)
