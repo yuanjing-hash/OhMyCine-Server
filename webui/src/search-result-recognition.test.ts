@@ -4,14 +4,15 @@ import { effectScope, nextTick, ref } from 'vue'
 import { flushPromises, mount } from '@vue/test-utils'
 import { api } from '@/api/client'
 import { useSearchResultRecognition } from '@/search-result-recognition'
-import { torrentRecognitionPath, saveTorrentSearchSession, type TorrentSearchResult, type TorrentRecognitionResult } from '@/sites'
+import { torrentRecognitionPath, saveTorrentSearchSession, ptRecognitionEngineVersion, type TorrentSearchResult, type TorrentRecognitionResult } from '@/sites'
+import type { ShareContentAnalysis } from '@/share-content'
 import ExploreView from '@/views/ExploreView.vue'
 
 vi.mock('@/api/client', async original => ({ ...await original<typeof import('@/api/client')>(), api: vi.fn() }))
 vi.mock('vue-router', () => ({ useRoute: () => ({ query: { mode: 'resources' } }), useRouter: () => ({ replace: vi.fn(), push: vi.fn() }) }))
 vi.mock('@/stores/auth', () => ({ useAuthStore: () => ({ can: () => true }) }))
 const item = (token: string): TorrentSearchResult => ({ token, title: token, expires_at: new Date(Date.now() + 300000).toISOString() })
-const matched = (id = 1): TorrentRecognitionResult => ({ engine_version: 'nextgen-domain-v12', status: 'matched', title: `作品${id}`, media_type: 'movie', tmdb_id: id, specifications: {} })
+const matched = (id = 1): TorrentRecognitionResult => ({ engine_version: ptRecognitionEngineVersion, status: 'matched', title: `作品${id}`, media_type: 'movie', tmdb_id: id, specifications: {} })
 const present = { media_type: 'movie', tmdb_id: 1, status: 'present', movie: { present: true }, freshness: {}, libraries: [] }
 function deferred<T>() { let resolve!: (value: T) => void; const promise = new Promise<T>(done => { resolve = done }); return { promise, resolve } }
 const cleanup: (() => void)[] = []
@@ -25,6 +26,46 @@ function setup(canRead = true) {
 }
 
 describe('automatic result recognition', () => {
+  it('automatically reads real cloud episodes on mounted cards before manual preview', async () => {
+    const cloud = { ...item('cloud-card'), title: 'Advertised 1–99', source_kind: '115_share' as const }
+    saveTorrentSearchSession(sessionStorage, { input: { keyword: 'Example', mediaType: '', siteIDs: [1], searchBy: 'title' }, groups: [{ site_id: 1, site_name: 'My custom PanSou', site_type: 'cloud_share', status: 'success', page: 1, has_next: false, skipped: 0, items: [cloud] }], recognitions: {}, searched: true, savedAt: Date.now() })
+    const pending = deferred<TorrentRecognitionResult>()
+    vi.mocked(api).mockImplementation(path => Promise.resolve(path === '/api/v1/discovery/search-options' ? { list: [{ id: 1, name: 'My custom PanSou', searchable: true }] } : path === torrentRecognitionPath ? pending.promise : present))
+    const wrapper = mount(ExploreView, { global: { stubs: { RouterLink: true } } })
+    cleanup.push(() => wrapper.unmount())
+    await flushPromises()
+    expect(wrapper.get('[aria-label="分享文件分析"]').text()).toContain('正在读取分享文件')
+    expect(vi.mocked(api).mock.calls.some(([path]) => path === torrentRecognitionPath)).toBe(true)
+    expect(vi.mocked(api).mock.calls.some(([path]) => path.includes('share-preview'))).toBe(false)
+    const analysis: ShareContentAnalysis = { status: 'complete', complete: true, groups: [{ title: 'Actual show', media_type: 'tv', season: 1, episodes: Array.from({ length: 14 }, (_, i) => i + 1), video_count: 15, status: 'matched' }], video_count: 15, ignored_count: 1, unresolved_count: 0, message: '', checked_at: new Date().toISOString() }
+    pending.resolve({ ...matched(), media_type: 'tv', episodes: { season: 1, episode_min: 1, episode_max: 99 }, share_analysis: analysis })
+    await flushPromises()
+    const content = wrapper.get('[aria-label="分享文件分析"]').text()
+    expect(content).toContain('已读取分享内容')
+    expect(content).toContain('第 1–14 集（共 14 集） · 15 个视频')
+    expect(content).not.toContain('1–99')
+    expect(wrapper.text()).toContain('站点：My custom PanSou')
+  })
+
+  it('preserves a newer preview against an earlier automatic response and invalidates replaced tokens', async () => {
+    const old = deferred<TorrentRecognitionResult>()
+    vi.mocked(api).mockImplementation(path => path === torrentRecognitionPath ? old.promise : Promise.resolve(present))
+    const { items, queue } = setup()
+    items.value = [{ ...item('share'), source_kind: '115_share' }]
+    await nextTick()
+    const analysis: ShareContentAnalysis = { status: 'complete', complete: true, groups: [], video_count: 0, ignored_count: 0, unresolved_count: 0, message: 'new preview', checked_at: new Date().toISOString() }
+    queue.acceptShareAnalysis('share', analysis)
+    await flushPromises()
+    old.resolve({ ...matched(), share_analysis: { ...analysis, message: 'old automatic' } })
+    await flushPromises()
+    expect(queue.recognitions.value.share?.share_analysis?.message).toBe('new preview')
+    items.value = [{ ...item('replacement'), source_kind: 'quark_share' }]
+    await flushPromises()
+    expect(queue.recognitions.value.share).toBeUndefined()
+    queue.acceptShareAnalysis('share', analysis)
+    expect(queue.recognitions.value.share).toBeUndefined()
+  })
+
   it('limits concurrency, deduplicates coverage, and keeps going after an individual failure', async () => {
     const pending = [deferred<TorrentRecognitionResult>(), deferred<TorrentRecognitionResult>()]
     let index = 0
@@ -155,6 +196,20 @@ describe('automatic result recognition', () => {
     expect(queue.recognitionErrors.value.expired).toContain('请重新搜索')
     expect(queue.retry('expired')).toBe(false)
     expect(api).not.toHaveBeenCalled()
+  })
+
+  it('bounds slow cloud inspection without applying the old title timeout or blocking later cards forever', async () => {
+    vi.useFakeTimers()
+    vi.mocked(api).mockImplementation(() => new Promise(() => {}))
+    const { items, queue } = setup()
+    items.value = ['one', 'two', 'three'].map(token => ({ ...item(token), source_kind: '115_share' }))
+    await nextTick()
+    await vi.advanceTimersByTimeAsync(30000)
+    expect(queue.recognizingTokens.value).toEqual(['one', 'two'])
+    expect(queue.recognitionErrors.value.one).toBeUndefined()
+    await vi.advanceTimersByTimeAsync(35000)
+    expect(queue.recognitionErrors.value.one).toContain('分享文件读取超时')
+    expect(queue.recognizingTokens.value).toEqual(['three'])
   })
 
   it('starts restored cards in visible sort order and offers retry on every card', async () => {

@@ -54,14 +54,15 @@ type SiteService struct {
 	searchPolicy    *siteSearchPolicy
 	pluginResources PluginResourceBridge
 
-	limitMu           sync.Mutex
-	limits            map[uint]*siteLimiter
-	vaultMu           sync.Mutex
-	vault             map[string]siteResultClaim
-	sharePreviews     map[string]siteSharePreview
-	shareValidations  map[string]siteShareValidationEntry
-	sharePreviewSlots chan struct{}
-	identitySnapshots map[string]identitySearchSnapshot
+	limitMu              sync.Mutex
+	limits               map[uint]*siteLimiter
+	vaultMu              sync.Mutex
+	vault                map[string]siteResultClaim
+	sharePreviews        map[string]siteSharePreview
+	shareValidations     map[string]siteShareValidationEntry
+	sharePreviewSlots    chan struct{}
+	shareAnalysisFlights map[string]chan struct{}
+	identitySnapshots    map[string]identitySearchSnapshot
 }
 
 type siteLimiter struct {
@@ -94,6 +95,7 @@ type siteResultClaim struct {
 	RecognitionSource         string
 	RecognitionStatus         string
 	RecognitionLocked         bool
+	SearchIdentity            *siteShareIdentity
 	Published                 bool
 }
 
@@ -330,6 +332,8 @@ type SiteRecognitionEpisodeFacts struct {
 	Count      int  `json:"count,omitempty"`
 }
 type SiteRecognitionSummary struct {
+	SeasonCount    int                           `json:"-"`
+	ShareAnalysis  *SiteShareAnalysis            `json:"share_analysis,omitempty"`
 	EngineVersion  string                        `json:"engine_version"`
 	Status         string                        `json:"status"`
 	IdentitySource string                        `json:"identity_source,omitempty"`
@@ -994,10 +998,9 @@ func (s *SiteService) SearchEach(ctx context.Context, actor Actor, input SiteSea
 }
 
 // BindExpectedIdentity upgrades an actor-bound result claim with the TMDB
-// identity selected in Player. The title must still match one of TMDB's
-// bounded multilingual aliases, otherwise the download is rejected before
-// resolving the torrent or touching a downloader.
-func (s *SiteService) BindExpectedIdentity(ctx context.Context, actor Actor, resultToken, mediaType string, tmdbID int64) error {
+// identity selected in Player. Torrents must match TMDB's bounded multilingual
+// aliases; cloud shares must establish that identity from actual file contents.
+func (s *SiteService) BindExpectedIdentity(ctx context.Context, actor Actor, resultToken, mediaType string, tmdbID int64, selections ...SiteDownloadInput) error {
 	if !actor.Can(authz.PermissionDownloadsCreate) || !actor.Can(authz.PermissionDiscoveryRead) {
 		return appError(CodePermissionDenied, "无权绑定入库媒体身份", nil)
 	}
@@ -1020,6 +1023,38 @@ func (s *SiteService) BindExpectedIdentity(ctx context.Context, actor Actor, res
 	verified, names, err := client.IdentitySearchNames(ctx, mediaType, tmdbID, "zh-CN", tmdb.DefaultIdentitySearchNameLimit)
 	if err != nil {
 		return appError(tmdb.ErrorCode(err), "TMDB 作品身份无法解析", nil)
+	}
+	if isCloudShareSource(claimCloudSource(claim)) {
+		expected := siteShareIdentity{TMDBID: tmdbID, MediaType: mediaType, Title: verified.Title, Names: names, Year: cloneInt(verified.ReleaseYear), SeasonCount: verified.Snapshot.SeasonCount}
+		if claim.SearchIdentity != nil && claim.SearchIdentity.TMDBID == tmdbID && claim.SearchIdentity.MediaType == mediaType {
+			expected.Season = cloneInt(claim.SearchIdentity.Season)
+		}
+		if len(selections) > 1 {
+			return appError(CodeInvalidRequest, "入库文件选择参数无效", nil)
+		}
+		if len(selections) == 1 && (selections[0].PreviewToken != "" || len(selections[0].SelectedEntryTokens) > 0) {
+			return s.bindExpectedShareSelection(ctx, actor, claim, token, expected, selections[0])
+		}
+		if err := s.bindShareSearchIdentity(token, actor.User.ID, expected); err != nil {
+			return err
+		}
+		claim, err = s.resolveAvailableClaim(token, actor.User.ID)
+		if err != nil {
+			return err
+		}
+		result, err := s.recognizeShareResult(ctx, actor, claim, token)
+		if err != nil {
+			return err
+		}
+		if result.ShareAnalysis == nil || !result.ShareAnalysis.Complete || result.ShareAnalysis.UnresolvedCount != 0 || len(result.ShareAnalysis.Groups) == 0 {
+			return appError(CodeSiteResultIdentityMismatch, "分享文件尚未核实为当前作品，请打开分享预览核对", nil)
+		}
+		for _, group := range result.ShareAnalysis.Groups {
+			if group.Status != mediaRecognitionStatusMatched || group.TMDBID == nil || *group.TMDBID != tmdbID || group.MediaType != mediaType {
+				return appError(CodeSiteResultIdentityMismatch, "分享包含其他作品，请在分享预览中核对具体文件", nil)
+			}
+		}
+		return s.bindClaimRecognition(token, actor.User.ID, tmdbID, mediaType, mediaIdentitySourceDirectID, mediaIdentityStatusVerified, false)
 	}
 	if len(names) == 0 || !mediaIdentityResultMatches(claim.Title, names, mediaType, verified.ReleaseYear, nil) {
 		return appError(CodeSiteResultIdentityMismatch, "所选资源与当前海报作品不匹配，请更换资源或使用 Server 手动识别", nil)
@@ -1307,9 +1342,8 @@ func (s *SiteService) cleanupExpiredPluginResourceClaims(limit int) error {
 	return s.db.Where("id IN ? AND expires_at <= ?", ids, s.now()).Delete(&models.PluginResourceClaim{}).Error
 }
 
-// RecognizeResult resolves only the actor-bound server-side title claim. It
-// intentionally does not reserve or consume the claim, fetch a torrent, or
-// submit a download task.
+// RecognizeResult keeps BT recognition title-based. Native cloud shares use
+// their complete file tree. Neither branch consumes the claim or submits work.
 func (s *SiteService) RecognizeResult(ctx context.Context, actor Actor, resultToken string) (SiteRecognitionSummary, error) {
 	if !actor.Can(authz.PermissionDiscoveryRead) {
 		return SiteRecognitionSummary{}, appError(CodePermissionDenied, "无权识别种子资源", nil)
@@ -1320,6 +1354,12 @@ func (s *SiteService) RecognizeResult(ctx context.Context, actor Actor, resultTo
 	}
 	if !actor.CanResource(authz.PermissionDiscoveryRead, models.AuthorizationResourceSite, uintID(claim.SiteID)) {
 		return SiteRecognitionSummary{}, appError(CodePermissionDenied, "无权识别这个站点的搜索结果", nil)
+	}
+	if isCloudShareSource(claimCloudSource(claim)) {
+		return s.recognizeShareResult(ctx, actor, claim, resultToken)
+	}
+	if claim.CloudProvider != "" {
+		return SiteRecognitionSummary{EngineVersion: mediarecognition.EngineVersion, Status: mediaRecognitionStatusUnrecognized, Title: claim.Title, ErrorCode: CodeDownloadSourceInvalid, ShareAnalysis: &SiteShareAnalysis{Status: "unavailable", Groups: []SiteShareAnalysisGroup{}, ErrorCode: CodeDownloadSourceInvalid, Message: "当前网盘尚无支持的原生接收器，未读取实际文件", CheckedAt: s.now()}}, nil
 	}
 	return s.recognizeSiteClaim(ctx, actor, claim, resultToken, nil)
 }
@@ -1350,6 +1390,10 @@ func (s *SiteService) recognizeSiteClaim(ctx context.Context, actor Actor, claim
 		return s.logRecognitionSummary(claim.SiteID, summary), nil
 	}
 
+	var assist mediaRecognitionAIAssist
+	if s.aiRecognition != nil {
+		assist = s.aiRecognition
+	}
 	result := recognizeMedia(ctx, client, MediaRecognitionRequest{
 		PackageName:      claim.Title,
 		Files:            files,
@@ -1360,9 +1404,10 @@ func (s *SiteService) recognizeSiteClaim(ctx context.Context, actor Actor, claim
 		Classification:   classification.DefaultRules(),
 		Language:         "zh-CN",
 		Region:           "CN",
-		AIAssist:         s.aiRecognition,
+		AIAssist:         assist,
 	})
 	summary = SiteRecognitionSummary{
+		SeasonCount:    result.Snapshot.SeasonCount,
 		EngineVersion:  mediarecognition.EngineVersion,
 		Status:         result.Status,
 		IdentitySource: result.IdentitySource,

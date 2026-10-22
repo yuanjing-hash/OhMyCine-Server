@@ -412,13 +412,14 @@ func (a *API) CreateDiscoveryDownload(c *gin.Context) {
 		writeError(c, a.log, &services.AppError{Code: services.CodeInvalidRequest, Message: "期望媒体身份参数不完整"})
 		return
 	}
+	input := services.SiteDownloadInput{PreviewToken: payload.PreviewToken, SelectedEntryTokens: payload.SelectedEntryTokens, ResultToken: payload.ResultToken, DownloaderID: payload.DownloaderID, MediaLibraryID: payload.MediaLibraryID, ProfileID: payload.ProfileID, Priority: payload.Priority}
 	if payload.ExpectedTMDBID != nil {
-		if err := a.sites.BindExpectedIdentity(c.Request.Context(), actor, payload.ResultToken, payload.ExpectedMediaType, *payload.ExpectedTMDBID); err != nil {
+		if err := a.sites.BindExpectedIdentity(c.Request.Context(), actor, payload.ResultToken, payload.ExpectedMediaType, *payload.ExpectedTMDBID, input); err != nil {
 			writeError(c, a.log, err)
 			return
 		}
 	}
-	item, err := a.sites.Download(c.Request.Context(), actor, services.SiteDownloadInput{PreviewToken: payload.PreviewToken, SelectedEntryTokens: payload.SelectedEntryTokens, ResultToken: payload.ResultToken, DownloaderID: payload.DownloaderID, MediaLibraryID: payload.MediaLibraryID, ProfileID: payload.ProfileID, Priority: payload.Priority}, middleware.RequestContextFrom(c))
+	item, err := a.sites.Download(c.Request.Context(), actor, input, middleware.RequestContextFrom(c))
 	if err != nil {
 		writeError(c, a.log, err)
 		return

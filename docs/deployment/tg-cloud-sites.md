@@ -42,6 +42,10 @@ PanSou 开启账号认证时，填写其账号与密码。Server 加密保存凭
 
 ## 入库和订阅
 
+搜索结果会自动分析分享里的真实视频文件，显示作品、季数和实际集数。BT/PT 继续按资源标题识别；分享帖标题只提供线索，不能证明目录里有整个范围。例如帖子写“1–14”，目录只有 E11、E13、E14 时，显示“11、13–14”，不会补上 E12。多个作品、多个季分别显示，同集多个格式不重复计算集数。ZIP、字幕和样片不会成为独立剧集。
+
+自动分析按配置顺序选择当前用户有权使用的同网盘接收器；人工预览仍使用明确选择的接收器。没有接收器、权限不足或目录未能完整读取时，会说明尚未核实，不能把标题范围显示为实际文件。完整目录已读取但作品身份未确认时，保留实际文件集数和待确认状态。订阅复用同一分析，只选择已验证作品、指定季和已确定缺失的实际视频叶文件。
+
 | 资源类型 | 处理方式 |
 | --- | --- |
 | 115 分享 | 推荐有权限且路由可用的 115 分享接收器 |
@@ -69,6 +73,10 @@ PanSou 开启账号认证时，填写其账号与密码。Server 加密保存凭
 PanSou 内部的 `gying` 来源仍由 PanSou 管理，因此可能继续返回同一站点的资源。查看结果上的来源标签即可区分两条来源。
 
 ## 接口合同
+
+现有 `POST /api/v1/discovery/torrent-results/recognize` 和 `POST /api/v1/discovery/share-preview`（以及对应 `/api/v1/player/discovery/...`）响应新增可选 `share_analysis`，不增加轮询接口。它包含 `status=complete|unavailable`、`complete`、`groups`、`video_count`、`ignored_count`、`unresolved_count`、安全 `message/error_code`、`checked_at/expires_at` 和 `downloader_id`。每组提供 `title`、`media_type`、可选 `tmdb_id/year/season/poster_url`、精确排序去重的 `episodes` 数组、`video_count`、`status=matched|unrecognized` 和可选身份错误。空分组/集数使用 `[]`。读取失败时 `complete=false`、`groups=[]`；识别元数据失败不抹掉已经完整读取的文件事实。
+
+分析沿用完整目录的 200 目录、15 层、2,000 条目边界；单次请求最多 45 秒，元数据识别另有最多 8 组及 10 秒子预算，公开摘要最多 32 组、每组最多 2,000 个实际集数。超出识别预算的文件计入未确认数量。短期复用最长五分钟并绑定当前用户权限、真实分享来源和接收配置；重复结果不会刷新旧证据的到期时间。人工重新预览读取最新目录。配置、权限或人工身份变化会阻止旧结果继续使用。摘要没有提供商文件 ID、URL、提取码或可提交的文件选择令牌。
 
 兼容保存的站点类型仍为 `kind=pansou_tg`、`site_type=cloud_share`。这个分类不再决定每条结果的下载路线。`cloud_config`增加：
 

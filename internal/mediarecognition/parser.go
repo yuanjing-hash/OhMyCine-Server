@@ -564,9 +564,46 @@ func firstNonEmptyDomain(values ...string) string {
 
 func cleanTitleSurface(value string) string {
 	value = norm.NFC.String(value)
-	value = strings.NewReplacer("—", "-", "–", "-", "－", "-", "：", ":", "，", ",").Replace(value)
+	value = strings.NewReplacer("—", "-", "–", "-", "－", "-", "：", ":", "，", ",", "（", "(", "）", ")").Replace(value)
+	// Posts commonly decorate real release names with pictographs. Keep letters,
+	// accents and meaningful punctuation; symbols and emoji presentation/joiner
+	// characters must not become part of a TMDB query or break technical tokens.
+	value = strings.Map(func(r rune) rune {
+		if unicode.Is(unicode.So, r) || unicode.Is(unicode.Sk, r) || unicode.Is(unicode.Cf, r) || r == '\ufe0f' || r == '\ufe0e' {
+			return ' '
+		}
+		return r
+	}, value)
+	value = removeUnpairedTitleBrackets(value)
 	value = emptyBracketPattern.ReplaceAllString(value, " ")
 	return strings.Join(strings.Fields(strings.Trim(value, " \t-:,.·・《》\"'")), " ")
+}
+
+// Episode token removal may consume a boundary bracket next to a year. Remove
+// only the unmatched delimiters left behind, preserving meaningful pairs.
+func removeUnpairedTitleBrackets(value string) string {
+	runes := []rune(value)
+	stack := []int{}
+	remove := make(map[int]bool)
+	for i, r := range runes {
+		switch r {
+		case '(', '[', '【':
+			stack = append(stack, i)
+		case ')', ']', '】':
+			if len(stack) > 0 && ((r == ')' && runes[stack[len(stack)-1]] == '(') || (r == ']' && runes[stack[len(stack)-1]] == '[') || (r == '】' && runes[stack[len(stack)-1]] == '【')) {
+				stack = stack[:len(stack)-1]
+			} else {
+				remove[i] = true
+			}
+		}
+	}
+	for _, i := range stack {
+		remove[i] = true
+	}
+	for i := range remove {
+		runes[i] = ' '
+	}
+	return string(runes)
 }
 
 // stripTrailingReleaseNoise handles edition/audio fragments that become

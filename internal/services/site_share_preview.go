@@ -29,6 +29,7 @@ type SiteSharePreviewEntry struct {
 	Size  int64  `json:"size"`
 }
 type SiteSharePreviewSummary struct {
+	ShareAnalysis   *SiteShareAnalysis      `json:"share_analysis,omitempty"`
 	ShareValidation *SiteShareValidation    `json:"share_validation,omitempty"`
 	Token           string                  `json:"token"`
 	Entries         []SiteSharePreviewEntry `json:"entries"`
@@ -42,6 +43,11 @@ type siteSharePreview struct {
 	ExpiresAt                                    time.Time
 	Entries                                      map[string]cloud.ShareTreeItem
 	SubmissionDigest                             string
+	IdentityDigest                               string
+	AuthorizationScope                           string
+	Summary                                      SiteSharePreviewSummary
+	AnalysisFiles                                []siteShareAnalyzedFile
+	Automatic                                    bool
 }
 
 func sharePreviewExpired() error {
@@ -78,6 +84,9 @@ func (s *SiteService) sharePreviewClaim(ctx context.Context, actor Actor, token 
 	if !actor.CanResource(authz.PermissionDiscoveryRead, models.AuthorizationResourceSite, uintID(claim.SiteID)) {
 		return claim, appError(CodePermissionDenied, "无权访问这个站点", nil)
 	}
+	if claim.AuthorizationScope != "" && claim.AuthorizationScope != discoveryAuthorizationScope(actor) {
+		return claim, sharePreviewExpired()
+	}
 	var site models.Site
 	if err := s.db.WithContext(ctx).First(&site, claim.SiteID).Error; err != nil {
 		return claim, siteNotFound(err)
@@ -108,6 +117,14 @@ func (s *SiteService) acquireSharePreview(ctx context.Context) (func(), error) {
 }
 
 func (s *SiteService) PreviewShare(ctx context.Context, actor Actor, resultToken, downloaderID string, requests ...RequestContext) (SiteSharePreviewSummary, error) {
+	request := RequestContext{}
+	if len(requests) > 0 {
+		request = requests[0]
+	}
+	return s.previewShare(ctx, actor, resultToken, downloaderID, false, request)
+}
+
+func (s *SiteService) previewShare(ctx context.Context, actor Actor, resultToken, downloaderID string, reuse bool, request RequestContext) (SiteSharePreviewSummary, error) {
 	var summary SiteSharePreviewSummary
 	ctx, cancel := context.WithTimeout(ctx, 45*time.Second)
 	defer cancel()
@@ -122,11 +139,14 @@ func (s *SiteService) PreviewShare(ctx context.Context, actor Actor, resultToken
 	if provider+"_share" != claimCloudSource(claim) {
 		return summary, appError(CodeDownloadSourceInvalid, "分享来源凭证不一致", nil)
 	}
-	request := RequestContext{}
-	if len(requests) > 0 {
-		request = requests[0]
+	if reuse {
+		release, err := s.acquireShareAnalysis(ctx, uintID(actor.User.ID)+":"+shareSourceDigest(raw)+":"+downloaderID)
+		if err != nil {
+			return summary, err
+		}
+		defer release()
 	}
-	entries, digest, validation, err := s.inspectResultShare(ctx, actor, claim, raw, downloaderID, true, request)
+	entries, digest, validation, cached, err := s.shareAnalysisTree(ctx, actor, claim, raw, downloaderID, reuse, request)
 	if err != nil {
 		return summary, err
 	}
@@ -141,7 +161,10 @@ func (s *SiteService) PreviewShare(ctx context.Context, actor Actor, resultToken
 	if claim.ExpiresAt.Before(expiry) {
 		expiry = claim.ExpiresAt
 	}
-	frozen := siteSharePreview{ActorID: actor.User.ID, ResultToken: strings.TrimSpace(resultToken), DownloaderID: downloaderID, ConfigDigest: digest, URL: raw, ExpiresAt: expiry, Entries: make(map[string]cloud.ShareTreeItem, len(entries))}
+	if cached != nil && cached.ExpiresAt.Before(expiry) {
+		expiry = cached.ExpiresAt
+	}
+	frozen := siteSharePreview{ActorID: actor.User.ID, ResultToken: strings.TrimSpace(resultToken), DownloaderID: downloaderID, ConfigDigest: digest, URL: raw, ExpiresAt: expiry, Entries: make(map[string]cloud.ShareTreeItem, len(entries)), IdentityDigest: shareAnalysisIdentityDigest(claim), AuthorizationScope: discoveryAuthorizationScope(actor), Automatic: reuse}
 	summary = SiteSharePreviewSummary{ShareValidation: &validation, Token: uuid.NewString(), ExpiresAt: expiry, Entries: make([]SiteSharePreviewEntry, 0, len(entries))}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].RelativePath < entries[j].RelativePath })
 	for _, item := range entries {
@@ -168,6 +191,38 @@ func (s *SiteService) PreviewShare(ctx context.Context, actor Actor, resultToken
 			}
 		}
 	}
+	if cached != nil && cached.IdentityDigest == frozen.IdentityDigest {
+		rawAnalysis, _ := json.Marshal(cached.Summary.ShareAnalysis)
+		_ = json.Unmarshal(rawAnalysis, &summary.ShareAnalysis)
+		tokens := map[string]string{}
+		for _, entry := range summary.Entries {
+			tokens[entry.Path] = entry.Token
+		}
+		for _, file := range cached.AnalysisFiles {
+			file.Token = tokens[file.Path]
+			frozen.AnalysisFiles = append(frozen.AnalysisFiles, file)
+		}
+	} else {
+		summary.ShareAnalysis, frozen.AnalysisFiles = s.analyzeShareEntries(ctx, actor, claim, summary.Entries)
+	}
+	summary.ShareAnalysis.CheckedAt = validation.CheckedAt
+	summary.ShareAnalysis.ExpiresAt = &expiry
+	summary.ShareAnalysis.DownloaderID = downloaderID
+	if err := ctx.Err(); err != nil {
+		return SiteSharePreviewSummary{}, err
+	}
+	currentClaim, err := s.sharePreviewClaim(ctx, actor, resultToken)
+	if err != nil {
+		return SiteSharePreviewSummary{}, err
+	}
+	if shareAnalysisIdentityDigest(currentClaim) != frozen.IdentityDigest {
+		return SiteSharePreviewSummary{}, sharePreviewExpired()
+	}
+	current, _, err = sharePreviewConfig(s.db.WithContext(ctx), downloaderID)
+	if err != nil || current != digest {
+		return SiteSharePreviewSummary{}, sharePreviewExpired()
+	}
+	frozen.Summary = summary
 	s.vaultMu.Lock()
 	defer s.vaultMu.Unlock()
 	if s.sharePreviews == nil {
@@ -176,6 +231,18 @@ func (s *SiteService) PreviewShare(ctx context.Context, actor Actor, resultToken
 	for token, item := range s.sharePreviews {
 		if !item.ExpiresAt.After(s.now()) || (item.ActorID == actor.User.ID && item.ResultToken == resultToken && item.DownloaderID == downloaderID && item.SubmissionDigest == "") {
 			delete(s.sharePreviews, token)
+		}
+	}
+	if len(s.sharePreviews) >= 32 {
+		oldest := ""
+		var expiry time.Time
+		for token, saved := range s.sharePreviews {
+			if saved.Automatic && saved.SubmissionDigest == "" && (oldest == "" || saved.ExpiresAt.Before(expiry)) {
+				oldest, expiry = token, saved.ExpiresAt
+			}
+		}
+		if oldest != "" {
+			delete(s.sharePreviews, oldest)
 		}
 	}
 	if len(s.sharePreviews) >= 32 {
@@ -226,11 +293,18 @@ func (s *SiteService) resolveSharePreview(ctx context.Context, actor Actor, toke
 	if !ok || preview.ActorID != actor.User.ID || !preview.ExpiresAt.After(s.now()) {
 		return preview, sharePreviewExpired()
 	}
-	if _, err := s.sharePreviewClaim(ctx, actor, preview.ResultToken); err != nil {
+	claim, err := s.sharePreviewClaim(ctx, actor, preview.ResultToken)
+	if err != nil {
 		return preview, err
+	}
+	if shareAnalysisIdentityDigest(claim) != preview.IdentityDigest {
+		return preview, sharePreviewExpired()
 	}
 	if !actor.CanResource(authz.PermissionDownloadsCreate, models.AuthorizationResourceDownloader, preview.DownloaderID) {
 		return preview, appError(CodePermissionDenied, "无权使用这个下载器", nil)
+	}
+	if preview.AuthorizationScope != discoveryAuthorizationScope(actor) {
+		return preview, sharePreviewExpired()
 	}
 	digest, _, err := sharePreviewConfig(s.db.WithContext(ctx), preview.DownloaderID)
 	if err != nil || digest != preview.ConfigDigest {
@@ -270,7 +344,7 @@ func (s *SiteService) resolveShareSelection(ctx context.Context, actor Actor, in
 	s.vaultMu.Lock()
 	preview, ok := s.sharePreviews[input.PreviewToken]
 	s.vaultMu.Unlock()
-	if !ok || preview.ActorID != actor.User.ID || preview.ResultToken != strings.TrimSpace(input.ResultToken) || preview.DownloaderID != input.DownloaderID || preview.URL != source.URL || !preview.ExpiresAt.After(s.now()) || !isCloudShareSource(source.Kind) {
+	if !ok || preview.ActorID != actor.User.ID || preview.ResultToken != strings.TrimSpace(input.ResultToken) || preview.DownloaderID != input.DownloaderID || preview.URL != source.URL || !preview.ExpiresAt.After(s.now()) || !isCloudShareSource(source.Kind) || preview.AuthorizationScope != discoveryAuthorizationScope(actor) {
 		return selection, nil, sharePreviewExpired()
 	}
 	if len(input.SelectedEntryTokens) == 0 || len(input.SelectedEntryTokens) > cloud.MaxSharePreviewEntries {
@@ -301,6 +375,9 @@ func (s *SiteService) resolveShareSelection(ctx context.Context, actor Actor, in
 	}
 	guard := func(tx *gorm.DB) error {
 		if !preview.ExpiresAt.After(s.now()) || !claim.ExpiresAt.After(s.now()) {
+			return sharePreviewExpired()
+		}
+		if shareAnalysisIdentityDigest(claim) != preview.IdentityDigest {
 			return sharePreviewExpired()
 		}
 		digest, _, err := sharePreviewConfig(tx, preview.DownloaderID)
