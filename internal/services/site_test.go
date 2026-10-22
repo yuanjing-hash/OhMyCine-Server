@@ -98,21 +98,29 @@ func (a *stubSiteAdapter) Test(_ context.Context, config sitepkg.Config) (sitepk
 	return sitepkg.Health{Status: "online", Username: "fixture-user"}, nil
 }
 
-func TestTorznabHTTPBaseURLIsKindScoped(t *testing.T) {
-	const jackett = "http://127.0.0.1:9117/api/v2.0/indexers/all/results/torznab/"
-	got, err := normalizeSiteBaseURL("torznab", jackett)
-	if err != nil || got != strings.TrimSuffix(jackett, "/") {
-		t.Fatalf("Torznab HTTP URL = %q, %v", got, err)
-	}
-	for _, kind := range []string{"auto_bt", "nexusphp", "pansou_tg"} {
-		if _, err := normalizeSiteBaseURL(kind, jackett); err == nil {
-			t.Fatalf("%s unexpectedly accepted HTTP", kind)
-		}
-	}
-	for _, invalid := range []string{"http://user@127.0.0.1:9117/api", "http://127.0.0.1:9117/api?apikey=secret", "http://127.0.0.1:9117/api#fragment"} {
-		if _, err := normalizeSiteBaseURL("torznab", invalid); err == nil {
-			t.Fatalf("Torznab accepted invalid URL %q", invalid)
-		}
+func TestSelfHostedSiteHTTPBaseURLsAndEndpointBoundaries(t *testing.T) {
+	// Torznab and PanSou are explicitly configured API services: Docker names,
+	// direct IPs and custom ports must not require HTTPS or a public hostname.
+	for _, kind := range []string{"torznab", "pansou_tg"} {
+		t.Run(kind, func(t *testing.T) {
+			for _, address := range []string{
+				"http://127.0.0.1:9117/api/v2.0/indexers/all/results/torznab/",
+				"http://pansou:8888/", "http://192.168.1.2:8080/api/", "https://search.example.test/api/",
+			} {
+				got, err := normalizeSiteBaseURL(kind, address)
+				if err != nil || got != strings.TrimSuffix(address, "/") {
+					t.Fatalf("configured API URL = %q, %v", got, err)
+				}
+			}
+			for _, invalid := range []string{
+				"http://user@127.0.0.1:9117/api", "http://127.0.0.1:9117/api?apikey=secret",
+				"http://127.0.0.1:9117/api#fragment", "ftp://pansou:8888/api", "http:///api",
+			} {
+				if _, err := normalizeSiteBaseURL(kind, invalid); err == nil {
+					t.Fatalf("configured API accepted invalid URL %q", invalid)
+				}
+			}
+		})
 	}
 }
 
@@ -305,7 +313,7 @@ func TestPluginResourceSearchRequiresHealthyCurrentLifecycle(t *testing.T) {
 	}
 
 	options, err := service.SearchOptions(actor)
-	if err != nil || len(options) != 1 || options[0].Searchable || !strings.Contains(options[0].Reason, "插件已停用") {
+	if err != nil || len(options) != 0 {
 		t.Fatalf("options=%+v err=%v", options, err)
 	}
 	if _, err := service.Search(context.Background(), actor, SiteSearchInput{Keyword: "test", SiteID: &site.ID, Page: 1}); ErrorCode(err) != "resource_entry_unavailable" {

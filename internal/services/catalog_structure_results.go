@@ -51,6 +51,19 @@ func (s *MediaLibraryStructureService) finalizeCancelledCatalogStructureResult(c
 		return err
 	}
 	if state.Stage != "catalog_published" && state.Stage != "reconciling" {
+		// A visible destination is not proof that an accepted/unknown native
+		// operation has settled. Cancellation never resubmits or drops its hold.
+		if boundary.Storage.Type == models.StorageTypeQuark {
+			bound, err := s.bindQuarkStructureBackend(ctx, repair, plan, &state, nil, boundary)
+			if err != nil {
+				return err
+			}
+			quarkBackend := bound.(quarkMediaLibraryStructureBackend)
+			if err := quarkBackend.resolveCancelledCursor(ctx, boundary); err != nil {
+				return err
+			}
+			backend = bound
+		}
 		observeCtx, stopObserve := context.WithTimeout(ctx, 20*time.Second)
 		defer stopObserve()
 		observe, err := structureFileObserver(observeCtx, boundary, backend)
@@ -118,7 +131,7 @@ func (s *MediaLibraryStructureService) finalizeCancelledCatalogStructureResult(c
 						if atSource {
 							row.Status = structureRepairItemFailed
 						} else {
-							if (!missing && boundary.Storage.Type != models.StorageTypePan115) || (recycle && boundary.Storage.Type != models.StorageTypeLocal) {
+							if (!missing && boundary.Storage.Type != models.StorageTypePan115 && boundary.Storage.Type != models.StorageTypeQuark) || (recycle && boundary.Storage.Type != models.StorageTypeLocal) {
 								return ErrCatalogFence
 							}
 							atTarget, _, err := observe(target, provider, size, modified)
@@ -190,7 +203,16 @@ func (s *MediaLibraryStructureService) finalizeCancelledCatalogStructureResult(c
 		if err != nil {
 			return err
 		}
+		var evidence quarkStructureEvidence
+		if quarkBackend, ok := backend.(quarkMediaLibraryStructureBackend); ok {
+			// Only metadata checks; cancellation cannot issue a native mutation.
+			evidence, err = quarkBackend.confirmedFacts(ctx, boundary, applied, &facts)
+			if err != nil {
+				return err
+			}
+		}
 		prepared, err := s.prepareCatalogStructureCandidate(ctx, repair, state, nil, facts)
+		prepared.quarkEvidence = evidence
 		defer s.abandonCatalogStructureCandidate(&prepared)
 		if err != nil {
 			return err

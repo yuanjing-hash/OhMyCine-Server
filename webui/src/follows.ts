@@ -22,7 +22,7 @@ export interface FollowDefaults {
 export interface FollowRoutePreview {
   available: boolean
   routes: Array<{
-    site_id: number; site_name: string; source_kind: 'pt' | 'bt' | '115_share'
+    site_id: number; site_name: string; source_kind: 'pt' | 'bt' | '115_share' | 'quark_share'
     recommended: { downloader_id: string; media_library_id: number } | null
     reason_code: string; reason_message: string
   }>

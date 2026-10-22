@@ -104,9 +104,10 @@ type SignedProxyService struct {
 	now          func() time.Time
 	playback     *pan115PlaybackCoordinator
 
-	mu      sync.Mutex
-	cache   map[string]proxyCacheEntry
-	flights map[string]*proxyFlight
+	mu          sync.Mutex
+	cache       map[string]proxyCacheEntry
+	flights     map[string]*proxyFlight
+	quarkPlayer quarkPlayerPlaybackCache
 }
 
 func NewSignedProxyService(db *gorm.DB, credentials *credential.Store, connections *ConnectionService, publicOrigin string, log zerolog.Logger) (*SignedProxyService, error) {
@@ -391,7 +392,18 @@ func (s *SignedProxyService) resolveTarget(ctx context.Context, opaque string, t
 
 func (s *SignedProxyService) resolveTargetWithItem(ctx context.Context, opaque string, target signedProxyTarget, userAgent, clientFingerprint string, verifiedItem *cloudpkg.Item) (ProxyRedirect, error) {
 	now := s.now()
-	cacheKey := proxyCacheKey(target.ConnectionID, opaque, target.ProviderItemID, userAgent+":"+clientFingerprint)
+	credentialIdentity, err := s.connections.CloudCredentialCacheKey(ctx, target.ConnectionID)
+	if mapped := quarkPlaybackError(target.StorageType, err); mapped != nil {
+		return ProxyRedirect{}, mapped
+	}
+	if err != nil {
+		return ProxyRedirect{}, appError(CodeProxyTargetUnavailable, "播放目标不可用", err)
+	}
+	fileVersion := target.SourceFingerprint
+	if verifiedItem != nil {
+		fileVersion += ":" + verifiedItem.Revision + ":" + strconv.FormatInt(verifiedItem.Size, 10) + ":" + verifiedItem.ModifiedAt.UTC().Format(time.RFC3339Nano)
+	}
+	cacheKey := proxyCacheKey(target.ConnectionID, opaque, target.ProviderItemID, userAgent+":"+clientFingerprint+":"+credentialIdentity+":"+fileVersion)
 	if cached, ok := s.cached(cacheKey, now); ok {
 		return cached, nil
 	}
@@ -409,26 +421,29 @@ func (s *SignedProxyService) resolveTargetWithItem(ctx context.Context, opaque s
 }
 
 type signedProxyTarget struct {
-	LibraryID      uint
-	ConnectionID   uint
-	ProviderItemID string
-	StorageType    string
-	ArtifactStatus string
-	ArtifactKind   string
-	TargetKind     string
-	Managed        bool
-	ArtifactActive bool
-	LibraryEnabled bool
-	StorageEnabled bool
-	STRMEnabled    bool
-	ProxyEnabled   bool
+	LibraryID         uint
+	ConnectionID      uint
+	ProviderItemID    string
+	StorageType       string
+	ProviderRootID    string
+	SourceFingerprint string
+	ArtifactStatus    string
+	ArtifactKind      string
+	TargetKind        string
+	Managed           bool
+	ArtifactActive    bool
+	LibraryEnabled    bool
+	StorageEnabled    bool
+	STRMEnabled       bool
+	ProxyEnabled      bool
 }
 
 func (s *SignedProxyService) proxyTarget(opaque string) (signedProxyTarget, error) {
 	var target signedProxyTarget
 	err := s.db.Table("media_artifacts").
 		Select(`media_artifacts.library_id, COALESCE(storages.connection_id, 0) AS connection_id,
-			media_artifacts.provider_item_id, storages.type AS storage_type,
+			media_artifacts.provider_item_id, media_artifacts.source_fingerprint, storages.type AS storage_type,
+			CASE WHEN media_libraries.provider_root_id <> '' THEN media_libraries.provider_root_id ELSE storages.root_path END AS provider_root_id,
 			media_artifacts.status AS artifact_status, media_artifacts.kind AS artifact_kind,
 			media_artifacts.target_kind, media_artifacts.managed, media_artifacts.active AS artifact_active,
 			media_libraries.enabled AS library_enabled, storages.enabled AS storage_enabled,
@@ -437,7 +452,7 @@ func (s *SignedProxyService) proxyTarget(opaque string) (signedProxyTarget, erro
 		Joins("JOIN media_libraries ON media_libraries.id = media_artifacts.library_id").
 		Joins("JOIN storages ON storages.id = media_libraries.storage_id").
 		Where("media_artifacts.opaque_id = ?", opaque).Take(&target).Error
-	if err != nil || !target.Managed || !target.ArtifactActive || !target.LibraryEnabled || !target.StorageEnabled || !target.STRMEnabled || !target.ProxyEnabled || target.ArtifactStatus != models.MediaArtifactStatusCompleted || target.ArtifactKind != models.MediaArtifactKindSTRM || target.TargetKind != models.MediaArtifactTargetLocalProjection || target.StorageType != models.StorageTypePan115 || target.ConnectionID == 0 || strings.TrimSpace(target.ProviderItemID) == "" {
+	if err != nil || !target.Managed || !target.ArtifactActive || !target.LibraryEnabled || !target.StorageEnabled || !target.STRMEnabled || !target.ProxyEnabled || target.ArtifactStatus != models.MediaArtifactStatusCompleted || target.ArtifactKind != models.MediaArtifactKindSTRM || target.TargetKind != models.MediaArtifactTargetLocalProjection || !models.IsNativeCloudStorage(target.StorageType) || target.ConnectionID == 0 || strings.TrimSpace(target.ProviderItemID) == "" {
 		return signedProxyTarget{}, appError(CodeProxyTargetUnavailable, "播放目标不可用", nil)
 	}
 	return target, nil
@@ -445,6 +460,9 @@ func (s *SignedProxyService) proxyTarget(opaque string) (signedProxyTarget, erro
 
 func (s *SignedProxyService) resolveProvider(ctx context.Context, opaque string, target signedProxyTarget, userAgent, clientFingerprint string, verifiedItem *cloudpkg.Item) (ProxyRedirect, error) {
 	_, driver, err := s.connections.driver(target.ConnectionID)
+	if mapped := quarkPlaybackError(target.StorageType, err); mapped != nil {
+		return ProxyRedirect{}, mapped
+	}
 	if err != nil || !driver.Capabilities().TemporaryDirectURL {
 		return ProxyRedirect{}, appError(CodeProxyTargetUnavailable, "播放目标不可用", err)
 	}
@@ -456,15 +474,32 @@ func (s *SignedProxyService) resolveProvider(ctx context.Context, opaque string,
 		var statErr error
 		if verifiedItem != nil {
 			item = *verifiedItem
+		} else if _, scoped := driver.(scopedPlaybackResolver); target.StorageType == models.StorageTypeQuark && scoped {
+			item, statErr = s.resolveQuarkArtifactItem(ctx, driver, target)
 		} else {
 			item, statErr = driver.Stat(ctx, target.ProviderItemID)
 		}
-		if statErr != nil || item.ID != target.ProviderItemID || item.IsDir || strings.TrimSpace(item.PickCode) == "" {
+		if mapped := quarkPlaybackError(target.StorageType, statErr); mapped != nil {
+			return ProxyRedirect{}, mapped
+		}
+		if statErr != nil || item.ID != target.ProviderItemID || item.IsDir || (target.StorageType == models.StorageTypePan115 && strings.TrimSpace(item.PickCode) == "") {
 			return ProxyRedirect{}, appError(CodeProxyTargetUnavailable, "播放目标不可用", statErr)
+		}
+		if _, scoped := driver.(scopedPlaybackResolver); target.StorageType == models.StorageTypeQuark && !scoped {
+			within, scopeErr := providerParentWithinRoot(ctx, driver, item.ParentID, target.ProviderRootID)
+			if mapped := quarkPlaybackError(target.StorageType, scopeErr); mapped != nil {
+				return ProxyRedirect{}, mapped
+			}
+			if scopeErr != nil || !within {
+				return ProxyRedirect{}, appError(CodeProxyTargetUnavailable, "播放文件已不在当前媒体库范围内", scopeErr)
+			}
 		}
 		temporary, err = driver.DirectURL(ctx, cloudpkg.DirectURLRequest{FileID: item.ID, PickCode: item.PickCode, UserAgent: userAgent})
 	}
 	if err != nil {
+		if mapped := quarkPlaybackError(target.StorageType, err); mapped != nil {
+			return ProxyRedirect{}, mapped
+		}
 		if ErrorCode(err) == CodeProxyDeviceLimit {
 			return ProxyRedirect{}, err
 		}
@@ -477,9 +512,15 @@ func (s *SignedProxyService) resolveProvider(ctx context.Context, opaque string,
 	if !proxyHeadersCompatible(temporary.Headers, userAgent) {
 		return ProxyRedirect{}, appError(CodeProxyHeadersUnsupported, "该播放地址需要 302 无法安全携带的请求头", nil)
 	}
+	if target.StorageType == models.StorageTypeQuark && len(temporary.Headers) != 0 {
+		return ProxyRedirect{}, appError(CodeProxyHeadersUnsupported, "夸克原文件链接要求额外请求头，无法直接播放", nil)
+	}
 	expires := temporary.ExpiresAt.UTC()
-	if expires.IsZero() {
+	if expires.IsZero() && target.StorageType != models.StorageTypeQuark {
 		expires = s.now().Add(2 * time.Minute)
+	}
+	if !expires.IsZero() && !expires.After(s.now()) {
+		return ProxyRedirect{}, appError(CodeProxyUpstreamUnavailable, "播放地址已过期，请重试", nil)
 	}
 	return ProxyRedirect{URL: parsed.String(), ExpiresAt: expires}, nil
 }
@@ -606,8 +647,12 @@ func ProxyHTTPStatus(err error) int {
 		return http.StatusForbidden
 	case CodeProxyTargetUnavailable:
 		return http.StatusNotFound
-	case CodeProxyDeviceLimit:
+	case CodeProxyDeviceLimit, "quark_rate_limited":
 		return http.StatusTooManyRequests
+	case "quark_auth_expired", "quark_unavailable", "quark_capability_unavailable":
+		return http.StatusServiceUnavailable
+	case "quark_identity_mismatch", "quark_shared_space_unverified":
+		return http.StatusConflict
 	default:
 		return http.StatusBadGateway
 	}

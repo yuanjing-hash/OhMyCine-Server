@@ -123,6 +123,9 @@ func (s *CredentialRevealService) reveal(input CredentialRevealInput) (string, e
 		}
 		switch input.Field {
 		case "credential":
+			if record.Provider == models.ConnectionProviderQuark {
+				return "", revealInvalid() // OAuth bundles and refresh tokens are never a revealable field.
+			}
 			return s.decrypt(connectionPurpose(record.ID, record.Provider), record.CredentialCiphertext)
 		case "recycle_password":
 			if record.Provider != models.ConnectionProviderPan115 {

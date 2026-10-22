@@ -1,14 +1,14 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { api, APIError } from '@/api/client'
-import { formatBytes } from '@/downloads'
+import { formatBytes, cloudShareDownloaderType } from '@/downloads'
 import { isShareVideo, shareEntryFiles, toggleShareEntry, type SharePreview, type SharePreviewEntry, type ShareSelection, type ShareValidation } from '@/share-preview'
 import type { TorrentRecognitionResult } from '@/sites'
 import type { DownloaderSummary } from '@/types/api'
 
-const props = defineProps<{ resultToken: string; title: string; downloaders: DownloaderSummary[] }>()
+const props = defineProps<{ resultToken: string; title: string; sourceKind?: string; downloaders: DownloaderSummary[] }>()
 const emit = defineEmits<{ close: []; select: [selection: ShareSelection]; validation: [resultToken: string, validation: ShareValidation] }>()
-const available = computed(() => props.downloaders.filter(item => item.enabled && item.type === 'pan115_offline' && item.capabilities.share_receive))
+const available = computed(() => props.downloaders.filter(item => item.enabled && item.type === cloudShareDownloaderType(props.sourceKind) && item.capabilities.share_receive))
 const dialog = ref<HTMLElement | null>(null)
 const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null
 const downloaderID = ref('')
@@ -106,10 +106,10 @@ onBeforeUnmount(() => { closed = true; request?.abort(); recognitionRequest.abor
         <button class="btn-secondary shrink-0" @click="close">关闭</button>
       </header>
       <div class="my-4 flex flex-wrap items-end gap-3">
-        <label class="min-w-48 flex-1"><span class="label">使用哪个 115 账号预览</span><select v-model="downloaderID" class="input"><option value="" disabled>请选择下载器</option><option v-for="item in available" :key="item.id" :value="item.id">{{ item.name }}</option></select></label>
+        <label class="min-w-48 flex-1"><span class="label">使用哪个网盘连接预览</span><select v-model="downloaderID" class="input"><option value="" disabled>请选择下载器</option><option v-for="item in available" :key="item.id" :value="item.id">{{ item.name }}</option></select></label>
         <button class="btn-secondary" :disabled="loading || !downloaderID" @click="load">{{ loading ? '读取中…' : '重新读取' }}</button>
       </div>
-      <p v-if="!available.length" class="semantic-warning">请先配置并启用支持分享转存的 115 下载器。</p>
+      <p v-if="!available.length" class="semantic-warning">请先配置并启用与此分享来源相同的网盘分享接收器。</p>
       <p v-if="error" class="semantic-warning" role="alert">{{ error }}</p>
       <p v-if="loading" class="text-subtle py-8 text-center" role="status">正在读取完整目录和文件大小…</p>
       <template v-if="preview">

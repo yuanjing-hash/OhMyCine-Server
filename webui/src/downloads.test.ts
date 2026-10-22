@@ -1,9 +1,21 @@
 import { readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
-import { beginDownloadRetry, canCancelDownloadPipeline, downloadErrorMessage, downloadProviderStatusLabel, downloadStatusClass, downloadStatusLabel, formatBytes, formatETA, formatProgress, isDownloadHistoryTask, nodePan115UnsupportedSource, parseDownloadSourceLines, reconcileDownloadRetries, summarizeDownloaderTasks, torrentToBase64 } from '@/downloads'
+import { beginDownloadRetry, downloadSourceKind, cloudShareDownloaderType, isCloudDownloader, canCancelDownloadPipeline, downloadErrorMessage, downloadProviderStatusLabel, downloadStatusClass, downloadStatusLabel, formatBytes, formatETA, formatProgress, isDownloadHistoryTask, nodePan115UnsupportedSource, parseDownloadSourceLines, reconcileDownloadRetries, summarizeDownloaderTasks, torrentToBase64 } from '@/downloads'
 import type { DownloadTaskSummary } from '@/types/api'
 
 const task = { job_status: 'queued' } as DownloadTaskSummary
+
+describe('provider-bound share sources', () => {
+  it('routes each share to its own native receiver without inventing offline capability', () => {
+    expect(downloadSourceKind('share', 'quark_share')).toBe('quark_share')
+    expect(downloadSourceKind('share', 'pan115_offline')).toBe('115_share')
+    expect(downloadSourceKind('torrent', 'qbittorrent')).toBe('torrent')
+    expect(cloudShareDownloaderType('quark_share')).toBe('quark_share')
+    expect(cloudShareDownloaderType('115_share')).toBe('pan115_offline')
+    expect(isCloudDownloader('quark_share')).toBe(true)
+    expect(isCloudDownloader('qbittorrent')).toBe(false)
+  })
+})
 
 describe('download presentation', () => {
   it('shows the authoritative queued dependency explanation separately from errors', () => {
@@ -159,10 +171,10 @@ describe('115 offline downloader directory selection', () => {
   it('renders separate native-offline and 115-share source entries', () => {
     const source = readFileSync(new URL('./views/DownloadsView.vue', import.meta.url), 'utf8')
     expect(source).toContain('value="share"')
-    expect(source).toContain("source_kind: sourceMode.value === 'share' ? '115_share' : 'url'")
+    expect(source).toContain("source_kind: selectedSourceKind.value")
     expect(source).toContain("? '离线下载' : '磁力 / URL'")
     expect(source).toContain('分享转存')
-    expect(source).toContain('selectedDownloader.provider_directory_path')
+    expect(source).toContain('selectedDownloader?.provider_directory_path')
     expect(source).toContain('createForm.autoListenLifeEvents')
     expect(source).toContain('editForm.autoListenLifeEvents')
   })

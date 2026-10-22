@@ -27,6 +27,7 @@ func catalogPhysicalOwnerTx(tx *gorm.DB, input CatalogPhysicalWriteInput, comple
 	var jobType, payloadField string
 	var claimAt *time.Time
 	var finished bool
+	payloadOwnerID := input.OwnerID
 	switch input.OwnerKind {
 	case CatalogPhysicalTransfer:
 		var row models.TransferTask
@@ -56,7 +57,15 @@ func catalogPhysicalOwnerTx(tx *gorm.DB, input CatalogPhysicalWriteInput, comple
 			owner.jobID = *row.JobID
 		}
 		jobType, payloadField = JobTypeMediaLibraryRepair, "repair_id"
-		owner.digest = catalogPhysicalDigest(row.PlanJSON, row.RuleFingerprint, row.Scope, row.WorkKey)
+		owner.digest = structureRepairOwnerDigest(row)
+		var state structureCatalogRepairState
+		if json.Unmarshal([]byte(row.StateJSON), &state) == nil && state.ParentTransferID != "" {
+			parent, err := quarkStructureParentTx(tx, row, state.ParentTransferID)
+			if err != nil {
+				return owner, err
+			}
+			jobType, payloadField, payloadOwnerID = "transfer", "transfer_task_id", parent.ID
+		}
 		finished = row.Phase == "completed" && row.FinishedAt != nil
 		if !completed && owner.jobID == "" {
 			if row.Scope != models.MediaLibraryStructureScopeWork {
@@ -129,7 +138,7 @@ func catalogPhysicalOwnerTx(tx *gorm.DB, input CatalogPhysicalWriteInput, comple
 		}
 		var payload map[string]json.RawMessage
 		var ownerID string
-		if job.JobType != jobType || json.Unmarshal([]byte(job.PayloadJSON), &payload) != nil || len(payload) != 1 || json.Unmarshal(payload[payloadField], &ownerID) != nil || ownerID != input.OwnerID {
+		if job.JobType != jobType || json.Unmarshal([]byte(job.PayloadJSON), &payload) != nil || len(payload) != 1 || json.Unmarshal(payload[payloadField], &ownerID) != nil || ownerID != payloadOwnerID {
 			return owner, ErrCatalogFence
 		}
 		if registering {

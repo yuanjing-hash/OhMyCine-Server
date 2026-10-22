@@ -21,6 +21,9 @@ const (
 )
 
 func (w *TransferWorker) resolveTransferRoute(task models.TransferTask, download models.DownloadTask) (transferRouteKind, error) {
+	if (download.ProviderType == models.DownloaderTypeQuarkShare || download.TargetStorageType == models.StorageTypeQuark) && task.RouteVersion == 0 {
+		return "", errors.New("quark requires frozen route identity")
+	}
 	if task.RouteVersion == 0 {
 		return w.resolveLegacyTransferRoute(download)
 	}
@@ -49,17 +52,20 @@ func (w *TransferWorker) resolveTransferRoute(task models.TransferTask, download
 	case models.TransferRouteSameSourceLocal:
 		return transferRouteLocal, nil
 	case models.TransferRouteSameSourceProvider:
-		if source.ProviderType != models.StorageTypePan115 || target.ProviderType != models.StorageTypePan115 {
+		if !transferCloudProvider(source.ProviderType) || source.ProviderType != target.ProviderType {
 			return "", errors.New("same-source provider executor is unavailable")
 		}
 		return transferRoutePan115Native, nil
 	case models.TransferRouteCrossSource:
+		if source.ProviderType == models.StorageTypeQuark && download.TransferMode == models.MediaLibraryTransferMove {
+			return "", errors.New("quark cross-source move requires verified recycle capability")
+		}
 		switch {
-		case source.Kind == models.DataSourceKindLocal && target.ProviderType == models.StorageTypePan115:
+		case source.Kind == models.DataSourceKindLocal && transferCloudProvider(target.ProviderType):
 			return transferRouteLocalToPan115, nil
-		case source.ProviderType == models.StorageTypePan115 && target.Kind == models.DataSourceKindLocal:
+		case transferCloudProvider(source.ProviderType) && target.Kind == models.DataSourceKindLocal:
 			return transferRoutePan115ToLocal, nil
-		case source.ProviderType == models.StorageTypePan115 && target.ProviderType == models.StorageTypePan115:
+		case transferCloudProvider(source.ProviderType) && transferCloudProvider(target.ProviderType):
 			return transferRoutePan115ToOtherCloud, nil
 		default:
 			return "", errors.New("cross-source executor is unavailable")
@@ -138,12 +144,12 @@ func decodeDataSourceIdentity(raw string) (models.DataSourceIdentity, error) {
 
 func (w *TransferWorker) revalidateSourceIdentity(download models.DownloadTask, identity models.DataSourceIdentity) error {
 	if identity.Kind == models.DataSourceKindLocal {
-		if download.ProviderType == models.DownloaderTypePan115Offline {
+		if download.ProviderType == models.DownloaderTypePan115Offline || download.ProviderType == models.DownloaderTypeQuarkShare {
 			return errors.New("local source identity no longer matches downloader")
 		}
 		return nil
 	}
-	if identity.ProviderType != models.StorageTypePan115 || download.StagingStorageID == nil {
+	if !transferCloudProvider(identity.ProviderType) || download.StagingStorageID == nil {
 		return errors.New("provider source identity is unsupported")
 	}
 	storageID, _ := strconv.ParseUint(identity.StorageScope, 10, 64)
@@ -181,6 +187,9 @@ func (w *TransferWorker) revalidateTargetIdentity(download models.DownloadTask, 
 }
 
 func validateTransferRouteSnapshot(download models.DownloadTask) error {
+	if (download.ProviderType == models.DownloaderTypeQuarkShare || download.TargetStorageType == models.StorageTypeQuark) && download.TransferRouteVersion == 0 {
+		return errors.New("quark requires frozen route identity")
+	}
 	if download.TransferRouteVersion == 0 {
 		if download.ProviderType == models.DownloaderTypePan115Offline && download.TargetStorageType != models.StorageTypePan115 {
 			return errors.New("legacy 115 cross-source route is unsupported")
@@ -209,4 +218,8 @@ func transferRouteUnsupportedMessage(download models.DownloadTask) string {
 		return "115 原生离线下载不能直接入库到本地媒体库；请选择同账号的 115 媒体库"
 	}
 	return "下载来源与目标媒体库之间没有可用的入库执行器"
+}
+
+func transferCloudProvider(provider string) bool {
+	return provider == models.StorageTypePan115 || provider == models.StorageTypeQuark
 }

@@ -134,6 +134,10 @@ type cloudFixtureAdapter struct {
 	searchByKeyword map[string]sitepkg.Result
 }
 
+func (a *cloudFixtureAdapter) ResolveSource(context.Context, sitepkg.Config, string) (sitepkg.Source, error) {
+	return a.resolved, nil
+}
+
 func (a *cloudFixtureAdapter) Search(_ context.Context, _ sitepkg.Config, q sitepkg.Query) (sitepkg.Page, error) {
 	if item, ok := a.searchByKeyword[q.Keyword]; ok {
 		return sitepkg.Page{Page: q.Page, Items: []sitepkg.Result{item}}, nil
@@ -142,7 +146,7 @@ func (a *cloudFixtureAdapter) Search(_ context.Context, _ sitepkg.Config, q site
 	if title == "" {
 		title = "Seven.Samurai.1954"
 	}
-	return sitepkg.Page{Page: q.Page, Items: []sitepkg.Result{{TorrentID: "42", Title: title, SourceKind: "115_share", CloudProvider: "115", Channel: "movies", Fingerprint: "stable-share-id"}}}, nil
+	return sitepkg.Page{Page: q.Page, Items: []sitepkg.Result{{TorrentID: a.resolved.ShareURL, Title: title, SourceKind: "115_share", CloudProvider: "115", Channel: "movies", Fingerprint: "stable-share-id"}}}, nil
 }
 
 func TestCloudFollowReusesShareForNewEpisodes(t *testing.T) {
@@ -273,8 +277,12 @@ type previewFixtureDriver struct{ *shareIngestDriver }
 func (d *previewFixtureDriver) InspectShare(ctx context.Context, raw string) (cloud.ShareSnapshot, error) {
 	return d.InspectShareDirectory(ctx, raw, "0")
 }
-func (d *previewFixtureDriver) InspectShareDirectory(_ context.Context, _ string, id string) (cloud.ShareSnapshot, error) {
+func (d *previewFixtureDriver) InspectShareDirectory(_ context.Context, raw string, id string) (cloud.ShareSnapshot, error) {
 	snapshot := cloud.ShareSnapshot{ShareCode: "example", ReceiveCode: "abcd"}
+	if strings.Contains(raw, "/episodes?") {
+		snapshot.Items = []cloud.ShareItem{{ID: "episode-one", Name: "Fixture.Show.S01E01.mkv", Size: 100}, {ID: "episode-two", Name: "Fixture.Show.S01E02.mkv", Size: 200}}
+		return snapshot, nil
+	}
 	if id == "0" {
 		snapshot.Items = []cloud.ShareItem{{ID: "private-dir", Name: "Movies", IsDir: true}}
 	} else {

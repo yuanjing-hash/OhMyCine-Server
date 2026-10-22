@@ -8,12 +8,14 @@ import (
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
 	downloadpkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/downloader"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/site/builtin"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/site/pansou"
 )
 
 const (
-	RouteSourcePT       = "pt"
-	RouteSourceBT       = "bt"
-	RouteSource115Share = "115_share"
+	RouteSourcePT         = "pt"
+	RouteSourceBT         = "bt"
+	RouteSource115Share   = "115_share"
+	RouteSourceQuarkShare = "quark_share"
 )
 
 type SourceRouteRecommendationInput struct {
@@ -89,6 +91,9 @@ func routeSourceDownloadKind(source string) string {
 	if source == RouteSource115Share {
 		return downloadpkg.SourcePan115Share
 	}
+	if source == RouteSourceQuarkShare {
+		return downloadpkg.SourceQuarkShare
+	}
 	return downloadpkg.SourceTorrent
 }
 
@@ -98,6 +103,8 @@ func routeDownloaderApplicable(source string, downloader models.Downloader) bool
 		return downloader.Type == models.DownloaderTypeQBittorrent
 	case RouteSource115Share:
 		return downloader.Type == models.DownloaderTypePan115Offline
+	case RouteSourceQuarkShare:
+		return downloader.Type == models.DownloaderTypeQuarkShare
 	case RouteSourceBT:
 		return downloader.Type == models.DownloaderTypeQBittorrent || downloader.Type == models.DownloaderTypePan115Offline
 	default:
@@ -112,14 +119,49 @@ func (s *SiteService) RecommendSiteRoute(ctx context.Context, actor Actor, input
 	if err != nil {
 		return SourceRouteRecommendation{}, err
 	}
+	if claim.SourceKind == "external_link" {
+		return SourceRouteRecommendation{}, appError(CodeDownloadSourceInvalid, "该链接类型尚无原生接收器，可查看或复制链接", nil)
+	}
+	if claim.AuthorizationScope != "" && claim.AuthorizationScope != discoveryAuthorizationScope(actor) {
+		return SourceRouteRecommendation{}, appError(CodeSiteResultExpired, "权限范围已变化，请重新搜索", nil)
+	}
 	var site models.Site
-	if err := s.db.WithContext(ctx).Select("revision", "enabled").First(&site, claim.SiteID).Error; err != nil || !site.Enabled || claim.SiteRevision != 0 && claim.SiteRevision != site.Revision {
+	if err := s.db.WithContext(ctx).First(&site, claim.SiteID).Error; err != nil || !site.Enabled || claim.SiteRevision != 0 && claim.SiteRevision != site.Revision {
 		return SourceRouteRecommendation{}, appError(CodeSiteResultExpired, "站点配置或搜索结果已失效，请重新搜索", err)
 	}
-	return s.downloads.RecommendSourceRoute(ctx, actor, claim.SiteID, input.MediaLibraryID, input.ExpectedBytes)
+	if site.SourceType == "plugin" && site.Kind == pluginResourceKind {
+		if available, code, reason := s.pluginResourceSearchAvailability(site); !available {
+			return SourceRouteRecommendation{}, appError(code, reason, nil)
+		}
+	}
+	return s.downloads.recommendSourceRoute(ctx, actor, claim.SiteID, input.MediaLibraryID, claim.SourceKind, input.ExpectedBytes)
 }
 
 func (s *DownloadService) RecommendSourceRoute(ctx context.Context, actor Actor, siteID uint, libraryID *uint, expectedBytes ...*int64) (SourceRouteRecommendation, error) {
+	result, err := s.recommendSourceRoute(ctx, actor, siteID, libraryID, "", expectedBytes...)
+	if err != nil || result.SourceKind != RouteSource115Share {
+		return result, err
+	}
+	quark, err := s.recommendSourceRoute(ctx, actor, siteID, libraryID, RouteSourceQuarkShare, expectedBytes...)
+	if err != nil {
+		return result, err
+	}
+	if result.Recommended == nil && quark.Recommended != nil {
+		return quark, nil
+	}
+	if result.Recommended == nil {
+		var site models.Site
+		if s.db.First(&site, siteID).Error == nil && site.Kind == pansou.Kind {
+			bt, err := s.recommendSourceRoute(ctx, actor, siteID, libraryID, RouteSourceBT, expectedBytes...)
+			if err == nil && bt.Recommended != nil {
+				return bt, nil
+			}
+		}
+	}
+	return result, nil
+}
+
+func (s *DownloadService) recommendSourceRoute(ctx context.Context, actor Actor, siteID uint, libraryID *uint, claimedSource string, expectedBytes ...*int64) (SourceRouteRecommendation, error) {
 	if !actor.Can(authz.PermissionDownloadsCreate) || !actor.Can(authz.PermissionDiscoveryRead) {
 		return SourceRouteRecommendation{}, appError(CodePermissionDenied, "无权选择下载路线", nil)
 	}
@@ -140,6 +182,12 @@ func (s *DownloadService) RecommendSourceRoute(ctx context.Context, actor Actor,
 	source, err := routeSourceForSite(site)
 	if err != nil {
 		return SourceRouteRecommendation{}, err
+	}
+	if source == RouteSource115Share && claimedSource != "" {
+		if claimedSource != RouteSource115Share && claimedSource != RouteSourceQuarkShare && !(site.Kind == pansou.Kind && claimedSource == RouteSourceBT) {
+			return SourceRouteRecommendation{}, appError(CodeDownloadSourceInvalid, "分享来源与搜索凭证不一致", nil)
+		}
+		source = claimedSource
 	}
 	var downloaders []models.Downloader
 	if err := s.db.WithContext(ctx).Where("enabled = ?", true).Order("sort_order, id").Find(&downloaders).Error; err != nil {
@@ -185,6 +233,9 @@ func (s *DownloadService) RecommendSourceRoute(ctx context.Context, actor Actor,
 		// A plugin resource resolves directly to a magnet. SiteService.Download
 		// verifies its saved plugin provenance before accepting a 115 route.
 		previewSourceKind, previewSiteID = downloadpkg.SourceURL, nil
+	}
+	if site.Kind == pansou.Kind && source == RouteSourceBT {
+		previewSourceKind = downloadpkg.SourceURL
 	}
 	for _, downloader := range visibleDownloaders {
 		if !routeDownloaderApplicable(source, downloader) {

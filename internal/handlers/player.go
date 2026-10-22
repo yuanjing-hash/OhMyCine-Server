@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"net/http"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -115,10 +116,10 @@ func (a *API) playerCapabilitiesWithServices(actor services.Actor) []string {
 func playerCapabilities(actor services.Actor) []string {
 	capabilities := []string{"server_connection", "playback_history_sync", "media_favorites", "media_collections"}
 	if actor.HasPermission(authz.PermissionMediaLibrariesRead) {
-		capabilities = append(capabilities, "canonical_playback_history_v1", "persistent_category_artwork_v1", "media_overview_v1", "media_catalog", "direct_stream")
+		capabilities = append(capabilities, "canonical_playback_history_v1", "persistent_category_artwork_v1", "media_overview_v1", "media_catalog", "direct_stream", "playback_check_v1")
 	}
 	if actor.HasPermission(authz.PermissionDiscoveryRead) {
-		capabilities = append(capabilities, "discovery_search")
+		capabilities = append(capabilities, "discovery_search", services.MixedDiscoveryCapability)
 	}
 	if actor.HasPermission(authz.PermissionDownloadsCreate) {
 		capabilities = append(capabilities, "acquisition_create", "download_control")
@@ -420,6 +421,26 @@ func (a *API) PlayerSearch(c *gin.Context) {
 func (a *API) PlayerMediaEntryStream(c *gin.Context) {
 	id, ok := a.playerPathID(c, "id")
 	if !ok {
+		return
+	}
+	query, err := url.ParseQuery(c.Request.URL.RawQuery)
+	if err != nil {
+		c.Header("Cache-Control", "no-store")
+		writeError(c, a.log, invalid("播放检查参数无效", nil))
+		return
+	}
+	if values, exists := query["check"]; exists {
+		c.Header("Cache-Control", "no-store")
+		if c.Request.Method != http.MethodGet || len(values) != 1 || values[0] != "1" {
+			writeError(c, a.log, invalid("播放检查参数无效", nil))
+			return
+		}
+		check, err := a.signedProxy.CheckPlayerEntryDetails(c.Request.Context(), mustActor(c), id, c.GetHeader("User-Agent"), c.Request.RemoteAddr)
+		if err != nil {
+			writeError(c, a.log, err)
+			return
+		}
+		success(c, http.StatusOK, check)
 		return
 	}
 	stream, err := a.signedProxy.ResolvePlayerEntry(c.Request.Context(), mustActor(c), id, c.GetHeader("User-Agent"), c.Request.RemoteAddr)

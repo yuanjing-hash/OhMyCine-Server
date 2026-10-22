@@ -10,6 +10,39 @@ package services
 // collection queries retain exact library/generation filters and mode gates.
 // Health/naming planners add no queries; retirement uses child-first batches.
 var catalogRuntimeAccessAllowlist = map[string]string{
+	// Quark review: initialization only counts legacy rows inside the fresh-library
+	// create transaction and refuses any existing facts; it is not a converter.
+	"internal/services/provider_observation_catalog.go:initializeFreshQuarkCatalogTx": "model:A=1,model:E=1,model:R=1|aba749825fc599f8",
+	// Recovery envelopes are private data, never alternate catalog queries.
+	// Bindings read Entries/Recognitions from PinCatalogTx in the publication
+	// transaction. Restored evidence is bounded to matching scope/root/epoch and
+	// existing identity anchors before the standard candidate allocator accepts it.
+	"internal/services/provider_observation_recovery.go:declaration(observationRecovery)":            "model:E=1,model:R=1|fbd5b6a03c071af0",
+	"internal/services/provider_observation_recovery.go:declaration(observationRecoveryEntry)":       "model:E=1|b45a8c2938ccc8fe",
+	"internal/services/provider_observation_recovery.go:declaration(observationRecoveryRecognition)": "model:R=1|afd97ddfbadb25d6",
+	"internal/services/provider_observation_recovery.go:prepareObservationRecovery":                  "model:E=1,model:R=1|ea9338c583b2ba60",
+	// Confirmed Quark removal captures the current pinned E/R before head change,
+	// under the same transaction and source epoch, capped at 250 rows / 1 MiB.
+	"internal/services/provider_observation_recovery.go:saveObservationRecoveryBindingsTx": "model:E=1,model:R=1,query:Find:E=1,query:Find:R=1|abcfd8255280dd80",
+	// Exact restoration IDs are read from a pinned effective head on the deferred
+	// pool; an omitted partial-baseline row is never treated as a tombstone.
+	"internal/services/provider_observation_recovery.go:appendObservationRecoveryBaseline": "model:E=1,model:R=1,query:Find:R=2|eb9ed67b53121143",
+	// Confirmed Quark removals revoke only the bounded, prepared STRM manifests
+	// after a pinned new-head absence check, within the publication transaction.
+	"internal/services/catalog_scan_revocation.go:revokeQuarkObservationSTRMTx": "model:E=1,query:Find:E=1|6c353cfff0e648a2",
+	// quark_live-only validation: existing snapshot data and a pinned read via
+	// MediaLibraryService.withCatalogRead; no production or legacy-table bypass.
+	"internal/services/quark_observation_live_validation.go:declaration(quarkObservationLiveSnapshot)": "model:E=1|6be932ae66281b87",
+	"internal/services/quark_observation_live_validation.go:quarkObservationLiveRuntime.snapshotAt":    "model:E=1,query:Find:E=1|e15e90f872b409e3",
+	// quark_live retirement acceptance reads the current recognition through
+	// the existing pinned catalog reader, scoped to its sole verified entry.
+	"internal/services/quark_observation_retirement_live_validation.go:quarkObservationLiveRuntime.retirementAuthority": "model:R=1,query:First:R=1|ca0f0eff797f70a4",
+	// Validation-only: the immutable exact published base/delta is source-fenced
+	// before projecting its sole E/R pair, preserving shared metadata masks.
+	"internal/services/quark_observation_retirement_live_validation.go:quarkObservationLiveRuntime.retirementVersionFacts": "model:E=1,query:First:E=1|82b2a3e837079b3c",
+	// Signed Quark playback reads the unique provider item through a pinned
+	// VisibleEntries query, not raw anchors, and repeats it after root resolution.
+	"internal/services/quark_playback.go:SignedProxyService.quarkArtifactEntry": "model:E=3,query:Find:E=1|e108e03166cbb726",
 	// Reviewed logical-exclusion visibility: public and artifact readers use
 	// VisibleEntries; exact source members are captured through pinned raw facts.
 	"internal/services/catalog_snapshot_reader.go:declaration(catalogVisibleEntryPredicate)": "sql:E=1|856d7aeb2a29f8c9",
@@ -66,11 +99,11 @@ var catalogRuntimeAccessAllowlist = map[string]string{
 	"internal/services/catalog_reorganization_writer.go:MediaReorganizationWorker.prepareReorganization":     "model:R=2,query:Find:R=1|ff045d6e6275b6ad",
 	"internal/services/catalog_scan_publication.go:MediaLibraryService.loadCatalogScanBaseline":              "model:A=1,model:E=1,model:R=1|30308740c95314ea",
 	"internal/services/catalog_scan_publication.go:MediaLibraryService.prepareCatalogScanAssets":             "model:A=8|823af9c330522bb6",
-	"internal/services/catalog_scan_publication.go:MediaLibraryService.prepareCatalogScanFacts":              "model:E=6,model:R=5|d82b15a07c30048d",
+	"internal/services/catalog_scan_publication.go:MediaLibraryService.prepareCatalogScanFacts":              "model:E=6,model:R=5|e0bbfb9cc56d1df4",
 	"internal/services/catalog_scan_publication.go:mediaLibraryRecognitionArtifactChanged":                   "model:R=1|115ab1d5b26c7d0c",
 	"internal/services/catalog_scan_publication.go:catalogScanEntry":                                         "model:E=2,model:R=1|f68047e0fcce0c7c",
-	"internal/services/catalog_scan_publication.go:declaration(catalogScanBaseline)":                         "model:A=1,model:E=1,model:R=1|141620de25ea6741",
-	"internal/services/catalog_snapshot_identity.go:CatalogSnapshotStore.resolveCatalogIdentityBatch":        "call:allocateCatalogAnchors=1|6e9c6793cdf6ff18",
+	"internal/services/catalog_scan_publication.go:declaration(catalogScanBaseline)":                         "model:A=1,model:E=1,model:R=1|8513ca1363eab390",
+	"internal/services/catalog_snapshot_identity.go:CatalogSnapshotStore.resolveCatalogIdentityBatch":        "call:allocateCatalogAnchors=1|b3383e6bd3bdc760",
 	"internal/services/catalog_snapshot_identity.go:allocateCatalogAnchors":                                  "helper:allocateCatalogAnchors=1,model:A=3,model:E=2,model:R=2,query:Model:A=1|f51e2e23267ea7f1",
 	"internal/services/catalog_snapshot_lifecycle.go:validateCatalogCandidate":                               "sql:E=3|1026ac785db4c741",
 	"internal/services/catalog_snapshot_reader.go:CatalogEntryFromLegacy":                                    "model:E=1,model:R=1|092430b0789d5c60",
@@ -92,7 +125,7 @@ var catalogRuntimeAccessAllowlist = map[string]string{
 	"internal/services/media_artifact.go:MediaArtifactService.writeSourceAsset":                              "model:A=1|72ecab2bca7060b9",
 	"internal/services/media_artifact.go:MediaArtifactWorker.Run":                                            "call:generateArtifacts=1|e4307e184ad81856",
 	"internal/services/media_artifact.go:nfoRelativePath":                                                    "model:E=1|c619a5d73b232599",
-	"internal/services/media_catalog.go:MediaLibraryService.aggregateCatalogTx":                              "sql:E=2|7c1af4a0c0e2012e",
+	"internal/services/media_catalog.go:MediaLibraryService.aggregateCatalogTx":                              "sql:E=2|6f22d75fc1003f97",
 	"internal/services/media_catalog.go:MediaLibraryService.catalogDetailTx":                                 "model:E=1,query:Find:E=1|b94ca59841b85e67",
 	"internal/services/media_catalog.go:MediaLibraryService.catalogItemsTx":                                  "model:R=2,query:Find:R=1|55b4d98d55d6ea37",
 	"internal/services/media_catalog.go:MediaLibraryService.catalogManagedTransfersTx":                       "model:E=1|8dcbcecdedac2f1d",
@@ -101,19 +134,23 @@ var catalogRuntimeAccessAllowlist = map[string]string{
 	"internal/services/media_catalog.go:catalogEpisode":                                                      "model:E=1|900014ad08f9a709",
 	"internal/services/media_catalog.go:declaration(MediaLibraryEntryPage)":                                  "model:E=1|077712704199536b",
 	"internal/services/media_catalog.go:resolvedCatalogEpisodeFacts":                                         "model:E=1|0ebc80e8d5222f4c",
-	"internal/services/media_catalog.go:selectCatalogRows":                                                   "sql:E=2|db2391f1cefa6a46",
-	"internal/services/media_catalog_deletion.go:MediaLibraryService.ConfirmCatalogDeletion":                 "model:E=2,model:R=1,query:Delete:E=1,query:Delete:R=1,query:Model:E=1|04f8cfc85a462e24",
-	"internal/services/media_catalog_deletion.go:MediaLibraryService.catalogSTRMImpact":                      "model:E=1|62be18822cbac2ec",
-	"internal/services/media_catalog_deletion.go:catalogDeletionDigest":                                      "model:E=2|4c87f12ec3ee85f4",
-	"internal/services/media_catalog_deletion.go:catalogDeletionTitle":                                       "model:E=1|9a2790a28c71bb78",
-	"internal/services/media_catalog_deletion.go:deletionItemFromEntry":                                      "model:E=1|11e81a65cfdacf18",
-	"internal/services/media_catalog_deletion.go:snapshotMatchesEntries":                                     "model:E=2|b5b8f520547d67d5",
-	"internal/services/media_coverage.go:MediaCoverageService.coverageCatalog":                               "model:E=2|10d01a9a249f9a4f",
-	"internal/services/media_coverage.go:coverageEntries":                                                    "model:E=2,query:Find:E=1|d971fc33bbc4812d",
-	"internal/services/media_coverage.go:uniqueEntryLibraries":                                               "model:E=1|6f3a02a90b57b2c6",
-	"internal/services/media_library.go:MediaLibraryService.Entries":                                         "model:E=2,query:Find:E=1|05e191c97a84a7ed",
-	"internal/services/media_library.go:MediaLibraryService.Update":                                          "model:A=1,model:E=1,model:R=1,query:Delete:A=1,query:Delete:E=1,query:Delete:R=1|664ebb2bb9cffcf5",
-	"internal/services/media_library.go:MediaLibraryService.reconcile":                                       "call:mergeScopedPan115Catalog=1,call:publishFastPan115Scan=1,call:recognizeLibraryUnits=1,call:reconcileTMDBCollectionsTx=1,call:stabilizeExistingRecognitionUnits=1,model:A=4,model:E=5,model:R=3,query:Delete:A=2,query:Delete:E=2,query:Delete:R=1,query:Find:A=1,query:Find:E=1,query:First:R=1,query:Save:A=1,query:Save:E=1,query:Save:R=1|275fb0389705bf72",
+	// The ordering helper receives only the caller's pinned VisibleEntries
+	// query. Added-time ordering precedes pagination; no alternate table access.
+	"internal/services/media_catalog.go:selectOrderedCatalogRows":                            "sql:E=3|93d7e8d0d4679938",
+	"internal/services/media_catalog_deletion.go:MediaLibraryService.ConfirmCatalogDeletion": "model:E=2,model:R=1,query:Delete:E=1,query:Delete:R=1,query:Model:E=1|04f8cfc85a462e24",
+	"internal/services/media_catalog_deletion.go:MediaLibraryService.catalogSTRMImpact":      "model:E=1|62be18822cbac2ec",
+	"internal/services/media_catalog_deletion.go:catalogDeletionDigest":                      "model:E=2|4c87f12ec3ee85f4",
+	"internal/services/media_catalog_deletion.go:catalogDeletionTitle":                       "model:E=1|9a2790a28c71bb78",
+	"internal/services/media_catalog_deletion.go:deletionItemFromEntry":                      "model:E=1|11e81a65cfdacf18",
+	"internal/services/media_catalog_deletion.go:snapshotMatchesEntries":                     "model:E=2|b5b8f520547d67d5",
+	"internal/services/media_coverage.go:MediaCoverageService.coverageCatalog":               "model:E=2|10d01a9a249f9a4f",
+	"internal/services/media_coverage.go:coverageEntries":                                    "model:E=2,query:Find:E=1|d971fc33bbc4812d",
+	"internal/services/media_coverage.go:uniqueEntryLibraries":                               "model:E=1|6f3a02a90b57b2c6",
+	"internal/services/media_library.go:MediaLibraryService.Entries":                         "model:E=2,query:Find:E=1|05e191c97a84a7ed",
+	"internal/services/media_library.go:MediaLibraryService.Update":                          "model:A=1,model:E=1,model:R=1,query:Delete:A=1,query:Delete:E=1,query:Delete:R=1|664ebb2bb9cffcf5",
+	// Quark enumeration is redirected to observation; verified outputs retain
+	// versioned-versus-legacy dispatch and commit their receipt in the same tx.
+	"internal/services/media_library.go:MediaLibraryService.reconcile":                                       "call:mergeScopedPan115Catalog=1,call:publishFastPan115Scan=1,call:recognizeLibraryUnits=1,call:reconcileTMDBCollectionsTx=1,call:stabilizeExistingRecognitionUnits=1,model:A=4,model:E=5,model:R=3,query:Delete:A=2,query:Delete:E=2,query:Delete:R=1,query:Find:A=1,query:Find:E=1,query:First:R=1,query:Save:A=1,query:Save:E=1,query:Save:R=1|981ded4c777db713",
 	"internal/services/media_library.go:applyRecognitionEpisodeHints":                                        "model:E=1|7d763b9b7156f0fa",
 	"internal/services/media_library.go:mediaLibraryEntryProjectionChanged":                                  "model:E=1|256c6390a86c4f76",
 	"internal/services/media_library.go:mediaRecognitionProjectionChanged":                                   "model:R=1|67d93d5424dac75c",
@@ -139,7 +176,7 @@ var catalogRuntimeAccessAllowlist = map[string]string{
 	"internal/services/media_library_recognition_api.go:recognitionPackageName":                              "model:E=1|a08ed012745b7140",
 	"internal/services/media_library_recognition_api.go:recognitionSummaryTx":                                "model:E=1,model:R=1,query:First:E=1,query:Where:R=2|b10dcfc82679876c",
 	"internal/services/media_library_retirement_cleanup.go:declaration(libraryRetirementCleanup)":            "sql:A=1,sql:E=1,sql:R=1|228465b2bde5f08f",
-	"internal/services/media_library_structure.go:MediaLibraryStructureService.EnsureWorkLayout":             "call:updateStructureCatalogPaths=1|94f5003109ac2185",
+	"internal/services/media_library_structure.go:MediaLibraryStructureService.EnsureWorkLayout":             "call:updateStructureCatalogPaths=1|90e232604935b8f6",
 	"internal/services/media_library_structure.go:MediaLibraryStructureService.RefreshRecognitionProjection": "model:E=1,model:R=1,query:First:R=1|b8c9c06a6d6b0789",
 	// Cancellation/partial-result audit (2026-09-08): runRepair dispatches any
 	// versioned state/head before reaching these original-table writes. Only
@@ -178,14 +215,16 @@ var catalogRuntimeAccessAllowlist = map[string]string{
 	"internal/services/player_history.go:PlayerHistoryService.availableServerHistoryRows":           "model:E=2,query:Find:E=1|2cbfe87093fb5d2e",
 	"internal/services/player_history.go:PlayerHistoryService.resolveServerHistoryAuthority":        "model:E=1,model:R=1,query:First:E=2,query:First:R=2|e71d59f0e86ee712",
 	"internal/services/player_history.go:serverHistoryIdentityAvailable":                            "model:E=1|2d8685db986c6552",
-	"internal/services/player_media.go:MediaLibraryService.PlayerCatalogDetail":                     "model:E=1,query:Find:E=1|9a63e6b95f99724b",
-	"internal/services/player_media.go:MediaLibraryService.playerLibrariesTx":                       "sql:E=2|ea4518f21be0a418",
-	"internal/services/player_media.go:MediaLibraryService.playerMediaItemTx":                       "model:R=1,query:First:R=1,sql:E=2,sql:R=2|80ea14078b1de9e9",
-	"internal/services/player_media.go:SignedProxyService.playerStreamSource":                       "sql:E=1|ca96ab7c34835e2e",
-	"internal/services/player_media.go:declaration(playerStreamSource)":                             "model:E=1|9a865ce5819b45c3",
-	"internal/services/player_media.go:openLocalPlayerEntry":                                        "model:E=1,query:First:E=1|cee6db3368d9c331",
-	"internal/services/player_media.go:openLocalPlayerEntrySource":                                  "model:E=1|ce2377f4f0209f68",
-	"internal/services/player_media.go:playerVersionLabels":                                         "model:E=1|1f35a946532e1940",
-	"internal/services/player_media_pages.go:PlayerMediaStateService.readableStateQuery":            "sql:E=2|d754e106fdb58f48",
-	"internal/services/transfer_deletion.go:TransferService.finalizeTransferDeletion":               "model:E=1,query:Delete:E=1|a7d0856f9a55d037",
+	// Player adds Quark redirect capability and added-time projection; catalog
+	// and recognition reads still use the authorized pinned visible catalog.
+	"internal/services/player_media.go:MediaLibraryService.PlayerCatalogDetail":          "model:E=1,query:Find:E=1|c8e1de8a8158a64f",
+	"internal/services/player_media.go:MediaLibraryService.playerLibrariesTx":            "sql:E=2|8ceb1c012c83f26d",
+	"internal/services/player_media.go:MediaLibraryService.playerMediaItemTx":            "model:R=1,query:First:R=1,sql:E=2,sql:R=2|d3fd4b845ce5d157",
+	"internal/services/player_media.go:SignedProxyService.playerStreamSource":            "sql:E=1|ca96ab7c34835e2e",
+	"internal/services/player_media.go:declaration(playerStreamSource)":                  "model:E=1|9a865ce5819b45c3",
+	"internal/services/player_media.go:openLocalPlayerEntry":                             "model:E=1,query:First:E=1|cee6db3368d9c331",
+	"internal/services/player_media.go:openLocalPlayerEntrySource":                       "model:E=1|ce2377f4f0209f68",
+	"internal/services/player_media.go:playerVersionLabels":                              "model:E=1|1f35a946532e1940",
+	"internal/services/player_media_pages.go:PlayerMediaStateService.readableStateQuery": "sql:E=2|d754e106fdb58f48",
+	"internal/services/transfer_deletion.go:TransferService.finalizeTransferDeletion":    "model:E=1,query:Delete:E=1|a7d0856f9a55d037",
 }

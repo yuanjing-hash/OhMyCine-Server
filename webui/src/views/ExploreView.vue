@@ -6,13 +6,14 @@ import { Permissions } from '@/auth/generated-permissions'
 import SharePreviewDialog from '@/components/SharePreviewDialog.vue'
 import { shareValidationLabel, type ShareSelection, type ShareValidation } from '@/share-preview'
 import { previewDownloadRoutes, recommendDownloadRoute, routeTargetByID, type DownloadRouteChoice, type DownloadRoutePreview, type DownloadRouteRecommendation } from '@/download-routes'
-import { formatBytes } from '@/downloads'
+import { formatBytes, isCloudShareSource, cloudShareDownloaderType } from '@/downloads'
 import { useSearchResultRecognition } from '@/search-result-recognition'
 import { useAuthStore } from '@/stores/auth'
 import { notify } from '@/toast'
 import { buildDiscoveryMediaSearchPath, discoveryDetailRoute, mediaIdentitySearchURL, type DiscoveryMediaSearch, type DiscoveryMediaSearchFilter, type DiscoveryMediaType, type DiscoverySearchName, type DiscoveryWork } from '@/discovery'
 import { discoveryDownloadsPath, discoverySearchOptionsPath, filterAndSortTorrentResults, ptRecognitionEpisodeLabel, ptRecognitionErrorLabel, ptRecognitionSpecLabels, readTorrentSearchSession, readTorrentSearchSiteSelection, saveTorrentSearchSession, saveTorrentSearchSiteSelection, sitesPath, torrentRecognitionCandidatesPath, torrentRecognitionOverridePath, torrentSearchPath, torrentSearchStreamPath, torrentSearchURL, upsertTorrentGroup, type PTRecognitionCandidate, type SearchSiteOption, type SiteSummary, type TorrentRecognitionResult, type TorrentResultDirection, type TorrentSearchGroup, type TorrentSearchProgress, type TorrentSearchResponse, type TorrentSearchResult, type TorrentSearchSession } from '@/sites'
 import type { DownloaderSummary, ListResponse, MediaLibraryDetail } from '@/types/api'
+import { discoveryOrigins, discoveryResultLinkPath, discoveryTypeOptions, resultTypeLabel, safeDiscoveryLink, type DiscoveryTypePolicy } from '@/sites'
 
 const route = useRoute()
 const router = useRouter()
@@ -47,6 +48,15 @@ const siteSelectorOpen = ref(false)
 const siteOptionsLoading = ref(false)
 const siteOptionsError = ref('')
 const siteOptions = ref<SearchSiteOption[]>([])
+const sourceStatusReady = ref(false)
+const restoredResults = ref(false)
+const panSouTypePolicy = ref<'default' | DiscoveryTypePolicy>('default')
+const panSouCloudTypes = ref<string[]>(['115', 'quark', 'magnet'])
+const appliedTypePolicy = ref<DiscoveryTypePolicy>()
+const appliedCloudTypes = ref<string[]>()
+const copyingToken = ref('')
+let availabilityRequest: AbortController | null = null
+let copyRequest: AbortController | null = null
 const selectedSiteIDs = ref<number[]>([])
 const activeSearchSiteIDs = ref<number[]>([])
 const downloaders = ref<DownloaderSummary[]>([])
@@ -95,7 +105,7 @@ const enabledDownloaders = computed(() => {
 })
 function choiceAppliesToSource(choice: DownloadRouteChoice) {
   const source = routeRecommendation.value?.source_kind
-  return source === 'pt' ? choice.downloader_type === 'qbittorrent' : source === '115_share' ? choice.downloader_type === 'pan115_offline' : true
+  return source === 'pt' ? choice.downloader_type === 'qbittorrent' : isCloudShareSource(source) ? choice.downloader_type === cloudShareDownloaderType(source) : true
 }
 const targetChoices = computed(() => {
   const byLibrary = new Map<number, DownloadRouteChoice>()
@@ -193,9 +203,9 @@ function switchMode(value: 'media' | 'resources') {
   else void router.replace({ path: '/discovery/explore', query: { mode: 'resources' } })
 }
 
-function searchInput(siteID?: number, page = 1) {
+function searchInput(siteID?: number, page = 1, refresh = false) {
   const fixedSiteID = lockedSiteID.value ?? siteID
-  return { keyword: keyword.value, mediaType: mediaType.value || undefined, year: year.value, tmdbID: tmdbID.value, searchBy: searchBy.value, page, siteID: fixedSiteID, siteIDs: fixedSiteID ? undefined : activeSearchSiteIDs.value }
+  return { keyword: keyword.value, mediaType: mediaType.value || undefined, year: year.value, tmdbID: tmdbID.value, searchBy: searchBy.value, page, siteID: fixedSiteID, siteIDs: fixedSiteID ? undefined : activeSearchSiteIDs.value, typePolicy: appliedTypePolicy.value, cloudTypes: appliedCloudTypes.value, snapshotID: !refresh && fixedSiteID ? groups.value.find(group => group.site_id === fixedSiteID)?.snapshot_id : undefined, refresh }
 }
 
 function stopStream() {
@@ -205,21 +215,27 @@ function stopStream() {
   streamTimeout = undefined
 }
 
-async function searchJSON(siteID?: number, page = 1) {
+async function searchJSON(siteID?: number, page = 1, refresh = false) {
   const run = searchGeneration
   const key = lockedSiteID.value ?? siteID ?? 0
   searchRequests.get(key)?.abort()
   const controller = new AbortController()
   searchRequests.set(key, controller)
+  if (searchProgress.value) searchProgress.value = { ...searchProgress.value, running: searchRequests.size, pending: Math.max(0, searchProgress.value.total - searchProgress.value.completed - searchRequests.size), site_id: key || undefined, site_name: groups.value.find(group => group.site_id === key)?.site_name || lockedSite.value?.name, site_status: 'running' }
   try {
     const identity = trustedIdentity.value
     const path = identity
-      ? mediaIdentitySearchURL(identity.mediaType, identity.tmdbID, { page, siteID: lockedSiteID.value ?? siteID, siteIDs: lockedSiteID.value || siteID ? undefined : activeSearchSiteIDs.value })
-      : torrentSearchURL(torrentSearchPath, searchInput(siteID, page))
+      ? mediaIdentitySearchURL(identity.mediaType, identity.tmdbID, searchInput(siteID, page, refresh))
+      : torrentSearchURL(torrentSearchPath, searchInput(siteID, page, refresh))
     const response = await api<TorrentSearchResponse & { query_names?: DiscoverySearchName[] }>(path, { signal: controller.signal })
     if (controller.signal.aborted || run !== searchGeneration) return
     identityNames.value = response.query_names ?? identityNames.value
     for (const group of response.groups) groups.value = upsertTorrentGroup(groups.value, group)
+    if (searchProgress.value) {
+      const completed = groups.value.length
+      const failed = groups.value.filter(group => group.status === 'error').length
+      searchProgress.value = { ...searchProgress.value, completed, succeeded: completed - failed, failed, running: Math.max(0, searchRequests.size - 1), pending: Math.max(0, searchProgress.value.total - completed - searchRequests.size + 1), result_count: groups.value.reduce((total, group) => total + group.items.length, 0), site_id: key || undefined, site_name: response.groups[0]?.site_name, site_status: response.groups.some(group => group.status === 'error') ? 'error' : 'success' }
+    }
     searched.value = true
   } catch (reason) { if (!controller.signal.aborted && run === searchGeneration) searchError.value = message(reason) }
   finally {
@@ -263,10 +279,15 @@ function search() {
 }
 
 function executeSearch(siteIDs: number[]) {
+  if (panSouTypePolicy.value === 'manual' && !panSouCloudTypes.value.length) { notify('请至少选择一种盘搜结果类型', 'warning'); return }
+  appliedTypePolicy.value = panSouTypePolicy.value === 'default' ? undefined : panSouTypePolicy.value
+  appliedCloudTypes.value = panSouTypePolicy.value === 'manual' ? [...panSouCloudTypes.value] : undefined
   cancelSearchRequests()
   activeSearchSiteIDs.value = [...siteIDs]
   stopStream()
   groups.value = []
+  restoredResults.value = false
+  void refreshSourceAvailability()
   activeChannel.value = 'all'
   resultRecognition.reset()
   identityNames.value = []
@@ -284,15 +305,15 @@ function executeSearch(siteIDs: number[]) {
   searching.value = true
   if (lockedSiteID.value) {
     activeChannel.value = lockedSiteID.value
-    void searchJSON(lockedSiteID.value)
+    void searchJSON(lockedSiteID.value, 1, true)
     return
   }
-  if (typeof EventSource === 'undefined') { void searchJSON(); return }
+  if (typeof EventSource === 'undefined') { void searchJSON(undefined, 1, true); return }
   let delivered = false
   const identity = trustedIdentity.value
   const eventSource = new EventSource(identity
-    ? mediaIdentitySearchURL(identity.mediaType, identity.tmdbID, { siteID: lockedSiteID.value, siteIDs: lockedSiteID.value ? undefined : activeSearchSiteIDs.value }, true)
-    : torrentSearchURL(torrentSearchStreamPath, searchInput()))
+    ? mediaIdentitySearchURL(identity.mediaType, identity.tmdbID, searchInput(undefined, 1, true), true)
+    : torrentSearchURL(torrentSearchStreamPath, searchInput(undefined, 1, true)))
   source = eventSource
   eventSource.addEventListener('site', event => {
     if (source !== eventSource) return
@@ -324,13 +345,13 @@ function executeSearch(siteIDs: number[]) {
   eventSource.onerror = () => {
     if (source !== eventSource) return
     stopStream()
-    if (!delivered) void searchJSON()
+    if (!delivered) void searchJSON(undefined, 1, true)
     else { searching.value = false; notify('部分站点流式结果已返回；连接提前结束，可单独重试失败站点', 'warning') }
   }
   streamTimeout = window.setTimeout(() => {
     if (source !== eventSource) return
     stopStream()
-    if (!delivered) void searchJSON()
+    if (!delivered) void searchJSON(undefined, 1, true)
     else searching.value = false
   }, identity ? 120_000 : 30_000)
 }
@@ -338,7 +359,7 @@ function executeSearch(siteIDs: number[]) {
 async function retrySite(group: TorrentSearchGroup) {
   searching.value = true
   searchError.value = ''
-  await searchJSON(group.site_id, 1)
+  await searchJSON(group.site_id, 1, true)
   const failed = groups.value.filter(item => item.status === 'error').length
   if (searchProgress.value) {
     searchProgress.value = {
@@ -364,6 +385,13 @@ async function previousPage(group: TorrentSearchGroup) {
   await searchJSON(group.site_id, group.page - 1)
 }
 
+function cancelResourceSearch() {
+  cancelSearchRequests()
+  stopStream()
+  searching.value = false
+  if (searchProgress.value) searchProgress.value = { ...searchProgress.value, running: 0, pending: 0, site_status: 'cancelled' }
+}
+
 async function loadDownloadOptions() {
   const requests: Promise<void>[] = []
   if (auth.can(Permissions.DownloadersRead)) requests.push(api<ListResponse<DownloaderSummary>>('/api/v1/downloaders').then(response => { downloaders.value = response.list }))
@@ -372,6 +400,7 @@ async function loadDownloadOptions() {
 }
 
 async function openSharePreview(item: TorrentSearchResult) {
+ if (resourceUnavailable(item)) return
  try { await loadDownloadOptions(); sharePreviewDialog.value = item } catch (reason) { notify(message(reason), 'error') }
 }
 async function acceptShareSelection(selection: ShareSelection) {
@@ -381,6 +410,7 @@ async function acceptShareSelection(selection: ShareSelection) {
  await openDownload(item, selection)
 }
 async function openDownload(item: TorrentSearchResult, selection: ShareSelection | null = null) {
+  if (resourceUnavailable(item)) return
   routeRecommendationRequest?.abort()
   routeRecommendationRequest = null
   routeRecommendationLoading.value = false
@@ -401,7 +431,7 @@ async function openDownload(item: TorrentSearchResult, selection: ShareSelection
 function expectedRouteBytes() {
   if (shareSelection.value) return shareSelection.value.totalSize > 0 ? shareSelection.value.totalSize : undefined
   const item = downloadDialog.value
-  return item?.source_kind !== '115_share' && item?.size_bytes && item.size_bytes > 0 ? item.size_bytes : undefined
+  return !isCloudShareSource(item?.source_kind) && item?.size_bytes && item.size_bytes > 0 ? item.size_bytes : undefined
 }
 
 async function loadRouteRecommendation(mediaLibraryID?: number) {
@@ -447,7 +477,7 @@ async function loadRoutePreview() {
   try {
     const preview = await previewDownloadRoutes({
       downloader_id: downloadForm.value.downloaderID,
-      source_kind: downloadDialog.value.source_kind === '115_share' ? '115_share' : 'torrent',
+      source_kind: isCloudShareSource(downloadDialog.value.source_kind) ? downloadDialog.value.source_kind : 'torrent',
       site_id: downloadSiteID.value,
       expected_bytes: expectedRouteBytes(),
     }, controller.signal)
@@ -485,7 +515,47 @@ function mediaTypeLabel(value?: string) { return value === 'movie' ? '电影' : 
 function message(reason: unknown) { return reason instanceof Error ? reason.message : '种子搜索暂时不可用' }
 
 function currentSearchInput() {
-  return { keyword: keyword.value, mediaType: mediaType.value, year: year.value, tmdbID: tmdbID.value, searchBy: searchBy.value, siteID: lockedSiteID.value, siteIDs: lockedSiteID.value || activeSearchSiteIDs.value.length === 0 ? undefined : activeSearchSiteIDs.value }
+  return { keyword: keyword.value, mediaType: mediaType.value, year: year.value, tmdbID: tmdbID.value, searchBy: searchBy.value, siteID: lockedSiteID.value, siteIDs: lockedSiteID.value || activeSearchSiteIDs.value.length === 0 ? undefined : activeSearchSiteIDs.value, typePolicy: appliedTypePolicy.value, cloudTypes: appliedCloudTypes.value }
+}
+
+async function refreshSourceAvailability() {
+  availabilityRequest?.abort()
+  const request = new AbortController()
+  availabilityRequest = request
+  sourceStatusReady.value = false
+  try {
+    const response = await api<ListResponse<SearchSiteOption>>(discoverySearchOptionsPath, { signal: request.signal })
+    if (availabilityRequest !== request || request.signal.aborted) return
+    if (!Array.isArray(response.list)) return
+    siteOptions.value = response.list
+    sourceStatusReady.value = true
+  } catch { /* Cached results stay visible; mutations wait for a confirmed current source. */ }
+}
+function groupUnavailable(group: TorrentSearchGroup) {
+  if (!sourceStatusReady.value) return restoredResults.value ? '历史结果的来源状态尚未确认，请重新搜索。' : ''
+  const option = siteOptions.value.find(site => site.id === group.site_id)
+  return option?.searchable ? '' : option?.reason || '来源已停用或不再可访问，保留历史结果。'
+}
+function resourceUnavailable(item: TorrentSearchResult) {
+  const group = groups.value.find(group => group.items.some(value => value.token === item.token))
+  return (group ? groupUnavailable(group) : '') || (resultExpired(item) ? '搜索结果已过期，请重新搜索' : '') || (item.acquisition_available === false ? item.acquisition_reason || '当前类型仅支持查看，尚无可用接收能力。' : '')
+}
+async function copyResourceLink(item: TorrentSearchResult) {
+  const group = groups.value.find(group => group.items.some(value => value.token === item.token))
+  if (resultExpired(item) || group && groupUnavailable(group)) return
+  copyRequest?.abort()
+  const request = new AbortController()
+  copyRequest = request
+  copyingToken.value = item.token
+  try {
+    const result = await api<{ url: string }>(discoveryResultLinkPath, { method: 'POST', signal: request.signal, body: JSON.stringify({ result_token: item.token }) })
+    if (copyRequest !== request || request.signal.aborted) return
+    const link = safeDiscoveryLink(result.url)
+    if (!link) throw new Error('Server 返回的资源链接无效。')
+    await navigator.clipboard.writeText(link)
+    if (copyRequest === request) notify('资源链接已复制', 'success')
+  } catch (reason) { if (!request.signal.aborted) notify(message(reason), 'error') }
+  finally { if (copyRequest === request) { copyRequest = null; copyingToken.value = '' } }
 }
 
 async function openManualRecognition(item: TorrentSearchResult) {
@@ -537,7 +607,7 @@ async function confirmManualRecognition() {
 
 function sameSearchInput(left: ReturnType<typeof currentSearchInput>, right: TorrentSearchSession['input']) {
   const sameScope = !left.siteIDs?.length || JSON.stringify(left.siteIDs) === JSON.stringify(right.siteIDs)
-  return left.keyword.trim() === right.keyword.trim() && left.mediaType === right.mediaType && left.year === right.year && left.tmdbID === right.tmdbID && left.searchBy === right.searchBy && left.siteID === right.siteID && sameScope
+  return left.keyword.trim() === right.keyword.trim() && left.mediaType === right.mediaType && left.year === right.year && left.tmdbID === right.tmdbID && left.searchBy === right.searchBy && left.siteID === right.siteID && sameScope && left.typePolicy === right.typePolicy && JSON.stringify(left.cloudTypes) === JSON.stringify(right.cloudTypes)
 }
 
 watch([groups, recognitions, searched], () => {
@@ -558,6 +628,7 @@ onMounted(async () => {
       lockedSite.value = response.list.find(item => item.id === lockedSiteID.value) ?? null
     } catch { /* Search API remains the authority if the management summary cannot load. */ }
   }
+  void refreshSourceAvailability()
   const cached = readTorrentSearchSession(typeof sessionStorage === 'undefined' ? undefined : sessionStorage)
   const hasRouteSearch = typeof route.query.title === 'string' || typeof route.query.tmdb_id === 'string'
   if (cached && (!hasRouteSearch || sameSearchInput(currentSearchInput(), cached.input))) {
@@ -570,12 +641,19 @@ onMounted(async () => {
     groups.value = cached.groups
     recognitions.value = cached.recognitions
     searched.value = cached.searched
+    restoredResults.value = true
+    panSouTypePolicy.value = cached.input.typePolicy ?? 'default'
+    panSouCloudTypes.value = cached.input.cloudTypes ?? ['115', 'quark', 'magnet']
+    appliedTypePolicy.value = cached.input.typePolicy
+    appliedCloudTypes.value = cached.input.cloudTypes
     if (lockedSiteID.value) activeChannel.value = lockedSiteID.value
     return
   }
   if (trustedIdentity.value || keyword.value.trim() || (searchBy.value === 'tmdb_id' && tmdbID.value)) search()
 })
 onBeforeUnmount(() => {
+  availabilityRequest?.abort()
+  copyRequest?.abort()
   routeRecommendationRequest?.abort()
   cancelSearchRequests()
   resultRecognition.dispose()
@@ -612,12 +690,17 @@ onBeforeUnmount(() => {
           <button class="btn-primary" :disabled="searching">{{ searching ? '搜索中…' : '搜索' }}</button>
         </div>
       </form>
+      <section class="panel space-y-3" aria-label="PanSou 结果类型">
+        <div class="flex flex-wrap items-end gap-3"><label class="min-w-64"><span class="label">PanSou 结果类型</span><select v-model="panSouTypePolicy" class="input" :disabled="searching"><option value="default">使用站点默认设置</option><option value="auto">自动：已接入网盘＋磁力</option><option value="all">全部类型</option><option value="manual">指定类型</option></select></label><button class="btn-secondary" type="button" :disabled="searching || panSouTypePolicy === 'manual' && !panSouCloudTypes.length" @click="activeSearchSiteIDs.length ? executeSearch(activeSearchSiteIDs) : search()">按此类型重新搜索</button></div>
+        <fieldset v-if="panSouTypePolicy === 'manual'" class="flex flex-wrap gap-3"><legend class="label">搜索类型</legend><label v-for="option in discoveryTypeOptions" :key="option[0]" class="text-sm"><input v-model="panSouCloudTypes" type="checkbox" :value="option[0]" /> {{ option[1] }}</label></fieldset>
+        <p class="text-subtle m-0 text-xs">来源包含所选 TG 频道和 PanSou 已启用插件；类型设置只影响盘搜。自动模式始终包含磁力。切换后点击重新搜索，其他网盘可能仅支持查看链接。</p>
+      </section>
       <div v-if="selectedTitle" class="panel"><span class="status-chip">已确认作品身份</span><h2 class="mt-3 text-xl font-750">{{ selectedTitle }}</h2><p class="mt-1 text-sm text-muted">Server 会重新验证 TMDB 身份，并按受限的中文名、地区别名、原名和英文名聚合搜索。</p><div v-if="identityNames.length" class="mt-3 flex flex-wrap gap-2"><span v-for="name in identityNames" :key="`${name.kind}:${name.locale}:${name.value}`" class="status-chip">{{ name.value }}<template v-if="name.locale"> · {{ name.locale }}</template></span></div></div>
       <div v-if="searchError" class="semantic-error p-4"><strong>搜索失败</strong><p class="mt-1 text-sm">{{ searchError }}</p><button class="btn-secondary mt-3" @click="search">{{ lockedSiteID ? '重试此站' : '重新选择站点' }}</button></div>
       <section v-if="searchProgress" class="panel" aria-live="polite">
         <div class="flex flex-wrap items-center justify-between gap-3">
           <div><strong>站点搜索进度 {{ searchProgress.completed }} / {{ searchProgress.total }}</strong><p class="text-subtle mb-0 mt-1 text-xs">等待 {{ searchProgress.pending }} · 正在搜索 {{ searchProgress.running }} · 成功 {{ searchProgress.succeeded }} · 失败 {{ searchProgress.failed }} · 已发现 {{ searchProgress.result_count }}</p></div>
-          <button v-if="searching" class="btn-secondary" type="button" @click="stopStream(); searching = false">取消搜索</button>
+          <button v-if="searching" class="btn-secondary" type="button" @click="cancelResourceSearch">取消搜索</button>
         </div>
         <div class="mt-3 h-2 overflow-hidden rounded-full bg-[var(--surface-subtle)]" role="progressbar" :aria-valuemin="0" :aria-valuemax="searchProgress.total" :aria-valuenow="searchProgress.completed">
           <div class="h-full rounded-full bg-[var(--accent)] transition-[width] duration-200" :style="{ width: `${searchProgressPercent}%` }"></div>
@@ -644,17 +727,18 @@ onBeforeUnmount(() => {
           <p class="text-subtle mb-0 text-xs xl:col-span-2">不同筛选项之间为 AND；同类标签按任一匹配。排序只针对已经取回的当前页结果。</p>
         </form>
 
-        <div v-if="activeGroup?.status === 'error'" class="semantic-warning flex flex-wrap items-center justify-between gap-3 p-4"><span>{{ activeGroup.site_name }} 暂时不可用（{{ activeGroup.error_code || 'site_unavailable' }}）。</span><button class="btn-secondary" :disabled="searching" @click="retrySite(activeGroup)">重试此站</button></div>
+        <div v-if="activeGroup?.status === 'error'" class="semantic-warning flex flex-wrap items-center justify-between gap-3 p-4"><span>{{ activeGroup.site_name }} 暂时不可用（{{ activeGroup.error_code || 'site_unavailable' }}）。已取得的有效结果仍会保留。</span><button class="btn-secondary" :disabled="searching || !!groupUnavailable(activeGroup)" @click="retrySite(activeGroup)">重试此站</button></div>
+        <template v-for="group in orderedGroups" :key="`notice:${group.site_id}`"><div v-if="activeChannel === 'all' || activeChannel === group.site_id" class="space-y-2"><p v-if="groupUnavailable(group)" class="semantic-warning m-0 p-3 text-sm">{{ group.site_name }}：{{ groupUnavailable(group) }}</p><p v-for="warning in group.warnings || []" :key="warning.code" class="semantic-warning m-0 p-3 text-sm">{{ group.site_name }}：{{ warning.message }}</p><p v-if="group.truncated" class="semantic-warning m-0 p-3 text-sm">结果达到本次保存上限，尚未完整展示；请缩小范围重新搜索。</p><p v-if="group.completion === 'received' && !group.warnings?.length" class="text-subtle m-0 text-xs">{{ group.site_name }} 已返回 {{ group.items.length }} 条；上游未确认全部来源完成。</p></div></template>
         <div v-if="!visibleResults.length" class="panel py-10 text-center text-muted">当前渠道和筛选条件下没有结果。</div>
         <div v-else class="grid gap-4 xl:grid-cols-2">
           <article v-for="entry in visibleResults" :key="entry.item.token" class="panel flex min-h-72 flex-col">
             <div class="flex min-w-0 flex-1 gap-4">
               <div class="flex h-32 w-22 shrink-0 items-center justify-center overflow-hidden rounded-lg bg-[var(--surface-subtle)] text-center text-xs text-subtle">
                 <img v-if="recognitions[entry.item.token]?.poster_url" :src="recognitions[entry.item.token].poster_url" :alt="`${recognitions[entry.item.token].title} 海报`" class="h-full w-full object-cover" loading="lazy" />
-                <span v-else>{{ entry.group.site_name }}<br />{{ entry.group.site_type === 'cloud_share' ? '115 网盘' : entry.group.site_type.toUpperCase() }}</span>
+                <span v-else>{{ entry.group.site_name }}<br />{{ resultTypeLabel(entry.item, entry.group.site_type.toUpperCase()) }}</span>
               </div>
               <div class="min-w-0 flex-1">
-                <div class="flex flex-wrap gap-1.5"><span class="status-chip">{{ entry.group.site_name }}</span><span class="status-chip">{{ entry.group.site_type === 'cloud_share' ? '115 网盘' : entry.group.site_type.toUpperCase() }}</span><span v-if="entry.item.channel" class="status-chip">@{{ entry.item.channel }}</span><a v-if="entry.item.post_url" :href="entry.item.post_url" target="_blank" rel="noopener noreferrer" class="text-xs">原帖 ↗</a><span v-if="entry.item.matched_name" class="status-chip status-chip--ready">命中 {{ entry.item.matched_name }}</span><span v-if="entry.item.promotion" class="status-chip status-chip--ready">{{ entry.item.promotion.toUpperCase() }}</span><span v-for="label in ptRecognitionSpecLabels(entry.item.specifications || {})" :key="label" class="status-chip">{{ label }}</span><span v-if="entry.item.quality" class="status-chip">{{ entry.item.quality }}</span><span v-for="tag in entry.item.tags || []" :key="tag" class="status-chip">{{ tag }}</span></div>
+                <div class="flex flex-wrap gap-1.5"><span class="status-chip">{{ entry.group.site_name }}</span><span class="status-chip">{{ resultTypeLabel(entry.item, entry.group.site_type.toUpperCase()) }}</span><template v-for="origin in discoveryOrigins(entry.item)" :key="`${origin.kind}:${origin.name}`"><span class="status-chip">PanSou · {{ origin.kind === 'tg' ? 'TG' : '插件' }} · {{ origin.name }}</span><a v-if="origin.post_url" :href="origin.post_url" target="_blank" rel="noopener noreferrer" class="text-xs">原帖 ↗</a></template><span v-if="entry.item.matched_name" class="status-chip status-chip--ready">命中 {{ entry.item.matched_name }}</span><span v-if="entry.item.promotion" class="status-chip status-chip--ready">{{ entry.item.promotion.toUpperCase() }}</span><span v-for="label in ptRecognitionSpecLabels(entry.item.specifications || {})" :key="label" class="status-chip">{{ label }}</span><span v-if="entry.item.quality" class="status-chip">{{ entry.item.quality }}</span><span v-for="tag in entry.item.tags || []" :key="tag" class="status-chip">{{ tag }}</span></div>
                 <h2 class="mt-3 break-words text-base font-750">{{ entry.item.title }}</h2>
                 <p v-if="entry.item.subtitle" class="text-subtle mb-0 mt-1 line-clamp-2 text-xs">{{ entry.item.subtitle }}</p>
                 <div class="text-subtle mt-3 flex flex-wrap gap-x-4 gap-y-1 text-xs"><span>{{ formatBytes(entry.item.size_bytes ?? null) }}</span><span>{{ formatTime(entry.item.published_at) }}</span><strong>做种 {{ count(entry.item.seeders) }}</strong><span>下载 {{ count(entry.item.leechers) }}</span><span>完成 {{ count(entry.item.completed) }}</span></div>
@@ -665,15 +749,16 @@ onBeforeUnmount(() => {
                 <p v-if="resultExpired(entry.item) && recognitionErrors[entry.item.token] !== '搜索结果已过期，请重新搜索'" class="semantic-warning mb-0 mt-3 p-3 text-xs">搜索结果已过期，请重新搜索</p>
               </div>
             </div>
-            <p v-if="entry.item.source_kind === '115_share'" class="text-subtle mt-3 text-xs" role="status" :title="shareValidation(entry.item)?.message">
+            <p v-if="isCloudShareSource(entry.item.source_kind)" class="text-subtle mt-3 text-xs" role="status" :title="shareValidation(entry.item)?.message">
               {{ shareValidationLabel(shareValidation(entry.item), validationClock) }}
               <span v-if="shareValidation(entry.item)"> · {{ formatTime(shareValidation(entry.item)?.checked_at) }}</span>
               <span v-if="shareValidation(entry.item)?.status === 'unavailable'"> · {{ shareValidation(entry.item)?.message }}</span>
             </p>
-            <footer class="mt-4 flex flex-wrap justify-end gap-2 border-t border-[var(--border)] pt-4"><button v-if="entry.item.source_kind === '115_share'" class="btn-secondary" :disabled="!auth.can(Permissions.DownloadsCreate)" @click="openSharePreview(entry.item)">预览分享链接内部内容</button><button class="btn-secondary" :disabled="!auth.can(Permissions.DiscoveryRead) || resultExpired(entry.item)" :title="resultExpired(entry.item) ? '搜索结果已过期，请重新搜索' : '重新读取作品识别及库内状态'" @click="resultRecognition.retry(entry.item.token)">重新检测</button><button class="btn-secondary" :disabled="!auth.can(Permissions.DownloadsCreate)" @click="openManualRecognition(entry.item)">手动检测</button><button class="btn-primary" :disabled="!auth.can(Permissions.DownloadsCreate)" @click="openDownload(entry.item)">{{ entry.item.source_kind === '115_share' ? '转存入库' : '入库' }}</button></footer>
+            <p v-if="resourceUnavailable(entry.item)" class="semantic-warning mt-3 p-3 text-xs" role="status">{{ resourceUnavailable(entry.item) }}</p>
+            <footer class="mt-4 flex flex-wrap justify-end gap-2 border-t border-[var(--border)] pt-4"><button v-if="entry.item.result_type" class="btn-secondary" :disabled="copyingToken === entry.item.token || resultExpired(entry.item) || !!groupUnavailable(entry.group)" @click="copyResourceLink(entry.item)">{{ copyingToken === entry.item.token ? '正在读取…' : '复制资源链接' }}</button><button v-if="isCloudShareSource(entry.item.source_kind)" class="btn-secondary" :disabled="!auth.can(Permissions.DownloadsCreate) || !!resourceUnavailable(entry.item)" @click="openSharePreview(entry.item)">预览分享链接内部内容</button><button class="btn-secondary" :disabled="!auth.can(Permissions.DiscoveryRead) || resultExpired(entry.item)" :title="resultExpired(entry.item) ? '搜索结果已过期，请重新搜索' : '重新读取作品识别及库内状态'" @click="resultRecognition.retry(entry.item.token)">重新检测</button><button class="btn-secondary" :disabled="!auth.can(Permissions.DownloadsCreate) || !!resourceUnavailable(entry.item)" @click="openManualRecognition(entry.item)">手动检测</button><button class="btn-primary" :disabled="!auth.can(Permissions.DownloadsCreate) || !!resourceUnavailable(entry.item)" :title="resourceUnavailable(entry.item)" @click="openDownload(entry.item)">{{ entry.item.acquisition_available === false ? '仅供查看' : isCloudShareSource(entry.item.source_kind) ? '转存入库' : '入库' }}</button></footer>
           </article>
         </div>
-        <footer v-if="activeGroup?.status === 'success'" class="panel flex items-center justify-center gap-3"><button class="btn-secondary" :disabled="searching || activeGroup.page <= 1" @click="previousPage(activeGroup)">上一页</button><span class="text-sm">{{ activeGroup.site_name }} · 第 {{ activeGroup.page }} 页</span><button class="btn-secondary" :disabled="searching || !activeGroup.has_next" @click="nextPage(activeGroup)">下一页</button></footer>
+        <footer v-if="activeGroup?.status === 'success'" class="panel flex items-center justify-center gap-3"><button class="btn-secondary" :disabled="searching || !!groupUnavailable(activeGroup) || activeGroup.page <= 1" @click="previousPage(activeGroup)">上一页</button><span class="text-sm">{{ activeGroup.site_name }} · 第 {{ activeGroup.page }} 页</span><button class="btn-secondary" :disabled="searching || !!groupUnavailable(activeGroup) || !activeGroup.has_next" @click="nextPage(activeGroup)">下一页</button></footer>
         <p v-else-if="activeChannel === 'all'" class="text-subtle text-center text-xs">“全部渠道”聚合显示各站点当前页；切换到单个站点后可独立翻页。</p>
       </template>
 
@@ -718,20 +803,20 @@ onBeforeUnmount(() => {
       </form>
     </div>
 
-    <SharePreviewDialog v-if="sharePreviewDialog" :result-token="sharePreviewDialog.token" :title="sharePreviewDialog.title" :downloaders="downloaders" @close="sharePreviewDialog = null" @select="acceptShareSelection" @validation="rememberShareValidation" />
+    <SharePreviewDialog v-if="sharePreviewDialog" :result-token="sharePreviewDialog.token" :title="sharePreviewDialog.title" :source-kind="sharePreviewDialog.source_kind" :downloaders="downloaders" @close="sharePreviewDialog = null" @select="acceptShareSelection" @validation="rememberShareValidation" />
     <div v-if="downloadDialog" class="modal-backdrop fixed inset-0 z-50 flex items-center justify-center p-4" @click.self="!submitting && (downloadDialog = null)">
       <form class="panel max-h-[90vh] w-full max-w-xl overflow-y-auto" role="dialog" aria-modal="true" aria-labelledby="pt-download-title" @submit.prevent="submitDownload">
-        <div class="flex items-start justify-between gap-3"><div><h2 id="pt-download-title" class="m-0 text-xl">{{ downloadDialog.source_kind === '115_share' ? '转存到媒体库' : '创建下载任务' }}</h2><p class="page-description mt-1 line-clamp-2 text-sm">{{ downloadDialog.title }}</p></div><button class="btn-secondary" type="button" :disabled="submitting" @click="downloadDialog = null">关闭</button></div>
+        <div class="flex items-start justify-between gap-3"><div><h2 id="pt-download-title" class="m-0 text-xl">{{ isCloudShareSource(downloadDialog.source_kind) ? '转存到媒体库' : '创建下载任务' }}</h2><p class="page-description mt-1 line-clamp-2 text-sm">{{ downloadDialog.title }}</p></div><button class="btn-secondary" type="button" :disabled="submitting" @click="downloadDialog = null">关闭</button></div>
         <div class="mt-5 grid gap-4 sm:grid-cols-2">
-          <div><label class="label">下载器</label><select v-model="downloadForm.downloaderID" class="input" required :disabled="!!shareSelection || routeRecommendationLoading" @change="loadRoutePreview"><option value="" disabled>请选择可执行的下载器</option><option v-for="item in enabledDownloaders" :key="item.id" :value="item.id">{{ item.name }} · {{ item.type === 'pan115_offline' ? '115 网盘' : item.type }}</option></select><p class="text-subtle mb-0 mt-2 text-xs">按资源来源和全局下载器顺序推荐；可手动改选兼容的下载器。</p></div>
+          <div><label class="label">下载器</label><select v-model="downloadForm.downloaderID" class="input" required :disabled="!!shareSelection || routeRecommendationLoading" @change="loadRoutePreview"><option value="" disabled>请选择可执行的下载器</option><option v-for="item in enabledDownloaders" :key="item.id" :value="item.id">{{ item.name }} · {{ item.type === 'pan115_offline' ? '115 网盘' : item.type === 'quark_share' ? '夸克分享转存' : item.type }}</option></select><p class="text-subtle mb-0 mt-2 text-xs">按资源来源和全局下载器顺序推荐；可手动改选兼容的下载器。</p></div>
           <div><label class="label">目标媒体库</label><div v-if="routeRecommendationLoading && !targetChoices.length" class="semantic-inset p-3 text-sm text-muted">正在计算入库路线…</div><div v-else-if="!targetChoices.length" class="semantic-warning p-3 text-sm">当前没有可用媒体库。</div><div v-else class="grid max-h-48 gap-2 overflow-y-auto" role="radiogroup" aria-label="目标媒体库"><label v-for="choice in targetChoices" :key="choice.media_library_id" class="semantic-list-item flex items-start gap-2 p-2 text-sm" :class="{ 'semantic-list-item--selected': downloadForm.mediaLibraryID === choice.media_library_id, 'opacity-60': !choice.enabled }"><input type="radio" name="explore-download-target" :checked="downloadForm.mediaLibraryID === choice.media_library_id" :disabled="!choice.enabled || routeRecommendationLoading" @change="chooseTarget(choice.media_library_id)" /><span><strong>{{ choice.library_name }}</strong><small class="text-subtle mt-1 block">{{ choice.route_label || choice.reason_message || '路线待确认' }}</small></span></label></div></div>
           <p v-if="routeFailure && !routeRecommendationLoading && !routePreviewLoading" class="semantic-warning sm:col-span-2">{{ routeFailure }}。可调整目标媒体库或手动选择兼容下载器。</p>
           <div class="sm:col-span-2"><label class="label">队列优先级</label><input v-model.number="downloadForm.priority" class="input" type="number" min="-100" max="100" /></div>
         </div>
         <div v-if="selectedLibrary && selectedRoute" class="semantic-inset mt-4 grid gap-3 p-4 text-sm sm:grid-cols-2"><div><span class="text-subtle block text-xs">最终媒体库</span><strong>{{ selectedLibrary.name }}</strong></div><div><span class="text-subtle block text-xs">分类与入库</span><strong>{{ selectedRoute.route_label }} · {{ selectedLibrary.profile_name }} · {{ selectedLibrary.transfer_mode }}</strong></div></div>
         <p v-if="shareSelection" class="semantic-inset mt-4 p-3 text-sm">本次仅转存所选 {{ shareSelection.fileCount }} 个文件 · {{ formatBytes(shareSelection.totalSize) }}。更换账号或文件范围请重新预览。</p>
-        <p class="text-subtle mt-4 text-xs">{{ downloadDialog.source_kind === '115_share' ? '分享内容将转存到 115 下载器目录，随后自动识别、整理并入库。' : '确认后获取资源，自动识别、整理并入库。' }}</p>
-        <div class="mt-5 flex justify-end gap-3"><button class="btn-secondary" type="button" :disabled="submitting" @click="downloadDialog = null">取消</button><button class="btn-primary" :disabled="submitting || routeRecommendationLoading || routePreviewLoading || !downloadForm.downloaderID || !selectedRoute?.enabled || !selectedLibrary">{{ submitting ? '正在提交…' : downloadDialog.source_kind === '115_share' ? '确认转存' : '确认并入队' }}</button></div>
+        <p class="text-subtle mt-4 text-xs">{{ isCloudShareSource(downloadDialog.source_kind) ? '分享内容将转存到对应网盘的下载器目录，随后自动识别、整理并入库。' : '确认后获取资源，自动识别、整理并入库。' }}</p>
+        <div class="mt-5 flex justify-end gap-3"><button class="btn-secondary" type="button" :disabled="submitting" @click="downloadDialog = null">取消</button><button class="btn-primary" :disabled="submitting || routeRecommendationLoading || routePreviewLoading || !downloadForm.downloaderID || !selectedRoute?.enabled || !selectedLibrary">{{ submitting ? '正在提交…' : isCloudShareSource(downloadDialog.source_kind) ? '确认转存' : '确认并入队' }}</button></div>
       </form>
     </div>
   </section>

@@ -197,8 +197,13 @@ export function mediaIdentitySearchPath(mediaType: DiscoveryMediaType, tmdbID: n
   return `/api/v1/discovery/media/${encodeURIComponent(mediaType)}/${encodeURIComponent(String(tmdbID))}/torrent-search${stream ? '/stream' : ''}`
 }
 
-export function mediaIdentitySearchURL(mediaType: DiscoveryMediaType, tmdbID: number, options: { season?: number; page?: number; siteID?: number; siteIDs?: number[] } = {}, stream = false) {
+export function mediaIdentitySearchURL(mediaType: DiscoveryMediaType, tmdbID: number, options: { season?: number; page?: number; siteID?: number; siteIDs?: number[]; typePolicy?: 'auto' | 'all' | 'manual'; cloudTypes?: string[]; snapshotID?: string; refresh?: boolean } = {}, stream = false) {
   const query = new URLSearchParams({ page: String(Math.max(1, Math.min(20, options.page ?? 1))) })
+  query.set('client_capabilities', 'mixed_discovery_v1')
+  if (options.typePolicy) query.set('type_policy', options.typePolicy)
+  for (const type of options.cloudTypes ?? []) query.append('cloud_types', type)
+  if (options.snapshotID) query.set('snapshot_id', options.snapshotID)
+  if (options.refresh) query.set('refresh', 'true')
   if (options.season != null) query.set('season', String(options.season))
   if (options.siteID && options.siteIDs) throw new Error('site_id and site_ids cannot be combined')
   if (options.siteID) query.set('site_id', String(options.siteID))

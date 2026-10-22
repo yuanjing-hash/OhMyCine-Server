@@ -152,7 +152,7 @@ func (s *DownloaderService) CreateContext(ctx context.Context, actor Actor, inpu
 		}
 		switch providerType {
 		case models.DownloaderTypeQBittorrent:
-		case models.DownloaderTypePan115Offline:
+		case models.DownloaderTypePan115Offline, models.DownloaderTypeQuarkShare:
 			if input.AutoListenLifeEvents {
 				return DownloaderSummary{}, appError(CodeInvalidRequest, "节点 115 下载器暂不承接生活事件自动摄取", nil)
 			}
@@ -160,7 +160,7 @@ func (s *DownloaderService) CreateContext(ctx context.Context, actor Actor, inpu
 			if err != nil {
 				return DownloaderSummary{}, err
 			}
-			node, nodeErr := s.prepareNodeStorageDownloader(input.NodeID)
+			node, nodeErr := s.prepareNodeStorageDownloader(input.NodeID, providerType)
 			if nodeErr != nil {
 				return DownloaderSummary{}, nodeErr
 			}
@@ -175,7 +175,7 @@ func (s *DownloaderService) CreateContext(ctx context.Context, actor Actor, inpu
 		}
 	}
 	providerDirectoryID, providerDirectoryPath := "", ""
-	if providerType == models.DownloaderTypePan115Offline {
+	if isCloudShareDownloader(providerType) {
 		selection, resolveErr := s.resolveProviderDirectory(ctx, actor, storage, input.ProviderDirectoryToken)
 		if resolveErr != nil {
 			return DownloaderSummary{}, resolveErr
@@ -289,7 +289,7 @@ func (s *DownloaderService) UpdateContext(ctx context.Context, actor Actor, id s
 			record.OwnerID = actor.User.ID
 		}
 	}
-	if record.Type == models.DownloaderTypePan115Offline && (input.StorageID != nil || input.ProviderDirectoryToken != nil) {
+	if isCloudShareDownloader(record.Type) && (input.StorageID != nil || input.ProviderDirectoryToken != nil) {
 		if input.StorageID == nil || input.ProviderDirectoryToken == nil {
 			return DownloaderSummary{}, appError(CodeDownloaderStorageRequired, "请选择完整的 115 离线下载目录", nil)
 		}
@@ -443,7 +443,7 @@ func (s *DownloaderService) client(id string) (models.Downloader, downloadpkg.Cl
 
 func (s *DownloaderService) clientFor(record models.Downloader) (downloadpkg.Client, error) {
 	if record.ExecutionLocation == models.NodeLocationRemote {
-		if record.Type == models.DownloaderTypePan115Offline {
+		if record.Type == models.DownloaderTypePan115Offline || record.Type == models.DownloaderTypeQuarkShare {
 			return s.nodeStorageProbeClient(record)
 		}
 		if record.Type != models.DownloaderTypeQBittorrent {
@@ -452,6 +452,33 @@ func (s *DownloaderService) clientFor(record models.Downloader) (downloadpkg.Cli
 		return s.nodeDownloaderClient(record, "", "")
 	}
 	config := downloadpkg.Config{BaseURL: record.BaseURL}
+	if record.Type == models.DownloaderTypeQuarkShare {
+		if record.StorageID == nil || s.connections == nil {
+			return nil, appError(CodeDownloaderStorageUnavailable, "夸克分享接收目录不可用", nil)
+		}
+		var storage models.Storage
+		if err := s.db.First(&storage, *record.StorageID).Error; err != nil || !storage.Enabled || storage.Type != models.StorageTypeQuark || storage.ConnectionID == nil {
+			return nil, appError(CodeDownloaderStorageUnavailable, "夸克分享接收目录不可用", err)
+		}
+		_, driver, err := s.connections.driver(*storage.ConnectionID)
+		if err != nil {
+			return nil, err
+		}
+		share, ok := driver.(cloudpkg.ShareBrowseDriver)
+		if !ok || !driver.Capabilities().ShareReceive || !driver.Capabilities().CreateDirectory {
+			return nil, appError(CodeDownloaderUnavailable, "夸克连接尚未完成文件管理授权及共同目录验证", nil)
+		}
+		directoryID := strings.TrimSpace(record.ProviderDirectoryID)
+		if directoryID == "" {
+			directoryID = storage.RootPath
+		}
+		config.ShareDriver, config.ProviderStorageRootID, config.ProviderDirectoryID = share, storage.RootPath, directoryID
+		config.ProviderStorageRootPath, config.ProviderDirectoryPath = storage.RootDisplayPath, record.ProviderDirectoryPath
+		if strings.TrimSpace(config.ProviderDirectoryPath) == "" {
+			config.ProviderDirectoryPath = "/"
+		}
+		return s.registry.Build(record.Type, config)
+	}
 	if record.Type == models.DownloaderTypePan115Offline {
 		if record.StorageID == nil || s.connections == nil {
 			return nil, appError(CodeDownloaderStorageUnavailable, "115 离线下载目录不可用", nil)
@@ -500,7 +527,7 @@ func (s *DownloaderService) validateDownloaderConfig(providerType, rawURL, usern
 	if providerType == models.DownloaderTypeFake {
 		return "", nil, nil
 	}
-	if providerType == models.DownloaderTypePan115Offline {
+	if isCloudShareDownloader(providerType) {
 		if rawURL != "" || username != "" || password != "" {
 			return "", nil, appError(CodeInvalidRequest, "115 离线下载器复用数据源凭据，无需填写地址或账号密码", nil)
 		}
@@ -508,7 +535,7 @@ func (s *DownloaderService) validateDownloaderConfig(providerType, rawURL, usern
 			return "", nil, appError(CodeDownloaderStorageRequired, "请选择 115 离线下载目录", nil)
 		}
 		var storage models.Storage
-		if err := s.db.First(&storage, *storageID).Error; err != nil || !storage.Enabled || storage.Type != models.StorageTypePan115 || storage.ConnectionID == nil {
+		if err := s.db.First(&storage, *storageID).Error; err != nil || !storage.Enabled || storage.Type != shareStorageType(providerType) || storage.ConnectionID == nil {
 			return "", nil, appError(CodeDownloaderStorageUnavailable, "115 离线下载目录不可用", err)
 		}
 		return "", &storage.ID, nil
@@ -607,7 +634,7 @@ func (s *DownloaderService) validateLifeEventDirectory(ctx context.Context, excl
 
 func (s *DownloaderService) resolveProviderDirectory(ctx context.Context, actor Actor, storageID *uint, token string) (ProviderDirectorySelection, error) {
 	if storageID == nil || strings.TrimSpace(token) == "" {
-		return ProviderDirectorySelection{}, appError(CodeDownloaderStorageRequired, "请浏览并选择 115 离线下载目录", nil)
+		return ProviderDirectorySelection{}, appError(CodeDownloaderStorageRequired, "请浏览并选择网盘下载目录", nil)
 	}
 	if s.connections == nil {
 		return ProviderDirectorySelection{}, appError(CodeDownloaderStorageUnavailable, "115 离线下载目录不可用", nil)
@@ -617,7 +644,7 @@ func (s *DownloaderService) resolveProviderDirectory(ctx context.Context, actor 
 		return ProviderDirectorySelection{}, err
 	}
 	if len(selection.ProviderID) > 128 || len(selection.RelativeRoot) > 2048 {
-		return ProviderDirectorySelection{}, appError(CodeDirectoryTokenInvalid, "115 离线下载目录无效", nil)
+		return ProviderDirectorySelection{}, appError(CodeDirectoryTokenInvalid, "网盘下载目录无效", nil)
 	}
 	return selection, nil
 }

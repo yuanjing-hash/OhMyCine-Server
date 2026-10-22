@@ -25,6 +25,10 @@ func (w *TransferWorker) finishCompletedTransfer(ctx context.Context, task model
 	if err := w.service.db.First(&download, "id = ?", task.DownloadTaskID).Error; err != nil {
 		return WorkerResult{ErrorCode: "transfer_download_missing", ErrorMessage: "原下载任务不存在"}
 	}
+	if err := w.recoverCompletedRemoteUploadOperations(ctx, &task, download); err != nil {
+		next := time.Now().UTC().Add(time.Minute)
+		return WorkerResult{RetryAt: &next, ErrorCode: "transfer_batch_publish_failed", ErrorMessage: "正在核对原传输节点的完成回执，将仅重试本批次"}
+	}
 	// The persisted successful targets are the only authorized catalog scope.
 	// Failure retries this batch; it must never wake an unscoped library scan.
 	if w.service.libraryReconciler != nil {
@@ -49,11 +53,27 @@ func (w *TransferWorker) finishCompletedTransfer(ctx context.Context, task model
 	} else if err != nil {
 		return WorkerResult{ErrorCode: "transfer_download_missing", ErrorMessage: "原下载任务不存在"}
 	}
-	if download.ProviderType != models.DownloaderTypePan115Offline && w.service.seeding != nil {
+	if download.ProviderType != models.DownloaderTypePan115Offline && download.ProviderType != models.DownloaderTypeQuarkShare && w.service.seeding != nil {
 		if err := w.service.seeding.AfterTransfer(ctx, download); err != nil {
 			next := time.Now().UTC().Add(time.Minute)
 			return WorkerResult{RetryAt: &next, ErrorCode: "post_transfer_provider_failed", ErrorMessage: "下载器收尾失败，将自动重试"}
 		}
+	}
+	if download.ProviderType == models.DownloaderTypeQuarkShare {
+		if err := cleanupCrossSourceManagedRoot(task, download); err != nil {
+			next := time.Now().UTC().Add(time.Minute)
+			return WorkerResult{RetryAt: &next, ErrorCode: "cross_source_staging_cleanup_failed", ErrorMessage: "入库已完成，跨数据源暂存清理将自动重试"}
+		}
+		// Quark recycle is not verified. Keep the source and empty package; never
+		// reinterpret provider paths as local staging or falsely claim cleanup.
+		if err := w.service.db.Model(&models.TransferTask{}).Where("id = ?", task.ID).Updates(map[string]any{"cleanup_status": models.TransferCleanupSkipped, "cleanup_error_code": "quark_recycle_unavailable", "updated_at": time.Now().UTC()}).Error; err != nil {
+			next := time.Now().UTC().Add(time.Minute)
+			return WorkerResult{RetryAt: &next, ErrorCode: "transfer_state_persist_failed", ErrorMessage: "入库已完成，源文件保留状态将自动重试"}
+		}
+		if task.CleanupStatus != models.TransferCleanupSkipped {
+			serverlog.OperationDownloadStagingCleanup.Event(w.service.log.Info()).Str("task_id", task.ID).Str("source_cleanup", "retained").Msg(serverlog.OperationDownloadStagingCleanup.Message("夸克入库已完成；回收能力尚未开放，保留云端接收目录和剩余文件"))
+		}
+		return WorkerResult{}
 	}
 	if download.ProviderType == models.DownloaderTypePan115Offline && normalizeExecutionLocation(download.ExecutionLocation) == models.NodeLocationRemote {
 		client, err := w.service.downloader.clientForDownloadTask(ctx, download)

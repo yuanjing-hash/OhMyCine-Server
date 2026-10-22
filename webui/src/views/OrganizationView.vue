@@ -6,7 +6,7 @@ import { Permissions } from '@/auth/generated-permissions'
 import ClearHistoryButton from '@/components/ClearHistoryButton.vue'
 import MediaReorganizationDialog from '@/components/MediaReorganizationDialog.vue'
 import TransferDeletionDialog from '@/components/TransferDeletionDialog.vue'
-import { controlJob, respondAction } from '@/jobs'
+import { controlJob, jobActionLabel as actionLabel, respondAction } from '@/jobs'
 import { useAuthStore } from '@/stores/auth'
 import { notify } from '@/toast'
 import {
@@ -312,10 +312,6 @@ function trapDrawerFocus(event: KeyboardEvent) {
   const last = focusable[focusable.length - 1]
   if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus() }
   else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus() }
-}
-
-function actionLabel(value: string): string {
-  return ({ overwrite: '覆盖', skip: '跳过', rename: '自动改名' } as Record<string, string>)[value] ?? value
 }
 
 function resultLabel(value: string): string {

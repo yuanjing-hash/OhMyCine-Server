@@ -21,6 +21,9 @@ func (s *MediaLibraryStructureService) prepareCatalogStructureDirectories(ctx co
 	if boundary.Storage.Type == models.StorageTypeLocal || len(plan.Items) == 0 {
 		return parents, nil
 	}
+	if value, ok := backend.(quarkMediaLibraryStructureBackend); ok {
+		return value.prepareDirectories(ctx, boundary, plan)
+	}
 	var getter func(uint) (cloudpkg.Driver, error)
 	switch value := backend.(type) {
 	case pan115MediaLibraryStructureBackend:

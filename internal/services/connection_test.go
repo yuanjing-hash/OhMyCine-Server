@@ -38,6 +38,7 @@ type fakeCloudDriver struct {
 	statCalls         int
 	directURLCalls    atomic.Int32
 	directURL         string
+	directURLNow      func() time.Time
 	directHeaders     http.Header
 	echoDirectUA      bool
 	createDirectory   bool
@@ -95,7 +96,11 @@ func (f *fakeCloudDriver) DirectURL(_ context.Context, request cloud.DirectURLRe
 		}
 		headers.Set("User-Agent", strings.TrimSpace(request.UserAgent))
 	}
-	return cloud.TemporaryURL{URL: value, Headers: headers, ExpiresAt: time.Now().Add(time.Minute)}, nil
+	now := time.Now()
+	if f.directURLNow != nil {
+		now = f.directURLNow()
+	}
+	return cloud.TemporaryURL{URL: value, Headers: headers, ExpiresAt: now.Add(time.Minute)}, nil
 }
 func (f *fakeCloudDriver) CreateDirectory(_ context.Context, parentID, name string) (cloud.Item, error) {
 	if !f.createDirectory {

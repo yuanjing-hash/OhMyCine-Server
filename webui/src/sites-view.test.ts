@@ -30,19 +30,19 @@ it('opens TG setup and generic PT setup when catalog entries have no preset URLs
   try {
     await flushPromises()
     await wrapper.get('header .btn-primary').trigger('click')
-    await wrapper.findAll('.type-card').find(button => button.text().includes('网盘分享站'))!.trigger('click')
+    await wrapper.findAll('.type-card').find(button => button.text().includes('网盘与磁力'))!.trigger('click')
     expect(errors).not.toHaveBeenCalled()
     expect(wrapper.get('#site-dialog-title').text()).toBe('添加网盘分享站')
     expect(wrapper.get<HTMLSelectElement>('#site-share-kind').element.value).toBe('pansou_tg')
     expect(wrapper.get<HTMLInputElement>('#site-url').element.value).toBe('https://so.252035.xyz')
-    expect(wrapper.get<HTMLInputElement>('#site-name').element.value).toBe('盘搜 · 115 分享')
+    expect(wrapper.get<HTMLInputElement>('#site-name').element.value).toBe('盘搜 · 网盘与磁力')
     expect(wrapper.get<HTMLInputElement>('#site-timeout').element.value).toBe('30')
-    expect(wrapper.findAll('form select, form input, form textarea').slice(0, 3).map(field => field.attributes('id'))).toEqual(['site-share-kind', 'site-url', 'site-channels'])
+    expect(wrapper.findAll('form select, form input, form textarea').slice(0, 3).map(field => field.attributes('id'))).toEqual(['site-share-kind', 'site-url', 'pansou-source-scope'])
     await wrapper.get('#site-url').setValue('https://pansou.example.com')
     await wrapper.get('#site-channels').setValue('@example_channel')
     await wrapper.get('form').trigger('submit')
     await flushPromises()
-    expect(savedSite).toMatchObject({ kind: 'pansou_tg', base_url: 'https://pansou.example.com', cloud_config: { provider: '115', channels: ['@example_channel'] } })
+    expect(savedSite).toMatchObject({ kind: 'pansou_tg', base_url: 'https://pansou.example.com', cloud_config: { source_scope: 'all', channel_mode: 'defaults_plus_custom', type_policy: 'auto', channels: ['@example_channel'] } })
     await wrapper.get('article').findAll('button').find(button => button.text() === '编辑')!.trigger('click')
     expect(wrapper.get<HTMLInputElement>('#site-url').element.value).toBe('https://pansou.example.com')
     expect(wrapper.get<HTMLTextAreaElement>('#site-channels').element.value).toBe('@example_channel')
@@ -57,4 +57,19 @@ it('opens TG setup and generic PT setup when catalog entries have no preset URLs
   } finally {
     wrapper.unmount()
   }
+})
+
+it('keeps a disabled plugin configuration in the disabled view with unavailable actions', async () => {
+  request.mockImplementation(async (path: string) => path === siteCatalogPath ? { list: [] } : { list: [{ id: 9, name: '挂了.com', kind: 'plugin_resource', site_type: 'bt_resource', credential_kind: 'plugin', enabled: true, effective_enabled: false, unavailable_code: 'plugin_disabled', unavailable_reason: '插件已停用', capabilities: { search: false, download: false }, cloud_config: undefined, base_url: 'https://example.test', health: { status: 'healthy', username: '', error_code: '' }, rate_limit_per_minute: 12 }] })
+  const wrapper = mount(SitesView, { global: { stubs: { RouterLink: { template: '<a><slot /></a>' } } } })
+  try {
+    await flushPromises()
+    expect(wrapper.findAll('article')).toHaveLength(0)
+    await wrapper.findAll('button').find(button => button.text() === '已停用（1）')!.trigger('click')
+    expect(wrapper.get('article').text()).toContain('插件已停用')
+    const search = wrapper.get('article').findAll('button').find(button => button.text() === '搜索')!
+    expect(search.attributes('disabled')).toBeDefined()
+    expect(search.attributes('title')).toBe('插件已停用')
+    expect(wrapper.get('article').text()).toContain('前往插件连接管理')
+  } finally { wrapper.unmount() }
 })

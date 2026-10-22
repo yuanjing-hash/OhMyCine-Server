@@ -49,7 +49,7 @@ export interface DownloadRouteChoice extends RecommendedDownloadPair {
   route_label: string
 }
 export interface DownloadRouteRecommendation {
-  source_kind: 'pt' | 'bt' | '115_share'
+  source_kind: 'pt' | 'bt' | '115_share' | 'quark_share'
   recommended: RecommendedDownloadPair | null
   choices: DownloadRouteChoice[]
 }

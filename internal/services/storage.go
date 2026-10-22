@@ -132,7 +132,7 @@ func (s *StorageService) CreateContext(ctx context.Context, actor Actor, input S
 	if storageType == "" {
 		storageType = models.StorageTypeLocal
 	}
-	if storageType == models.StorageTypePan115 {
+	if isNativeCloudProvider(storageType) {
 		return s.createPan115(ctx, actor, input, name, normalized, request)
 	}
 	if storageType != models.StorageTypeLocal {
@@ -189,7 +189,7 @@ func (s *StorageService) UpdateContext(ctx context.Context, actor Actor, id uint
 	if err := s.db.First(&record, id).Error; err != nil {
 		return StorageSummary{}, storageNotFound(err)
 	}
-	if record.Type == models.StorageTypePan115 {
+	if isNativeCloudProvider(record.Type) {
 		return s.updatePan115(ctx, actor, record, input, request)
 	}
 	expected := record
@@ -262,7 +262,7 @@ func (s *StorageService) TestContext(ctx context.Context, actor Actor, id uint, 
 	if err := s.db.First(&record, id).Error; err != nil {
 		return storagefs.Probe{}, storageNotFound(err)
 	}
-	if record.Type == models.StorageTypePan115 {
+	if isNativeCloudProvider(record.Type) {
 		probe, err := s.probePan115(ctx, actor, &record)
 		if saveErr := s.saveProbe(actor, &record, probe, request); saveErr != nil {
 			return storagefs.Probe{}, saveErr
@@ -289,17 +289,25 @@ func (s *StorageService) TestContext(ctx context.Context, actor Actor, id uint, 
 
 func (s *StorageService) createPan115(ctx context.Context, actor Actor, input StorageInput, name, normalized string, request RequestContext) (StorageSummary, error) {
 	if s.connections == nil || input.ConnectionID == nil || *input.ConnectionID == 0 || strings.TrimSpace(input.RootPath) == "" || !strings.HasPrefix(input.RootDisplayPath, "/") {
-		return StorageSummary{}, appError(CodeInvalidRequest, "请选择 115 账号和网盘目录", nil)
+		return StorageSummary{}, appError(CodeInvalidRequest, "请选择账号和网盘目录", nil)
 	}
 	connection, driver, err := s.connections.Driver(actor, *input.ConnectionID)
 	if err != nil {
 		return StorageSummary{}, err
 	}
+	if connection.Provider != input.Type {
+		return StorageSummary{}, appError(CodeInvalidRequest, "网盘账号与数据源类型不匹配", nil)
+	}
 	item, err := driver.Stat(ctx, input.RootPath)
 	if err != nil || !item.IsDir {
 		return StorageSummary{}, providerDirectoryError(err)
 	}
-	normalizedRoot := fmt.Sprintf("pan115:%d:%s", connection.ID, item.ID)
+	if connection.Provider == cloudpkg.ProviderQuark {
+		if err := s.connections.ensureQuarkRootProof(ctx, actor, connection.ID, item.ID, input.RootDisplayPath, request); err != nil {
+			return StorageSummary{}, err
+		}
+	}
+	normalizedRoot := fmt.Sprintf("%s:%d:%s", connection.Provider, connection.ID, item.ID)
 	if err := s.ensureUnique(0, normalized, normalizedRoot); err != nil {
 		return StorageSummary{}, err
 	}
@@ -307,7 +315,7 @@ func (s *StorageService) createPan115(ctx context.Context, actor Actor, input St
 	if err != nil {
 		return StorageSummary{}, err
 	}
-	record := models.Storage{Name: name, NameNormalized: normalized, Type: models.StorageTypePan115, RootPath: item.ID, RootDisplayPath: input.RootDisplayPath, RootPathNormalized: normalizedRoot, ConnectionID: &connection.ID, Enabled: input.Enabled, Capabilities: string(capabilities)}
+	record := models.Storage{Name: name, NameNormalized: normalized, Type: connection.Provider, RootPath: item.ID, RootDisplayPath: input.RootDisplayPath, RootPathNormalized: normalizedRoot, ConnectionID: &connection.ID, Enabled: input.Enabled, Capabilities: string(capabilities)}
 	applyProbe(&record, cloudStorageProbe(connection, ""))
 	if err := s.db.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Create(&record).Error; err != nil {
@@ -325,7 +333,7 @@ func (s *StorageService) createPan115(ctx context.Context, actor Actor, input St
 
 func (s *StorageService) updatePan115(ctx context.Context, actor Actor, record models.Storage, input UpdateStorageInput, request RequestContext) (StorageSummary, error) {
 	expected := record
-	if input.Type != nil && strings.TrimSpace(*input.Type) != models.StorageTypePan115 {
+	if input.Type != nil && strings.TrimSpace(*input.Type) != record.Type {
 		return StorageSummary{}, appError(CodeStorageTypeUnsupported, "不能修改数据源类型", nil)
 	}
 	if input.Name != nil {
@@ -348,17 +356,25 @@ func (s *StorageService) updatePan115(ctx context.Context, actor Actor, record m
 		record.RootDisplayPath = *input.RootDisplayPath
 	}
 	if record.ConnectionID == nil || !strings.HasPrefix(record.RootDisplayPath, "/") {
-		return StorageSummary{}, appError(CodeInvalidRequest, "请选择 115 账号和网盘目录", nil)
+		return StorageSummary{}, appError(CodeInvalidRequest, "请选择账号和网盘目录", nil)
 	}
 	connection, driver, err := s.connections.driver(*record.ConnectionID)
 	if err != nil {
 		return StorageSummary{}, err
 	}
+	if connection.Provider != record.Type {
+		return StorageSummary{}, appError(CodeInvalidRequest, "网盘账号与数据源类型不匹配", nil)
+	}
 	item, err := driver.Stat(ctx, record.RootPath)
 	if err != nil || !item.IsDir {
 		return StorageSummary{}, providerDirectoryError(err)
 	}
-	record.RootPath, record.RootPathNormalized = item.ID, fmt.Sprintf("pan115:%d:%s", connection.ID, item.ID)
+	if connection.Provider == cloudpkg.ProviderQuark {
+		if err := s.connections.ensureQuarkRootProof(ctx, actor, connection.ID, item.ID, record.RootDisplayPath, request); err != nil {
+			return StorageSummary{}, err
+		}
+	}
+	record.RootPath, record.RootPathNormalized = item.ID, fmt.Sprintf("%s:%d:%s", connection.Provider, connection.ID, item.ID)
 	if err := s.ensureUnique(record.ID, record.NameNormalized, record.RootPathNormalized); err != nil {
 		return StorageSummary{}, err
 	}
@@ -384,7 +400,7 @@ func (s *StorageService) updatePan115(ctx context.Context, actor Actor, record m
 
 func (s *StorageService) probePan115(ctx context.Context, _ Actor, record *models.Storage) (storagefs.Probe, error) {
 	if s.connections == nil || record.ConnectionID == nil {
-		return cloudStorageProbe(models.Connection{}, CodeConnectionUnavailable), appError(CodeConnectionUnavailable, "115 连接不可用", nil)
+		return cloudStorageProbe(models.Connection{}, CodeConnectionUnavailable), appError(CodeConnectionUnavailable, "网盘连接不可用", nil)
 	}
 	connection, driver, err := s.connections.driver(*record.ConnectionID)
 	if err != nil {
@@ -566,7 +582,7 @@ func storageSummary(record models.Storage) StorageSummary {
 // to recreate every existing Storage.
 func (s *StorageService) storageSummary(record models.Storage) StorageSummary {
 	summary := storageSummary(record)
-	if record.Type != models.StorageTypePan115 || record.ConnectionID == nil || s.connections == nil {
+	if !isNativeCloudProvider(record.Type) || record.ConnectionID == nil || s.connections == nil {
 		return summary
 	}
 	if _, driver, err := s.connections.driver(*record.ConnectionID); err == nil {

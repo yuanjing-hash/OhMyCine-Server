@@ -18,12 +18,21 @@ import (
 	"gorm.io/gorm/clause"
 )
 
-type nodeStorageProbe struct{ node *nodeclient.Client }
+type nodeStorageProbe struct {
+	node  *nodeclient.Client
+	quark bool
+}
 
 func (client nodeStorageProbe) Test(ctx context.Context) (downloadpkg.Health, error) {
 	health, err := client.node.Health(ctx)
 	if err != nil {
 		return downloadpkg.Health{}, downloadpkg.Error(nodeprotocol.ErrorNodeOffline, true, err)
+	}
+	if client.quark {
+		if !nodeprotocol.QuarkShareSupported(health.Capabilities) {
+			return downloadpkg.Health{}, downloadpkg.Error(nodeprotocol.ErrorCapabilityMissing, false, nil)
+		}
+		return downloadpkg.Health{Version: health.AgentVersion}, nil
 	}
 	for _, capability := range []string{nodeprotocol.CapabilityPan115Offline, nodeprotocol.CapabilityPan115Read, nodeprotocol.CapabilityPan115ShareReceive, nodeprotocol.CapabilityRangeExport} {
 		if !health.Capabilities.Has(capability) {
@@ -50,10 +59,13 @@ func (s *DownloaderService) nodeStorageProbeClient(record models.Downloader) (do
 	if err != nil {
 		return nil, err
 	}
-	return nodeStorageProbe{node: client}, nil
+	return nodeStorageProbe{node: client, quark: record.Type == models.DownloaderTypeQuarkShare}, nil
 }
 
 func (s *DownloaderService) nodeStorageSourceClient(ctx context.Context, record models.Downloader, task models.DownloadTask) (*nodeclient.StorageSourceClient, error) {
+	if record.Type == models.DownloaderTypeQuarkShare {
+		return s.nodeQuarkStorageSourceClient(ctx, record, task)
+	}
 	if s == nil || s.transferNodes == nil || s.connections == nil || record.NodeID == nil || task.NodeID == nil || *record.NodeID != *task.NodeID || record.StorageID == nil || task.StagingStorageID == nil || *record.StorageID != *task.StagingStorageID {
 		return nil, appError(CodeDownloaderUnavailable, "节点 115 下载任务的来源快照不完整", nil)
 	}
@@ -133,37 +145,51 @@ func nodeStorageSourceInput(source downloadSourceEnvelope) (string, string, erro
 			return nodeprotocol.StorageSourceKindPan115ShareSelected, raw, err
 		}
 		return nodeprotocol.StorageSourceKindPan115Share, uri, nil
+	case source.Kind == downloadpkg.SourceQuarkShare && source.ShareSelection != nil:
+		raw, err := cloudpkg.EncodeSelectedShareSource(uri, *source.ShareSelection)
+		return nodeprotocol.StorageSourceKindQuarkShareSelected, raw, err
 	default:
 		return "", "", appError(CodeTransferRouteUnsupported, "当前下载来源不能交给传输节点的 115 下载器", nil)
 	}
 }
 
 func buildNodeStorageSourcePlan(sourceStorage models.Storage, task models.DownloadTask, sourceKind, sourceURI, destinationID string) (nodeprotocol.StorageSourcePlan, error) {
-	if sourceStorage.ID == 0 || sourceStorage.Type != models.StorageTypePan115 || sourceStorage.ConnectionID == nil {
+	if sourceStorage.ID == 0 || !models.IsNativeCloudStorage(sourceStorage.Type) || sourceStorage.ConnectionID == nil {
 		return nodeprotocol.StorageSourcePlan{}, appError(CodeDownloaderStorageUnavailable, "节点 115 下载器的来源数据源不可用", nil)
 	}
 	contentDigest, err := nodeprotocol.StorageSourceContentDigest(sourceKind, sourceURI)
 	if err != nil {
 		return nodeprotocol.StorageSourcePlan{}, appError(CodeDownloadSourceInvalid, "下载来源缺少稳定身份，不能安全重试", err)
 	}
-	sourceIdentity, err := nodeprotocol.StorageIdentityDigest(nodeprotocol.StorageProviderPan115, strconv.FormatUint(uint64(*sourceStorage.ConnectionID), 10))
+	sourceIdentity, err := nodeprotocol.StorageIdentityDigest(sourceStorage.Type, strconv.FormatUint(uint64(*sourceStorage.ConnectionID), 10))
 	if err != nil {
 		return nodeprotocol.StorageSourcePlan{}, appError(CodeTransferRouteUnsupported, "来源 115 身份无法冻结", err)
 	}
 	targetKind, targetIdentity := nodeprotocol.StorageSourceTargetLocal, ""
-	if task.TargetStorageType == models.StorageTypePan115 {
+	if models.IsNativeCloudStorage(task.TargetStorageType) {
 		if task.TargetConnectionID == nil {
 			return nodeprotocol.StorageSourcePlan{}, appError(CodeTransferRouteUnsupported, "目标 115 身份无法冻结", nil)
 		}
-		targetKind = nodeprotocol.StorageSourceTargetPan115
-		targetIdentity, err = nodeprotocol.StorageIdentityDigest(nodeprotocol.StorageProviderPan115, strconv.FormatUint(uint64(*task.TargetConnectionID), 10))
+		targetKind = task.TargetStorageType
+		targetIdentity, err = nodeprotocol.StorageIdentityDigest(task.TargetStorageType, strconv.FormatUint(uint64(*task.TargetConnectionID), 10))
 		if err != nil || targetIdentity == sourceIdentity {
 			return nodeprotocol.StorageSourcePlan{}, appError(CodeTransferRouteUnsupported, "同一 115 账号不经过传输节点中转", err)
 		}
 	} else if task.TargetStorageType != models.StorageTypeLocal {
 		return nodeprotocol.StorageSourcePlan{}, appError(CodeTransferRouteUnsupported, "目标媒体库不支持节点中转", nil)
 	}
-	plan := nodeprotocol.StorageSourcePlan{StorageID: strconv.FormatUint(uint64(sourceStorage.ID), 10), ProviderType: nodeprotocol.StorageProviderPan115, SourceKind: sourceKind, TargetKind: targetKind, SourceIdentityDigest: sourceIdentity, TargetIdentityDigest: targetIdentity, SourceContentDigest: contentDigest, OfflineDestinationID: strings.TrimSpace(destinationID)}
+	plan := nodeprotocol.StorageSourcePlan{StorageID: strconv.FormatUint(uint64(sourceStorage.ID), 10), ProviderType: sourceStorage.Type, SourceKind: sourceKind, TargetKind: targetKind, SourceIdentityDigest: sourceIdentity, TargetIdentityDigest: targetIdentity, SourceContentDigest: contentDigest, OfflineDestinationID: strings.TrimSpace(destinationID)}
+	if sourceStorage.Type == models.StorageTypeQuark {
+		plan.DigestVersion = 2
+		plan.TaskDirectoryName = task.ProviderTag
+		plan.DestinationRelativePath = task.StagingRelativePath
+		if plan.DestinationRelativePath == "" {
+			if plan.OfflineDestinationID != sourceStorage.RootPath {
+				return nodeprotocol.StorageSourcePlan{}, appError(CodeTransferRouteUnsupported, "夸克接收目录缺少冻结路径，请重新创建任务", nil)
+			}
+			plan.DestinationRelativePath = "/"
+		}
+	}
 	if err := plan.Validate(); err != nil {
 		return nodeprotocol.StorageSourcePlan{}, appError(CodeTransferRouteUnsupported, "节点 115 来源计划无效", err)
 	}
@@ -306,6 +332,9 @@ func (s *DownloaderService) observeNodeStorageSource(ctx context.Context, taskID
 }
 
 func (s *TransferNodeService) sealStorageSourceGrant(ctx context.Context, node models.TransferNode, storage models.Storage, taskID, operationKey string, actions []string, sourceURI string) (nodeprotocol.CredentialGrantEnvelope, error) {
+	if storage.Type == models.StorageTypeQuark {
+		return s.sealQuarkSourceGrant(ctx, node, storage, taskID, operationKey, actions, sourceURI)
+	}
 	if storage.Type != models.StorageTypePan115 || storage.ConnectionID == nil || storage.ID == 0 {
 		return nodeprotocol.CredentialGrantEnvelope{}, appError(CodeTransferRouteUnsupported, "来源存储不支持节点读取", nil)
 	}

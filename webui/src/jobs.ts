@@ -81,6 +81,14 @@ export const statusLabels: Record<JobStatus, string> = {
   failed: "失败",
   cancelled: "已取消",
 };
+export function jobActionLabel(value: string): string {
+  return ({
+    overwrite: "覆盖",
+    skip: "跳过",
+    rename: "自动改名",
+    recheck: "重新核对",
+  } as Record<string, string>)[value] ?? value;
+}
 export const listJobs = (query: URLSearchParams, signal?: AbortSignal) =>
   api<Page<Job>>(`/api/v1/jobs?${query}`, { signal });
 export const getAttempts = (id: string, signal?: AbortSignal, page = 1) =>

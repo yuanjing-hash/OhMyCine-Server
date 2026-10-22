@@ -4,6 +4,7 @@ import { useRouter } from 'vue-router'
 import { api } from '@/api/client'
 import { Permissions } from '@/auth/generated-permissions'
 import SecretInput from '@/components/SecretInput.vue'
+import PanSouSettings from '@/components/PanSouSettings.vue'
 import { credentialLoader } from '@/credentials'
 import { notify } from '@/toast'
 import {
@@ -16,6 +17,9 @@ import {
   sitePath,
   sitesPath,
   siteTestPath,
+  normalizeCloudSiteConfig,
+  siteEffectiveEnabled,
+  type CloudSiteConfig,
   type CookieCloudMode,
   type CookieCloudSettings,
   type CookieCloudSyncResult,
@@ -27,8 +31,7 @@ import type { ListResponse } from '@/types/api'
 import { useAuthStore } from '@/stores/auth'
 
 interface SiteForm {
-  channels: string
-  cloudProvider: '115'
+  cloudConfig: CloudSiteConfig
   authEnabled: boolean
   username: string
   password: string
@@ -66,6 +69,9 @@ const sites = ref<SiteSummary[]>([])
 const siteCatalog = ref<SiteCatalogItem[]>([])
 const loading = ref(true)
 const loadError = ref('')
+const siteView = ref<'active' | 'disabled' | 'all'>('active')
+const disabledSiteCount = computed(() => sites.value.filter(site => !siteEffectiveEnabled(site)).length)
+const visibleSites = computed(() => sites.value.filter(site => siteView.value === 'all' || siteEffectiveEnabled(site) === (siteView.value === 'active')))
 const saving = ref(false)
 const busyID = ref<number | null>(null)
 const dialogOpen = ref(false)
@@ -99,7 +105,7 @@ const cookieCloudEndpoint = computed(() => {
 
 function emptyForm(): SiteForm {
   return {
-    channels: '', cloudProvider: '115', authEnabled: false, username: '', password: '',
+    cloudConfig: normalizeCloudSiteConfig(), authEnabled: false, username: '', password: '',
     kind: 'pttime', name: 'PTTime', baseURL: '', cookie: '', passkey: '', apiKey: '', userAgent: '', enabled: true,
     priority: 100, timeoutSeconds: 12, rateLimitPerMinute: 12,
     browserEmulation: false, browserServiceURL: '', clearBrowserService: false, clearPasskey: false, clearAPIKey: false,
@@ -147,7 +153,7 @@ function selectSiteType(type: 'pt' | 'bt' | 'cloud_share') {
   applyCatalogSelection()
   if (type === 'cloud_share') {
     form.value.kind = 'pansou_tg'
-    form.value.name = '盘搜 · 115 分享'
+    form.value.name = '盘搜 · 网盘与磁力'
     form.value.baseURL = defaultPanSouBaseURL
     form.value.timeoutSeconds = 30
   }
@@ -193,7 +199,7 @@ function openEdit(site: SiteSummary) {
   btResolution.value = null
   editing.value = site
   form.value = {
-    channels: site.cloud_config?.channels.join('\n') ?? '', cloudProvider: '115', authEnabled: site.cloud_config?.auth_enabled ?? false, username: site.login_username ?? '', password: '',
+    cloudConfig: normalizeCloudSiteConfig(site.cloud_config), authEnabled: site.cloud_config?.auth_enabled ?? false, username: site.login_username ?? '', password: '',
     kind: site.kind, name: site.name, baseURL: site.base_url, cookie: '', passkey: '', apiKey: '', userAgent: site.user_agent,
     enabled: site.enabled, priority: site.priority, timeoutSeconds: site.timeout_seconds,
     rateLimitPerMinute: site.rate_limit_per_minute, browserEmulation: site.browser_emulation,
@@ -218,7 +224,7 @@ async function save() {
     if (!editing.value && form.value.kind === 'auto_bt' && !await resolveBT()) return
     const current = editing.value
     const cloudFields = form.value.kind === 'pansou_tg' ? {
-      cloud_config: { provider: form.value.cloudProvider, channels: [...new Set(form.value.channels.split(/[,，\n]/).map(value => value.trim()).filter(Boolean))], auth_enabled: form.value.authEnabled },
+      cloud_config: { ...form.value.cloudConfig, auth_enabled: form.value.authEnabled },
       username: form.value.username, password: form.value.password || undefined,
     } : {}
     const common = {
@@ -263,11 +269,12 @@ function searchSite(site: SiteSummary) {
 }
 
 function siteSearchDisabled(site: SiteSummary) {
-  return !site.enabled || !site.capabilities.search || site.health.status === 'offline'
+  return !siteEffectiveEnabled(site) || !site.capabilities.search || site.health.status === 'offline'
     || (site.site_type === 'bt_resource' && site.health.status !== 'healthy')
 }
 
 function siteSearchHint(site: SiteSummary) {
+  if (site.unavailable_reason) return site.unavailable_reason
   if (!site.enabled) return '启用站点后才能搜索'
   if (!site.capabilities.search) return '该适配器不支持搜索'
   if (site.site_type === 'bt_resource' && site.health.status !== 'healthy') return '请先到插件连接页完成登录和检测'
@@ -337,6 +344,7 @@ async function syncCookieCloud() {
 }
 
 async function testSite(site: SiteSummary) {
+  if (!siteEffectiveEnabled(site)) return
   busyID.value = site.id
   try {
     await api(siteTestPath(site.id), { method: 'POST', body: '{}' })
@@ -370,6 +378,7 @@ async function deleteSite(site: SiteSummary) {
 }
 
 function healthLabel(site: SiteSummary) {
+  if (!siteEffectiveEnabled(site)) return site.unavailable_reason || '已停用'
   if (site.health.status === 'online' || site.health.status === 'healthy') return site.health.username ? `在线 · ${site.health.username}` : '在线'
   if (site.health.status === 'auth_required') return '需要登录'
   if (site.health.status === 'rate_limited') return '站点限流中'
@@ -413,34 +422,38 @@ onMounted(loadSites)
       <p class="page-description mt-2">可添加 PT、公开 BT、网盘分享站，或连接 Jackett/Prowlarr 的 Torznab API。</p>
       <button class="btn-primary mt-4" @click="openCreate">添加第一个站点</button>
     </div>
-    <div v-else class="site-grid">
-      <article v-for="site in sites" :key="site.id" class="panel flex min-h-72 flex-col">
-        <header class="flex items-start justify-between gap-3">
-          <div class="min-w-0">
-            <div class="flex flex-wrap items-center gap-2"><h2 class="m-0 truncate text-lg">{{ site.name }}</h2><span class="status-chip">{{ site.site_type === 'cloud_share' ? '网盘分享站' : site.site_type.toUpperCase() }}</span></div>
-            <p class="text-subtle mt-1 truncate font-mono text-xs" :title="site.base_url">{{ site.base_url }}</p>
+    <template v-else>
+      <div class="flex flex-wrap items-center gap-2" role="group" aria-label="站点状态筛选"><button class="btn-secondary" :aria-pressed="siteView === 'active'" @click="siteView = 'active'">可用站点</button><button class="btn-secondary" :aria-pressed="siteView === 'disabled'" @click="siteView = 'disabled'">已停用（{{ disabledSiteCount }}）</button><button class="btn-secondary" :aria-pressed="siteView === 'all'" @click="siteView = 'all'">全部</button></div>
+      <p v-if="!visibleSites.length" class="panel text-muted">该范围内没有站点；已停用站点的配置和历史仍然保留。</p>
+      <div class="site-grid">
+        <article v-for="site in visibleSites" :key="site.id" class="panel flex min-h-72 flex-col">
+          <header class="flex items-start justify-between gap-3">
+            <div class="min-w-0">
+              <div class="flex flex-wrap items-center gap-2"><h2 class="m-0 truncate text-lg">{{ site.name }}</h2><span class="status-chip">{{ site.site_type === 'cloud_share' ? '网盘分享站' : site.site_type.toUpperCase() }}</span></div>
+              <p class="text-subtle mt-1 truncate font-mono text-xs" :title="site.base_url">{{ site.base_url }}</p>
+            </div>
+            <span :class="siteEffectiveEnabled(site) ? 'status-chip status-chip--ready' : 'status-chip'">{{ siteEffectiveEnabled(site) ? '已启用' : site.unavailable_reason || '已停用' }}</span>
+          </header>
+          <dl class="mt-5 grid grid-cols-2 gap-3 text-sm">
+            <div><dt class="text-subtle text-xs">连接状态</dt><dd class="m-0 mt-1">{{ healthLabel(site) }}</dd></div>
+            <div><dt class="text-subtle text-xs">凭据</dt><dd class="m-0 mt-1">{{ site.cloud_config ? (site.cloud_config.auth_enabled ? 'PanSou 登录已安全配置' : 'PanSou 无需登录') : site.credential_kind === 'plugin' ? '由插件连接管理' : site.credential_kind === 'none' ? '无需凭据' : site.credential_configured ? '已安全配置' : '未配置' }}</dd></div>
+            <div><dt class="text-subtle text-xs">请求策略</dt><dd class="m-0 mt-1">{{ site.rate_limit_per_minute }} 次/分钟</dd></div>
+            <div><dt class="text-subtle text-xs">连接方式<span v-if="site.cloud_config"> · {{ site.cloud_config.channels.length }} 个自定义频道</span></dt><dd class="m-0 mt-1">{{ site.site_type === 'bt_resource' ? 'WASM 插件' : site.site_type === 'cloud_share' ? 'PanSou · 网盘与磁力' : site.kind === 'torznab' ? 'Torznab API' : site.browser_emulation ? '浏览器仿真' : '原生适配' }}</dd></div>
+          </dl>
+          <p v-if="site.health.error_code" class="semantic-warning mt-4 p-3 text-xs">最近检测：<span class="font-mono">{{ site.health.error_code }}</span>。更新候选凭据失败时原配置会保留。</p>
+          <div class="mt-auto flex flex-wrap gap-2 pt-5">
+            <button class="btn-primary" :disabled="busyID !== null || siteSearchDisabled(site)" :title="siteSearchHint(site)" @click="searchSite(site)">搜索</button>
+            <RouterLink v-if="site.site_type === 'bt_resource'" class="btn-secondary" :to="{ name: 'plugins' }">前往插件连接管理</RouterLink>
+            <template v-else>
+              <button class="btn-secondary" :disabled="busyID !== null" @click="testSite(site)">{{ busyID === site.id ? '检测中…' : '测试连接' }}</button>
+              <button class="btn-secondary" :disabled="busyID !== null" @click="openEdit(site)">编辑</button>
+              <button class="btn-secondary" :disabled="busyID !== null" @click="toggleSite(site)">{{ site.enabled ? '停用' : '启用' }}</button>
+              <button class="btn-danger" :disabled="busyID !== null" @click="deleteSite(site)">删除</button>
+            </template>
           </div>
-          <span :class="site.enabled ? 'status-chip status-chip--ready' : 'status-chip'">{{ site.enabled ? '已启用' : '已停用' }}</span>
-        </header>
-        <dl class="mt-5 grid grid-cols-2 gap-3 text-sm">
-          <div><dt class="text-subtle text-xs">连接状态</dt><dd class="m-0 mt-1">{{ healthLabel(site) }}</dd></div>
-          <div><dt class="text-subtle text-xs">凭据</dt><dd class="m-0 mt-1">{{ site.cloud_config ? (site.cloud_config.auth_enabled ? 'PanSou 登录已安全配置' : 'PanSou 无需登录') : site.credential_kind === 'plugin' ? '由插件连接管理' : site.credential_kind === 'none' ? '无需凭据' : site.credential_configured ? '已安全配置' : '未配置' }}</dd></div>
-          <div><dt class="text-subtle text-xs">请求策略</dt><dd class="m-0 mt-1">{{ site.rate_limit_per_minute }} 次/分钟</dd></div>
-          <div><dt class="text-subtle text-xs">连接方式<span v-if="site.cloud_config"> · {{ site.cloud_config.channels.length }} 个频道</span></dt><dd class="m-0 mt-1">{{ site.site_type === 'bt_resource' ? 'WASM 插件' : site.site_type === 'cloud_share' ? 'PanSou · 115 分享转存' : site.kind === 'torznab' ? 'Torznab API' : site.browser_emulation ? '浏览器仿真' : '原生适配' }}</dd></div>
-        </dl>
-        <p v-if="site.health.error_code" class="semantic-warning mt-4 p-3 text-xs">最近检测：<span class="font-mono">{{ site.health.error_code }}</span>。更新候选凭据失败时原配置会保留。</p>
-        <div class="mt-auto flex flex-wrap gap-2 pt-5">
-          <button class="btn-primary" :disabled="busyID !== null || siteSearchDisabled(site)" :title="siteSearchHint(site)" @click="searchSite(site)">搜索</button>
-          <RouterLink v-if="site.site_type === 'bt_resource'" class="btn-secondary" :to="{ name: 'plugins' }">前往插件连接管理</RouterLink>
-          <template v-else>
-            <button class="btn-secondary" :disabled="busyID !== null" @click="testSite(site)">{{ busyID === site.id ? '检测中…' : '测试连接' }}</button>
-            <button class="btn-secondary" :disabled="busyID !== null" @click="openEdit(site)">编辑</button>
-            <button class="btn-secondary" :disabled="busyID !== null" @click="toggleSite(site)">{{ site.enabled ? '停用' : '启用' }}</button>
-            <button class="btn-danger" :disabled="busyID !== null" @click="deleteSite(site)">删除</button>
-          </template>
-        </div>
-      </article>
-    </div>
+        </article>
+      </div>
+    </template>
 
     <div v-if="dialogOpen" class="modal-backdrop fixed inset-0 z-50 flex items-center justify-center p-4" @click.self="closeDialog">
       <section v-if="dialogStep === 'type'" class="panel w-full max-w-2xl" role="dialog" aria-modal="true" aria-labelledby="site-type-title">
@@ -460,7 +473,7 @@ onMounted(loadSites)
         </button>
         <button class="type-card mt-3 w-full text-left" type="button" @click="selectSiteType('cloud_share')">
           <span class="type-card__icon">分享</span>
-          <span><strong class="block">网盘分享站</strong><span class="text-subtle mt-1 block text-sm">把多个 TG 频道聚合成一个资源站点，参与搜索与订阅，分享资源直接转存入库。</span></span>
+          <span><strong class="block">盘搜 · 网盘与磁力</strong><span class="text-subtle mt-1 block text-sm">同时搜索 TG 频道和 PanSou 已启用插件，按资源类型选择转存或 BT 下载。</span></span>
           <span class="ml-auto text-subtle">下一步 →</span>
         </button>
       </section>
@@ -476,19 +489,10 @@ onMounted(loadSites)
           <div v-else-if="selectedType === 'bt'" class="sm:col-span-2"><label class="label" for="site-bt-mode">BT 接入方式</label><select id="site-bt-mode" v-model="form.kind" class="input" @change="applyCatalogSelection"><option value="auto_bt">输入官网自动识别</option><option value="torznab">Torznab · Jackett/Prowlarr</option></select><p class="text-subtle mb-0 mt-1 text-xs">Server 内置适配器，但不会列出、探测或访问尚未由你添加的公共 BT 站点。</p></div>
           <div v-else-if="selectedType === 'cloud_share'" class="sm:col-span-2"><label class="label" for="site-share-kind">站点分类</label><select id="site-share-kind" v-model="form.kind" class="input" :disabled="Boolean(editing)"><option value="pansou_tg">盘搜（PanSou）</option></select></div>
           <div v-if="selectedType !== 'cloud_share'"><label class="label" for="site-name">显示名称</label><input id="site-name" v-model="form.name" class="input" maxlength="128" required /></div>
-          <div :class="{ 'sm:col-span-2': selectedType === 'cloud_share' }"><label class="label" for="site-url">{{ selectedType === 'cloud_share' ? 'PanSou 服务地址（HTTPS）' : form.kind === 'torznab' ? 'Jackett 根地址或 Torznab API 地址（HTTP / HTTPS）' : 'HTTPS 根地址' }}</label><input id="site-url" v-model="form.baseURL" class="input font-mono" type="url" :placeholder="form.kind === 'torznab' ? 'http://jackett:9117' : 'https://example.test'" required autocomplete="off" :readonly="Boolean(editing && selectedCatalog?.engine === 'rss')" @input="btResolution = null" /><p v-if="selectedType === 'cloud_share'" class="text-subtle mb-0 mt-1 text-xs">已预填默认盘搜服务，可修改为其他 PanSou 服务的 HTTPS 根地址，无需添加 /api/search。</p><p v-else-if="form.kind === 'torznab'" class="text-subtle mb-0 mt-1 text-xs">Jackett 根地址会自动使用全部索引器 API；Prowlarr 或单个索引器请填写完整 Torznab API URL，不要附加 apikey 查询参数。地址须由 Server 容器访问，localhost 指的是 Server 容器自身。</p><p v-if="form.kind === 'torznab' && /^http:\/\//i.test(form.baseURL.trim())" class="semantic-warning mb-0 mt-2 p-3 text-xs">HTTP 会明文传输 Torznab API Key。仅在可信网络中使用。</p></div>
+          <div :class="{ 'sm:col-span-2': selectedType === 'cloud_share' }"><label class="label" for="site-url">{{ selectedType === 'cloud_share' ? 'PanSou 服务地址（HTTP / HTTPS）' : form.kind === 'torznab' ? 'Jackett 根地址或 Torznab API 地址（HTTP / HTTPS）' : 'HTTPS 根地址' }}</label><input id="site-url" v-model="form.baseURL" class="input font-mono" type="url" :placeholder="form.kind === 'torznab' ? 'http://jackett:9117' : 'https://example.test'" required autocomplete="off" :readonly="Boolean(editing && selectedCatalog?.engine === 'rss')" @input="btResolution = null" /><p v-if="selectedType === 'cloud_share'" class="text-subtle mb-0 mt-1 text-xs">已预填默认盘搜服务，可使用 HTTP 或 HTTPS，包括 Docker 服务名、IP 和自定义端口；地址须从 Server 容器可达，无需添加 /api/search。</p><p v-else-if="form.kind === 'torznab'" class="text-subtle mb-0 mt-1 text-xs">Jackett 根地址会自动使用全部索引器 API；Prowlarr 或单个索引器请填写完整 Torznab API URL，不要附加 apikey 查询参数。地址须由 Server 容器访问，localhost 指的是 Server 容器自身。</p><p v-if="form.kind === 'torznab' && /^http:\/\//i.test(form.baseURL.trim())" class="semantic-warning mb-0 mt-2 p-3 text-xs">HTTP 会明文传输 Torznab API Key。仅在可信网络中使用。</p></div>
           <template v-if="selectedType === 'cloud_share'">
-            <div class="sm:col-span-2">
-              <label class="label" for="site-channels">TG 频道</label>
-              <textarea id="site-channels" v-model="form.channels" class="input min-h-32 font-mono text-sm" required placeholder="每行一个频道，最多 100 个&#10;@channel_name&#10;https://t.me/channel_name" />
-              <p class="text-subtle mb-0 mt-2 text-xs">支持频道名称和公开频道链接。频道会作为一个站点参与统一搜索；结果显示具体来源。</p>
-            </div>
-            <div><label class="label" for="site-name">显示名称</label><input id="site-name" v-model="form.name" class="input" maxlength="128" required /></div>
-            <div>
-              <label class="label" for="site-cloud">网盘类型</label>
-              <select id="site-cloud" v-model="form.cloudProvider" class="input"><option value="115">115 网盘 · 分享转存</option></select>
-              <p class="text-subtle mb-0 mt-2 text-xs">转存账号和目录沿用已有下载器配置。</p>
-            </div>
+            <PanSouSettings v-model="form.cloudConfig" :base-u-r-l="form.baseURL" :username="form.username" :password="form.password" :auth-enabled="form.authEnabled" :site-i-d="editing?.id" :revision="editing?.revision" />
+            <div class="sm:col-span-2"><label class="label" for="site-name">显示名称</label><input id="site-name" v-model="form.name" class="input" maxlength="128" required /></div>
             <label class="flex items-center gap-2 text-sm sm:col-span-2"><input v-model="form.authEnabled" type="checkbox" />PanSou 服务需要账号认证</label>
             <template v-if="form.authEnabled">
               <div><label class="label" for="site-user">PanSou 用户名</label><input id="site-user" v-model="form.username" class="input" required autocomplete="off" maxlength="128" /></div>
@@ -560,4 +564,5 @@ onMounted(loadSites)
 .type-card:hover { border-color: var(--accent); background: var(--surface-hover); }
 .type-card__icon { display: grid; width: 3rem; height: 3rem; place-items: center; border-radius: .7rem; background: var(--accent-soft); color: var(--accent); font-weight: 800; }
 .link-button { border: 0; background: transparent; padding: 0; color: var(--accent); cursor: pointer; }
+.btn-secondary[aria-pressed="true"] { border-color: var(--accent); background: var(--accent-soft); color: var(--accent); }
 </style>

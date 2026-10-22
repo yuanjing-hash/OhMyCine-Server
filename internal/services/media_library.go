@@ -57,6 +57,7 @@ type MediaLibraryService struct {
 	structure         *MediaLibraryStructureService
 	libraryArtwork    MediaLibraryArtworkScheduler
 	queue             *QueueService
+	observations      *ProviderObservationService
 }
 
 // MediaLibraryIngestEnqueuer is the narrow boundary from provider directory
@@ -130,6 +131,7 @@ type UpdateMediaLibraryInput struct {
 }
 type MediaLibraryDetail struct {
 	MediaLibraryReadiness
+	Synchronization *ProviderObservationStatus `json:"synchronization,omitempty"`
 	models.MediaLibrary
 	StorageName                  string                         `json:"storage_name"`
 	ConnectionID                 *uint                          `json:"connection_id,omitempty"`
@@ -306,6 +308,19 @@ func (s *MediaLibraryService) Create(ctx context.Context, actor Actor, input Med
 		// replacing them with GORM tag defaults (notably enabled=false).
 		if err := tx.Select("*").Create(&record).Error; err != nil {
 			return err
+		}
+		var storage models.Storage
+		if err := tx.First(&storage, record.StorageID).Error; err != nil {
+			return err
+		}
+		if storage.Type == models.StorageTypeQuark {
+			var profile models.MediaClassificationProfile
+			if err := tx.First(&profile, record.ProfileID).Error; err != nil {
+				return err
+			}
+			if err := initializeFreshQuarkCatalogTx(tx, record, storage, profile); err != nil {
+				return err
+			}
 		}
 		if err := tx.Create(&models.MediaLibraryStructureAutoState{LibraryID: record.ID, SourceRevision: 1, Status: "pending", UpdatedAt: time.Now().UTC()}).Error; err != nil {
 			return err
@@ -638,6 +653,15 @@ func (s *MediaLibraryService) Scan(ctx context.Context, actor Actor, id uint, mo
 	if !actor.CanResource(authz.PermissionMediaLibrariesScan, models.AuthorizationResourceMediaLibrary, uintID(id)) {
 		return models.MediaLibraryScanRun{}, appError(CodePermissionDenied, "无权扫描媒体库", nil)
 	}
+	if mode == "incremental" || mode == "full" {
+		var storage models.Storage
+		if err := s.db.Table("storages").Select("storages.*").Joins("JOIN media_libraries ON media_libraries.storage_id = storages.id").Where("media_libraries.id = ?", id).Take(&storage).Error; err != nil {
+			return models.MediaLibraryScanRun{}, mediaLibraryNotFound(err)
+		}
+		if storage.Type == models.StorageTypeQuark {
+			return s.requestQuarkObservation(ctx, id, true)
+		}
+	}
 	switch strings.ToLower(strings.TrimSpace(mode)) {
 	case "incremental":
 		return s.reconcile(ctx, id, "incremental")
@@ -762,7 +786,7 @@ func (s *MediaLibraryService) validateInput(ctx context.Context, id uint, actor 
 		return models.MediaLibrary{}, appError(CodeMediaLibraryPathInvalid, "媒体库相对路径无效", err)
 	}
 	var storage models.Storage
-	if err := s.db.First(&storage, input.StorageID).Error; err != nil || !storage.Enabled || (storage.Type != models.StorageTypeLocal && storage.Type != models.StorageTypePan115) {
+	if err := s.db.First(&storage, input.StorageID).Error; err != nil || !storage.Enabled || (storage.Type != models.StorageTypeLocal && !models.IsNativeCloudStorage(storage.Type)) {
 		return models.MediaLibrary{}, appError(CodeMediaLibraryStorageUnavailable, "来源 Storage 不可用", err)
 	}
 	if storage.Type == models.StorageTypeLocal {
@@ -770,7 +794,7 @@ func (s *MediaLibraryService) validateInput(ctx context.Context, id uint, actor 
 			return models.MediaLibrary{}, appError(CodeMediaLibraryPathInvalid, "媒体库目录不可读或越过 Storage 边界", err)
 		}
 	} else if storage.ConnectionID == nil || s.connections == nil || strings.TrimSpace(input.ProviderRootID) == "" {
-		return models.MediaLibrary{}, appError(CodeMediaLibraryPathInvalid, "115 媒体库目录身份无效", nil)
+		return models.MediaLibrary{}, appError(CodeMediaLibraryPathInvalid, "网盘媒体库目录身份无效", nil)
 	}
 	if storage.Type == models.StorageTypeLocal && (input.STRMEnabled || input.STRMLocalRoot != "") {
 		return models.MediaLibrary{}, appError(CodeInvalidRequest, "本地来源不能启用 STRM 投影", nil)
@@ -782,6 +806,9 @@ func (s *MediaLibraryService) validateInput(ctx context.Context, id uint, actor 
 		}
 	}
 	metadataArtifactsEnabled := storage.Type == models.StorageTypeLocal || input.STRMEnabled
+	if storage.Type == models.StorageTypeQuark && input.UploadSidecars {
+		return models.MediaLibrary{}, appError(CodeInvalidRequest, "夸克旁挂文件当前只生成在本地投影目录", nil)
+	}
 	cloudEmptyCleanupEnabled := input.CloudEmptyCleanupEnabled != nil && *input.CloudEmptyCleanupEnabled
 	if cloudEmptyCleanupEnabled {
 		if storage.Type != models.StorageTypePan115 || storage.ConnectionID == nil || s.connections == nil {
@@ -988,8 +1015,8 @@ func (s *MediaLibraryService) validateInput(ctx context.Context, id uint, actor 
 	default:
 		return models.MediaLibrary{}, appError(CodeInvalidRequest, "媒体库转移方式无效", nil)
 	}
-	if storage.Type == models.StorageTypePan115 && input.TransferMode == models.MediaLibraryTransferSymlink {
-		return models.MediaLibrary{}, appError(CodeInvalidRequest, "115 网盘媒体库不支持软链接入库", nil)
+	if models.IsNativeCloudStorage(storage.Type) && input.TransferMode == models.MediaLibraryTransferSymlink {
+		return models.MediaLibrary{}, appError(CodeInvalidRequest, "网盘媒体库不支持软链接入库", nil)
 	}
 	if input.ConflictPolicy == "" {
 		input.ConflictPolicy = models.MediaLibraryConflictAsk
@@ -1166,6 +1193,19 @@ func (s *MediaLibraryService) detail(record models.MediaLibrary, actors ...Actor
 		return detail, err
 	}
 	detail.MediaLibraryReadiness, err = libraryReadiness(s.db, record.ID)
+	if err == nil && s.observations != nil {
+		var scope models.ProviderObservationScope
+		lookupErr := s.db.Where("library_id = ? AND kind = ? AND enabled = ?", record.ID, "library", true).First(&scope).Error
+		if lookupErr == nil {
+			status, statusErr := s.observations.Status(context.Background(), scope.ID)
+			if statusErr != nil {
+				return detail, statusErr
+			}
+			detail.Synchronization = &status
+		} else if !errors.Is(lookupErr, gorm.ErrRecordNotFound) {
+			return detail, lookupErr
+		}
+	}
 	return detail, err
 }
 
@@ -1302,6 +1342,11 @@ func (s *MediaLibraryService) RequestReconcile(id uint) {
 }
 
 func (s *MediaLibraryService) supervise(ctx context.Context, id uint, wake chan struct{}, pending *providerChangeAccumulator) {
+	var source models.Storage
+	if s.db.Table("storages").Joins("JOIN media_libraries ON media_libraries.storage_id = storages.id").Where("media_libraries.id = ?", id).Select("storages.*").Take(&source).Error == nil && source.Type == models.StorageTypeQuark {
+		s.superviseQuarkObservation(ctx, id, wake)
+		return
+	}
 	delay := time.Second
 	for {
 		if ctx.Err() != nil {
@@ -1994,6 +2039,12 @@ func (s *MediaLibraryService) reconcile(ctx context.Context, id uint, kind strin
 	if err := s.db.First(&storage, library.StorageID).Error; err != nil {
 		return models.MediaLibraryScanRun{}, err
 	}
+	// Quark has no authoritative life journal or atomic tree snapshot. Every
+	// enumeration request uses the durable observation queue; only verified
+	// operation outputs and observation publications may enter reconciliation.
+	if storage.Type == models.StorageTypeQuark && !isTransferBatch && (!hasProviderScope || providerScope.VerifiedResult == nil) {
+		return s.requestQuarkObservation(ctx, id, true)
+	}
 	readiness, readinessErr := libraryReadiness(s.db.WithContext(ctx), id)
 	if readinessErr != nil {
 		return models.MediaLibraryScanRun{}, readinessErr
@@ -2154,12 +2205,15 @@ func (s *MediaLibraryService) reconcile(ctx context.Context, id uint, kind strin
 				if err := persistProviderPathsTx(tx, current, currentStorage, result, run.StartedAt, run.ID); err != nil {
 					return err
 				}
-				return tx.Save(&run).Error
+				if err := tx.Save(&run).Error; err != nil {
+					return err
+				}
+				return commitProviderObservationContextTx(ctx, tx)
 			})
 		}
 	}
 	if versionedScan {
-		published, err := s.publishCatalogScan(ctx, library, storage, profile, run, result, storage.Type == models.StorageTypePan115 && s.queue != nil && !isTransferBatch && !hasProviderScope, s.catalogScanCommit)
+		published, err := s.publishCatalogScan(ctx, library, storage, profile, run, result, storage.Type == models.StorageTypePan115 && s.queue != nil && !isTransferBatch && !hasProviderScope, providerObservationScanCommit(ctx, s.catalogScanCommit))
 		if err != nil {
 			return s.failFastScanPersistence(run, operation, started, mediaLibraryPersistenceStageEntries, err)
 		}
@@ -2498,7 +2552,7 @@ func (s *MediaLibraryService) reconcile(ctx context.Context, id uint, kind strin
 			}
 			committedChange = change
 		}
-		return nil
+		return commitProviderObservationContextTx(ctx, tx)
 	})
 	if transactionErr != nil {
 		finished := time.Now().UTC()

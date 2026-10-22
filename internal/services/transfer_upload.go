@@ -29,14 +29,18 @@ func (w *TransferWorker) runCloudUpload(ctx context.Context, runtime JobRuntime,
 	if err != nil {
 		return w.cloudFailure(task, err)
 	}
+	driver, err = transferCloudDriver(driver, task.ID)
+	if err != nil {
+		return w.cloudFailure(task, err)
+	}
 	uploader, uploadOK := driver.(cloudpkg.UploadDriver)
 	mutations, mutationOK := driver.(cloudpkg.MutationDriver)
 	capabilities := driver.Capabilities()
-	if !uploadOK || !mutationOK || connection.Provider != cloudpkg.ProviderPan115 || !capabilities.FileUpload || !capabilities.CreateDirectory || !capabilities.Recycle {
+	if !uploadOK || !mutationOK || (connection.Provider != cloudpkg.ProviderPan115 && connection.Provider != cloudpkg.ProviderQuark) || !capabilities.FileUpload || !capabilities.CreateDirectory || (connection.Provider == cloudpkg.ProviderPan115 && !capabilities.Recycle) {
 		return w.cloudFailure(task, cloudTransferError("cloud_upload_capability_missing", false, nil))
 	}
 	var targetStorage models.Storage
-	if err := w.service.db.First(&targetStorage, *download.TargetStorageID).Error; err != nil || targetStorage.Type != models.StorageTypePan115 || targetStorage.ConnectionID == nil || *targetStorage.ConnectionID != *download.TargetConnectionID {
+	if err := w.service.db.First(&targetStorage, *download.TargetStorageID).Error; err != nil || targetStorage.Type != connection.Provider || targetStorage.ConnectionID == nil || *targetStorage.ConnectionID != *download.TargetConnectionID {
 		return w.cloudFailure(task, cloudTransferError("cloud_transfer_boundary_invalid", false, err))
 	}
 	targetBasePath, _ := joinProviderPath(targetStorage.RootDisplayPath, download.TargetRelativeRoot)
@@ -94,7 +98,7 @@ func (w *TransferWorker) runCloudUpload(ctx context.Context, runtime JobRuntime,
 		return w.cloudFailure(task, err)
 	}
 	if len(conflicts) > 0 && policy == models.MediaLibraryConflictAsk {
-		return WorkerResult{Wait: &WaitForAction{ActionType: "transfer_conflict", Prompt: "目标媒体库存在同名文件，请选择处理方式", Options: []string{models.MediaLibraryConflictOverwrite, models.MediaLibraryConflictSkip, models.MediaLibraryConflictRename}, Preview: map[string]string{"媒体库": task.LibraryName, "冲突文件": strconv.Itoa(len(conflicts))}, Checkpoint: map[string]any{"conflict_count": len(conflicts)}}}
+		return WorkerResult{Wait: &WaitForAction{ActionType: "transfer_conflict", Prompt: "目标媒体库存在同名文件，请选择处理方式", Options: cloudTransferConflictOptions(capabilities.Recycle), Preview: map[string]string{"媒体库": task.LibraryName, "冲突文件": strconv.Itoa(len(conflicts))}, Checkpoint: map[string]any{"conflict_count": len(conflicts)}}}
 	}
 	if err := w.persistCloudState(&task, state, models.TransferTaskStatusTransferring, completedCloudItems(state), nil); err != nil {
 		return w.cloudFailure(task, cloudTransferError("transfer_state_persist_failed", true, err))
@@ -119,7 +123,7 @@ func (w *TransferWorker) runCloudUpload(ctx context.Context, runtime JobRuntime,
 			if reconcileErr != nil {
 				return w.cloudFailure(task, reconcileErr)
 			}
-			if found {
+			if found && connection.Provider != cloudpkg.ProviderQuark {
 				state.Items[key] = cloudTransferItemState{SourceID: key, CurrentID: reconciled.ID, TargetParentID: parentID, TargetName: name, Status: "completed"}
 			}
 		}
@@ -128,6 +132,9 @@ func (w *TransferWorker) runCloudUpload(ctx context.Context, runtime JobRuntime,
 			case models.MediaLibraryConflictSkip:
 				state.Items[key] = cloudTransferItemState{SourceID: key, CurrentID: conflict.ID, TargetParentID: parentID, TargetName: name, Status: "skipped"}
 			case models.MediaLibraryConflictOverwrite:
+				if !capabilities.Recycle {
+					return w.cloudFailure(task, cloudTransferError("cloud_overwrite_capability_missing", false, nil))
+				}
 				if conflict.IsDir {
 					return w.cloudFailure(task, cloudTransferError("cloud_transfer_target_type_conflict", false, nil))
 				}
@@ -175,6 +182,15 @@ func (w *TransferWorker) runCloudUpload(ctx context.Context, runtime JobRuntime,
 				return w.cloudFailure(task, cloudTransferError("cloud_upload_reconcile_failed", true, closeErr))
 			}
 			state.Items[key] = cloudTransferItemState{SourceID: key, CurrentID: uploaded.ID, TargetParentID: parentID, TargetName: name, Status: "completed"}
+			if quarkDriver, ok := driver.(*quarkTransferDriver); ok {
+				proof, exists := quarkDriver.verifiedUploads[uploaded.ID]
+				if !exists {
+					return w.cloudFailure(task, cloudTransferError("cloud_upload_readback_missing", false, nil))
+				}
+				item := state.Items[key]
+				item.ContentDigest = &proof
+				state.Items[key] = item
+			}
 		}
 		processed := completedCloudItems(state)
 		if index < len(summary.Items) {
@@ -216,7 +232,7 @@ func (w *TransferWorker) runCloudUpload(ctx context.Context, runtime JobRuntime,
 		if err := SettleCatalogPhysicalWriteTx(tx, permit, &job); err != nil {
 			return err
 		}
-		return w.service.audit.Record(tx, &task.OwnerID, "transfer.complete", "transfer_task", task.ID, "success", map[string]any{"download_task_id": task.DownloadTaskID, "media_library_id": task.LibraryID, "mode": "managed_upload", "files": len(targets), "provider": cloudpkg.ProviderPan115}, RequestContext{})
+		return w.service.audit.Record(tx, &task.OwnerID, "transfer.complete", "transfer_task", task.ID, "success", map[string]any{"download_task_id": task.DownloadTaskID, "media_library_id": task.LibraryID, "mode": "managed_upload", "files": len(targets), "provider": connection.Provider}, RequestContext{})
 	})
 	if errors.Is(err, context.Canceled) {
 		return WorkerResult{}
@@ -224,7 +240,7 @@ func (w *TransferWorker) runCloudUpload(ctx context.Context, runtime JobRuntime,
 	if err != nil {
 		return w.cloudFailure(task, cloudTransferError("transfer_state_persist_failed", true, err))
 	}
-	serverlog.OperationPan115CloudTransfer.Event(w.service.log.Info()).Str("task_id", task.ID).Uint("library_id", task.LibraryID).Int("files", len(targets)).Int64("duration_ms", time.Since(started).Milliseconds()).Msg(serverlog.OperationPan115CloudTransfer.Message("受管上传完成"))
+	serverlog.OperationMediaTransfer.Event(w.service.log.Info()).Str("task_id", task.ID).Uint("library_id", task.LibraryID).Int("files", len(targets)).Int64("duration_ms", time.Since(started).Milliseconds()).Msg(serverlog.OperationMediaTransfer.Message("受管上传完成"))
 	task.Phase = models.TransferTaskStatusCompleted
 	return w.finishCompletedTransfer(ctx, task)
 }

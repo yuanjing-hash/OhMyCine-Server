@@ -47,7 +47,7 @@ func (w *TransferWorker) runRemoteNodeUpload(ctx context.Context, runtime JobRun
 	if w.service == nil || w.service.downloader == nil || w.service.downloader.transferNodes == nil || normalizeExecutionLocation(download.ExecutionLocation) != models.NodeLocationRemote || download.NodeID == nil || task.NodeID == nil || *download.NodeID != *task.NodeID {
 		return w.cloudFailure(task, cloudTransferError("node_transfer_snapshot_invalid", false, nil))
 	}
-	if (download.ProviderType != models.DownloaderTypeQBittorrent && download.ProviderType != models.DownloaderTypePan115Offline) || download.TargetStorageType != models.StorageTypePan115 || download.TargetStorageID == nil || download.TargetConnectionID == nil || strings.TrimSpace(download.TargetProviderRootID) == "" {
+	if (download.ProviderType != models.DownloaderTypeQBittorrent && download.ProviderType != models.DownloaderTypePan115Offline && download.ProviderType != models.DownloaderTypeQuarkShare) || !models.IsNativeCloudStorage(download.TargetStorageType) || download.TargetStorageID == nil || download.TargetConnectionID == nil || strings.TrimSpace(download.TargetProviderRootID) == "" {
 		return w.cloudFailure(task, cloudTransferError(CodeTransferRouteUnsupported, false, nil))
 	}
 	if download.TransferMode != models.MediaLibraryTransferCopy && download.TransferMode != models.MediaLibraryTransferMove {
@@ -62,11 +62,11 @@ func (w *TransferWorker) runRemoteNodeUpload(ctx context.Context, runtime JobRun
 		return w.cloudFailure(task, remoteUploadClientError(err))
 	}
 	var capabilities nodeprotocol.Capabilities
-	if json.Unmarshal([]byte(node.CapabilitiesJSON), &capabilities) != nil || !capabilities.Has(nodeprotocol.CapabilityPan115Upload) || !capabilities.Has(nodeprotocol.CapabilityRangeExport) {
+	if json.Unmarshal([]byte(node.CapabilitiesJSON), &capabilities) != nil || !remoteUploadCapabilities(capabilities, download.TargetStorageType) {
 		return w.cloudFailure(task, cloudTransferError(nodeprotocol.ErrorCapabilityMissing, false, nil))
 	}
 	var storage models.Storage
-	if err := w.service.db.WithContext(ctx).First(&storage, *download.TargetStorageID).Error; err != nil || storage.Type != models.StorageTypePan115 || storage.ConnectionID == nil || *storage.ConnectionID != *download.TargetConnectionID {
+	if err := w.service.db.WithContext(ctx).First(&storage, *download.TargetStorageID).Error; err != nil || storage.Type != download.TargetStorageType || storage.ConnectionID == nil || *storage.ConnectionID != *download.TargetConnectionID {
 		return w.cloudFailure(task, cloudTransferError("cloud_transfer_boundary_invalid", false, err))
 	}
 
@@ -84,7 +84,11 @@ func (w *TransferWorker) runRemoteNodeUpload(ctx context.Context, runtime JobRun
 			return w.cloudFailure(task, planErr)
 		}
 		if conflicts > 0 && policy == models.MediaLibraryConflictAsk {
-			return WorkerResult{Wait: &WaitForAction{ActionType: "transfer_conflict", Prompt: "目标媒体库存在同名文件，请选择处理方式", Options: []string{models.MediaLibraryConflictOverwrite, models.MediaLibraryConflictSkip, models.MediaLibraryConflictRename}, Preview: map[string]string{"媒体库": task.LibraryName, "冲突文件": strconv.Itoa(conflicts)}, Checkpoint: map[string]any{"conflict_count": conflicts}}}
+			options := []string{models.MediaLibraryConflictOverwrite, models.MediaLibraryConflictSkip, models.MediaLibraryConflictRename}
+			if storage.Type == models.StorageTypeQuark {
+				options = []string{models.MediaLibraryConflictSkip, models.MediaLibraryConflictRename}
+			}
+			return WorkerResult{Wait: &WaitForAction{ActionType: "transfer_conflict", Prompt: "目标媒体库存在同名文件，请选择处理方式", Options: options, Preview: map[string]string{"媒体库": task.LibraryName, "冲突文件": strconv.Itoa(conflicts)}, Checkpoint: map[string]any{"conflict_count": conflicts}}}
 		}
 		rows, err = w.createRemoteUploadFiles(ctx, task, planned)
 		if errors.Is(err, gorm.ErrDuplicatedKey) {
@@ -119,6 +123,9 @@ func (w *TransferWorker) runRemoteNodeUpload(ctx context.Context, runtime JobRun
 			return WorkerResult{}
 		}
 		if remoteUploadRowsTerminal(batch.rows) {
+			if err := w.recoverTerminalRemoteUploadBatch(ctx, client, &task, download, rows, batch); err != nil {
+				return w.cloudFailure(task, err)
+			}
 			continue
 		}
 		if err := w.refreshRemoteUploadExport(ctx, &task, download, &manifest); err != nil {
@@ -162,7 +169,7 @@ func (w *TransferWorker) runRemoteNodeUpload(ctx context.Context, runtime JobRun
 		if err := SettleCatalogPhysicalWriteTx(tx, permit, &job); err != nil {
 			return err
 		}
-		return w.service.audit.Record(tx, &task.OwnerID, "transfer.complete", "transfer_task", task.ID, "success", map[string]any{"download_task_id": task.DownloadTaskID, "media_library_id": task.LibraryID, "mode": "remote_node_upload", "files": len(rows), "provider": cloudpkg.ProviderPan115, "node_id": node.ID}, RequestContext{})
+		return w.service.audit.Record(tx, &task.OwnerID, "transfer.complete", "transfer_task", task.ID, "success", map[string]any{"download_task_id": task.DownloadTaskID, "media_library_id": task.LibraryID, "mode": "remote_node_upload", "files": len(rows), "provider": storage.Type, "node_id": node.ID}, RequestContext{})
 	})
 	if errors.Is(err, context.Canceled) {
 		return WorkerResult{}
@@ -170,7 +177,7 @@ func (w *TransferWorker) runRemoteNodeUpload(ctx context.Context, runtime JobRun
 	if err != nil {
 		return w.cloudFailure(task, cloudTransferError("transfer_state_persist_failed", true, err))
 	}
-	serverlog.OperationPan115CloudTransfer.Event(w.service.log.Info()).Str("task_id", task.ID).Uint("library_id", task.LibraryID).Str("node_id", node.ID).Int("files", len(rows)).Int64("duration_ms", time.Since(started).Milliseconds()).Msg(serverlog.OperationPan115CloudTransfer.Message("传输节点直传完成"))
+	serverlog.OperationCloudTransfer.Event(w.service.log.Info()).Str("task_id", task.ID).Uint("library_id", task.LibraryID).Str("node_id", node.ID).Str("provider", storage.Type).Int("files", len(rows)).Int64("duration_ms", time.Since(started).Milliseconds()).Msg(serverlog.OperationCloudTransfer.Message("传输节点直传完成"))
 	task.Phase = models.TransferTaskStatusCompleted
 	return w.finishCompletedTransfer(ctx, task)
 }
@@ -179,7 +186,21 @@ func buildRemoteUploadBatches(rows []models.RemoteUploadFile, storage models.Sto
 	if len(rows) == 0 || storage.ID == 0 || download.ID == "" || manifest.RemoteExportOperationKey == "" || !nodeprotocol.ValidDigest(manifest.RemoteExportDigest) {
 		return nil, errors.New("remote upload batch input is incomplete")
 	}
-	base := nodeprotocol.StorageUploadPlan{StorageID: strconv.FormatUint(uint64(storage.ID), 10), ProviderType: nodeprotocol.StorageProviderPan115, SourceExportOperationKey: manifest.RemoteExportOperationKey, SourceManifestDigest: manifest.RemoteExportDigest, TargetRootID: download.TargetProviderRootID}
+	provider := nodeprotocol.StorageProviderPan115
+	if storage.Type == models.StorageTypeQuark {
+		provider = nodeprotocol.StorageProviderQuark
+	}
+	base := nodeprotocol.StorageUploadPlan{StorageID: strconv.FormatUint(uint64(storage.ID), 10), ProviderType: provider, SourceExportOperationKey: manifest.RemoteExportOperationKey, SourceManifestDigest: manifest.RemoteExportDigest, TargetRootID: download.TargetProviderRootID}
+	if provider == nodeprotocol.StorageProviderQuark {
+		base.DigestVersion = 2
+		base.TargetRootRelativePath = download.TargetRelativeRoot
+		if base.TargetRootRelativePath == "" {
+			if base.TargetRootID != storage.RootPath {
+				return nil, errors.New("quark upload root has no frozen relative path")
+			}
+			base.TargetRootRelativePath = "/"
+		}
+	}
 	batches := make([]remoteUploadBatch, 0, (len(rows)+nodeprotocol.MaxStorageUploadFiles-1)/nodeprotocol.MaxStorageUploadFiles)
 	for offset := 0; offset < len(rows); {
 		plan := base
@@ -262,12 +283,21 @@ func (w *TransferWorker) executeRemoteUploadBatch(ctx context.Context, runtime J
 	}
 
 	credentialRefreshes := 0
+	lastQuarkGrant := time.Now()
 	leaseExpiresAt := plan.LeaseExpiresAt
 	for {
+		if storage.Type == models.StorageTypeQuark && time.Since(lastQuarkGrant) > 5*time.Minute && response.Status != nodeprotocol.StorageActionCompleted {
+			var renewErr error
+			request, renewErr = w.authorizeRemoteUpload(ctx, client, node, storage, request, batch.rows)
+			if renewErr != nil {
+				return renewErr
+			}
+			lastQuarkGrant = time.Now()
+		}
 		if err := validateStorageActionResponse(response, request, len(batch.rows)); err != nil {
 			return err
 		}
-		if err := w.applyRemoteUploadResponse(ctx, task, allRows, batch.rows, response); err != nil {
+		if err := w.applyRemoteUploadResponse(ctx, task, allRows, batch.rows, response, batch.plan.ProviderType); err != nil {
 			return err
 		}
 		phase := nodeprotocol.PhaseUploadingTarget
@@ -481,7 +511,8 @@ func validateStorageActionResponse(response nodeprotocol.StorageActionResponse, 
 	}
 }
 
-func (w *TransferWorker) applyRemoteUploadResponse(ctx context.Context, task *models.TransferTask, allRows, batchRows []models.RemoteUploadFile, response nodeprotocol.StorageActionResponse) error {
+func (w *TransferWorker) applyRemoteUploadResponse(ctx context.Context, task *models.TransferTask, allRows, batchRows []models.RemoteUploadFile, response nodeprotocol.StorageActionResponse, providers ...string) error {
+	quarkTarget := len(providers) > 0 && providers[0] == nodeprotocol.StorageProviderQuark
 	byToken := make(map[string]int, len(batchRows))
 	for index := range batchRows {
 		byToken[batchRows[index].SourceFileToken] = index
@@ -499,25 +530,35 @@ func (w *TransferWorker) applyRemoteUploadResponse(ctx context.Context, task *mo
 		if !remoteUploadResultTerminal(file.Status) {
 			continue
 		}
-		if file.Status != nodeprotocol.StorageFileSkipped && (strings.TrimSpace(file.TargetParentID) == "" || strings.TrimSpace(file.TargetItemID) == "" || !validRemoteSHA1(file.SHA1)) {
+		digestJSON := ""
+		if file.ContentDigest != nil {
+			raw, _ := json.Marshal(file.ContentDigest)
+			digestJSON = string(raw)
+		}
+		validDigest := validRemoteSHA1(file.SHA1)
+		if quarkTarget {
+			validDigest = validRemoteQuarkDigest(digestJSON, batchRows[index].SHA256) && file.SHA1 == ""
+		}
+		if file.Status != nodeprotocol.StorageFileSkipped && (strings.TrimSpace(file.TargetParentID) == "" || strings.TrimSpace(file.TargetItemID) == "" || !validDigest) {
 			return cloudTransferError(nodeprotocol.ErrorReconciliationNeeded, true, nil)
 		}
-		if file.Status == nodeprotocol.StorageFileSkipped && (file.TargetItemID != "" || file.SHA1 != "") {
+		if file.Status == nodeprotocol.StorageFileSkipped && (file.TargetItemID != "" || file.SHA1 != "" || file.ContentDigest != nil) {
 			return cloudTransferError(nodeprotocol.ErrorPlanConflict, false, nil)
 		}
 		row := &batchRows[index]
 		if remoteUploadResultTerminal(row.Status) {
-			if row.Status != file.Status || row.TargetParentID != file.TargetParentID || row.TargetItemID != file.TargetItemID || !strings.EqualFold(row.TargetSHA1, file.SHA1) {
+			if row.Status != file.Status || row.TargetParentID != file.TargetParentID || row.TargetItemID != file.TargetItemID || !strings.EqualFold(row.TargetSHA1, file.SHA1) || quarkTarget && row.TargetDigestJSON != digestJSON {
 				return cloudTransferError(nodeprotocol.ErrorPlanConflict, false, nil)
 			}
 			continue
 		}
 		now := time.Now().UTC()
-		result := w.service.db.WithContext(ctx).Model(&models.RemoteUploadFile{}).Where("id = ? AND transfer_task_id = ? AND source_file_token = ? AND status NOT IN ?", row.ID, task.ID, row.SourceFileToken, []string{nodeprotocol.StorageFileCompleted, nodeprotocol.StorageFileReused, nodeprotocol.StorageFileSkipped}).Updates(map[string]any{"status": file.Status, "target_parent_id": file.TargetParentID, "target_item_id": file.TargetItemID, "target_sha1": strings.ToUpper(file.SHA1), "updated_at": now})
+		result := w.service.db.WithContext(ctx).Model(&models.RemoteUploadFile{}).Where("id = ? AND transfer_task_id = ? AND source_file_token = ? AND status NOT IN ?", row.ID, task.ID, row.SourceFileToken, []string{nodeprotocol.StorageFileCompleted, nodeprotocol.StorageFileReused, nodeprotocol.StorageFileSkipped}).Updates(map[string]any{"status": file.Status, "target_parent_id": file.TargetParentID, "target_item_id": file.TargetItemID, "target_sha1": strings.ToUpper(file.SHA1), "target_digest_json": digestJSON, "updated_at": now})
 		if result.Error != nil || result.RowsAffected != 1 {
 			return cloudTransferError("transfer_state_persist_failed", true, firstNonNil(result.Error, gorm.ErrRecordNotFound))
 		}
 		row.Status, row.TargetParentID, row.TargetItemID, row.TargetSHA1, row.UpdatedAt = file.Status, file.TargetParentID, file.TargetItemID, strings.ToUpper(file.SHA1), now
+		row.TargetDigestJSON = digestJSON
 		for allIndex := range allRows {
 			if allRows[allIndex].ID == row.ID {
 				allRows[allIndex] = *row
@@ -584,7 +625,11 @@ func captureRemoteUploadManagedItems(tx *gorm.DB, task models.TransferTask, down
 		if row.Status == nodeprotocol.StorageFileSkipped {
 			continue
 		}
-		if (row.Status != nodeprotocol.StorageFileCompleted && row.Status != nodeprotocol.StorageFileReused) || strings.TrimSpace(row.TargetItemID) == "" || strings.TrimSpace(row.TargetParentID) == "" || !validRemoteSHA1(row.TargetSHA1) {
+		validDigest := validRemoteSHA1(row.TargetSHA1)
+		if download.TargetStorageType == models.StorageTypeQuark {
+			validDigest = validRemoteQuarkDigest(row.TargetDigestJSON, row.SHA256)
+		}
+		if (row.Status != nodeprotocol.StorageFileCompleted && row.Status != nodeprotocol.StorageFileReused) || strings.TrimSpace(row.TargetItemID) == "" || strings.TrimSpace(row.TargetParentID) == "" || !validDigest {
 			return errors.New("remote upload result is incomplete")
 		}
 		kind := models.MediaManagedItemKindSidecar

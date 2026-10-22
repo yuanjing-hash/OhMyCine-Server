@@ -638,9 +638,13 @@ func TestMigrateUpgradesAuthFoundationDatabaseToStorageFoundation(t *testing.T) 
 	if len(versions) != len(schemaMigrations()) {
 		t.Fatalf("migration versions=%v, want %d migrations", versions, len(schemaMigrations()))
 	}
+	// Parallel work can reserve an ID without shipping that migration here.
+	// Verify every registered version, ordering and uniqueness rather than
+	// manufacturing a placeholder that would skip its real migration later.
+	registered := schemaMigrations()
 	for index, version := range versions {
-		if version != index+1 {
-			t.Fatalf("nonsequential migrations=%v", versions)
+		if version <= 0 || version != registered[index].Version || index > 0 && version <= versions[index-1] {
+			t.Fatalf("invalid applied migration versions=%v", versions)
 		}
 	}
 	if !db.Migrator().HasTable(&models.PlayerPlaybackHistory{}) || !db.Migrator().HasTable(&models.PlayerPlaybackHistoryRevision{}) {

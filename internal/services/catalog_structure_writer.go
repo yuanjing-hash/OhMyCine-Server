@@ -28,27 +28,30 @@ type structureLogicalFence struct {
 }
 
 type structureCatalogRepairState struct {
-	Version                  int                   `json:"version"`
-	Fence                    structureLogicalFence `json:"fence"`
-	BoundRevision            uint64                `json:"bound_revision"`
-	Layers                   []CatalogBindingLayer `json:"layers"`
-	Stage                    string                `json:"stage"`
-	PublishedContentRevision uint64                `json:"published_content_revision,omitempty"`
-	AfterManaged             int                   `json:"after_managed,omitempty"`
-	AfterResolved            int                   `json:"after_resolved,omitempty"`
-	AfterSkipped             int                   `json:"after_skipped,omitempty"`
-	AfterMoves               int                   `json:"after_moves,omitempty"`
-	ArtifactGeneration       uint64                `json:"artifact_generation,omitempty"`
-	DiagnosisJobID           string                `json:"diagnosis_job_id,omitempty"`
-	DiagnosisGeneration      uint64                `json:"diagnosis_generation,omitempty"`
-	SourceRevision           uint64                `json:"source_revision,omitempty"`
-	SelectionBound           bool                  `json:"selection_bound,omitempty"`
-	FailedItems              int                   `json:"failed_items,omitempty"`
-	BlockedItems             int                   `json:"blocked_items,omitempty"`
-	OriginalTotalItems       int                   `json:"original_total_items,omitempty"`
-	CancelVerified           int                   `json:"cancel_verified,omitempty"`
-	Cancelled                bool                  `json:"cancelled,omitempty"`
-	RetryCheckpointBefore    time.Time             `json:"retry_checkpoint_before,omitempty"`
+	Version                  int                     `json:"version"`
+	Fence                    structureLogicalFence   `json:"fence"`
+	BoundRevision            uint64                  `json:"bound_revision"`
+	Layers                   []CatalogBindingLayer   `json:"layers"`
+	Stage                    string                  `json:"stage"`
+	PublishedContentRevision uint64                  `json:"published_content_revision,omitempty"`
+	AfterManaged             int                     `json:"after_managed,omitempty"`
+	AfterResolved            int                     `json:"after_resolved,omitempty"`
+	AfterSkipped             int                     `json:"after_skipped,omitempty"`
+	AfterMoves               int                     `json:"after_moves,omitempty"`
+	ArtifactGeneration       uint64                  `json:"artifact_generation,omitempty"`
+	DiagnosisJobID           string                  `json:"diagnosis_job_id,omitempty"`
+	DiagnosisGeneration      uint64                  `json:"diagnosis_generation,omitempty"`
+	SourceRevision           uint64                  `json:"source_revision,omitempty"`
+	SelectionBound           bool                    `json:"selection_bound,omitempty"`
+	FailedItems              int                     `json:"failed_items,omitempty"`
+	BlockedItems             int                     `json:"blocked_items,omitempty"`
+	OriginalTotalItems       int                     `json:"original_total_items,omitempty"`
+	CancelVerified           int                     `json:"cancel_verified,omitempty"`
+	Cancelled                bool                    `json:"cancelled,omitempty"`
+	RetryCheckpointBefore    time.Time               `json:"retry_checkpoint_before,omitempty"`
+	ObservationHoldVersion   int                     `json:"observation_hold_version,omitempty"`
+	QuarkMutation            *quarkStructureMutation `json:"quark_mutation,omitempty"`
+	ParentTransferID         string                  `json:"parent_transfer_id,omitempty"`
 	// Only the exiting execution stack may supply cancellation authority.
 	cancelPermit *CatalogPhysicalWritePermit
 }
@@ -165,6 +168,15 @@ func (s *MediaLibraryStructureService) validateCatalogStructureExecutionTx(tx *g
 	if current.PlanJSON != repair.PlanJSON || current.Phase == "completed" {
 		return ErrCatalogFence
 	}
+	var durableState structureCatalogRepairState
+	if json.Unmarshal([]byte(current.StateJSON), &durableState) != nil || durableState.ParentTransferID != state.ParentTransferID {
+		return ErrCatalogFence
+	}
+	if state.ParentTransferID != "" {
+		if _, err := quarkStructureParentTx(tx, current, state.ParentTransferID); err != nil {
+			return err
+		}
+	}
 	if state.Stage == "catalog_published" || state.Stage == "reconciling" {
 		var published structureCatalogRepairState
 		if json.Unmarshal([]byte(current.StateJSON), &published) != nil || (published.Stage != "catalog_published" && published.Stage != "reconciling") || published.PublishedContentRevision != state.PublishedContentRevision || published.ArtifactGeneration != state.ArtifactGeneration {
@@ -242,10 +254,11 @@ func validateCatalogStructureSelectionTx(tx *gorm.DB, plan StructurePlan, member
 }
 
 type catalogStructurePrepared struct {
-	Head      models.CatalogHead
-	Candidate models.CatalogSnapshot
-	Token     string
-	Facts     CatalogFactBatch
+	Head          models.CatalogHead
+	Candidate     models.CatalogSnapshot
+	Token         string
+	Facts         CatalogFactBatch
+	quarkEvidence quarkStructureEvidence
 }
 
 // Read original raw facts to preserve every SharedOverrideMask bit. Paths and

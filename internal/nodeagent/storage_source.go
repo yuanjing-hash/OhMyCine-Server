@@ -21,6 +21,7 @@ import (
 
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud/pan115"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud/quark"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/nodeprotocol"
 )
 
@@ -122,6 +123,11 @@ func (a *Agent) storageSourceAction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if plan.ProviderType == nodeprotocol.StorageProviderQuark {
+		response.CredentialExpiresAt = &grant.ExpiresAt
+		// A renewal must not replace a newer progress or terminal response.
+		_, _ = a.store.db.ExecContext(r.Context(), `UPDATE provider_receipts SET response_json=json_set(response_json,'$.credential_expires_at',?),updated_at=? WHERE paired_server_id=? AND request_id=? AND status<>'completed' AND json_valid(response_json)`, grant.ExpiresAt.UTC().Format(time.RFC3339Nano), a.now(), serverID, input.RequestID)
+	}
 	started := a.startStorageSource(serverID, input, plan, grant, credential)
 	if started && response.Status == nodeprotocol.StorageSourceAccepted {
 		response.Status = nodeprotocol.StorageSourceSubmitting
@@ -198,7 +204,7 @@ func (a *Agent) storageSourceCredential(ctx context.Context, serverID string, in
 		if run.OutputRootID != "" {
 			requiredActions = []string{nodeprotocol.StorageSourceGrantRead}
 		}
-	case nodeprotocol.StorageSourceKindPan115Share, nodeprotocol.StorageSourceKindPan115ShareSelected:
+	case nodeprotocol.StorageSourceKindPan115Share, nodeprotocol.StorageSourceKindPan115ShareSelected, nodeprotocol.StorageSourceKindQuarkShareSelected:
 		if run.OutputRootID == "" {
 			requiredActions = []string{nodeprotocol.StorageSourceGrantShareInspect, nodeprotocol.StorageSourceGrantShareReceive, nodeprotocol.StorageSourceGrantRead}
 		} else {
@@ -217,6 +223,14 @@ func (a *Agent) storageSourceCredential(ctx context.Context, serverID string, in
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&credential); err != nil || nodeprotocol.ValidateStorageSourceCredential(credential, requireURI) != nil {
 		return nodeprotocol.CredentialGrant{}, nodeprotocol.StorageSourceCredential{}, errors.New("node_credential_payload_invalid")
+	}
+	if credential.ProviderType != plan.ProviderType {
+		return nodeprotocol.CredentialGrant{}, nodeprotocol.StorageSourceCredential{}, ErrPlanConflict
+	}
+	if plan.ProviderType == nodeprotocol.StorageProviderQuark {
+		if _, e := validateQuarkGrant(nodeprotocol.StorageCredential{ProviderType: credential.ProviderType, Quark: credential.Quark, RootID: credential.RootID, Cookie: credential.Cookie}); e != nil {
+			return nodeprotocol.CredentialGrant{}, nodeprotocol.StorageSourceCredential{}, e
+		}
 	}
 	if requireURI || strings.TrimSpace(credential.SourceURI) != "" {
 		contentDigest, digestErr := nodeprotocol.StorageSourceContentDigest(plan.SourceKind, credential.SourceURI)
@@ -247,6 +261,10 @@ func (a *Agent) startStorageSource(serverID string, input nodeprotocol.StorageSo
 }
 
 func (a *Agent) runStorageSource(ctx context.Context, serverID string, input nodeprotocol.StorageSourceActionRequest, plan nodeprotocol.StorageSourcePlan, grant nodeprotocol.CredentialGrant, credential nodeprotocol.StorageSourceCredential) {
+	if plan.ProviderType == nodeprotocol.StorageProviderQuark {
+		a.runQuarkStorageSource(ctx, serverID, input, plan, grant, credential)
+		return
+	}
 	run, err := a.store.StorageSourceRun(ctx, serverID, input.OperationKey)
 	if err != nil {
 		return
@@ -1032,7 +1050,7 @@ func manifestHashFile(writer io.Writer, file StorageSourceFile) {
 }
 
 func sourceResponse(input nodeprotocol.StorageSourceActionRequest, run StorageSourceRun) nodeprotocol.StorageSourceActionResponse {
-	return nodeprotocol.StorageSourceActionResponse{RequestID: input.RequestID, OperationKey: input.OperationKey, PlanDigest: input.PlanDigest, Status: run.Status, TotalFiles: run.TotalFiles, DownloadedFiles: run.DownloadedFiles, TotalBytes: run.TotalBytes, DownloadedBytes: run.DownloadedBytes, Progress: sourceProgress(run)}
+	return nodeprotocol.StorageSourceActionResponse{RequestID: input.RequestID, OperationKey: input.OperationKey, PlanDigest: input.PlanDigest, Status: run.Status, OutputRootID: run.OutputRootID, TotalFiles: run.TotalFiles, DownloadedFiles: run.DownloadedFiles, TotalBytes: run.TotalBytes, DownloadedBytes: run.DownloadedBytes, Progress: sourceProgress(run)}
 }
 
 func sourceProgress(run StorageSourceRun) *float64 {
@@ -1061,6 +1079,10 @@ func storageSourceErrorCode(err error) string {
 	if err == nil {
 		return ""
 	}
+	var quarkFailure *quark.Failure
+	if errors.As(err, &quarkFailure) && (quarkFailure.Code == quark.CodePending || quarkFailure.Code == cloud.CodeMutationUnknown) {
+		return "node_source_pending"
+	}
 	if errors.Is(err, ErrLeaseConflict) || strings.Contains(err.Error(), nodeprotocol.ErrorLeaseExpired) {
 		return nodeprotocol.ErrorLeaseExpired
 	}
@@ -1077,15 +1099,15 @@ func storageSourceErrorCode(err error) string {
 	}
 	code, _ := cloud.ErrorInfo(err)
 	switch code {
-	case cloud.CodeAuthExpired, cloud.CodeCookieInvalid:
+	case cloud.CodeAuthExpired, cloud.CodeCookieInvalid, quark.CodeAuth:
 		return nodeprotocol.ErrorCredentialExpired
 	case cloud.CodeShareExpired:
 		return nodeprotocol.ErrorSourceShareExpired
 	case cloud.CodeSharePassword:
 		return nodeprotocol.ErrorSourceSharePassword
-	case cloud.CodeRateLimited:
+	case cloud.CodeRateLimited, quark.CodeLimited:
 		return nodeprotocol.ErrorSourceRateLimited
-	case cloud.CodeNotFound, cloud.CodeMutationUnknown:
+	case cloud.CodeNotFound, cloud.CodeMutationUnknown, quark.CodePending:
 		return nodeprotocol.ErrorReconciliationNeeded
 	case cloud.CodeOfflineNoQuota:
 		return "node_source_offline_quota_exhausted"
@@ -1111,9 +1133,9 @@ func writeStorageSourceError(w http.ResponseWriter, err error) {
 func storageSourceSafeMessage(code string) string {
 	switch code {
 	case nodeprotocol.ErrorSourceShareExpired:
-		return "115 分享已失效或已被取消"
+		return "分享已失效或已被取消"
 	case nodeprotocol.ErrorSourceSharePassword:
-		return "115 分享提取码有误"
+		return "分享提取码有误"
 	case nodeprotocol.ErrorLeaseExpired:
 		return "任务租约已经过期"
 	case nodeprotocol.ErrorPlanConflict:

@@ -36,7 +36,18 @@ func (w *MediaReorganizationWorker) validateCatalogItemExecution(ctx context.Con
 
 func (w *MediaReorganizationWorker) runVersioned(ctx context.Context, runtime JobRuntime, claim ClaimedJob, task models.MediaReorganizationTask, download models.DownloadTask, library models.MediaLibrary, storage models.Storage, plan reorganizationPlan, state reorganizationState) WorkerResult {
 	fail := func(err error) WorkerResult {
+		if result, waiting := w.quarkReorganizationWait(ctx, task, plan, state, claim, err); waiting {
+			return result
+		}
 		code, message := reorganizationWriteError(err)
+		if storage.Type == models.StorageTypeQuark {
+			if safeCode, safeMessage, ok := quarkReorganizationFailure(err); ok {
+				code, message = safeCode, safeMessage
+			}
+			if state.Catalog != nil && state.Catalog.ObservationHoldVersion == 1 && (errors.Is(err, ErrCatalogFence) || errors.Is(err, ErrCatalogInvalid)) {
+				message = "媒体、来源或任务已变化；已保留原操作与观察暂停状态，请恢复原任务条件后核对，不要重复提交"
+			}
+		}
 		// A lost lease cannot write failure over a successor's state.
 		if w.service.queue != nil {
 			var admission *CatalogWriteAdmission
@@ -86,7 +97,7 @@ func (w *MediaReorganizationWorker) runVersioned(ctx context.Context, runtime Jo
 	}
 	// Provider parents may require mkdir, but only after the complete tentative
 	// candidate (including collection projection) fits all publication budgets.
-	if storage.Type == models.StorageTypePan115 {
+	if storage.Type == models.StorageTypePan115 || storage.Type == models.StorageTypeQuark {
 		if err := w.prepareReorganizationDirectories(ctx, task, library, storage, plan, &state, claim); err != nil {
 			return fail(err)
 		}
@@ -100,6 +111,9 @@ func (w *MediaReorganizationWorker) runVersioned(ctx context.Context, runtime Jo
 		return fail(err)
 	}
 	if err := w.executeCatalogReorganization(ctx, runtime, task, library, storage, plan, &state, claim, p.Facts); err != nil {
+		return fail(err)
+	}
+	if err := w.verifyQuarkReorganizationDirectories(ctx, task, library, storage, plan, &state, claim); err != nil {
 		return fail(err)
 	}
 	// Rebuild only for physical compaction/expired candidate lease. Bound facts
@@ -119,22 +133,24 @@ func (w *MediaReorganizationWorker) prepareReorganizationDirectories(ctx context
 	if storage.ConnectionID == nil || w.service.connections == nil {
 		return ErrCatalogFence
 	}
-	connection, driver, err := w.service.connections.driver(*storage.ConnectionID)
+	driver, mutation, err := w.service.reorganizationCloudDriver(ctx, library, storage, task.ID)
 	if err != nil {
 		return err
 	}
-	mutation, ok := driver.(cloudpkg.MutationDriver)
-	if !ok || connection.Provider != cloudpkg.ProviderPan115 {
-		return ErrCatalogInvalid
-	}
 	root, err := providerItemWithinRoot(ctx, driver, library.ProviderRootID, storage.RootPath)
-	if err != nil || !root.IsDir {
+	if err != nil {
+		return reorganizationSourceReadError(storage, err)
+	}
+	if !root.IsDir {
 		return ErrCatalogFence
 	}
 	if state.Catalog.Directories == nil {
 		state.Catalog.Directories = map[string]string{}
 	}
 	state.Catalog.Directories["."] = root.ID
+	if storage.Type == models.StorageTypeQuark {
+		rememberQuarkReorganizationFact(state, root)
+	}
 	for _, item := range plan.Items {
 		parent, walked := root.ID, "."
 		for _, segment := range strings.Split(reorganizationParentPath(item.NewRelativePath), "/") {
@@ -150,8 +166,14 @@ func (w *MediaReorganizationWorker) prepareReorganizationDirectories(ctx context
 			}
 			if known := state.Catalog.Directories[walked]; known != "" {
 				current, err := driver.Stat(ctx, known)
-				if err != nil || !current.IsDir || current.ParentID != parent || current.Name != segment {
+				if err != nil {
+					return reorganizationSourceReadError(storage, err)
+				}
+				if !current.IsDir || current.ParentID != parent || current.Name != segment {
 					return ErrCatalogFence
+				}
+				if storage.Type == models.StorageTypeQuark {
+					rememberQuarkReorganizationFact(state, current)
 				}
 				parent = known
 				continue
@@ -161,13 +183,18 @@ func (w *MediaReorganizationWorker) prepareReorganizationDirectories(ctx context
 				return err
 			}
 			matches := namedCloudItems(children, segment)
-			if len(matches) > 1 || len(matches) == 1 && !matches[0].IsDir {
+			pending := state.Catalog.QuarkMutation
+			resumeCreate := storage.Type == models.StorageTypeQuark && pending != nil && pending.Kind == "mkdir" && pending.DirectoryPath == walked
+			if !resumeCreate && (len(matches) > 1 || len(matches) == 1 && !matches[0].IsDir) {
 				return ErrCatalogFence
 			}
 			var child cloudpkg.Item
-			if len(matches) == 1 {
+			if len(matches) == 1 && !resumeCreate {
 				child = matches[0]
 			} else {
+				if err := w.beginQuarkReorganizationMutation(ctx, task, plan, state, claim, quarkReorganizationMutation{Kind: "mkdir", ParentID: parent, Name: segment, DirectoryPath: walked}); err != nil {
+					return err
+				}
 				child, err = mutation.CreateDirectory(ctx, parent, segment)
 				if err != nil {
 					return err
@@ -180,6 +207,12 @@ func (w *MediaReorganizationWorker) prepareReorganizationDirectories(ctx context
 				return err
 			}
 			state.Catalog.Directories[walked] = child.ID
+			if storage.Type == models.StorageTypeQuark {
+				rememberQuarkReorganizationFact(state, child)
+				if state.Catalog.QuarkMutation != nil && state.Catalog.QuarkMutation.Kind == "mkdir" && state.Catalog.QuarkMutation.DirectoryPath == walked {
+					state.Catalog.QuarkMutation = nil
+				}
+			}
 			if err := w.persistCatalogReorganizationState(ctx, task, plan, *state, claim); err != nil {
 				return err
 			}
@@ -211,19 +244,15 @@ func (w *MediaReorganizationWorker) executeCatalogReorganization(ctx context.Con
 		if err != nil {
 			return err
 		}
-	case models.StorageTypePan115:
+	case models.StorageTypePan115, models.StorageTypeQuark:
 		if storage.ConnectionID == nil || w.service.connections == nil {
 			return ErrCatalogFence
 		}
-		connection, d, err := w.service.connections.driver(*storage.ConnectionID)
+		d, m, err := w.service.reorganizationCloudDriver(ctx, library, storage, task.ID)
 		if err != nil {
 			return err
 		}
-		var ok bool
-		mutation, ok = d.(cloudpkg.MutationDriver)
-		if !ok || connection.Provider != cloudpkg.ProviderPan115 {
-			return ErrCatalogInvalid
-		}
+		mutation = m
 		driver = d
 		root = library.ProviderRootID
 	default:
@@ -271,7 +300,10 @@ func (w *MediaReorganizationWorker) executeCatalogReorganization(ctx context.Con
 			}
 		} else {
 			current, err := providerItemWithinRoot(ctx, driver, item.ProviderItemID, root)
-			if err != nil || current.ID != item.ProviderItemID || cloudReorganizationSourceChanged(item, current) {
+			if err != nil {
+				return reorganizationSourceReadError(storage, err)
+			}
+			if current.ID != item.ProviderItemID || cloudReorganizationSourceChanged(item, current) {
 				return ErrCatalogFence
 			}
 			parent := state.Catalog.Directories[reorganizationParentPath(item.NewRelativePath)]
@@ -279,7 +311,10 @@ func (w *MediaReorganizationWorker) executeCatalogReorganization(ctx context.Con
 				return ErrCatalogFence
 			}
 			parentFact, err := providerItemWithinRoot(ctx, driver, parent, root)
-			if err != nil || !parentFact.IsDir {
+			if err != nil {
+				return reorganizationSourceReadError(storage, err)
+			}
+			if !parentFact.IsDir {
 				return ErrCatalogFence
 			}
 			name := pathpkg.Base(item.NewRelativePath)
@@ -297,23 +332,51 @@ func (w *MediaReorganizationWorker) executeCatalogReorganization(ctx context.Con
 				if err := ensureReorganizationCloudTargetAvailable(ctx, driver, parent, name, current.ID); err != nil {
 					return err
 				}
-				if current.ParentID != parent {
+				pending := state.Catalog.QuarkMutation
+				resumeMove := storage.Type == models.StorageTypeQuark && pending != nil && pending.Kind == "move" && pending.ItemID == current.ID
+				if current.ParentID != parent || resumeMove {
+					if err := w.beginQuarkReorganizationMutation(ctx, task, plan, state, claim, quarkReorganizationMutation{Kind: "move", ItemID: current.ID, ParentID: parent}); err != nil {
+						return err
+					}
 					if err := mutation.Move(ctx, current.ID, parent); err != nil {
+						if storage.Type == models.StorageTypeQuark {
+							return err
+						}
 						return appError(CodeReorganizationUnavailable, "115 移动失败", nil)
+					}
+					if err := w.finishQuarkReorganizationMutation(ctx, task, plan, state, claim); err != nil {
+						return err
 					}
 				}
 				if err := w.validateCatalogItemExecution(ctx, task, plan, *state, claim, item.ManagedItemID); err != nil {
 					return err
 				}
-				if current.Name != name {
+				pending = state.Catalog.QuarkMutation
+				resumeRename := storage.Type == models.StorageTypeQuark && pending != nil && pending.Kind == "rename" && pending.ItemID == current.ID
+				if current.Name != name || resumeRename {
+					if err := w.beginQuarkReorganizationMutation(ctx, task, plan, state, claim, quarkReorganizationMutation{Kind: "rename", ItemID: current.ID, Name: name}); err != nil {
+						return err
+					}
 					if err := mutation.Rename(ctx, current.ID, name); err != nil {
+						if storage.Type == models.StorageTypeQuark {
+							return err
+						}
 						return appError(CodeReorganizationUnavailable, "115 重命名失败", nil)
+					}
+					if err := w.finishQuarkReorganizationMutation(ctx, task, plan, state, claim); err != nil {
+						return err
 					}
 				}
 				current, err = driver.Stat(ctx, current.ID)
-				if err != nil || current.ParentID != parent || current.Name != name || cloudReorganizationSourceChanged(item, current) {
+				if err != nil {
+					return reorganizationSourceReadError(storage, err)
+				}
+				if current.ID != item.ProviderItemID || current.ParentID != parent || current.Name != name || cloudReorganizationSourceChanged(item, current) {
 					return ErrCatalogFence
 				}
+			}
+			if storage.Type == models.StorageTypeQuark {
+				rememberQuarkReorganizationFact(state, current)
 			}
 		}
 		state.Completed[item.ManagedItemID] = true
@@ -341,6 +404,27 @@ func (w *MediaReorganizationWorker) finalizeCatalogReorganization(ctx context.Co
 	err := libraries.catalogStore.Admission().WithForeground(ctx, func() error {
 		return w.service.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 			stateOnly := uint(0)
+			if storage.Type == models.StorageTypeQuark && state.Catalog.ObservationHoldVersion == 0 {
+				// A metadata-only plan may have made no cloud mutation. It needs no
+				// durable hold during reads; establish and release it atomically with
+				// publication, so a failed preflight never freezes the observer.
+				if err := w.validateCatalogExecutionGuardTx(tx, task, plan, state, claim, &stateOnly); err != nil {
+					return err
+				}
+				publicationState := *state.Catalog
+				publicationState.ObservationHoldVersion = 1
+				state.Catalog = &publicationState
+				raw, err := json.Marshal(state)
+				if err != nil {
+					return err
+				}
+				if len(raw) > CatalogBatchBytes {
+					return ErrCatalogBudget
+				}
+				if err := tx.Model(&models.MediaReorganizationTask{}).Where("id=?", task.ID).Update("state_json", string(raw)).Error; err != nil {
+					return err
+				}
+			}
 			if _, err := libraries.catalogStore.PublishTx(tx, p.Candidate.ID, p.Token, p.Head.Revision, func(tx *gorm.DB) error {
 				return w.validateCatalogExecutionGuardTx(tx, task, plan, state, claim, &stateOnly)
 			}); err != nil {
@@ -376,7 +460,16 @@ func (w *MediaReorganizationWorker) finalizeCatalogReorganization(ctx context.Co
 			if err := tx.First(&published, library.ID).Error; err != nil {
 				return err
 			}
+			if storage.Type == models.StorageTypeQuark {
+				if state.Catalog.QuarkMutation != nil {
+					return ErrCatalogFence
+				}
+				if err := ConfirmQuarkReorganizationObservationTx(tx, task, plan, state, quarkReorganizationFacts(state)); err != nil {
+					return err
+				}
+			}
 			nextCatalog := *state.Catalog
+			nextCatalog.ObservationHoldVersion = 0
 			nextCatalog.Stage = "reconciling"
 			nextCatalog.ManagedRevision = plan.ManagedRevision
 			nextCatalog.PublishedContentRevision = published.ContentRevision

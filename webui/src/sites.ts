@@ -9,7 +9,76 @@ export interface SiteHealth {
   checked_at?: string
 }
 
-export interface CloudSiteConfig { provider: '115'; channels: string[]; auth_enabled: boolean }
+export type PanSouSourceScope = 'all' | 'tg' | 'plugin'
+export type PanSouChannelMode = 'custom_only' | 'defaults_plus_custom'
+export type DiscoveryTypePolicy = 'auto' | 'all' | 'manual'
+export interface CloudSiteConfig {
+  provider?: '115' | 'quark' | 'all'
+  channels: string[]
+  auth_enabled: boolean
+  source_scope?: PanSouSourceScope
+  channel_mode?: PanSouChannelMode
+  plugins?: string[]
+  type_policy?: DiscoveryTypePolicy
+  cloud_types?: string[]
+}
+export interface PanSouScope {
+  source_scope: PanSouSourceScope
+  channel_mode: PanSouChannelMode
+  default_channels: string[]
+  custom_channels: string[]
+  effective_channels: string[]
+  default_count: number
+  custom_count: number
+  effective_count: number
+  default_error_code?: string
+}
+export interface DiscoveryOrigin { kind: 'tg' | 'plugin'; name: string; post_url?: string }
+export const discoveryTypeOptions = [
+  ['115', '115'], ['quark', '夸克'], ['magnet', '磁力'], ['aliyun', '阿里'],
+  ['baidu', '百度'], ['tianyi', '天翼'], ['uc', 'UC'], ['xunlei', '迅雷'],
+  ['123', '123 网盘'], ['pikpak', 'PikPak'], ['ed2k', '电驴'], ['others', '其他'],
+] as const
+export function discoveryTypeLabel(type?: string) {
+  return discoveryTypeOptions.find(item => item[0] === type)?.[1] || type || '资源'
+}
+export function normalizeCloudSiteConfig(value?: CloudSiteConfig): CloudSiteConfig {
+  return {
+    provider: value?.provider ?? 'all', channels: [...(value?.channels ?? [])], auth_enabled: value?.auth_enabled ?? false,
+    source_scope: value?.source_scope ?? 'all',
+    channel_mode: value?.channel_mode ?? (value?.channels?.length ? 'custom_only' : 'defaults_plus_custom'),
+    plugins: [...(value?.plugins ?? [])], type_policy: value?.type_policy ?? 'auto', cloud_types: [...(value?.cloud_types ?? [])],
+  }
+}
+export function resultSiteType(item: Pick<PTSearchResult, 'source_kind' | 'result_type'>, fallback: PTSearchGroup['site_type']): PTSearchGroup['site_type'] {
+  if (fallback !== 'cloud_share') return fallback
+  if (item.source_kind === 'bt' || item.result_type === 'magnet') return 'bt'
+  if (item.source_kind === '115_share' || item.source_kind === 'quark_share' || item.result_type && item.result_type !== 'magnet') return 'cloud_share'
+  return fallback
+}
+export function siteEffectiveEnabled(site: Pick<SiteSummary, 'enabled' | 'effective_enabled'>) {
+  return site.enabled && site.effective_enabled !== false
+}
+export function resultTypeLabel(item: Pick<PTSearchResult, 'result_type' | 'source_kind' | 'cloud_provider'>, fallback = '资源') {
+  return item.result_type ? discoveryTypeLabel(item.result_type) : item.cloud_provider ? discoveryTypeLabel(item.cloud_provider) : item.source_kind === 'bt' ? '磁力' : fallback
+}
+export function safeDiscoveryPostURL(value?: string) {
+  return value && /^https:\/\/t\.me\/[A-Za-z0-9_]{3,64}\/[1-9]\d{0,19}$/.test(value) ? value : undefined
+}
+export function discoveryOrigins(item: Pick<PTSearchResult, 'origins' | 'channel' | 'post_url'>): DiscoveryOrigin[] {
+  const origins: DiscoveryOrigin[] = Array.isArray(item.origins) && item.origins.length ? item.origins : typeof item.channel === 'string' && item.channel ? [{ kind: 'tg', name: item.channel, post_url: item.post_url }] : []
+  return origins.filter(origin => origin && (origin.kind === 'tg' || origin.kind === 'plugin') && typeof origin.name === 'string' && origin.name.length > 0 && origin.name.length <= 128 && !hasDiscoveryControl(origin.name)).map(origin => ({ kind: origin.kind, name: origin.name, post_url: origin.kind === 'tg' ? safeDiscoveryPostURL(origin.post_url) : undefined }))
+}
+function hasDiscoveryControl(value: string, rejectSpace = false) { return Array.from(value).some(character => character.charCodeAt(0) <= (rejectSpace ? 32 : 31) || character.charCodeAt(0) === 127) }
+export function safeDiscoveryLink(value: unknown): string | undefined {
+  if (typeof value !== 'string' || value.length > 8192 || hasDiscoveryControl(value, true)) return undefined
+  try {
+    const url = new URL(value)
+    if ((url.protocol === 'http:' || url.protocol === 'https:') && url.hostname && !url.username && !url.password) return value
+    if ((url.protocol === 'magnet:' && url.searchParams.has('xt')) || url.protocol === 'ed2k:') return value
+  } catch { /* Malformed links never become a navigation target. */ }
+  return undefined
+}
 export interface SiteSummary {
   cloud_config?: CloudSiteConfig
   login_username?: string
@@ -23,6 +92,9 @@ export interface SiteSummary {
   base_url: string
   user_agent: string
   enabled: boolean
+  effective_enabled?: boolean
+  unavailable_code?: string
+  unavailable_reason?: string
   priority: number
   timeout_seconds: number
   rate_limit_per_minute: number
@@ -113,6 +185,10 @@ export interface PTSearchResult {
   cloud_provider?: string
   channel?: string
   post_url?: string
+  result_type?: string
+  origins?: DiscoveryOrigin[]
+  acquisition_available?: boolean
+  acquisition_reason?: string
   token: string
   matched_name?: string
   title: string
@@ -139,6 +215,13 @@ export interface PTSearchGroup {
   has_next: boolean
   skipped: number
   items: PTSearchResult[]
+  snapshot_id?: string
+  snapshot_expires_at?: string
+  partial?: boolean
+  truncated?: boolean
+  completion?: 'received' | 'complete'
+  warnings?: { code: string; message: string }[]
+  scope?: PanSouScope
 }
 
 export interface PTRecognitionSpecifications {
@@ -193,6 +276,7 @@ export type TorrentResultDirection = 'asc' | 'desc'
 export interface TorrentResultFilters {
   activeChannel: 'all' | number
   enabledSiteTypes: ReadonlyArray<'pt' | 'bt' | 'bt_resource' | 'cloud_share'>
+  resultTypes?: readonly string[]
   resolution?: string
   promotion?: string
   minimumSeeders?: number
@@ -220,6 +304,8 @@ export const torrentRecognitionCandidatesPath = '/api/v1/discovery/torrent-resul
 export const torrentRecognitionOverridePath = '/api/v1/discovery/torrent-results/recognition-override'
 export const discoveryDownloadsPath = '/api/v1/discovery/downloads'
 export const discoverySearchOptionsPath = '/api/v1/discovery/search-options'
+export const discoveryResultLinkPath = '/api/v1/discovery/results/link'
+export const panSouScopePath = `${sitesPath}/pansou-scope`
 export const cookieCloudSettingsPath = '/api/v1/settings/sites/cookiecloud'
 export const cookieCloudSyncPath = `${cookieCloudSettingsPath}/sync`
 
@@ -237,8 +323,13 @@ export function cookieCloudErrorLabel(code: string) {
   } as Record<string, string>)[code] || code || '未知错误'
 }
 
-export function buildPTSearchQuery(input: { keyword: string; mediaType?: string; year?: number; tmdbID?: number; searchBy?: 'title' | 'tmdb_id'; page?: number; siteID?: number; siteIDs?: number[] }) {
+export function buildPTSearchQuery(input: { keyword: string; mediaType?: string; year?: number; tmdbID?: number; searchBy?: 'title' | 'tmdb_id'; page?: number; siteID?: number; siteIDs?: number[]; typePolicy?: DiscoveryTypePolicy; cloudTypes?: string[]; snapshotID?: string; refresh?: boolean }) {
   const query = new URLSearchParams({ keyword: input.keyword.trim(), page: String(input.page ?? 1) })
+  query.set('client_capabilities', 'mixed_discovery_v1')
+  if (input.typePolicy) query.set('type_policy', input.typePolicy)
+  for (const type of input.cloudTypes ?? []) query.append('cloud_types', type)
+  if (input.snapshotID) query.set('snapshot_id', input.snapshotID)
+  if (input.refresh) query.set('refresh', 'true')
   if (input.mediaType) query.set('media_type', input.mediaType)
   if (input.year) query.set('year', String(input.year))
   if (input.tmdbID) query.set('tmdb_id', String(input.tmdbID))
@@ -282,6 +373,10 @@ export function upsertPTGroup(groups: PTSearchGroup[], incoming: PTSearchGroup, 
   if (index < 0) return [...groups, normalized]
   const next = [...groups]
   const previous = normalizePTSearchGroup(next[index])
+  if (normalized.status === 'error' && !normalized.items.length && previous.items.length) {
+    next[index] = { ...normalized, items: previous.items, partial: true }
+    return next
+  }
   next[index] = append && normalized.status === 'success'
     ? { ...normalized, items: [...previous.items, ...normalized.items.filter(item => !previous.items.some(existing => existing.token === item.token))] }
     : normalized
@@ -319,7 +414,7 @@ const torrentSearchSessionMaxBytes = 512 * 1024
 const torrentSearchSessionMaxAgeMs = 30 * 60 * 1000
 
 export interface TorrentSearchSession {
-  input: { keyword: string; mediaType: string; year?: number; tmdbID?: number; searchBy: 'title' | 'tmdb_id'; siteID?: number; siteIDs?: number[] }
+  input: { keyword: string; mediaType: string; year?: number; tmdbID?: number; searchBy: 'title' | 'tmdb_id'; siteID?: number; siteIDs?: number[]; typePolicy?: DiscoveryTypePolicy; cloudTypes?: string[] }
   groups: TorrentSearchGroup[]
   recognitions: Record<string, TorrentRecognitionResult>
   searched: boolean
@@ -350,11 +445,12 @@ export function filterAndSortTorrentResults(groups: readonly PTSearchGroup[], fi
     || left.item.title.localeCompare(right.item.title)
     || left.item.token.localeCompare(right.item.token)
   return scoped
-    .flatMap(group => group.status === 'success' ? group.items.map(item => ({ item, group })) : [])
-    .filter(({ group }) => filters.enabledSiteTypes.includes(group.site_type))
+    .flatMap(group => group.items.map(item => ({ item, group })))
+    .filter(({ group, item }) => filters.enabledSiteTypes.includes(resultSiteType(item, group.site_type)))
+    .filter(({ item }) => !filters.resultTypes?.length || !item.result_type || filters.resultTypes.includes(item.result_type))
     .filter(({ item }) => !resolution || item.specifications?.resolution === resolution || item.quality === resolution)
-    .filter(({ item }) => item.source_kind === '115_share' || !promotion || item.promotion?.toLowerCase() === promotion)
-    .filter(({ item }) => item.source_kind === '115_share' || filters.minimumSeeders == null || (item.seeders ?? -1) >= filters.minimumSeeders)
+    .filter(({ item, group }) => resultSiteType(item, group.site_type) === 'cloud_share' || !promotion || item.promotion?.toLowerCase() === promotion)
+    .filter(({ item, group }) => resultSiteType(item, group.site_type) === 'cloud_share' || filters.minimumSeeders == null || (item.seeders ?? -1) >= filters.minimumSeeders)
     .sort((left, right) => {
       if (filters.sort === 'published') return compareOptionalNumber(timestamp(left.item.published_at), timestamp(right.item.published_at)) || left.group.site_id - right.group.site_id
       if (filters.sort === 'size') return compareOptionalNumber(left.item.size_bytes, right.item.size_bytes) || stableTieBreak(left, right)
@@ -447,6 +543,9 @@ export function readTorrentSearchSession(storage: SearchSessionStorage | undefin
       return null
     }
     if (value.input.searchBy !== 'title' && value.input.searchBy !== 'tmdb_id') return null
+    if (value.input.typePolicy !== undefined && !['auto', 'all', 'manual'].includes(value.input.typePolicy)) return null
+    const cloudTypes = Array.isArray(value.input.cloudTypes) ? [...new Set(value.input.cloudTypes.filter(type => discoveryTypeOptions.some(option => option[0] === type)))].slice(0, discoveryTypeOptions.length) : undefined
+    if (value.input.typePolicy === 'manual' && !cloudTypes?.length) return null
     const scopeSiteID = typeof value.input.siteID === 'number' && Number.isInteger(value.input.siteID) && value.input.siteID > 0 ? value.input.siteID : undefined
     const scopeSiteIDs = Array.isArray(value.input.siteIDs) ? [...new Set(value.input.siteIDs.filter((id): id is number => typeof id === 'number' && Number.isInteger(id) && id > 0))].slice(0, 64) : undefined
     // Sessions created before explicit site scoping must never revive the old
@@ -479,6 +578,8 @@ export function readTorrentSearchSession(storage: SearchSessionStorage | undefin
         searchBy: value.input.searchBy,
         siteID: scopeSiteID,
         siteIDs: scopeSiteIDs,
+        typePolicy: value.input.typePolicy,
+        cloudTypes,
       },
       groups,
       recognitions,

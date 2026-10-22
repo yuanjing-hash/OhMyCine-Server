@@ -43,6 +43,7 @@ func (s *DownloadService) RetargetCompletedImport(ctx context.Context, actor Act
 	switch task.SourceOrigin {
 	case models.DownloadSourceOriginShare:
 		sourceKind = downloadpkg.SourcePan115Share
+		if task.ProviderType == models.DownloaderTypeQuarkShare { sourceKind = downloadpkg.SourceQuarkShare }
 	case models.DownloadSourceOriginProviderIngest:
 		sourceKind = downloadpkg.SourceProviderItem
 	}

@@ -20,18 +20,24 @@ import (
 )
 
 type versionedReorganizationFixture struct {
-	store    *CatalogSnapshotStore
-	worker   *MediaReorganizationWorker
-	library  models.MediaLibrary
-	storage  models.Storage
-	profile  models.MediaClassificationProfile
-	task     models.MediaReorganizationTask
-	download models.DownloadTask
-	plan     reorganizationPlan
-	state    reorganizationState
-	claim    ClaimedJob
-	entries  []models.MediaLibraryEntry
-	driver   *fakeMutationCloudDriver
+	store       *CatalogSnapshotStore
+	worker      *MediaReorganizationWorker
+	library     models.MediaLibrary
+	storage     models.Storage
+	profile     models.MediaClassificationProfile
+	task        models.MediaReorganizationTask
+	download    models.DownloadTask
+	plan        reorganizationPlan
+	state       reorganizationState
+	claim       ClaimedJob
+	entries     []models.MediaLibraryEntry
+	driver      *fakeMutationCloudDriver
+	quarkDriver *quarkTransferFake
+}
+
+func newQuarkReorganizationFixture(t *testing.T, artifacts bool) versionedReorganizationFixture {
+	t.Helper()
+	return newVersionedReorganizationFixture(t, true, artifacts, true)
 }
 
 func newVersionedReorganizationFixture(t *testing.T, provider ...bool) versionedReorganizationFixture {
@@ -55,14 +61,25 @@ func newVersionedReorganizationFixture(t *testing.T, provider ...bool) versioned
 		library.ArtifactGeneration = 3
 	}
 	var driver *fakeMutationCloudDriver
+	var quarkDriver *quarkTransferFake
 	if len(provider) > 0 && provider[0] {
 		connection := models.Connection{Name: "reorg115", NameNormalized: "reorg115", Provider: cloudpkg.ProviderPan115, Enabled: true, Revision: 1}
+		isQuark := len(provider) > 2 && provider[2]
+		if isQuark {
+			connection.Name, connection.NameNormalized, connection.Provider = "reorg-quark", "reorg-quark", cloudpkg.ProviderQuark
+		}
 		if err := store.writeDB.Create(&connection).Error; err != nil {
 			t.Fatal(err)
 		}
 		storage.RootPath, storage.Type, storage.ConnectionID = "storage-root", models.StorageTypePan115, &connection.ID
+		if isQuark {
+			storage.Type = models.StorageTypeQuark
+		}
 		library.ProviderRootID = "library-root"
 		driver = newFakeMutationCloudDriver()
+		if isQuark {
+			quarkDriver = makeQuarkTransferFake(driver)
+		}
 		for _, item := range []cloudpkg.Item{{ID: "0", Name: "root", IsDir: true}, {ID: "storage-root", Name: "storage", ParentID: "0", IsDir: true}, {ID: "library-root", ParentID: "storage-root", Name: "library", IsDir: true}, {ID: "show-root", ParentID: "library-root", Name: "Show", IsDir: true}, {ID: "old-parent", ParentID: "show-root", Name: "Season 02", IsDir: true}} {
 			driver.items[item.ID] = item
 		}
@@ -102,11 +119,26 @@ func newVersionedReorganizationFixture(t *testing.T, provider ...bool) versioned
 	}
 	rec.ManualOverride = true
 	catalogConvert(t, store, library, rec, entries)
+	if quarkDriver != nil {
+		// Generic catalog fixtures use symbolic fingerprints. This integration
+		// exercises the real physical owner/source fence and must use real ones.
+		fingerprints := map[string]any{"source_fingerprint": catalogSourceFingerprint(library, storage), "config_fingerprint": catalogConfigFingerprint(library, storage, profile)}
+		if err := store.writeDB.Model(&models.CatalogHead{}).Where("library_id=?", library.ID).Updates(fingerprints).Error; err != nil {
+			t.Fatal(err)
+		}
+		if err := store.writeDB.Model(&models.CatalogSnapshot{}).Where("library_id=?", library.ID).Updates(fingerprints).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
 	audit := NewAuditService(store.writeDB)
 	queue := NewQueueService(store.writeDB, audit)
 	service := NewMediaReorganizationService(store.writeDB, audit, queue, nil, nil, zerolog.Nop())
 	if driver != nil {
-		service.connections = &ConnectionService{db: store.writeDB, drivers: map[uint]cloudpkg.Driver{*storage.ConnectionID: driver}}
+		var cached cloudpkg.Driver = driver
+		if quarkDriver != nil {
+			cached = quarkDriver
+		}
+		service.connections = &ConnectionService{db: store.writeDB, drivers: map[uint]cloudpkg.Driver{*storage.ConnectionID: cached}}
 	}
 	libraries := NewMediaLibraryService(store.writeDB, audit, zerolog.Nop())
 	libraries.SetCatalogSnapshotStore(store)
@@ -173,7 +205,7 @@ func newVersionedReorganizationFixture(t *testing.T, provider ...bool) versioned
 	if err != nil || claim == nil {
 		t.Fatalf("claim %v", err)
 	}
-	return versionedReorganizationFixture{store: store, worker: NewMediaReorganizationWorker(service), library: library, storage: storage, profile: profile, task: task, download: download, plan: plan, state: state, claim: *claim, entries: entries, driver: driver}
+	return versionedReorganizationFixture{store: store, worker: NewMediaReorganizationWorker(service), library: library, storage: storage, profile: profile, task: task, download: download, plan: plan, state: state, claim: *claim, entries: entries, driver: driver, quarkDriver: quarkDriver}
 }
 
 func (f versionedReorganizationFixture) run() WorkerResult {

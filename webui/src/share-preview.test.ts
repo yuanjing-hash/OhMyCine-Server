@@ -7,6 +7,20 @@ import type { DownloaderSummary } from '@/types/api'
 import { shareValidationLabel, type ShareValidation, type SharePreview } from '@/share-preview'
 vi.mock('@/api/client', async importOriginal => ({ ...await importOriginal<typeof import('@/api/client')>(), api: vi.fn() }))
 describe('share preview selection', () => {
+ it('previews Quark using only the matching receiver even when 115 is first', async () => {
+  vi.mocked(api).mockClear()
+  vi.mocked(api).mockResolvedValue({ token: 'quark-preview', total_size: 0, file_count: 0, expires_at: new Date(Date.now() + 300000).toISOString(), entries: [] })
+  const receivers = [
+   { id: '115', name: '115 first', type: 'pan115_offline', enabled: true, capabilities: { share_receive: true } },
+   { id: 'quark', name: 'Quark', type: 'quark_share', enabled: true, capabilities: { share_receive: true } },
+  ] as DownloaderSummary[]
+  const wrapper = mount(SharePreviewDialog, { props: { title: 'Show', resultToken: 'quark-claim', sourceKind: 'quark_share', downloaders: receivers } })
+  await flushPromises()
+  expect(wrapper.find('select').findAll('option').map(option => option.element.value)).toEqual(['', 'quark'])
+  const call = vi.mocked(api).mock.calls.find(([url]) => url.endsWith('/share-preview'))
+  expect(JSON.parse(String(call?.[1]?.body))).toMatchObject({ result_token: 'quark-claim', downloader_id: 'quark' })
+  wrapper.unmount()
+ })
  it('only submits selected leaves, reports their size, and closing aborts recognition', async () => {
   const response: SharePreview = { token: 'preview', total_size: 110, file_count: 2, expires_at: new Date(Date.now() + 300000).toISOString(), entries: [
    { token: 'dir', path: 'Movies', name: 'Movies', is_dir: true, size: 110 },

@@ -49,7 +49,21 @@ func (s *MediaLibraryStructureService) runCatalogStructureRepair(ctx context.Con
 		}
 	}
 	physicalDone := state.Stage == "physical_completed"
+	var library models.MediaLibrary
+	var storage models.Storage
 	fail := func(err error) WorkerResult {
+		if storage.Type == models.StorageTypeQuark {
+			if waiting, ok := quarkStructureWaitResult(err); ok {
+				if saveErr := s.structureCatalogWriteTx(ctx, func(tx *gorm.DB) error {
+					if err := s.validateCatalogStructureExecutionTx(tx, repair, state, claim, true); err != nil {
+						return err
+					}
+					return persistCatalogStructureStateTx(tx, repair.ID, state, map[string]any{"phase": "executing", "last_error_code": waiting.ErrorCode})
+				}); saveErr == nil {
+					return waiting
+				}
+			}
+		}
 		cloudCode, _ := cloudpkg.ErrorInfo(err)
 		if cloudCode == cloudpkg.CodeAuthExpired || ErrorCode(err) == cloudpkg.CodeAuthExpired {
 			return s.waitRepairCredentials(ctx, repair, claim)
@@ -104,8 +118,6 @@ func (s *MediaLibraryStructureService) runCatalogStructureRepair(ctx context.Con
 		}
 		return WorkerResult{}
 	}
-	var library models.MediaLibrary
-	var storage models.Storage
 	if err := s.withCatalogRead(ctx, repair.LibraryID, func(tx *gorm.DB, _ *CatalogReader) error {
 		if err := s.validateCatalogStructureExecutionTx(tx, repair, state, claim, true); err != nil {
 			return err
@@ -123,6 +135,12 @@ func (s *MediaLibraryStructureService) runCatalogStructureRepair(ctx context.Con
 	backend, err := s.backends.Get(storage.Type)
 	if err != nil {
 		return fail(err)
+	}
+	if storage.Type == models.StorageTypeQuark {
+		backend, err = s.bindQuarkStructureBackend(ctx, repair, plan, &state, claim, StructureBoundary{Library: library, Storage: storage})
+		if err != nil {
+			return fail(err)
+		}
 	}
 	if err := s.validateStructureSelectionSafety(ctx, plan); err != nil {
 		return fail(err)
@@ -228,6 +246,9 @@ func (s *MediaLibraryStructureService) runCatalogStructureRepair(ctx context.Con
 		}
 		execution := s.executeStructureRepairItems(ctx, runtime, repair, fullPlan, boundary, backend, claim)
 		if execution.GlobalErr != nil {
+			if storage.Type == models.StorageTypeQuark {
+				return fail(execution.GlobalErr)
+			}
 			if execution.RetryAt != nil {
 				_ = s.structureRepairCheckpointTx(ctx, repair, claim, func(tx *gorm.DB) error {
 					return tx.Model(&models.MediaLibraryStructureRepair{}).Where("id = ?", repair.ID).Updates(map[string]any{"phase": "queued", "last_error_code": execution.GlobalCode, "updated_at": time.Now().UTC()}).Error
@@ -280,6 +301,19 @@ func (s *MediaLibraryStructureService) runCatalogStructureRepair(ctx context.Con
 			return fail(err)
 		}
 	}
+	if quarkBackend, ok := backend.(quarkMediaLibraryStructureBackend); ok {
+		facts := prepared.Facts
+		evidence, err := quarkBackend.confirmedFacts(ctx, boundary, plan, &facts)
+		if err != nil {
+			return fail(err)
+		}
+		s.abandonCatalogStructureCandidate(&prepared)
+		prepared, err = s.prepareCatalogStructureCandidate(ctx, repair, state, claim, facts)
+		if err != nil {
+			return fail(err)
+		}
+		prepared.quarkEvidence = evidence
+	}
 	if err := s.publishCatalogStructureRepair(ctx, repair, plan, &state, claim, &prepared); err != nil {
 		return fail(err)
 	}
@@ -303,6 +337,12 @@ func (s *MediaLibraryStructureService) publishCatalogStructureRepair(ctx context
 				}
 			} else if err := guard(tx); err != nil {
 				return err
+			}
+			if state.ObservationHoldVersion != 0 {
+				if err := confirmQuarkStructureObservationTx(tx, repair, plan, *state, prepared.quarkEvidence); err != nil {
+					return err
+				}
+				nextState.ObservationHoldVersion = 0
 			}
 			var library models.MediaLibrary
 			if err := tx.First(&library, repair.LibraryID).Error; err != nil {
@@ -352,13 +392,14 @@ func (s *MediaLibraryStructureService) publishCatalogStructureRepair(ctx context
 		}); err != nil {
 			return err
 		}
-		facts := prepared.Facts
+		facts, evidence := prepared.Facts, prepared.quarkEvidence
 		s.abandonCatalogStructureCandidate(prepared)
 		var prepareErr error
 		*prepared, prepareErr = s.prepareCatalogStructureCandidate(ctx, repair, *state, claim, facts)
 		if prepareErr != nil {
 			return prepareErr
 		}
+		prepared.quarkEvidence = evidence
 	}
 	return ErrCatalogFence
 }

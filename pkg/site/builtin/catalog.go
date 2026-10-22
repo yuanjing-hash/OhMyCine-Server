@@ -51,7 +51,7 @@ type Definition struct {
 }
 
 var definitions = []Definition{
-	{Key: pansou.Kind, Name: "TG 网盘资源 · PanSou", Engine: "pansou", SiteType: SiteTypeCloud, CredentialKind: CredentialNone, Search: true, Download: true},
+	{Key: pansou.Kind, Name: "盘搜 · 网盘与磁力", Engine: "pansou", SiteType: SiteTypeCloud, CredentialKind: CredentialNone, Search: true, Download: true},
 	nexusDefinition("pttime", "PTTime", true, "https://www.pttime.org", "https://www.pttime.me"),
 	nexusDefinition("sewerpt", "下水道 · SewerPT", true, "https://sewerpt.com"),
 	nexusDefinition("panda", "熊猫高清 · PandaPT", true, "https://pandapt.net"),

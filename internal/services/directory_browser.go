@@ -220,7 +220,7 @@ func (s *DirectoryBrowserService) StorageToken(ctx context.Context, actor Actor,
 	if err := s.db.First(&record, storageID).Error; err != nil {
 		return DirectoryListing{}, storageNotFound(err)
 	}
-	if record.Type == models.StorageTypePan115 {
+	if models.IsNativeCloudStorage(record.Type) {
 		if s.provider == nil {
 			return DirectoryListing{}, appError(CodeDirectoryUnavailable, "网盘目录服务不可用", nil)
 		}

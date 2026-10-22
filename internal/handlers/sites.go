@@ -242,6 +242,17 @@ func parsePTSearch(c *gin.Context) (services.SiteSearchInput, error) {
 		return input, err
 	}
 	input.SiteID, input.SiteIDs = siteID, siteIDs
+	mixed, err := parseMixedDiscovery(c)
+	if err != nil {
+		return input, err
+	}
+	input.ClientCapabilities, input.TypePolicy, input.CloudTypes, input.SnapshotID, input.Refresh = mixed.ClientCapabilities, mixed.TypePolicy, mixed.CloudTypes, mixed.SnapshotID, mixed.Refresh
+	if input.SnapshotID != "" && input.SiteID == nil {
+		return input, invalid("搜索快照仅用于单站翻页", nil)
+	}
+	if input.Refresh && input.Page != 1 {
+		return input, invalid("刷新搜索必须从第一页开始", nil)
+	}
 	return input, nil
 }
 
@@ -284,6 +295,17 @@ func parseMediaIdentitySearch(c *gin.Context) (services.MediaIdentitySearchInput
 	}
 	if input.SiteID, input.SiteIDs, err = parseSearchSiteScope(c); err != nil {
 		return input, err
+	}
+	mixed, err := parseMixedDiscovery(c)
+	if err != nil {
+		return input, err
+	}
+	input.ClientCapabilities, input.TypePolicy, input.CloudTypes, input.SnapshotID, input.Refresh = mixed.ClientCapabilities, mixed.TypePolicy, mixed.CloudTypes, mixed.SnapshotID, mixed.Refresh
+	if input.SnapshotID != "" && input.SiteID == nil {
+		return input, invalid("搜索快照仅用于单站翻页", nil)
+	}
+	if input.Refresh && input.Page != 1 {
+		return input, invalid("刷新搜索必须从第一页开始", nil)
 	}
 	return input, nil
 }

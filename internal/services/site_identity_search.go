@@ -14,18 +14,25 @@ import (
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/mediarecognition"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/metadata/tmdb"
+	sitepkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/site"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/site/builtin"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/site/pansou"
 	"golang.org/x/text/cases"
 	"golang.org/x/text/unicode/norm"
 )
 
 type MediaIdentitySearchInput struct {
-	MediaType string
-	TMDBID    int64
-	Season    *int
-	Page      int
-	SiteID    *uint
-	SiteIDs   []uint
+	MediaType          string
+	TMDBID             int64
+	Season             *int
+	Page               int
+	SiteID             *uint
+	SiteIDs            []uint
+	ClientCapabilities []string
+	TypePolicy         string
+	CloudTypes         []string
+	SnapshotID         string
+	Refresh            bool
 }
 
 type MediaIdentitySearchResult struct {
@@ -113,13 +120,20 @@ func (s *SiteService) SearchMediaIdentityEachProgress(ctx context.Context, actor
 }
 
 func (s *SiteService) searchMediaIdentitySite(ctx context.Context, actor Actor, input MediaIdentitySearchInput, verified tmdb.Match, names []tmdb.SearchName, record models.Site) SiteSearchGroup {
+	if record.Kind == pansou.Kind {
+		return s.searchPanSouIdentitySite(ctx, actor, input, verified, names, record)
+	}
+	return s.searchMediaIdentitySitePage(ctx, actor, input, verified, names, record)
+}
+
+func (s *SiteService) searchMediaIdentitySitePage(ctx context.Context, actor Actor, input MediaIdentitySearchInput, verified tmdb.Match, names []tmdb.SearchName, record models.Site) SiteSearchGroup {
 	var target *SiteSearchGroup
 	privateKeys := make(map[string]int)
 	for _, name := range names {
 		if ctx.Err() != nil {
 			break
 		}
-		group := s.searchSite(ctx, actor, record, SiteSearchInput{Keyword: name.Value, MediaType: input.MediaType, SearchBy: "title", Year: identitySearchYear(input.MediaType, verified.ReleaseYear), TMDBID: &input.TMDBID, Page: input.Page, SiteID: &record.ID})
+		group := s.searchSite(ctx, actor, record, SiteSearchInput{Keyword: name.Value, MediaType: input.MediaType, SearchBy: "title", Year: identitySearchYear(input.MediaType, verified.ReleaseYear), TMDBID: &input.TMDBID, Page: input.Page, SiteID: &record.ID, ClientCapabilities: input.ClientCapabilities, TypePolicy: input.TypePolicy, CloudTypes: input.CloudTypes, Refresh: input.Refresh})
 		if target == nil {
 			copy := group
 			copy.Items = []SiteSearchResult{}
@@ -129,6 +143,23 @@ func (s *SiteService) searchMediaIdentitySite(ctx context.Context, actor Actor, 
 		}
 		target.HasNext = target.HasNext || group.HasNext
 		target.Skipped += group.Skipped
+		target.Partial = target.Partial || group.Partial
+		target.Truncated = target.Truncated || group.Truncated
+		if group.Completion != "" {
+			target.Completion = group.Completion
+		}
+		for _, warning := range group.Warnings {
+			present := false
+			for _, saved := range target.Warnings {
+				if saved.Code == warning.Code {
+					present = true
+					break
+				}
+			}
+			if !present {
+				target.Warnings = append(target.Warnings, warning)
+			}
+		}
 		if group.Status == "success" {
 			target.Status, target.ErrorCode = "success", ""
 		} else {
@@ -148,12 +179,12 @@ func (s *SiteService) searchMediaIdentitySite(ctx context.Context, actor Actor, 
 				continue
 			}
 			identity := claim.TorrentID
-			if item.SourceKind == "115_share" && item.ResourceFingerprint != "" {
+			if (isCloudShareSource(item.SourceKind) || item.SourceKind == RouteSourceBT) && item.ResourceFingerprint != "" {
 				identity = item.ResourceFingerprint
 			}
 			key := strconv.FormatUint(uint64(group.SiteID), 10) + ":" + identity
 			index, duplicate := privateKeys[key]
-			if duplicate && (item.SourceKind != "115_share" || compareOptionalTime(item.Published, target.Items[index].Published) <= 0) {
+			if duplicate && (!isCloudShareSource(item.SourceKind) || compareOptionalTime(item.Published, target.Items[index].Published) <= 0) {
 				s.deleteClaim(item.Token)
 				continue
 			}
@@ -176,6 +207,10 @@ func (s *SiteService) searchMediaIdentitySite(ctx context.Context, actor Actor, 
 	if target == nil {
 		definition, _ := builtin.DefinitionForKey(record.Kind)
 		return SiteSearchGroup{SiteID: record.ID, SiteName: record.Name, SiteType: definition.SiteType, Status: "error", ErrorCode: CodeSiteUnavailable, Page: input.Page, Items: []SiteSearchResult{}}
+	}
+	if record.Kind == pansou.Kind && target.ErrorCount > 0 && target.Status == "success" {
+		target.Partial = true
+		target.Warnings = append(target.Warnings, sitepkg.SearchWarning{Code: "pansou_alias_search_incomplete", Message: "部分作品名称搜索未完成，已保留成功返回的结果"})
 	}
 	sort.SliceStable(target.Items, func(left, right int) bool {
 		leftSeeders, rightSeeders := intValue(target.Items[left].Seeders), intValue(target.Items[right].Seeders)

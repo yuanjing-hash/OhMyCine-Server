@@ -253,6 +253,7 @@ func NewMediaLibraryStructureService(db *gorm.DB, audit *AuditService, queue *Qu
 	service := &MediaLibraryStructureService{db: db, audit: audit, queue: queue, connections: connections, log: log, confirmKey: key}
 	service.backends = NewMediaLibraryStructureBackendRegistry(
 		localMediaLibraryStructureBackend{},
+		quarkMediaLibraryStructureBackend{},
 		pan115MediaLibraryStructureBackend{driver: func(connectionID uint) (cloudpkg.Driver, error) {
 			if service.connections == nil {
 				return nil, errors.New("provider connection is unavailable")
@@ -1084,7 +1085,7 @@ func (s *MediaLibraryStructureService) Repairs(actor Actor, libraryID uint, limi
 // EnsureWorkLayout repairs only an already indexed matching work before a new
 // transfer is planned. It is intentionally synchronous: a failed repair must
 // prevent Transfer from creating a second directory tree for the same work.
-func (s *MediaLibraryStructureService) EnsureWorkLayout(ctx context.Context, ownerID, libraryID uint, tmdbID int64, mediaType string) error {
+func (s *MediaLibraryStructureService) EnsureWorkLayout(ctx context.Context, ownerID, libraryID uint, tmdbID int64, mediaType string, claims ...*ClaimedJob) error {
 	if tmdbID <= 0 || (mediaType != "movie" && mediaType != "tv") {
 		return nil
 	}
@@ -1098,16 +1099,35 @@ func (s *MediaLibraryStructureService) EnsureWorkLayout(ctx context.Context, own
 	if err != nil {
 		return err
 	}
+	var sourceLibrary models.MediaLibrary
+	var sourceStorage models.Storage
+	if err := s.db.WithContext(ctx).First(&sourceLibrary, libraryID).Error; err != nil {
+		return err
+	}
+	if err := s.db.WithContext(ctx).First(&sourceStorage, sourceLibrary.StorageID).Error; err != nil {
+		return err
+	}
+	var parentClaim *ClaimedJob
+	if sourceStorage.Type == models.StorageTypeQuark && len(claims) > 0 {
+		parentClaim = claims[0]
+	}
 	// A synchronous transfer repair has a durable receipt too. Resume its
 	// published bookkeeping before planning again; a now-correct path must not
 	// strand the previous repair's pending ready event after a process restart.
 	var prior models.MediaLibraryStructureRepair
-	if err := s.db.WithContext(ctx).Where("library_id = ? AND scope = ? AND work_key = ? AND job_id IS NULL AND phase <> ?", libraryID, models.MediaLibraryStructureScopeWork, match.WorkKey, "completed").Order("created_at DESC").First(&prior).Error; err == nil {
+	priorQuery := s.db.WithContext(ctx).Where("library_id = ? AND scope = ? AND work_key = ? AND phase <> ?", libraryID, models.MediaLibraryStructureScopeWork, match.WorkKey, "completed")
+	if sourceStorage.Type != models.StorageTypeQuark {
+		priorQuery = priorQuery.Where("job_id IS NULL")
+	}
+	if err := priorQuery.Order("created_at DESC").First(&prior).Error; err == nil {
+		if sourceStorage.Type == models.StorageTypeQuark && ((prior.JobID != nil && (parentClaim == nil || *prior.JobID != parentClaim.Job.ID)) || prior.JobID == nil && parentClaim != nil) {
+			return ErrCatalogFence
+		}
 		var state structureCatalogRepairState
 		if json.Unmarshal([]byte(prior.StateJSON), &state) == nil && state.Version == 1 {
-			result := s.runRepair(ctx, nil, prior.ID)
-			if result.ErrorCode != "" || result.RetryAt != nil {
-				return appError(result.ErrorCode, result.ErrorMessage, nil)
+			result := s.runRepair(ctx, nil, prior.ID, parentClaim)
+			if err := structureRepairResultError(result); err != nil {
+				return err
 			}
 		}
 	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
@@ -1125,12 +1145,18 @@ func (s *MediaLibraryStructureService) EnsureWorkLayout(ctx context.Context, own
 	if err != nil {
 		return err
 	}
+	if storage.Type == models.StorageTypeQuark && plan.catalogFence == nil {
+		return ErrCatalogFence
+	}
 	raw, err := json.Marshal(plan)
 	if err != nil {
 		return err
 	}
 	now := time.Now().UTC()
 	repair := models.MediaLibraryStructureRepair{ID: uuid.NewString(), OwnerID: ownerID, LibraryID: libraryID, Scope: models.MediaLibraryStructureScopeWork, WorkKey: match.WorkKey, RuleFingerprint: plan.RuleFingerprint, Generation: plan.Generation, PlanJSON: string(raw), StateJSON: `{}`, Phase: "executing", IssueCount: plan.IssueCount, TotalItems: len(plan.Items), CreatedAt: now, UpdatedAt: now}
+	if parentClaim != nil {
+		repair.JobID = &parentClaim.Job.ID
+	}
 	if err := s.structureCatalogWriteTx(ctx, func(tx *gorm.DB) error {
 		if err := AssertCatalogPhysicalAdmissionTx(tx, libraryID); err != nil {
 			return err
@@ -1138,16 +1164,41 @@ func (s *MediaLibraryStructureService) EnsureWorkLayout(ctx context.Context, own
 		if err := s.freezeCatalogStructureRepairTx(tx, &repair, plan); err != nil {
 			return err
 		}
+		if parentClaim != nil {
+			if s.queue == nil {
+				return ErrCatalogFence
+			}
+			if _, err := s.queue.verifyLease(tx, parentClaim.Job.ID, parentClaim.LeaseToken); err != nil {
+				return err
+			}
+			var payload transferJobPayload
+			if json.Unmarshal([]byte(parentClaim.Job.PayloadJSON), &payload) != nil || payload.TransferTaskID == "" {
+				return ErrCatalogFence
+			}
+			if _, err := quarkStructureParentTx(tx, repair, payload.TransferTaskID); err != nil {
+				return err
+			}
+			var state structureCatalogRepairState
+			if json.Unmarshal([]byte(repair.StateJSON), &state) != nil || state.Version != 1 {
+				return ErrCatalogFence
+			}
+			state.ParentTransferID = payload.TransferTaskID
+			raw, err := json.Marshal(state)
+			if err != nil {
+				return err
+			}
+			repair.StateJSON = string(raw)
+			// The parent is already running, so its exact lease is checked above;
+			// EnterCatalogPhysicalWrite creates this repair's own physical proof.
+			return tx.Create(&repair).Error
+		}
 		return RegisterCatalogPhysicalOwnerTx(tx, CatalogPhysicalWriteInput{LibraryID: libraryID, OwnerKind: CatalogPhysicalRepair, OwnerID: repair.ID, ActorID: repair.OwnerID}, func(tx *gorm.DB) error { return tx.Create(&repair).Error })
 	}); err != nil {
 		return err
 	}
 	if plan.catalogFence != nil {
-		result := s.runCatalogStructureRepair(ctx, nil, repair, plan, nil)
-		if result.ErrorCode != "" || result.RetryAt != nil {
-			return appError(result.ErrorCode, result.ErrorMessage, nil)
-		}
-		return nil
+		result := s.runCatalogStructureRepair(ctx, nil, repair, plan, parentClaim)
+		return structureRepairResultError(result)
 	}
 	permit, err := enterCatalogPhysicalWrite(ctx, s.db, CatalogPhysicalWriteInput{LibraryID: libraryID, OwnerKind: CatalogPhysicalRepair, OwnerID: repair.ID, ActorID: ownerID})
 	if err != nil {
