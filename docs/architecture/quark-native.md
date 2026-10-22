@@ -24,6 +24,20 @@ TV 与 Agent 的令牌更新共用连接级互斥与同一密文版本的 CAS。
 
 TV 和 Agent 的账号 ID、文件 ID 保留各自命名空间。共同空间验证在选定根下写入极小随机文件，再由 TV 独立定位并读取内容，保存根范围的共同访问证明。该证明不等于官方账号等价声明。更换账号、授权身份或验证根后，旧证明不再适用。
 
+验证文件的随机名称和全部 32 字节先进入加密收据，上传使用固定的子操作。只有明确尚未发送请求的 `prepared/prepare` 检查点可以继续同一次申请；`pre_inflight` 或 `finish_inflight` 的结果不明时，只独立读取原目录、Agent 身份与完整 TV 内容，核对随机挑战后恢复原收据。空目录、同名同大小、HTTP 400 或账号已登录均不能授权重新上传。普通媒体上传不因此获得按名称认领的能力。安全上传阶段及有界 HTTP/errno 保存到原收据，重试不会抹掉原始诊断。
+
+证明已保存到凭据后，Server 只清理该收据拥有的精确验证文件。清理前重新核对账号、根、证明代际、Agent/TV 文件身份、名称、大小和全部随机字节；最终提交与凭据更新共用连接锁。清理意图在请求前持久化，结果不明后只核对原身份，不重新发送删除。独立完整目录读取确认原身份均已不在所选根中时，界面显示“原验证文件已不在所选目录中”。这不宣称永久清除、回收站能力或 Agent 账号权益已通过真实验收；同名替换项和其他目录中的文件均不会被删除。该私有清理不开放普通文件删除能力，也不需要 Web 第三次登录。
+
+清理等待不撤销已保存的共同访问证明，不阻止 Storage 创建/使用，也不重新上传。API 只公开安全状态，不公开收据、账号或提供方文件 ID：
+
+| 接口 | 合同 |
+| --- | --- |
+| `GET /api/v1/connections/:id/quark/status` | 增加 `root_cleanup_pending`；读取状态不执行清理。 |
+| `POST /api/v1/connections/:id/quark/verify-root` | 成功仍返回 `verified/path/message`，另含可选 `cleanup_state`（`pending/complete`）与固定 `cleanup_message`。 |
+| `POST /api/v1/connections/:id/quark/cleanup` | 严格空 JSON `{}`，不接受路径/文件/收据参数；只处理当前凭据中已保存的原证明，返回 `pending/message`。单次最多 8 个原证明、45 秒；失败可继续核对。 |
+
+清理接口与验证接口使用 Session、Origin/CSRF、`no-store`，要求 `connections.update`、`connections.read`、`storages.browse` 及 `storages.create` 或 `storages.update`。运行诊断使用固定 `reason=connection.quark.root.verify.failed`、`phase/error_code` 和有界提供方数字，不把普通日志伪装成受信业务 `event_code`。
+
 目录与媒体清单采用 TV 身份。管理写操作前重新定位对应 Agent 身份；写完后独立映射回 TV，检查父目录、名称、类型和大小。不能把一种接口的 ID 直接交给另一种接口，也不能只凭相同文件名认定同一文件。
 
 ## 播放与文件传输分开

@@ -665,6 +665,10 @@ func downloaderPurpose(id, field string) string { return "downloader:" + id + ":
 func (s *DownloaderService) summary(actor Actor, record models.Downloader) DownloaderSummary {
 	var capabilities downloadpkg.Capabilities
 	_ = json.Unmarshal([]byte(record.CapabilitiesJSON), &capabilities)
+	if isCloudShareDownloader(record.Type) {
+		_, err := s.configuredShareReceiver(context.Background(), record)
+		capabilities.ShareReceive = err == nil && actor.CanResource(authz.PermissionDownloadsCreate, models.AuthorizationResourceDownloader, record.ID)
+	}
 	name := ""
 	var defaultLibraryID *uint
 	defaultLibraryName := ""

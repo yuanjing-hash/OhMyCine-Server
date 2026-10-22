@@ -36,23 +36,24 @@ type uploadPart struct {
 	ETag   string `json:"etag"`
 }
 type uploadPayload struct {
-	Parent       string              `json:"parent"`
-	Name         string              `json:"name"`
-	Size         int64               `json:"size"`
-	SHA1         string              `json:"sha1"`
-	MD5          string              `json:"md5"`
-	SHA256       string              `json:"sha256"`
-	TaskID       string              `json:"task_id"`
-	Handle       string              `json:"handle"`
-	PartSize     int64               `json:"part_size"`
-	Headers      map[string]string   `json:"common_headers"`
-	Destinations []uploadDestination `json:"upload_urls"`
-	Parts        []uploadPart        `json:"parts"`
-	InFlightPart int                 `json:"inflight_part"`
-	Phase        string              `json:"phase"`
-	Output       *cloud.Item         `json:"output,omitempty"`
-	Target       *operationTarget    `json:"target,omitempty"`
-	Mapping      *operationMapping   `json:"mapping,omitempty"`
+	Parent        string                  `json:"parent"`
+	Name          string                  `json:"name"`
+	Size          int64                   `json:"size"`
+	SHA1          string                  `json:"sha1"`
+	MD5           string                  `json:"md5"`
+	SHA256        string                  `json:"sha256"`
+	TaskID        string                  `json:"task_id"`
+	Handle        string                  `json:"handle"`
+	PartSize      int64                   `json:"part_size"`
+	Headers       map[string]string       `json:"common_headers"`
+	Destinations  []uploadDestination     `json:"upload_urls"`
+	Parts         []uploadPart            `json:"parts"`
+	InFlightPart  int                     `json:"inflight_part"`
+	Phase         string                  `json:"phase"`
+	Output        *cloud.Item             `json:"output,omitempty"`
+	Target        *operationTarget        `json:"target,omitempty"`
+	Mapping       *operationMapping       `json:"mapping,omitempty"`
+	SubmitFailure *operationSubmitFailure `json:"submit_failure,omitempty"`
 }
 type contextReader struct {
 	ctx context.Context
@@ -193,8 +194,12 @@ func (d *Client) upload(ctx context.Context, id string, request cloud.UploadRequ
 		if r.State == "confirmed" && p.Output != nil {
 			return *p.Output, nil
 		}
-		if r.State != "accepted" && r.State != "unknown" || p.Phase == "finish_inflight" || p.Handle == "" && (p.TaskID == "" || p.PartSize <= 0) {
-			return cloud.Item{}, failure(cloud.CodeMutationUnknown)
+		prepared := challenge && r.State == "prepared" && p.Phase == "prepare"
+		if !prepared && (r.State != "accepted" && r.State != "unknown" || p.Phase == "finish_inflight" || p.Handle == "" && (p.TaskID == "" || p.PartSize <= 0)) {
+			if challenge {
+				return d.recoverChallengeUpload(ctx, &r, p)
+			}
+			return cloud.Item{}, uploadUnknownError(p)
 		}
 	} else {
 		if !errors.Is(e, cloud.ErrOperationNotFound) {
@@ -220,8 +225,7 @@ func (d *Client) upload(ctx context.Context, id string, request cloud.UploadRequ
 		// Check a renewed Node grant before creating the first durable intent.
 		// A denied grant has not submitted anything and must remain retryable;
 		// an already prepared/in-flight receipt keeps its no-replay semantics.
-		current, e := d.uploadAuthorization(ctx, a)
-		if e != nil {
+		if _, e := d.uploadAuthorization(ctx, a); e != nil {
 			return cloud.Item{}, e
 		}
 		r = cloud.OperationReceipt{ID: id, Provider: cloud.ProviderQuark, Route: string(RouteAgent), AccountID: a.AccountID, Kind: "upload", Revision: 1, State: "prepared", UpdatedAt: d.api.clock()}
@@ -229,14 +233,33 @@ func (d *Client) upload(ctx context.Context, id string, request cloud.UploadRequ
 		if e = d.config.Operations.Create(ctx, r); e != nil {
 			return cloud.Item{}, operationError("upload_receipt_create", e)
 		}
+	}
+	// The prepared checkpoint precedes every provider dispatch. A restart may
+	// continue that same intent; pre_inflight and later phases are query-only
+	// until their original acknowledgement or exact challenge is recovered.
+	if r.State == "prepared" && p.Phase == "prepare" {
+		if challenge {
+			target, err := d.freezeChallengeTarget(ctx, r.ID, p.Parent, p.Name, p.SHA256)
+			if err != nil {
+				return cloud.Item{}, err
+			}
+			if p.Target == nil || !p.Target.Challenge || p.Target.Path != target.Path || p.Target.TVParent != target.TVParent || p.Target.Proof.TVAccount != target.Proof.TVAccount || p.Target.Proof.AgentAccount != target.Proof.AgentAccount || !sameAgent(p.Target.AgentParent, target.AgentParent) {
+				return cloud.Item{}, failure(CodeIdentity)
+			}
+		}
+		current, e := d.uploadAuthorization(ctx, a)
+		if e != nil {
+			return cloud.Item{}, e
+		}
 		p.Phase = "pre_inflight"
 		if e = d.saveUpload(ctx, &r, p, "submitting", false); e != nil {
 			return cloud.Item{}, e
 		}
 		raw, e := d.uploadPre(ctx, current, p, h, request.Reader)
 		if e != nil {
+			p.SubmitFailure = uploadSubmitFailure(e)
 			_ = d.saveUpload(ctx, &r, p, "unknown", true)
-			return cloud.Item{}, operationError("upload_prepare", unknownUploadOutcome(e))
+			return cloud.Item{}, uploadUnknownError(p)
 		}
 		var out struct {
 			ID       string              `json:"fid"`
@@ -312,8 +335,9 @@ func (d *Client) upload(ctx context.Context, id string, request cloud.UploadRequ
 			}
 			etag, e := d.putPart(ctx, dest, p.Headers, request.Reader, size, current)
 			if e != nil {
+				p.SubmitFailure = uploadSubmitFailure(e)
 				_ = d.saveUpload(ctx, &r, p, "unknown", true)
-				return cloud.Item{}, operationError("upload_part", unknownUploadOutcome(e))
+				return cloud.Item{}, uploadUnknownError(p)
 			}
 			p.Parts = append(p.Parts, uploadPart{Number: n, ETag: etag})
 			p.InFlightPart = 0
@@ -332,8 +356,9 @@ func (d *Client) upload(ctx context.Context, id string, request cloud.UploadRequ
 		}
 		raw, e := d.api.agent(ctx, current, http.MethodPost, "/open/v1/file/upload_finish", nil, map[string]any{"task_id": p.TaskID, "part_info_list": p.Parts})
 		if e != nil {
+			p.SubmitFailure = uploadSubmitFailure(e)
 			_ = d.saveUpload(ctx, &r, p, "unknown", true)
-			return cloud.Item{}, operationError("upload_finish", unknownUploadOutcome(e))
+			return cloud.Item{}, uploadUnknownError(p)
 		}
 		var out struct {
 			ID     string          `json:"fid"`
@@ -376,8 +401,15 @@ func (d *Client) queryUpload(ctx context.Context, r cloud.OperationReceipt) (clo
 	if r.State == "confirmed" && p.Output != nil {
 		return cloud.OperationResult{Receipt: r, Items: []cloud.Item{*p.Output}, Complete: true}, nil
 	}
-	if r.State != "accepted" || p.Handle == "" {
-		return cloud.OperationResult{Receipt: r}, failure(cloud.CodeMutationUnknown)
+	if r.State != "accepted" && r.State != "unknown" || p.Handle == "" {
+		if p.Target != nil && p.Target.Challenge {
+			item, err := d.recoverChallengeUpload(ctx, &r, p)
+			if err != nil {
+				return cloud.OperationResult{Receipt: r}, err
+			}
+			return cloud.OperationResult{Receipt: r, Items: []cloud.Item{item}, Complete: true}, nil
+		}
+		return cloud.OperationResult{Receipt: r}, uploadUnknownError(p)
 	}
 	item, e := d.confirmUpload(ctx, &r, p)
 	if e != nil {

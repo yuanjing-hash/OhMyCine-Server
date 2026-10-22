@@ -360,6 +360,13 @@ func (s *DownloadService) buildDownloadTargetSnapshot(ctx context.Context, downl
 		if driverErr != nil {
 			return nil, models.MediaClassificationProfile{}, appError(CodeDownloaderStorageUnavailable, "下载器来源连接不可用", driverErr)
 		}
+		if isCloudShareSource(sourceKind) {
+			// Explicit route checks may recover a checkpointed authorization via
+			// driver above. Search only uses the local configuration gate.
+			if _, err := s.downloader.configuredShareReceiver(ctx, downloader); err != nil {
+				return nil, models.MediaClassificationProfile{}, err
+			}
+		}
 		if sourceStorage.Type == models.StorageTypeQuark && routeKind == models.TransferRouteCrossSource && library.TransferMode == models.MediaLibraryTransferMove && !sourceDriver.Capabilities().Recycle {
 			return nil, models.MediaClassificationProfile{}, appError(CodeTransferRouteUnsupported, "夸克来源尚不支持跨盘移动所需的源文件回收；请将目标库设置为复制入库，来源文件会保留", nil)
 		}

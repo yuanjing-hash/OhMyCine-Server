@@ -3,6 +3,7 @@ package services
 import (
 	"context"
 	"path"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -10,9 +11,15 @@ import (
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud"
 )
 
-// selectFollowShareFiles proves coverage from individual file names. A share
-// title is insufficient evidence that every episode in a season already exists.
-func selectFollowShareFiles(entries []SiteSharePreviewEntry, season int, wanted []int) ([]string, []int) {
+var followBareEpisodePattern = regexp.MustCompile(`^[0-9]{1,3}$`)
+var followShareCounterPattern = regexp.MustCompile(`\s*[（(][0-9]{1,5}[)）]\s*$`)
+var followShareSeasonDirectoryPattern = regexp.MustCompile(`(?i)^(?:season|s)[ ._-]*[0-9]{1,3}$|^第\s*[0-9零〇一二两兩三四五六七八九十百千]{1,12}\s*季$`)
+var followShareExtraPattern = regexp.MustCompile(`(?i)(?:^|[ ./_()\[\]-])(?:samples?|extras?|trailers?|interviews?|bonus|bdmv|video_ts)(?:$|[ ./_()\[\]-])|样片|预告|花絮`)
+
+// The title is supplied only after the identity-aware search has verified the
+// candidate work and season. It provides context for numeric leaf names, never
+// proof that the share contains an entire season.
+func selectFollowShareFiles(entries []SiteSharePreviewEntry, season int, wanted []int, verifiedTitle ...string) ([]string, []int) {
 	missing := map[int]bool{}
 	for _, n := range wanted {
 		missing[n] = true
@@ -21,7 +28,13 @@ func selectFollowShareFiles(entries []SiteSharePreviewEntry, season int, wanted 
 	selected := []string{}
 	stems := map[string][]string{}
 	for _, entry := range entries {
-		if entry.IsDir || !isVideoFile(entry.Path) || !followEpisodeDeclarationIsUnambiguous(path.Base(entry.Path), season) {
+		if entry.IsDir || !isVideoFile(entry.Path) || followShareExtraPattern.MatchString(entry.Path) || !followEpisodeDeclarationIsUnambiguous(path.Base(entry.Path), season) {
+			continue
+		}
+		// File structure retains all parent-season facts; a caller's season hint
+		// must never overwrite a conflicting Season 02 directory.
+		structure, structureErr := mediarecognition.Parse(mediarecognition.InputFacts{Files: []mediarecognition.FileFact{{RelativePath: entry.Path}}, SourceKind: mediarecognition.SourceLibraryScan, MediaTypeHint: mediarecognition.MediaTypeTV})
+		if structureErr != nil || structure.Structure.HasExtras || structure.Structure.HasBDMV || structure.Structure.HasVideoTS || structure.Episodes.SeasonMin != nil && (*structure.Episodes.SeasonMin != season || structure.Episodes.SeasonMax == nil || *structure.Episodes.SeasonMax != season) {
 			continue
 		}
 		facts := mediarecognition.InputFacts{PackageName: path.Base(entry.Path), SourceKind: mediarecognition.SourceDownload, MediaTypeHint: mediarecognition.MediaTypeTV}
@@ -29,6 +42,14 @@ func selectFollowShareFiles(entries []SiteSharePreviewEntry, season int, wanted 
 		if e == nil && parsed.Season == nil {
 			facts.SeasonHint = &season
 			parsed, e = mediarecognition.Parse(facts)
+		}
+		if e == nil && parsed.Episodes.EpisodeMin == nil && len(verifiedTitle) == 1 && followBareEpisodePattern.MatchString(strings.TrimSuffix(path.Base(entry.Path), path.Ext(entry.Path))) && followNumericShareContext(entry.Path, verifiedTitle[0], season) {
+			// Reuse the recognizer's actual file facts, not digits from the share
+			// title, folder counters, years or technical specifications.
+			parsed.Episodes = structure.Episodes
+			if parsed.Episodes.EpisodeMin == nil || *parsed.Episodes.EpisodeMin < 1 || parsed.Episodes.EpisodeMax == nil || *parsed.Episodes.EpisodeMax > 200 {
+				continue
+			}
 		}
 		if e != nil || parsed.Season == nil || *parsed.Season != season || parsed.Episodes.EpisodeMin == nil || parsed.Episodes.EpisodeMax == nil {
 			continue
@@ -71,12 +92,43 @@ func selectFollowShareFiles(entries []SiteSharePreviewEntry, season int, wanted 
 	return selected, episodes
 }
 
-func (s *SiteService) prepareFollowShare(ctx context.Context, actor Actor, result, downloader string, season int, missing []int) (string, []string, []int, string, error) {
+func followNumericShareContext(relative, verifiedTitle string, season int) bool {
+	context, err := mediarecognition.Parse(mediarecognition.InputFacts{PackageName: verifiedTitle, SourceKind: mediarecognition.SourceDownload, MediaTypeHint: mediarecognition.MediaTypeTV})
+	if err != nil || context.Season == nil || *context.Season != season || !followEpisodeDeclarationIsUnambiguous(verifiedTitle, season) {
+		return false
+	}
+	work := identitySearchKey(context.CanonicalTitle)
+	if work == "" {
+		return false
+	}
+	for dir := path.Dir(relative); dir != "." && dir != "/"; dir = path.Dir(dir) {
+		name := path.Base(dir)
+		if !followEpisodeDeclarationIsUnambiguous(name, season) {
+			return false
+		}
+		// Structural season folders have already been checked above. A different
+		// work directory cannot borrow the enclosing search result's identity.
+		if followShareSeasonDirectoryPattern.MatchString(name) {
+			continue
+		}
+		parent, err := mediarecognition.Parse(mediarecognition.InputFacts{PackageName: followShareCounterPattern.ReplaceAllString(name, ""), SourceKind: mediarecognition.SourceDownload})
+		if err != nil || parent.Season != nil && *parent.Season != season || parent.Episodes.EpisodeMin != nil {
+			return false
+		}
+		key := identitySearchKey(parent.CanonicalTitle)
+		if key == "" || key != work {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *SiteService) prepareFollowShare(ctx context.Context, actor Actor, result, downloader string, season int, missing []int, verifiedTitle string) (string, []string, []int, string, error) {
 	preview, e := s.PreviewShare(ctx, actor, result, downloader)
 	if e != nil {
 		return "", nil, nil, "", e
 	}
-	tokens, episodes := selectFollowShareFiles(preview.Entries, season, missing)
+	tokens, episodes := selectFollowShareFiles(preview.Entries, season, missing, verifiedTitle)
 	if len(episodes) == 0 {
 		return "", nil, nil, "", appError(CodeDownloadSourceInvalid, "分享中没有已核实且符合缺集范围的视频文件", nil)
 	}

@@ -36,6 +36,7 @@ func TestPanSouIdentitySnapshotFreezesAliasesAndPages(t *testing.T) {
 	}))
 	defer panSou.Close()
 	s, _, actor, store, _, _ := siteFixture(t)
+	receiver, _, _ := seedPanSouReceiver(t, s, models.ConnectionProviderQuark)
 	metadata := NewMetadataSettingsService(s.db, s.audit, store, tmdb.Credential{Kind: tmdb.CredentialKindReadAccessToken, Value: "fixture"})
 	metadata.clientFactory = func(tmdb.Credential, string, string) (*tmdb.Client, error) {
 		return tmdb.NewForTest("fixture", metadataServer.URL, metadataServer.Client())
@@ -114,6 +115,14 @@ func TestPanSouIdentitySnapshotFreezesAliasesAndPages(t *testing.T) {
 	changed, err := s.SearchMediaIdentity(context.Background(), actor, input)
 	if err != nil || len(changed.Groups) != 1 || changed.Groups[0].ErrorCode != CodeSiteResultExpired || searches != requests {
 		t.Fatalf("scope drift accepted: %+v err=%v", changed, err)
+	}
+	input.TypePolicy, input.CloudTypes = "all", nil
+	if err := s.db.Model(&receiver).Update("enabled", false).Error; err != nil {
+		t.Fatal(err)
+	}
+	changed, err = s.SearchMediaIdentity(context.Background(), actor, input)
+	if err != nil || len(changed.Groups) != 1 || changed.Groups[0].ErrorCode != CodeSiteResultExpired || searches != requests {
+		t.Fatalf("receiver change reused identity snapshot: %+v err=%v", changed, err)
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/rs/zerolog"
+	serverlog "github.com/yuanjing-hash/OhMyCine-Server/internal/logging"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud/quark"
 )
@@ -46,7 +47,7 @@ func TestQuarkRootFailureSafeStageDiagnostics(t *testing.T) {
 				}
 			}
 			var event map[string]any
-			if json.Unmarshal(logs.Bytes(), &event) != nil || event["phase"] != tt.phase || event["error_code"] != tt.code || event["connection_id"] != float64(42) || event["event_code"] != "connection.quark.root.verify.failed" {
+			if json.Unmarshal(logs.Bytes(), &event) != nil || event["phase"] != tt.phase || event["error_code"] != tt.code || event["connection_id"] != float64(42) || event["reason"] != "connection.quark.root.verify.failed" {
 				t.Fatalf("missing structured diagnostic: %s", logs.String())
 			}
 			for key, want := range map[string]int{"provider_http_status": tt.status, "provider_errno": tt.errno} {
@@ -55,6 +56,24 @@ func TestQuarkRootFailureSafeStageDiagnostics(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestQuarkRootDiagnosticSurvivesProductionLogManager(t *testing.T) {
+	var output bytes.Buffer
+	manager, err := serverlog.NewManager(t.TempDir(), "test", &output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = manager.Close() })
+	s := &ConnectionService{log: zerolog.New(manager)}
+	_ = s.quarkRootFailure(2, "challenge_upload", &quark.OperationError{Stage: "upload_prepare", Cause: &quark.Failure{Code: cloud.CodeMutationUnknown, UnknownOutcome: true, HTTPStatus: 400, Errno: 23018}})
+	var event map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(output.Bytes()), &event); err != nil {
+		t.Fatal(err)
+	}
+	if event["reason"] != "connection.quark.root.verify.failed" || event["phase"] != "upload_prepare" || event["provider_http_status"] != float64(400) || event["provider_errno"] != float64(23018) || event["error_code"] != cloud.CodeMutationUnknown || event["event_code"] != nil {
+		t.Fatalf("production normalization lost the safe ordinary diagnostic: %s", output.String())
 	}
 }
 

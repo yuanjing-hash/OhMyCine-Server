@@ -1,17 +1,28 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { api, APIError } from '@/api/client'
-import { formatBytes, cloudShareDownloaderType } from '@/downloads'
+import { formatBytes, cloudShareDownloaderType, isCloudShareSource } from '@/downloads'
 import { isShareVideo, shareEntryFiles, toggleShareEntry, type SharePreview, type SharePreviewEntry, type ShareSelection, type ShareValidation } from '@/share-preview'
 import type { TorrentRecognitionResult } from '@/sites'
 import type { DownloaderSummary } from '@/types/api'
 
 const props = defineProps<{ resultToken: string; title: string; sourceKind?: string; downloaders: DownloaderSummary[] }>()
 const emit = defineEmits<{ close: []; select: [selection: ShareSelection]; validation: [resultToken: string, validation: ShareValidation] }>()
-const available = computed(() => props.downloaders.filter(item => item.enabled && item.type === cloudShareDownloaderType(props.sourceKind) && item.capabilities.share_receive))
+// Omitted source kind is the legacy 115 dialog contract; an explicit other source
+// must never inherit that fallback. Readiness comes from the current Server DTO.
+const sourceKind = computed(() => props.sourceKind ?? '115_share')
+const providerLabel = computed(() => sourceKind.value === 'quark_share' ? '夸克' : sourceKind.value === '115_share' ? '115' : '此来源')
+const available = computed(() => isCloudShareSource(sourceKind.value)
+ ? props.downloaders.filter(item => item.enabled && item.type === cloudShareDownloaderType(sourceKind.value) && item.capabilities.share_receive)
+ : [])
 const dialog = ref<HTMLElement | null>(null)
 const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null
 const downloaderID = ref('')
+const selectedDownloader = computed(() => available.value.find(item => item.id === downloaderID.value))
+const previewContext = computed(() => {
+ const item = selectedDownloader.value
+ return JSON.stringify([props.resultToken, sourceKind.value, item && [item.id, item.type, item.storage_id, item.execution_location, item.node_id, item.updated_at]])
+})
 const preview = ref<SharePreview | null>(null)
 const selected = ref<string[]>([])
 const collapsed = ref<string[]>([])
@@ -25,6 +36,7 @@ let request: AbortController | null = null
 let recognitionRequest = new AbortController()
 let recognitionActive = 0
 let closed = false
+let acceptedContext = ''
 const entries = computed(() => preview.value?.entries ?? [])
 const visible = computed(() => entries.value.filter(item => !collapsed.value.some(dir => item.path.startsWith(dir + '/'))))
 const rows = computed(() => visible.value.slice(0, limit.value))
@@ -33,23 +45,26 @@ const chosenSize = computed(() => chosen.value.reduce((sum, item) => sum + item.
 function message(reason: unknown) { return reason instanceof Error ? reason.message : '分享预览暂时不可用' }
 function reset() {
  request?.abort(); request = null; loading.value = false; recognitionRequest.abort(); recognitionRequest = new AbortController()
+ recognitionActive = 0; acceptedContext = ''
  preview.value = null; selected.value = []; collapsed.value = []; limit.value = 50
  recognition.value = {}; recognitionErrors.value = {}; recognizing.value = []; error.value = ''
 }
 async function load() {
  reset()
- if (!downloaderID.value) return
+ if (closed || !selectedDownloader.value) return
+ const context = previewContext.value, resultToken = props.resultToken, receiverID = selectedDownloader.value.id
  const controller = new AbortController(); request = controller; loading.value = true
  const timeout = window.setTimeout(() => controller.abort(), 60000)
  try {
-  const result = await api<SharePreview>('/api/v1/discovery/share-preview', { method: 'POST', signal: controller.signal, body: JSON.stringify({ result_token: props.resultToken, downloader_id: downloaderID.value }) })
-  if (controller.signal.aborted || closed) return
+  const result = await api<SharePreview>('/api/v1/discovery/share-preview', { method: 'POST', signal: controller.signal, body: JSON.stringify({ result_token: resultToken, downloader_id: receiverID }) })
+  if (controller.signal.aborted || closed || request !== controller || context !== previewContext.value) return
+  acceptedContext = context
   preview.value = result
-  if (result.share_validation) emit('validation', props.resultToken, result.share_validation)
+  if (result.share_validation) emit('validation', resultToken, result.share_validation)
  } catch (reason) {
-  if (request === controller && !closed) {
+  if (request === controller && !closed && context === previewContext.value) {
    error.value = controller.signal.aborted ? '预览超时，请重试或选择内容更少的分享。' : message(reason)
-   if (!controller.signal.aborted && reason instanceof APIError && reason.shareValidation) emit('validation', props.resultToken, reason.shareValidation)
+   if (!controller.signal.aborted && reason instanceof APIError && reason.shareValidation) emit('validation', resultToken, reason.shareValidation)
   }
  }
  finally { window.clearTimeout(timeout); if (request === controller) { request = null; loading.value = false } }
@@ -60,7 +75,7 @@ function partial(entry: SharePreviewEntry) { return !checked(entry) && leaves(en
 function toggleFolder(entry: SharePreviewEntry) { collapsed.value = collapsed.value.includes(entry.path) ? collapsed.value.filter(path => path !== entry.path) : [...collapsed.value, entry.path] }
 function selectFiles(videosOnly = false) { selected.value = entries.value.filter(item => !item.is_dir && (!videosOnly || isShareVideo(item))).map(item => item.token) }
 function submit() {
- if (!preview.value || !chosen.value.length || chosen.value.length > 500) return
+ if (closed || !selectedDownloader.value || acceptedContext !== previewContext.value || !preview.value || !chosen.value.length || chosen.value.length > 500) return
  if (Date.parse(preview.value.expires_at) <= Date.now()) { error.value = '预览已过期，请重新读取分享。'; return }
  emit('select', { previewToken: preview.value.token, entryTokens: chosen.value.map(item => item.token), downloaderID: downloaderID.value, fileCount: chosen.value.length, totalSize: chosenSize.value, expiresAt: preview.value.expires_at })
 }
@@ -79,12 +94,16 @@ function pumpRecognition() {
   void api<TorrentRecognitionResult>('/api/v1/discovery/share-preview/recognize', { method: 'POST', signal: fileRequest.signal, body: JSON.stringify({ preview_token: previewToken, entry_token: entry.token }) })
    .then(result => { if (!controller.signal.aborted) recognition.value = { ...recognition.value, [entry.token]: result } })
    .catch(reason => { if (!controller.signal.aborted) recognitionErrors.value = { ...recognitionErrors.value, [entry.token]: message(reason) } })
-   .finally(() => { window.clearTimeout(fileTimeout); controller.signal.removeEventListener('abort', abortFile); recognitionActive--; recognizing.value = recognizing.value.filter(token => token !== entry.token); pumpRecognition() })
+   .finally(() => {
+    window.clearTimeout(fileTimeout); controller.signal.removeEventListener('abort', abortFile)
+    if (controller !== recognitionRequest || closed) return
+    recognitionActive--; recognizing.value = recognizing.value.filter(token => token !== entry.token); pumpRecognition()
+   })
  }
 }
 watch(rows, pumpRecognition)
 watch(available, value => { if (!value.some(item => item.id === downloaderID.value)) downloaderID.value = value.length === 1 ? value[0]!.id : '' }, { immediate: true })
-watch(downloaderID, () => { if (downloaderID.value) void load(); else reset() }, { immediate: true })
+watch(previewContext, () => { void load() }, { immediate: true })
 function close() { closed = true; request?.abort(); recognitionRequest.abort(); emit('close') }
 function trapFocus(event: KeyboardEvent) {
  if (event.key !== 'Tab') return
@@ -102,14 +121,14 @@ onBeforeUnmount(() => { closed = true; request?.abort(); recognitionRequest.abor
   <div class="modal-backdrop fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-6" @click.self="close" @keydown.esc="close">
     <section ref="dialog" class="panel flex max-h-[90vh] w-full max-w-4xl flex-col" role="dialog" aria-modal="true" aria-labelledby="share-preview-title" @keydown="trapFocus">
       <header class="flex items-start justify-between gap-4">
-        <div class="min-w-0"><h2 id="share-preview-title" class="m-0 text-xl">预览分享链接内部内容</h2><p class="text-subtle mt-1 line-clamp-2 text-sm">{{ title }}</p></div>
+        <div class="min-w-0"><h2 id="share-preview-title" class="m-0 text-xl">预览{{ providerLabel }}分享内容</h2><p class="text-subtle mt-1 line-clamp-2 text-sm">{{ title }}</p></div>
         <button class="btn-secondary shrink-0" @click="close">关闭</button>
       </header>
       <div class="my-4 flex flex-wrap items-end gap-3">
-        <label class="min-w-48 flex-1"><span class="label">使用哪个网盘连接预览</span><select v-model="downloaderID" class="input"><option value="" disabled>请选择下载器</option><option v-for="item in available" :key="item.id" :value="item.id">{{ item.name }}</option></select></label>
-        <button class="btn-secondary" :disabled="loading || !downloaderID" @click="load">{{ loading ? '读取中…' : '重新读取' }}</button>
+        <label class="min-w-48 flex-1"><span class="label">{{ providerLabel }}分享接收器</span><select v-model="downloaderID" class="input" :disabled="!available.length"><option value="" disabled>请选择{{ providerLabel }}分享接收器</option><option v-for="item in available" :key="item.id" :value="item.id">{{ item.name }}</option></select></label>
+        <button class="btn-secondary" :disabled="loading || !selectedDownloader" @click="load">{{ loading ? '读取中…' : '重新读取' }}</button>
       </div>
-      <p v-if="!available.length" class="semantic-warning">请先配置并启用与此分享来源相同的网盘分享接收器。</p>
+      <p v-if="!available.length" class="semantic-warning" role="status">当前没有可用的{{ providerLabel }}分享接收器。请在下载管理中检查对应接收器是否启用、连接授权和目录验证是否完成，以及当前账号是否有使用权限。</p>
       <p v-if="error" class="semantic-warning" role="alert">{{ error }}</p>
       <p v-if="loading" class="text-subtle py-8 text-center" role="status">正在读取完整目录和文件大小…</p>
       <template v-if="preview">

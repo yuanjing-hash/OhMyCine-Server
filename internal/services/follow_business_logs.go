@@ -175,6 +175,7 @@ func followBusinessFailure(code string) string {
 var followRejectionLabels = map[string]string{
 	"episode_unproven": "无法确认所选季或集号", "include_keyword": "未包含要求的关键词", "exclude_keyword": "命中排除关键词",
 	"episode_not_confirmed": "资源包含未播或状态未确认的剧集，不能整包下载",
+	"candidate_budget":      "本轮资源核验已达到预算，仍有候选待检查",
 	"resolution":            "分辨率不符", "video_codec": "视频编码不符", "quality": "资源质量不符", "release_group": "制作组不符", "excluded_release_group": "制作组被排除",
 	"seeders": "做种人数不足或未知", "size": "大小不符或未知", "age": "发布时间超限或未知", "duplicate": "同一资源重复返回", "no_missing_coverage": "未覆盖本轮缺集",
 	"identity_mismatch": "作品身份或所选季不符", "claim_unavailable": "搜索结果凭据不可用", "identity_bind_failed": "无法绑定已确认的作品身份",

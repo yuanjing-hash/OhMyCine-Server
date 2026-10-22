@@ -5,7 +5,7 @@ import { Permissions } from '@/auth/generated-permissions'
 import DirectoryPickerDialog from '@/components/DirectoryPickerDialog.vue'
 import { useAuthStore } from '@/stores/auth'
 import { quarkAuthorizationLabel, quarkAuthorizationURL, quarkPollDelay, quarkQRDataURL } from '@/quark'
-import type { QuarkAuthPurpose, QuarkAuthSession, QuarkConnectionStatus } from '@/quark'
+import type { QuarkAuthPurpose, QuarkAuthSession, QuarkCleanupResult, QuarkConnectionStatus, QuarkRootVerification } from '@/quark'
 import type { ConnectionSummary, StorageSummary } from '@/types/api'
 
 const props = defineProps<{ connection: ConnectionSummary; storage?: StorageSummary | null }>()
@@ -85,6 +85,18 @@ function cancelAuthorization() {
   const id = props.connection.id, key = session.value?.session_id
   stop(); session.value = null; busy.value = false; cancelSavedSession(id, key)
 }
+async function retryCleanup() {
+  if (!canAuthorize.value || !canSelect.value || busy.value || session.value || !props.connection.enabled) return
+  const version = generation, id = props.connection.id
+  busy.value = true; error.value = ''; notice.value = '正在核对原验证文件…'
+  try {
+    const result = await boundedAPI<QuarkCleanupResult>(`${endpoint(id)}/cleanup`, { method: 'POST', body: '{}' })
+    if (version !== generation || id !== props.connection.id) return
+    notice.value = result.message
+    await refreshStatus()
+  } catch (reason) { if (version === generation) { error.value = message(reason); notice.value = '' } }
+  finally { if (version === generation) busy.value = false }
+}
 async function save() {
   if (!canSave.value || !name.value.trim() || busy.value || session.value) return
   const version = generation, id = props.connection.id, storage = props.storage
@@ -105,11 +117,12 @@ async function createStorage() {
   const version = generation, id = props.connection.id, selection = directory.value
   busy.value = true; error.value = ''; notice.value = '正在验证所选目录的播放与管理访问能力…'
   try {
-    await boundedAPI(`${endpoint(id)}/verify-root`, { method: 'POST', body: JSON.stringify({ provider_picker_token: selection.token }) }, 120_000)
+    const verification = await boundedAPI<QuarkRootVerification>(`${endpoint(id)}/verify-root`, { method: 'POST', body: JSON.stringify({ provider_picker_token: selection.token }) }, 120_000)
     if (version !== generation) return
     const value = await boundedAPI<StorageSummary>('/api/v1/storages', { method: 'POST', body: JSON.stringify({ name: name.value, type: 'quark', connection_id: id, provider_picker_token: selection.token, enabled: enabled.value }) }, 120_000)
     if (version !== generation) return
-    directory.value = null; notice.value = '夸克数据源已添加'; emit('created', value)
+    directory.value = null; notice.value = ['夸克数据源已添加', verification.cleanup_message].filter(Boolean).join('。'); emit('created', value)
+    await refreshStatus()
   } catch (reason) { if (version === generation) { error.value = message(reason); notice.value = '' } }
   finally { if (version === generation) busy.value = false }
 }
@@ -138,13 +151,17 @@ onBeforeUnmount(() => { const key = session.value?.session_id; stop(); cancelSav
       <label class="label">{{ storage ? '数据源名称' : '账号名称' }}<input v-model="name" class="input mt-2" maxlength="128" :disabled="!canSave || busy" /></label>
       <label class="text-muted flex items-center gap-2 text-sm"><input v-model="enabled" type="checkbox" :disabled="!canSave || busy" />启用{{ storage ? '数据源' : '账号' }}</label>
       <label class="label">云端根目录<input class="input mt-2" :value="directory?.path ?? storage?.root_display_path ?? '尚未选择'" readonly /></label>
-      <p v-if="!storage" class="text-subtle m-0 text-sm">完成两项核心授权后选择目录。Server 会在所选目录写入一个极小验证文件，并从播放授权独立读回，验证这两项授权能共同访问此范围。</p>
+      <p v-if="!storage" class="text-subtle m-0 text-sm">完成两项核心授权后选择目录。Server 会写入一个极小验证文件，从播放授权独立读回，保存验证结果后清理该文件。</p>
       <div class="flex flex-wrap gap-2">
         <button v-if="canSelect" type="button" class="btn-secondary" :disabled="busy || Boolean(session) || !ready" @click="pickerOpen = true">{{ storage ? '更换目录' : '选择云端目录' }}</button>
         <button v-if="canSave" type="button" class="btn-secondary" :disabled="busy || Boolean(session) || !name.trim()" @click="save">保存{{ storage ? '配置' : '账号' }}</button>
         <button v-if="!storage && canSelect" type="button" class="btn-primary" :disabled="busy || Boolean(session) || !ready || !directory || !name.trim()" @click="createStorage">验证目录并添加数据源</button>
       </div>
     </div>
+    <section v-if="status?.root_cleanup_pending" class="semantic-inset mt-4 p-4" aria-live="polite">
+      <p class="text-muted m-0 text-sm">目录验证已通过；{{ status.root_cleanup_pending }} 个验证文件的清理尚未确认，不影响添加或使用数据源。重新核对会继续处理原文件，不会再次上传。</p>
+      <button v-if="canAuthorize && canSelect" type="button" class="btn-secondary mt-3" :disabled="busy || Boolean(session) || !connection.enabled" @click="retryCleanup">重新核对验证文件</button>
+    </section>
     <p v-if="error" role="alert" class="semantic-danger-text mt-4 text-sm">{{ error }}</p>
     <p v-if="notice" role="status" class="text-muted mt-4 text-sm">{{ notice }}</p>
     <DirectoryPickerDialog :open="pickerOpen" :provider-connection-id="connection.id" @close="pickerOpen = false" @select="directory = $event" />

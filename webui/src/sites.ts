@@ -60,7 +60,11 @@ export function siteEffectiveEnabled(site: Pick<SiteSummary, 'enabled' | 'effect
   return site.enabled && site.effective_enabled !== false
 }
 export function resultTypeLabel(item: Pick<PTSearchResult, 'result_type' | 'source_kind' | 'cloud_provider'>, fallback = '资源') {
-  return item.result_type ? discoveryTypeLabel(item.result_type) : item.cloud_provider ? discoveryTypeLabel(item.cloud_provider) : item.source_kind === 'bt' ? '磁力' : fallback
+  if (item.result_type) return discoveryTypeLabel(item.result_type)
+  if (item.cloud_provider) return discoveryTypeLabel(item.cloud_provider)
+  if (item.source_kind === '115_share') return '115'
+  if (item.source_kind === 'quark_share') return '夸克'
+  return item.source_kind === 'bt' ? '磁力' : fallback
 }
 export function safeDiscoveryPostURL(value?: string) {
   return value && /^https:\/\/t\.me\/[A-Za-z0-9_]{3,64}\/[1-9]\d{0,19}$/.test(value) ? value : undefined

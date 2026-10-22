@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { flushPromises, mount } from '@vue/test-utils'
 import QuarkConnectionPanel from '@/components/QuarkConnectionPanel.vue'
 import { APIError } from '@/api/client'
-import type { ConnectionSummary } from '@/types/api'
+import type { ConnectionSummary, StorageSummary } from '@/types/api'
 import type { QuarkAuthSession, QuarkConnectionStatus } from '@/quark'
 
 const mocks = vi.hoisted(() => ({ api: vi.fn(), allowed: true }))
@@ -88,6 +88,56 @@ describe('Quark authorization panel', () => {
     expect(wrapper.text()).toContain('未授权')
     expect(wrapper.findAll('button')).toHaveLength(0)
     expect(wrapper.find('input[type="password"]').exists()).toBe(false)
+    wrapper.unmount()
+  })
+
+  it('adds storage with a valid proof and retains the nonblocking cleanup warning', async () => {
+    mocks.api.mockImplementation(async (path: string) => {
+      if (path.endsWith('/status')) return { ...status(1, true), root_cleanup_pending: 1 }
+      if (path.endsWith('/verify-root')) return { verified: true, path: '/媒体', cleanup_state: 'pending', cleanup_message: '目录验证已通过；验证文件清理尚未确认' }
+      if (path === '/api/v1/storages') return { id: 7, name: '媒体', type: 'quark' }
+      return {}
+    })
+    const wrapper = render(); await flushPromises()
+    wrapper.getComponent({ name: 'DirectoryPickerDialog' }).vm.$emit('select', { path: '/媒体', token: 'opaque-directory' }); await flushPromises()
+    await wrapper.findAll('button').find(button => button.text() === '验证目录并添加数据源')!.trigger('click'); await flushPromises()
+    expect(wrapper.emitted('created')).toHaveLength(1)
+    expect(wrapper.text()).toContain('不影响添加或使用数据源')
+    expect(wrapper.get('[role="status"]').text()).toContain('验证文件清理尚未确认')
+    expect(wrapper.find('[role="alert"]').exists()).toBe(false)
+    wrapper.unmount()
+  })
+
+  it('retries original cleanup after storage creation without a directory token or verification upload', async () => {
+    let pending = 1
+    mocks.api.mockImplementation(async (path: string) => {
+      if (path.endsWith('/status')) return { ...status(1, true), root_cleanup_pending: pending }
+      if (path.endsWith('/cleanup')) { pending = 0; return { pending: 0, message: '原验证文件已清理' } }
+      throw new Error('unexpected request')
+    })
+    const wrapper = mount(QuarkConnectionPanel, { props: { connection, storage: { id: 7, name: '媒体', enabled: true, root_display_path: '/媒体' } as StorageSummary }, global: { stubs: { DirectoryPickerDialog: true } } })
+    await flushPromises()
+    await wrapper.findAll('button').find(button => button.text() === '重新核对验证文件')!.trigger('click'); await flushPromises()
+    expect(mocks.api.mock.calls.filter(call => call[0].endsWith('/cleanup'))).toHaveLength(1)
+    expect(mocks.api.mock.calls.find(call => call[0].endsWith('/cleanup'))?.[1].body).toBe('{}')
+    expect(mocks.api.mock.calls.some(call => call[0].endsWith('/verify-root') || call[0] === '/api/v1/storages')).toBe(false)
+    expect(wrapper.text()).toContain('原验证文件已清理')
+    expect(wrapper.findAll('button').some(button => button.text() === '重新核对验证文件')).toBe(false)
+    wrapper.unmount()
+  })
+
+  it('discards a cleanup completion after changing connection', async () => {
+    let finish!: (value: { pending: number; message: string }) => void
+    mocks.api.mockImplementation((path: string) => {
+      if (path.endsWith('/status')) return Promise.resolve({ ...status(path.includes('/2/') ? 2 : 1, true), root_cleanup_pending: path.includes('/2/') ? 0 : 1 })
+      return new Promise(resolve => { finish = resolve })
+    })
+    const wrapper = render(); await flushPromises()
+    await wrapper.findAll('button').find(button => button.text() === '重新核对验证文件')!.trigger('click')
+    await wrapper.setProps({ connection: { ...connection, id: 2, name: '第二个账号' } }); await flushPromises()
+    finish({ pending: 0, message: '旧账号清理完成' }); await flushPromises()
+    expect(wrapper.text()).not.toContain('旧账号清理完成')
+    expect(wrapper.text()).toContain('第二个账号')
     wrapper.unmount()
   })
 })

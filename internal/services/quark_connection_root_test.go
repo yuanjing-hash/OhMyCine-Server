@@ -35,7 +35,7 @@ func TestQuarkRootVerificationNativePersistentRecovery(t *testing.T) {
 	name := ""
 	uploaded := false
 	rejectManagement := false
-	pre, puts, finish, reads := 0, 0, 0, 0
+	pre, puts, finish, reads, deletes := 0, 0, 0, 0, 0
 	fixture := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
 		defer mu.Unlock()
@@ -107,9 +107,24 @@ func TestQuarkRootVerificationNativePersistentRecovery(t *testing.T) {
 		case "/open/v1/file/upload_finish":
 			finish++
 			uploaded = true
-			data = map[string]any{"fid": "created-ack", "finish": true}
+			// The cloud committed, but no acknowledgement/handle was received.
+			http.Error(w, "fixture lost finish acknowledgement", http.StatusServiceUnavailable)
+			return
 		case "/open/v1/file/info":
-			data = file("created-ack", "listed|root", name, false)
+			data = file(r.URL.Query().Get("fid"), "listed|root", name, false)
+		case "/open/v1/file/delete":
+			deletes++
+			var body struct {
+				Action int      `json:"action_type"`
+				IDs    []string `json:"fid_list"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if body.Action != 1 || len(body.IDs) != 1 || body.IDs[0] != "listed|created" {
+				t.Error("cleanup did not target the exact original challenge")
+			}
+			uploaded = false
+			http.Error(w, "fixture lost delete acknowledgement", http.StatusServiceUnavailable)
+			return
 		case "/read":
 			reads++
 			if r.Header.Get("Cookie") != "" || r.Header.Get("Authorization") != "" || r.Header.Get("Range") != "bytes=0-31" {
@@ -140,7 +155,15 @@ func TestQuarkRootVerificationNativePersistentRecovery(t *testing.T) {
 	}
 	http.DefaultTransport = transport
 	t.Cleanup(func() { http.DefaultTransport = oldTransport; transport.CloseIdleConnections() })
+	cleanup, err := s.RetryQuarkProofCleanup(context.Background(), actor, created.ID, RequestContext{})
+	if err != nil || cleanup.Pending != 0 || cleanup.Message != "没有需要核对的验证文件" {
+		t.Fatal("empty proof history claimed a verified removal")
+	}
 	root := quark.QualifyID(quark.RouteTV, "tv-private-account", "tv-root")
+	if _, err := s.VerifyQuarkRoot(context.Background(), actor, created.ID, root, "/媒体库", RequestContext{}); ErrorCode(err) != CodeConnectionUnavailable || !strings.Contains(ErrorMessage(err), "确认验证文件上传") {
+		t.Fatalf("lost finish was not retained: %v", err)
+	}
+	s.invalidate(created.ID)
 	for attempt := 0; attempt < 2; attempt++ {
 		if attempt == 1 {
 			s.invalidate(created.ID)
@@ -149,8 +172,34 @@ func TestQuarkRootVerificationNativePersistentRecovery(t *testing.T) {
 		if err != nil || !result.Verified {
 			t.Fatalf("attempt %d: verification failed %v (pre=%d puts=%d finish=%d reads=%d)", attempt, err, pre, puts, finish, reads)
 		}
+		if attempt == 0 {
+			if result.CleanupState != "pending" || result.CleanupMessage == "" {
+				t.Fatal("valid proof hid pending cleanup")
+			}
+			status, err := s.QuarkStatus(context.Background(), actor, created.ID)
+			if err != nil || status.RootCleanupPending != 1 || !status.Capabilities.FileUpload {
+				t.Fatal("cleanup failure blocked proof capability or disappeared")
+			}
+			if err := s.db.Model(&models.Connection{}).Where("id = ?", created.ID).Update("enabled", false).Error; err != nil {
+				t.Fatal(err)
+			}
+			status, err = s.QuarkStatus(context.Background(), actor, created.ID)
+			if err != nil || status.RootCleanupPending != 1 || status.Capabilities.FileUpload {
+				t.Fatal("unavailable driver incorrectly reported cleanup complete")
+			}
+			if err := s.db.Model(&models.Connection{}).Where("id = ?", created.ID).Update("enabled", true).Error; err != nil {
+				t.Fatal(err)
+			}
+			// A new service driver restores only encrypted receipts. No picker,
+			// reauthorization, verify-root call or upload is needed for cleanup.
+			s.invalidate(created.ID)
+			cleanup, err := s.RetryQuarkProofCleanup(context.Background(), actor, created.ID, RequestContext{})
+			if err != nil || cleanup.Pending != 0 {
+				t.Fatalf("cleanup receipt did not reconcile: %v", err)
+			}
+		}
 	}
-	if pre != 1 || puts != 1 || finish != 1 || reads != 2 {
+	if pre != 1 || puts != 1 || finish != 1 || reads != 3 || deletes != 1 {
 		t.Fatalf("challenge replayed: pre=%d puts=%d finish=%d reads=%d", pre, puts, finish, reads)
 	}
 	var receipts []models.QuarkOperationReceipt
@@ -166,7 +215,7 @@ func TestQuarkRootVerificationNativePersistentRecovery(t *testing.T) {
 		}
 	}
 	status, err := s.QuarkStatus(context.Background(), actor, created.ID)
-	if err != nil || status.VerifiedRoots != 1 || !status.Capabilities.FileUpload {
+	if err != nil || status.VerifiedRoots != 1 || !status.Capabilities.FileUpload || status.RootCleanupPending != 0 {
 		t.Fatalf("verified capabilities missing: %v", err)
 	}
 	raw, _ := json.Marshal(status)
@@ -183,7 +232,7 @@ func TestQuarkRootVerificationNativePersistentRecovery(t *testing.T) {
 	if ErrorCode(err) != CodeConnectionUnavailable || !strings.Contains(ErrorMessage(err), "管理授权下的目录") || !strings.Contains(ErrorMessage(err), "HTTP 400") || !strings.Contains(ErrorMessage(err), "23018") || strings.Contains(ErrorMessage(err), "private") {
 		t.Fatalf("native provider failure was flattened: %v", err)
 	}
-	if pre != 1 || puts != 1 || finish != 1 || reads != 2 {
+	if pre != 1 || puts != 1 || finish != 1 || reads != 3 || deletes != 1 {
 		t.Fatal("rejected directory listing replayed the confirmed upload")
 	}
 }
