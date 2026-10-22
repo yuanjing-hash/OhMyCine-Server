@@ -319,12 +319,21 @@ func TestPluginBT115RechecksClassificationAfterResolveAndAtPersist(t *testing.T)
 			} else {
 				input.BeforePersist = mutate
 			}
-			if _, err := f.sites.Download(ctx, f.actor, input, RequestContext{}); ErrorCode(err) != CodeDownloadSourceInvalid {
-				t.Fatalf("source drift %s accepted: %v", phase, err)
+			expectedCode := CodeDownloadSourceInvalid
+			if phase == "persist" {
+				// The final plugin lifecycle fence detects the changed source before
+				// the general downloader classification check in the same transaction.
+				expectedCode = CodeSiteResultExpired
+			}
+			if _, err := f.sites.Download(ctx, f.actor, input, RequestContext{}); ErrorCode(err) != expectedCode {
+				t.Fatalf("source drift %s expected=%s code=%s err=%v", phase, expectedCode, ErrorCode(err), err)
 			}
 			var count int64
 			if err := f.sites.db.Model(&models.DownloadTask{}).Count(&count).Error; err != nil || count != 0 {
 				t.Fatal("drifted source created a task")
+			}
+			if err := f.sites.db.Model(&models.Job{}).Where("job_type = ?", "download").Count(&count).Error; err != nil || count != 0 {
+				t.Fatal("drifted source left an enqueued job")
 			}
 			if err := f.sites.db.First(&claim, "id = ?", claim.ID).Error; err != nil || claim.ConsumedAt != nil {
 				t.Fatal("source drift consumed claim instead of rolling back")
