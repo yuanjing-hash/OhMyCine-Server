@@ -116,6 +116,15 @@ func (s *ConnectionService) quarkRootFailure(id uint, fallback string, err error
 		if upload.TaskFinishStatus != nil {
 			event = event.Int("upload_task_finish_status", *upload.TaskFinishStatus)
 		}
+		if upload.TaskQueryReason != "" {
+			event = event.Str("upload_task_query_reason", upload.TaskQueryReason)
+		}
+		if upload.TaskResponseField != "" {
+			event = event.Str("upload_task_response_field", upload.TaskResponseField)
+		}
+		if upload.TaskResponseType != "" {
+			event = event.Str("upload_task_response_type", upload.TaskResponseType)
+		}
 	}
 	event.Msg(serverlog.OperationConnectionManagement.Message(message))
 	return appError(appCode, message, nil)

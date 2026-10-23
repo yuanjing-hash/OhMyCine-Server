@@ -22,6 +22,19 @@ import (
 // Exercise the production driver, encrypted SQLite receipts and credential
 // persister together. No provider request can leave this local TLS fixture.
 func TestQuarkRootVerificationNativePersistentRecovery(t *testing.T) {
+	testQuarkRootVerificationNativePersistentRecovery(t, "finish")
+}
+
+func TestQuarkRootVerificationNativePersistentUnknownPartRecovery(t *testing.T) {
+	for _, recovery := range []string{"completed_task", "exact_original_file"} {
+		t.Run(recovery, func(t *testing.T) {
+			testQuarkRootVerificationNativePersistentRecovery(t, recovery)
+		})
+	}
+}
+
+func testQuarkRootVerificationNativePersistentRecovery(t *testing.T, recovery string) {
+	t.Helper()
 	s, actor, created := createQuarkConnection(t)
 	if err := s.registry.Register(cloud.ProviderQuark, quark.New); err != nil {
 		t.Fatal(err)
@@ -101,6 +114,13 @@ func TestQuarkRootVerificationNativePersistentRecovery(t *testing.T) {
 		case "/put":
 			puts++
 			content, _ = io.ReadAll(io.LimitReader(r.Body, 33))
+			if recovery != "finish" {
+				uploaded = true
+				// The original PUT result is unknown; the retry must observe
+				// that exact operation/file without issuing another PUT.
+				http.Error(w, "fixture lost PUT acknowledgement", http.StatusServiceUnavailable)
+				return
+			}
 			w.Header().Set("ETag", "fixture-part")
 			w.WriteHeader(http.StatusOK)
 			return
@@ -112,6 +132,9 @@ func TestQuarkRootVerificationNativePersistentRecovery(t *testing.T) {
 			return
 		case "/open/v1/file/list_uploaded_parts":
 			data = map[string]any{"finish_status": 0, "uploaded_parts": []any{}}
+			if recovery == "completed_task" {
+				data = map[string]any{"finish_status": 2, "fid": "ack|created", "uploaded_parts": []any{}, "next_part_number_marker": ""}
+			}
 		case "/open/v1/file/info":
 			data = file(r.URL.Query().Get("fid"), "listed|root", name, false)
 		case "/open/v1/file/delete":
@@ -162,8 +185,19 @@ func TestQuarkRootVerificationNativePersistentRecovery(t *testing.T) {
 		t.Fatal("empty proof history claimed a verified removal")
 	}
 	root := quark.QualifyID(quark.RouteTV, "tv-private-account", "tv-root")
-	if _, err := s.VerifyQuarkRoot(context.Background(), actor, created.ID, root, "/媒体库", RequestContext{}); ErrorCode(err) != CodeConnectionUnavailable || !strings.Contains(ErrorMessage(err), "确认验证文件上传") {
-		t.Fatalf("lost finish was not retained: %v", err)
+	lostStage := "确认验证文件上传"
+	wantFinish := 1
+	wantReads := 3 // Full candidate mapping, independent proof and owned cleanup.
+	if recovery != "finish" {
+		lostStage, wantFinish = "写入验证文件内容", 0
+	}
+	if recovery == "completed_task" {
+		// The original task acknowledgement identifies the output directly;
+		// independent proof and cleanup still each read all 32 bytes.
+		wantReads = 2
+	}
+	if _, err := s.VerifyQuarkRoot(context.Background(), actor, created.ID, root, "/媒体库", RequestContext{}); ErrorCode(err) != CodeConnectionUnavailable || !strings.Contains(ErrorMessage(err), lostStage) {
+		t.Fatalf("lost original %s was not retained: %v", recovery, err)
 	}
 	s.invalidate(created.ID)
 	for attempt := 0; attempt < 2; attempt++ {
@@ -201,7 +235,7 @@ func TestQuarkRootVerificationNativePersistentRecovery(t *testing.T) {
 			}
 		}
 	}
-	if pre != 1 || puts != 1 || finish != 1 || reads != 3 || deletes != 1 {
+	if pre != 1 || puts != 1 || finish != wantFinish || reads != wantReads || deletes != 1 {
 		t.Fatalf("challenge replayed: pre=%d puts=%d finish=%d reads=%d", pre, puts, finish, reads)
 	}
 	var receipts []models.QuarkOperationReceipt
@@ -234,7 +268,7 @@ func TestQuarkRootVerificationNativePersistentRecovery(t *testing.T) {
 	if ErrorCode(err) != CodeConnectionUnavailable || !strings.Contains(ErrorMessage(err), "管理授权下的目录") || !strings.Contains(ErrorMessage(err), "HTTP 400") || !strings.Contains(ErrorMessage(err), "23018") || strings.Contains(ErrorMessage(err), "private") {
 		t.Fatalf("native provider failure was flattened: %v", err)
 	}
-	if pre != 1 || puts != 1 || finish != 1 || reads != 3 || deletes != 1 {
+	if pre != 1 || puts != 1 || finish != wantFinish || reads != wantReads || deletes != 1 {
 		t.Fatal("rejected directory listing replayed the confirmed upload")
 	}
 }
