@@ -184,6 +184,7 @@ func main() {
 	directories.SetProviderDirectoryService(providerDirectories)
 	profiles := services.NewMediaClassificationProfileService(db, audit, nil)
 	libraries := services.NewMediaLibraryService(db, audit, logManager.Logger("media_library", "supervisor"))
+	libraries.SetCatalogCompatibility(catalogCompatibility)
 	observations := services.NewProviderObservationService(db)
 	libraries.SetProviderObservationService(observations)
 	libraries.SetCatalogSnapshotStore(catalogStore)
