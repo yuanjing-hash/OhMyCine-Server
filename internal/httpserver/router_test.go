@@ -41,6 +41,7 @@ type testClient struct {
 	queueEvents *services.QueueEventHub
 	db          *gorm.DB
 	connections *services.ConnectionService
+	credentials *credential.Store
 	signedProxy *services.SignedProxyService
 	embyGateway *services.EmbyGatewayService
 	changes     *services.MediaChangeService
@@ -372,12 +373,22 @@ func newTestClientWithSiteAdapters(t *testing.T, siteAdapters []sitepkg.Adapter,
 		if _, err := pan115.ParseCookie(config.Cookie); err != nil {
 			return nil, cloudpkg.Error(cloudpkg.CodeCookieInvalid, false, err)
 		}
-		if len(cloudDrivers) > 0 {
-			return cloudDrivers[0], nil
+		for _, driver := range cloudDrivers {
+			if driver.Provider() == cloudpkg.ProviderPan115 {
+				return driver, nil
+			}
 		}
 		return routerCloudDriver{}, nil
 	}); err != nil {
 		t.Fatal(err)
+	}
+	for _, driver := range cloudDrivers {
+		if driver.Provider() == cloudpkg.ProviderPan115 {
+			continue
+		}
+		if err := cloudRegistry.Register(driver.Provider(), func(cloudpkg.Config) (cloudpkg.Driver, error) { return driver, nil }); err != nil {
+			t.Fatal(err)
+		}
 	}
 	connections := services.NewConnectionService(db, audit, credentialStore, cloudRegistry, log)
 	api.SetCredentialRevealService(services.NewCredentialRevealService(db, audit, credentialStore))
@@ -453,7 +464,7 @@ func newTestClientWithSiteAdapters(t *testing.T, siteAdapters []sitepkg.Adapter,
 	api.SetSeedingSettingsService(seedingSettings)
 	api.SetSeedingService(seeding)
 	api.SetPluginRepositoryService(services.NewPluginRepositoryService(db, audit, nil, log))
-	return &testClient{router: New(cfg, api, auth, log), queue: queue, queueEvents: events, db: db, connections: connections, signedProxy: signedProxy, embyGateway: embyGateway, changes: changes, sites: sites, libraries: libraries, history: playerHistory, artworkRoot: artworkRoot, logManager: logManager}
+	return &testClient{router: New(cfg, api, auth, log), queue: queue, queueEvents: events, db: db, connections: connections, credentials: credentialStore, signedProxy: signedProxy, embyGateway: embyGateway, changes: changes, sites: sites, libraries: libraries, history: playerHistory, artworkRoot: artworkRoot, logManager: logManager}
 }
 
 func TestTransferNodeRoutesAreNoStoreAndKeepEnrollmentSecretsOutOfLists(t *testing.T) {
