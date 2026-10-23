@@ -131,4 +131,31 @@ func TestQuarkRootUploadStateSurvivesProductionLogManager(t *testing.T) {
 	if strings.Contains(output.String(), "private") || strings.Contains(ErrorMessage(public), "private") || len(store.rows) != 1 || !bytes.Equal(store.rows[r.ID].Payload, payload) || store.rows[r.ID].Revision != r.Revision {
 		t.Fatal("blocked query leaked or rewrote the original upload")
 	}
+	// A native resolver/dial classification must survive the private receipt
+	// projection and the real log manager, without becoming replay evidence.
+	taskData = map[string]any{"finish_status": 0, "uploaded_parts": []any{}}
+	for _, reason := range []string{"transport_dns", "transport_timeout", "transport_canceled", "transport_address_rejected", "transport_connect"} {
+		t.Run(reason, func(t *testing.T) {
+			var private map[string]any
+			_ = json.Unmarshal(payload, &private)
+			private["submit_failure"] = map[string]any{"reason": reason}
+			classified := r
+			classified.Payload, _ = json.Marshal(private)
+			classifiedStore := &quarkReadbackOperations{rows: map[string]cloud.OperationReceipt{r.ID: classified}}
+			driver, err := quark.NewClient(cloud.Config{Credentials: credentials, Operations: classifiedStore})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, queryErr := driver.QueryOperation(context.Background(), r.ID)
+			output.Reset()
+			public := s.quarkRootFailure(2, "challenge_upload", queryErr)
+			var event map[string]any
+			if queryErr == nil || json.Unmarshal(bytes.TrimSpace(output.Bytes()), &event) != nil || event["upload_submit_reason"] != reason || event["upload_not_dispatched"] != false || event["upload_receipt_state"] != "unknown" {
+				t.Fatal("finite native transport cause vanished or implied safe replay")
+			}
+			if strings.Contains(output.String(), "private") || strings.Contains(ErrorMessage(public), "private") || !bytes.Equal(classifiedStore.rows[r.ID].Payload, classified.Payload) || classifiedStore.rows[r.ID].Revision != r.Revision {
+				t.Fatal("native transport classification leaked or rewrote the receipt")
+			}
+		})
+	}
 }

@@ -1295,16 +1295,6 @@ func (host *Host) publicHostAddresses(ctx context.Context, hostname string) ([]n
 	return addresses, requirePublicAddresses(addresses)
 }
 
-func requirePublicAddresses(addresses []net.IPAddr) error {
-	for _, address := range addresses {
-		ip := address.IP
-		if address.Zone != "" || ip == nil || ip.To16() == nil || ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() || ip.IsMulticast() || isFakeIP(ip) {
-			return denied("plugin_http_private_address_denied", nil)
-		}
-	}
-	return nil
-}
-
 func domainAllowed(hostname string, permissions []contract.Permission) bool {
 	hostname = strings.ToLower(strings.TrimSuffix(hostname, "."))
 	for _, permission := range permissions {
