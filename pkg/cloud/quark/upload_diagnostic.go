@@ -9,12 +9,13 @@ import (
 // UploadDiagnostic is a bounded projection, never the private upload payload.
 // It deliberately contains no task/receipt/file ID, name, URL, hash or ETag.
 type UploadDiagnostic struct {
-	Phase, State                                      string
-	HasTask, HasOutput, TargetRecorded, NotDispatched bool
-	InFlightPart, ConfirmedParts                      int
-	TaskFinishStatus                                  *int
-	TaskPages                                         int
-	TaskListingComplete                               bool
+	Phase, State                                         string
+	HasTask, HasOutput, TargetRecorded, NotDispatched    bool
+	InFlightPart, ConfirmedParts                         int
+	TaskFinishStatus                                     *int
+	TaskPages                                            int
+	TaskListingComplete                                  bool
+	TaskQueryReason, TaskResponseField, TaskResponseType string
 }
 
 type uploadStateError struct {
@@ -54,9 +55,29 @@ func withUploadDiagnostic(r cloud.OperationReceipt, p uploadPayload, err error) 
 			status := *p.Observation.FinishStatus
 			d.TaskFinishStatus = &status
 		}
+		switch p.Observation.Reason {
+		case "response_type_invalid", "marker_invalid", "parts_limit", "finish_status_invalid", "finish_status_regressed", "completed_fid_invalid", "completed_fid_changed", "part_invalid", "part_changed", "cursor_repeated", "page_limit", "original_part_unconfirmed", "task_unfinished":
+			d.TaskQueryReason = p.Observation.Reason
+		}
+		switch p.Observation.Field {
+		case "response", "finish_status", "fid", "uploaded_parts", "uploaded_parts.part_number", "uploaded_parts.etag", "etag", "next_part_number_marker":
+			d.TaskResponseField = p.Observation.Field
+		}
+		switch p.Observation.ValueType {
+		case "missing", "string", "object", "array", "boolean", "null", "number", "unknown":
+			d.TaskResponseType = p.Observation.ValueType
+		}
 	}
 	var unsent *requestNotDispatchedError
-	d.NotDispatched = errors.As(err, &unsent)
+	var operation *OperationError
+	if errors.As(err, &unsent) && errors.As(err, &operation) {
+		// A blocked read only proves that query was not sent. It cannot
+		// establish non-submission of the original unresolved upload write.
+		switch operation.Stage {
+		case "upload_prepare", "upload_part_prepare", "upload_finish":
+			d.NotDispatched = true
+		}
+	}
 	return &uploadStateError{diagnostic: d, cause: err}
 }
 

@@ -313,6 +313,9 @@ func (d *Client) upload(ctx context.Context, id string, request cloud.UploadRequ
 	if p.Handle == "" {
 		if p.InFlightPart != 0 {
 			if e = d.recoverUploadedPart(ctx, &r, &p); e != nil {
+				if challenge {
+					return d.recoverChallengePartOutput(ctx, &r, p, e)
+				}
 				return cloud.Item{}, e
 			}
 			if p.Handle != "" {
@@ -450,7 +453,7 @@ func (d *Client) queryUpload(ctx context.Context, r cloud.OperationReceipt) (res
 		return cloud.OperationResult{Receipt: r, Items: []cloud.Item{*p.Output}, Complete: true}, nil
 	}
 	if r.State != "accepted" && r.State != "unknown" || p.Handle == "" {
-		if p.Target != nil && p.Target.Challenge && (p.Phase == "pre_inflight" || p.Phase == "finish_inflight") {
+		if p.Target != nil && p.Target.Challenge && (p.Phase == "pre_inflight" || p.Phase == "put_inflight" || p.Phase == "finish_inflight") {
 			item, err := d.recoverChallengeUpload(ctx, &r, p)
 			if err != nil {
 				return cloud.OperationResult{Receipt: r}, err
@@ -470,6 +473,7 @@ func (d *Client) queryUpload(ctx context.Context, r cloud.OperationReceipt) (res
 				item, err := d.confirmUpload(ctx, &r, p)
 				return cloud.OperationResult{Receipt: r, Items: []cloud.Item{item}, Complete: err == nil}, operationError("upload_output_confirmation", err)
 			}
+			p.Observation.Reason = "task_unfinished"
 			return cloud.OperationResult{Receipt: r}, operationError("upload_part_recovery", uploadUnknownFailure(p))
 		}
 		return cloud.OperationResult{Receipt: r}, uploadUnknownError(p)
@@ -543,6 +547,7 @@ func (d *Client) recoverUploadedPart(ctx context.Context, r *cloud.OperationRece
 		}
 	}
 	// An incomplete or eventually consistent query cannot authorize another PUT.
+	p.Observation.Reason = "original_part_unconfirmed"
 	return operationError("upload_part_recovery", uploadUnknownFailure(*p))
 }
 func (d *Client) uploadPartURL(ctx context.Context, a Authorization, p *uploadPayload, n int, reader io.ReadSeeker) (uploadDestination, error) {
