@@ -25,6 +25,7 @@ import (
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/mediarecognition"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/services"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/updater"
 	cloudpkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud/pan115"
 	downloadpkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/downloader"
@@ -313,6 +314,17 @@ func newTestClientWithSiteAdapters(t *testing.T, siteAdapters []sitepkg.Adapter,
 	t.Helper()
 	testRoot := t.TempDir()
 	cfg := config.Config{Host: "127.0.0.1", Port: 3000, DatabasePath: filepath.Join(testRoot, "server.db"), LogDirectory: filepath.Join(testRoot, "logs"), CredentialKeyFile: filepath.Join(testRoot, "credentials.key"), Environment: "test", PublicOrigin: "http://localhost:3000", SessionIdleTTL: 2 * time.Hour, SessionMaxTTL: 7 * 24 * time.Hour}
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	compatibility, err := updater.CheckStartupCompatibility(cfg.DatabasePath, testRoot, executable, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := compatibility.ReserveFreshDatabase(); err != nil {
+		t.Fatal(err)
+	}
 	db, err := database.Open(cfg.DatabasePath)
 	if err != nil {
 		t.Fatal(err)
@@ -323,6 +335,9 @@ func newTestClientWithSiteAdapters(t *testing.T, siteAdapters []sitepkg.Adapter,
 	}
 	t.Cleanup(func() { _ = sqlDB.Close() })
 	if err := database.Migrate(db); err != nil {
+		t.Fatal(err)
+	}
+	if err := compatibility.CompleteInitialization(); err != nil {
 		t.Fatal(err)
 	}
 	log := NewLogger("test")
@@ -343,6 +358,7 @@ func newTestClientWithSiteAdapters(t *testing.T, siteAdapters []sitepkg.Adapter,
 	artworkRoot := filepath.Join(testRoot, "library-artwork")
 	api.SetLibraryArtworkService(services.NewLibraryArtworkService(db, nil, nil, nil, log, services.WithLibraryArtworkRoot(artworkRoot)))
 	libraries := services.NewMediaLibraryService(db, audit, log)
+	libraries.SetCatalogCompatibility(compatibility)
 	profiles.SetReferences(libraries)
 	profiles.SetRevisionNotifier(libraries)
 	storages.SetReferenceChecker(libraries)

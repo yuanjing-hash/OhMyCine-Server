@@ -78,19 +78,7 @@ func catalogConversionJobTx(tx *gorm.DB, input catalogConversionInput) error {
 }
 
 func (s *CatalogSnapshotStore) checkConversionCompatibility(ctx context.Context, compatibility *updater.CatalogCompatibility) error {
-	var databases []struct{ Name, File string }
-	if err := s.readDB.WithContext(ctx).Raw("PRAGMA database_list").Scan(&databases).Error; err != nil {
-		return err
-	}
-	for _, db := range databases {
-		if db.Name == "main" && db.File != "" {
-			if err := compatibility.ValidateCatalogDatabase(db.File); err != nil {
-				return err
-			}
-			return compatibility.EnsureCatalogFormat()
-		}
-	}
-	return ErrCatalogInvalid
+	return ensureCatalogActivation(ctx, s.readDB, compatibility)
 }
 
 // startCatalogConversion installs the library writer fence and an owned private

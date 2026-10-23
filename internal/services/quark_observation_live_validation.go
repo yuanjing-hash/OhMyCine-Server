@@ -27,6 +27,7 @@ import (
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/database"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
 	storagefs "github.com/yuanjing-hash/OhMyCine-Server/internal/storage"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/updater"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud/quark"
 	"gorm.io/gorm"
@@ -153,13 +154,34 @@ func quarkObservationLiveOpen(ctx context.Context, in QuarkObservationLiveInput,
 			_ = r.close()
 		}
 	}()
-	var err error
-	r.db, err = database.Open(filepath.Join(in.StateDir, "observation.db"))
+	path := filepath.Join(in.StateDir, "observation.db")
+	executable, err := os.Executable()
 	if err != nil {
+		return nil, err
+	}
+	compatibility, err := updater.CheckStartupCompatibility(path, in.StateDir, executable, nil)
+	if err != nil {
+		return nil, err
+	}
+	if err := compatibility.ReserveFreshDatabase(); err != nil {
+		return nil, err
+	}
+	r.db, err = database.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	format, err := database.ReadCatalogFormat(ctx, r.db)
+	if err != nil {
+		return nil, err
+	}
+	if err := compatibility.ValidateDatabaseFormat(format); err != nil {
 		return nil, err
 	}
 	if fresh {
 		if err = database.Migrate(r.db); err != nil {
+			return nil, err
+		}
+		if err := compatibility.CompleteInitialization(); err != nil {
 			return nil, err
 		}
 	}
@@ -187,6 +209,7 @@ func quarkObservationLiveOpen(ctx context.Context, in QuarkObservationLiveInput,
 	r.artifacts.SetConnectionService(connections)
 	r.artifacts.SetMediaChangeService(r.changes)
 	r.library = NewMediaLibraryService(r.db, audit, zerolog.Nop())
+	r.library.SetCatalogCompatibility(compatibility)
 	r.library.SetConnectionService(connections)
 	r.library.SetCatalogSnapshotStore(r.catalog)
 	r.library.SetQueueService(r.queue)

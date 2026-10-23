@@ -22,6 +22,7 @@ import (
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/medialibrary"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
 	storagefs "github.com/yuanjing-hash/OhMyCine-Server/internal/storage"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/updater"
 	cloudpkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/metadata/tmdb"
 	"gorm.io/gorm"
@@ -31,34 +32,35 @@ import (
 const maxSourceAssetExtraExtensions = 16
 
 type MediaLibraryService struct {
-	db                *gorm.DB
-	catalogStore      *CatalogSnapshotStore
-	catalogScanCommit CatalogScanCommit
-	catalogFollowupMu sync.Mutex
-	audit             *AuditService
-	log               zerolog.Logger
-	mu                sync.Mutex
-	supervisors       map[uint]supervisorHandle
-	scanLocks         map[uint]*sync.Mutex
-	connections       *ConnectionService
-	metadata          *MetadataSettingsService
-	aiRecognition     *AIRecognitionSettingsService
-	ingest            MediaLibraryIngestEnqueuer
-	artifacts         *MediaArtifactService
-	changes           *MediaChangeService
-	closed            bool
-	lifeEventCtx      context.Context
-	lifeEventStop     context.CancelFunc
-	lifeEventDone     <-chan struct{}
-	lifeEventWG       sync.WaitGroup
-	lifeEventRechecks map[uint]struct{}
-	lifeEventMu       sync.Mutex
-	lifeEvents        map[string]downloaderLifeEventCandidate
-	backends          *MediaLibraryBackendRegistry
-	structure         *MediaLibraryStructureService
-	libraryArtwork    MediaLibraryArtworkScheduler
-	queue             *QueueService
-	observations      *ProviderObservationService
+	db                   *gorm.DB
+	catalogStore         *CatalogSnapshotStore
+	catalogCompatibility *updater.CatalogCompatibility
+	catalogScanCommit    CatalogScanCommit
+	catalogFollowupMu    sync.Mutex
+	audit                *AuditService
+	log                  zerolog.Logger
+	mu                   sync.Mutex
+	supervisors          map[uint]supervisorHandle
+	scanLocks            map[uint]*sync.Mutex
+	connections          *ConnectionService
+	metadata             *MetadataSettingsService
+	aiRecognition        *AIRecognitionSettingsService
+	ingest               MediaLibraryIngestEnqueuer
+	artifacts            *MediaArtifactService
+	changes              *MediaChangeService
+	closed               bool
+	lifeEventCtx         context.Context
+	lifeEventStop        context.CancelFunc
+	lifeEventDone        <-chan struct{}
+	lifeEventWG          sync.WaitGroup
+	lifeEventRechecks    map[uint]struct{}
+	lifeEventMu          sync.Mutex
+	lifeEvents           map[string]downloaderLifeEventCandidate
+	backends             *MediaLibraryBackendRegistry
+	structure            *MediaLibraryStructureService
+	libraryArtwork       MediaLibraryArtworkScheduler
+	queue                *QueueService
+	observations         *ProviderObservationService
 }
 
 // MediaLibraryIngestEnqueuer is the narrow boundary from provider directory
@@ -172,6 +174,13 @@ func (s *MediaLibraryService) SetConnectionService(connections *ConnectionServic
 func (s *MediaLibraryService) SetCatalogSnapshotStore(store *CatalogSnapshotStore) {
 	s.catalogStore = store
 }
+
+// SetCatalogCompatibility installs the existing startup capability before
+// serving requests. It never grants activation authority to an unproven store.
+func (s *MediaLibraryService) SetCatalogCompatibility(compatibility *updater.CatalogCompatibility) {
+	s.catalogCompatibility = compatibility
+}
+
 func (s *MediaLibraryService) SetCatalogScanCommit(commit CatalogScanCommit) {
 	s.catalogScanCommit = commit
 }
@@ -298,6 +307,16 @@ func (s *MediaLibraryService) Create(ctx context.Context, actor Actor, input Med
 	if err != nil {
 		return MediaLibraryDetail{}, err
 	}
+	var source models.Storage
+	if err := s.db.WithContext(ctx).First(&source, record.StorageID).Error; err != nil {
+		return MediaLibraryDetail{}, err
+	}
+	activateQuark := source.Type == models.StorageTypeQuark
+	if activateQuark {
+		if err := ensureCatalogActivation(ctx, s.db, s.catalogCompatibility); err != nil {
+			return MediaLibraryDetail{}, err
+		}
+	}
 	record.StructureStatus = models.MediaLibraryStructurePending
 	transactionErr := s.db.Transaction(func(tx *gorm.DB) error {
 		var maxOrder int
@@ -315,6 +334,9 @@ func (s *MediaLibraryService) Create(ctx context.Context, actor Actor, input Med
 			return err
 		}
 		if storage.Type == models.StorageTypeQuark {
+			if !activateQuark {
+				return ErrCatalogFence
+			}
 			var profile models.MediaClassificationProfile
 			if err := tx.First(&profile, record.ProfileID).Error; err != nil {
 				return err
