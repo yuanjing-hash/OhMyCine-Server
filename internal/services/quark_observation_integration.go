@@ -205,6 +205,9 @@ func (s *MediaLibraryService) recordQuarkObservationProgress(ctx context.Context
 		updates["phase"] = "waiting_retry"
 	}
 	if status.LastCompleteAt != nil && !status.LastCompleteAt.Before(scope.CoverageStartedAt) && status.PendingDirectories == 0 && status.PendingPublications == 0 && status.PathRepairs == 0 && status.PendingConfirmations == 0 && status.ErrorCode == "" {
+		if scope.Kind == "library" && s.catalogStore != nil {
+			return s.completeQuarkObservation(ctx, scope)
+		}
 		updates = map[string]any{"status": "success", "phase": "completed", "partial": false, "finished_at": status.LastCompleteAt, "error_code": ""}
 	}
 	return s.db.WithContext(ctx).Model(&models.MediaLibraryScanRun{}).Where("id = ? AND library_id = ? AND finished_at IS NULL", scope.RequestedScanRunID, scope.LibraryID).Updates(updates).Error
