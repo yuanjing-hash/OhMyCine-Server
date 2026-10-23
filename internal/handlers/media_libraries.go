@@ -1043,7 +1043,7 @@ func (a *API) mediaLibraryInput(c *gin.Context, actor services.Actor, libraryID 
 	}
 	relative := p.RelativeRoot
 	providerRootID := ""
-	if storage.Type == "pan115" {
+	if models.IsNativeCloudStorage(storage.Type) {
 		if p.RelativeRootToken != "" {
 			selection, err := a.providerDirectory.ResolveStorageSelection(c.Request.Context(), actor, p.StorageID, p.RelativeRootToken)
 			if err != nil {
@@ -1053,14 +1053,14 @@ func (a *API) mediaLibraryInput(c *gin.Context, actor services.Actor, libraryID 
 			providerRootID = selection.ProviderID
 		} else {
 			if libraryID == 0 {
-				return services.MediaLibraryInput{}, invalid("必须通过 115 目录选择器选择媒体库来源目录", nil)
+				return services.MediaLibraryInput{}, invalid("必须通过网盘目录选择器选择媒体库来源目录", nil)
 			}
 			existing, err := a.libraries.Get(actor, libraryID)
 			if err != nil {
 				return services.MediaLibraryInput{}, err
 			}
 			if p.StorageID != existing.StorageID || (p.RelativeRoot != "" && p.RelativeRoot != existing.RelativeRoot) {
-				return services.MediaLibraryInput{}, invalid("更改 Storage 或来源目录必须重新使用 115 目录选择器", nil)
+				return services.MediaLibraryInput{}, invalid("更改 Storage 或来源目录必须重新使用网盘目录选择器", nil)
 			}
 			relative = existing.RelativeRoot
 			providerRootID = existing.ProviderRootID
@@ -1072,7 +1072,7 @@ func (a *API) mediaLibraryInput(c *gin.Context, actor services.Actor, libraryID 
 		}
 		relative = resolved
 	}
-	if storage.Type != "pan115" && p.RelativeRootToken == "" {
+	if !models.IsNativeCloudStorage(storage.Type) && p.RelativeRootToken == "" {
 		if libraryID == 0 {
 			return services.MediaLibraryInput{}, invalid("必须通过 Server 目录选择器选择媒体库来源目录", nil)
 		}

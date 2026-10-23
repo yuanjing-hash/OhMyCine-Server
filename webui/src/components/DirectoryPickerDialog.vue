@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { nextTick, onBeforeUnmount, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import { api } from '@/api/client'
 import type { DirectoryItem, DirectoryListing } from '@/types/api'
 import { directoryPickerBrowseEndpoint, directoryPickerFallbackEndpoint, directoryPickerInitialEndpoint, directoryRootLabel, FILESYSTEM_ROOTS_ENDPOINT, storageDirectoryEndpoint } from '@/directory-navigation'
@@ -10,25 +10,29 @@ const emit = defineEmits<{ close: []; select: [value: { path: string; token: str
 const dialog = ref<HTMLElement | null>(null)
 const closeButton = ref<HTMLButtonElement | null>(null)
 const listing = ref<DirectoryListing | null>(null)
+const providerDirectory = computed(() => Boolean(props.providerConnectionId || ['pan115', 'quark'].includes(listing.value?.platform ?? '')))
 const loading = ref(false)
 const loadingMore = ref(false)
 const error = ref('')
 let previousFocus: HTMLElement | null = null
-let activeRequest: { controller: AbortController; version: number } | null = null
+type PickerRequest = { controller: AbortController; version: number; session: number; target: string }
+let activeRequest: PickerRequest | null = null
 let requestVersion = 0
+let sessionVersion = 0
 let currentCacheKey = ''
 const sessionCache = new Map<string, DirectoryListing>()
 const restrictedHistory: string[] = []
 
-watch(() => props.open, async open => {
-  if (!open) { endSession(); await nextTick(); previousFocus?.focus(); return }
-  sessionCache.clear()
-  currentCacheKey = ''
-  previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null
+watch(() => [props.open, props.storageId, props.providerConnectionId, props.restrictToStorage, props.initialEndpoint] as const, async ([open], previous) => {
+  endSession()
+  if (!open) { await nextTick(); previousFocus?.focus(); return }
+  const session = sessionVersion
+  if (!previous?.[0]) previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null
   await nextTick()
+  if (!props.open || session !== sessionVersion) return
   closeButton.value?.focus()
 	await loadInitial()
-}, { immediate: true })
+}, { immediate: true, flush: 'sync' })
 
 onBeforeUnmount(() => { endSession(); previousFocus?.focus() })
 
@@ -71,23 +75,36 @@ async function loadInitialWithRootsFallback(endpoint: string) {
 const withinStorage = () => Boolean(props.restrictToStorage && props.storageId)
 
 async function browse(token: string) {
+  if (!props.open || loading.value || !listing.value) return
+  const current = listing.value
+  if (token !== current.current_token && token !== current.parent_token
+    && !current.breadcrumbs.some(crumb => crumb.token === token)
+    && !current.items.some(item => item.enterable && item.token === token)
+    && !restrictedHistory.includes(token)) return
   const base = directoryPickerBrowseEndpoint(props.storageId, props.providerConnectionId)
   await load(base + '?token=' + encodeURIComponent(token), { cacheKey: browseCacheKey(base, token) })
 }
 
 async function enter(token: string) {
+  if (!props.open || loading.value || !listing.value?.items.some(item => item.enterable && item.token === token)) return
   if (withinStorage() && listing.value?.current_token) restrictedHistory.push(listing.value.current_token)
   await browse(token)
 }
 
 async function backWithinStorage() {
-  const token = restrictedHistory.pop()
-  if (token) await browse(token)
+  if (!props.open || loading.value) return
+  const token = restrictedHistory.at(-1)
+  if (token) {
+    const pending = browse(token)
+    restrictedHistory.pop()
+    await pending
+  }
 }
 
-async function loadRoots() { await load(FILESYSTEM_ROOTS_ENDPOINT) }
+async function loadRoots() { if (props.open && !loading.value) await load(FILESYSTEM_ROOTS_ENDPOINT) }
 
 async function load(path: string, options: { cacheKey?: string; force?: boolean } = {}) {
+  if (!props.open) return
   const cacheKey = options.cacheKey ?? path
   const cached = !options.force ? sessionCache.get(cacheKey) : undefined
   if (cached) {
@@ -110,6 +127,7 @@ async function load(path: string, options: { cacheKey?: string; force?: boolean 
 }
 
 async function refreshCurrent() {
+  if (!props.open || loading.value) return
   if (listing.value?.current_token) {
     const base = directoryPickerBrowseEndpoint(props.storageId, props.providerConnectionId)
     await load(`${base}?token=${encodeURIComponent(listing.value.current_token)}`, { cacheKey: browseCacheKey(base, listing.value.current_token), force: true })
@@ -121,7 +139,7 @@ async function refreshCurrent() {
 
 async function loadNextPage() {
   const pageToken = listing.value?.next_page_token
-  if (!pageToken || !listing.value || loading.value || loadingMore.value) return
+  if (!props.open || !pageToken || !listing.value || loading.value || loadingMore.value) return
   const current = listing.value
   const request = beginRequest()
   loadingMore.value = true
@@ -144,8 +162,9 @@ async function loadNextPage() {
 
 function beginRequest() {
 	cancelRequest()
+	loadingMore.value = false
 	const controller = new AbortController()
-  const request = { controller, version: ++requestVersion }
+  const request = { controller, version: ++requestVersion, session: sessionVersion, target: targetKey() }
 	activeRequest = request
 	return request
 }
@@ -156,14 +175,19 @@ function cancelRequest() {
   requestVersion++
 }
 
-function isCurrent(request: { controller: AbortController; version: number }) {
-  return activeRequest === request && request.version === requestVersion && !request.controller.signal.aborted
+function targetKey() {
+  return JSON.stringify([props.storageId, props.providerConnectionId, props.restrictToStorage, props.initialEndpoint])
 }
 
-function finishRequest(request: { controller: AbortController; version: number }) {
+function isCurrent(request: PickerRequest) {
+  return props.open && activeRequest === request && request.version === requestVersion && request.session === sessionVersion && request.target === targetKey() && !request.controller.signal.aborted
+}
+
+function finishRequest(request: PickerRequest) {
   if (!isCurrent(request)) return
   activeRequest = null
   loading.value = false
+  loadingMore.value = false
 }
 
 function browseCacheKey(base: string, token: string) {
@@ -183,21 +207,28 @@ function showListing(result: DirectoryListing, cacheKey: string) {
 }
 
 function endSession() {
+  sessionVersion++
   cancelRequest()
+  listing.value = null
   sessionCache.clear()
   restrictedHistory.length = 0
   currentCacheKey = ''
   loading.value = false
   loadingMore.value = false
+  error.value = ''
 }
 
 function choose(path: string, token: string) {
-  if (!path || !token) return
+  if (!props.open || loading.value || !path || !token || !listing.value) return
+  const current = listing.value
+  if (!(current.location === path && current.current_selection_token === token)
+    && !current.items.some(item => item.selectable && item.location === path && item.selection_token === token)) return
   emit('select', { path, token })
   close()
 }
 
 function close() {
+  if (!props.open) return
   endSession()
   emit('close')
   nextTick(() => previousFocus?.focus())
@@ -225,7 +256,7 @@ function onKeydown(event: KeyboardEvent) {
     <div v-if="open" class="directory-overlay fixed inset-0 z-100 flex items-center justify-center p-4" @mousedown.self="close">
       <section ref="dialog" role="dialog" aria-modal="true" aria-labelledby="directory-picker-title" class="panel flex max-h-[min(46rem,92vh)] w-full max-w-4xl flex-col overflow-hidden" @keydown="onKeydown">
         <header class="flex items-start justify-between gap-4">
-          <div><h2 id="directory-picker-title" class="m-0 text-xl">{{ providerConnectionId || listing?.platform === 'pan115' ? '选择 115 网盘目录' : '选择 Server 目录' }}</h2><p class="page-description mb-0 mt-2 text-sm">{{ providerConnectionId || listing?.platform === 'pan115' ? '只显示当前 Storage 根目录及其下级文件夹。' : '这里显示运行 OhMyCine Server 的设备，不是当前浏览器所在设备。' }}</p></div>
+          <div><h2 id="directory-picker-title" class="m-0 text-xl">{{ providerDirectory ? '选择网盘目录' : '选择 Server 目录' }}</h2><p class="page-description mb-0 mt-2 text-sm">{{ providerDirectory ? restrictToStorage ? '只显示当前 Storage 根目录及其下级文件夹。' : '只显示当前账号可访问的网盘文件夹。' : '这里显示运行 OhMyCine Server 的设备，不是当前浏览器所在设备。' }}</p></div>
           <button ref="closeButton" type="button" class="btn-secondary" aria-label="关闭目录选择器" @click="close">关闭</button>
         </header>
 
@@ -234,7 +265,7 @@ function onKeydown(event: KeyboardEvent) {
           <span v-else-if="listing" class="text-muted text-sm">来源 Storage</span>
           <span v-if="listing?.breadcrumbs?.length && !withinStorage()" aria-hidden="true" class="text-subtle">/</span>
           <button v-for="crumb in withinStorage() || providerConnectionId ? [] : listing?.breadcrumbs ?? []" :key="crumb.token" type="button" class="breadcrumb-button" :disabled="loading" @click="browse(crumb.token)">{{ crumb.name }}</button>
-          <span v-if="listing && !listing.breadcrumbs?.length" class="text-muted text-sm">{{ providerConnectionId ? '115 网盘根目录' : '选择一个 Server 根位置开始浏览' }}</span>
+          <span v-if="listing && !listing.breadcrumbs?.length" class="text-muted text-sm">{{ providerDirectory ? withinStorage() ? 'Storage 根目录' : '网盘根目录' : '选择一个 Server 根位置开始浏览' }}</span>
         </div>
 
         <div class="mt-4 flex flex-wrap gap-2">
@@ -262,7 +293,7 @@ function onKeydown(event: KeyboardEvent) {
 
         <footer class="semantic-divider mt-4 flex flex-wrap items-center justify-between gap-3 border-t pt-4">
           <div class="min-w-0"><span class="text-subtle text-xs">当前位置</span><div class="truncate font-mono text-sm">{{ listing?.location || 'Server 根位置' }}</div></div>
-          <button type="button" class="btn-primary" :disabled="!listing?.current_selection_token" @click="listing && choose(listing.location, listing.current_selection_token)">选择当前目录</button>
+          <button type="button" class="btn-primary" :disabled="loading || !listing?.current_selection_token" @click="listing && choose(listing.location, listing.current_selection_token)">选择当前目录</button>
         </footer>
       </section>
     </div>
