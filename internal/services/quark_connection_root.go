@@ -2,8 +2,6 @@ package services
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"strings"
 
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/authz"
@@ -26,14 +24,18 @@ func (s *ConnectionService) VerifyQuarkRoot(ctx context.Context, actor Actor, id
 	if err := s.ensureQuarkRootProof(ctx, actor, id, tvRoot, displayPath, request); err != nil {
 		return QuarkRootVerification{}, err
 	}
+	return s.quarkRootVerificationResult(ctx, id, tvRoot, displayPath), nil
+}
+
+func (s *ConnectionService) quarkRootVerificationResult(ctx context.Context, id uint, tvRoot, displayPath string) QuarkRootVerification {
 	result := QuarkRootVerification{Verified: true, Path: displayPath, Message: "播放与管理授权已在此目录完成共同访问验证"}
 	_, bundle, err := s.quarkCredentials(ctx, id)
 	if err != nil {
-		return result, nil
+		return result
 	}
 	_, driver, err := s.driver(id)
 	if err != nil {
-		return result, nil
+		return result
 	}
 	if cleanup, ok := driver.(quarkProofCleaner); ok {
 		for _, proof := range bundle.Proofs {
@@ -46,9 +48,18 @@ func (s *ConnectionService) VerifyQuarkRoot(ctx context.Context, actor Actor, id
 			}
 		}
 	}
-	return result, nil
+	return result
 }
 func (s *ConnectionService) ensureQuarkRootProof(ctx context.Context, actor Actor, id uint, tvRoot, displayPath string, request RequestContext) error {
+	unlock, err := lockQuarkRootVerification(ctx, id)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	return s.ensureQuarkRootProofLocked(ctx, actor, id, tvRoot, displayPath, request)
+}
+
+func (s *ConnectionService) ensureQuarkRootProofLocked(ctx context.Context, actor Actor, id uint, tvRoot, displayPath string, request RequestContext) error {
 	if !actor.Can(authz.PermissionConnectionsRead) || !actor.Can(authz.PermissionStoragesBrowse) || (!actor.Can(authz.PermissionStoragesCreate) && !actor.Can(authz.PermissionStoragesUpdate)) {
 		return appError(CodePermissionDenied, "无权验证数据源目录", nil)
 	}
@@ -56,13 +67,24 @@ func (s *ConnectionService) ensureQuarkRootProof(ctx context.Context, actor Acto
 	if err != nil || clean != displayPath || strings.TrimSpace(tvRoot) == "" {
 		return appError(CodeInvalidRequest, "目录验证范围无效，请重新选择", nil)
 	}
-	_, bundle, err := s.quarkCredentials(ctx, id)
+	record, bundle, err := s.quarkCredentials(ctx, id)
 	if err != nil {
 		return err
 	}
 	if bundle.TV == nil || bundle.Agent == nil || !bundle.TV.IdentityVerified || !bundle.Agent.IdentityVerified {
 		return appError(CodeConnectionUnavailable, "请先完成原画播放和文件管理授权", nil)
 	}
+	identity := quarkRootIdentity(bundle)
+	if expected, ok := ctx.Value(quarkRootAttemptFenceKey{}).(quarkRootRecoveryClaims); ok && (expected.Configuration != record.Revision || expected.Identity != identity) {
+		return quarkRootRecoveryConflict()
+	}
+	ctx = quark.WithCommonSpaceGuard(ctx, func(ctx context.Context) error {
+		current, saved, err := s.quarkCredentials(ctx, id)
+		if err != nil || !current.Enabled || current.Revision != record.Revision || saved.TV == nil || saved.Agent == nil || !saved.TV.IdentityVerified || !saved.Agent.IdentityVerified || quarkRootIdentity(saved) != identity {
+			return appError(CodeConflict, "连接或授权身份已变化，请重新读取状态", nil)
+		}
+		return nil
+	})
 	_, driver, err := s.driver(id)
 	if err != nil {
 		return err
@@ -82,16 +104,35 @@ func (s *ConnectionService) ensureQuarkRootProof(ctx context.Context, actor Acto
 	if !ok {
 		return appError(CodeConnectionUnavailable, "夸克目录验证能力不可用", nil)
 	}
-	// The provider persists its random challenge and output under this stable
-	// operation identity. Repeating a request after a timeout reconciles it.
-	fingerprint := sha256.Sum256([]byte(uintID(id) + "\x00" + bundle.TV.AccountID + "\x00" + bundle.Agent.AccountID + "\x00" + tvRoot + "\x00" + clean))
-	receiptID := "quark-space-" + hex.EncodeToString(fingerprint[:])
+	// Ordinary verification follows the durably selected attempt. It never
+	// creates a successor for an unresolved upload; only the separate explicit
+	// administrator recovery action can advance this cursor.
+	base := quarkRootProofBase(id, bundle, tvRoot, clean)
+	_, cursor, err := s.loadQuarkRootCursor(ctx, id, base, nil)
+	if err != nil {
+		return s.quarkRootFailure(id, "proof_receipt_load", err)
+	}
+	if cursor.Previous != "" && (cursor.Configuration != record.Revision || cursor.Identity != identity) {
+		alreadyVerified := false
+		for _, saved := range bundle.Proofs {
+			if saved.TVRoot == tvRoot && saved.Path == clean && bundle.HasProof(saved.TVRoot, saved.AgentRoot) {
+				alreadyVerified = true
+			}
+		}
+		if !alreadyVerified {
+			return quarkRootRecoveryConflict()
+		}
+	}
+	receiptID := cursor.Active
 	proof, err := verifier.VerifyCommonSpace(ctx, receiptID, clean)
 	if err != nil {
 		return s.quarkRootFailure(id, "verification_input", err)
 	}
 	if proof.TVRoot != tvRoot || proof.Path != clean || proof.TVAccount != bundle.TV.AccountID || proof.AgentAccount != bundle.Agent.AccountID {
 		return appError(CodeConflict, "目录或授权身份发生变化，请重新读取状态", nil)
+	}
+	if err = s.guardQuarkConnection(ctx, id, record.Revision); err != nil {
+		return appError(CodeConflict, "连接配置已变化，请重新读取状态", nil)
 	}
 	_, saved, err := s.quarkCredentials(ctx, id)
 	if err != nil {

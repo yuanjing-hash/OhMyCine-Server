@@ -118,3 +118,60 @@ func (a *API) RetryQuarkProofCleanup(c *gin.Context) {
 	}
 	success(c, http.StatusOK, result)
 }
+
+func (a *API) QuarkRootRecoveryInfo(c *gin.Context) {
+	c.Header("Cache-Control", "no-store")
+	actor, _ := middleware.ActorFrom(c)
+	id, ok := pathID(c)
+	if !ok {
+		return
+	}
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 16<<10)
+	var payload struct {
+		Token string `json:"provider_picker_token"`
+	}
+	if err := strictJSON(c, &payload); err != nil {
+		writeError(c, a.log, invalid("目录验证恢复请求无效", nil))
+		return
+	}
+	selection, err := a.providerDirectory.ResolveSelection(c.Request.Context(), actor, id, payload.Token)
+	if err != nil {
+		writeError(c, a.log, err)
+		return
+	}
+	result, err := a.connections.QuarkRootRecoveryInfo(c.Request.Context(), actor, id, selection.ProviderID, selection.DisplayPath)
+	if err != nil {
+		writeError(c, a.log, err)
+		return
+	}
+	success(c, http.StatusOK, result)
+}
+
+func (a *API) StartQuarkRootAttempt(c *gin.Context) {
+	c.Header("Cache-Control", "no-store")
+	actor, _ := middleware.ActorFrom(c)
+	id, ok := pathID(c)
+	if !ok {
+		return
+	}
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 24<<10)
+	var payload struct {
+		Token         string `json:"provider_picker_token"`
+		RecoveryToken string `json:"recovery_token"`
+	}
+	if err := strictJSON(c, &payload); err != nil {
+		writeError(c, a.log, invalid("独立目录验证请求无效", nil))
+		return
+	}
+	selection, err := a.providerDirectory.ResolveSelection(c.Request.Context(), actor, id, payload.Token)
+	if err != nil {
+		writeError(c, a.log, err)
+		return
+	}
+	result, err := a.connections.StartQuarkRootAttempt(c.Request.Context(), actor, id, selection.ProviderID, selection.DisplayPath, payload.RecoveryToken, middleware.RequestContextFrom(c))
+	if err != nil {
+		writeError(c, a.log, err)
+		return
+	}
+	success(c, http.StatusOK, result)
+}

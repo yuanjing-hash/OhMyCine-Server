@@ -42,6 +42,7 @@ func unknownUploadOutcome(err error) error {
 	var cause *Failure
 	if errors.As(err, &cause) {
 		f.HTTPStatus, f.Errno = cause.HTTPStatus, cause.Errno
+		f.SubmitReason = safeUploadSubmitReason(cause.SubmitReason)
 	}
 	return f
 }

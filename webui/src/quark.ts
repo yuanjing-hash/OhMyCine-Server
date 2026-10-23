@@ -22,6 +22,12 @@ export interface QuarkRootVerification {
   cleanup_message?: string
 }
 
+export interface QuarkRootRecovery {
+  available: boolean
+  recovery_token?: string
+  message: string
+}
+
 export interface QuarkCleanupResult {
   pending: number
   message: string

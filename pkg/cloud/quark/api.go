@@ -61,6 +61,9 @@ func (a *apiClient) call(ctx context.Context, r *http.Request) (raw json.RawMess
 	if e := ctx.Err(); e != nil {
 		return nil, &requestNotDispatchedError{Cause: e}
 	}
+	if e := checkCommonSpaceGuard(ctx); e != nil {
+		return nil, &requestNotDispatchedError{Cause: e}
+	}
 	if a.config.BeforeCall != nil {
 		if e := a.config.BeforeCall(ctx); e != nil {
 			return nil, &requestNotDispatchedError{Cause: e}
@@ -76,6 +79,11 @@ func (a *apiClient) call(ctx context.Context, r *http.Request) (raw json.RawMess
 		return nil, &requestNotDispatchedError{Cause: &Failure{Code: CodeLimited, RetryAfter: wait}}
 	}
 	if e := ctx.Err(); e != nil {
+		return nil, &requestNotDispatchedError{Cause: e}
+	}
+	// Admission/cooldown callbacks can wait while configuration changes. Keep
+	// the proof fence at the actual transport boundary as well as entry.
+	if e := checkCommonSpaceGuard(ctx); e != nil {
 		return nil, &requestNotDispatchedError{Cause: e}
 	}
 	r.GetBody = nil

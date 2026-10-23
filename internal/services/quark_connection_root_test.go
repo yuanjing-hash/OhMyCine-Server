@@ -3,8 +3,11 @@ package services
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
+	"crypto/sha1"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"net"
@@ -33,6 +36,10 @@ func TestQuarkRootVerificationNativePersistentUnknownPartRecovery(t *testing.T) 
 	}
 }
 
+func TestQuarkRootExplicitIndependentNativeProofAndCleanup(t *testing.T) {
+	testQuarkRootVerificationNativePersistentRecovery(t, "independent_attempt")
+}
+
 func testQuarkRootVerificationNativePersistentRecovery(t *testing.T, recovery string) {
 	t.Helper()
 	s, actor, created := createQuarkConnection(t)
@@ -49,6 +56,7 @@ func testQuarkRootVerificationNativePersistentRecovery(t *testing.T, recovery st
 	uploaded := false
 	rejectManagement := false
 	pre, puts, finish, reads, deletes := 0, 0, 0, 0, 0
+	var preMD5, preSHA1 string
 	fixture := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
 		defer mu.Unlock()
@@ -102,19 +110,46 @@ func testQuarkRootVerificationNativePersistentRecovery(t *testing.T, recovery st
 		case "/open/v1/file/upload_pre":
 			pre++
 			var input struct {
-				Name string `json:"file_name"`
-				Size int    `json:"size"`
+				Name     string `json:"file_name"`
+				Size     int    `json:"size"`
+				MD5      string `json:"md5"`
+				SHA1     string `json:"sha1"`
+				Parallel bool   `json:"parallel_upload"`
+				Parts    []struct {
+					Number  int `json:"part_number"`
+					Size    int `json:"part_size"`
+					Context struct {
+						Offset int      `json:"part_offset"`
+						H      []uint32 `json:"h"`
+					} `json:"parallel_sha1_ctx"`
+				} `json:"part_info_list"`
 			}
 			_ = json.NewDecoder(r.Body).Decode(&input)
 			name = input.Name
+			preMD5, preSHA1 = input.MD5, input.SHA1
 			if input.Size != 32 || !quark.IsVerificationName(name) {
 				t.Error("invalid challenge upload")
+			}
+			if recovery == "independent_attempt" && (!input.Parallel || len(input.Parts) != 1 || input.Parts[0].Number != 1 || input.Parts[0].Size != 32 || input.Parts[0].Context.Offset != 0 || len(input.Parts[0].Context.H) != 5 || input.Parts[0].Context.H[0] != 0x67452301 || input.Parts[0].Context.H[4] != 0xc3d2e1f0) {
+				t.Error("tiny FormUpload wire differs from pinned SDK shape")
 			}
 			data = map[string]any{"task_id": "proof-upload", "part_size": 64, "common_headers": map[string]string{}, "upload_urls": []any{map[string]any{"part_number": 1, "upload_url": "https://objects.example/put", "signature_info": map[string]string{"signature": "object-fixture"}}}}
 		case "/put":
 			puts++
 			content, _ = io.ReadAll(io.LimitReader(r.Body, 33))
-			if recovery != "finish" {
+			if recovery == "independent_attempt" {
+				md, sh := md5.Sum(content), sha1.Sum(content)
+				if len(content) != 32 || r.ContentLength != 32 || r.Header.Get("Authorization") != "object-fixture" || r.Header.Get("Cookie") != "" || r.Header.Get("X-Agent-ID") != "" || hex.EncodeToString(md[:]) != preMD5 || hex.EncodeToString(sh[:]) != preSHA1 {
+					t.Error("new tiny upload changed bytes/hash or leaked account credentials")
+				}
+			}
+			if recovery == "independent_attempt" && puts == 1 {
+				// The original task has no acknowledged part and no visible
+				// output. Ordinary retry cannot prove it safe to resend.
+				http.Error(w, "fixture lost original PUT", http.StatusServiceUnavailable)
+				return
+			}
+			if recovery != "finish" && recovery != "independent_attempt" {
 				uploaded = true
 				// The original PUT result is unknown; the retry must observe
 				// that exact operation/file without issuing another PUT.
@@ -127,6 +162,10 @@ func testQuarkRootVerificationNativePersistentRecovery(t *testing.T, recovery st
 		case "/open/v1/file/upload_finish":
 			finish++
 			uploaded = true
+			if recovery == "independent_attempt" {
+				data = map[string]any{"fid": "ack|created", "finish": true}
+				break
+			}
 			// The cloud committed, but no acknowledgement/handle was received.
 			http.Error(w, "fixture lost finish acknowledgement", http.StatusServiceUnavailable)
 			return
@@ -198,6 +237,69 @@ func testQuarkRootVerificationNativePersistentRecovery(t *testing.T, recovery st
 	}
 	if _, err := s.VerifyQuarkRoot(context.Background(), actor, created.ID, root, "/媒体库", RequestContext{}); ErrorCode(err) != CodeConnectionUnavailable || !strings.Contains(ErrorMessage(err), lostStage) {
 		t.Fatalf("lost original %s was not retained: %v", recovery, err)
+	}
+	if recovery == "independent_attempt" {
+		ctx := context.Background()
+		_, bundle, _ := s.quarkCredentials(ctx, created.ID)
+		base := quarkRootProofBase(created.ID, bundle, root, "/媒体库")
+		store := NewQuarkOperationStore(s.db, s.credentials, created.ID)
+		oldProof, _ := store.Load(ctx, base)
+		oldUpload, _ := store.Load(ctx, base+"/upload")
+		for i := 0; i < 2; i++ {
+			if _, err := s.VerifyQuarkRoot(ctx, actor, created.ID, root, "/媒体库", RequestContext{}); err == nil {
+				t.Fatal("unfinished original task pretended to prove root")
+			}
+		}
+		if pre != 1 || puts != 1 || finish != 0 {
+			t.Fatal("ordinary retry replayed original upload")
+		}
+		info, err := s.QuarkRootRecoveryInfo(ctx, actor, created.ID, root, "/媒体库")
+		if err != nil || !info.Available {
+			t.Fatalf("native recovery unavailable: %v", err)
+		}
+		other, err := s.QuarkRootRecoveryInfo(ctx, actor, created.ID, root, "/媒体库")
+		if err != nil || !other.Available {
+			t.Fatal(err)
+		}
+		results := make(chan error, 2)
+		for _, token := range []string{info.RecoveryToken, other.RecoveryToken} {
+			go func(token string) {
+				result, err := s.StartQuarkRootAttempt(ctx, actor, created.ID, root, "/媒体库", token, RequestContext{})
+				if err == nil && !result.Verified {
+					err = io.ErrUnexpectedEOF
+				}
+				results <- err
+			}(token)
+		}
+		for i := 0; i < 2; i++ {
+			if err := <-results; err != nil {
+				t.Fatalf("independent native proof failed: %v", err)
+			}
+		}
+		s.invalidate(created.ID)
+		if result, err := s.StartQuarkRootAttempt(ctx, actor, created.ID, root, "/媒体库", info.RecoveryToken, RequestContext{}); err != nil || !result.Verified {
+			t.Fatalf("lost response/restart replay failed: %v", err)
+		}
+		// The successful finish supplies its original handle. Independent
+		// proof and exact owned cleanup each still read all32 random bytes.
+		if pre != 2 || puts != 2 || finish != 1 || reads != 2 || deletes != 1 {
+			t.Fatalf("new proof did not preserve exactly one complete chain: pre=%d puts=%d finish=%d reads=%d deletes=%d", pre, puts, finish, reads, deletes)
+		}
+		if current, _ := store.Load(ctx, base); current.Revision != oldProof.Revision || current.State != oldProof.State || !bytes.Equal(current.Payload, oldProof.Payload) {
+			t.Fatal("old proof rewritten")
+		}
+		if current, _ := store.Load(ctx, base+"/upload"); current.Revision != oldUpload.Revision || current.State != oldUpload.State || !bytes.Equal(current.Payload, oldUpload.Payload) {
+			t.Fatal("old upload replayed or reset")
+		}
+		info, err = s.QuarkRootRecoveryInfo(ctx, actor, created.ID, root, "/媒体库")
+		if err != nil || info.Available || info.RecoveryToken != "" {
+			t.Fatal("valid saved proof still offered new upload")
+		}
+		status, err := s.QuarkStatus(ctx, actor, created.ID)
+		if err != nil || status.VerifiedRoots != 1 || !status.Capabilities.FileUpload || status.RootCleanupPending != 0 {
+			t.Fatal("new proof capabilities/cleanup missing")
+		}
+		return
 	}
 	s.invalidate(created.ID)
 	for attempt := 0; attempt < 2; attempt++ {

@@ -34,9 +34,19 @@ TV 和 Agent 的账号 ID、文件 ID 保留各自命名空间。共同空间验
 | --- | --- |
 | `GET /api/v1/connections/:id/quark/status` | 增加 `root_cleanup_pending`；读取状态不执行清理。 |
 | `POST /api/v1/connections/:id/quark/verify-root` | 成功仍返回 `verified/path/message`，另含可选 `cleanup_state`（`pending/complete`）与固定 `cleanup_message`。 |
+| `POST /api/v1/connections/:id/quark/verify-root/recovery` | 严格 JSON `{provider_picker_token}`；返回 `available/recovery_token?/message`。只检查当前选定范围的私密记录，不上传、不改变操作记录。 |
+| `POST /api/v1/connections/:id/quark/verify-root/new-attempt` | 严格 JSON `{provider_picker_token,recovery_token}`；管理员明确确认后，选择一次独立的新验证并执行完整证明链，成功格式同 `verify-root`。 |
 | `POST /api/v1/connections/:id/quark/cleanup` | 严格空 JSON `{}`，不接受路径/文件/收据参数；只处理当前凭据中已保存的原证明，返回 `pending/message`。单次最多 8 个原证明、45 秒；失败可继续核对。 |
 
 清理接口与验证接口使用 Session、Origin/CSRF、`no-store`，要求 `connections.update`、`connections.read`、`storages.browse` 及 `storages.create` 或 `storages.update`。运行诊断使用固定 `reason=connection.quark.root.verify.failed`、`phase/error_code` 和有界提供方数字，不把普通日志伪装成受信业务 `event_code`。
+
+普通重试仍只核对已选定的原操作。若原上传一直缺少完成证据，管理员可从恢复选项明确开启一次新随机挑战；旧证明和上传的密文、状态、修订、任务身份均保留，不把它们改成失败、取消或已清理。恢复选项的加密不透明令牌有效期为10分钟，绑定当前操作者、连接配置和凭据修订、两条授权身份、目录以及原检查点；不能代替目录选择令牌。未接受的过期、替换身份、配置/目录或检查点请求返回 `CONFLICT`，且不创建新操作。已接受的相同意图在响应丢失、重启、令牌到期及同身份日常续期后仍指向同一个后继；更早祖先不能覆盖更晚明确选择的后继。
+
+Server 在现有加密收据表保存 `space_proof_cursor`，其 `confirmed` 仅表示本地选择已经落盘，不代表云端上传完成。游标 CAS 和每连接的可取消串行门覆盖普通验证、Storage 验证与新验证；先提交选择，再进入原生上传、完整 TV 读回、证明 CAS 与精确清理。崩溃在选择落盘后、挑战创建前时仍继续同一个后继。每次提供方调用、对象 PUT、证明保存及清理均检查连接和授权身份，旧验证不能在替换配置或设备身份后继续写入或发布。
+
+只有原生校验通过的私密证明/上传配对才将 SQL 元数据分类为 `reserved_space_proof` / `reserved_space_proof_upload`：核对证明身份、两条账号命名空间、根、不可预测名称、全部32字节及 SHA256、大小与父目录；若存在冻结目标，还必须属于该证明。该分类不改云操作状态或加密内容，仅使已排除的精确验证文件不永久占用媒体变化观察的写入屏障。一般未知上传、只有相同前缀/大小的文件或未证实配对仍保持原屏障。没有数据库结构迁移。
+
+上传的 `upload_submit_reason` 只保留有限诊断：传输取消/超时/DNS/TLS/其他错误、对象 HTTP 状态、响应读取/超限、缺失/无效 ETag。它不含原异常字符串、URL、头或响应体，且 `Do` 之后任何此类错误都不能证明请求未发出。历史记录没有该字段时不追补或猜测原因。
 
 目录与媒体清单采用 TV 身份。管理写操作前重新定位对应 Agent 身份；写完后独立映射回 TV，检查父目录、名称、类型和大小。不能把一种接口的 ID 直接交给另一种接口，也不能只凭相同文件名认定同一文件。
 
