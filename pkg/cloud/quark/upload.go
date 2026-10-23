@@ -637,22 +637,31 @@ func (d *Client) sendUploadPart(ctx context.Context, request *http.Request) (str
 	if err := ctx.Err(); err != nil {
 		return "", &requestNotDispatchedError{Cause: err}
 	}
+	if err := checkCommonSpaceGuard(ctx); err != nil {
+		return "", &requestNotDispatchedError{Cause: err}
+	}
 	client := &http.Client{Transport: d.mediaTransport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	response, e := client.Do(request)
 	if e != nil {
-		return "", failure(CodeUnavailable)
+		return "", &Failure{Code: CodeUnavailable, SubmitReason: uploadTransportReason(ctx, e)}
 	}
 	defer response.Body.Close()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return "", &Failure{Code: CodeUnavailable, HTTPStatus: response.StatusCode}
+		return "", &Failure{Code: CodeUnavailable, HTTPStatus: response.StatusCode, SubmitReason: "object_http_status"}
 	}
 	n, e := io.Copy(io.Discard, io.LimitReader(response.Body, apiLimit+1))
-	if e != nil || n > apiLimit {
-		return "", failure(CodeUnavailable)
+	if e != nil {
+		return "", &Failure{Code: CodeUnavailable, SubmitReason: "object_body_read"}
+	}
+	if n > apiLimit {
+		return "", &Failure{Code: CodeUnavailable, SubmitReason: "object_body_limit"}
 	}
 	etag := response.Header.Get("ETag")
+	if etag == "" {
+		return "", &Failure{Code: CodeInvalid, SubmitReason: "object_etag_missing"}
+	}
 	if !scalar(etag, 1024) {
-		return "", failure(CodeInvalid)
+		return "", &Failure{Code: CodeInvalid, SubmitReason: "object_etag_invalid"}
 	}
 	return etag, nil
 }

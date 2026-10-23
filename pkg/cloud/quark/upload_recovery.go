@@ -14,6 +14,7 @@ func uploadSubmitFailure(err error) *operationSubmitFailure {
 		return nil
 	}
 	diagnostic := &operationSubmitFailure{}
+	diagnostic.Reason = safeUploadSubmitReason(f.SubmitReason)
 	if f.HTTPStatus >= 100 && f.HTTPStatus <= 599 {
 		diagnostic.HTTPStatus = f.HTTPStatus
 	}
@@ -40,6 +41,7 @@ func uploadUnknownFailure(p uploadPayload) error {
 	f := &Failure{Code: cloud.CodeMutationUnknown, UnknownOutcome: true}
 	if p.SubmitFailure != nil {
 		f.HTTPStatus, f.Errno = p.SubmitFailure.HTTPStatus, p.SubmitFailure.Errno
+		f.SubmitReason = safeUploadSubmitReason(p.SubmitFailure.Reason)
 	}
 	return f
 }

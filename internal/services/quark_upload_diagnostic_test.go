@@ -41,7 +41,7 @@ func TestQuarkRootUploadStateSurvivesProductionLogManager(t *testing.T) {
 	http.DefaultTransport = transport
 	t.Cleanup(func() { http.DefaultTransport = previous; transport.CloseIdleConnections() })
 	credentials, _ := json.Marshal(quark.Credentials{Version: 1, Revision: 1, Agent: testQuarkAuthorization()})
-	payload, _ := json.Marshal(map[string]any{"name": "private-name", "task_id": "private-task", "parent": "private-root", "size": 32, "part_size": 64, "phase": "put_inflight", "inflight_part": 1, "submit_failure": map[string]int{"http_status": 503}})
+	payload, _ := json.Marshal(map[string]any{"name": "private-name", "task_id": "private-task", "parent": "private-root", "size": 32, "part_size": 64, "phase": "put_inflight", "inflight_part": 1, "submit_failure": map[string]any{"http_status": 503, "reason": "object_etag_missing"}})
 	r := cloud.OperationReceipt{ID: "private-operation", Provider: cloud.ProviderQuark, Route: "agent", AccountID: "private-account", Kind: "upload", State: "unknown", Revision: 4, Payload: payload}
 	store := &quarkReadbackOperations{rows: map[string]cloud.OperationReceipt{r.ID: r}}
 	d, err := quark.NewClient(cloud.Config{Credentials: credentials, Operations: store})
@@ -66,6 +66,9 @@ func TestQuarkRootUploadStateSurvivesProductionLogManager(t *testing.T) {
 	}
 	if event["phase"] != "upload_part_recovery" || event["upload_phase"] != "put_inflight" || event["upload_receipt_state"] != "unknown" || event["upload_has_task"] != true || event["upload_has_output"] != false || event["upload_inflight_part"] != float64(1) || event["upload_task_pages"] != float64(1) || event["upload_task_listing_complete"] != true || event["upload_task_finish_status"] != float64(0) || event["upload_task_query_reason"] != "task_unfinished" || event["provider_http_status"] != float64(503) {
 		t.Fatalf("production manager lost bounded upload state: %s", output.String())
+	}
+	if event["upload_submit_reason"] != "object_etag_missing" {
+		t.Fatal("production manager lost finite first-submit reason")
 	}
 	for _, secret := range []string{"private-operation", "private-task", "private-root", "private-account", "private-name", "access-secret", "refresh-secret", "open-api-drive"} {
 		if strings.Contains(output.String(), secret) || strings.Contains(ErrorMessage(public), secret) {

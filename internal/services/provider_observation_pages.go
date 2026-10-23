@@ -243,7 +243,7 @@ func observationHeatParentsTx(tx *gorm.DB, scopeID, parentID, previousParentID s
 
 func (s *ProviderObservationService) scopeHasPendingWritesTx(tx *gorm.DB, scopeID string) (bool, error) {
 	var count int64
-	err := tx.Model(&models.QuarkOperationReceipt{}).Where("(scope_id = ? OR (scope_id = '' AND connection_id = (SELECT connection_id FROM provider_observation_scopes WHERE id = ?))) AND state NOT IN ?", scopeID, scopeID, []string{"confirmed", "catalog_published", "artifacts_ready", "rejected", "failed"}).Count(&count).Error
+	err := tx.Model(&models.QuarkOperationReceipt{}).Where("(scope_id = ? OR (scope_id = '' AND connection_id = (SELECT connection_id FROM provider_observation_scopes WHERE id = ?))) AND state NOT IN ?", scopeID, scopeID, []string{"confirmed", "catalog_published", "artifacts_ready", "rejected", "failed"}).Where("kind NOT IN ?", []string{"reserved_space_proof", "reserved_space_proof_upload"}).Count(&count).Error
 	return count > 0, err
 }
 

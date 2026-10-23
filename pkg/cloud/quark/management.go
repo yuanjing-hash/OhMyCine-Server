@@ -353,8 +353,9 @@ type operationPayload struct {
 // Only fixed codes and numeric diagnostics survive a failed submission. Never
 // retain upstream response text, URLs or headers in an error or a receipt.
 type operationSubmitFailure struct {
-	HTTPStatus int `json:"http_status,omitempty"`
-	Errno      int `json:"errno,omitempty"`
+	HTTPStatus int    `json:"http_status,omitempty"`
+	Errno      int    `json:"errno,omitempty"`
+	Reason     string `json:"reason,omitempty"`
 }
 
 func operationUnknownFailure(p operationPayload) *Failure {

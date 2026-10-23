@@ -176,6 +176,9 @@ func (d *Client) persistProof(ctx context.Context, p SpaceProof) error {
 	lock := d.credentialLock()
 	lock.Lock()
 	defer lock.Unlock()
+	if err := checkCommonSpaceGuard(ctx); err != nil {
+		return err
+	}
 	c := d.Credentials()
 	if d.config.LoadCredentials != nil {
 		raw, e := d.config.LoadCredentials(ctx)

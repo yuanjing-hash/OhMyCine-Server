@@ -113,6 +113,9 @@ func (s *ConnectionService) quarkRootFailure(id uint, fallback string, err error
 			Bool("upload_target_recorded", upload.TargetRecorded).Bool("upload_not_dispatched", upload.NotDispatched).
 			Int("upload_inflight_part", upload.InFlightPart).Int("upload_confirmed_parts", upload.ConfirmedParts).
 			Int("upload_task_pages", upload.TaskPages).Bool("upload_task_listing_complete", upload.TaskListingComplete)
+		if upload.SubmitReason != "" {
+			event = event.Str("upload_submit_reason", upload.SubmitReason)
+		}
 		if upload.TaskFinishStatus != nil {
 			event = event.Int("upload_task_finish_status", *upload.TaskFinishStatus)
 		}

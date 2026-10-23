@@ -199,6 +199,7 @@ type Failure struct {
 	Errno          int
 	RetryAfter     time.Duration
 	UnknownOutcome bool
+	SubmitReason   string
 }
 
 func (e *Failure) Error() string { return e.Code }

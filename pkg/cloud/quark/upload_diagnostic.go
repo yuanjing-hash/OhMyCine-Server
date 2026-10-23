@@ -16,6 +16,7 @@ type UploadDiagnostic struct {
 	TaskPages                                            int
 	TaskListingComplete                                  bool
 	TaskQueryReason, TaskResponseField, TaskResponseType string
+	SubmitReason                                         string
 }
 
 type uploadStateError struct {
@@ -35,6 +36,9 @@ func withUploadDiagnostic(r cloud.OperationReceipt, p uploadPayload, err error) 
 		return err
 	}
 	d := UploadDiagnostic{Phase: "unknown", State: "unknown", HasTask: p.TaskID != "", HasOutput: p.Handle != "", TargetRecorded: p.Target != nil}
+	if p.SubmitFailure != nil {
+		d.SubmitReason = safeUploadSubmitReason(p.SubmitFailure.Reason)
+	}
 	switch p.Phase {
 	case "prepare", "pre_inflight", "pre_received", "put_inflight", "put_received", "finish_inflight", "finish_received", "metadata_confirmed":
 		d.Phase = p.Phase

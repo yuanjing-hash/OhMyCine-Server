@@ -13,6 +13,7 @@ import (
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/credential"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud/quark"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
@@ -47,6 +48,11 @@ func (s *quarkOperationStore) purpose(key string) string {
 }
 
 func validQuarkReceipt(r cloud.OperationReceipt) bool {
+	// Reserved SQL classifications are derived only from a validated private
+	// proof/upload pair, never accepted as caller-supplied receipt assertions.
+	if r.Kind == "reserved_space_proof" || r.Kind == "reserved_space_proof_upload" {
+		return false
+	}
 	if r.ID == "" || len(r.ID) > 512 || r.Provider != "quark" || r.AccountID == "" || len(r.AccountID) > 512 || r.Kind == "" || len(r.Kind) > 80 || len(r.Payload) > 1<<20 || !json.Valid(r.Payload) || strings.ContainsAny(r.ID+r.AccountID+r.Kind, "\x00\r\n") {
 		return false
 	}
@@ -90,7 +96,10 @@ func (s *quarkOperationStore) decode(row models.QuarkOperationReceipt) (cloud.Op
 }
 
 func (s *quarkOperationStore) Create(ctx context.Context, r cloud.OperationReceipt) error {
-	if r.State != "prepared" || r.Revision > 1 {
+	// A cursor is a confirmed local selection, not a provider mutation. Do
+	// not make observation treat it as an eternal pending account-wide write.
+	localCursor := r.Kind == "space_proof_cursor" && r.State == "confirmed"
+	if r.State != "prepared" && !localCursor || r.Revision > 1 {
 		return ErrObservationInvalid
 	}
 	sealed, err := s.encode(r)
@@ -120,8 +129,39 @@ func (s *quarkOperationStore) Create(ctx context.Context, r cloud.OperationRecei
 		if result.RowsAffected != 1 {
 			return ErrQuarkOperationConflict
 		}
+		if r.Kind == "upload" && strings.HasSuffix(r.ID, "/upload") {
+			proof, err := (&quarkOperationStore{db: tx, credentials: s.credentials, connectionID: s.connectionID}).Load(ctx, strings.TrimSuffix(r.ID, "/upload"))
+			if err != nil && !errors.Is(err, cloud.ErrOperationNotFound) {
+				return err
+			}
+			if err == nil && quark.OwnsCommonSpaceReceipts(proof, r) {
+				return s.classifyCommonSpaceTx(ctx, tx, proof, r)
+			}
+		}
 		return nil
 	})
+}
+
+// Preserve encrypted receipts and all cloud states. Only a proved private pair
+// receives metadata that excludes its reserved challenge from media-observation
+// write barriers. Unknown general uploads never receive this classification.
+func (s *quarkOperationStore) classifyCommonSpaceTx(ctx context.Context, tx *gorm.DB, proof, upload cloud.OperationReceipt) error {
+	if !quark.OwnsCommonSpaceReceipts(proof, upload) {
+		return ErrObservationInvalid
+	}
+	for _, pair := range []struct {
+		r    cloud.OperationReceipt
+		kind string
+	}{{proof, "reserved_space_proof"}, {upload, "reserved_space_proof_upload"}} {
+		result := tx.WithContext(ctx).Model(&models.QuarkOperationReceipt{}).Where("id = ? AND connection_id = ? AND revision = ?", s.key(pair.r.ID), s.connectionID, pair.r.Revision).Update("kind", pair.kind)
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return ErrQuarkOperationConflict
+		}
+	}
+	return nil
 }
 
 func (s *quarkOperationStore) Load(ctx context.Context, id string) (cloud.OperationReceipt, error) {
