@@ -13,6 +13,7 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/authz"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
+	downloadpkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/downloader"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/metadata/tmdb"
 	sitepkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/site"
 )
@@ -361,7 +362,7 @@ func TestFollowWorkerUsesCoverageIdentitySearchAndDownloadPipeline(t *testing.T)
 	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		switch request.URL.Path {
 		case "/tv/100":
-			_, _ = writer.Write([]byte(`{"id":100,"name":"示例剧","original_name":"Fixture Show","original_language":"en","first_air_date":"2026-01-01","seasons":[{"id":1,"season_number":1,"name":"第 1 季","episode_count":3,"poster_path":"/s1.jpg"}],"alternative_titles":{"results":[]},"translations":{"translations":[]}}`))
+			_, _ = writer.Write([]byte(`{"id":100,"name":"示例剧","original_name":"Fixture Show","original_language":"en","first_air_date":"2026-01-01","genres":[{"id":18,"name":"剧情"}],"origin_country":["US"],"seasons":[{"id":1,"season_number":1,"name":"第 1 季","episode_count":3,"poster_path":"/s1.jpg"}],"alternative_titles":{"results":[]},"translations":{"translations":[]}}`))
 		case "/tv/100/season/1":
 			_, _ = writer.Write([]byte(`{"season_number":1,"episodes":[{"id":11,"season_number":1,"episode_number":1,"name":"已入库","air_date":"2026-01-01"},{"id":12,"season_number":1,"episode_number":2,"name":"待下载","air_date":"2026-01-08"},{"id":13,"season_number":1,"episode_number":3,"name":"后续播出","air_date":"2026-08-20"}]}`))
 		default:
@@ -380,6 +381,7 @@ func TestFollowWorkerUsesCoverageIdentitySearchAndDownloadPipeline(t *testing.T)
 		return tmdb.NewForTest("test-token", upstream.URL, upstream.Client())
 	}
 	sites.SetMetadataSettings(metadata)
+	downloads.SetMetadataSettings(metadata)
 	adapter.searchTitle = "Fixture.Show.S01E02.1080p.WEB-DL.HEVC-GROUP"
 
 	var administrator models.Role
@@ -580,6 +582,38 @@ func TestFollowWorkerUsesCoverageIdentitySearchAndDownloadPipeline(t *testing.T)
 	currentSummary, err := follows.Get(actor, subscription.ID)
 	if err != nil || currentSummary.ProgressTarget != 2 || currentSummary.ProgressPresent != 1 || currentSummary.ProgressMissing != 1 {
 		t.Fatalf("initial progress=%+v err=%v", currentSummary, err)
+	}
+
+	// Exercise the actual submitted identity through completion and the real
+	// Transfer trust gate. A successful Follow submission alone cannot establish
+	// that the later intake consumes the same source/lock/season facts.
+	completion := &followCompletedDownloadClient{stubDownloadClient: &stubDownloadClient{seedTask: &downloadpkg.Task{ID: "follow-provider", Status: "completed", Completed: true}}, manifest: downloadpkg.Manifest{Name: adapter.searchTitle, Complete: true, Files: []downloadpkg.File{{RelativePath: adapter.searchTitle + ".mkv", Size: 2 * 1024 * 1024 * 1024}}}}
+	downloaders.registry = downloadpkg.NewRegistry()
+	if err := downloaders.registry.Register(models.DownloaderTypeQBittorrent, downloadpkg.Capabilities{Seeding: true}, func(downloadpkg.Config) (downloadpkg.Client, error) { return completion, nil }); err != nil {
+		t.Fatal(err)
+	}
+	downloads.SetTransferService(NewTransferService(queue.db, queue.audit, queue, logger))
+	downloadClaim, err := queue.Claim([]string{"download"})
+	if err != nil || downloadClaim == nil || downloadClaim.Job.ID != task.JobID {
+		t.Fatalf("download claim=%+v err=%v", downloadClaim, err)
+	}
+	downloadResult := NewDownloadWorker(downloads).Run(context.Background(), workerRuntime{queue: queue, job: *downloadClaim}, *downloadClaim)
+	if downloadResult.ErrorCode != "" || downloadResult.RetryAt != nil || downloadResult.Wait != nil {
+		t.Fatalf("automatic Follow intake failed: %+v", downloadResult)
+	}
+	if err := queue.db.First(&task, "id = ?", task.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	identity, err := decodeMediaIdentity(task.IdentitySnapshotJSON)
+	if err != nil || task.IdentitySource != mediaIdentitySourceDirectID || task.IdentityLocked || task.IdentityStatus != mediaIdentityStatusVerified || task.IdentityRevision != 1 || identity.Locked || identity.Season == nil || *identity.Season != 1 || identity.Episode == nil || *identity.Episode != 2 || identity.TMDBID == nil || *identity.TMDBID != 100 {
+		t.Fatalf("Follow identity changed at completion: task=%+v identity=%+v err=%v", task, identity, err)
+	}
+	var intake models.TransferTask
+	if err := queue.db.First(&intake, "download_task_id = ?", task.ID).Error; err != nil || intake.LibraryID != library.ID {
+		t.Fatalf("automatic Follow did not enqueue its original target: %+v %v", intake, err)
+	}
+	if err := queue.Complete(downloadClaim.Job.ID, downloadClaim.LeaseToken); err != nil {
+		t.Fatal(err)
 	}
 
 	episodeTwo := 2
