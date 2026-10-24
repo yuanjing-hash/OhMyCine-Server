@@ -596,7 +596,7 @@ func (s *DownloadService) submit(ctx context.Context, ownerID uint, input Submit
 		record.IdentityRevision = 1
 		record.RecognitionOverrideSeason = cloneInt(input.RecognitionOverride.Season)
 		record.RecognitionOverrideEpisode = cloneInt(input.RecognitionOverride.Episode)
-		identity := MediaIdentitySnapshot{Version: 1, Revision: 1, Source: input.RecognitionOverride.Source, Status: input.RecognitionOverride.Status, Locked: input.RecognitionOverride.Locked, TMDBID: cloneInt64(&input.RecognitionOverride.TMDBID), MediaType: input.RecognitionOverride.MediaType, Title: displayName}
+		identity := MediaIdentitySnapshot{Version: 1, Revision: 1, Source: input.RecognitionOverride.Source, Status: input.RecognitionOverride.Status, Locked: input.RecognitionOverride.Locked, TMDBID: cloneInt64(&input.RecognitionOverride.TMDBID), MediaType: input.RecognitionOverride.MediaType, Title: displayName, Season: cloneInt(input.RecognitionOverride.Season), Episode: cloneInt(input.RecognitionOverride.Episode)}
 		if rawIdentity, marshalErr := json.Marshal(identity); marshalErr == nil {
 			record.IdentitySnapshotJSON = string(rawIdentity)
 		}
@@ -717,7 +717,7 @@ func validDownloadIdentityBinding(identity DownloadRecognitionIdentity) bool {
 	case mediaIdentitySourceManual:
 		return identity.Locked && identity.Status == mediaIdentityStatusVerified
 	case mediaIdentitySourceDirectID:
-		return identity.Status == mediaIdentityStatusVerified || identity.Status == mediaIdentityStatusProvisional
+		return !identity.Locked && (identity.Status == mediaIdentityStatusVerified || identity.Status == mediaIdentityStatusProvisional)
 	case mediaIdentitySourceAutomatic, mediaIdentitySourceAI:
 		return !identity.Locked && (identity.Status == mediaIdentityStatusVerified || identity.Status == mediaIdentityStatusProvisional)
 	default:
@@ -2359,15 +2359,14 @@ func (w *DownloadWorker) classify(ctx context.Context, task models.DownloadTask,
 	boundEpisode := cloneInt(task.RecognitionOverrideEpisode)
 	boundSource := mediaIdentitySourceManual
 	boundStatus := mediaIdentityStatusVerified
-	if boundTMDBID == nil && task.IdentityRevision > 0 && strings.TrimSpace(task.IdentitySnapshotJSON) != "" {
-		if identity, decodeErr := decodeMediaIdentity(task.IdentitySnapshotJSON); decodeErr == nil && identity.Revision == task.IdentityRevision && identity.TMDBID != nil && (identity.MediaType == "movie" || identity.MediaType == "tv") {
-			boundTMDBID = cloneInt64(identity.TMDBID)
-			boundMediaType = identity.MediaType
-			boundSeason = cloneInt(identity.Season)
-			boundEpisode = cloneInt(identity.Episode)
-			boundSource = firstNonEmpty(identity.Source, firstNonEmpty(task.IdentitySource, mediaIdentitySourceDirectID))
-			boundStatus = firstNonEmpty(identity.Status, firstNonEmpty(task.IdentityStatus, mediaIdentityStatusProvisional))
-		}
+	if identity, identityErr := downloadCanonicalIdentityBinding(task); identityErr != nil {
+		return result, identityErr
+	} else if identity != nil {
+		boundTMDBID = cloneInt64(&identity.TMDBID)
+		boundMediaType = identity.MediaType
+		boundSeason = cloneInt(identity.Season)
+		boundEpisode = cloneInt(identity.Episode)
+		boundSource, boundStatus = identity.Source, identity.Status
 	}
 	// v48 could recover the legacy identity columns without materializing the
 	// versioned JSON snapshot. Treat a previously selected automatic TMDB item
@@ -2441,12 +2440,23 @@ func (w *DownloadWorker) classify(ctx context.Context, task models.DownloadTask,
 }
 
 func (w *DownloadWorker) persistScrape(task *models.DownloadTask, match scrapeMatch, status string, files int) error {
+	return w.persistScrapeIdentity(task, *task, match, status, files)
+}
+
+// identityTask may differ only for a proven legacy Follow lock correction.
+// task retains the observed database identity until its compare-and-swap wins.
+func (w *DownloadWorker) persistScrapeIdentity(task *models.DownloadTask, identityTask models.DownloadTask, match scrapeMatch, status string, files int) error {
 	updates := map[string]any{"scrape_status": status, "scrape_title": safeLabel(match.Title, 256), "scrape_media_type": safeLabel(match.MediaType, 16), "scrape_category": safeLabel(match.Category, 128), "scrape_tmdb_id": match.TMDBID, "scrape_confidence": match.Confidence, "scrape_year": match.Year, "scrape_season": match.Season, "scrape_episode": match.Episode, "manifest_file_count": files, "last_error_code": "", "last_error_message": "", "updated_at": time.Now().UTC()}
 	identitySource := firstNonEmpty(match.IdentitySource, mediaIdentitySourceAutomatic)
 	identityStatus := firstNonEmpty(match.IdentityStatus, mediaIdentityStatusVerified)
-	identityLocked := task.IdentityLocked || task.RecognitionOverrideTMDBID != nil
+	identityLocked := identityTask.IdentityLocked
+	if identityTask.IdentitySource == "" && identityTask.RecognitionOverrideTMDBID != nil {
+		// Pre-versioned manual overrides retain their historical meaning. A
+		// versioned direct/automatic identity never derives a lock from this ID.
+		identityLocked = true
+	}
 	if identityLocked {
-		identitySource = firstNonEmpty(task.IdentitySource, firstNonEmpty(match.IdentitySource, mediaIdentitySourceManual))
+		identitySource = firstNonEmpty(identityTask.IdentitySource, firstNonEmpty(match.IdentitySource, mediaIdentitySourceManual))
 		identityStatus = mediaIdentityStatusVerified
 	} else if match.TMDBID == nil {
 		identitySource, identityStatus = mediaIdentitySourceLocalProvisional, mediaIdentityStatusLocalProvisional
@@ -2467,12 +2477,12 @@ func (w *DownloadWorker) persistScrape(task *models.DownloadTask, match scrapeMa
 	}
 	updates["identity_source"], updates["identity_status"], updates["identity_locked"] = identitySource, identityStatus, identityLocked
 	updates["identity_revision"], updates["identity_snapshot_json"] = revision, snapshotJSON
-	active, err := w.updateActiveTask(task, updates)
+	active, err := w.persistDownloadIdentity(task, identityTask, updates)
 	if err != nil {
 		return err
 	}
 	if !active {
-		return context.Canceled
+		return errDownloadIdentityChanged
 	}
 	task.ScrapeStatus = status
 	task.ScrapeTitle = safeLabel(match.Title, 256)
@@ -2642,8 +2652,18 @@ func (w *DownloadWorker) verifyCompleted(ctx context.Context, task *models.Downl
 	if err := w.validateSelectedShareManifest(*task, manifest); err != nil {
 		return downloadpkg.Manifest{}, err
 	}
-	match, err := w.classify(ctx, *task, manifest)
+	identityTask, identityErr := completedDownloadIdentity(w.service.db.WithContext(ctx), *task, manifest)
+	if identityErr != nil {
+		return downloadpkg.Manifest{}, identityErr
+	}
+	match, err := w.classify(ctx, identityTask, manifest)
+	if errors.Is(err, errDownloadIdentityInvalid) {
+		return downloadpkg.Manifest{}, err
+	}
 	if err != nil || !match.Confident {
+		if identityTask.IdentityLocked != task.IdentityLocked {
+			return downloadpkg.Manifest{}, appError(CodeTransferMediaUnrecognized, "下载已完成，但原媒体身份尚未核实；来源文件保留", err)
+		}
 		code := classificationFallbackCode(err, match)
 		if persistErr := w.persistScrape(task, match, "completed_unrecognized", len(manifest.Files)); persistErr != nil {
 			return downloadpkg.Manifest{}, appError("download_state_persist_failed", "完成后刮削结果保存失败", persistErr)
@@ -2653,6 +2673,9 @@ func (w *DownloadWorker) verifyCompleted(ctx context.Context, task *models.Downl
 	}
 	selected, err := selectDownloadPackageManifest(manifest, match.MediaType)
 	if err != nil {
+		if identityTask.IdentityLocked != task.IdentityLocked {
+			return downloadpkg.Manifest{}, appError(CodeTransferMediaUnrecognized, "下载已完成，但原文件清单尚未核实；来源文件保留", err)
+		}
 		status := "completed_unrecognized"
 		if errors.Is(err, errPackageEpisodeUnrecognized) {
 			status = "completed_verified"
@@ -2665,7 +2688,7 @@ func (w *DownloadWorker) verifyCompleted(ctx context.Context, task *models.Downl
 		}
 		return downloadpkg.Manifest{}, appError(CodeTransferMediaUnrecognized, "下载已完成，但没有找到可信主媒体，未自动入库", nil)
 	}
-	if err := w.persistScrape(task, match, "completed_verified", len(selected.Files)); err != nil {
+	if err := w.persistScrapeIdentity(task, identityTask, match, "completed_verified", len(selected.Files)); err != nil {
 		return downloadpkg.Manifest{}, appError("download_state_persist_failed", "完成后刮削结果保存失败", err)
 	}
 	w.recordDownload(ctx, *task, "download.manifest_verified", "verify", "confirmed", fmt.Sprintf("下载包识别为 %s；完整清单 %d 项，选择可入库媒体及附属文件 %d 项，排除 %d 项；尚未执行移动或重命名", serverlog.BusinessDisplayName(match.Title), len(manifest.Files), len(selected.Files), len(manifest.Files)-len(selected.Files)), map[string]any{"title": match.Title, "media_type": match.MediaType, "total_count": len(manifest.Files), "selected_count": len(selected.Files), "rejected_count": len(manifest.Files) - len(selected.Files)})
@@ -2945,6 +2968,11 @@ func recoverableDownloadTelemetryError(code string) bool {
 }
 
 func (w *DownloadWorker) failure(task models.DownloadTask, err error) WorkerResult {
+	if errors.Is(err, errDownloadIdentityChanged) {
+		// A newer correction or cancellation owns the task now. Do not decorate
+		// that revision with this retired worker's failure.
+		return WorkerResult{}
+	}
 	code, retryable := downloadpkg.ErrorInfo(err)
 	var applicationError *AppError
 	if errors.As(err, &applicationError) {
@@ -2954,7 +2982,17 @@ func (w *DownloadWorker) failure(task models.DownloadTask, err error) WorkerResu
 		return w.failureRetryable(task, err)
 	}
 	message := downloadFailureMessage(code, false)
-	_ = w.markFailure(task, code, message, true)
+	if errors.Is(err, errDownloadIdentityInvalid) {
+		active, persistErr := w.markDownloadIdentityFailure(task, code, message)
+		if persistErr != nil {
+			return WorkerResult{ErrorCode: "download_state_persist_failed", ErrorMessage: "下载完成后的识别结果保存失败，请重试"}
+		}
+		if !active {
+			return WorkerResult{}
+		}
+	} else {
+		_ = w.markFailure(task, code, message, true)
+	}
 	operation := downloadOperation(task.ProviderType, task.SourceOrigin)
 	operation.Event(w.service.log.Error()).Str("task_id", task.ID).Str("error_code", code).Msg(operation.Message("执行失败"))
 	return WorkerResult{ErrorCode: code, ErrorMessage: message}
