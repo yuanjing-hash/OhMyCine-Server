@@ -110,6 +110,9 @@ func (w *FollowSearchWorker) recordRunEnd(ctx context.Context, runtime JobRuntim
 			message = "本轮追更失败：" + followBusinessFailure(persisted.ErrorCode)
 			if persisted.ErrorCode == "follow_coverage_unknown" {
 				outcome, message = "waiting", "等待媒体库扫描或剧集播出信息完善，本轮未搜索或提交下载；订阅将按计划重新检查"
+				if reasons["coverage_library_unknown"]+reasons["coverage_air_date_unknown"]+reasons["coverage_metadata_unknown"]+reasons["coverage_seasons_unavailable"] > 0 {
+					message = followCoverageWaitMessage(mediaCoverageUncertainty{Library: reasons["coverage_library_unknown"], AirDate: reasons["coverage_air_date_unknown"], Metadata: reasons["coverage_metadata_unknown"], Seasons: reasons["coverage_seasons_unavailable"]})
+				}
 			}
 		}
 		if outcome == "finished" && (persisted.ErrorCode != "" || reasons["site_error"] > 0 || reasons["site_incomplete"] > 0 || reasons["search_incomplete"] > 0) {

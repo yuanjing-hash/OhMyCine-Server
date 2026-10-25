@@ -2,7 +2,6 @@ package services
 
 import (
 	"context"
-	"errors"
 	"sort"
 	"strings"
 	"sync"
@@ -43,6 +42,14 @@ type MediaCoverageEpisode struct {
 	AirDate       string `json:"air_date,omitempty"`
 	Status        string `json:"status"`
 	LibraryIDs    []uint `json:"library_ids"`
+	uncertainty   string
+}
+
+type mediaCoverageUncertainty struct {
+	Library  int
+	AirDate  int
+	Metadata int
+	Seasons  int
 }
 
 type MediaCoverageCounts struct {
@@ -61,6 +68,7 @@ type MediaCoverageSeason struct {
 	Status       string                 `json:"status"`
 	Counts       MediaCoverageCounts    `json:"counts"`
 	Episodes     []MediaCoverageEpisode `json:"episodes"`
+	uncertainty  mediaCoverageUncertainty
 }
 
 type MediaCoverage struct {
@@ -139,6 +147,18 @@ func (s *MediaCoverageService) Coverage(ctx context.Context, actor Actor, mediaT
 		presence[key] = appendUniqueUint(presence[key], entry.LibraryID)
 	}
 	seasons := append([]tmdb.SeasonSnapshot(nil), verified.Snapshot.Seasons...)
+	knownSeasons := make(map[int]bool, len(seasons))
+	for _, season := range seasons {
+		knownSeasons[season.SeasonNumber] = true
+	}
+	// Catalog identity remains positive evidence when TMDB omits a season.
+	for coordinate := range presence {
+		if !knownSeasons[coordinate[0]] {
+			seasons = append(seasons, tmdb.SeasonSnapshot{SeasonNumber: coordinate[0]})
+			knownSeasons[coordinate[0]] = true
+			result.Freshness.TMDBState = "partial"
+		}
+	}
 	if len(seasons) > maxCoverageSeasons {
 		seasons = seasons[:maxCoverageSeasons]
 		result.Freshness.TMDBState = "partial"
@@ -181,21 +201,28 @@ func (s *MediaCoverageService) Coverage(ctx context.Context, actor Actor, mediaT
 		if upstream, imageErr := client.ImageURL(season.PosterPath, "w300"); imageErr == nil {
 			projection.PosterURL = proxyDiscoveryImage("tmdb", upstream)
 		}
-		if seasonErrors[index] || len(seasonEpisodes[index]) == 0 {
-			projection.Counts.Unknown = max(0, season.EpisodeCount)
-			projection.Counts.Total = projection.Counts.Unknown
-			result.Freshness.TMDBState = "partial"
-			tv.Seasons = append(tv.Seasons, projection)
-			if !projection.Special {
-				tv.Counts.Total += projection.Counts.Total
-				tv.Counts.Unknown += projection.Counts.Unknown
-			}
-			continue
-		}
 		episodes := append([]tmdb.EpisodeSnapshot(nil), seasonEpisodes[index]...)
+		metadataEpisodes := make(map[int]bool, len(episodes))
+		for _, episode := range episodes {
+			metadataEpisodes[episode.EpisodeNumber] = true
+		}
+		if seasonErrors[index] || len(episodes) == 0 {
+			result.Freshness.TMDBState = "partial"
+			projection.uncertainty.Seasons = 1
+		}
+		for coordinate := range presence {
+			if coordinate[0] == season.SeasonNumber && !metadataEpisodes[coordinate[1]] {
+				episodes = append(episodes, tmdb.EpisodeSnapshot{EpisodeNumber: coordinate[1], SeasonNumber: coordinate[0]})
+				result.Freshness.TMDBState = "partial"
+			}
+		}
 		sort.SliceStable(episodes, func(left, right int) bool { return episodes[left].EpisodeNumber < episodes[right].EpisodeNumber })
 		seenEpisodes := make(map[int]struct{}, len(episodes))
 		for _, episode := range episodes {
+			if episode.EpisodeNumber <= 0 {
+				result.Freshness.TMDBState = "partial"
+				continue
+			}
 			if _, duplicate := seenEpisodes[episode.EpisodeNumber]; duplicate {
 				result.Freshness.TMDBState = "partial"
 				continue
@@ -204,15 +231,23 @@ func (s *MediaCoverageService) Coverage(ctx context.Context, actor Actor, mediaT
 			ids := append([]uint{}, presence[[2]int{season.SeasonNumber, episode.EpisodeNumber}]...)
 			sort.Slice(ids, func(left, right int) bool { return ids[left] < ids[right] })
 			item := MediaCoverageEpisode{EpisodeNumber: episode.EpisodeNumber, Name: episode.Name, AirDate: episode.AirDate, LibraryIDs: ids}
+			airing := coverageAirDateState(episode.AirDate, s.now())
 			switch {
 			case len(ids) > 0:
 				item.Status = "present"
-			case coverageAirDateState(episode.AirDate, s.now()) == "future":
+			case airing == "future":
 				item.Status = "future"
-			case coverageAirDateState(episode.AirDate, s.now()) == "aired" && reliable:
+			case airing == "aired" && reliable:
 				item.Status = "missing"
 			default:
 				item.Status = "unknown"
+				if airing == "aired" {
+					item.uncertainty = "library"
+					projection.uncertainty.Library++
+				} else {
+					item.uncertainty = "air_date"
+					projection.uncertainty.AirDate++
+				}
 			}
 			projection.Episodes = append(projection.Episodes, item)
 			incrementCoverageCount(&projection.Counts, item.Status)
@@ -223,6 +258,7 @@ func (s *MediaCoverageService) Coverage(ctx context.Context, actor Actor, mediaT
 		if missingFacts := max(0, season.EpisodeCount-projection.Counts.Total); missingFacts > 0 {
 			projection.Counts.Total += missingFacts
 			projection.Counts.Unknown += missingFacts
+			projection.uncertainty.Metadata += missingFacts
 			result.Freshness.TMDBState = "partial"
 		}
 		projection.Status = coverageSeasonStatus(projection.Counts)
@@ -272,70 +308,45 @@ func (s *MediaCoverageService) coverageCatalog(ctx context.Context, actor Actor,
 	state := "unknown"
 	err := facade.withCatalogReadTx(ctx, func(tx *gorm.DB) error {
 		var err error
-		libraries, reliable, state, err = s.coverageLibrariesTx(tx, actor)
+		facade := &MediaLibraryService{db: s.db, catalogStore: s.catalogStore}
+		authorized, err := facade.authorizedMediaLibraryIDsTx(tx, actor, authz.PermissionMediaLibrariesRead, true)
 		if err != nil {
 			return err
 		}
-		ids := make([]uint, 0, len(libraries))
-		for _, library := range libraries {
-			ids = append(ids, library.ID)
+		var records []models.MediaLibrary
+		if err := tx.Select("media_libraries.*").Joins("JOIN storages ON storages.id=media_libraries.storage_id").Where("media_libraries.id IN ? AND media_libraries.enabled = ? AND storages.enabled = ?", authorized, true, true).Order("media_libraries.sort_order ASC,media_libraries.id ASC").Find(&records).Error; err != nil {
+			return err
+		}
+		ids := make([]uint, 0, len(records))
+		for _, record := range records {
+			ids = append(ids, record.ID)
 		}
 		reader, err := PinCatalogTx(tx, ids)
 		if err != nil {
 			return err
 		}
+		states, err := libraryCatalogStatesTx(tx, reader, ids)
+		if err != nil {
+			return err
+		}
+		libraries = make([]MediaCoverageLibrary, 0, len(records))
+		reliable = len(records) > 0
+		state = "unscanned"
+		for _, record := range records {
+			projection := states[record.ID]
+			reliable = reliable && projection.AbsenceReliable
+			if projection.ScanState != "unscanned" {
+				state = "partial"
+			}
+			libraries = append(libraries, MediaCoverageLibrary{ID: record.ID, Name: record.Name, ScanState: projection.ScanState, LastSuccessfulAt: record.LastSuccessfulScanAt, ContentRevision: record.ContentRevision})
+		}
+		if reliable {
+			state = "complete"
+		}
 		entries, err = coverageEntries(reader, mediaType, tmdbID)
 		return err
 	})
 	return libraries, entries, reliable, state, err
-}
-
-func (s *MediaCoverageService) coverageLibrariesTx(tx *gorm.DB, actor Actor) ([]MediaCoverageLibrary, bool, string, error) {
-	facade := &MediaLibraryService{db: s.db, catalogStore: s.catalogStore}
-	ids, err := facade.authorizedMediaLibraryIDsTx(tx, actor, authz.PermissionMediaLibrariesRead, true)
-	if err != nil {
-		return nil, false, "unknown", err
-	}
-	var records []models.MediaLibrary
-	if err := tx.Select("media_libraries.*").Joins("JOIN storages ON storages.id=media_libraries.storage_id").Where("media_libraries.id IN ? AND media_libraries.enabled = ? AND storages.enabled = ?", ids, true, true).Order("media_libraries.sort_order ASC,media_libraries.id ASC").Find(&records).Error; err != nil {
-		return nil, false, "unknown", err
-	}
-	result := make([]MediaCoverageLibrary, 0, len(records))
-	reliable := len(records) > 0
-	anyScanned := false
-	anyPartial := false
-	for _, record := range records {
-		if !actor.CanResource(authz.PermissionMediaLibrariesRead, models.AuthorizationResourceMediaLibrary, uintID(record.ID)) {
-			continue
-		}
-		state := "unscanned"
-		var run models.MediaLibraryScanRun
-		runErr := tx.Where("library_id = ?", record.ID).Order("id DESC").First(&run).Error
-		if runErr != nil && !errors.Is(runErr, gorm.ErrRecordNotFound) {
-			return nil, false, "unknown", runErr
-		}
-		if record.BaselineGeneration > 0 && record.LastSuccessfulScanAt != nil {
-			anyScanned = true
-			if runErr == nil && (run.Status != "success" || run.Partial) {
-				state, anyPartial, reliable = "partial", true, false
-			} else {
-				state = "complete"
-			}
-		} else {
-			reliable = false
-		}
-		result = append(result, MediaCoverageLibrary{ID: record.ID, Name: record.Name, ScanState: state, LastSuccessfulAt: record.LastSuccessfulScanAt, ContentRevision: record.ContentRevision})
-	}
-	if len(result) == 0 {
-		reliable = false
-	}
-	aggregate := "unscanned"
-	if reliable {
-		aggregate = "complete"
-	} else if anyPartial || anyScanned {
-		aggregate = "partial"
-	}
-	return result, reliable, aggregate, nil
 }
 
 func coverageEntries(reader *CatalogReader, mediaType string, tmdbID int64) ([]models.MediaLibraryEntry, error) {

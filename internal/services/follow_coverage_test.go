@@ -42,9 +42,21 @@ func newFollowCoverageFixture(t *testing.T, trailing, scanState string, presentC
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/tv/100":
+			if strings.HasPrefix(trailingState.Load().(string), "zero_") {
+				_, _ = w.Write([]byte(`{"id":100,"name":"嫁金钗","original_name":"Fixture Show","first_air_date":"2026-10-01","seasons":[{"id":1,"season_number":1,"name":"第 1 季","episode_count":0}]}`))
+				return
+			}
 			_, _ = w.Write([]byte(`{"id":100,"name":"嫁金钗","original_name":"Fixture Show","original_language":"en","first_air_date":"2026-10-01","seasons":[{"id":1,"season_number":1,"name":"第 1 季","episode_count":24}],"alternative_titles":{"results":[]},"translations":{"translations":[]}}`))
 		case "/tv/100/season/1":
 			trailing := trailingState.Load().(string)
+			if trailing == "season_error" || trailing == "zero_error" {
+				http.Error(w, "fixture season unavailable", http.StatusNotFound)
+				return
+			}
+			if trailing == "zero_empty" {
+				_, _ = w.Write([]byte(`{"season_number":1,"episodes":[]}`))
+				return
+			}
 			episodes := []map[string]any{}
 			for episode := 1; episode <= 24; episode++ {
 				if episode > 15 && trailing == "missing_rows" {
@@ -109,7 +121,7 @@ func newFollowCoverageFixture(t *testing.T, trailing, scanState string, presentC
 		t.Fatal(err)
 	}
 	if scanState != "unscanned" {
-		if err := queue.db.Create(&models.MediaLibraryScanRun{LibraryID: library.ID, Kind: "full", Status: "success", Partial: scanState == "partial", Generation: 1, StartedAt: lastScan, FinishedAt: &lastScan}).Error; err != nil {
+		if err := queue.db.Create(&models.MediaLibraryScanRun{LibraryID: library.ID, Kind: "full", Status: "success", SourceFingerprint: mediaLibraryScanSourceFingerprint(library, storage, profile), Partial: scanState == "partial", Generation: 1, StartedAt: lastScan, FinishedAt: &lastScan}).Error; err != nil {
 			t.Fatal(err)
 		}
 	}

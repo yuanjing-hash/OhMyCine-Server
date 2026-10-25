@@ -44,7 +44,7 @@ const readinessRepairCancelledUnenteredSQL = `EXISTS (
 const readinessRepairActiveSQL = `(r.phase IN ('queued','executing','reconciling') AND NOT (` + readinessRepairCancelledUnenteredSQL + `)) OR
 	(r.phase='failed' AND EXISTS(SELECT 1 FROM jobs retry_job WHERE retry_job.id=r.job_id AND retry_job.job_type='media_library_repair' AND retry_job.status IN ('queued','running')))`
 
-func libraryReadinessRows(db *gorm.DB, ids []uint) (map[uint]MediaLibraryReadiness, error) {
+func libraryExecutionReadinessRows(db *gorm.DB, ids []uint) (map[uint]MediaLibraryReadiness, error) {
 	type row struct {
 		ID                 uint
 		Enabled            bool

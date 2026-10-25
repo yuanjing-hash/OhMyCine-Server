@@ -410,6 +410,7 @@ func (s *DownloadService) Submit(ctx context.Context, actor Actor, input SubmitD
 }
 
 func (s *DownloadService) submit(ctx context.Context, ownerID uint, input SubmitDownloadInput, request RequestContext, sourceOrigin, ingestSourceKey, providerItemID string) (DownloadTaskSummary, error) {
+	var replacingFollowTask *models.DownloadTask
 	input.FollowSubscriptionID = strings.TrimSpace(input.FollowSubscriptionID)
 	input.FollowResourceFingerprint = strings.TrimSpace(input.FollowResourceFingerprint)
 	if (input.FollowSubscriptionID == "") != (input.FollowResourceFingerprint == "") || len(input.FollowSubscriptionID) > 36 || len(input.FollowResourceFingerprint) > 64 {
@@ -423,12 +424,7 @@ func (s *DownloadService) submit(ctx context.Context, ownerID uint, input Submit
 				_ = s.db.First(&job, "id = ?", existing.JobID).Error
 				return s.observedSubmission(ctx, existing, job.Status, "reused", input.SourceSiteID), nil
 			}
-			result := s.db.Model(&models.DownloadTask{}).
-				Where("id = ? AND phase IN ?", existing.ID, []string{models.DownloadTaskStatusFailed, models.DownloadTaskStatusCancelled}).
-				Updates(map[string]any{"follow_subscription_id": "", "follow_resource_fingerprint": ""})
-			if result.Error != nil {
-				return DownloadTaskSummary{}, result.Error
-			}
+			replacingFollowTask = &existing
 		} else if err != gorm.ErrRecordNotFound {
 			return DownloadTaskSummary{}, err
 		}
@@ -683,6 +679,27 @@ func (s *DownloadService) submit(ctx context.Context, ownerID uint, input Submit
 			}
 		}
 		record.JobID = job.ID
+		if input.FollowSubscriptionID != "" {
+			// Releasing the failed occurrence and accepting its replacement are
+			// one commit. Validation/permission/lifecycle/AfterPersist failure
+			// must leave the original completed package's binding untouched.
+			var previous models.DownloadTask
+			err := tx.Where("follow_subscription_id = ? AND follow_resource_fingerprint = ?", input.FollowSubscriptionID, input.FollowResourceFingerprint).First(&previous).Error
+			if err == nil {
+				if replacingFollowTask == nil || previous.ID != replacingFollowTask.ID || previous.OwnerID != ownerID || previous.Phase != models.DownloadTaskStatusFailed && previous.Phase != models.DownloadTaskStatusCancelled {
+					return appError(CodeConflict, "原追更下载任务状态已变化，请重试", nil)
+				}
+				release := downloadIdentityObservedQuery(tx, *replacingFollowTask).Where("phase = ?", replacingFollowTask.Phase).Updates(map[string]any{"follow_subscription_id": "", "follow_resource_fingerprint": ""})
+				if release.Error != nil {
+					return release.Error
+				}
+				if release.RowsAffected != 1 {
+					return appError(CodeConflict, "原追更下载任务状态已变化，请重试", nil)
+				}
+			} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+				return err
+			}
+		}
 		if err := tx.Create(&record).Error; err != nil {
 			return err
 		}
@@ -701,7 +718,7 @@ func (s *DownloadService) submit(ctx context.Context, ownerID uint, input Submit
 	if err != nil {
 		if input.FollowSubscriptionID != "" {
 			var existing models.DownloadTask
-			if queryErr := s.db.Where("follow_subscription_id = ? AND follow_resource_fingerprint = ?", input.FollowSubscriptionID, input.FollowResourceFingerprint).First(&existing).Error; queryErr == nil {
+			if queryErr := s.db.Where("follow_subscription_id = ? AND follow_resource_fingerprint = ?", input.FollowSubscriptionID, input.FollowResourceFingerprint).First(&existing).Error; queryErr == nil && existing.Phase != models.DownloadTaskStatusFailed && existing.Phase != models.DownloadTaskStatusCancelled {
 				var existingJob models.Job
 				_ = s.db.First(&existingJob, "id = ?", existing.JobID).Error
 				return s.observedSubmission(ctx, existing, existingJob.Status, "reused", input.SourceSiteID), nil
@@ -1997,6 +2014,9 @@ func (w *DownloadWorker) completedRecognitionRecoveryTask(job ClaimedJob) (model
 	if err := w.service.db.First(&task, "id = ?", payload.DownloadTaskID).Error; err != nil {
 		return task, false, err
 	}
+	if job.Job.JobType != "download" || task.JobID != job.Job.ID || job.Job.OwnerID == nil || *job.Job.OwnerID != task.OwnerID {
+		return task, false, errDownloadIdentityChanged
+	}
 	return task, isCompletedRecognitionRecovery(task), nil
 }
 
@@ -2662,7 +2682,11 @@ func (w *DownloadWorker) verifyCompleted(ctx context.Context, task *models.Downl
 	}
 	if err != nil || !match.Confident {
 		if identityTask.IdentityLocked != task.IdentityLocked {
-			return downloadpkg.Manifest{}, appError(CodeTransferMediaUnrecognized, "下载已完成，但原媒体身份尚未核实；来源文件保留", err)
+			reason := "metadata_incomplete"
+			if err != nil {
+				reason = "metadata_unavailable"
+			}
+			return downloadpkg.Manifest{}, invalidDownloadIdentityReason("exact_id", reason)
 		}
 		code := classificationFallbackCode(err, match)
 		if persistErr := w.persistScrape(task, match, "completed_unrecognized", len(manifest.Files)); persistErr != nil {
@@ -2674,7 +2698,7 @@ func (w *DownloadWorker) verifyCompleted(ctx context.Context, task *models.Downl
 	selected, err := selectDownloadPackageManifest(manifest, match.MediaType)
 	if err != nil {
 		if identityTask.IdentityLocked != task.IdentityLocked {
-			return downloadpkg.Manifest{}, appError(CodeTransferMediaUnrecognized, "下载已完成，但原文件清单尚未核实；来源文件保留", err)
+			return downloadpkg.Manifest{}, invalidDownloadIdentityReason("package_select", "selected_package_invalid")
 		}
 		status := "completed_unrecognized"
 		if errors.Is(err, errPackageEpisodeUnrecognized) {
@@ -2689,6 +2713,9 @@ func (w *DownloadWorker) verifyCompleted(ctx context.Context, task *models.Downl
 		return downloadpkg.Manifest{}, appError(CodeTransferMediaUnrecognized, "下载已完成，但没有找到可信主媒体，未自动入库", nil)
 	}
 	if err := w.persistScrapeIdentity(task, identityTask, match, "completed_verified", len(selected.Files)); err != nil {
+		if errors.Is(err, errDownloadIdentityInvalid) || errors.Is(err, errDownloadIdentityChanged) {
+			return downloadpkg.Manifest{}, err
+		}
 		return downloadpkg.Manifest{}, appError("download_state_persist_failed", "完成后刮削结果保存失败", err)
 	}
 	w.recordDownload(ctx, *task, "download.manifest_verified", "verify", "confirmed", fmt.Sprintf("下载包识别为 %s；完整清单 %d 项，选择可入库媒体及附属文件 %d 项，排除 %d 项；尚未执行移动或重命名", serverlog.BusinessDisplayName(match.Title), len(manifest.Files), len(selected.Files), len(manifest.Files)-len(selected.Files)), map[string]any{"title": match.Title, "media_type": match.MediaType, "total_count": len(manifest.Files), "selected_count": len(selected.Files), "rejected_count": len(manifest.Files) - len(selected.Files)})
@@ -2982,6 +3009,10 @@ func (w *DownloadWorker) failure(task models.DownloadTask, err error) WorkerResu
 		return w.failureRetryable(task, err)
 	}
 	message := downloadFailureMessage(code, false)
+	var identityFailure *downloadIdentityFailure
+	if errors.As(err, &identityFailure) {
+		message = ErrorMessage(err)
+	}
 	if errors.Is(err, errDownloadIdentityInvalid) {
 		active, persistErr := w.markDownloadIdentityFailure(task, code, message)
 		if persistErr != nil {
@@ -2994,7 +3025,11 @@ func (w *DownloadWorker) failure(task models.DownloadTask, err error) WorkerResu
 		_ = w.markFailure(task, code, message, true)
 	}
 	operation := downloadOperation(task.ProviderType, task.SourceOrigin)
-	operation.Event(w.service.log.Error()).Str("task_id", task.ID).Str("error_code", code).Msg(operation.Message("执行失败"))
+	event := operation.Event(w.service.log.Error()).Str("task_id", task.ID).Str("error_code", code)
+	if identityFailure != nil {
+		event.Str("identity_stage", identityFailure.Stage).Str("identity_reason", identityFailure.Reason)
+	}
+	event.Msg(operation.Message("执行失败"))
 	return WorkerResult{ErrorCode: code, ErrorMessage: message}
 }
 

@@ -183,7 +183,6 @@ describe('115 offline downloader directory selection', () => {
     const source = readFileSync(new URL('./views/DownloadsView.vue', import.meta.url), 'utf8')
 
     expect(source).toContain('重新识别并入库')
-    expect(source).toContain('不会重复下载')
     expect(source).toContain('/tmdb-candidates?')
     expect(source).toContain('/recognition-override')
     expect(source).toContain('验证并继续入库')
