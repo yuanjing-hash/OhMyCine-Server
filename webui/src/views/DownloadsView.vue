@@ -14,7 +14,7 @@ import { beginDownloadRetry, isCloudDownloader, downloadSourceKind, canCancelDow
 import { previewDownloadRoutes, routeTargetByID, type DownloadRoutePreview } from '@/download-routes'
 import { useAuthStore } from '@/stores/auth'
 import { notify } from '@/toast'
-import { retargetCompletedImport, transferRouteLabel } from '@/transfers'
+import { retargetCompletedImport, transferIdentityLabel, transferRouteLabel } from '@/transfers'
 import type { DownloaderSummary, DownloadSettings, DownloadTaskSummary, ListResponse, MediaLibraryDetail, SeedingTaskSummary, StorageSummary, TMDBCandidate, TransferNodeSummary } from '@/types/api'
 
 const auth = useAuthStore()
@@ -374,12 +374,7 @@ async function cancelDownloadPipeline(task: DownloadTaskSummary) {
 }
 
 function downloadIdentityLabel(task: DownloadTaskSummary) {
-  if (task.identity_locked || task.identity_source === 'manual') return `人工锁定 · r${task.identity_revision}`
-  if (task.identity_source === 'ai') return `AI 辅助 · r${task.identity_revision}`
-  if (task.identity_status === 'local_provisional') return `本地暂定 · r${task.identity_revision}`
-  if (task.identity_status === 'provisional') return `自动暂定 · r${task.identity_revision}`
-  if (task.identity_source === 'direct_id') return `TMDB ID 验证 · r${task.identity_revision}`
-  return task.identity_revision > 0 ? `自动识别 · r${task.identity_revision}` : ''
+  return task.identity_revision > 0 || task.identity_source ? transferIdentityLabel(task) : ''
 }
 
 async function retryRecognitionImport(task: DownloadTaskSummary) {
@@ -387,7 +382,7 @@ async function retryRecognitionImport(task: DownloadTaskSummary) {
   saving.value = true
   try {
     await api(`/api/v1/jobs/${task.job_id}/retry`, { method: 'POST', body: '{}' })
-    notify('已使用 115 中现有文件重新识别并入库，不会重复下载', 'success')
+    notify('已请求使用原下载文件重新识别并入库，不会重新提交下载', 'success')
   } catch (reason) {
     clearTaskRetrying(task.id)
     notify(message(reason), 'error')

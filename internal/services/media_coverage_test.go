@@ -174,7 +174,7 @@ func coverageFixture(t *testing.T, upstream *httptest.Server, now time.Time) (*M
 		t.Fatal(err)
 	}
 	finished := last
-	runs := []models.MediaLibraryScanRun{{LibraryID: complete.ID, Kind: "full", Status: "success", Generation: 1, StartedAt: last, FinishedAt: &finished}, {LibraryID: partial.ID, Kind: "incremental", Status: "success", Generation: 1, StartedAt: last, FinishedAt: &finished}}
+	runs := []models.MediaLibraryScanRun{{LibraryID: complete.ID, Kind: "full", Status: "success", SourceFingerprint: mediaLibraryScanSourceFingerprint(complete, storage, profile), Generation: 1, StartedAt: last, FinishedAt: &finished}, {LibraryID: partial.ID, Kind: "incremental", Status: "success", SourceFingerprint: mediaLibraryScanSourceFingerprint(partial, storage, profile), Generation: 1, StartedAt: last, FinishedAt: &finished}}
 	if err := db.Create(&runs).Error; err != nil {
 		t.Fatal(err)
 	}

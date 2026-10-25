@@ -231,13 +231,36 @@ func (s *ProviderObservationService) validScopeTx(tx *gorm.DB, scope models.Prov
 	if s.validate == nil {
 		return ErrObservationUnavailable
 	}
+	if err := observationMutationHoldTx(tx, scope); err != nil {
+		return err
+	}
+	return s.validate(tx, scope)
+}
+
+// Read-only consumers use the same durable mutation holds as observation
+// execution. A queue lease or a routine directory read is not such a hold.
+func observationMutationHoldTx(tx *gorm.DB, scope models.ProviderObservationScope) error {
 	if err := observationQuarkReorganizationHoldTx(tx, scope); err != nil {
 		return err
 	}
 	if err := observationQuarkStructureHoldTx(tx, scope); err != nil {
 		return err
 	}
-	return s.validate(tx, scope)
+	return nil
+}
+
+// Native library observation owns its private source/configuration fence.
+// Catalog read consumers consult this existing adapter boundary without
+// reconstructing an account namespace or dispatching a provider request.
+func observationLibrarySourceCurrentTx(tx *gorm.DB, scope models.ProviderObservationScope) error {
+	input, err := quarkObservationScopeTx(tx, scope.LibraryID)
+	if err != nil {
+		return err
+	}
+	if scope.Kind != "library" || input.Provider != scope.Provider || input.Fence != scope.Fence || input.RootID != scope.RootID || input.AccountKey != scope.AccountKey || input.ConnectionID != scope.ConnectionID {
+		return ErrObservationFence
+	}
+	return nil
 }
 
 // Run resumes durable queues, including incomplete traversals left by another

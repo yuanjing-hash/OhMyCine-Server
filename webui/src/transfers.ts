@@ -202,8 +202,9 @@ export const transferDeletionLabels: Record<TransferDeletionScope, string> = {
   record_source_and_library: '删除转移记录、源文件和媒体库文件',
 }
 
-export function transferIdentityLabel(item: TransferSummary): string {
-  if (item.identity_locked || item.identity_source === 'manual') return `人工锁定 · r${item.identity_revision}`
+export function transferIdentityLabel(item: Pick<TransferSummary, 'identity_locked' | 'identity_source' | 'identity_status' | 'identity_revision'>): string {
+  if (item.identity_source === 'manual' && item.identity_locked) return `人工锁定 · r${item.identity_revision}`
+  if (item.identity_locked || item.identity_source === 'manual') return `身份待核实 · r${item.identity_revision}`
   if (item.identity_source === 'ai') return `AI 辅助 · r${item.identity_revision}`
   if (item.identity_status === 'local_provisional') return `本地暂定 · r${item.identity_revision}`
   if (item.identity_status === 'provisional') return `自动暂定 · r${item.identity_revision}`

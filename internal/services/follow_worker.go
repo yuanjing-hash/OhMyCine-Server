@@ -118,11 +118,16 @@ func (w *FollowSearchWorker) Run(ctx context.Context, runtime JobRuntime, job Cl
 	missing := map[[2]int]struct{}{}
 	seenSeasons := map[int]MediaCoverageSeason{}
 	target, present, unknown := 0, 0, 0
+	uncertain := mediaCoverageUncertainty{}
 	for _, season := range coverage.TV.Seasons {
 		if _, ok := selectedSeasons[season.SeasonNumber]; !ok {
 			continue
 		}
 		seenSeasons[season.SeasonNumber] = season
+		uncertain.Library += season.uncertainty.Library
+		uncertain.AirDate += season.uncertainty.AirDate
+		uncertain.Metadata += season.uncertainty.Metadata
+		uncertain.Seasons += season.uncertainty.Seasons
 		for _, episode := range season.Episodes {
 			switch episode.Status {
 			case "present":
@@ -169,12 +174,8 @@ func (w *FollowSearchWorker) Run(ctx context.Context, runtime JobRuntime, job Cl
 		if target > present {
 			return w.finish(run, subscription, models.FollowRunSubmitted, models.FollowStatusActive, "", "", snapshot, 0, 0, map[string]int{"active_claims": target - present, "coverage_unknown": unknown})
 		}
-		if unknown > 0 {
-			message := "所选季仍有播出信息不完整的剧集，当前没有可独立搜索的明确缺集；等待剧集信息更新，将按计划重新检查"
-			if coverage.Freshness.LibraryScanState != "complete" {
-				message = "媒体库扫描尚不完整，无法确认未在库剧集是否缺失；等待扫描完成，将按计划重新检查"
-			}
-			return w.waitForCoverage(run, subscription, snapshot, message, unknown)
+		if unknown > 0 || uncertain.Seasons > 0 {
+			return w.waitForCoverage(run, subscription, snapshot, followCoverageWaitMessage(uncertain), unknown, uncertain)
 		}
 		return w.finish(run, subscription, models.FollowRunCompleted, models.FollowStatusCompleted, "", "", snapshot, 0, 0, map[string]int{})
 	}
@@ -189,6 +190,7 @@ func (w *FollowSearchWorker) Run(ctx context.Context, runtime JobRuntime, job Cl
 	candidates, queryNames, filterSummary := w.searchCandidates(searchCtx, actor, subscription, snapshot, missing, seenSeasons)
 	if unknown > 0 {
 		filterSummary["coverage_unknown"] = unknown
+		addFollowCoverageReasons(filterSummary, uncertain)
 	}
 	if searchCtx.Err() != nil && ctx.Err() == nil {
 		filterSummary["search_incomplete"]++
@@ -817,14 +819,45 @@ func (w *FollowSearchWorker) block(run models.FollowRun, subscription models.Fol
 	return w.finish(run, subscription, models.FollowRunFailed, models.FollowStatusBlocked, code, message, FollowExecutionSnapshot{}, 0, 0, map[string]int{})
 }
 
-func (w *FollowSearchWorker) waitForCoverage(run models.FollowRun, subscription models.FollowSubscription, snapshot FollowExecutionSnapshot, message string, unknown int) WorkerResult {
+func (w *FollowSearchWorker) waitForCoverage(run models.FollowRun, subscription models.FollowSubscription, snapshot FollowExecutionSnapshot, message string, unknown int, reasons ...mediaCoverageUncertainty) WorkerResult {
 	// Uncertain metadata/absence is temporary. Keep the normal schedule active
 	// without claiming a successful search or marking the subscription complete.
 	summary := map[string]int{}
 	if unknown > 0 {
 		summary["coverage_unknown"] = unknown
 	}
+	for _, reason := range reasons {
+		addFollowCoverageReasons(summary, reason)
+	}
 	return w.finish(run, subscription, models.FollowRunFailed, models.FollowStatusActive, "follow_coverage_unknown", message, snapshot, 0, 0, summary)
+}
+
+func addFollowCoverageReasons(summary map[string]int, uncertain mediaCoverageUncertainty) {
+	for reason, count := range map[string]int{"coverage_library_unknown": uncertain.Library, "coverage_air_date_unknown": uncertain.AirDate, "coverage_metadata_unknown": uncertain.Metadata, "coverage_seasons_unavailable": uncertain.Seasons} {
+		if count > 0 {
+			summary[reason] = count
+		}
+	}
+}
+
+func followCoverageWaitMessage(uncertain mediaCoverageUncertainty) string {
+	parts := []string{}
+	if uncertain.Library > 0 {
+		parts = append(parts, fmt.Sprintf("媒体库扫描尚不完整或当前目录依据待核实，%d 集已播剧集无法确认是否缺失；请在媒体库页面查看覆盖与识别任务，必要时执行完整核对", uncertain.Library))
+	}
+	if uncertain.AirDate > 0 {
+		parts = append(parts, fmt.Sprintf("%d 集播出信息不完整，等待剧集播出日期更新", uncertain.AirDate))
+	}
+	if uncertain.Metadata > 0 {
+		parts = append(parts, fmt.Sprintf("%d 集的 TMDB 剧集信息暂缺，等待元数据更新", uncertain.Metadata))
+	}
+	if uncertain.Seasons > 0 {
+		parts = append(parts, fmt.Sprintf("%d 个季的 TMDB 剧集清单暂不可用，等待季信息恢复", uncertain.Seasons))
+	}
+	if len(parts) == 0 {
+		parts = append(parts, "所选季剧集信息暂不完整，等待信息更新")
+	}
+	return strings.Join(parts, "；") + "；当前没有可独立搜索的明确缺集，将按计划重新检查"
 }
 func (w *FollowSearchWorker) stopRun(run models.FollowRun, status, code, message string) WorkerResult {
 	now := w.follows.now()

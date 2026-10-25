@@ -30,6 +30,7 @@ describe('media organization presentation', () => {
 
   it('distinguishes locked, AI and provisional identities', () => {
     expect(transferIdentityLabel({ ...summary, identity_locked: true, identity_source: 'manual', identity_status: 'verified', identity_revision: 3 })).toBe('人工锁定 · r3')
+    expect(transferIdentityLabel({ ...summary, identity_locked: true, identity_source: 'direct_id', identity_status: 'verified', identity_revision: 1 })).toBe('身份待核实 · r1')
     expect(transferIdentityLabel({ ...summary, identity_locked: false, identity_source: 'ai', identity_status: 'provisional', identity_revision: 2 })).toBe('AI 辅助 · r2')
     expect(transferIdentityLabel({ ...summary, identity_locked: false, identity_source: 'automatic', identity_status: 'provisional', identity_revision: 1 })).toBe('自动暂定 · r1')
   })
