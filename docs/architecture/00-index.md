@@ -19,6 +19,8 @@
 | 28 | [插件原生离线下载](28-plugin-native-offline.md) | op20、设备授权、HLS 控制展开和只读账号摘要 |
 | 29 | [在线目录缓存与 Player 系统历史](29-plugin-catalogue-and-player-history.md) | 持久预热、scope 失效、精确在线历史与版本能力 |
 | 30 | [慢速站点搜索与渐进结果](30-progressive-site-search.md) | 搜索预算、同站累计快照、细进度、兼容与部分结果保留 |
+| 32 | [仪表盘媒体、任务与容量](32-dashboard-media-overview.md) | 实际活动任务、目录入库、共享日历与有界容量采样 |
+| 33 | [订阅播出日历](subscription-calendar.md) | 公共排期缓存、获权季集日程、真实入库与任务状态 |
 
 ## 快速开始
 

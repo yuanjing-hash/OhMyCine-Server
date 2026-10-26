@@ -30,7 +30,10 @@ async function load(quiet = false) {
   try {
     const query = new URLSearchParams({ page: String(page.value), page_size: String(pageSize) })
     if (status.value) query.set('status', status.value)
-    const result = await api<FollowPage>(`/api/v1/follows?${query}`, { signal: request.signal })
+    const focusedID = typeof route.query.follow_id === 'string' ? route.query.follow_id : ''
+    const result = focusedID
+      ? await api<FollowSummary>(followPath(focusedID), { signal: request.signal }).then(item => ({ list: [item], total: 1, page: 1, page_size: pageSize }))
+      : await api<FollowPage>(`/api/v1/follows?${query}`, { signal: request.signal })
     if (!request.isCurrent()) return
     items.value = result.list
     total.value = result.total
@@ -88,7 +91,7 @@ watch(() => route.fullPath, () => {
   status.value = ['active', 'paused', 'completed', 'blocked'].includes(nextStatus) ? nextStatus : ''
   const rawPage = typeof route.query.page === 'string' && /^\d{1,6}$/.test(route.query.page) ? Number(route.query.page) : 1
   page.value = Math.max(1, Math.min(100000, rawPage))
-  const key = `${status.value}:${page.value}`
+  const key = `${status.value}:${page.value}:${typeof route.query.follow_id === 'string' ? route.query.follow_id : ''}`
   if (key === previousKey) return
   previousKey = key
   closeRuns()

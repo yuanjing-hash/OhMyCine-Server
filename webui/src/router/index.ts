@@ -32,6 +32,7 @@ import LibraryCatalogView from '@/views/LibraryCatalogView.vue'
 import LibraryCatalogDetailView from '@/views/LibraryCatalogDetailView.vue'
 import FollowsView from '@/views/FollowsView.vue'
 import SchedulesView from '@/views/SchedulesView.vue'
+import SubscriptionCalendarView from '@/views/SubscriptionCalendarView.vue'
 
 function navigationMeta(id: string) {
   const item = findNavigationItem(id)
@@ -40,7 +41,6 @@ function navigationMeta(id: string) {
 
 const plannedRoutes = [
   ['subscriptions/workflows', 'workflows'],
-  ['subscriptions/calendar', 'calendar'],
   ['automation/files', 'files'],
 ] as const
 
@@ -62,6 +62,7 @@ export const router = createRouter({
         { path: 'discovery/library', name: 'library-catalog', component: LibraryCatalogView, meta: navigationMeta('library-catalog') },
         { path: 'discovery/library/:libraryID/:workID', name: 'library-catalog-detail', component: LibraryCatalogDetailView, meta: navigationMeta('library-catalog') },
         { path: 'subscriptions/manage', name: 'subscriptions', component: FollowsView, meta: navigationMeta('subscriptions') },
+        { path: 'subscriptions/calendar', name: 'calendar', component: SubscriptionCalendarView, meta: navigationMeta('calendar') },
         { path: 'system/connections', name: 'connections-storage', component: StorageView, meta: navigationMeta('connections-storage') },
         { path: playersRouteContract.path, name: playersRouteContract.name, component: PlayersView, meta: navigationMeta(playersRouteContract.navigationID) },
         { path: mediaLibrariesRouteContract.path, name: mediaLibrariesRouteContract.name, component: MediaLibrariesView, meta: navigationMeta(mediaLibrariesRouteContract.navigationID) },

@@ -37,6 +37,7 @@ type BrowserHistoryItem struct {
 	Duration    *float64 `json:"duration,omitempty"`
 	Completed   bool     `json:"completed"`
 	UpdatedAt   int64    `json:"updated_at"`
+	RecordCount int      `json:"record_count,omitempty"`
 }
 
 type BrowserHistoryPage struct {

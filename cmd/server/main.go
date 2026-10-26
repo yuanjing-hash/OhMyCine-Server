@@ -265,10 +265,13 @@ func main() {
 	follows := services.NewFollowService(db, audit, queue, mediaCoverage, authorization)
 	follows.SetDownloadService(downloads)
 	follows.SetLogger(logManager.Logger("follow", "worker"))
+	subscriptionCalendar := services.NewSubscriptionCalendarService(db, queue, metadataSettings, mediaCoverage)
+	subscriptionCalendar.SetLogger(logManager.Logger("calendar", "metadata"))
 	runtimeLogs.SetExecutionServices(queue, follows)
 	cookieCloud := services.NewCookieCloudService(db, audit, credentialStore, sites, logManager.Logger("site", "cookiecloud"))
 	unifiedSchedules := services.NewUnifiedScheduleService(db, queue, authorization, libraries, libraryStructure, strmManagement, follows, cookieCloud, logManager.Logger("scheduler", "unified"))
 	unifiedSchedules.SetRecycleCleanup(recycleCleanup)
+	unifiedSchedules.SetSubscriptionCalendar(subscriptionCalendar)
 	downloads.SetMetadataSettings(metadataSettings)
 	downloads.SetAIRecognitionSettings(aiRecognitionSettings)
 	downloads.SetSeedingSettings(seedingSettings)
@@ -391,6 +394,9 @@ func main() {
 	if err := registry.Register(services.JobTypeFollowSearch, services.NewFollowSearchWorker(follows, sites)); err != nil {
 		logging.OperationServerLifecycle.Event(log.Fatal()).Err(err).Str("error_code", "follow_worker_registration_failed").Msg(logging.OperationServerLifecycle.Message("自动追更 Worker 注册失败"))
 	}
+	if err := registry.Register(services.JobTypeSubscriptionCalendar, subscriptionCalendar); err != nil {
+		logging.OperationServerLifecycle.Event(log.Fatal()).Str("error_code", "calendar_worker_registration_failed").Msg("播出计划更新 Worker 注册失败")
+	}
 	if err := registry.Register(services.JobTypePan115RecycleCleanup, services.NewPan115RecycleCleanupWorker(recycleCleanup)); err != nil {
 		logging.OperationServerLifecycle.Event(log.Fatal()).Err(err).Str("error_code", "pan115_recycle_cleanup_worker_registration_failed").Msg(logging.OperationServerLifecycle.Message("115 回收站清理 Worker 注册失败"))
 	}
@@ -419,6 +425,7 @@ func main() {
 	api.SetPlayerMediaStateService(playerMediaState)
 	api.SetPlayerOverviewService(playerOverview)
 	api.SetFollowService(follows)
+	api.SetSubscriptionCalendarService(subscriptionCalendar)
 	api.SetSiteService(sites)
 	api.SetCookieCloudService(cookieCloud)
 	api.SetUnifiedScheduleService(unifiedSchedules)

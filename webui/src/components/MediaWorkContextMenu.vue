@@ -1,19 +1,21 @@
 <script setup lang="ts">
-import { computed, nextTick, onUnmounted, ref } from 'vue'
+import { computed, nextTick, onUnmounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { api } from '@/api/client'
 import { Permissions } from '@/auth/generated-permissions'
 import { useAuthStore } from '@/stores/auth'
 import { notify } from '@/toast'
+import { createLatestRequest } from '@/latest-request'
 import type { MediaCatalogLibraryWork } from '@/types/api'
 import type { UserCollectionSummary, UserMediaPage } from '@/user-media-overview'
 
-export type WorkMenuAction = 'play' | 'details' | 'favorite' | 'collection' | 'remove-collection' | 'metadata' | 'recognize' | 'rescrape' | 'exclude' | 'delete-source' | 'delete-history'
+export type WorkMenuAction = 'play' | 'details' | 'favorite' | 'collection' | 'remove-collection' | 'metadata' | 'recognize' | 'rescrape' | 'exclude' | 'delete-source' | 'delete-history' | 'watched'
 export interface WorkMenuTarget {
   title: string
   kind: 'movie' | 'series'
   works: MediaCatalogLibraryWork[]
   historyId?: string
+  completed?: boolean
   favorite?: boolean
   collectionId?: string
 }
@@ -28,6 +30,7 @@ const pending = ref<WorkMenuAction | null>(null)
 const collections = ref<UserCollectionSummary[]>([])
 const chosenWork = ref<MediaCatalogLibraryWork | null>(null)
 const busy = ref(false)
+const historyActions = createLatestRequest()
 const origin = ref<HTMLElement | null>(null)
 const actions = computed(() => {
   if (!target.value) return []
@@ -43,11 +46,17 @@ const actions = computed(() => {
     )
     if (auth.can(Permissions.MediaLibrariesMediaDelete)) list.push({ id: 'delete-source', label: '删除源文件…' })
   }
-  if (target.value.historyId) list.push({ id: 'delete-history', label: '删除这条观看记录' })
+  if (target.value.historyId) {
+    const unit = target.value.kind === 'movie' ? '影片' : '本集'
+    list.push({ id: 'watched', label: target.value.completed ? `标记${unit}未看完` : `标记${unit}已看完` })
+    list.push({ id: 'delete-history', label: '删除这条观看记录' })
+  }
   return list
 })
 
 function close(restoreFocus = true) {
+  if (historyActions.pending) busy.value = false
+  historyActions.cancel()
   target.value = null; chooser.value = null; pending.value = null
   if (restoreFocus) origin.value?.focus()
   origin.value = null
@@ -105,12 +114,20 @@ function play(work: MediaCatalogLibraryWork) {
 async function execute(action: WorkMenuAction, work?: MediaCatalogLibraryWork) {
   const item = target.value
   if (!item || busy.value) return
-  if (action === 'delete-history') {
+  if (action === 'watched' || action === 'delete-history') {
     if (!item.historyId) return
+    const request = historyActions.begin()
     busy.value = true
-    try { await api(`/api/v1/media-libraries/history/${encodeURIComponent(item.historyId)}`, { method: 'DELETE' }); notify('观看记录已删除', 'success'); close(); emit('changed') }
-    catch (reason) { notify(errorMessage(reason), 'error') }
-    finally { busy.value = false }
+    try {
+      const path = `/api/v1/media-libraries/history/${encodeURIComponent(item.historyId)}`
+      if (action === 'watched') await api(`${path}/watched`, { method: 'PUT', body: JSON.stringify({ completed: !item.completed }), signal: request.signal })
+      else await api(path, { method: 'DELETE', signal: request.signal })
+      if (!request.isCurrent() || target.value !== item) return
+      notify(action === 'delete-history' ? '观看记录已删除' : item.completed ? '已标记未看完' : '已标记看完', 'success')
+      close()
+      emit('changed')
+    } catch (reason) { if (request.isCurrent() && target.value === item) notify(errorMessage(reason), 'error') }
+    finally { if (request.isCurrent()) busy.value = false; request.finish() }
     return
   }
   if (!work) {
@@ -172,7 +189,8 @@ async function selectCollection(collection: UserCollectionSummary) {
 function errorMessage(reason: unknown) { return reason instanceof Error ? reason.message : '操作失败' }
 window.addEventListener('pointerdown', outside)
 window.addEventListener('scroll', scroll, true)
-onUnmounted(() => { window.removeEventListener('pointerdown', outside); window.removeEventListener('scroll', scroll, true) })
+watch(() => auth.user, () => close(false))
+onUnmounted(() => { historyActions.cancel(); window.removeEventListener('pointerdown', outside); window.removeEventListener('scroll', scroll, true) })
 defineExpose({ open, close })
 </script>
 

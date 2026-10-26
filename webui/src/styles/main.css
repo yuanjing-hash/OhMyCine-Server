@@ -73,7 +73,7 @@
 
 * { box-sizing: border-box; }
 html, body, #app { min-height: 100%; margin: 0; }
-body { min-width: 320px; background: var(--canvas); color: var(--text); }
+body { min-width: min(320px, 100%); background: var(--canvas); color: var(--text); }
 button, input, textarea, select { font: inherit; }
 button { cursor: pointer; }
 button:disabled { cursor: not-allowed; }

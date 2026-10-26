@@ -8,20 +8,21 @@ describe('mixed dashboard card contract', () => {
     const positions = dashboardCards.map(card => priority.get(card.section) ?? -1)
 
     expect(positions).toEqual([...positions].sort((left, right) => left - right))
-    expect(dashboardCards.at(-1)?.id).toBe('discovery-hero')
+    expect(dashboardCards.at(-1)?.id).toBe('quick-actions')
   })
 
   it('marks only wired read models as live', () => {
-    expect(dashboardCards.filter(card => card.state === 'live').map(card => card.id)).toEqual(['server-status', 'media-summary', 'storage-summary', 'connection-health', 'active-tasks', 'scheduler-jobs', 'download-summary'])
+    expect(dashboardCards.every(card => card.state === 'live')).toBe(true)
+    expect(dashboardCards.map(card => card.id)).toEqual(['server-status', 'media-summary', 'storage-summary', 'connection-health', 'active-tasks', 'recent-imports', 'scheduler-jobs', 'download-summary', 'subscription-calendar', 'quick-actions'])
   })
 
   it('omits protected domain cards instead of leaking their counts', () => {
     const visible = getVisibleDashboardCards([Permissions.DashboardRead])
     expect(visible.map(card => card.id)).toEqual(['server-status'])
 
-    const transferVisible = getVisibleDashboardCards([Permissions.TransfersReadOwn])
-    expect(transferVisible.map(card => card.id)).toEqual(['recent-imports'])
-    expect(transferVisible[0]?.description).not.toContain('API 尚未实现')
+    expect(getVisibleDashboardCards([Permissions.TransfersReadOwn])).toEqual([])
+    const libraryVisible = getVisibleDashboardCards([Permissions.MediaLibrariesRead])
+    expect(libraryVisible.map(card => card.id)).toEqual(['media-summary', 'recent-imports', 'quick-actions'])
   })
 
   it('preserves the canonical order after permission filtering', () => {

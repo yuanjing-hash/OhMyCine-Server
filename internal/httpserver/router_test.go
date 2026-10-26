@@ -457,6 +457,7 @@ func newTestClientWithSiteAdapters(t *testing.T, siteAdapters []sitepkg.Adapter,
 	follows := services.NewFollowService(db, audit, queue, coverage, authorization)
 	runtimeLogs.SetExecutionServices(queue, follows)
 	api.SetFollowService(follows)
+	api.SetSubscriptionCalendarService(services.NewSubscriptionCalendarService(db, queue, metadataSettings, coverage))
 	libraries.SetMetadataSettingsService(metadataSettings)
 	storages.AddReferenceChecker(downloadSettings)
 	downloads := services.NewDownloadService(db, audit, credentialStore, downloaders, downloadSettings, queue, log)

@@ -301,6 +301,14 @@ func normalizeMediaCoverageCollections(result *MediaCoverage) {
 }
 
 func (s *MediaCoverageService) coverageCatalog(ctx context.Context, actor Actor, mediaType string, tmdbID int64) ([]MediaCoverageLibrary, []models.MediaLibraryEntry, bool, string, error) {
+	return s.coverageCatalogMany(ctx, actor, mediaType, []int64{tmdbID}, 0)
+}
+
+// coverageCatalogMany shares one authorized pinned catalog observation. A
+// bounded consumer may publish positive facts from its prefix, but cannot
+// establish absence when that budget is exhausted. Ordinary Coverage retains
+// its existing unlimited single-work contract.
+func (s *MediaCoverageService) coverageCatalogMany(ctx context.Context, actor Actor, mediaType string, tmdbIDs []int64, maximum int) ([]MediaCoverageLibrary, []models.MediaLibraryEntry, bool, string, error) {
 	facade := &MediaLibraryService{db: s.db, catalogStore: s.catalogStore}
 	var libraries []MediaCoverageLibrary
 	var entries []models.MediaLibraryEntry
@@ -343,8 +351,24 @@ func (s *MediaCoverageService) coverageCatalog(ctx context.Context, actor Actor,
 		if reliable {
 			state = "complete"
 		}
-		entries, err = coverageEntries(reader, mediaType, tmdbID)
-		return err
+		for offset := 0; offset < len(tmdbIDs); offset += 500 {
+			query := reader.VisibleEntries().Where("media_type = ? AND tmdb_id IN ? AND match_status = ?", mediaType, tmdbIDs[offset:min(offset+500, len(tmdbIDs))], mediaRecognitionStatusMatched)
+			if maximum > 0 {
+				query = query.Limit(maximum - len(entries) + 1)
+			}
+			var batch []models.MediaLibraryEntry
+			if err := query.Find(&batch).Error; err != nil {
+				return err
+			}
+			entries = append(entries, batch...)
+			if maximum > 0 && len(entries) > maximum {
+				entries = entries[:maximum]
+				reliable = false
+				state = "bounded"
+				break
+			}
+		}
+		return nil
 	})
 	return libraries, entries, reliable, state, err
 }

@@ -39,6 +39,7 @@ export interface UserHistoryItem {
   duration?: number
   completed: boolean
   updated_at: number
+  record_count?: number
 }
 
 export interface UserCollectionSummary {
@@ -85,6 +86,8 @@ export interface UserHistoryPage {
 export const userMediaEndpoints = {
   overview: '/api/v1/media-libraries/overview',
   history: (page: number, pageSize: number) => `/api/v1/media-libraries/history?page=${Math.max(1, Math.trunc(page))}&page_size=${Math.max(1, Math.trunc(pageSize))}`,
+  groupedHistory: (page: number, pageSize: number): string => `${userMediaEndpoints.history(page, pageSize)}&group_by=work`,
+  workHistory: (libraryId: number, workId: string, page: number, pageSize: number): string => `${userMediaEndpoints.history(page, pageSize)}&library_id=${libraryId}&work_id=${encodeURIComponent(workId)}`,
   favorites: '/api/v1/media-libraries/favorites',
   collections: (kind: 'collection' | 'playlist' = 'collection') => `/api/v1/media-libraries/collections?kind=${kind}`,
   collectionItems: (id: string) => `/api/v1/media-libraries/collections/${encodeURIComponent(id)}/items`,
@@ -188,6 +191,7 @@ function normalizeHistoryItem(value: unknown): UserHistoryItem {
     ...(text(source.backdrop_url) ? { backdrop_url: text(source.backdrop_url) } : {}),
     position: nonNegativeNumber(source.position), ...(optionalNumber(source.duration) != null ? { duration: nonNegativeNumber(source.duration) } : {}),
     completed: source.completed === true, updated_at: nonNegativeNumber(source.updated_at),
+    ...(optionalNumber(source.record_count) != null ? { record_count: nonNegativeNumber(source.record_count) } : {}),
   }
 }
 

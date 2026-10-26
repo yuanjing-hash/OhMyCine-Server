@@ -55,6 +55,7 @@ type API struct {
 	acquisition           *services.AcquisitionService
 	schedules             *services.UnifiedScheduleService
 	follows               *services.FollowService
+	calendar              *services.SubscriptionCalendarService
 	sites                 *services.SiteService
 	cookieCloud           *services.CookieCloudService
 	credentialReveal      *services.CredentialRevealService
@@ -126,7 +127,10 @@ func (a *API) SetAcquisitionService(service *services.AcquisitionService) { a.ac
 func (a *API) SetUnifiedScheduleService(service *services.UnifiedScheduleService) {
 	a.schedules = service
 }
-func (a *API) SetFollowService(service *services.FollowService)           { a.follows = service }
+func (a *API) SetFollowService(service *services.FollowService) { a.follows = service }
+func (a *API) SetSubscriptionCalendarService(service *services.SubscriptionCalendarService) {
+	a.calendar = service
+}
 func (a *API) SetSiteService(service *services.SiteService)               { a.sites = service }
 func (a *API) SetCookieCloudService(service *services.CookieCloudService) { a.cookieCloud = service }
 func (a *API) SetCredentialRevealService(service *services.CredentialRevealService) {
@@ -218,7 +222,8 @@ func (a *API) CSRF(c *gin.Context) {
 }
 
 func (a *API) Dashboard(c *gin.Context) {
-	data, err := a.admin.Dashboard()
+	c.Header("Cache-Control", "no-store")
+	data, err := a.admin.DashboardForActor(c.Request.Context(), mustActor(c))
 	if err != nil {
 		writeError(c, a.log, err)
 		return

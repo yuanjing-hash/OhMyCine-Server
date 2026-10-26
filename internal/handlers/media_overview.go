@@ -6,6 +6,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/middleware"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/services"
 )
 
 func (a *API) MediaLibraryOverview(c *gin.Context) {
@@ -28,12 +29,49 @@ func (a *API) MediaLibraryHistory(c *gin.Context) {
 		return
 	}
 	actor, _ := middleware.ActorFrom(c)
-	result, err := a.playerHistory.BrowserList(actor, page, pageSize)
+	options := services.BrowserHistoryOptions{GroupByWork: c.Query("group_by") == "work", WorkID: c.Query("work_id")}
+	if value := c.Query("group_by"); value != "" && value != "work" {
+		writeError(c, a.log, invalid("播放历史分组方式无效", nil))
+		return
+	}
+	if value := c.Query("library_id"); value != "" {
+		id, parseErr := strconv.ParseUint(value, 10, 32)
+		if parseErr != nil || id == 0 {
+			writeError(c, a.log, invalid("播放历史媒体库无效", nil))
+			return
+		}
+		options.LibraryID = uint(id)
+	}
+	result, err := a.playerHistory.BrowserListWithOptions(actor, page, pageSize, options)
 	if err != nil {
 		writeError(c, a.log, err)
 		return
 	}
 	success(c, http.StatusOK, result)
+}
+
+func (a *API) SetMediaLibraryHistoryWatched(c *gin.Context) {
+	if a.playerHistory == nil {
+		writeError(c, a.log, invalid("Server 暂不支持播放历史", nil))
+		return
+	}
+	var input struct {
+		Completed *bool `json:"completed"`
+	}
+	if err := c.ShouldBindJSON(&input); err != nil {
+		writeError(c, a.log, invalid("观看状态格式无效", err))
+		return
+	}
+	if input.Completed == nil {
+		writeError(c, a.log, invalid("请选择观看完成状态", nil))
+		return
+	}
+	actor, _ := middleware.ActorFrom(c)
+	if err := a.playerHistory.SetBrowserHistoryWatched(c.Request.Context(), actor, c.Param("historyId"), *input.Completed); err != nil {
+		writeError(c, a.log, err)
+		return
+	}
+	success(c, http.StatusOK, gin.H{"completed": *input.Completed})
 }
 
 func (a *API) DeleteMediaLibraryHistory(c *gin.Context) {

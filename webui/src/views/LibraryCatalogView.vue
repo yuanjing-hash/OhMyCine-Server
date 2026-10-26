@@ -3,13 +3,15 @@ import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { api } from '@/api/client'
 import UserMediaManager from '@/components/UserMediaManager.vue'
+import HistoryMediaCard from '@/components/HistoryMediaCard.vue'
 import MediaWorkContextMenu, { type WorkMenuTarget } from '@/components/MediaWorkContextMenu.vue'
 import { Permissions } from '@/auth/generated-permissions'
 import { useAuthStore } from '@/stores/auth'
 import { notify } from '@/toast'
+import { createLatestRequest } from '@/latest-request'
 import { mediaCatalogEndpoint, mediaCatalogOpenTargets, mediaCatalogPageCount, mediaCatalogPageSizes, type MediaCatalogPageSize, type MediaCatalogTypeFilter } from '@/media-catalog'
 import {
-  emptyUserMediaOverview, historyProgress, normalizeUserHistoryPage,
+  emptyUserMediaOverview, normalizeUserHistoryPage,
   normalizeUserMediaOverview, userMediaEndpoints,
   type UserCollectionSummary, type UserHistoryItem, type UserHistoryPage, type UserMediaItem,
   type UserMediaLibrarySummary, type UserMediaOverview,
@@ -27,6 +29,7 @@ const excluded = ref<ExcludedPage>({ list: [], total: 0, page: 1, page_size: 24,
 const excludedLoading = ref(false)
 const excludedError = ref('')
 const restoring = ref<string | null>(null)
+const excludedReads = createLatestRequest(), restoreActions = createLatestRequest()
 const activeView = ref<LibraryView>('overview')
 const overview = ref<UserMediaOverview>(emptyUserMediaOverview())
 const overviewLoading = ref(true)
@@ -34,6 +37,7 @@ const overviewLoaded = ref(false)
 const overviewError = ref('')
 const libraries = ref<UserMediaLibrarySummary[]>([])
 const history = ref<UserHistoryPage>({ list: [], total: 0, page: 1, page_size: 24, has_more: false })
+const historyWork = ref<Pick<UserHistoryItem, 'library_id' | 'work_id' | 'title'> | null>(null)
 const selectedCollection = ref<UserCollectionSummary | null>(null)
 const sectionLoading = ref(false)
 const sectionError = ref('')
@@ -54,28 +58,34 @@ let overviewController: AbortController | null = null
 let sectionController: AbortController | null = null
 let catalogController: AbortController | null = null
 let sectionGeneration = 0
+let overviewGeneration = 0
+let catalogGeneration = 0
 
 const categories = computed(() => result.value.categories ?? [])
 const pages = computed(() => mediaCatalogPageCount(result.value.total, pageSize.value))
 
 async function loadOverview() {
+  const generation = ++overviewGeneration
   overviewController?.abort()
   overviewController = new AbortController()
   overviewLoading.value = true
   overviewError.value = ''
   try {
-    overview.value = normalizeUserMediaOverview(await api<unknown>(userMediaEndpoints.overview, { signal: overviewController.signal }))
+    const data = await api<unknown>(userMediaEndpoints.overview, { signal: overviewController.signal })
+    if (generation !== overviewGeneration) return
+    overview.value = normalizeUserMediaOverview(data)
     libraries.value = overview.value.sections.media_libraries.list.filter(item => item.id > 0)
     overviewLoaded.value = true
   } catch (reason) {
     if (reason instanceof DOMException && reason.name === 'AbortError') return
-    overviewError.value = message(reason, '媒体总览加载失败')
-  } finally { overviewLoading.value = false }
+    if (generation === overviewGeneration) overviewError.value = message(reason, '媒体总览加载失败')
+  } finally { if (generation === overviewGeneration) overviewLoading.value = false }
 }
 
-async function ensureCatalogLibraries() {
+async function ensureCatalogLibraries(generation: number) {
   if (libraries.value.length) return
   const response = await api<ListResponse<MediaLibraryDetail>>('/api/v1/media-libraries')
+  if (generation !== catalogGeneration) return
   libraries.value = response.list.filter(item => item.enabled).map(item => ({
     id: item.id, name: item.name, status: item.status, entry_count: item.entry_count,
     work_count: 0, last_successful_scan_at: item.last_successful_scan_at ?? undefined,
@@ -90,7 +100,12 @@ async function loadSection(mode: LibraryView, requestedPage = 1) {
   sectionError.value = ''
   selectedCollection.value = null
   try {
-    if (mode === 'history') history.value = normalizeUserHistoryPage(await api<unknown>(userMediaEndpoints.history(requestedPage, 24), { signal: sectionController.signal }))
+    if (mode === 'history') {
+      const scope = historyWork.value
+      const endpoint = scope ? userMediaEndpoints.workHistory(scope.library_id, scope.work_id, requestedPage, 24) : userMediaEndpoints.groupedHistory(requestedPage, 24)
+      const data = await api<unknown>(endpoint, { signal: sectionController.signal })
+      if (generation === sectionGeneration) history.value = normalizeUserHistoryPage(data)
+    }
   } catch (reason) {
     if (reason instanceof DOMException && reason.name === 'AbortError') return
     if (generation === sectionGeneration) sectionError.value = message(reason, '内容加载失败')
@@ -98,26 +113,31 @@ async function loadSection(mode: LibraryView, requestedPage = 1) {
 }
 
 async function loadCatalog() {
+  const generation = ++catalogGeneration
   catalogController?.abort()
   catalogController = new AbortController()
   catalogLoading.value = true
   catalogError.value = ''
   try {
-    await ensureCatalogLibraries()
-    result.value = await api<MediaCatalogPage>(mediaCatalogEndpoint(selectedLibrary.value, {
+    await ensureCatalogLibraries(generation)
+    if (generation !== catalogGeneration) return
+    const data = await api<MediaCatalogPage>(mediaCatalogEndpoint(selectedLibrary.value, {
       page: page.value, pageSize: pageSize.value, query: query.value, mediaType: mediaType.value,
       matchStatus: '', category: category.value,
     }), { signal: catalogController.signal })
+    if (generation !== catalogGeneration) return
+    result.value = data
     catalogLoaded.value = true
   } catch (reason) {
     if (reason instanceof DOMException && reason.name === 'AbortError') return
-    catalogError.value = message(reason, '媒体库内容加载失败')
-  } finally { catalogLoading.value = false }
+    if (generation === catalogGeneration) catalogError.value = message(reason, '媒体库内容加载失败')
+  } finally { if (generation === catalogGeneration) catalogLoading.value = false }
 }
 
 function activate(mode: LibraryView) {
   activeView.value = mode
   selectedCollection.value = null
+  historyWork.value = null
   sectionController?.abort(); ++sectionGeneration
   if (mode === 'overview') { if (!overviewLoaded.value) void loadOverview(); return }
   if (mode === 'catalog') { if (!catalogLoaded.value) void loadCatalog(); return }
@@ -129,6 +149,11 @@ function openHistory(item: UserHistoryItem) {
   if (item.playable)
     void router.push({ name: 'library-catalog-detail', params: { libraryID: String(item.library_id), workID: item.work_id } })
 }
+function openHistoryRecords(item: UserHistoryItem) {
+  historyWork.value = { library_id: item.library_id, work_id: item.work_id, title: item.title }
+  void loadSection('history')
+}
+function closeHistoryRecords() { historyWork.value = null; void loadSection('history') }
 function openOverviewCollection(item: UserCollectionSummary) { selectedCollection.value = item; activeView.value = item.source === 'manual' ? 'manual' : 'automatic' }
 function openOverviewLibrary(item: UserMediaLibrarySummary) {
   const changed = selectedLibrary.value !== item.id
@@ -155,28 +180,35 @@ function openCatalogItem(item: MediaCatalogItem) {
 function openTarget(target: MediaCatalogLibraryWork) { pendingSelection.value = null; void router.push({ name: 'library-catalog-detail', params: { libraryID: String(target.library_id), workID: target.work_id } }) }
 
 async function loadExcluded(requestedPage = 1) {
+  const request = excludedReads.begin()
   excludedLoading.value = true; excludedError.value = ''
-  try { excluded.value = await api<ExcludedPage>(`/api/v1/media-libraries/exclusions?page=${requestedPage}&page_size=24`) }
-  catch (reason) { excludedError.value = message(reason, '已移出作品加载失败') }
-  finally { excludedLoading.value = false }
+  try {
+    const data = await api<ExcludedPage>(`/api/v1/media-libraries/exclusions?page=${requestedPage}&page_size=24`, { signal: request.signal })
+    if (request.isCurrent()) excluded.value = data
+  }
+  catch (reason) { if (request.isCurrent()) excludedError.value = message(reason, '已移出作品加载失败') }
+  finally { if (request.isCurrent()) excludedLoading.value = false; request.finish() }
 }
 async function restore(item: ExcludedItem) {
   if (restoring.value) return
+  const request = restoreActions.begin()
   restoring.value = item.exclusion_id
   try {
-    await api(`/api/v1/media-libraries/${item.library_id}/exclusions/${encodeURIComponent(item.exclusion_id)}/restore`, { method: 'POST' })
+    await api(`/api/v1/media-libraries/${item.library_id}/exclusions/${encodeURIComponent(item.exclusion_id)}/restore`, { method: 'POST', signal: request.signal })
+    if (!request.isCurrent()) return
     notify('作品已恢复展示，正在重新扫描', 'success')
-    void api(`/api/v1/media-libraries/${item.library_id}/scan`, { method: 'POST', body: JSON.stringify({ mode: 'full' }) }).catch(reason => notify(`作品已恢复，自动扫描失败：${message(reason, '请手动扫描')}`, 'error'))
+    void api(`/api/v1/media-libraries/${item.library_id}/scan`, { method: 'POST', body: JSON.stringify({ mode: 'full' }), signal: request.signal }).catch(reason => { if (request.isCurrent()) notify(`作品已恢复，自动扫描失败：${message(reason, '请手动扫描')}`, 'error') })
     await loadExcluded(excluded.value.page)
+    if (!request.isCurrent()) return
     overviewLoaded.value = false; catalogLoaded.value = false
-  } catch (reason) { notify(message(reason, '恢复失败'), 'error') }
-  finally { restoring.value = null }
+  } catch (reason) { if (request.isCurrent()) notify(message(reason, '恢复失败'), 'error') }
+  finally { if (request.isCurrent()) restoring.value = null; request.finish() }
 }
 function workTarget(item: UserMediaItem, favorite = false): WorkMenuTarget {
   return { title: item.title, kind: item.kind, favorite, works: [{ library_id: item.library_id, work_id: item.work_id, library_name: libraries.value.find(library => library.id === item.library_id)?.name ?? `媒体库 ${item.library_id}`, file_count: 0 }] }
 }
 function historyTarget(item: UserHistoryItem): WorkMenuTarget {
-  return { title: item.title, kind: item.media_type === 'movie' ? 'movie' : 'series', historyId: item.history_id,
+  return { title: item.title, kind: item.media_type === 'movie' ? 'movie' : 'series', historyId: item.history_id, completed: item.completed,
     works: item.playable && item.library_id && item.work_id ? [{ library_id: item.library_id, work_id: item.work_id, library_name: libraries.value.find(library => library.id === item.library_id)?.name ?? `媒体库 ${item.library_id}`, file_count: 0 }] : [] }
 }
 function catalogTarget(item: MediaCatalogItem): WorkMenuTarget {
@@ -192,14 +224,31 @@ function refreshWorkSections() {
   if (activeView.value === 'history') void loadSection('history', history.value.page)
   if (activeView.value === 'catalog') void loadCatalog()
 }
+function showHistoryMenu(event: MouseEvent | KeyboardEvent, item: UserHistoryItem) { showWorkMenu(event, historyTarget(item)) }
 function formatBytes(value: number) { if (value < 1024) return `${value} B`; const units = ['KB', 'MB', 'GB', 'TB']; let size = value / 1024; let index = 0; while (size >= 1024 && index < units.length - 1) { size /= 1024; index++ }; return `${size.toFixed(size >= 10 ? 1 : 2)} ${units[index]}` }
 function formatDate(value: number | string) { const date = new Date(value); return Number.isNaN(date.getTime()) ? '时间未知' : new Intl.DateTimeFormat('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }).format(date) }
 function message(reason: unknown, fallback: string) { return reason instanceof Error ? reason.message : fallback }
 
 watch([selectedLibrary, mediaType, category, pageSize], () => { if (activeView.value === 'catalog') { page.value = 1; void loadCatalog() } })
 watch(page, () => { if (activeView.value === 'catalog') void loadCatalog() })
+watch(() => auth.user, () => {
+  overviewController?.abort(); sectionController?.abort(); catalogController?.abort()
+  excludedReads.cancel(); restoreActions.cancel()
+  ++overviewGeneration; ++sectionGeneration; ++catalogGeneration
+  workMenu.value?.close(false)
+  pendingSelection.value = null; selectedCollection.value = null
+  selectedLibrary.value = null; category.value = ''; query.value = ''; page.value = 1
+  overview.value = emptyUserMediaOverview(); overviewLoaded.value = false
+  history.value = { list: [], total: 0, page: 1, page_size: 24, has_more: false }; historyWork.value = null
+  libraries.value = []; result.value = { list: [], total: 0, page: 1, page_size: 20, categories: [] }; catalogLoaded.value = false
+  excluded.value = { list: [], total: 0, page: 1, page_size: 24, has_more: false }; restoring.value = null
+  overviewError.value = ''; sectionError.value = ''; catalogError.value = ''; excludedError.value = ''
+  overviewLoading.value = false; sectionLoading.value = false; catalogLoading.value = false; excludedLoading.value = false
+  activeView.value = 'overview'
+  if (auth.user && auth.can(Permissions.MediaLibrariesRead)) void loadOverview()
+})
 onMounted(loadOverview)
-onUnmounted(() => { overviewController?.abort(); sectionController?.abort(); catalogController?.abort() })
+onUnmounted(() => { ++overviewGeneration; ++sectionGeneration; ++catalogGeneration; overviewController?.abort(); sectionController?.abort(); catalogController?.abort(); excludedReads.cancel(); restoreActions.cancel() })
 </script>
 
 <template>
@@ -216,7 +265,7 @@ onUnmounted(() => { overviewController?.abort(); sectionController?.abort(); cat
         <article class="panel overflow-hidden p-0">
           <header class="overview-heading"><div><h2>继续观看</h2><p>同一账号下跨设备合并的观看进度</p></div><button class="btn-secondary" @click="activate('history')">查看全部</button></header>
           <div v-if="overview.sections.continue_watching.status === 'unavailable'" class="overview-empty">该栏目暂时不可用（{{ overview.sections.continue_watching.error_code || 'UNKNOWN' }}）</div>
-          <div v-else-if="overview.sections.continue_watching.list.length" class="discovery-row p-5"><button v-for="item in overview.sections.continue_watching.list" :key="`${item.source_kind}:${item.library_id}:${item.work_id}:${item.subtitle || ''}`" class="discovery-poster" :class="{ 'cursor-default': !item.playable }" @click="openHistory(item)" @contextmenu.prevent="showWorkMenu($event, historyTarget(item))" @keydown="workMenuKey($event, historyTarget(item))"><div class="discovery-poster__image"><img v-if="item.poster_url" :src="item.poster_url" :alt="`${item.title} 海报`" loading="lazy"><span v-else>暂无海报</span></div><strong :title="item.title">{{ item.title }}</strong><small>{{ item.subtitle || '继续观看' }}</small><small>{{ item.source_name }}</small><span class="history-progress" aria-hidden="true"><i :style="{ width: `${historyProgress(item)}%` }"></i></span></button></div>
+          <div v-else-if="overview.sections.continue_watching.list.length" class="discovery-row p-5"><HistoryMediaCard v-for="item in overview.sections.continue_watching.list" :key="`${item.library_id}:${item.work_id}`" :item="item" @open="openHistory" @menu="showHistoryMenu" /></div>
           <div v-else class="overview-empty">当前账号暂无未看完的媒体。</div>
         </article>
 
@@ -239,9 +288,10 @@ onUnmounted(() => { overviewController?.abort(); sectionController?.abort(); cat
     </template>
 
     <template v-else-if="activeView === 'history'">
+      <header class="panel flex flex-wrap items-center justify-between gap-3"><div><h2 class="m-0 text-lg">{{ historyWork ? `${historyWork.title} · 分集观看记录` : '播放历史' }}</h2><p class="mb-0 mt-1 text-sm text-muted">{{ historyWork ? '保留每集原有进度，操作仅作用于选中的一条记录。' : '按作品汇总，显示最近一次观看；可展开查看分集记录。' }}</p></div><button v-if="historyWork" class="btn-secondary" @click="closeHistoryRecords">返回作品历史</button></header>
       <div v-if="sectionLoading" class="panel py-14 text-center text-muted">正在读取播放历史…</div>
       <div v-else-if="sectionError" class="semantic-error p-4"><strong>播放历史暂时不可用</strong><p class="mt-1 text-sm">{{ sectionError }}</p><button class="btn-secondary mt-3" @click="loadSection('history', history.page)">重试</button></div>
-      <template v-else><div v-if="history.list.length" class="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-5 2xl:grid-cols-7"><button v-for="item in history.list" :key="`${item.source_kind}:${item.library_id}:${item.work_id}:${item.subtitle || ''}`" class="discovery-poster" :class="{ 'cursor-default': !item.playable }" @click="openHistory(item)" @contextmenu.prevent="showWorkMenu($event, historyTarget(item))" @keydown="workMenuKey($event, historyTarget(item))"><div class="discovery-poster__image"><img v-if="item.poster_url" :src="item.poster_url" :alt="`${item.title} 海报`" loading="lazy"><span v-else>暂无海报</span></div><strong :title="item.title">{{ item.title }}</strong><small>{{ item.subtitle || (item.completed ? '已看完' : '已观看') }}</small><small>{{ item.source_name }} · {{ formatDate(item.updated_at) }}</small><span class="history-progress" aria-hidden="true"><i :style="{ width: `${historyProgress(item)}%` }"></i></span></button></div><div v-else class="panel py-14 text-center text-muted">当前账号还没有同步播放历史。</div><footer v-if="history.total" class="panel flex flex-wrap items-center justify-between gap-3 py-3"><span class="text-sm text-muted">共 {{ history.total }} 条记录</span><div class="flex items-center gap-2"><button class="btn-secondary" :disabled="history.page <= 1" @click="loadSection('history', history.page - 1)">上一页</button><span class="text-sm">第 {{ history.page }} 页</span><button class="btn-secondary" :disabled="!history.has_more" @click="loadSection('history', history.page + 1)">下一页</button></div></footer></template>
+      <template v-else><div v-if="history.list.length" class="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-5 2xl:grid-cols-7"><HistoryMediaCard v-for="item in history.list" :key="item.history_id || `${item.library_id}:${item.work_id}`" :item="item" show-updated-at :show-records="!historyWork" @open="openHistory" @menu="showHistoryMenu" @records="openHistoryRecords" /></div><div v-else class="panel py-14 text-center text-muted">当前账号还没有同步播放历史。</div><footer v-if="history.total" class="panel flex flex-wrap items-center justify-between gap-3 py-3"><span class="text-sm text-muted">共 {{ history.total }} {{ historyWork ? '条记录' : '部作品' }}</span><div class="flex items-center gap-2"><button class="btn-secondary" :disabled="history.page <= 1" @click="loadSection('history', history.page - 1)">上一页</button><span class="text-sm">第 {{ history.page }} 页</span><button class="btn-secondary" :disabled="!history.has_more" @click="loadSection('history', history.page + 1)">下一页</button></div></footer></template>
     </template>
 
     <UserMediaManager v-else-if="activeView === 'favorites' || activeView === 'automatic' || activeView === 'manual'" :key="activeView" :mode="activeView" :initial-collection="selectedCollection" @changed="overviewLoaded = false" />
@@ -270,8 +320,6 @@ onUnmounted(() => { overviewController?.abort(); sectionController?.abort(); cat
 .overview-heading h2 { margin: 0; font-size: 1.05rem; }
 .overview-heading p { margin: .2rem 0 0; color: var(--text-muted); font-size: .75rem; }
 .overview-empty { padding: 2rem 1.25rem; color: var(--text-muted); font-size: .875rem; text-align: center; }
-.history-progress { display: block; height: .22rem; margin-top: .55rem; overflow: hidden; border-radius: 999px; background: var(--surface-muted); }
-.history-progress i { display: block; height: 100%; border-radius: inherit; background: var(--accent); }
 .library-summary-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(18rem, 100%), 1fr)); gap: .75rem; }
 .library-artwork { display: grid; aspect-ratio: 1; place-items: center; overflow: hidden; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface-muted); color: var(--text-subtle); }
 .library-artwork img { width: 100%; height: 100%; object-fit: cover; }

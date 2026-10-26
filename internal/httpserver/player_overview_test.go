@@ -130,6 +130,13 @@ func TestBrowserMediaLibraryOverviewUsesSessionFiltersSourcesAndReturnsSafeDTOs(
 	if err := client.db.Create(&rows).Error; err != nil {
 		t.Fatal(err)
 	}
+	// Keep the manually seeded rows consistent with the durable sync cursor.
+	for _, row := range rows {
+		revision := models.PlayerPlaybackHistoryRevision{ID: row.Revision, UserID: row.UserID, SyncKey: row.SyncKey, ChangedAt: now}
+		if err := client.db.Create(&revision).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
 
 	status, envelope := client.request(t, http.MethodGet, "/api/v1/media-libraries/overview", nil, false)
 	if status != http.StatusOK || client.lastHeader.Get("Cache-Control") != "no-store" {
@@ -179,6 +186,45 @@ func TestBrowserMediaLibraryOverviewUsesSessionFiltersSourcesAndReturnsSafeDTOs(
 				t.Fatalf("%s leaked %q: %s", path, forbidden, envelope.Data)
 			}
 		}
+	}
+
+	groupedPath := "/api/v1/media-libraries/history?page=1&page_size=24&group_by=work"
+	status, envelope = client.request(t, http.MethodGet, groupedPath, nil, false)
+	if err := json.Unmarshal(envelope.Data, &page); status != http.StatusOK || err != nil || len(page.List) != 1 || !strings.Contains(string(page.List[0]), `"record_count":1`) {
+		t.Fatalf("grouped browser history status=%d err=%v data=%s", status, err, envelope.Data)
+	}
+	status, _ = client.request(t, http.MethodGet, groupedPath+"&library_id=invalid&work_id="+workToken, nil, false)
+	if status != http.StatusBadRequest {
+		t.Fatalf("invalid history scope status=%d", status)
+	}
+	watchedPath := "/api/v1/media-libraries/history/" + strings.Repeat("a", 64) + "/watched"
+	status, _ = client.request(t, http.MethodPut, watchedPath, map[string]any{"completed": true}, false)
+	if status != http.StatusForbidden || client.lastHeader.Get("Cache-Control") != "no-store" {
+		t.Fatalf("watched without CSRF status=%d", status)
+	}
+	status, _ = client.request(t, http.MethodPut, watchedPath, map[string]any{}, true)
+	if status != http.StatusBadRequest {
+		t.Fatalf("watched without explicit state status=%d", status)
+	}
+	status, envelope = client.request(t, http.MethodPut, watchedPath, map[string]any{"completed": true}, true)
+	if status != http.StatusOK || client.lastHeader.Get("Cache-Control") != "no-store" {
+		t.Fatalf("watched status=%d data=%s", status, envelope.Data)
+	}
+	var marked models.PlayerPlaybackHistory
+	if err := client.db.Where("sync_key = ?", rows[0].SyncKey).First(&marked).Error; err != nil || !marked.Completed || marked.Position != 1200 || marked.Revision <= rows[0].Revision {
+		t.Fatalf("watched changed the wrong history fact: %+v err=%v", marked, err)
+	}
+	status, envelope = client.request(t, http.MethodGet, "/api/v1/media-libraries/overview", nil, false)
+	if err := json.Unmarshal(envelope.Data, &overview); status != http.StatusOK || err != nil || len(overview.Sections["continue_watching"].List) != 0 {
+		t.Fatalf("watched still in continue status=%d err=%v data=%s", status, err, envelope.Data)
+	}
+	status, _ = client.request(t, http.MethodPut, "/api/v1/media-libraries/history/"+rows[1].SyncKey+"/watched", map[string]any{"completed": true}, true)
+	if status != http.StatusNotFound {
+		t.Fatalf("browser mutated external relay status=%d", status)
+	}
+	status, envelope = client.request(t, http.MethodPut, watchedPath, map[string]any{"completed": false}, true)
+	if status != http.StatusOK {
+		t.Fatalf("unwatched status=%d data=%s", status, envelope.Data)
 	}
 
 	deletePath := "/api/v1/media-libraries/history/" + strings.Repeat("a", 64)

@@ -1204,6 +1204,12 @@ func (c *Client) get(ctx context.Context, endpoint string, values url.Values, ta
 	return nil
 }
 func (c *Client) getAt(ctx context.Context, base, endpoint string, values url.Values) ([]byte, error) {
+	return c.getAtBounded(ctx, base, endpoint, values, maxResponseBytes)
+}
+
+// getAtBounded preserves the configured transport and credentials while a
+// caller declares its own finite response budget.
+func (c *Client) getAtBounded(ctx context.Context, base, endpoint string, values url.Values, budget int64) ([]byte, error) {
 	values = cloneValues(values)
 	if c.credential.Kind == CredentialKindAPIKey {
 		values.Set("api_key", c.credential.Value)
@@ -1225,8 +1231,8 @@ func (c *Client) getAt(ctx context.Context, base, endpoint string, values url.Va
 		return nil, &networkRequestError{cause: err}
 	}
 	defer func() { _ = response.Body.Close() }()
-	body, readErr := io.ReadAll(io.LimitReader(response.Body, maxResponseBytes+1))
-	if readErr != nil || len(body) > maxResponseBytes {
+	body, readErr := io.ReadAll(io.LimitReader(response.Body, budget+1))
+	if readErr != nil || int64(len(body)) > budget {
 		return nil, clientError(ErrorInvalidResponse, readErr)
 	}
 	if response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden {
