@@ -191,7 +191,7 @@ func TestCloudFollowReusesShareForNewEpisodes(t *testing.T) {
 	if err := f.db.Model(&models.MediaLibrary{}).Where("id = ?", library.ID).Updates(map[string]any{"enabled": true, "status": models.MediaLibraryStatusListening, "baseline_generation": 1, "last_successful_scan_at": now}).Error; err != nil {
 		t.Fatal(err)
 	}
-	if err := f.db.Create(&models.MediaLibraryScanRun{LibraryID: library.ID, Kind: "full", Status: "success", Generation: 1, StartedAt: now, FinishedAt: &now}).Error; err != nil {
+	if err := f.db.Create(&models.MediaLibraryScanRun{LibraryID: library.ID, Kind: "full", Status: "success", SourceFingerprint: mediaLibraryScanSourceFingerprint(library.MediaLibrary, f.storage, f.profile), Generation: 1, StartedAt: now, FinishedAt: &now}).Error; err != nil {
 		t.Fatal(err)
 	}
 	if err := f.db.Exec("UPDATE media_library_structure_auto_states SET diagnosed_revision=source_revision WHERE library_id=?", library.ID).Error; err != nil {

@@ -334,6 +334,8 @@ func testPartialRepairLifecycle(t *testing.T, retry bool) {
 		if err := os.Remove(conflict); err != nil {
 			t.Fatal(err)
 		}
+		// Explicit continuation resolves current authority from the database.
+		persistFixtureAuthority(t, s.db, actor)
 		if _, err := s.queue.Control(actor, claim.Job.ID, "retry", RequestContext{}); err != nil {
 			t.Fatal(err)
 		}
@@ -463,6 +465,7 @@ func TestStructureLostAcknowledgementSettlesOrRecoversAfterDiagnosisChanges(t *t
 				}
 			}
 			s.backends.Register(localMediaLibraryStructureBackend{})
+			persistFixtureAuthority(t, s.db, actor)
 			if _, err := s.queue.Control(actor, claim.Job.ID, "retry", RequestContext{}); err != nil {
 				t.Fatal(err)
 			}

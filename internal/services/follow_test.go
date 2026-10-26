@@ -411,7 +411,7 @@ func TestFollowWorkerUsesCoverageIdentitySearchAndDownloadPipeline(t *testing.T)
 		t.Fatal(err)
 	}
 	finished := lastScan
-	if err := queue.db.Create(&models.MediaLibraryScanRun{LibraryID: library.ID, Kind: "full", Status: "success", Generation: 1, StartedAt: lastScan, FinishedAt: &finished}).Error; err != nil {
+	if err := queue.db.Create(&models.MediaLibraryScanRun{LibraryID: library.ID, Kind: "full", Status: "success", SourceFingerprint: mediaLibraryScanSourceFingerprint(library, storage, profile), Generation: 1, StartedAt: lastScan, FinishedAt: &finished}).Error; err != nil {
 		t.Fatal(err)
 	}
 	season, episodeOne := 1, 1
