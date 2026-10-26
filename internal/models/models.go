@@ -790,27 +790,34 @@ type Pan115PlaybackLease struct {
 // Storage is a registered provider root. It does not classify media or choose a
 // final placement; those responsibilities belong to later library/destination domains.
 type Storage struct {
-	ID                        uint       `gorm:"primaryKey" json:"id"`
-	Name                      string     `gorm:"size:128;not null" json:"name"`
-	NameNormalized            string     `gorm:"size:128;not null;uniqueIndex" json:"-"`
-	Type                      string     `gorm:"size:32;not null" json:"type"`
-	RootPath                  string     `gorm:"type:text;not null" json:"root_path"`
-	RootDisplayPath           string     `gorm:"type:text;not null;default:''" json:"root_display_path"`
-	RootPathNormalized        string     `gorm:"type:text;not null;uniqueIndex" json:"-"`
-	ConnectionID              *uint      `gorm:"index" json:"connection_id"`
-	CatalogConnectionEpoch    uint64     `gorm:"->;not null;default:0" json:"-"`
-	CatalogConnectionRevision uint64     `gorm:"->;not null;default:0" json:"-"`
-	Enabled                   bool       `gorm:"not null;default:true" json:"enabled"`
-	Capabilities              string     `gorm:"type:text;not null" json:"-"`
-	LastProbeExists           bool       `gorm:"not null;default:false" json:"-"`
-	LastProbeReadable         bool       `gorm:"not null;default:false" json:"-"`
-	LastProbeAvailable        bool       `gorm:"not null;default:false" json:"-"`
-	LastProbeFreeBytes        *uint64    `json:"-"`
-	LastProbeTotalBytes       *uint64    `json:"-"`
-	LastProbeErrorCode        string     `gorm:"size:64;not null;default:''" json:"-"`
-	LastProbeCheckedAt        *time.Time `json:"-"`
-	CreatedAt                 time.Time  `json:"created_at"`
-	UpdatedAt                 time.Time  `json:"updated_at"`
+	ID                            uint       `gorm:"primaryKey" json:"id"`
+	Name                          string     `gorm:"size:128;not null" json:"name"`
+	NameNormalized                string     `gorm:"size:128;not null;uniqueIndex" json:"-"`
+	Type                          string     `gorm:"size:32;not null" json:"type"`
+	RootPath                      string     `gorm:"type:text;not null" json:"root_path"`
+	RootDisplayPath               string     `gorm:"type:text;not null;default:''" json:"root_display_path"`
+	RootPathNormalized            string     `gorm:"type:text;not null;uniqueIndex" json:"-"`
+	ConnectionID                  *uint      `gorm:"index" json:"connection_id"`
+	CatalogConnectionEpoch        uint64     `gorm:"->;not null;default:0" json:"-"`
+	CatalogConnectionRevision     uint64     `gorm:"->;not null;default:0" json:"-"`
+	Enabled                       bool       `gorm:"not null;default:true" json:"enabled"`
+	Capabilities                  string     `gorm:"type:text;not null" json:"-"`
+	LastProbeExists               bool       `gorm:"not null;default:false" json:"-"`
+	LastProbeReadable             bool       `gorm:"not null;default:false" json:"-"`
+	LastProbeAvailable            bool       `gorm:"not null;default:false" json:"-"`
+	LastProbeFreeBytes            *uint64    `json:"-"`
+	LastProbeTotalBytes           *uint64    `json:"-"`
+	LastProbeErrorCode            string     `gorm:"size:64;not null;default:''" json:"-"`
+	LastProbeCheckedAt            *time.Time `json:"-"`
+	LastCapacityFreeBytes         *uint64    `gorm:"<-:update" json:"-"`
+	LastCapacityTotalBytes        *uint64    `gorm:"<-:update" json:"-"`
+	LastCapacityCheckedAt         *time.Time `gorm:"<-:update" json:"-"`
+	LastCapacitySampledAt         *time.Time `gorm:"<-:update" json:"-"`
+	LastCapacityErrorCode         string     `gorm:"<-:update;size:64;not null;default:''" json:"-"`
+	LastCapacityStatus            string     `gorm:"<-:update;size:32;not null;default:''" json:"-"`
+	LastCapacitySourceFingerprint string     `gorm:"<-:update;size:64;not null;default:''" json:"-"`
+	CreatedAt                     time.Time  `json:"created_at"`
+	UpdatedAt                     time.Time  `json:"updated_at"`
 }
 
 // ProviderEvent is a normalized, credential-free inbox record. The composite

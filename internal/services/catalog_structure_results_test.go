@@ -277,7 +277,14 @@ func testCatalogStructurePartialRetry(t *testing.T, cancelRetry bool, interruptF
 	if err := s.queue.Fail(job.ID, first.LeaseToken, result.ErrorCode, result.ErrorMessage); err != nil {
 		t.Fatal(err)
 	}
-	actor := Actor{User: models.User{ID: repair.OwnerID}, Permissions: map[string]struct{}{authz.PermissionJobsControlAll: {}, authz.PermissionJobsReadAll: {}}}
+	actor := Actor{User: models.User{ID: repair.OwnerID}, Permissions: map[string]struct{}{
+		authz.PermissionJobsControlAll:     {},
+		authz.PermissionJobsReadAll:        {},
+		authz.PermissionMediaLibrariesScan: {},
+	}}
+	// Explicit retry reauthorizes the owner from persisted authority, including
+	// the scan permission required to continue this library repair.
+	persistFixtureAuthority(t, s.db, actor)
 	if _, err := s.queue.Control(actor, job.ID, "retry", RequestContext{}); err != nil {
 		t.Fatal(err)
 	}

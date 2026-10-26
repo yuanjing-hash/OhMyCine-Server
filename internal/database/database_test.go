@@ -1303,7 +1303,7 @@ func TestPersistentQueueMigrationPoliciesRBACAndForeignKeys(t *testing.T) {
 		}
 	}
 	var policies int64
-	if err := db.Model(&models.QueuePolicy{}).Count(&policies).Error; err != nil || policies != 18 {
+	if err := db.Model(&models.QueuePolicy{}).Count(&policies).Error; err != nil || policies != 19 {
 		t.Fatalf("policies=%d err=%v", policies, err)
 	}
 	var retirementPolicy models.QueuePolicy

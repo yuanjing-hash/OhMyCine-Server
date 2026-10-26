@@ -316,31 +316,7 @@ func (s *PlayerHistoryService) listAvailableServerHistory(actor Actor, page, pag
 }
 
 func (s *PlayerHistoryService) BrowserList(actor Actor, page, pageSize int) (BrowserHistoryPage, error) {
-	if page < 1 || page > 100_000 || pageSize < 1 || pageSize > 100 {
-		return BrowserHistoryPage{}, appError(CodeInvalidRequest, "播放历史分页参数无效", nil)
-	}
-	wantedOffset := (page - 1) * pageSize
-	result := BrowserHistoryPage{List: make([]BrowserHistoryItem, 0, pageSize), Page: page, PageSize: pageSize}
-	selected := make([]PlayerHistoryChange, 0, pageSize)
-	err := s.visitAvailableHistory(actor, true, false, func(change PlayerHistoryChange) bool {
-		_, ok := browserHistoryItem(change, nil)
-		if !ok {
-			return true
-		}
-		if result.Total >= int64(wantedOffset) && len(selected) < pageSize {
-			selected = append(selected, change)
-		}
-		result.Total++
-		return true
-	})
-	if err != nil {
-		return BrowserHistoryPage{}, err
-	}
-	// Image configuration may use another connection; decorate only after the
-	// pinned catalogue/history snapshot has been released.
-	result.List = browserHistoryItems(selected, s.libraries)
-	result.HasMore = int64(wantedOffset+len(result.List)) < result.Total
-	return result, nil
+	return s.BrowserListWithOptions(actor, page, pageSize, BrowserHistoryOptions{})
 }
 
 // BrowserContinueWatching returns the first limit eligible items across the
@@ -353,8 +329,20 @@ func (s *PlayerHistoryService) BrowserContinueWatching(actor Actor, limit int) (
 		return nil, false, appError(CodeInvalidRequest, "继续观看数量无效", nil)
 	}
 	selected := make([]PlayerHistoryChange, 0, limit+1)
-	err := s.visitAvailableHistory(actor, true, true, func(change PlayerHistoryChange) bool {
-		if _, ok := browserHistoryItem(change, nil); ok {
+	seen := make(map[browserHistoryWork]struct{})
+	// Decide the current work state before testing completion. Otherwise marking
+	// the latest episode watched would resurrect an older unfinished episode.
+	err := s.visitAvailableHistory(actor, true, false, func(change PlayerHistoryChange) bool {
+		item, ok := browserHistoryItem(change, nil)
+		if !ok || (!change.Completed && change.Position <= 0) {
+			return true
+		}
+		key := browserHistoryWork{item.LibraryID, item.WorkID}
+		if _, exists := seen[key]; exists {
+			return true
+		}
+		seen[key] = struct{}{}
+		if playerOverviewContinueEligible(change) {
 			selected = append(selected, change)
 		}
 		return len(selected) <= limit

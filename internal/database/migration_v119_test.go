@@ -8,7 +8,7 @@ import (
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
 )
 
-func TestMigrationReleased118To121PreservesAuthorizationHistoryAndConfiguration(t *testing.T) {
+func TestMigrationReleased118To122PreservesAuthorizationHistoryAndConfiguration(t *testing.T) {
 	db, err := Open(t.TempDir() + "/released118-upgrade.db")
 	if err != nil {
 		t.Fatal(err)
@@ -59,7 +59,7 @@ func TestMigrationReleased118To121PreservesAuthorizationHistoryAndConfiguration(
 			}
 		}
 		var versions []int
-		if err := db.Table("schema_migrations").Where("version >= ?", 116).Order("version").Pluck("version", &versions).Error; err != nil || !reflect.DeepEqual(versions, []int{116, 117, 118, 119, 120, 121}) {
+		if err := db.Table("schema_migrations").Where("version >= ?", 116).Order("version").Pluck("version", &versions).Error; err != nil || !reflect.DeepEqual(versions, []int{116, 117, 118, 119, 120, 121, 122}) {
 			t.Fatalf("released migration identities lost or new ones repeated: %v %v", versions, err)
 		}
 		for _, model := range []any{&models.ProviderObservationScope{}, &models.ProviderObservationBatch{}, &models.ProviderObservationItem{}} {

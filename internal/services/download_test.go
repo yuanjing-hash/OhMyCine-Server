@@ -433,7 +433,7 @@ func configureDownloadStaging(t *testing.T, queue *QueueService, storageID uint)
 }
 
 func TestDownloadTargetRequiresExplicitLibraryAndKeepsSnapshot(t *testing.T) {
-	downloads, downloaders, queue, actor, _ := downloadFixture(t)
+	downloads, downloaders, queue, actor, client := downloadFixture(t)
 	createStorage := func(name, root string, enabled bool) models.Storage {
 		storage := models.Storage{Name: name, NameNormalized: strings.ToLower(name), Type: models.StorageTypeLocal, RootPath: root, RootPathNormalized: strings.ToLower(root), Enabled: true, Capabilities: `{}`}
 		if err := queue.db.Create(&storage).Error; err != nil {
@@ -481,8 +481,21 @@ func TestDownloadTargetRequiresExplicitLibraryAndKeepsSnapshot(t *testing.T) {
 	manual := createLibrary("Manual third", manualStorage, 3, models.MediaLibraryTransferSymlink, models.MediaLibraryConflictSkip)
 
 	automaticID := uint(0)
-	if _, err := downloads.Submit(context.Background(), actor, SubmitDownloadInput{DownloaderID: provider.ID, MediaLibraryID: &automaticID, Source: DownloadSourceInput{Kind: downloadpkg.SourceURL, URL: "magnet:?xt=urn:btih:auto-target"}}, RequestContext{}); ErrorCode(err) != CodeMediaLibraryStorageUnavailable {
+	if _, err := downloads.Submit(context.Background(), actor, SubmitDownloadInput{DownloaderID: provider.ID, MediaLibraryID: &automaticID, Source: DownloadSourceInput{Kind: downloadpkg.SourceURL, URL: "magnet:?xt=urn:btih:auto-target"}}, RequestContext{}); ErrorCode(err) != CodePermissionDenied {
 		t.Fatalf("implicit target error=%v", err)
+	}
+	var taskCount, jobCount int64
+	if err := queue.db.Model(&models.DownloadTask{}).Count(&taskCount).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := queue.db.Model(&models.Job{}).Where("job_type = ?", "download").Count(&jobCount).Error; err != nil {
+		t.Fatal(err)
+	}
+	client.mu.Lock()
+	submits := client.submits
+	client.mu.Unlock()
+	if taskCount != 0 || jobCount != 0 || submits != 0 {
+		t.Fatalf("implicit target selected a library or submitted work: tasks=%d jobs=%d submits=%d", taskCount, jobCount, submits)
 	}
 	selectedID := selected.ID
 	selectedTask, err := downloads.Submit(context.Background(), actor, SubmitDownloadInput{DownloaderID: provider.ID, MediaLibraryID: &selectedID, Source: DownloadSourceInput{Kind: downloadpkg.SourceURL, URL: "magnet:?xt=urn:btih:selected-target"}}, RequestContext{})
@@ -1878,6 +1891,7 @@ func TestDownloadWorkerAutomaticallyRoutesUnrecognizedWithoutTMDBCredential(t *t
 	for _, code := range []string{authz.PermissionDownloadersCreate, authz.PermissionDownloadsCreate, authz.PermissionDownloadsReadAll, authz.PermissionJobsRespond} {
 		actor.Permissions[code] = struct{}{}
 	}
+	persistFixtureAuthority(t, queue.db, actor)
 	store, err := credential.Open(filepath.Join(t.TempDir(), "credentials.key"), "")
 	if err != nil {
 		t.Fatal(err)
@@ -1926,6 +1940,12 @@ func TestDownloadWorkerAutomaticallyRoutesUnrecognizedWithoutTMDBCredential(t *t
 	}
 	if task.Phase != models.DownloadTaskStatusCompleted {
 		t.Fatalf("completion phase=%q", task.Phase)
+	}
+	client.mu.Lock()
+	submits := client.submits
+	client.mu.Unlock()
+	if submits != 1 {
+		t.Fatalf("classification fallback resubmitted the download: submits=%d", submits)
 	}
 	var actionCount int64
 	if err := queue.db.Model(&models.JobActionRequest{}).Where("job_id = ?", task.JobID).Count(&actionCount).Error; err != nil || actionCount != 0 {
@@ -2181,11 +2201,13 @@ func TestProviderRoutingFailureDoesNotPersistClassifiedState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := queue.db.Model(&models.DownloadTask{}).Where("id = ?", created.ID).Updates(map[string]any{"provider_task_id": "provider-hash", "phase": models.DownloadTaskStatusClassifying}).Error; err != nil {
+		t.Fatal(err)
+	}
 	var task models.DownloadTask
 	if err := queue.db.First(&task, "id = ?", created.ID).Error; err != nil {
 		t.Fatal(err)
 	}
-	task.ProviderTaskID = "provider-hash"
 	worker := NewDownloadWorker(downloads)
 	confidence, tmdbID := .98, int64(550)
 	match := scrapeMatch{Title: "Example", MediaType: "movie", Category: "电影", TMDBID: &tmdbID, Confidence: &confidence, Confident: true}
@@ -2193,15 +2215,18 @@ func TestProviderRoutingFailureDoesNotPersistClassifiedState(t *testing.T) {
 		t.Fatal(err)
 	}
 	client := &metadataDownloadClient{stubDownloadClient: &stubDownloadClient{}, setCategoryErr: downloadpkg.Error("downloader_unavailable", true, errors.New("offline"))}
-	if err := worker.routeCategory(context.Background(), &task, client, root, match.Category, "classified", "", ""); err == nil {
-		t.Fatal("provider routing failure was ignored")
+	if err := worker.routeCategory(context.Background(), &task, client, root, match.Category, "classified", "", ""); codeOfProviderError(err) != "downloader_unavailable" {
+		t.Fatalf("provider routing failure was not preserved: %v", err)
 	}
 	var persisted models.DownloadTask
 	if err := queue.db.First(&persisted, "id = ?", created.ID).Error; err != nil {
 		t.Fatal(err)
 	}
-	if persisted.ScrapeStatus != "matched" || persisted.ScrapeStatus == "classified" || client.resumed {
+	if persisted.ScrapeStatus != "matched" || persisted.Phase != models.DownloadTaskStatusClassifying || persisted.ProviderTaskID != task.ProviderTaskID || persisted.IdentitySnapshotJSON != task.IdentitySnapshotJSON || persisted.IdentityRevision != task.IdentityRevision || client.resumed || client.submits != 0 {
 		t.Fatalf("routing failure skipped retry state: status=%q resumed=%v", persisted.ScrapeStatus, client.resumed)
+	}
+	if got := strings.Join(client.categoryCalls, ","); got != "categories,create,categories,set" {
+		t.Fatalf("failed provider route call order=%q", got)
 	}
 }
 

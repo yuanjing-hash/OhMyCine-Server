@@ -18,8 +18,11 @@ func TestJobWaitReasonLibraryGateAndSafeScope(t *testing.T) {
 		t.Fatal(err)
 	}
 	queue := NewQueueService(db, NewAuditService(db))
-	job, err := queue.Enqueue(EnqueueJobInput{System: true, JobType: "fake", DisplayName: "waiting", ResourceKey: "library:" + uintID(l.ID), Payload: map[string]any{}})
+	job, err := queue.Enqueue(EnqueueJobInput{System: true, JobType: "fake", DisplayName: "waiting", Provider: "private-provider", ResourceKey: "library:" + uintID(l.ID), Payload: map[string]any{}})
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&models.Job{}).Where("id = ?", job.ID).Update("last_error_message", "private library failure").Error; err != nil {
 		t.Fatal(err)
 	}
 	reader := Actor{Permissions: map[string]struct{}{authz.PermissionJobsReadAll: {}, authz.PermissionMediaLibrariesRead: {}}}
@@ -28,34 +31,56 @@ func TestJobWaitReasonLibraryGateAndSafeScope(t *testing.T) {
 		t.Fatalf("dto=%+v err=%v", got, err)
 	}
 	page, err := queue.List(reader, JobListFilter{})
-	if err != nil || len(page.List) != 1 || page.List[0].WaitReason.Code != got.WaitReason.Code {
+	if err != nil || len(page.List) != 1 || page.List[0].WaitReason == nil || page.List[0].WaitReason.Code != got.WaitReason.Code {
 		t.Fatalf("page=%+v err=%v", page, err)
+	}
+	assertRedacted := func(dto JobDTO) {
+		t.Helper()
+		if dto.ID != job.ID || dto.DisplayName != "资源权限受限的任务" || dto.Provider != "" || dto.ResourceKey != "" || dto.LastErrorMessage != "" || dto.WaitReason != nil || dto.Action != nil {
+			t.Fatalf("resource details were not redacted: %+v", dto)
+		}
+		b, err := json.Marshal(dto)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, private := range []string{"library_disabled", job.Provider, job.ResourceKey, "private library failure"} {
+			if strings.Contains(string(b), private) {
+				t.Fatalf("resource scope leak: %s", b)
+			}
+		}
 	}
 	reader.ResourceRules = []AuthorizationRule{{PermissionCode: authz.PermissionMediaLibrariesRead, Effect: models.AuthorizationEffectDeny, ResourceType: models.AuthorizationResourceMediaLibrary, ResourceID: uintID(l.ID)}}
 	got, err = queue.Get(reader, job.ID)
-	if err != nil || got.WaitReason == nil || got.WaitReason.Code != "dependency_not_ready" {
+	if err != nil {
 		t.Fatalf("resource denied dto=%+v err=%v", got, err)
 	}
+	assertRedacted(got)
 	page, err = queue.List(reader, JobListFilter{})
-	if err != nil || page.List[0].WaitReason.Code != "dependency_not_ready" {
+	if err != nil || len(page.List) != 1 {
 		t.Fatalf("resource denied page=%+v err=%v", page, err)
 	}
+	assertRedacted(page.List[0])
 	reader.ResourceRules = nil
 	delete(reader.Permissions, authz.PermissionMediaLibrariesRead)
 	got, err = queue.Get(reader, job.ID)
-	if err != nil || got.WaitReason == nil || got.WaitReason.Code != "dependency_not_ready" {
+	if err != nil {
 		t.Fatalf("scope dto=%+v err=%v", got, err)
 	}
-	b, _ := json.Marshal(got.WaitReason)
-	if strings.Contains(string(b), "library_disabled") || strings.Contains(string(b), job.ID) {
-		t.Fatalf("scope leak %s", b)
+	assertRedacted(got)
+	page, err = queue.List(reader, JobListFilter{})
+	if err != nil || len(page.List) != 1 {
+		t.Fatalf("scope page=%+v err=%v", page, err)
 	}
+	assertRedacted(page.List[0])
+	// Restore resource visibility so redaction cannot mask an incorrect wait
+	// reason on a terminal or currently running job.
+	reader.Permissions[authz.PermissionMediaLibrariesRead] = struct{}{}
 	for _, status := range []string{models.JobStatusCancelled, models.JobStatusCompleted, models.JobStatusRunning} {
 		if err := db.Model(&models.Job{}).Where("id=?", job.ID).Update("status", status).Error; err != nil {
 			t.Fatal(err)
 		}
 		got, err = queue.Get(reader, job.ID)
-		if err != nil || got.WaitReason != nil {
+		if err != nil || got.Status != status || got.DisplayName != job.DisplayName || got.WaitReason != nil {
 			t.Fatalf("terminal/running=%+v err=%v", got, err)
 		}
 	}

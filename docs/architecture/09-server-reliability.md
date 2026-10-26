@@ -70,3 +70,13 @@ Session + CSRF 下新增 `PUT favorites/:itemId`、`POST collections`、`PATCH/D
 “保留全部文件（自动区分重名）”不表示已经证明每份文件内容不同。预览初始展示 50 个文件，可通过 `POST /api/v1/media-libraries/:id/structure/selection-preview/items` 分页检查全部最终名称：原名保留、改名移动或进入可恢复回收站。两项 POST 都要求浏览器 Session、CSRF、scan 权限和 no-store；确认 token 放 body，不进入 URL。文件路径仅展示受控相对路径，回收站不暴露内部物理位置。
 
 v76 为私有修复草稿增加有界展示 JSON（8 MiB），旧草稿的原确认内容保留，缺少文件明细时须重新预览。查询明细不重建计划、不调用 Provider、不入队；最终执行仍须单独确认并复验当前来源、规则、代次和文件事实。
+
+## 浏览器作品历史与已看完操作
+
+`GET /api/v1/media-libraries/history` 保留默认的精确历史分页；网页显式传 `group_by=work`，在当前账号、有效目录与权限过滤之后，按媒体库和稳定作品身份聚合，再计算总数和分页。卡片代表最近一条可见记录，`record_count` 是该作品的记录数量。`library_id` 与 `work_id` 必须同时提供，用于分页查看该作品的原分集记录。聚合只改变呈现，不重写每集进度、历史主键或同步记录。
+
+浏览器继续观看同样先确定每个作品最新有效记录，再判断显式完成状态；标记最新一集已看完后，不把更早残留的未完成集重新推回卡片。不同媒体库、同名但身份不同的作品保持区分。
+
+`PUT /api/v1/media-libraries/history/:historyId/watched` 使用 Session、CSRF、`media_libraries.read` 和 `{ "completed": true|false }`。只修改当前用户在当前有效目录中仍可读的既有精确记录，保留位置、时长与身份；新完成状态沿现有 revision/cursor 和时间优先级同步至 Player。重复相同操作不推进 revision。浏览器不能通过此接口修改外部来源中继记录、其他用户或已隐藏/移出的作品。
+
+历史卡片提供右键、键盘菜单和可见“更多操作”按钮；剧集明确显示“标记本集已看完”，电影显示“标记影片已看完”，不将整部剧自动标完。修改成功刷新历史和继续观看；失败保留可重试入口。账号切换、撤权及卸载后拒绝旧请求结果。

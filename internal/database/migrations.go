@@ -99,7 +99,7 @@ func schemaMigrationsThrough109() []migration {
 }
 
 func schemaMigrations() []migration {
-	return append(schemaMigrationsThrough109(), migration{Version: 110, Apply: migrateProviderDeletion}, migration{Version: 111, Apply: migrateCloudEmptyCleanup}, migration{Version: 112, Apply: migrateTGCloudSites}, migration{Version: 113, Apply: migrateMediaCatalogExclusions}, migration{Version: 114, Apply: migrateDownloaderOrder}, migration{Version: 115, Apply: migrateUserResourceAccessPolicies}, migration{Version: 116, Apply: migratePluginAccountSummary}, migration{Version: 117, Apply: migratePluginCatalogueSnapshots}, migration{Version: 118, Apply: migrateSiteSearchTimeout}, migration{Version: 119, Apply: migrateQuarkProviderTypes, DisableForeignKeys: true}, migration{Version: 120, Apply: migrateProviderObservations}, migration{Version: 121, Apply: migrateQuarkAccountBudgets})
+	return append(schemaMigrationsThrough109(), migration{Version: 110, Apply: migrateProviderDeletion}, migration{Version: 111, Apply: migrateCloudEmptyCleanup}, migration{Version: 112, Apply: migrateTGCloudSites}, migration{Version: 113, Apply: migrateMediaCatalogExclusions}, migration{Version: 114, Apply: migrateDownloaderOrder}, migration{Version: 115, Apply: migrateUserResourceAccessPolicies}, migration{Version: 116, Apply: migratePluginAccountSummary}, migration{Version: 117, Apply: migratePluginCatalogueSnapshots}, migration{Version: 118, Apply: migrateSiteSearchTimeout}, migration{Version: 119, Apply: migrateQuarkProviderTypes, DisableForeignKeys: true}, migration{Version: 120, Apply: migrateProviderObservations}, migration{Version: 121, Apply: migrateQuarkAccountBudgets}, migration{Version: 122, Apply: migrateSubscriptionCalendar})
 }
 
 func migratePluginAccountSummary(db *gorm.DB) error {
@@ -1980,6 +1980,7 @@ func seedQueuePolicies(db *gorm.DB) error {
 		{JobType: "pan115_recycle_cleanup", Concurrency: 2, ResourceConcurrency: 1, MaxAttempts: 1, LeaseSeconds: 30},
 		{JobType: "unified_schedule", Concurrency: 4, ResourceConcurrency: 1, MaxAttempts: 11, LeaseSeconds: 60},
 		{JobType: "follow-search", Concurrency: 4, ResourceConcurrency: 1, MaxAttempts: 4, LeaseSeconds: 60},
+		{JobType: "subscription_calendar_refresh", Concurrency: 2, ResourceConcurrency: 1, MaxAttempts: 3, LeaseSeconds: 60},
 		{JobType: "refresh", Concurrency: 2, ResourceConcurrency: 1, MaxAttempts: 3, LeaseSeconds: 30},
 		{JobType: "fake", Concurrency: 2, ResourceConcurrency: 1, MaxAttempts: 3, LeaseSeconds: 10},
 	}

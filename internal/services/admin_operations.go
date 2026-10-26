@@ -110,7 +110,7 @@ func (s *AdminService) DashboardOperations(ctx context.Context, actor Actor) map
 				Status string
 				Count  int64
 			}
-			if err := query.Select("status,COUNT(*) AS count").Group("status").Scan(&groups).Error; err != nil {
+			if err := query.Where("status IN ?", activeJobStatuses()).Select("status,COUNT(*) AS count").Group("status").Scan(&groups).Error; err != nil {
 				return nil, err
 			}
 			facts := make([]DashboardFact, 0, len(groups))

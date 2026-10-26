@@ -117,6 +117,33 @@ func newFollowPreviewFixture(t *testing.T) (*followCoverageFixture, *followPrevi
 	if err := sites.db.Model(&models.MediaLibrary{}).Where("id = ?", f.libraryID).Updates(map[string]any{"storage_id": storage.ID, "provider_root_id": "library", "relative_root": "/媒体库"}).Error; err != nil {
 		t.Fatal(err)
 	}
+	// The local fixture's complete scan cannot establish absence after changing
+	// its source. Model a new complete enumeration of this exact cloud root;
+	// retain the original local receipt so stale-source fencing remains tested.
+	var library models.MediaLibrary
+	var profile models.MediaClassificationProfile
+	if err := sites.db.First(&library, f.libraryID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := sites.db.First(&profile, library.ProfileID).Error; err != nil {
+		t.Fatal(err)
+	}
+	now := f.follows.now()
+	generation := library.BaselineGeneration + 1
+	library.DirtyGeneration = generation - 1
+	if err := sites.db.Create(&models.MediaLibraryScanRun{LibraryID: library.ID, Kind: "full", Status: "success", SourceFingerprint: mediaLibraryScanSourceFingerprint(library, storage, profile), Generation: generation, StartedAt: now, FinishedAt: &now}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := sites.db.Model(&models.MediaLibrary{}).Where("id = ?", library.ID).Updates(map[string]any{"baseline_generation": generation, "dirty_generation": generation, "last_successful_scan_at": now}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := sites.db.Model(&models.MediaLibraryEntry{}).Where("library_id = ?", library.ID).Update("last_generation", generation).Error; err != nil {
+		t.Fatal(err)
+	}
+	coverage, err := f.follows.coverage.Coverage(context.Background(), f.actor, "tv", 100)
+	if err != nil || coverage.TV == nil || coverage.TV.Counts != (MediaCoverageCounts{Total: 24, Present: 10, Missing: 5, Unknown: 9}) {
+		t.Fatalf("cloud-source fixture lacks complete current evidence: %+v %v", coverage, err)
+	}
 	caps := downloadpkg.Capabilities{ShareReceive: true, NativeOffline: true, OutputConstraint: downloadpkg.OutputConstraintProviderStorage}
 	if err := sites.downloads.downloader.registry.Register(models.DownloaderTypePan115Offline, caps, func(downloadpkg.Config) (downloadpkg.Client, error) { return &stubDownloadClient{}, nil }); err != nil {
 		t.Fatal(err)

@@ -71,6 +71,7 @@ type UnifiedScheduleService struct {
 	follows        *FollowService
 	cookieCloud    *CookieCloudService
 	recycleCleanup *Pan115RecycleCleanupService
+	calendar       *SubscriptionCalendarService
 	log            zerolog.Logger
 	readinessLog   map[string]bool // guarded by pollMu; observation only
 	now            func() time.Time
@@ -82,6 +83,10 @@ type UnifiedScheduleService struct {
 
 func (s *UnifiedScheduleService) SetRecycleCleanup(service *Pan115RecycleCleanupService) {
 	s.recycleCleanup = service
+}
+
+func (s *UnifiedScheduleService) SetSubscriptionCalendar(service *SubscriptionCalendarService) {
+	s.calendar = service
 }
 
 func NewUnifiedScheduleService(db *gorm.DB, queue *QueueService, authorization *AuthorizationService, libraries *MediaLibraryService, structure *MediaLibraryStructureService, strm *STRMManagementService, follows *FollowService, cookieCloud *CookieCloudService, log zerolog.Logger) *UnifiedScheduleService {
@@ -521,6 +526,12 @@ func (s *UnifiedScheduleService) Close() {
 func (s *UnifiedScheduleService) Poll(ctx context.Context) error {
 	s.pollMu.Lock()
 	defer s.pollMu.Unlock()
+	if s.calendar != nil {
+		// Cache maintenance failure cannot stop existing business schedules.
+		if err := s.calendar.EnqueueDue(ctx, 20); err != nil {
+			s.log.Warn().Str("error_code", "calendar_maintenance_failed").Msg("播出计划后台更新暂不可用，现有计划继续执行")
+		}
+	}
 	omittedReadiness := 0
 	defer func() {
 		if omittedReadiness > 0 {

@@ -13,6 +13,10 @@ package services
 // change nine function digests without adding E/R/A references or changing the
 // legacy/catalog gates, pinned facts, publication fences or write receivers.
 var catalogRuntimeAccessAllowlist = map[string]string{
+	// Existing acquisition projection: task ownership/resource checks and this
+	// exact work lookup share withCatalogReadTx. Readability is checked before
+	// PinCatalogTx; VisibleEntries is bounded to one authorized library/work.
+	"internal/services/acquisition.go:acquisitionProjection.catalogTarget": "model:E=1,query:Take:E=1|cda110c5981cb399",
 	// Quark review: initialization only counts legacy rows inside the fresh-library
 	// create transaction and refuses any existing facts; it is not a converter.
 	"internal/services/provider_observation_catalog.go:initializeFreshQuarkCatalogTx": "model:A=1,model:E=1,model:R=1|aba749825fc599f8",
@@ -146,14 +150,25 @@ var catalogRuntimeAccessAllowlist = map[string]string{
 	"internal/services/media_catalog_deletion.go:catalogDeletionTitle":                       "model:E=1|9a2790a28c71bb78",
 	"internal/services/media_catalog_deletion.go:deletionItemFromEntry":                      "model:E=1|11e81a65cfdacf18",
 	"internal/services/media_catalog_deletion.go:snapshotMatchesEntries":                     "model:E=2|b5b8f520547d67d5",
-	"internal/services/media_coverage.go:MediaCoverageService.coverageCatalog":               "model:E=2|10d01a9a249f9a4f",
-	"internal/services/media_coverage.go:coverageEntries":                                    "model:E=2,query:Find:E=1|d971fc33bbc4812d",
-	"internal/services/media_coverage.go:uniqueEntryLibraries":                               "model:E=1|6f3a02a90b57b2c6",
-	"internal/services/media_library.go:MediaLibraryService.Entries":                         "model:E=2,query:Find:E=1|05e191c97a84a7ed",
-	"internal/services/media_library.go:MediaLibraryService.Update":                          "model:A=1,model:E=1,model:R=1,query:Delete:A=1,query:Delete:E=1,query:Delete:R=1|664ebb2bb9cffcf5",
+	// Coverage uses authorized enabled library IDs, pins those heads and queries
+	// VisibleEntries in the same query-only transaction. The single-work wrapper
+	// retains its unlimited contract; bounded calendar consumers cannot infer
+	// absence from a truncated prefix. No alternate anchor-table query is added.
+	"internal/services/media_coverage.go:MediaCoverageService.coverageCatalog":     "model:E=1|2626cd586351a75f",
+	"internal/services/media_coverage.go:MediaCoverageService.coverageCatalogMany": "model:E=3,query:Find:E=1|dc06a22b31bb17cf",
+	// Calendar's only E reference groups already-authorized coverage facts. It
+	// obtains those facts through coverageCatalogMany and preserves unknown when
+	// coverage is incomplete or bounded; this function makes no E/R/A query.
+	"internal/services/subscription_calendar.go:SubscriptionCalendarService.Read": "model:E=1|a7b5fda7e30f387a",
+	"internal/services/media_coverage.go:coverageEntries":                         "model:E=2,query:Find:E=1|d971fc33bbc4812d",
+	"internal/services/media_coverage.go:uniqueEntryLibraries":                    "model:E=1|6f3a02a90b57b2c6",
+	"internal/services/media_library.go:MediaLibraryService.Entries":              "model:E=2,query:Find:E=1|05e191c97a84a7ed",
+	"internal/services/media_library.go:MediaLibraryService.Update":               "model:A=1,model:E=1,model:R=1,query:Delete:A=1,query:Delete:E=1,query:Delete:R=1|664ebb2bb9cffcf5",
 	// Quark enumeration is redirected to observation; verified outputs retain
 	// versioned-versus-legacy dispatch and commit their receipt in the same tx.
-	"internal/services/media_library.go:MediaLibraryService.reconcile":                                       "call:mergeScopedPan115Catalog=1,call:publishFastPan115Scan=1,call:recognizeLibraryUnits=1,call:reconcileTMDBCollectionsTx=1,call:stabilizeExistingRecognitionUnits=1,model:A=4,model:E=5,model:R=3,query:Delete:A=2,query:Delete:E=2,query:Delete:R=1,query:Find:A=1,query:Find:E=1,query:First:R=1,query:Save:A=1,query:Save:E=1,query:Save:R=1|8ae918635093aaf8",
+	// The legacy E/R/A writes remain gated by requireLegacyCatalogWriteTx and
+	// the current source fingerprint; versioned publication returns before them.
+	"internal/services/media_library.go:MediaLibraryService.reconcile":                                       "call:mergeScopedPan115Catalog=1,call:publishFastPan115Scan=1,call:recognizeLibraryUnits=1,call:reconcileTMDBCollectionsTx=1,call:stabilizeExistingRecognitionUnits=1,model:A=4,model:E=5,model:R=3,query:Delete:A=2,query:Delete:E=2,query:Delete:R=1,query:Find:A=1,query:Find:E=1,query:First:R=1,query:Save:A=1,query:Save:E=1,query:Save:R=1|9caac6f3f4f92468",
 	"internal/services/media_library.go:applyRecognitionEpisodeHints":                                        "model:E=1|7d763b9b7156f0fa",
 	"internal/services/media_library.go:mediaLibraryEntryProjectionChanged":                                  "model:E=1|256c6390a86c4f76",
 	"internal/services/media_library.go:mediaRecognitionProjectionChanged":                                   "model:R=1|67d93d5424dac75c",
