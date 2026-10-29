@@ -1390,6 +1390,9 @@ GET    /api/v1/media-libraries/{id}                    # 媒体库详情
 POST   /api/v1/media-libraries/{id}/scan               # 立即扫描
 GET    /api/v1/media-libraries/{id}/entries            # 文件事实分页
 GET    /api/v1/media-libraries/{id}/catalog            # 作品聚合分页
+POST   /api/v1/media-libraries/{id}/catalog/{work}/entries/{entry}/upgrade-preview
+GET    /api/v1/media-upgrades/{upgrade}                # 精确版本洗版状态
+POST   /api/v1/media-upgrades/{upgrade}/submit         # 新版就绪后回收指定旧版
 GET    /api/v1/media-libraries/{id}/runs               # 扫描记录
 GET    /api/v1/media-libraries/{id}/provider-events?page=1 # 暂停自动处理的通知，固定每页 50 条
 GET    /api/v1/media-libraries/{id}/recognitions       # 识别单元分页
@@ -1423,6 +1426,8 @@ GET    /api/v1/permissions                   # roles.read
 GET    /api/v1/audit                         # audit.read
 
 # ====== 系统设置 ======
+GET    /api/v1/settings/follows              # settings.read；新订阅字幕默认值及revision
+PATCH  /api/v1/settings/follows              # settings.update；revision CAS，不改既有订阅
 GET    /api/v1/settings                      # 获取设置
 PUT    /api/v1/settings                      # 更新设置
 GET    /api/v1/settings/metadata             # 元数据设置（凭据来源与非敏感路由）
@@ -1959,3 +1964,23 @@ Player 的入库查询、分页列表在同一只读事务中核对任务所有�
 本次完成需要同一个下载、转存及其队列所有者，已结算的物理操作凭证、完整成功文件数、所有视频的有效目录成员，以及成功 `transfer_batch` 的原始发布凭证。发布事务在私密 checkpoint 写入带版本和显式零值的 `acquisition_publication_scope`，绑定库、source epoch、来源根生命周期与来源指纹。根切走再切回、来源连接代际变化、缺成员及旧凭证均不能按同名作品推断成功。普通作品排除或恢复不改变来源根生命周期。
 
 物理操作完成但目录尚未发布时返回 `import/publishing`；旧任务已有发布时间却缺少完整原证据时，兼容该状态并返回固定安全码 `acquisition_publication_unverified`，界面显示“入库结果待核对”。不会伪造发布、重放云操作或重新扫描，已有授权作品仍可独立导航。媒体库分类只包含真实分类，入库过程留在任务和条目状态中。
+
+
+## 实际资源清单与选择获取合同
+
+资源搜索先由Server统一检查115／夸克分享、原始种子或磁力元数据，再把实际文件交给共享媒体识别与选择器。公开接口是成对的 Session／Player `POST /discovery/content-preview` 和 `POST /discovery/content-selection`，完整路径与请求／响应见 [资源内容与洗版OpenAPI](../api/resource-content.openapi.json)。Provider内部ID、原始索引、tracker和凭据不作为浏览器权限；浏览器只持有短期不透明凭证。
+
+只读检查与最终获取分离。BT元数据解析不依赖下载器或Node在线；授权关联允许读取分享时，不因缺少接收目录拒绝纯读取。自动PanSou来源筛选和最终转存仍检查可用接收器、目标库、账号范围与能力。获取时冻结实际子集及摘要，原始种子info字节保持不变，只把计划交给选定执行器；不把files选择模式降级为整包获取。
+
+单电影／单集洗版是同一获取链的替换意图。持久记录捕获的旧版本、确切新导入与目录／产物完成证据，先保留两个版本，再通过Storage声明的回收能力处理本次旧文件及独占字幕。未知写结果只核对原操作，重启或授权刷新不改变任务身份；无法回收时提前说明，不永久删除代替回收。
+
+选集与普通下载的原生归属双向隔离。普通入口不能通过同hash重复提交、按标签查询或取消操作采用受管选集；创建前的“不存在”证据必须是完整有效的原生响应，缺字段和`null`不是空列表。115在同一加密操作账本中为普通已知BT写入建立临时资源占用，明确确认后用CAS释放，未知结果继续核对原操作；其本机单计划wanted的独占声明仍保留，不能据此宣称支持可变选集合并或远端wanted。旧Node的普通115操作在Server发放授权前受同一资源占用约束，不把未持有该账本的Node当作归属权威。
+
+
+精确选集由可选执行接口承担：普通任务客户端负责持久任务身份，`SelectiveFilesClient`负责单计划输出与控制，`SelectionGroupClient`负责受管同资源引用的原生选择合并。是否支持文件选择、共享选择、云分享接收、远程执行和回收分别声明，不能因实现一个接口就默认其它能力也可用。qB原始种子保持不变，停止提交后映射原生索引、设置并读回优先级，再开始下载；每个引用只交付自己的文件。受管源清理由既有做种／整理流程核对消费者和代际后执行，不递归删除未知文件。
+
+115当前精确BT路线是v1单计划wanted，使用独立的加密提供方操作收据和账号级资源占用。它支持本次冻结子集，尚不声明同hash增量union或Node远程wanted；旧记录、已知不完整提交及跨Connection账号冲突必须按原收据恢复。115／夸克分享转存继续走真实文件叶子的独立能力。旧Quark收据、密文purpose与观察屏障不迁移到新表。
+
+Node通过`selective_files_v1`及`selective_files_union_v1`协商，旧Node在提交前排除。私有种子来源加密，临时密钥只经封装授权传送；刷新授权不改变原操作身份。Node的总并发限制实际提供方／上传／校验／导出工作，保留取消控制通路；它不代表外部qB进程的带宽限制。
+
+新订阅默认优先简体中文、其次繁体中文；未确认字幕仍允许下载并提示。全局默认和逐订阅均可改为忽略／优先／必须，语言顺序保存在各自快照；没有字幕字段的旧订阅保留原忽略行为。默认值编辑采用revision比较更新，不回写已存在的订阅。

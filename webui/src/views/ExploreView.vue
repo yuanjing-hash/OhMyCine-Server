@@ -5,19 +5,23 @@ import { api, APIError } from '@/api/client'
 import { Permissions } from '@/auth/generated-permissions'
 import SharePreviewDialog from '@/components/SharePreviewDialog.vue'
 import ShareContentSummary from '@/components/ShareContentSummary.vue'
+import ResourceContentSummary from '@/components/ResourceContentSummary.vue'
+import type { ResourceContentSelection } from '@/resource-content'
 import { isCloudContentResult } from '@/share-content'
 import { shareValidationLabel, type ShareSelection, type ShareValidation } from '@/share-preview'
 import { previewDownloadRoutes, recommendDownloadRoute, routeTargetByID, type DownloadRouteChoice, type DownloadRoutePreview, type DownloadRouteRecommendation } from '@/download-routes'
 import { formatBytes, isCloudShareSource, cloudShareDownloaderType } from '@/downloads'
 import { useSearchResultRecognition } from '@/search-result-recognition'
+import { normalizeResourceSearchDraft, resourceAcquisitionContextKey, resourceSearchIntentFromRoute, resourceSearchRouteKey, sameResourceSearchDraft, type BoundResourceIdentity, type ResourceSearchDraft } from '@/search-intent'
 import { useSiteSearch } from '@/use-site-search'
+import { isPreparedMediaUpgrade, mediaVersionUpgradePath, type MediaVersionUpgrade } from '@/media-version-upgrade'
 import { searchDuration, searchIssueLabel, searchPhaseLabel } from '@/search-progress'
 import { useAuthStore } from '@/stores/auth'
 import { notify } from '@/toast'
 import { buildDiscoveryMediaSearchPath, discoveryDetailRoute, mediaIdentitySearchURL, type DiscoveryMediaSearch, type DiscoveryMediaSearchFilter, type DiscoveryMediaType, type DiscoverySearchName, type DiscoveryWork } from '@/discovery'
 import { discoveryDownloadsPath, discoverySearchOptionsPath, filterAndSortTorrentResults, ptRecognitionEpisodeLabel, ptRecognitionErrorLabel, ptRecognitionSpecLabels, readTorrentSearchSession, readTorrentSearchSiteSelection, saveTorrentSearchSession, saveTorrentSearchSiteSelection, sitesPath, torrentRecognitionCandidatesPath, torrentRecognitionOverridePath, torrentSearchPath, torrentSearchStreamPath, torrentSearchURL, torrentSearchSessionKey, type PTRecognitionCandidate, type SearchSiteOption, type SiteSummary, type TorrentRecognitionResult, type TorrentResultDirection, type TorrentSearchGroup, type TorrentSearchProgress, type TorrentSearchResult, type TorrentSearchSession } from '@/sites'
 import type { DownloaderSummary, ListResponse, MediaLibraryDetail } from '@/types/api'
-import { discoveryOrigins, discoveryResultLinkPath, discoveryTypeOptions, resultTypeLabel, safeDiscoveryLink, type DiscoveryTypePolicy } from '@/sites'
+import { discoveryOrigins, discoveryResultLinkPath, discoveryTypeOptions, resultPreviewSourceKind, resultTypeLabel, safeDiscoveryLink, torrentResourceTypeOptions, type DiscoveryTypePolicy } from '@/sites'
 
 const route = useRoute()
 const router = useRouter()
@@ -31,13 +35,38 @@ const mediaTotalPages = ref(1)
 const mediaSearching = ref(false)
 const mediaSearched = ref(false)
 const mediaError = ref('')
-const keyword = ref(typeof route.query.title === 'string' ? route.query.title : '')
-const mediaType = ref(typeof route.query.media_type === 'string' ? route.query.media_type : '')
-const year = ref<number | undefined>(typeof route.query.year === 'string' ? Number(route.query.year) || undefined : undefined)
-const tmdbID = ref<number | undefined>(typeof route.query.tmdb_id === 'string' ? Number(route.query.tmdb_id) || undefined : undefined)
-const searchBy = ref<'title' | 'tmdb_id'>(route.query.search_by === 'tmdb_id' ? 'tmdb_id' : 'title')
+const initialIntent = resourceSearchIntentFromRoute(route.query)
+const keyword = ref(initialIntent.draft.keyword)
+const mediaType = ref(initialIntent.draft.mediaType)
+const year = ref<number | undefined>(initialIntent.draft.year)
+const tmdbID = ref<number | undefined>(initialIntent.draft.tmdbID)
+const searchBy = ref<'title' | 'tmdb_id'>(initialIntent.draft.searchBy)
+const boundIdentity = ref<BoundResourceIdentity | null>(initialIntent.identity)
+const upgradeContext = ref<MediaVersionUpgrade | null>(null)
+const upgradeContextError = ref('')
+const upgradeContextLoading = ref(false)
+const upgradeID = computed(() => resourceAcquisitionContextKey(route.query))
+let upgradeContextRequest: AbortController | null = null
+let upgradeContextGeneration = 0
+async function loadUpgradeContext() {
+  const generation = ++upgradeContextGeneration
+  upgradeContextRequest?.abort(); upgradeContextRequest = null
+  upgradeContext.value = null; upgradeContextError.value = ''; upgradeContextLoading.value = false
+  const id = upgradeID.value
+  if (!id) return
+  const controller = new AbortController(); upgradeContextRequest = controller; upgradeContextLoading.value = true
+  try {
+    const result = await api<MediaVersionUpgrade>(mediaVersionUpgradePath(id), { signal: controller.signal })
+    if (controller.signal.aborted || generation !== upgradeContextGeneration) return
+    if (result.id !== id) throw new Error('洗版目标已变化，请返回作品重新选择')
+    upgradeContext.value = result
+  } catch (reason) { if (generation === upgradeContextGeneration && !controller.signal.aborted) upgradeContextError.value = reason instanceof Error ? reason.message : '无法读取洗版目标' }
+  finally { if (generation === upgradeContextGeneration) { upgradeContextRequest = null; upgradeContextLoading.value = false } }
+}
+watch(() => [upgradeID.value, auth.user?.id], () => { void loadUpgradeContext() }, { immediate: true })
+
 const identityNames = ref<DiscoverySearchName[]>([])
-const selectedTitle = computed(() => typeof route.query.title === 'string' ? route.query.title : '')
+const selectedTitle = computed(() => boundIdentity.value && sameResourceSearchDraft(currentResourceDraft(), boundIdentity.value.draft) ? boundIdentity.value.title : '')
 const lockedSiteID = computed(() => {
   const value = typeof route.query.site_id === 'string' ? Number(route.query.site_id) : 0
   return Number.isInteger(value) && value > 0 ? value : undefined
@@ -52,6 +81,7 @@ const siteSelectorOpen = ref(false)
 const siteOptionsLoading = ref(false)
 const siteOptionsError = ref('')
 const siteOptions = ref<SearchSiteOption[]>([])
+let siteOptionsRequest: AbortController | null = null
 const sourceStatusReady = ref(false)
 const restoredResults = ref(false)
 const panSouTypePolicy = ref<'default' | DiscoveryTypePolicy>('default')
@@ -76,6 +106,9 @@ function rememberShareValidation(token: string, validation: ShareValidation) {
 }
 function shareValidation(item: TorrentSearchResult) { return shareValidations.value[item.token] ?? item.share_validation }
 const shareSelection = ref<ShareSelection | null>(null)
+const contentSelection = ref<{ resultToken: string; selection: ResourceContentSelection } | null>(null)
+const wholeResourceRequested = ref(false)
+const modernSelectionRequired = computed(() => !!downloadDialog.value?.content_inspection && !contentSelection.value && !shareSelection.value && (!!upgradeID.value || isCloudShareSource(downloadDialog.value?.source_kind) || !wholeResourceRequested.value))
 const downloadForm = ref({ downloaderID: '', mediaLibraryID: 0, priority: 0 })
 const downloadSiteID = ref<number | undefined>()
 const routePreview = ref<DownloadRoutePreview | null>(null)
@@ -115,7 +148,7 @@ const targetChoices = computed(() => {
     const previous = byLibrary.get(choice.media_library_id)
     if (!previous || !previous.enabled && choice.enabled) byLibrary.set(choice.media_library_id, choice)
   }
-  return [...byLibrary.values()]
+  return [...byLibrary.values()].filter(choice => !upgradeID.value || choice.media_library_id === upgradeContext.value?.library_id)
 })
 const selectedRoute = computed(() => routeTargetByID(routePreview.value, downloadForm.value.mediaLibraryID))
 const selectedChoice = computed(() => routeChoices.value.find(choice => choice.media_library_id === downloadForm.value.mediaLibraryID && choice.downloader_id === downloadForm.value.downloaderID))
@@ -127,6 +160,7 @@ const selectedLibrary = computed(() => libraries.value.find(item => item.id === 
 const selectableSiteOptions = computed(() => siteOptions.value.filter(item => item.searchable))
 const activeChannel = ref<'all' | number>('all')
 const enabledSiteTypes = ref<Array<'pt' | 'bt' | 'bt_resource' | 'cloud_share'>>(['pt', 'bt', 'bt_resource', 'cloud_share'])
+const enabledResultTypes = ref<string[]>([])
 const resolutionFilter = ref('')
 const promotionFilter = ref('')
 const minimumSeeders = ref<number | undefined>()
@@ -146,6 +180,7 @@ const resolutionOptions = computed(() => [...new Set(groups.value.flatMap(group 
 const visibleResults = computed(() => filterAndSortTorrentResults(groups.value, {
   activeChannel: activeChannel.value,
   enabledSiteTypes: enabledSiteTypes.value,
+  resultTypes: enabledResultTypes.value,
   resolution: resolutionFilter.value,
   promotion: promotionFilter.value,
   minimumSeeders: minimumSeeders.value,
@@ -159,13 +194,28 @@ const recognitionItems = computed(() => {
   return [...visible, ...groups.value.flatMap(group => group.items).filter(item => !visibleTokens.has(item.token))]
 })
 const resultRecognition = useSearchResultRecognition(recognitionItems, () => auth.can(Permissions.MediaLibrariesRead))
-const { recognitions, recognitionErrors, recognizingTokens, libraryStates } = resultRecognition
-const trustedIdentity = computed(() => mode.value === 'resources' && route.query.identity === 'tmdb' && (mediaType.value === 'movie' || mediaType.value === 'tv') && tmdbID.value != null && tmdbID.value > 0
-  ? { mediaType: mediaType.value as DiscoveryMediaType, tmdbID: tmdbID.value }
+const { recognitions, recognitionErrors, recognizingTokens, libraryStates, contentPreviews, contentErrors, inspectingTokens } = resultRecognition
+const trustedIdentity = computed(() => mode.value === 'resources' && boundIdentity.value && sameResourceSearchDraft(currentResourceDraft(), boundIdentity.value.draft)
+  ? { mediaType: boundIdentity.value.mediaType, tmdbID: boundIdentity.value.tmdbID }
   : null)
 const initialResourceSearch = Boolean(trustedIdentity.value || keyword.value.trim() || searchBy.value === 'tmdb_id' && tmdbID.value)
 let submittedSearchInput: TorrentSearchSession['input'] | null = null
 let submittedIdentity: { mediaType: DiscoveryMediaType; tmdbID: number } | null = null
+const submittedDraft = ref<ResourceSearchDraft | null>(null)
+const submittedLabel = ref('')
+const draftChanged = computed(() => submittedDraft.value !== null && !sameResourceSearchDraft(currentResourceDraft(), submittedDraft.value))
+let applyingRouteDraft = false
+
+watch([keyword, mediaType, year, tmdbID, searchBy], () => {
+  const previous = boundIdentity.value
+  if (applyingRouteDraft || !previous || sameResourceSearchDraft(currentResourceDraft(), previous.draft)) return
+  boundIdentity.value = null
+  identityNames.value = []
+  // Poster-derived identity and year belong to that title, not the next typed
+  // work. A separately edited filter remains part of the user's new draft.
+  if (keyword.value.trim() !== previous.draft.keyword && year.value === previous.draft.year) year.value = undefined
+  if (searchBy.value === 'title' && tmdbID.value === previous.draft.tmdbID) tmdbID.value = undefined
+}, { flush: 'sync' })
 
 const searchRunner = useSiteSearch({
   groups, progress: searchProgress, error: searchError, searching, searched,
@@ -224,6 +274,7 @@ async function searchMedia(page = 1) {
 
 function openMedia(work: DiscoveryWork) { void router.push(discoveryDetailRoute(work)) }
 function switchMode(value: 'media' | 'resources') {
+  retireResultInteractions()
   if (value === 'media') {
     searchRunner.reset()
     searching.value = false
@@ -246,18 +297,25 @@ function searchInput(siteID?: number, page = 1, refresh = false) {
 function cancelSearch() { searchRunner.cancel() }
 
 async function openSiteSelector() {
+  siteOptionsRequest?.abort()
+  const controller = new AbortController()
+  siteOptionsRequest = controller
+  const generation = interactionGeneration
+  const current = () => siteOptionsRequest === controller && !controller.signal.aborted && generation === interactionGeneration
   siteSelectorOpen.value = true
   siteOptionsLoading.value = true
   siteOptionsError.value = ''
   try {
-    const response = await api<ListResponse<SearchSiteOption>>(discoverySearchOptionsPath)
+    const response = await api<ListResponse<SearchSiteOption>>(discoverySearchOptionsPath, { signal: controller.signal })
+    if (!current()) return
     siteOptions.value = response.list
     selectedSiteIDs.value = readTorrentSearchSiteSelection(typeof localStorage === 'undefined' ? undefined : localStorage, response.list)
   } catch (reason) {
+    if (!current()) return
     siteOptions.value = []
     selectedSiteIDs.value = []
     siteOptionsError.value = message(reason)
-  } finally { siteOptionsLoading.value = false }
+  } finally { if (current()) { siteOptionsLoading.value = false; siteOptionsRequest = null } }
 }
 
 function selectAllSites() { selectedSiteIDs.value = selectableSiteOptions.value.map(item => item.id) }
@@ -284,10 +342,12 @@ function executeSearch(siteIDs: number[]) {
   appliedTypePolicy.value = panSouTypePolicy.value === 'default' ? undefined : panSouTypePolicy.value
   appliedCloudTypes.value = panSouTypePolicy.value === 'manual' ? [...panSouCloudTypes.value] : undefined
   searchRunner.reset()
-  previewOpenGeneration++
+  retireResultInteractions()
   activeSearchSiteIDs.value = [...siteIDs]
   submittedSearchInput = currentSearchInput()
   submittedIdentity = trustedIdentity.value ? { ...trustedIdentity.value } : null
+  submittedDraft.value = currentResourceDraft()
+  submittedLabel.value = selectedTitle.value || submittedSearchInput.keyword || `TMDB ${submittedSearchInput.tmdbID}`
   groups.value = []
   restoredResults.value = false
   void refreshSourceAvailability()
@@ -296,11 +356,6 @@ function executeSearch(siteIDs: number[]) {
   identityNames.value = []
   searchError.value = ''
   searched.value = false
-  manualRequestGeneration++
-  manualCandidatesRequest?.abort()
-  manualDialog.value = null
-  manualSearching.value = false
-  manualSaving.value = false
   searchRunner.start(siteIDs, 1, true)
 }
 
@@ -336,7 +391,13 @@ async function acceptShareSelection(selection: ShareSelection) {
  sharePreviewDialog.value = null
  await openDownload(item, selection)
 }
-async function openDownload(item: TorrentSearchResult, selection: ShareSelection | null = null) {
+async function acceptContentSelection(value: { resultToken: string; selection: ResourceContentSelection }) {
+  const item = visibleResults.value.find(entry => entry.item.token === value.resultToken)?.item
+  if (!item || resultExpired(item) || resourceUnavailable(item)) return
+  await openDownload(item, null, value)
+}
+async function openDownload(item: TorrentSearchResult, selection: ShareSelection | null = null, inspected: { resultToken: string; selection: ResourceContentSelection } | null = null) {
+  if (upgradeID.value && (!upgradeContext.value || !isPreparedMediaUpgrade(upgradeContext.value))) { notify(upgradeContextError.value || '洗版目标未就绪或已有执行任务，请返回所选版本查看', 'warning'); return }
   if (resourceUnavailable(item)) return
   const generation = interactionGeneration
   const openGeneration = ++downloadOpenGeneration
@@ -344,9 +405,11 @@ async function openDownload(item: TorrentSearchResult, selection: ShareSelection
   routeRecommendationRequest = null
   routeRecommendationLoading.value = false
   shareSelection.value = selection
+  contentSelection.value = inspected?.resultToken === item.token ? inspected : null
+  wholeResourceRequested.value = false
   downloadDialog.value = item
   downloadSiteID.value = groups.value.find(group => group.items.some(candidate => candidate.token === item.token))?.site_id
-  downloadForm.value = { downloaderID: selection?.downloaderID ?? '', mediaLibraryID: 0, priority: 0 }
+  downloadForm.value = { downloaderID: selection?.downloaderID ?? '', mediaLibraryID: upgradeContext.value?.library_id ?? 0, priority: 0 }
   routePreviewRequest?.abort()
   routePreviewRequest = null
   routePreview.value = null
@@ -358,12 +421,14 @@ async function openDownload(item: TorrentSearchResult, selection: ShareSelection
 }
 
 function expectedRouteBytes() {
+  if (contentSelection.value) return contentSelection.value.selection.selected_bytes
   if (shareSelection.value) return shareSelection.value.totalSize > 0 ? shareSelection.value.totalSize : undefined
   const item = downloadDialog.value
   return !isCloudShareSource(item?.source_kind) && item?.size_bytes && item.size_bytes > 0 ? item.size_bytes : undefined
 }
 
 async function loadRouteRecommendation(mediaLibraryID?: number) {
+  if (upgradeID.value) mediaLibraryID = upgradeContext.value?.library_id
   routeRecommendationRequest?.abort()
   routeRecommendationRequest = null
   routePreviewRequest?.abort()
@@ -375,11 +440,12 @@ async function loadRouteRecommendation(mediaLibraryID?: number) {
   routeRecommendationRequest = controller
   routeRecommendationLoading.value = true
   try {
-    const recommendation = await recommendDownloadRoute(item.token, mediaLibraryID, expectedRouteBytes(), controller.signal)
+    const recommendation = await recommendDownloadRoute(item.token, mediaLibraryID, expectedRouteBytes(), controller.signal, contentSelection.value?.selection.selection_token)
     if (controller.signal.aborted) return
     routeRecommendation.value = recommendation
-    if (!mediaLibraryID) routeChoices.value = recommendation.choices
-    if (!mediaLibraryID) downloadForm.value.mediaLibraryID = recommendation.recommended?.media_library_id ?? 0
+    if (!mediaLibraryID || upgradeID.value) routeChoices.value = recommendation.choices
+    if (upgradeID.value) downloadForm.value.mediaLibraryID = upgradeContext.value?.library_id ?? 0
+    else if (!mediaLibraryID) downloadForm.value.mediaLibraryID = recommendation.recommended?.media_library_id ?? 0
     downloadForm.value.downloaderID = shareSelection.value?.downloaderID ?? recommendation.recommended?.downloader_id ?? ''
     await loadRoutePreview()
   } catch (reason) {
@@ -390,6 +456,7 @@ async function loadRouteRecommendation(mediaLibraryID?: number) {
 }
 
 async function chooseTarget(mediaLibraryID: number) {
+  if (upgradeID.value && mediaLibraryID !== upgradeContext.value?.library_id) return
   downloadForm.value.mediaLibraryID = mediaLibraryID
   await loadRouteRecommendation(mediaLibraryID)
 }
@@ -406,7 +473,7 @@ async function loadRoutePreview() {
   try {
     const preview = await previewDownloadRoutes({
       downloader_id: downloadForm.value.downloaderID,
-      source_kind: isCloudShareSource(downloadDialog.value.source_kind) ? downloadDialog.value.source_kind : 'torrent',
+      source_kind: resultPreviewSourceKind(downloadDialog.value, routeRecommendation.value?.preview_source_kind),
       site_id: downloadSiteID.value,
       expected_bytes: expectedRouteBytes(),
     }, controller.signal)
@@ -424,9 +491,21 @@ async function submitDownload() {
   if (!item || !downloadForm.value.downloaderID) { notify('请选择已启用的下载器', 'warning'); return }
   if (!selectedRoute.value?.enabled || !selectedLibrary.value) { notify('请选择一条 Server 已确认可执行的入库路线', 'warning'); return }
   if (shareSelection.value && (shareSelection.value.downloaderID !== downloadForm.value.downloaderID || Date.parse(shareSelection.value.expiresAt) <= Date.now())) { notify('预览已过期或下载器已变化，请重新预览分享', 'warning'); return }
+  if (contentSelection.value && contentSelection.value.resultToken !== item.token) { notify('文件选择与当前结果不一致，请重新读取', 'warning'); return }
+  if (upgradeID.value && (!upgradeContext.value || !isPreparedMediaUpgrade(upgradeContext.value) || downloadForm.value.mediaLibraryID !== upgradeContext.value.library_id)) { notify('洗版目标已变化，请返回所选版本重新开始', 'warning'); return }
+  if (modernSelectionRequired.value) { notify('请先选择实际文件；公开资源也可以显式选择获取整个资源', 'warning'); return }
   submitting.value = true
   try {
-    const result = await api<{ id: string; selection_tasks?: { id: string }[]; selection_pending?: number; selection_error?: string; share_validation?: ShareValidation }>(discoveryDownloadsPath, { method: 'POST', body: JSON.stringify({ preview_token: shareSelection.value?.previewToken, selected_entry_tokens: shareSelection.value?.entryTokens, result_token: item.token, downloader_id: downloadForm.value.downloaderID, media_library_id: downloadForm.value.mediaLibraryID, priority: downloadForm.value.priority }) })
+    if (upgradeID.value && upgradeContext.value) {
+      const current = upgradeContext.value
+      const result = await api<MediaVersionUpgrade>(`${mediaVersionUpgradePath(current.id)}/submit`, { method: 'POST', body: JSON.stringify({ content_selection_token: contentSelection.value?.selection.selection_token, preview_token: shareSelection.value?.previewToken, selected_entry_tokens: shareSelection.value?.entryTokens, result_token: item.token, downloader_id: downloadForm.value.downloaderID, priority: downloadForm.value.priority, revision: current.revision }) })
+      if (generation !== interactionGeneration || upgradeID.value !== current.id) return
+      upgradeContext.value = result
+      notify('洗版已入队。新版本和产物就绪后回收所选旧版本；失败时旧版本保留。', 'success')
+      downloadDialog.value = null
+      return
+    }
+    const result = await api<{ id: string; selection_tasks?: { id: string }[]; selection_pending?: number; selection_error?: string; share_validation?: ShareValidation }>(discoveryDownloadsPath, { method: 'POST', body: JSON.stringify({ content_mode:item.content_inspection ? contentSelection.value || shareSelection.value ? 'files' : 'all' : undefined, content_selection_token: contentSelection.value?.selection.selection_token, preview_token: shareSelection.value?.previewToken, selected_entry_tokens: shareSelection.value?.entryTokens, result_token: item.token, downloader_id: downloadForm.value.downloaderID, media_library_id: downloadForm.value.mediaLibraryID, priority: downloadForm.value.priority }) })
     if (generation !== interactionGeneration) return
     if (result.share_validation) rememberShareValidation(item.token, result.share_validation)
     if (result.selection_pending) { notify(result.selection_error ?? '部分任务未提交，请重试', 'warning'); return }
@@ -447,7 +526,12 @@ function mediaTypeLabel(value?: string) { return value === 'movie' ? '电影' : 
 function message(reason: unknown) { return reason instanceof Error ? reason.message : '种子搜索暂时不可用' }
 
 function currentSearchInput() {
-  return { keyword: keyword.value, mediaType: mediaType.value, year: year.value, tmdbID: tmdbID.value, searchBy: searchBy.value, siteID: lockedSiteID.value, siteIDs: lockedSiteID.value || activeSearchSiteIDs.value.length === 0 ? undefined : activeSearchSiteIDs.value, typePolicy: appliedTypePolicy.value, cloudTypes: appliedCloudTypes.value }
+  const draft = currentResourceDraft()
+  return { ...draft, tmdbID: draft.searchBy === 'tmdb_id' || trustedIdentity.value ? draft.tmdbID : undefined, siteID: lockedSiteID.value, siteIDs: lockedSiteID.value || activeSearchSiteIDs.value.length === 0 ? undefined : activeSearchSiteIDs.value, typePolicy: appliedTypePolicy.value, cloudTypes: appliedCloudTypes.value }
+}
+
+function currentResourceDraft() {
+  return normalizeResourceSearchDraft({ keyword: keyword.value, mediaType: mediaType.value, year: year.value, tmdbID: tmdbID.value, searchBy: searchBy.value, acquisitionContextKey: resourceAcquisitionContextKey(route.query) })
 }
 
 async function refreshSourceAvailability() {
@@ -564,31 +648,65 @@ async function confirmManualRecognition() {
 
 function sameSearchInput(left: ReturnType<typeof currentSearchInput>, right: TorrentSearchSession['input']) {
   const sameScope = !left.siteIDs?.length || JSON.stringify(left.siteIDs) === JSON.stringify(right.siteIDs)
-  return left.keyword.trim() === right.keyword.trim() && left.mediaType === right.mediaType && left.year === right.year && left.tmdbID === right.tmdbID && left.searchBy === right.searchBy && left.siteID === right.siteID && sameScope && left.typePolicy === right.typePolicy && JSON.stringify(left.cloudTypes) === JSON.stringify(right.cloudTypes)
+  return !left.acquisitionContextKey && left.keyword.trim() === right.keyword.trim() && left.mediaType === right.mediaType && left.year === right.year && left.tmdbID === right.tmdbID && left.searchBy === right.searchBy && left.siteID === right.siteID && sameScope && left.typePolicy === right.typePolicy && JSON.stringify(left.cloudTypes) === JSON.stringify(right.cloudTypes)
 }
 
-function clearSearchForActorChange() {
-  searchRunner.reset()
+function retireResultInteractions() {
   interactionGeneration++
   previewOpenGeneration++; downloadOpenGeneration++
   cancelDownloadOptionRequests()
-  submittedSearchInput = null; submittedIdentity = null
-  groups.value = []; searchProgress.value = null; searching.value = false; searched.value = false
-  activeSearchSiteIDs.value = []; identityNames.value = []; searchError.value = ''
+  siteOptionsRequest?.abort(); siteOptionsRequest = null
+  siteSelectorOpen.value = false; siteOptionsLoading.value = false; siteOptionsError.value = ''
+  copyRequest?.abort(); copyRequest = null; copyingToken.value = ''
   downloadDialog.value = null; sharePreviewDialog.value = null; manualDialog.value = null
   downloaders.value = []; libraries.value = []; routeChoices.value = []; routeRecommendation.value = null; routePreview.value = null
   downloadForm.value = { downloaderID: '', mediaLibraryID: 0, priority: 0 }; downloadSiteID.value = undefined
   submitting.value = false; routeRecommendationLoading.value = false; routePreviewLoading.value = false
-  shareValidations.value = {}; shareSelection.value = null
+  shareValidations.value = {}; shareSelection.value = null; contentSelection.value = null; wholeResourceRequested.value = false
   manualRequestGeneration++; manualCandidatesRequest?.abort(); manualSearching.value = false; manualSaving.value = false
   routeRecommendationRequest?.abort(); routePreviewRequest?.abort()
+  routeRecommendationRequest = null; routePreviewRequest = null
+}
+
+function clearSearchForActorChange() {
+  searchRunner.reset()
+  retireResultInteractions()
+  availabilityRequest?.abort(); availabilityRequest = null; sourceStatusReady.value = false; siteOptions.value = []
+  submittedSearchInput = null; submittedIdentity = null; submittedDraft.value = null; submittedLabel.value = ''
+  groups.value = []; searchProgress.value = null; searching.value = false; searched.value = false
+  activeSearchSiteIDs.value = []; identityNames.value = []; searchError.value = ''
   resultRecognition.reset()
   try { sessionStorage.removeItem(torrentSearchSessionKey) } catch { /* Storage is optional. */ }
 }
 watch(() => auth.user?.id, (current, previous) => { if (current !== previous) clearSearchForActorChange() })
 watch(() => auth.can(Permissions.DiscoveryRead), (allowed, previous) => { if (previous && !allowed) clearSearchForActorChange() })
 
+watch(() => resourceSearchRouteKey(route.query), () => {
+  const resourceMode = route.query.mode === 'resources' || typeof route.query.site_id === 'string'
+  if (!resourceMode && mode.value === 'media' && mediaQuery.value === (typeof route.query.query === 'string' ? route.query.query : '') && mediaFilter.value === (route.query.media_type === 'movie' || route.query.media_type === 'tv' ? route.query.media_type : 'all')) return
+  clearSearchForActorChange()
+  mediaSearchRequest?.abort(); mediaSearchRequest = null; mediaSearching.value = false
+  mode.value = resourceMode ? 'resources' : 'media'
+  if (!resourceMode) {
+    mediaQuery.value = typeof route.query.query === 'string' ? route.query.query : ''
+    mediaFilter.value = route.query.media_type === 'movie' || route.query.media_type === 'tv' ? route.query.media_type : 'all'
+    if (mediaQuery.value.trim()) void searchMedia()
+    return
+  }
+  const intent = resourceSearchIntentFromRoute(route.query)
+  applyingRouteDraft = true
+  keyword.value = intent.draft.keyword; mediaType.value = intent.draft.mediaType; year.value = intent.draft.year
+  tmdbID.value = intent.draft.tmdbID; searchBy.value = intent.draft.searchBy
+  boundIdentity.value = intent.identity
+  applyingRouteDraft = false
+  lockedSite.value = null; activeChannel.value = lockedSiteID.value ?? 'all'
+  resultSort.value = lockedSiteID.value ? 'published' : 'seeders'
+  void refreshSourceAvailability()
+  if (trustedIdentity.value || keyword.value.trim() || searchBy.value === 'tmdb_id' && tmdbID.value) search()
+})
+
 watch([groups, recognitions, searched], () => {
+  if (upgradeID.value) return
   saveTorrentSearchSession(typeof sessionStorage === 'undefined' ? undefined : sessionStorage, {
     actorID: auth.user?.id, input: submittedSearchInput ?? currentSearchInput(), groups: groups.value, recognitions: recognitions.value, searched: searched.value, savedAt: Date.now(),
   })
@@ -613,15 +731,19 @@ onMounted(async () => {
   if (cached && cached.actorID !== auth.user?.id) {
     try { sessionStorage.removeItem(torrentSearchSessionKey) } catch { /* Storage is optional. */ }
   }
-  if (cached && cached.actorID === auth.user?.id && (!hasRouteSearch || sameSearchInput(currentSearchInput(), cached.input))) {
+  if (cached && cached.actorID === auth.user?.id && !resourceAcquisitionContextKey(route.query) && (!hasRouteSearch || sameSearchInput(currentSearchInput(), cached.input))) {
+    applyingRouteDraft = true
     keyword.value = cached.input.keyword
     mediaType.value = cached.input.mediaType
     year.value = cached.input.year
     tmdbID.value = cached.input.tmdbID
     searchBy.value = cached.input.searchBy
+    applyingRouteDraft = false
     activeSearchSiteIDs.value = cached.input.siteIDs ?? []
     submittedSearchInput = cached.input
     submittedIdentity = trustedIdentity.value ? { ...trustedIdentity.value } : null
+    submittedDraft.value = currentResourceDraft()
+    submittedLabel.value = selectedTitle.value || cached.input.keyword || `TMDB ${cached.input.tmdbID}`
     groups.value = cached.groups
     searchRunner.restore()
     recognitions.value = cached.recognitions
@@ -637,6 +759,8 @@ onMounted(async () => {
   if (initialResourceSearch) search()
 })
 onBeforeUnmount(() => {
+  upgradeContextGeneration++; upgradeContextRequest?.abort(); upgradeContextRequest = null
+  siteOptionsRequest?.abort()
   availabilityRequest?.abort()
   copyRequest?.abort()
   interactionGeneration++
@@ -655,6 +779,12 @@ onBeforeUnmount(() => {
 <template>
   <section class="space-y-5">
     <header><p class="text-xs font-700 uppercase tracking-widest text-[var(--text-subtle)]">Search</p><h1 v-if="mode === 'media'" class="mt-1 text-2xl font-800">搜索</h1><h1 v-else class="mt-1 text-2xl font-800">直接搜索</h1><p class="page-description mt-1">{{ mode === 'media' ? '先从 TMDB 海报确认作品，再进入统一详情、媒体库覆盖率和多语言资源聚合。' : lockedSiteID ? '当前处于单站搜索模式；请求、重试和翻页不会回退到其他站点。' : '按原始关键词、标题或 TMDB ID 直接查询 PT/BT 资源。' }}</p></header>
+    <article v-if="upgradeID" class="panel" data-upgrade-context>
+      <h2 class="m-0 text-lg">洗版 · 查找替代版本</h2>
+      <p v-if="upgradeContextLoading" role="status">正在核对所选版本…</p>
+      <p v-else-if="upgradeContextError" role="alert" class="semantic-error p-3">{{ upgradeContextError }}</p>
+      <template v-else-if="upgradeContext"><p class="mb-1">{{ upgradeContext.title }}<template v-if="upgradeContext.season != null && upgradeContext.episode != null"> · 第 {{ upgradeContext.season }} 季第 {{ upgradeContext.episode }} 集</template> · 仅替换已选中的文件版本</p><p class="text-sm text-muted">新版本完成入库及产物后，才回收选中的旧视频和独占字幕。观看历史保留。{{ upgradeContext.error_message }}</p><p v-if="upgradeContext.state !== 'prepared'" role="status">已提交任务：{{ upgradeContext.stage }}<template v-if="upgradeContext.download_task_id"> · {{ upgradeContext.download_task_id }}</template></p></template>
+    </article>
     <nav class="management-tabs overflow-x-auto" role="tablist" aria-label="搜索模式"><button class="management-tab shrink-0" :class="mode === 'media' ? 'management-tab--active' : ''" type="button" role="tab" :aria-selected="mode === 'media'" @click="switchMode('media')">搜索</button><button class="management-tab shrink-0" :class="mode === 'resources' ? 'management-tab--active' : ''" type="button" role="tab" :aria-selected="mode === 'resources'" @click="switchMode('resources')">直接搜索</button></nav>
 
     <template v-if="mode === 'media'">
@@ -675,7 +805,7 @@ onBeforeUnmount(() => {
           <div v-else><label class="label" for="discovery-tmdb">TMDB ID</label><input id="discovery-tmdb" v-model.number="tmdbID" class="input font-mono" type="number" min="1" placeholder="346" required /></div>
           <div><label class="label" for="discovery-kind">媒体类型</label><select id="discovery-kind" v-model="mediaType" class="input"><option value="">自动</option><option value="movie">电影</option><option value="tv">剧集</option></select></div>
           <div><label class="label" for="discovery-year">年份</label><input id="discovery-year" v-model.number="year" class="input" type="number" min="1880" max="2200" placeholder="可选" /></div>
-          <button class="btn-primary" :disabled="searching">{{ searching ? '搜索中…' : '搜索' }}</button>
+          <button class="btn-primary" :disabled="searching && !draftChanged">{{ searching ? draftChanged ? '搜索新条件' : '搜索中…' : '搜索' }}</button>
         </div>
       </form>
       <section class="panel space-y-3" aria-label="PanSou 结果类型">
@@ -687,7 +817,7 @@ onBeforeUnmount(() => {
       <div v-if="searchError" class="semantic-error p-4"><strong>{{ groups.some(group => group.items.length) ? '搜索未完整完成' : '搜索失败' }}</strong><p class="mt-1 text-sm">{{ searchError }}</p><button class="btn-secondary mt-3" @click="search">{{ lockedSiteID ? '重试此站' : '重新选择站点' }}</button></div>
       <section v-if="searchProgress" class="panel" aria-live="polite">
         <div class="flex flex-wrap items-center justify-between gap-3">
-          <div><strong>站点搜索进度 {{ searchProgress.completed }} / {{ searchProgress.total }}</strong><span class="status-chip ml-2">{{ searchOutcomeLabel }}</span><p class="text-subtle mb-0 mt-1 text-xs">等待 {{ searchProgress.pending }} · 正在搜索 {{ searchProgress.running }} · 成功 {{ searchProgress.succeeded }} · 失败 {{ searchProgress.failed }} · 已发现 {{ searchProgress.result_count }}</p></div>
+          <div><strong>站点搜索进度 {{ searchProgress.completed }} / {{ searchProgress.total }}</strong><span class="status-chip ml-2">{{ searchOutcomeLabel }}</span><p v-if="submittedLabel" class="text-subtle mb-0 mt-1 text-xs">当前查询：{{ submittedLabel }}<template v-if="draftChanged">；输入条件已修改，点击“{{ searching ? '搜索新条件' : '搜索' }}”应用。</template></p><p class="text-subtle mb-0 mt-1 text-xs">等待 {{ searchProgress.pending }} · 正在搜索 {{ searchProgress.running }} · 成功 {{ searchProgress.succeeded }} · 失败 {{ searchProgress.failed }} · 已发现 {{ searchProgress.result_count }}</p></div>
           <button v-if="searching" class="btn-secondary" type="button" @click="cancelSearch">取消搜索</button>
         </div>
         <div class="mt-3 h-2 overflow-hidden rounded-full bg-[var(--surface-subtle)]" role="progressbar" :aria-valuemin="0" :aria-valuemax="searchProgress.total" :aria-valuenow="searchProgress.completed">
@@ -718,6 +848,7 @@ onBeforeUnmount(() => {
 
         <form class="panel grid gap-3 md:grid-cols-2 xl:grid-cols-[auto_auto_11rem_11rem_9rem_10rem_9rem_auto] xl:items-end" @submit.prevent>
           <fieldset class="flex flex-wrap gap-3"><legend class="label">站点类型</legend><label class="text-sm"><input v-model="enabledSiteTypes" type="checkbox" value="pt" /> PT</label><label class="text-sm"><input v-model="enabledSiteTypes" type="checkbox" value="bt" /> 公共 BT</label><label class="text-sm"><input v-model="enabledSiteTypes" type="checkbox" value="bt_resource" /> 插件资源站</label><label class="text-sm"><input v-model="enabledSiteTypes" type="checkbox" value="cloud_share" /> 网盘分享站</label></fieldset>
+          <fieldset class="flex flex-wrap items-center gap-3" aria-label="资源类型筛选"><legend class="label">资源类型</legend><button type="button" class="btn-secondary py-1 text-xs" :aria-pressed="!enabledResultTypes.length" @click="enabledResultTypes = []">全部</button><label v-for="option in torrentResourceTypeOptions" :key="option[0]" class="text-sm"><input v-model="enabledResultTypes" type="checkbox" :value="option[0]" /> {{ option[1] }}</label></fieldset>
           <label><span class="label">分辨率</span><select v-model="resolutionFilter" class="input"><option value="">全部</option><option v-for="value in resolutionOptions" :key="value" :value="value">{{ value }}</option></select></label>
           <label><span class="label">优惠</span><select v-model="promotionFilter" class="input"><option value="">全部</option><option value="free">FREE</option><option value="2xfree">2X FREE</option><option value="2x">2X</option></select></label>
           <label><span class="label">最低做种</span><input v-model.number="minimumSeeders" class="input" type="number" min="0" placeholder="不限" /></label>
@@ -744,7 +875,8 @@ onBeforeUnmount(() => {
                 <p v-if="entry.item.subtitle" class="text-subtle mb-0 mt-1 line-clamp-2 text-xs">{{ entry.item.subtitle }}</p>
                 <div class="text-subtle mt-3 flex flex-wrap gap-x-4 gap-y-1 text-xs"><span>{{ formatBytes(entry.item.size_bytes ?? null) }}</span><span>{{ formatTime(entry.item.published_at) }}</span><strong>做种 {{ count(entry.item.seeders) }}</strong><span>下载 {{ count(entry.item.leechers) }}</span><span>完成 {{ count(entry.item.completed) }}</span></div>
                 <div v-if="recognitions[entry.item.token]" class="semantic-inset mt-3 p-3 text-sm"><div class="flex flex-wrap items-center gap-2"><strong>{{ recognitions[entry.item.token].title }}</strong><span :class="recognitions[entry.item.token].status === 'matched' ? 'status-chip status-chip--ready' : 'status-chip status-chip--warning'">{{ recognitions[entry.item.token].manual_override ? '已人工确认' : isCloudContentResult(entry.item) ? recognitions[entry.item.token].share_analysis?.complete ? recognitions[entry.item.token].status === 'matched' ? '文件识别成功' : '分享内作品待确认' : '标题线索，仅供参考' : recognitions[entry.item.token].status === 'matched' ? 'BT 标题识别成功' : 'BT 标题待确认' }}</span><span class="status-chip">{{ mediaTypeLabel(recognitions[entry.item.token].media_type) }}</span><span v-if="recognitions[entry.item.token].year" class="status-chip">{{ recognitions[entry.item.token].year }}</span></div><p v-if="!isCloudContentResult(entry.item) && ptRecognitionEpisodeLabel(recognitions[entry.item.token])" class="mb-0 mt-2">{{ ptRecognitionEpisodeLabel(recognitions[entry.item.token]) }}</p><p v-if="recognitions[entry.item.token].error_code" class="text-subtle mb-0 mt-2 text-xs">{{ ptRecognitionErrorLabel(recognitions[entry.item.token].error_code) }}</p></div>
-                <ShareContentSummary v-if="isCloudContentResult(entry.item)" :analysis="recognitions[entry.item.token]?.share_analysis" :loading="recognizingTokens.includes(entry.item.token)" :received="!!recognitions[entry.item.token]" :error="recognitionErrors[entry.item.token]" />
+                <ResourceContentSummary v-if="entry.item.content_inspection" :result-token="entry.item.token" :read-lane="isCloudShareSource(entry.item.source_kind) ? 'cloud-content' : entry.item.payload_kind === 'magnet' || entry.item.result_type === 'magnet' ? 'magnet-content' : 'torrent-content'" :preview="contentPreviews[entry.item.token]" :loading="inspectingTokens.includes(entry.item.token)" :error="contentErrors[entry.item.token]" :can-select="auth.can(Permissions.DownloadsCreate) && !resourceUnavailable(entry.item)" @retry="resultRecognition.retryContent(entry.item.token)" @select="acceptContentSelection" />
+                <ShareContentSummary v-else-if="isCloudContentResult(entry.item)" :analysis="recognitions[entry.item.token]?.share_analysis" :loading="recognizingTokens.includes(entry.item.token)" :received="!!recognitions[entry.item.token]" :error="recognitionErrors[entry.item.token]" />
                 <p v-else-if="!recognitions[entry.item.token] && !recognitionErrors[entry.item.token]" class="text-subtle mt-3 text-xs" role="status">{{ recognizingTokens.includes(entry.item.token) ? '正在识别 BT 标题…' : '等待识别 BT 标题…' }}</p>
                 <p v-if="libraryStates[entry.item.token]" class="mt-3 text-xs" role="status" :title="libraryStates[entry.item.token].detail"><span class="status-chip" :class="libraryStates[entry.item.token].present ? 'status-chip--ready' : ''">库内：{{ libraryStates[entry.item.token].label }}</span><span class="text-subtle ml-2">当前可见媒体库 · 作品级</span></p>
                 <p v-if="recognitionErrors[entry.item.token] && !isCloudContentResult(entry.item)" class="semantic-warning mb-0 mt-3 p-3 text-xs">{{ recognitionErrors[entry.item.token] }}</p>
@@ -776,7 +908,7 @@ onBeforeUnmount(() => {
         <div v-else class="mt-4 grid gap-2 sm:grid-cols-2">
           <label v-for="site in siteOptions" :key="site.id" class="semantic-list-item flex items-start gap-3 p-3" :class="{ 'opacity-60': !site.searchable }">
             <input v-model="selectedSiteIDs" type="checkbox" :value="site.id" :disabled="!site.searchable" />
-            <span class="min-w-0"><strong class="block break-words">{{ site.name }}</strong><small class="text-subtle mt-1 block">{{ site.site_type === 'cloud_share' ? '网盘分享站' : site.site_type.toUpperCase() }} · {{ site.health_status || 'unknown' }}</small><small v-if="site.reason" class="semantic-danger-text mt-1 block">{{ site.reason }}</small></span>
+            <span class="min-w-0"><strong class="block break-words">{{ site.name }}</strong><small class="text-subtle mt-1 block">{{ site.site_type === 'cloud_share' ? '网盘分享站' : site.site_type ? site.site_type.toUpperCase() : '类型未知' }} · {{ site.health_status || 'unknown' }}</small><small v-if="site.reason" class="semantic-danger-text mt-1 block">{{ site.reason }}</small></span>
           </label>
         </div>
         <p v-if="!siteOptionsLoading && !siteOptionsError && selectedSiteIDs.length === 0" class="semantic-warning mt-4 p-3 text-sm" role="alert">至少选择一个可搜索站点后才能开始搜索。</p>
@@ -809,6 +941,7 @@ onBeforeUnmount(() => {
     <div v-if="downloadDialog" class="modal-backdrop fixed inset-0 z-50 flex items-center justify-center p-4" @click.self="!submitting && (downloadDialog = null)">
       <form class="panel max-h-[90vh] w-full max-w-xl overflow-y-auto" role="dialog" aria-modal="true" aria-labelledby="pt-download-title" @submit.prevent="submitDownload">
         <div class="flex items-start justify-between gap-3"><div><h2 id="pt-download-title" class="m-0 text-xl">{{ isCloudShareSource(downloadDialog.source_kind) ? '转存到媒体库' : '创建下载任务' }}</h2><p class="page-description mt-1 line-clamp-2 text-sm">{{ downloadDialog.title }}</p></div><button class="btn-secondary" type="button" :disabled="submitting" @click="downloadDialog = null">关闭</button></div>
+        <p v-if="upgradeContext" class="semantic-warning mt-4 p-3 text-sm">洗版仅替换《{{ upgradeContext.title }}》当前所选版本。新版本完成前保留旧文件，成功后回收旧版本及其独占字幕；目标媒体库已固定。</p>
         <div class="mt-5 grid gap-4 sm:grid-cols-2">
           <div><label class="label">下载器</label><select v-model="downloadForm.downloaderID" class="input" required :disabled="!!shareSelection || routeRecommendationLoading" @change="loadRoutePreview"><option value="" disabled>请选择可执行的下载器</option><option v-for="item in enabledDownloaders" :key="item.id" :value="item.id">{{ item.name }} · {{ item.type === 'pan115_offline' ? '115 网盘' : item.type === 'quark_share' ? '夸克分享转存' : item.type }}</option></select><p class="text-subtle mb-0 mt-2 text-xs">按资源来源和全局下载器顺序推荐；可手动改选兼容的下载器。</p></div>
           <div><label class="label">目标媒体库</label><div v-if="routeRecommendationLoading && !targetChoices.length" class="semantic-inset p-3 text-sm text-muted">正在计算入库路线…</div><div v-else-if="!targetChoices.length" class="semantic-warning p-3 text-sm">当前没有可用媒体库。</div><div v-else class="grid max-h-48 gap-2 overflow-y-auto" role="radiogroup" aria-label="目标媒体库"><label v-for="choice in targetChoices" :key="choice.media_library_id" class="semantic-list-item flex items-start gap-2 p-2 text-sm" :class="{ 'semantic-list-item--selected': downloadForm.mediaLibraryID === choice.media_library_id, 'opacity-60': !choice.enabled }"><input type="radio" name="explore-download-target" :checked="downloadForm.mediaLibraryID === choice.media_library_id" :disabled="!choice.enabled || routeRecommendationLoading" @change="chooseTarget(choice.media_library_id)" /><span><strong>{{ choice.library_name }}</strong><small class="text-subtle mt-1 block">{{ choice.route_label || choice.reason_message || '路线待确认' }}</small></span></label></div></div>
@@ -817,8 +950,10 @@ onBeforeUnmount(() => {
         </div>
         <div v-if="selectedLibrary && selectedRoute" class="semantic-inset mt-4 grid gap-3 p-4 text-sm sm:grid-cols-2"><div><span class="text-subtle block text-xs">最终媒体库</span><strong>{{ selectedLibrary.name }}</strong></div><div><span class="text-subtle block text-xs">分类与入库</span><strong>{{ selectedRoute.route_label }} · {{ selectedLibrary.profile_name }} · {{ selectedLibrary.transfer_mode }}</strong></div></div>
         <p v-if="shareSelection" class="semantic-inset mt-4 p-3 text-sm">本次仅转存所选 {{ shareSelection.fileCount }} 个文件 · {{ formatBytes(shareSelection.totalSize) }}。更换账号或文件范围请重新预览。</p>
+        <p v-if="contentSelection" class="semantic-inset mt-4 p-3 text-sm">本次仅获取所选 {{ contentSelection.selection.file_count }} 个实际文件 · {{ formatBytes(contentSelection.selection.selected_bytes) }}。更换下载器只重新核对执行能力，不扩大文件范围。</p>
+        <div v-else-if="downloadDialog.content_inspection && !shareSelection" class="semantic-warning mt-4 p-3 text-sm"><p>{{ upgradeID ? '洗版需要先读取实际文件，并在卡片中选择对应版本。' : isCloudShareSource(downloadDialog.source_kind) ? '请在卡片中选择实际文件后转存，尚未取得清单时不能提交。' : '尚未冻结包内文件选择。可返回卡片选择文件，或明确获取整个资源。' }}</p><label v-if="!upgradeID && !isCloudShareSource(downloadDialog.source_kind)" class="mt-2 flex items-center gap-2"><input v-model="wholeResourceRequested" type="checkbox" data-test="whole-resource-intent">获取整个资源；本次不筛选包内文件</label></div>
         <p class="text-subtle mt-4 text-xs">{{ isCloudShareSource(downloadDialog.source_kind) ? '分享内容将转存到对应网盘的下载器目录，随后自动识别、整理并入库。' : '确认后获取资源，自动识别、整理并入库。' }}</p>
-        <div class="mt-5 flex justify-end gap-3"><button class="btn-secondary" type="button" :disabled="submitting" @click="downloadDialog = null">取消</button><button class="btn-primary" :disabled="submitting || routeRecommendationLoading || routePreviewLoading || !downloadForm.downloaderID || !selectedRoute?.enabled || !selectedLibrary">{{ submitting ? '正在提交…' : isCloudShareSource(downloadDialog.source_kind) ? '确认转存' : '确认并入队' }}</button></div>
+        <div class="mt-5 flex justify-end gap-3"><button class="btn-secondary" type="button" :disabled="submitting" @click="downloadDialog = null">取消</button><button class="btn-primary" :disabled="submitting || routeRecommendationLoading || routePreviewLoading || !downloadForm.downloaderID || !selectedRoute?.enabled || !selectedLibrary || modernSelectionRequired">{{ submitting ? '正在提交…' : isCloudShareSource(downloadDialog.source_kind) ? '确认转存' : '确认并入队' }}</button></div>
       </form>
     </div>
   </section>

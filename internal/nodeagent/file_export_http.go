@@ -63,6 +63,12 @@ func (a *Agent) fileExportChunks(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *Agent) fileExportRange(w http.ResponseWriter, r *http.Request) {
+	release, admissionErr := a.acquireOperation(r.Context())
+	if admissionErr != nil {
+		writeError(w, http.StatusServiceUnavailable, "node_operation_busy", "节点文件读取队列暂时不可用")
+		return
+	}
+	defer release()
 	serverID := r.Header.Get("X-OhMyCine-Verified-Server-ID")
 	operationKey := r.PathValue("operation_key")
 	taskID := strings.TrimSpace(r.Header.Get(fileExportTaskHeader))

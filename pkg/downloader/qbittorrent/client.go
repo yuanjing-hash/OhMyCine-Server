@@ -29,7 +29,7 @@ const (
 
 var errMetadataStopConditionUnsupported = errors.New("qbittorrent metadata stop condition unsupported")
 
-var Capabilities = downloader.Capabilities{Pause: true, Resume: true, Cancel: true, DeleteData: true, DownloadSpeed: true, UploadSpeed: true, ETA: true, Seeding: true, OutputConstraint: downloader.OutputConstraintLocalStaging}
+var Capabilities = downloader.Capabilities{RemoteSelectiveFilesCapability: "selective_files_union_v1", SelectiveFileGroups: true, SelectiveFiles: true, Pause: true, Resume: true, Cancel: true, DeleteData: true, DownloadSpeed: true, UploadSpeed: true, ETA: true, Seeding: true, OutputConstraint: downloader.OutputConstraintLocalStaging}
 
 type Client struct {
 	baseURL  string
@@ -72,6 +72,25 @@ func (c *Client) Test(ctx context.Context) (downloader.Health, error) {
 }
 
 func (c *Client) Submit(ctx context.Context, request downloader.SubmitRequest) (downloader.Task, error) {
+	if request.Source.ContentSelection != nil {
+		return c.submitSelected(ctx, request)
+	}
+	if err := validateSource(request.Source); err != nil {
+		return downloader.Task{}, err
+	}
+	identity, err := sourceIdentity(request.Source)
+	if err != nil {
+		return downloader.Task{}, err
+	}
+	release, err := c.selectionLock(ctx, identity)
+	if err != nil {
+		return downloader.Task{}, err
+	}
+	defer release()
+	return c.submit(ctx, request, false)
+}
+
+func (c *Client) submit(ctx context.Context, request downloader.SubmitRequest, stopped bool) (downloader.Task, error) {
 	request.Tag = strings.TrimSpace(request.Tag)
 	if request.Tag == "" || len(request.Tag) > 96 || strings.ContainsAny(request.Tag, ",\r\n") || strings.TrimSpace(request.SavePath) == "" {
 		return downloader.Task{}, downloader.Error("downloader_request_invalid", false, nil)
@@ -79,16 +98,43 @@ func (c *Client) Submit(ctx context.Context, request downloader.SubmitRequest) (
 	if err := validateSource(request.Source); err != nil {
 		return downloader.Task{}, err
 	}
+	if stopped && request.Source.ContentSelection == nil {
+		return downloader.Task{}, downloader.Error("downloader_selection_required", false, nil)
+	}
+	identity, err := sourceIdentity(request.Source)
+	if err != nil {
+		return downloader.Task{}, err
+	}
+	// Native creation is serialized for this endpoint/account as well as the
+	// known resource lock held by the caller. This closes the unknown-HTTP vs
+	// known-selected creation window without serializing unrelated controls.
+	releaseAdmission, err := c.nativeLocks(ctx, []string{"\x00admission"})
+	if err != nil {
+		return downloader.Task{}, err
+	}
+	defer releaseAdmission()
+	if !stopped {
+		if err = c.rejectManagedSource(ctx, identity, false); err != nil {
+			return downloader.Task{}, err
+		}
+	}
 	// Submission can succeed upstream while the response is lost or rejected by
 	// an older adapter. Adopt the stable OMC tag before creating anything.
-	if existing, err := c.Get(ctx, "tag:"+request.Tag); err == nil {
+	if existing, err := c.getTask(ctx, "tag:"+request.Tag, stopped); err == nil {
 		return existing, nil
 	} else if code, retryable := downloader.ErrorInfo(err); code != "downloader_task_not_found" || retryable {
 		return downloader.Task{}, err
 	}
+	if stopped {
+		// A competing ordinary admission may have created this hash after the
+		// outer selectedState check. Never duplicate-add or adopt that task.
+		if err = c.rejectManagedSource(ctx, identity, true); err != nil {
+			return downloader.Task{}, err
+		}
+	}
 	var addedID string
 	metadataStopCondition := request.MetadataOnly && request.Source.Kind == downloader.SourceURL && strings.HasPrefix(strings.ToLower(strings.TrimSpace(request.Source.URL)), "magnet:")
-	err := c.session(ctx, func(cookie string) error {
+	err = c.session(ctx, func(cookie string) error {
 		var body bytes.Buffer
 		writer := multipart.NewWriter(&body)
 		switch request.Source.Kind {
@@ -117,6 +163,15 @@ func (c *Client) Submit(ctx context.Context, request downloader.SubmitRequest) (
 			return downloader.Error("downloader_source_invalid", false, nil)
 		}
 		fields := map[string]string{"savepath": request.SavePath, "tags": request.Tag}
+		if stopped {
+			marker, err := selectionMarker(*request.Source.ContentSelection)
+			if err != nil {
+				return err
+			}
+			fields["tags"] = request.Tag + "," + marker
+			fields["paused"], fields["stopped"], fields["autoTMM"] = "true", "true", "false"
+			fields["contentLayout"] = "Original"
+		}
 		if metadataStopCondition {
 			fields["stopCondition"] = "MetadataReceived"
 		}
@@ -176,18 +231,17 @@ func (c *Client) Submit(ctx context.Context, request downloader.SubmitRequest) (
 	})
 	if err != nil {
 		if metadataStopCondition && (errors.Is(err, errMetadataStopConditionUnsupported) || isUnsupportedStopCondition(err)) {
-			request.MetadataOnly = false
-			return c.Submit(ctx, request)
+			return downloader.Task{}, downloader.Error("downloader_metadata_stop_unsupported", false, err)
 		}
 		return downloader.Task{}, err
 	}
 	if addedID != "" {
-		if task, getErr := c.Get(ctx, addedID); getErr == nil {
+		if task, getErr := c.getTask(ctx, addedID, stopped); getErr == nil {
 			return task, nil
 		}
 	}
 	for attempt := 0; attempt < 5; attempt++ {
-		task, getErr := c.Get(ctx, "tag:"+request.Tag)
+		task, getErr := c.getTask(ctx, "tag:"+request.Tag, stopped)
 		if getErr == nil {
 			return task, nil
 		}
@@ -229,10 +283,11 @@ func isUnsupportedStopCondition(err error) bool {
 }
 
 func (c *Client) Manifest(ctx context.Context, id string) (downloader.Manifest, error) {
-	hash, err := c.resolveHash(ctx, id)
+	hash, release, err := c.ordinaryHash(ctx, id)
 	if err != nil {
 		return downloader.Manifest{}, err
 	}
+	defer release()
 	task, err := c.Get(ctx, hash)
 	if err != nil {
 		return downloader.Manifest{}, err
@@ -366,10 +421,15 @@ func (c *Client) UpdateCategory(ctx context.Context, name, savePath string) erro
 }
 
 func (c *Client) SetCategory(ctx context.Context, id, category, savePath string) error {
-	hash, err := c.resolveHash(ctx, id)
+	hash, release, err := c.ordinaryHash(ctx, id)
 	if err != nil {
 		return err
 	}
+	defer release()
+	return c.setCategoryHash(ctx, hash, category, savePath)
+}
+
+func (c *Client) setCategoryHash(ctx context.Context, hash, category, savePath string) error {
 	category = strings.TrimSpace(category)
 	savePath = strings.TrimSpace(savePath)
 	if category == "" || len(category) > 128 || strings.ContainsAny(category, "\r\n") || savePath == "" || strings.ContainsAny(savePath, "\r\n") {
@@ -423,40 +483,49 @@ func validateSource(source downloader.Source) error {
 }
 
 func (c *Client) Get(ctx context.Context, id string) (downloader.Task, error) {
-	var result downloader.Task
-	err := c.session(ctx, func(cookie string) error {
-		values := url.Values{}
-		if strings.HasPrefix(id, "tag:") {
-			values.Set("tag", strings.TrimPrefix(id, "tag:"))
-		} else {
-			values.Set("hashes", id)
+	return c.getTask(ctx, id, false)
+}
+
+// allowManaged is private to the stopped selected creation/reconciliation
+// path, whose caller proves full identity, binding and native file facts.
+func (c *Client) getTask(ctx context.Context, id string, allowManaged bool) (downloader.Task, error) {
+	values := url.Values{}
+	if strings.HasPrefix(id, "tag:") {
+		values.Set("tag", strings.TrimPrefix(id, "tag:"))
+	} else {
+		values.Set("hashes", id)
+	}
+	torrents, err := c.torrentInfos(ctx, values, false)
+	if err != nil {
+		return downloader.Task{}, err
+	}
+	if len(torrents) == 0 {
+		return downloader.Task{}, downloader.Error("downloader_task_not_found", false, nil)
+	}
+	if strings.TrimSpace(torrents[0].Hash) == "" {
+		return downloader.Task{}, downloader.Error("downloader_response_invalid", false, nil)
+	}
+	if !allowManaged {
+		for _, info := range torrents {
+			if managedSelectionTags(info.Tags) {
+				return downloader.Task{}, downloader.Error("downloader_selection_owner_conflict", false, nil)
+			}
 		}
-		body, status, err := c.do(ctx, cookie, http.MethodGet, "/api/v2/torrents/info?"+values.Encode(), "", nil)
-		if err != nil {
-			return err
-		}
-		if status != http.StatusOK {
-			return statusError(status)
-		}
-		var torrents []torrentInfo
-		if err := json.Unmarshal(body, &torrents); err != nil {
-			return downloader.Error("downloader_response_invalid", false, err)
-		}
-		if len(torrents) == 0 {
-			return downloader.Error("downloader_task_not_found", false, nil)
-		}
-		result = toTask(torrents[0])
-		return nil
-	})
-	return result, err
+	}
+	return toTask(torrents[0]), nil
 }
 
 func (c *Client) Pause(ctx context.Context, id string) error {
-	hash, err := c.resolveHash(ctx, id)
+	hash, release, err := c.ordinaryHash(ctx, id)
 	if err != nil {
 		return err
 	}
-	err = c.action(ctx, "/api/v2/torrents/pause", url.Values{"hashes": {hash}})
+	defer release()
+	return c.pauseHash(ctx, hash)
+}
+
+func (c *Client) pauseHash(ctx context.Context, hash string) error {
+	err := c.action(ctx, "/api/v2/torrents/pause", url.Values{"hashes": {hash}})
 	var statusErr *httpStatusError
 	if errors.As(err, &statusErr) && statusErr.status == http.StatusNotFound {
 		return c.action(ctx, "/api/v2/torrents/stop", url.Values{"hashes": {hash}})
@@ -465,11 +534,16 @@ func (c *Client) Pause(ctx context.Context, id string) error {
 }
 
 func (c *Client) Resume(ctx context.Context, id string) error {
-	hash, err := c.resolveHash(ctx, id)
+	hash, release, err := c.ordinaryHash(ctx, id)
 	if err != nil {
 		return err
 	}
-	err = c.action(ctx, "/api/v2/torrents/resume", url.Values{"hashes": {hash}})
+	defer release()
+	return c.resumeHash(ctx, hash)
+}
+
+func (c *Client) resumeHash(ctx context.Context, hash string) error {
+	err := c.action(ctx, "/api/v2/torrents/resume", url.Values{"hashes": {hash}})
 	var statusErr *httpStatusError
 	if errors.As(err, &statusErr) && statusErr.status == http.StatusNotFound {
 		return c.action(ctx, "/api/v2/torrents/start", url.Values{"hashes": {hash}})
@@ -478,10 +552,15 @@ func (c *Client) Resume(ctx context.Context, id string) error {
 }
 
 func (c *Client) Cancel(ctx context.Context, id string, deleteData bool) error {
-	hash, err := c.resolveHash(ctx, id)
+	hash, release, err := c.ordinaryHash(ctx, id)
 	if err != nil {
 		return err
 	}
+	defer release()
+	return c.cancelHash(ctx, hash, deleteData)
+}
+
+func (c *Client) cancelHash(ctx context.Context, hash string, deleteData bool) error {
 	return c.action(ctx, "/api/v2/torrents/delete", url.Values{"hashes": {hash}, "deleteFiles": {strconv.FormatBool(deleteData)}})
 }
 
@@ -489,6 +568,16 @@ func (c *Client) DeleteManagedTag(ctx context.Context, tag string) error {
 	tag = strings.TrimSpace(tag)
 	if !validManagedTag(tag) {
 		return downloader.Error("downloader_request_invalid", false, nil)
+	}
+	release, err := c.nativeLocks(ctx, []string{"\x00admission"})
+	if err != nil {
+		return err
+	}
+	defer release()
+	if _, err = c.Get(ctx, "tag:"+tag); err != nil {
+		if code, retryable := downloader.ErrorInfo(err); code != "downloader_task_not_found" || retryable {
+			return err
+		}
 	}
 	return c.action(ctx, "/api/v2/torrents/deleteTags", url.Values{"tags": {tag}})
 }
@@ -500,17 +589,6 @@ func validManagedTag(tag string) bool {
 	}
 	_, err := uuid.Parse(strings.TrimPrefix(tag, prefix))
 	return err == nil
-}
-
-func (c *Client) resolveHash(ctx context.Context, id string) (string, error) {
-	if !strings.HasPrefix(id, "tag:") {
-		return id, nil
-	}
-	task, err := c.Get(ctx, id)
-	if err != nil {
-		return "", err
-	}
-	return task.ID, nil
 }
 
 func (c *Client) action(ctx context.Context, endpoint string, values url.Values) error {
@@ -588,6 +666,9 @@ func isSessionCookie(name string) bool {
 }
 
 func (c *Client) do(ctx context.Context, cookie, method, endpoint, contentType string, body []byte) ([]byte, int, error) {
+	if err := downloader.CheckSelectionFence(ctx); err != nil {
+		return nil, 0, err
+	}
 	request, err := http.NewRequestWithContext(ctx, method, c.baseURL+endpoint, bytes.NewReader(body))
 	if err != nil {
 		return nil, 0, downloader.Error("downloader_request_invalid", false, err)
@@ -628,6 +709,8 @@ func statusError(status int) error {
 }
 
 type torrentInfo struct {
+	SavePath   string   `json:"save_path"`
+	Tags       string   `json:"tags"`
 	Hash       string   `json:"hash"`
 	Name       string   `json:"name"`
 	State      string   `json:"state"`

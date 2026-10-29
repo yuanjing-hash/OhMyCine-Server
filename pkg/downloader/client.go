@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/resourcecontent"
 )
 
 const (
@@ -23,17 +24,20 @@ const (
 )
 
 type Capabilities struct {
-	Pause            bool   `json:"pause"`
-	Resume           bool   `json:"resume"`
-	Cancel           bool   `json:"cancel"`
-	DeleteData       bool   `json:"delete_data"`
-	DownloadSpeed    bool   `json:"download_speed"`
-	UploadSpeed      bool   `json:"upload_speed"`
-	ETA              bool   `json:"eta"`
-	Seeding          bool   `json:"seeding"`
-	NativeOffline    bool   `json:"native_offline"`
-	ShareReceive     bool   `json:"share_receive"`
-	OutputConstraint string `json:"output_constraint"`
+	SelectiveFileGroups            bool   `json:"selective_file_groups"`
+	RemoteSelectiveFilesCapability string `json:"remote_selective_files_capability,omitempty"`
+	SelectiveFiles                 bool   `json:"selective_files"`
+	Pause                          bool   `json:"pause"`
+	Resume                         bool   `json:"resume"`
+	Cancel                         bool   `json:"cancel"`
+	DeleteData                     bool   `json:"delete_data"`
+	DownloadSpeed                  bool   `json:"download_speed"`
+	UploadSpeed                    bool   `json:"upload_speed"`
+	ETA                            bool   `json:"eta"`
+	Seeding                        bool   `json:"seeding"`
+	NativeOffline                  bool   `json:"native_offline"`
+	ShareReceive                   bool   `json:"share_receive"`
+	OutputConstraint               string `json:"output_constraint"`
 }
 
 type Config struct {
@@ -51,6 +55,8 @@ type Config struct {
 }
 
 type Source struct {
+	AllFilesVerified bool                       `json:"-"`
+	ContentSelection *resourcecontent.Selection `json:"-"`
 	// ShareSelection is internal-only and persisted encrypted by Server.
 	ShareSelection *cloud.ShareSelection
 	Kind           string
@@ -73,6 +79,9 @@ type SubmitRequest struct {
 }
 
 type File struct {
+	// NativeIndex is supplied only when the provider exposes a stable native
+	// file index. Missing is not equivalent to index zero or a display row.
+	NativeIndex      *int   `json:"native_index,omitempty"`
 	RelativePath     string `json:"relative_path"`
 	Size             int64  `json:"size"`
 	ProviderItemID   string `json:"provider_item_id,omitempty"`

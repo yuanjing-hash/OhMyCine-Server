@@ -29,8 +29,9 @@ export interface ShareContentAnalysis {
 }
 
 export function isCloudContentResult(item: { source_kind?: string; cloud_provider?: string; result_type?: string }): boolean {
+  if (item.source_kind === 'bt' || item.source_kind === 'pt') return false
   return item.source_kind === '115_share' || item.source_kind === 'quark_share' || !!item.cloud_provider
-    || !!item.result_type && item.result_type !== 'magnet' && item.result_type !== 'ed2k'
+    || !!item.result_type && item.result_type !== 'magnet' && item.result_type !== 'torrent' && item.result_type !== 'ed2k'
 }
 
 const record = (value: unknown): Record<string, unknown> | undefined => value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : undefined

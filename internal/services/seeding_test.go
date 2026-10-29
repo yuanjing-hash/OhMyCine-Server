@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -24,6 +25,11 @@ func seedingFixture(t *testing.T, mode string, cleanup bool) (*SeedingService, *
 	}
 	now := time.Now().UTC()
 	download := models.DownloadTask{ID: "download-" + mode, OwnerID: actor.User.ID, DownloaderID: &provider.ID, DownloaderName: provider.Name, ProviderType: provider.Type, ProviderTaskID: "provider-hash", SourceCiphertext: "encrypted", ProfileRulesJSON: "{}", TransferMode: mode, SeedingCleanupEnabled: cleanup, SeedingMinimumMinutes: 60, SeedingMinimumRatio: 1, SeedingCompletionMode: models.SeedingCompletionAll, DisplayName: "Example", Phase: models.DownloadTaskStatusCompleted, CreatedAt: now, UpdatedAt: now}
+	legacySource, _ := json.Marshal(downloadSourceEnvelope{Kind: downloadpkg.SourceURL, URL: "magnet:?xt=urn:btih:" + strings.Repeat("a", 40)})
+	download.SourceCiphertext, err = downloaders.credentials.Encrypt(downloadSourcePurpose(download.ID), string(legacySource))
+	if err != nil {
+		t.Fatal(err)
+	}
 	_, err = queue.EnqueueWith(EnqueueJobInput{OwnerID: actor.User.ID, JobType: "download", DisplayName: "original", Payload: map[string]any{"download_task_id": download.ID}}, func(tx *gorm.DB, job models.Job) error { download.JobID = job.ID; return tx.Create(&download).Error })
 	if err != nil {
 		t.Fatal(err)

@@ -3,10 +3,43 @@ package services
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/authz"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
+	sitepkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/site"
 )
+
+func TestResultBoundRoutePreviewUsesAdapterPayloadAndKeepsPrivatePT(t *testing.T) {
+	sites, adapter, actor, _, _, _ := siteFixture(t)
+	for _, test := range []struct {
+		name, kind, wantSource, wantPreview string
+		payload                             sitepkg.PayloadKind
+	}{
+		{"public magnet", "mikan", RouteSourceBT, "url", sitepkg.PayloadMagnet},
+		{"public torrent", "mikan", RouteSourceBT, "torrent", sitepkg.PayloadTorrent},
+		{"legacy unknown", "mikan", RouteSourceBT, "torrent", sitepkg.PayloadUnknown},
+		{"private magnet does not become public", "pttime", RouteSourcePT, "torrent", sitepkg.PayloadMagnet},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			site := models.Site{Name: test.name, NameNormalized: test.name, Kind: test.kind, BaseURL: "https://fixture.example.test", Enabled: true, Revision: 1}
+			if err := sites.db.Create(&site).Error; err != nil {
+				t.Fatal(err)
+			}
+			token, err := sites.issueClaim(siteResultClaim{ActorID: actor.User.ID, SiteID: site.ID, SiteRevision: 1, PayloadKind: test.payload, TorrentID: "server-only-source-id", ExpiresAt: sites.now().Add(time.Minute)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, err := sites.RecommendSiteRoute(context.Background(), actor, SourceRouteRecommendationInput{ResultToken: token})
+			if err != nil || result.SourceKind != test.wantSource || result.PreviewSourceKind != test.wantPreview {
+				t.Fatalf("source projection=%+v err=%v", result, err)
+			}
+		})
+	}
+	if adapter.downloads != 0 {
+		t.Fatal("source projection resolved a private payload")
+	}
+}
 
 func TestSourceRouteOrderPinsPTAndFallsThroughForPublicBT(t *testing.T) {
 	_, _, actor, _, downloads, downloaders := siteFixture(t)
@@ -48,6 +81,9 @@ func TestSourceRouteOrderPinsPTAndFallsThroughForPublicBT(t *testing.T) {
 	if err != nil || ptRoute.Recommended == nil || ptRoute.Recommended.DownloaderID != second.ID {
 		t.Fatalf("PT route = %+v, %v", ptRoute, err)
 	}
+	if ptRoute.SourceKind != RouteSourcePT || ptRoute.PreviewSourceKind != "torrent" {
+		t.Fatalf("private PT preview source changed: %+v", ptRoute)
+	}
 	// The first qB becomes unusable for this target. PT must not silently use
 	// the second qB, while public BT may continue to its next safe candidate.
 	if err := downloads.db.Model(&models.Downloader{}).Where("id = ?", second.ID).Update("execution_location", models.NodeLocationRemote).Error; err != nil {
@@ -60,6 +96,9 @@ func TestSourceRouteOrderPinsPTAndFallsThroughForPublicBT(t *testing.T) {
 	btRoute, err := downloads.RecommendSourceRoute(ctx, actor, bt.ID, &library.ID)
 	if err != nil || btRoute.Recommended == nil || btRoute.Recommended.DownloaderID != first.ID {
 		t.Fatalf("public BT fallback = %+v, %v", btRoute, err)
+	}
+	if btRoute.PreviewSourceKind != "torrent" {
+		t.Fatalf("torrent preview source changed: %+v", btRoute)
 	}
 }
 

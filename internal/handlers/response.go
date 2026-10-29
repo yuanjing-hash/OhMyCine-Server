@@ -26,6 +26,14 @@ func writeError(c *gin.Context, log zerolog.Logger, err error) {
 	status := http.StatusInternalServerError
 	code := services.ErrorCode(err)
 	switch code {
+	case "resource_content_unavailable", "resource_content_private_metadata_unavailable":
+		status = http.StatusServiceUnavailable
+	case services.CodeMediaUpgradeSelection:
+		status = http.StatusBadRequest
+	case services.CodeMediaUpgradeChanged, services.CodeMediaUpgradePending:
+		status = http.StatusConflict
+	case services.CodeMediaUpgradeUnsupported:
+		status = http.StatusUnprocessableEntity
 	case "quark_rate_limited":
 		status = http.StatusTooManyRequests
 	case "quark_auth_expired", "quark_unavailable", "quark_capability_unavailable":

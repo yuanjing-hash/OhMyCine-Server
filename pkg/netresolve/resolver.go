@@ -76,7 +76,15 @@ func New(config Config) *FakeIPResolver {
 }
 
 func newDoHClient() *http.Client {
-	transport := http.DefaultTransport.(*http.Transport).Clone()
+	// The DoH bootstrap is independent of the process-wide HTTP transport.
+	// Callers may install any RoundTripper there; cloning it could also inherit
+	// a TLS dialer or protocol hook that bypasses the fixed bootstrap below.
+	transport := &http.Transport{
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		ExpectContinueTimeout: time.Second,
+	}
 	transport.Proxy = nil
 	transport.DisableCompression = true
 	transport.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12, ServerName: "dns.alidns.com"}

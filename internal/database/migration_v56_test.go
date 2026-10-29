@@ -75,7 +75,7 @@ func TestMigrationV56AddsRouteSnapshotsAndFreezesOneDefaultIngestLibrary(t *test
 		{ID: "v56-same", OwnerID: ownerID, JobID: legacyJobs[0].ID, DownloaderID: &downloader.ID, DownloaderName: downloader.Name, ProviderType: models.DownloaderTypePan115Offline, SourceCiphertext: "encrypted", StagingStorageID: &storage.ID, TargetLibraryID: &libraryA.ID, TargetStorageID: &storage.ID, TargetStorageType: models.StorageTypePan115, TargetConnectionID: &connection.ID, DisplayName: "same", Phase: models.DownloadTaskStatusQueued, CreatedAt: now, UpdatedAt: now},
 		{ID: "v56-cross", OwnerID: ownerID, JobID: legacyJobs[1].ID, DownloaderID: &downloader.ID, DownloaderName: downloader.Name, ProviderType: models.DownloaderTypePan115Offline, SourceCiphertext: "encrypted", StagingStorageID: &storage.ID, TargetLibraryID: &libraryBConnection.ID, TargetStorageID: &storageB.ID, TargetStorageType: models.StorageTypePan115, TargetConnectionID: &connectionB.ID, DisplayName: "cross", Phase: models.DownloadTaskStatusQueued, CreatedAt: now, UpdatedAt: now},
 	}
-	if err := db.Omit("SourceDataSourceJSON", "TargetDataSourceJSON", "TransferRouteKind", "TransferRouteVersion", "ExecutionLocation", "NodeID", "NodeName", "ProtocolVersion", "RoutePlanRevision", "RoutePlanDigest", "PluginResourceClaimID").Create(&legacyTasks).Error; err != nil {
+	if err := db.Omit("SourceDataSourceJSON", "TargetDataSourceJSON", "TransferRouteKind", "TransferRouteVersion", "ExecutionLocation", "NodeID", "NodeName", "ProtocolVersion", "RoutePlanRevision", "RoutePlanDigest", "PluginResourceClaimID", "BTSelectionGroupID", "ContentSelectionRequired").Create(&legacyTasks).Error; err != nil {
 		t.Fatal(err)
 	}
 

@@ -20,7 +20,7 @@ func TestNodeStoreMigrationsCreateFreshSchemaAndReopenIdempotently(t *testing.T)
 		t.Fatal(err)
 	}
 
-	wantVersions := []int{1, 2, 3, 4, 5, 6, 7, 8}
+	wantVersions := []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
 	versions, appliedAt := nodeMigrationLedger(t, store.db)
 	if !reflect.DeepEqual(versions, wantVersions) {
 		t.Fatalf("fresh migration versions=%v want=%v", versions, wantVersions)
@@ -33,6 +33,7 @@ func TestNodeStoreMigrationsCreateFreshSchemaAndReopenIdempotently(t *testing.T)
 		"credential_grants",
 		"provider_receipts",
 		"managed_downloads",
+		"managed_download_selections", "managed_download_groups", "managed_download_group_refs",
 		"file_exports",
 		"file_export_files",
 		"file_export_chunks",
@@ -77,7 +78,7 @@ func TestNodeStoreMigrationUpgradesV3ToV4WithoutChangingV3Data(t *testing.T) {
 	if err := store.SaveManagedDownload(context.Background(), want, now); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.db.Exec(`DROP TABLE cloud_operation_receipts; DROP TABLE http_request_nonces; DROP TABLE storage_source_chunks; DROP TABLE storage_source_files; DROP TABLE storage_source_runs; DROP TABLE storage_upload_files; DELETE FROM node_schema_migrations WHERE version IN (4,5,6,7,8)`); err != nil {
+	if _, err := store.db.Exec(`DROP TABLE managed_download_group_refs; DROP TABLE managed_download_groups; DROP TABLE managed_download_selections; DROP TABLE cloud_operation_receipts; DROP TABLE http_request_nonces; DROP TABLE storage_source_chunks; DROP TABLE storage_source_files; DROP TABLE storage_source_runs; DROP TABLE storage_upload_files; DELETE FROM node_schema_migrations WHERE version IN (4,5,6,7,8,9,10)`); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.Close(); err != nil {
@@ -90,7 +91,7 @@ func TestNodeStoreMigrationUpgradesV3ToV4WithoutChangingV3Data(t *testing.T) {
 	}
 	defer func() { _ = upgraded.Close() }()
 	versions, _ := nodeMigrationLedger(t, upgraded.db)
-	if !reflect.DeepEqual(versions, []int{1, 2, 3, 4, 5, 6, 7, 8}) {
+	if !reflect.DeepEqual(versions, []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}) {
 		t.Fatalf("upgrade versions=%v", versions)
 	}
 	for _, table := range []string{"file_exports", "file_export_files", "file_export_chunks", "storage_upload_files"} {
@@ -108,7 +109,7 @@ func TestNodeStoreFailedMigrationRollsBackSchemaAndDoesNotRecordVersion(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.db.Exec(`DROP TABLE cloud_operation_receipts; DROP TABLE http_request_nonces; DROP TABLE storage_source_chunks; DROP TABLE storage_source_files; DROP TABLE storage_source_runs; DROP TABLE storage_upload_files; DELETE FROM node_schema_migrations WHERE version IN (4,5,6,7,8); CREATE TABLE storage_upload_files (broken TEXT)`); err != nil {
+	if _, err := store.db.Exec(`DROP TABLE managed_download_group_refs; DROP TABLE managed_download_groups; DROP TABLE managed_download_selections; DROP TABLE cloud_operation_receipts; DROP TABLE http_request_nonces; DROP TABLE storage_source_chunks; DROP TABLE storage_source_files; DROP TABLE storage_source_runs; DROP TABLE storage_upload_files; DELETE FROM node_schema_migrations WHERE version IN (4,5,6,7,8,9,10); CREATE TABLE storage_upload_files (broken TEXT)`); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.Close(); err != nil {
@@ -150,7 +151,7 @@ func TestNodeStoreFailedV6MigrationRollsBackFirstColumn(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.db.Exec(`DROP TABLE cloud_operation_receipts; DROP TABLE http_request_nonces; ALTER TABLE storage_source_runs DROP COLUMN cleanup_status; ALTER TABLE storage_source_runs DROP COLUMN cleaned_at; ALTER TABLE storage_source_runs ADD COLUMN cleaned_at DATETIME; DELETE FROM node_schema_migrations WHERE version IN (6,7,8)`); err != nil {
+	if _, err := store.db.Exec(`DROP TABLE managed_download_group_refs; DROP TABLE managed_download_groups; DROP TABLE managed_download_selections; DROP TABLE cloud_operation_receipts; DROP TABLE http_request_nonces; ALTER TABLE storage_source_runs DROP COLUMN cleanup_status; ALTER TABLE storage_source_runs DROP COLUMN cleaned_at; ALTER TABLE storage_source_runs ADD COLUMN cleaned_at DATETIME; DELETE FROM node_schema_migrations WHERE version IN (6,7,8,9,10)`); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.Close(); err != nil {

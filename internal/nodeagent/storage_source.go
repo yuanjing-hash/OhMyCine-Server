@@ -261,6 +261,13 @@ func (a *Agent) startStorageSource(serverID string, input nodeprotocol.StorageSo
 }
 
 func (a *Agent) runStorageSource(ctx context.Context, serverID string, input nodeprotocol.StorageSourceActionRequest, plan nodeprotocol.StorageSourcePlan, grant nodeprotocol.CredentialGrant, credential nodeprotocol.StorageSourceCredential) {
+	ctx, cancel := a.ownedOperationContext(ctx, serverID, input.OperationKey, input.PlanDigest, grant.ExpiresAt)
+	defer cancel()
+	release, admissionErr := a.acquireOperation(ctx)
+	if admissionErr != nil {
+		return
+	}
+	defer release()
 	if plan.ProviderType == nodeprotocol.StorageProviderQuark {
 		a.runQuarkStorageSource(ctx, serverID, input, plan, grant, credential)
 		return

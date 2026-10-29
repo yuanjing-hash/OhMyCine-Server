@@ -3,6 +3,7 @@ package netresolve
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -383,6 +384,55 @@ func TestDoHTransportPinsTLSBootstrapAndRejectsRedirects(t *testing.T) {
 	}
 	if requests.Load() != 0 {
 		t.Fatal("bad TLS reached resolver application")
+	}
+}
+
+func TestDoHTransportDoesNotDependOnGlobalTransport(t *testing.T) {
+	original := http.DefaultTransport
+	t.Cleanup(func() { http.DefaultTransport = original })
+	var globalRequests atomic.Int32
+	for _, global := range []struct {
+		name      string
+		transport http.RoundTripper
+	}{
+		{name: "custom", transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			globalRequests.Add(1)
+			return nil, errors.New("global transport must not receive DoH requests")
+		})},
+		{name: "nil"},
+		{name: "modified-default", transport: &http.Transport{
+			Proxy:           http.ProxyFromEnvironment,
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			DialTLSContext: func(context.Context, string, string) (net.Conn, error) {
+				globalRequests.Add(1)
+				return nil, errors.New("global TLS dialer must not bypass bootstrap")
+			},
+		}},
+	} {
+		t.Run(global.name, func(t *testing.T) {
+			http.DefaultTransport = global.transport
+			// Use the public construction path that is also called eagerly by
+			// resource inspection. No DNS query or network I/O is needed.
+			resolver := New(Config{System: fakeSystemDNS})
+			client := resolver.client
+			transport, ok := client.Transport.(*http.Transport)
+			if !ok || transport == global.transport || transport.Proxy != nil || transport.DialTLSContext != nil || transport.DialTLS != nil || transport.TLSClientConfig == nil || transport.TLSClientConfig.InsecureSkipVerify || transport.TLSClientConfig.ServerName != "dns.alidns.com" || transport.TLSClientConfig.MinVersion < tls.VersionTLS12 {
+				t.Fatal("global transport changed the independent DoH TLS/bootstrap policy")
+			}
+			defer transport.CloseIdleConnections()
+			if client.Timeout != fakeIPDNSTimeout || !transport.DisableCompression || transport.TLSHandshakeTimeout != time.Second || transport.ResponseHeaderTimeout != 2*time.Second || transport.MaxResponseHeaderBytes != 8*1024 {
+				t.Fatal("DoH response or timeout bounds changed")
+			}
+			if _, err := transport.DialContext(context.Background(), "tcp", "127.0.0.1:443"); err == nil {
+				t.Fatal("arbitrary bootstrap accepted")
+			}
+			if err := client.CheckRedirect(&http.Request{}, nil); err == nil {
+				t.Fatal("DoH redirect accepted")
+			}
+		})
+	}
+	if globalRequests.Load() != 0 {
+		t.Fatal("DoH construction invoked the global transport")
 	}
 }
 

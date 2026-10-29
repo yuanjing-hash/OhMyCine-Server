@@ -335,16 +335,19 @@ func (a *Adapter) Search(ctx context.Context, c site.Config, q site.Query) (site
 			return
 		}
 		sum := sha256.Sum256([]byte(kind + ":" + identity))
-		item := site.Result{TorrentID: normalized, Title: title, ResultType: kind, Origins: []site.ResultOrigin{origin}, Fingerprint: hex.EncodeToString(sum[:])}
+		item := site.Result{PayloadKind: site.PayloadUnknown, TorrentID: normalized, Title: title, ResultType: kind, Origins: []site.ResultOrigin{origin}, Fingerprint: hex.EncodeToString(sum[:])}
 		switch kind {
 		case "115", "quark":
+			item.PayloadKind = site.PayloadShare
 			item.SourceKind = kind + "_share"
 			item.CloudProvider = kind
 		case "magnet":
+			item.PayloadKind = site.PayloadMagnet
 			item.SourceKind = "bt"
 		default:
 			item.SourceKind = "external_link"
 			if kind != "ed2k" && kind != "others" {
+				item.PayloadKind = site.PayloadShare
 				item.CloudProvider = kind
 			}
 		}

@@ -45,7 +45,7 @@ func TestHTMLProfilesSearchAndResolveOnlySameHostDetails(t *testing.T) {
 			adapter := NewForTest(test.name, profile, server.Client(), server.URL)
 			adapter.profile.AllowedHosts = profile.AllowedHosts
 			page, err := adapter.Search(context.Background(), site.Config{BaseURL: server.URL}, site.Query{Keyword: "Example", Page: 1})
-			if err != nil || len(page.Items) != 1 || !page.HasNext || page.Items[0].Seeders == nil || *page.Items[0].Seeders != 31 {
+			if err != nil || len(page.Items) != 1 || page.Items[0].PayloadKind != site.PayloadMagnet || !page.HasNext || page.Items[0].Seeders == nil || *page.Items[0].Seeders != 31 {
 				t.Fatalf("page=%+v err=%v", page, err)
 			}
 			source, err := adapter.ResolveSource(context.Background(), site.Config{BaseURL: server.URL}, page.Items[0].TorrentID)

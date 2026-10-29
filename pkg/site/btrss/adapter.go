@@ -123,7 +123,8 @@ func (a *Adapter) Search(ctx context.Context, config site.Config, query site.Que
 			result.Skipped++
 			continue
 		}
-		result.Items = append(result.Items, site.Result{TorrentID: identity, Title: item.Title, Subtitle: item.Subtitle, SizeBytes: item.SizeBytes, Published: item.Published, Seeders: item.Seeders, Leechers: item.Leechers, Completed: item.Completed})
+		kind, _, _ := DecodeIdentity(identity)
+		result.Items = append(result.Items, site.Result{PayloadKind: site.NormalizePayloadKind(site.PayloadKind(kind)), TorrentID: identity, Title: item.Title, Subtitle: item.Subtitle, SizeBytes: item.SizeBytes, Published: item.Published, Seeders: item.Seeders, Leechers: item.Leechers, Completed: item.Completed})
 	}
 	return result, nil
 }

@@ -1,0 +1,1306 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "OhMyCine Resource Content, Follow Defaults and Version Upgrade API",
+    "version": "resource-content-v1",
+    "description": "Scoped additive API contract. Existing API authentication, current resource permissions and standard envelopes apply. No endpoint accepts native provider IDs or raw torrent indexes as browser authority. Publication/deployment and real provider acceptance are separate."
+  },
+  "paths": {
+    "/api/v1/discovery/content-preview": {
+      "post": {
+        "operationId": "sessionContentPreview",
+        "summary": "Read actual resource files without submitting a download. Discovery permission; cloud reads also require authorized download/account association.",
+        "security": [
+          {
+            "sessionCookie": []
+          },
+          {
+            "secureSessionCookie": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success; standard code/message/data envelope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ContentPreviewResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Safe permission, stale-claim, validation, capability, conflict or upstream-unavailable error. No private provider values.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ContentPreviewInput"
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CSRFToken"
+          }
+        ]
+      }
+    },
+    "/api/v1/discovery/content-selection": {
+      "post": {
+        "operationId": "sessionContentSelection",
+        "summary": "Freeze bounded actual file choices into an opaque token. Discovery and download-create permissions required.",
+        "security": [
+          {
+            "sessionCookie": []
+          },
+          {
+            "secureSessionCookie": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success; standard code/message/data envelope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ContentSelectionResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Safe permission, stale-claim, validation, capability, conflict or upstream-unavailable error. No private provider values.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ContentSelectionInput"
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CSRFToken"
+          }
+        ]
+      }
+    },
+    "/api/v1/player/discovery/content-preview": {
+      "post": {
+        "operationId": "playerContentPreview",
+        "summary": "Read actual resource files without submitting a download. Discovery permission; cloud reads also require authorized download/account association.",
+        "security": [
+          {
+            "playerDevice": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success; standard code/message/data envelope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ContentPreviewResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Safe permission, stale-claim, validation, capability, conflict or upstream-unavailable error. No private provider values.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ContentPreviewInput"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/player/discovery/content-selection": {
+      "post": {
+        "operationId": "playerContentSelection",
+        "summary": "Freeze bounded actual file choices into an opaque token. Discovery and download-create permissions required.",
+        "security": [
+          {
+            "playerDevice": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success; standard code/message/data envelope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ContentSelectionResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Safe permission, stale-claim, validation, capability, conflict or upstream-unavailable error. No private provider values.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ContentSelectionInput"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/media-libraries/{id}/catalog/{work}/entries/{entry}/upgrade-preview": {
+      "post": {
+        "operationId": "prepareMediaVersionUpgrade",
+        "summary": "Prepare replacement of one exact catalog version. Does not recycle the old file.",
+        "security": [
+          {
+            "sessionCookie": []
+          },
+          {
+            "secureSessionCookie": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success; standard code/message/data envelope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MediaUpgradeResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Safe permission, stale-claim, validation, capability, conflict or upstream-unavailable error. No private provider values.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
+          },
+          {
+            "name": "work",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "entry",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
+          },
+          {
+            "$ref": "#/components/parameters/CSRFToken"
+          }
+        ]
+      }
+    },
+    "/api/v1/media-upgrades/{upgrade}": {
+      "get": {
+        "operationId": "getMediaVersionUpgrade",
+        "summary": "Read authorized replacement and delayed-recycle status.",
+        "security": [
+          {
+            "sessionCookie": []
+          },
+          {
+            "secureSessionCookie": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success; standard code/message/data envelope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MediaUpgradeResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Safe permission, stale-claim, validation, capability, conflict or upstream-unavailable error. No private provider values.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "upgrade",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
+      }
+    },
+    "/api/v1/media-upgrades/{upgrade}/submit": {
+      "post": {
+        "operationId": "submitMediaVersionUpgrade",
+        "summary": "Acquire a replacement; recycle captured old video/exclusive subtitles only after exact new import and required artifacts are ready.",
+        "security": [
+          {
+            "sessionCookie": []
+          },
+          {
+            "secureSessionCookie": []
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Success; standard code/message/data envelope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MediaUpgradeResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Safe permission, stale-claim, validation, capability, conflict or upstream-unavailable error. No private provider values.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpgradeSubmitInput"
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "upgrade",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/CSRFToken"
+          }
+        ]
+      }
+    },
+    "/api/v1/settings/follows": {
+      "get": {
+        "operationId": "getFollowPolicyDefaults",
+        "summary": "Read defaults for new subscriptions; settings.read required. New initial default prefers zh-Hans then zh-Hant, allowing missing subtitles with a warning.",
+        "security": [
+          {
+            "sessionCookie": []
+          },
+          {
+            "secureSessionCookie": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success; standard code/message/data envelope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FollowPolicyDefaultsResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Safe validation, permission, stale revision, capability or upstream error. No credentials or native identifiers.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      },
+      "patch": {
+        "operationId": "updateFollowPolicyDefaults",
+        "summary": "Save default subtitle policy using revision CAS; settings.update and CSRF required. Existing subscription snapshots are unchanged.",
+        "security": [
+          {
+            "sessionCookie": []
+          },
+          {
+            "secureSessionCookie": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success; standard code/message/data envelope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FollowPolicyDefaultsResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Safe validation, permission, stale revision, capability or upstream error. No credentials or native identifiers.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateFollowPolicyDefaultsInput"
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CSRFToken"
+          }
+        ]
+      }
+    },
+    "/api/v1/discovery/downloads": {
+      "post": {
+        "operationId": "sessionCreateContentDownload",
+        "summary": "Accept a frozen actual-file selection or explicit manual whole-resource intent. Current discovery/download, resource, receiver and target permissions are revalidated. Body limit 128 KiB.",
+        "security": [
+          {
+            "sessionCookie": []
+          },
+          {
+            "secureSessionCookie": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success; standard code/message/data envelope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DownloadResultResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Safe validation, permission, stale revision, capability or upstream error. No credentials or native identifiers.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DiscoveryAcquisitionInput"
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CSRFToken"
+          }
+        ]
+      }
+    },
+    "/api/v1/player/discovery/downloads": {
+      "post": {
+        "operationId": "playerCreateContentDownload",
+        "summary": "Accept a frozen actual-file selection or explicit manual whole-resource intent. Current discovery/download, resource, receiver and target permissions are revalidated. Body limit 128 KiB.",
+        "security": [
+          {
+            "playerDevice": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success; standard code/message/data envelope.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DownloadResultResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Safe validation, permission, stale revision, capability or upstream error. No credentials or native identifiers.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DiscoveryAcquisitionInput"
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "sessionCookie": {
+        "type": "apiKey",
+        "in": "cookie",
+        "name": "omc_session"
+      },
+      "secureSessionCookie": {
+        "type": "apiKey",
+        "in": "cookie",
+        "name": "__Host-omc_session"
+      },
+      "playerDevice": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "Existing authorized Player device token, scoped to the configured Server origin."
+      }
+    },
+    "schemas": {
+      "ContentPreviewInput": {
+        "type": "object",
+        "properties": {
+          "result_token": {
+            "type": "string",
+            "description": "Short-lived opaque actor/resource/configuration-bound token; keep only in memory."
+          },
+          "downloader_id": {
+            "type": "string",
+            "description": "Optional legacy authorized association; does not grant account access."
+          },
+          "preview_token": {
+            "type": "string",
+            "description": "Short-lived opaque actor/resource/configuration-bound token; keep only in memory."
+          },
+          "offset": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 200
+          }
+        },
+        "required": [
+          "result_token"
+        ],
+        "additionalProperties": false
+      },
+      "ContentSelectionInput": {
+        "type": "object",
+        "properties": {
+          "result_token": {
+            "type": "string",
+            "description": "Short-lived opaque actor/resource/configuration-bound token; keep only in memory."
+          },
+          "preview_token": {
+            "type": "string",
+            "description": "Short-lived opaque actor/resource/configuration-bound token; keep only in memory."
+          },
+          "selected_entry_tokens": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "description": "Short-lived opaque actor/resource/configuration-bound token; keep only in memory."
+            },
+            "minItems": 1,
+            "maxItems": 500
+          },
+          "selection_token": {
+            "type": "string",
+            "description": "Short-lived opaque actor/resource/configuration-bound token; keep only in memory."
+          }
+        },
+        "required": [
+          "result_token",
+          "preview_token",
+          "selected_entry_tokens"
+        ],
+        "additionalProperties": false
+      },
+      "SubtitleEvidence": {
+        "type": "object",
+        "properties": {
+          "language": {
+            "type": "string"
+          },
+          "script": {
+            "type": "string"
+          },
+          "source": {
+            "type": "string",
+            "description": "Evidence level such as release_claim or sidecar_filename; no implied verified embedded stream."
+          }
+        },
+        "required": [
+          "language",
+          "source"
+        ]
+      },
+      "ContentFile": {
+        "type": "object",
+        "properties": {
+          "token": {
+            "type": "string",
+            "description": "Short-lived opaque actor/resource/configuration-bound token; keep only in memory."
+          },
+          "path": {
+            "type": "string",
+            "description": "Safe resource-relative path, never a local absolute path."
+          },
+          "name": {
+            "type": "string"
+          },
+          "size": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "is_dir": {
+            "type": "boolean"
+          },
+          "file_kind": {
+            "type": "string",
+            "enum": [
+              "directory",
+              "video",
+              "subtitle",
+              "archive",
+              "other"
+            ]
+          },
+          "season": {
+            "type": "integer"
+          },
+          "episodes": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "minimum": 1
+            }
+          },
+          "work_status": {
+            "type": "string"
+          },
+          "unresolved_reason": {
+            "type": "string"
+          },
+          "subtitles": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SubtitleEvidence"
+            }
+          }
+        },
+        "required": [
+          "path",
+          "name",
+          "size",
+          "is_dir",
+          "file_kind",
+          "episodes",
+          "work_status"
+        ]
+      },
+      "ContentPreview": {
+        "type": "object",
+        "properties": {
+          "version": {
+            "type": "integer",
+            "enum": [
+              1
+            ]
+          },
+          "token": {
+            "type": "string",
+            "description": "Short-lived opaque actor/resource/configuration-bound token; keep only in memory."
+          },
+          "status": {
+            "type": "string"
+          },
+          "complete": {
+            "type": "boolean"
+          },
+          "files": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ContentFile"
+            }
+          },
+          "analysis": {
+            "type": "object",
+            "properties": {},
+            "description": "Existing SiteShareAnalysis with exact sparse groups; file enumeration and metadata recognition are independent."
+          },
+          "total_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "displayed_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "next_offset": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "total_size": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "checked_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "error_code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "version",
+          "status",
+          "complete",
+          "files",
+          "total_count",
+          "displayed_count",
+          "total_size",
+          "checked_at",
+          "expires_at",
+          "message"
+        ]
+      },
+      "ContentSelection": {
+        "type": "object",
+        "properties": {
+          "selection_token": {
+            "type": "string",
+            "description": "Short-lived opaque actor/resource/configuration-bound token; keep only in memory."
+          },
+          "preview_token": {
+            "type": "string",
+            "description": "Short-lived opaque actor/resource/configuration-bound token; keep only in memory."
+          },
+          "selected_entry_tokens": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "description": "Short-lived opaque actor/resource/configuration-bound token; keep only in memory."
+            },
+            "maxItems": 500
+          },
+          "file_count": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 500
+          },
+          "video_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "total_size": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "selected_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "selection_token",
+          "preview_token",
+          "selected_entry_tokens",
+          "file_count",
+          "video_count",
+          "total_size",
+          "selected_bytes"
+        ]
+      },
+      "UpgradeSearch": {
+        "type": "object",
+        "properties": {
+          "tmdb_id": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1
+          },
+          "media_type": {
+            "type": "string",
+            "enum": [
+              "movie",
+              "tv"
+            ]
+          },
+          "title": {
+            "type": "string"
+          },
+          "season": {
+            "type": "integer"
+          },
+          "episode": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "tmdb_id",
+          "media_type",
+          "title"
+        ]
+      },
+      "MediaUpgrade": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "state": {
+            "type": "string"
+          },
+          "stage": {
+            "type": "string"
+          },
+          "library_id": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "entry_id": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "work_token": {
+            "type": "string",
+            "description": "Short-lived opaque actor/resource/configuration-bound token; keep only in memory."
+          },
+          "title": {
+            "type": "string"
+          },
+          "media_type": {
+            "type": "string",
+            "enum": [
+              "movie",
+              "tv"
+            ]
+          },
+          "tmdb_id": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1
+          },
+          "season": {
+            "type": "integer"
+          },
+          "episode": {
+            "type": "integer"
+          },
+          "revision": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "search": {
+            "$ref": "#/components/schemas/UpgradeSearch"
+          },
+          "recycle_supported": {
+            "type": "boolean"
+          },
+          "error_code": {
+            "type": "string"
+          },
+          "error_message": {
+            "type": "string"
+          },
+          "download_task_id": {
+            "type": "string"
+          },
+          "transfer_task_id": {
+            "type": "string"
+          },
+          "next_attempt_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "required": [
+          "id",
+          "state",
+          "stage",
+          "library_id",
+          "entry_id",
+          "work_token",
+          "title",
+          "media_type",
+          "tmdb_id",
+          "revision",
+          "expires_at",
+          "search",
+          "recycle_supported"
+        ]
+      },
+      "UpgradeSubmitInput": {
+        "type": "object",
+        "properties": {
+          "revision": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "result_token": {
+            "type": "string",
+            "description": "Short-lived opaque actor/resource/configuration-bound token; keep only in memory."
+          },
+          "downloader_id": {
+            "type": "string"
+          },
+          "content_selection_token": {
+            "type": "string",
+            "description": "Short-lived opaque actor/resource/configuration-bound token; keep only in memory."
+          },
+          "preview_token": {
+            "type": "string",
+            "description": "Short-lived opaque actor/resource/configuration-bound token; keep only in memory."
+          },
+          "selected_entry_tokens": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "description": "Short-lived opaque actor/resource/configuration-bound token; keep only in memory."
+            },
+            "maxItems": 500
+          },
+          "priority": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "revision",
+          "result_token",
+          "downloader_id"
+        ],
+        "additionalProperties": false
+      },
+      "ErrorEnvelope": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "integer"
+          },
+          "message": {
+            "type": "string"
+          },
+          "data": {
+            "nullable": true
+          }
+        },
+        "required": [
+          "code",
+          "message",
+          "data"
+        ]
+      },
+      "ContentPreviewResponse": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "integer",
+            "enum": [
+              0
+            ]
+          },
+          "message": {
+            "type": "string"
+          },
+          "data": {
+            "$ref": "#/components/schemas/ContentPreview"
+          }
+        },
+        "required": [
+          "code",
+          "message",
+          "data"
+        ]
+      },
+      "ContentSelectionResponse": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "integer",
+            "enum": [
+              0
+            ]
+          },
+          "message": {
+            "type": "string"
+          },
+          "data": {
+            "$ref": "#/components/schemas/ContentSelection"
+          }
+        },
+        "required": [
+          "code",
+          "message",
+          "data"
+        ]
+      },
+      "MediaUpgradeResponse": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "integer",
+            "enum": [
+              0
+            ]
+          },
+          "message": {
+            "type": "string"
+          },
+          "data": {
+            "$ref": "#/components/schemas/MediaUpgrade"
+          }
+        },
+        "required": [
+          "code",
+          "message",
+          "data"
+        ]
+      },
+      "SubtitlePolicy": {
+        "type": "object",
+        "properties": {
+          "mode": {
+            "type": "string",
+            "enum": [
+              "ignore",
+              "prefer",
+              "require"
+            ]
+          },
+          "languages": {
+            "type": "array",
+            "maxItems": 8,
+            "items": {
+              "type": "string",
+              "enum": [
+                "zh-Hans",
+                "zh-Hant",
+                "en",
+                "ja",
+                "ko",
+                "zh-CN",
+                "zh-SG",
+                "zh-TW",
+                "zh-HK"
+              ]
+            },
+            "description": "Ordered preference; aliases normalize to Hans/Hant and duplicates collapse. Prefer/require need at least one language."
+          }
+        },
+        "required": [
+          "mode",
+          "languages"
+        ],
+        "additionalProperties": false
+      },
+      "FollowPolicyDefaults": {
+        "type": "object",
+        "properties": {
+          "revision": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1
+          },
+          "subtitles": {
+            "$ref": "#/components/schemas/SubtitlePolicy"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "required": [
+          "revision",
+          "subtitles",
+          "updated_at"
+        ],
+        "additionalProperties": false
+      },
+      "UpdateFollowPolicyDefaultsInput": {
+        "type": "object",
+        "properties": {
+          "revision": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1,
+            "maximum": 9223372036854775806,
+            "description": "Compare-and-swap against the current saved revision; stale revision returns conflict."
+          },
+          "subtitles": {
+            "$ref": "#/components/schemas/SubtitlePolicy"
+          }
+        },
+        "required": [
+          "revision",
+          "subtitles"
+        ],
+        "additionalProperties": false
+      },
+      "FollowSubtitleFilterExtension": {
+        "type": "object",
+        "description": "Additive extension of the existing subscription snapshot filters. Omission preserves legacy ignore; changing global defaults never rewrites existing snapshots.",
+        "properties": {
+          "subtitles": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/SubtitlePolicy"
+              }
+            ],
+            "nullable": true
+          }
+        }
+      },
+      "DiscoveryAcquisitionInput": {
+        "type": "object",
+        "properties": {
+          "content_mode": {
+            "type": "string",
+            "enum": [
+              "files",
+              "all"
+            ],
+            "description": "New clients explicitly choose files or whole BT/PT resource. Omitted mode retains legacy contract. All forbids selection fields, Follow/washing intent and cloud-share sources; it is not backend verified_all authority."
+          },
+          "content_selection_token": {
+            "type": "string",
+            "description": "Short-lived opaque actor/resource/configuration-bound token; keep only in memory."
+          },
+          "preview_token": {
+            "type": "string",
+            "description": "Short-lived opaque actor/resource/configuration-bound token; keep only in memory."
+          },
+          "selected_entry_tokens": {
+            "type": "array",
+            "maxItems": 500,
+            "items": {
+              "type": "string",
+              "description": "Short-lived opaque actor/resource/configuration-bound token; keep only in memory."
+            }
+          },
+          "result_token": {
+            "type": "string",
+            "description": "Short-lived opaque actor/resource/configuration-bound token; keep only in memory."
+          },
+          "downloader_id": {
+            "type": "string"
+          },
+          "media_library_id": {
+            "type": "integer",
+            "minimum": 1,
+            "nullable": true
+          },
+          "profile_id": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "priority": {
+            "type": "integer"
+          },
+          "expected_tmdb_id": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1,
+            "nullable": true
+          },
+          "expected_media_type": {
+            "type": "string",
+            "enum": [
+              "movie",
+              "tv"
+            ],
+            "description": "Must be paired with expected_tmdb_id; revalidated by Server."
+          }
+        },
+        "required": [
+          "result_token",
+          "downloader_id"
+        ],
+        "additionalProperties": false
+      },
+      "DownloadResult": {
+        "type": "object",
+        "description": "Existing DownloadTaskSummary contract, including optional SelectionTasks for accepted selected outputs; task acceptance is not import completion.",
+        "additionalProperties": true
+      },
+      "FollowPolicyDefaultsResponse": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "integer"
+          },
+          "message": {
+            "type": "string"
+          },
+          "data": {
+            "$ref": "#/components/schemas/FollowPolicyDefaults"
+          }
+        },
+        "required": [
+          "code",
+          "message",
+          "data"
+        ],
+        "additionalProperties": false
+      },
+      "DownloadResultResponse": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "integer"
+          },
+          "message": {
+            "type": "string"
+          },
+          "data": {
+            "$ref": "#/components/schemas/DownloadResult"
+          }
+        },
+        "required": [
+          "code",
+          "message",
+          "data"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "parameters": {
+      "CSRFToken": {
+        "name": "X-CSRF-Token",
+        "in": "header",
+        "required": true,
+        "description": "Current session CSRF value; session-authenticated mutations only.",
+        "schema": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}

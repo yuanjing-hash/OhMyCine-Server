@@ -32,10 +32,12 @@ type stubSiteAdapter struct {
 	searchErr          map[string]error
 	searchErrByKeyword map[string]error
 	downloadErr        error
+	downloadTorrent    []byte
 	downloads          int
 	downloadStarted    chan struct{}
 	downloadRelease    chan struct{}
 	searchTitle        string
+	searchPayloadKind  sitepkg.PayloadKind
 	searchSubtitle     string
 	searchBases        []string
 	lastConfig         sitepkg.Config
@@ -220,7 +222,7 @@ func (a *stubSiteAdapter) Search(_ context.Context, config sitepkg.Config, query
 	if title == "" {
 		title = "Seven.Samurai.1954.1080p"
 	}
-	return sitepkg.Page{Page: query.Page, Items: []sitepkg.Result{{TorrentID: "42", Title: title, Subtitle: a.searchSubtitle, SizeBytes: 1024, Seeders: &seeders, Leechers: &leechers}}, HasNext: true}, nil
+	return sitepkg.Page{Page: query.Page, Items: []sitepkg.Result{{PayloadKind: a.searchPayloadKind, TorrentID: "42", Title: title, Subtitle: a.searchSubtitle, SizeBytes: 1024, Seeders: &seeders, Leechers: &leechers}}, HasNext: true}, nil
 }
 
 func TestSiteSearchSelectedScopeIsBoundedAndRevalidated(t *testing.T) {
@@ -387,6 +389,9 @@ func (a *stubSiteAdapter) Download(_ context.Context, _ sitepkg.Config, torrentI
 	a.mu.Lock()
 	a.downloads++
 	a.mu.Unlock()
+	if a.downloadTorrent != nil {
+		return append([]byte(nil), a.downloadTorrent...), "fixture.torrent", nil
+	}
 	return []byte("d4:infod4:name4:testee"), "seven-samurai.torrent", nil
 }
 

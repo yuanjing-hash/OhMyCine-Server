@@ -30,6 +30,7 @@ import (
 	downloadpkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/downloader"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/metadata/tmdb"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/nodeprotocol"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/resourcecontent"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
@@ -175,14 +176,18 @@ func (s *DownloadService) ProviderEventsChanged(_ context.Context, connectionID 
 }
 
 type DownloadSourceInput struct {
-	ShareSelection *cloud.ShareSelection
-	Kind           string
-	URL            string
-	Torrent        []byte
-	Filename       string
+	AllFilesVerified bool                       `json:"-"`
+	ContentSelection *resourcecontent.Selection `json:"-"`
+	ShareSelection   *cloud.ShareSelection
+	Kind             string
+	URL              string
+	Torrent          []byte
+	Filename         string
 }
 
 type SubmitDownloadInput struct {
+	// Internal replacement acquisition: never recycle a conflicting old version.
+	PreserveExistingVersions bool
 	// SourceSiteID is set only by SiteService after validating its actor-bound claim.
 	// Public download handlers never deserialize provenance from the client.
 	SourceSiteID          uint
@@ -292,17 +297,20 @@ type DownloadRecognitionIdentity struct {
 }
 
 type downloadSourceEnvelope struct {
-	ShareSelection     *cloud.ShareSelection `json:"share_selection,omitempty"`
-	Kind               string                `json:"kind"`
-	URL                string                `json:"url,omitempty"`
-	Torrent            []byte                `json:"torrent,omitempty"`
-	Filename           string                `json:"filename,omitempty"`
-	ProviderItemID     string                `json:"provider_item_id,omitempty"`
-	PluginConnectionID string                `json:"plugin_connection_id,omitempty"`
-	PluginItemID       string                `json:"plugin_item_id,omitempty"`
-	PluginSegmentID    string                `json:"plugin_segment_id,omitempty"`
-	PluginVersionID    string                `json:"plugin_version_id,omitempty"`
-	PluginVariantID    string                `json:"plugin_variant_id,omitempty"`
+	ContentSelection       *resourcecontent.Selection `json:"content_selection,omitempty"`
+	ContentSelectionDigest string                     `json:"content_selection_digest,omitempty"`
+	SelectionMode          string                     `json:"selection_mode,omitempty"`
+	ShareSelection         *cloud.ShareSelection      `json:"share_selection,omitempty"`
+	Kind                   string                     `json:"kind"`
+	URL                    string                     `json:"url,omitempty"`
+	Torrent                []byte                     `json:"torrent,omitempty"`
+	Filename               string                     `json:"filename,omitempty"`
+	ProviderItemID         string                     `json:"provider_item_id,omitempty"`
+	PluginConnectionID     string                     `json:"plugin_connection_id,omitempty"`
+	PluginItemID           string                     `json:"plugin_item_id,omitempty"`
+	PluginSegmentID        string                     `json:"plugin_segment_id,omitempty"`
+	PluginVersionID        string                     `json:"plugin_version_id,omitempty"`
+	PluginVariantID        string                     `json:"plugin_variant_id,omitempty"`
 }
 
 type downloadJobPayload struct {
@@ -451,7 +459,8 @@ func (s *DownloadService) submit(ctx context.Context, ownerID uint, input Submit
 	if source.Kind == downloadpkg.SourceProviderItem && sourceOrigin != models.DownloadSourceOriginProviderIngest {
 		return DownloadTaskSummary{}, appError(CodeDownloadSourceInvalid, "内部摄取来源不能由用户提交", nil)
 	}
-	if source.Kind == downloadpkg.SourceTorrent && downloaderRecord.Type == models.DownloaderTypePan115Offline {
+	capabilities, capabilitiesKnown := s.downloader.registry.Capabilities(downloaderRecord.Type)
+	if source.Kind == downloadpkg.SourceTorrent && source.ContentSelection == nil && (!capabilitiesKnown || capabilities.NativeOffline) {
 		return DownloadTaskSummary{}, appError(CodeDownloadSourceInvalid, "种子文件只能提交到非网盘 BT 下载器", nil)
 	}
 	if input.SourceSiteID != 0 {
@@ -472,7 +481,17 @@ func (s *DownloadService) submit(ctx context.Context, ownerID uint, input Submit
 	if normalizeExecutionLocation(downloaderRecord.ExecutionLocation) == models.NodeLocationRemote && downloaderRecord.Type == models.DownloaderTypePan115Offline && input.MediaLibraryID == nil {
 		return DownloadTaskSummary{}, appError(CodeMediaLibraryStorageUnavailable, "传输节点下载必须选择唯一的最终媒体库", nil)
 	}
-	capabilities, capabilitiesKnown := s.downloader.registry.Capabilities(downloaderRecord.Type)
+	if source.ContentSelection != nil {
+		if err := s.downloader.validateContentSelectionExecutor(downloaderRecord, downloadpkg.Source{Kind: source.Kind, URL: source.URL, Torrent: source.Torrent, ContentSelection: source.ContentSelection, AllFilesVerified: source.SelectionMode == "verified_all"}); err != nil {
+			return DownloadTaskSummary{}, err
+		}
+		// Full-coverage proof does not change a selective executor's mode. Only
+		// the separately admitted local native-offline compatibility route may
+		// use ordinary URI parameters at execution.
+		if source.SelectionMode == "verified_all" && !s.downloader.verifiedAllExecutor(downloaderRecord, downloadpkg.Source{Kind: source.Kind, URL: source.URL, Torrent: source.Torrent, ContentSelection: source.ContentSelection, AllFilesVerified: true}) {
+			source.SelectionMode = "files"
+		}
+	}
 	if source.Kind == downloadpkg.SourceQuarkShare && downloaderRecord.Type != models.DownloaderTypeQuarkShare || downloaderRecord.Type == models.DownloaderTypeQuarkShare && source.Kind != downloadpkg.SourceQuarkShare && source.Kind != downloadpkg.SourceProviderItem {
 		return DownloadTaskSummary{}, appError(CodeDownloadSourceInvalid, "夸克分享接收器只接收夸克分享，不支持离线下载", nil)
 	}
@@ -571,6 +590,15 @@ func (s *DownloadService) submit(ctx context.Context, ownerID uint, input Submit
 		sourceOrigin = models.DownloadSourceOriginPlugin
 	}
 	record := models.DownloadTask{ID: taskID, OwnerID: ownerID, DownloaderID: &downloaderRecord.ID, DownloaderName: downloaderRecord.Name, ProviderType: downloaderRecord.Type, ExecutionLocation: executionLocation, NodeID: downloaderRecord.NodeID, NodeName: downloaderRecord.NodeName, ProviderTag: "omc-" + taskID, SourceCiphertext: encryptedSource, StagingAbsolutePath: staging.AbsolutePath, IngestSourceKey: strings.TrimSpace(ingestSourceKey), SourceOrigin: sourceOrigin, PluginID: strings.TrimSpace(input.PluginID), PluginVersion: strings.TrimSpace(input.PluginVersion), PluginConnectionID: strings.TrimSpace(input.PluginConnectionID), PluginResourceClaimID: strings.TrimSpace(input.PluginResourceClaimID), FollowSubscriptionID: input.FollowSubscriptionID, FollowResourceFingerprint: input.FollowResourceFingerprint, ProfileID: profile.ID, ProfileRevision: profile.Revision, ProfileRulesJSON: canonicalRules, ProfileBuiltinRecognitionPacksJSON: organization.BuiltinRecognitionPacksJSON, ProfileRecognitionRulesJSON: organization.RecognitionRulesJSON, SeedingCleanupEnabled: seedingPolicy.CleanupEnabled, SeedingMinimumMinutes: seedingPolicy.MinimumSeedMinutes, SeedingMinimumRatio: seedingPolicy.MinimumRatio, SeedingCompletionMode: seedingPolicy.CompletionMode, DisplayName: displayName, Phase: models.DownloadTaskStatusQueued, CreatedAt: now, UpdatedAt: now}
+	record.ContentSelectionRequired = source.ContentSelection != nil
+	selectionGroup, err := s.prepareBTSelectionGroup(ownerID, downloaderRecord, source, staging.AbsolutePath, input)
+	if err != nil {
+		return DownloadTaskSummary{}, err
+	}
+	if selectionGroup != nil {
+		record.BTSelectionGroupID = selectionGroup.ID
+		record.StagingAbsolutePath = selectionGroup.Workspace
+	}
 	if executionLocation == models.NodeLocationRemote {
 		if record.NodeID == nil || strings.TrimSpace(record.NodeName) == "" {
 			return DownloadTaskSummary{}, appError(CodeDownloaderUnavailable, "下载器的传输节点绑定不完整", nil)
@@ -632,6 +660,9 @@ func (s *DownloadService) submit(ctx context.Context, ownerID uint, input Submit
 		record.TransferRouteVersion = target.RouteVersion
 		record.TransferMode = target.TransferMode
 		record.ConflictPolicy = target.ConflictPolicy
+		if input.PreserveExistingVersions {
+			record.ConflictPolicy = models.MediaLibraryConflictRename
+		}
 		record.MovieDirectoryTemplate = organization.MovieDirectoryTemplate
 		record.MovieFilenameTemplate = organization.MovieFilenameTemplate
 		record.TVDirectoryTemplate = organization.TVDirectoryTemplate
@@ -701,6 +732,9 @@ func (s *DownloadService) submit(ctx context.Context, ownerID uint, input Submit
 			}
 		}
 		if err := tx.Create(&record).Error; err != nil {
+			return err
+		}
+		if err := attachBTSelectionRef(tx, selectionGroup, record, source, s.credentials); err != nil {
 			return err
 		}
 		if input.AfterPersist != nil {
@@ -952,6 +986,22 @@ func (s *DownloadService) ReconcileManagedProviderTags(ctx context.Context, limi
 func (s *DownloadService) cleanupManagedProviderTag(ctx context.Context, task *models.DownloadTask, client downloadpkg.Client) error {
 	if task == nil || task.ProviderType != models.DownloaderTypeQBittorrent || strings.TrimSpace(task.ProviderTag) == "" || !isEstablishedProviderTask(task.ProviderTaskID) {
 		return nil
+	}
+	if retain, ok := client.(interface{ RetainManagedTag() bool }); ok && retain.RetainManagedTag() {
+		return nil
+	}
+	if task.SourceCiphertext != "" {
+		plain, err := s.credentials.Decrypt(downloadSourcePurpose(task.ID), task.SourceCiphertext)
+		if err != nil {
+			return err
+		}
+		var source downloadSourceEnvelope
+		if json.Unmarshal([]byte(plain), &source) != nil {
+			return appError("download_source_invalid", "下载来源记录无效", nil)
+		}
+		if source.SelectionMode == "files" || source.ContentSelection != nil {
+			return nil
+		}
 	}
 	cleaner, ok := client.(downloadpkg.ManagedTagCleaner)
 	if !ok {
@@ -1619,6 +1669,24 @@ func normalizeDownloadSource(input DownloadSourceInput, requestedName string) (d
 	default:
 		return source, "", appError(CodeDownloadSourceInvalid, "请选择下载来源类型", nil)
 	}
+	if input.ContentSelection != nil {
+		selection := *input.ContentSelection
+		selection.Files = append([]resourcecontent.SelectedFile(nil), selection.Files...)
+		source.ContentSelection = &selection
+		source.Torrent = append([]byte(nil), input.Torrent...)
+		if _, err := downloadpkg.ValidateContentSource(downloadpkg.Source{Kind: source.Kind, URL: source.URL, Torrent: source.Torrent, ContentSelection: source.ContentSelection}); err != nil {
+			return source, "", appError(CodeDownloadSourceInvalid, "精确文件选择与原种子不一致，未提交下载", err)
+		}
+		source.SelectionMode = "files"
+		if input.AllFilesVerified {
+			candidate := downloadpkg.Source{Kind: source.Kind, URL: source.URL, Torrent: source.Torrent, ContentSelection: source.ContentSelection, AllFilesVerified: true}
+			if !downloadpkg.VerifiedAllSource(candidate) {
+				return downloadSourceEnvelope{}, "", appError(CodeDownloadSourceInvalid, "完整资源选择证明无效", nil)
+			}
+			source.SelectionMode = "verified_all"
+		}
+		source.ContentSelectionDigest, _ = selection.Digest()
+	}
 	fallbackName := "URL 下载"
 	if source.Kind == downloadpkg.SourcePan115Share {
 		fallbackName = "115 分享转存"
@@ -1760,7 +1828,7 @@ func (w *DownloadWorker) Run(ctx context.Context, runtime JobRuntime, job Claime
 	if err := w.resetFailedPan115ForExplicitRetry(ctx, &task, client, downloaderRecord.Type); err != nil {
 		return w.failure(task, err)
 	}
-	if task.Phase == models.DownloadTaskStatusPaused && task.ProviderTaskID != "" {
+	if task.Phase == models.DownloadTaskStatusPaused && task.ProviderTaskID != "" && (source.ContentSelection == nil || task.ScrapeStatus == "classified" || task.ScrapeStatus == "fallback_unrecognized") {
 		resumer, ok := client.(downloadpkg.Resumer)
 		if !ok {
 			return w.failure(task, downloadpkg.Error("downloader_resume_unsupported", false, nil))
@@ -2029,6 +2097,7 @@ func (w *DownloadWorker) completedRecognitionManifestClient(ctx context.Context,
 	if task.ProviderTaskID == "" || task.DownloaderID == nil {
 		return nil, appError("download_completion_manifest_unavailable", "已完成下载的文件清单不可用", nil)
 	}
+	ctx = withCompletedManifestRecovery(ctx)
 	_, client, _, err := w.taskDownloaderClient(ctx, &task)
 	if err != nil {
 		return nil, err
@@ -2521,6 +2590,24 @@ func (w *DownloadWorker) persistScrapeIdentity(task *models.DownloadTask, identi
 }
 
 func (w *DownloadWorker) routeCategory(ctx context.Context, task *models.DownloadTask, client downloadpkg.MetadataClient, savePath, category, scrapeStatus, errorCode, errorMessage string) error {
+	if task.BTSelectionGroupID != "" {
+		// A shared source workspace cannot be relocated by any one reference's
+		// target library/profile. Classification remains per reference.
+		if !providerPathsEqual(task.StagingAbsolutePath, savePath) {
+			return downloadpkg.Error("downloader_selection_group_workspace_conflict", false, nil)
+		}
+		if err := client.Resume(ctx, task.ProviderTaskID); err != nil {
+			return err
+		}
+		active, err := w.updateActiveTask(task, map[string]any{"phase": models.DownloadTaskStatusDownloading, "scrape_status": scrapeStatus, "scrape_category": category, "staging_category": ".", "last_error_code": safeLabel(errorCode, 96), "last_error_message": safeLabel(errorMessage, 512), "updated_at": time.Now().UTC()})
+		if !active && err == nil {
+			return context.Canceled
+		}
+		task.ScrapeStatus = scrapeStatus
+		task.ScrapeCategory = category
+		task.StagingCategory = "."
+		return err
+	}
 	category = strings.Join(strings.Fields(category), " ")
 	if category == "" || len([]rune(category)) > 128 || strings.ContainsAny(category, `/\\:\r\n`) {
 		return downloadpkg.Error("downloader_category_invalid", false, nil)
@@ -2805,7 +2892,10 @@ func (w *DownloadWorker) load(ctx context.Context, job ClaimedJob) (models.Downl
 	if err := json.Unmarshal([]byte(plaintext), &source); err != nil {
 		return task, record, nil, downloadpkg.Source{}, "", err
 	}
-	return task, record, client, downloadpkg.Source{Kind: source.Kind, URL: source.URL, Torrent: source.Torrent, Filename: source.Filename, ProviderItemID: source.ProviderItemID, ShareSelection: source.ShareSelection}, savePath, nil
+	if err := validateStoredContentSelection(source); err != nil {
+		return task, record, nil, downloadpkg.Source{}, "", err
+	}
+	return task, record, client, downloadpkg.Source{Kind: source.Kind, URL: source.URL, Torrent: source.Torrent, Filename: source.Filename, ProviderItemID: source.ProviderItemID, ShareSelection: source.ShareSelection, ContentSelection: source.ContentSelection, AllFilesVerified: source.SelectionMode == "verified_all"}, savePath, nil
 }
 
 func (w *DownloadWorker) taskDownloaderClient(ctx context.Context, task *models.DownloadTask) (models.Downloader, downloadpkg.Client, string, error) {
@@ -2818,6 +2908,9 @@ func (w *DownloadWorker) taskDownloaderClient(ctx context.Context, task *models.
 	}
 	if !record.Enabled {
 		return record, nil, "", appError(CodeDownloaderUnavailable, "下载器已停用", nil)
+	}
+	if err := w.service.prepareBTSelectionWorkspace(ctx, *task, record); err != nil {
+		return record, nil, "", err
 	}
 	savePath, err := w.service.settings.ResolveSnapshot(ctx, record.Type, task.StagingAbsolutePath, task.StagingStorageID, task.StagingRelativePath)
 	if err != nil {
@@ -3089,12 +3182,14 @@ func downloadFailureMessage(code string, retryable bool) string {
 		return "下载器请求受到限速，任务将延后重试"
 	case "downloader_source_invalid", "downloader_source_unsupported":
 		return "下载器拒绝了下载链接，请检查链接后重试"
+	case "downloader_selection_identity_required":
+		return "此来源尚未确认资源身份，下载器暂不能安全接收；请先由软件解析文件内容，再重新提交"
 	case "downloader_storage_unavailable":
 		return "下载目标目录不存在或已移动，请重新选择目录"
 	case "downloader_quota_exhausted":
 		return "115 离线下载配额已耗尽，请检查账号权益后重试"
 	case "downloader_task_exists":
-		return "115 已存在相同离线任务，但未能安全接管；请在 115 删除旧任务记录后重试"
+		return "115 已存在相同资源的任务，无法安全接管；请先检查原任务的归属和状态"
 	case "downloader_response_invalid":
 		return "下载器返回了无法识别的响应，请重新测试连接"
 	case "downloader_category_update_unsupported":

@@ -80,6 +80,7 @@ type Query struct {
 }
 
 type Result struct {
+	PayloadKind   PayloadKind    `json:"payload_kind,omitempty"`
 	SourceKind    string         `json:"source_kind,omitempty"`
 	CloudProvider string         `json:"cloud_provider,omitempty"`
 	Channel       string         `json:"channel,omitempty"`

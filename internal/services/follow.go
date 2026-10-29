@@ -34,17 +34,18 @@ type FollowSchedule struct {
 }
 
 type FollowFilters struct {
-	Resolutions          []string `json:"resolutions"`
-	VideoCodecs          []string `json:"video_codecs"`
-	Qualities            []string `json:"qualities"`
-	IncludeKeywords      []string `json:"include_keywords"`
-	ExcludeKeywords      []string `json:"exclude_keywords"`
-	ReleaseGroups        []string `json:"release_groups"`
-	ExcludeReleaseGroups []string `json:"exclude_release_groups"`
-	MinSeeders           int      `json:"min_seeders"`
-	MaxAgeHours          *int     `json:"max_age_hours"`
-	MinSizeBytes         *int64   `json:"min_size_bytes"`
-	MaxSizeBytes         *int64   `json:"max_size_bytes"`
+	Subtitles            *SubtitlePolicy `json:"subtitles,omitempty"`
+	Resolutions          []string        `json:"resolutions"`
+	VideoCodecs          []string        `json:"video_codecs"`
+	Qualities            []string        `json:"qualities"`
+	IncludeKeywords      []string        `json:"include_keywords"`
+	ExcludeKeywords      []string        `json:"exclude_keywords"`
+	ReleaseGroups        []string        `json:"release_groups"`
+	ExcludeReleaseGroups []string        `json:"exclude_release_groups"`
+	MinSeeders           int             `json:"min_seeders"`
+	MaxAgeHours          *int            `json:"max_age_hours"`
+	MinSizeBytes         *int64          `json:"min_size_bytes"`
+	MaxSizeBytes         *int64          `json:"max_size_bytes"`
 }
 
 type FollowExecutionSnapshot struct {
@@ -79,13 +80,14 @@ type FollowLibraryOption struct {
 }
 
 type FollowDefaults struct {
-	Snapshot          FollowExecutionSnapshot `json:"snapshot"`
-	Sites             []FollowSiteOption      `json:"sites"`
-	Downloaders       []FollowOption          `json:"downloaders"`
-	MediaLibraries    []FollowLibraryOption   `json:"media_libraries"`
-	SubscribedSeasons []int                   `json:"subscribed_seasons"`
-	Coverage          MediaCoverage           `json:"coverage"`
-	UnavailableReason string                  `json:"unavailable_reason,omitempty"`
+	PolicyDefaultsRevision uint64                  `json:"policy_defaults_revision"`
+	Snapshot               FollowExecutionSnapshot `json:"snapshot"`
+	Sites                  []FollowSiteOption      `json:"sites"`
+	Downloaders            []FollowOption          `json:"downloaders"`
+	MediaLibraries         []FollowLibraryOption   `json:"media_libraries"`
+	SubscribedSeasons      []int                   `json:"subscribed_seasons"`
+	Coverage               MediaCoverage           `json:"coverage"`
+	UnavailableReason      string                  `json:"unavailable_reason,omitempty"`
 }
 
 type CreateFollowInput struct {
@@ -295,6 +297,12 @@ func (s *FollowService) Defaults(ctx context.Context, actor Actor, tmdbID int64)
 	result.Snapshot.Schedule = FollowSchedule{Kind: "interval", Minutes: 360}
 	result.Snapshot.MaxResourcesPerRun = 3
 	result.Snapshot.Filters = FollowFilters{Resolutions: []string{}, VideoCodecs: []string{}, Qualities: []string{}, IncludeKeywords: []string{}, ExcludeKeywords: []string{}, ReleaseGroups: []string{}, ExcludeReleaseGroups: []string{}, MinSeeders: 1}
+	policyDefaults, err := s.policyDefaults(ctx)
+	if err != nil {
+		return FollowDefaults{}, err
+	}
+	result.PolicyDefaultsRevision = policyDefaults.Revision
+	result.Snapshot.Filters.Subtitles = &policyDefaults.Subtitles
 	type routeChoices struct {
 		source       string
 		byDownloader map[string]map[uint]SourceRouteChoice
@@ -849,6 +857,10 @@ func (s *FollowService) validateSnapshotWithRoutes(actor Actor, tmdbID int64, in
 		}
 	}
 	var err error
+	input.Filters.Subtitles, err = normalizeSubtitlePolicy(input.Filters.Subtitles)
+	if err != nil {
+		return input, nil, err
+	}
 	for _, values := range []*[]string{&input.Filters.Resolutions, &input.Filters.VideoCodecs, &input.Filters.Qualities, &input.Filters.IncludeKeywords, &input.Filters.ExcludeKeywords, &input.Filters.ReleaseGroups, &input.Filters.ExcludeReleaseGroups} {
 		*values, err = normalizeRuleStrings(*values)
 		if err != nil {

@@ -467,6 +467,7 @@ func newTestClientWithSiteAdapters(t *testing.T, siteAdapters []sitepkg.Adapter,
 	sites := services.NewSiteServiceWithAdapters(db, audit, credentialStore, downloads, siteAdapters, log)
 	sites.SetMetadataSettings(metadataSettings)
 	api.SetSiteService(sites)
+	api.SetMediaVersionUpgradeService(services.NewMediaVersionUpgradeService(db, libraries, sites, queue))
 	api.SetAcquisitionService(services.NewAcquisitionService(db))
 	transfers := services.NewTransferService(db, audit, queue, log)
 	seeding := services.NewSeedingService(db, audit, queue, downloaders, log)

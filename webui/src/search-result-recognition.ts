@@ -1,8 +1,9 @@
-import { ref, watch, type Ref } from 'vue'
+import { computed, ref, watch, type Ref } from 'vue'
 import { api } from '@/api/client'
 import { discoveryCoveragePath, normalizeMediaCoverage, coverageStatusLabel, type MediaCoverage } from '@/discovery'
 import { torrentRecognitionPath, type TorrentRecognitionResult, type TorrentSearchResult } from '@/sites'
 import { isCloudContentResult, parseShareContentAnalysis, type ShareContentAnalysis } from '@/share-content'
+import { useResourceContentRecognition } from '@/resource-content-recognition'
 
 type LibraryState = { label: string; detail: string; present: boolean }
 type Attempt = { controller: AbortController; generation: number; revision: number; cancel: () => void }
@@ -16,6 +17,7 @@ export function useSearchResultRecognition(items: Ref<TorrentSearchResult[]>, ca
   const recognitionErrors = ref<Record<string, string>>({})
   const recognizingTokens = ref<string[]>([])
   const libraryStates = ref<Record<string, LibraryState>>({})
+  const modern = useResourceContentRecognition(items, canReadLibrary, { recognitions, recognitionErrors, libraryStates })
   let generation = 0
   let stopped = false
   let active = new Map<string, Attempt>()
@@ -129,6 +131,7 @@ export function useSearchResultRecognition(items: Ref<TorrentSearchResult[]>, ca
     const byToken = new Map(items.value.map(item => [item.token, item]))
     const ordered = [...[...retryPriority].map(token => byToken.get(token)).filter((item): item is TorrentSearchResult => !!item), ...items.value]
     for (const item of ordered) {
+      if (item.content_inspection) continue
       if (active.size >= concurrentRecognitions) break
       if (active.has(item.token) || completed.has(item.token)) continue
       completed.add(item.token)
@@ -157,6 +160,7 @@ export function useSearchResultRecognition(items: Ref<TorrentSearchResult[]>, ca
   function retry(token: string) {
     const item = items.value.find(candidate => candidate.token === token)
     if (stopped || !item) return false
+    if (item.content_inspection) return modern.retry(token)
     revisions.set(token, (revisions.get(token) ?? 0) + 1)
     invalidate(token)
     if (!(Date.parse(item.expires_at) > Date.now())) {
@@ -178,6 +182,7 @@ export function useSearchResultRecognition(items: Ref<TorrentSearchResult[]>, ca
 
   function acceptManual(token: string, result: TorrentRecognitionResult) {
     if (stopped || !items.value.some(item => item.token === token)) return
+    if (items.value.some(item => item.token === token && item.content_inspection)) { modern.acceptManual(token, result); return }
     revisions.set(token, (revisions.get(token) ?? 0) + 1)
     invalidate(token)
     recognitions.value[token] = result
@@ -197,6 +202,7 @@ export function useSearchResultRecognition(items: Ref<TorrentSearchResult[]>, ca
   }
 
   function reset() {
+    modern.reset()
     generation++
     for (const token of active.keys()) invalidate(token)
     active = new Map()
@@ -209,6 +215,8 @@ export function useSearchResultRecognition(items: Ref<TorrentSearchResult[]>, ca
     recognizingTokens.value = []
     libraryStates.value = {}
   }
-  function dispose() { stopped = true; stopWatch(); reset() }
-  return { recognitions, recognitionErrors, recognizingTokens, libraryStates, retry, acceptManual, acceptShareAnalysis, reset, dispose }
+  function dispose() { stopped = true; stopWatch(); modern.dispose(); reset() }
+  const titleTokens = computed(() => [...recognizingTokens.value, ...items.value.filter(item => modern.titleTokens.value.some(key => key === `${item.token}:0` || key.startsWith(`${item.token}:`))).map(item => item.token)])
+  const inspectingTokens = computed(() => items.value.filter(item => modern.inspectingTokens.value.some(key => key.startsWith(`${item.token}:`))).map(item => item.token))
+  return { recognitions, recognitionErrors, recognizingTokens: titleTokens, libraryStates, contentPreviews: modern.contentPreviews, contentErrors: modern.contentErrors, inspectingTokens, retryContent: modern.retryContent, retry, acceptManual, acceptShareAnalysis, reset, dispose }
 }

@@ -1303,8 +1303,12 @@ func TestPersistentQueueMigrationPoliciesRBACAndForeignKeys(t *testing.T) {
 		}
 	}
 	var policies int64
-	if err := db.Model(&models.QueuePolicy{}).Count(&policies).Error; err != nil || policies != 19 {
+	if err := db.Model(&models.QueuePolicy{}).Count(&policies).Error; err != nil || policies != 20 {
 		t.Fatalf("policies=%d err=%v", policies, err)
+	}
+	var upgradePolicy models.QueuePolicy
+	if err := db.First(&upgradePolicy, "job_type = ?", "media_version_upgrade").Error; err != nil || upgradePolicy.Concurrency != 2 || upgradePolicy.ResourceConcurrency != 1 || upgradePolicy.LeaseSeconds != 30 {
+		t.Fatalf("upgrade policy=%+v err=%v", upgradePolicy, err)
 	}
 	var retirementPolicy models.QueuePolicy
 	if err := db.First(&retirementPolicy, "job_type = ?", "media_library_retirement").Error; err != nil || retirementPolicy.Concurrency != 1 || retirementPolicy.ResourceConcurrency != 1 || retirementPolicy.LeaseSeconds != 30 {

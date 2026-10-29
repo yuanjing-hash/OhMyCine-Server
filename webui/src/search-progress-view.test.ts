@@ -512,7 +512,7 @@ describe('detailed incremental single-site search', () => {
     await button(wrapper, label).trigger('click')
     auth.user = { ...auth.user, id: 2, username: 'new-actor', display_name: '新账号' }
     await flushPromises()
-    for (const [, options] of apiMock.mock.calls.filter(([path]) => path === '/api/v1/downloaders' || path === '/api/v1/media-libraries')) expect((options.signal as AbortSignal).aborted).toBe(true)
+    for (const [path, options] of apiMock.mock.calls.filter(([path]) => path === '/api/v1/downloaders' || path === '/api/v1/media-libraries')) expect((options.signal as AbortSignal).aborted, `${path} option request must retire with its actor`).toBe(true)
     expect(wrapper.findAll('article')).toHaveLength(0)
     expect(wrapper.find('[aria-labelledby="pt-download-title"]').exists()).toBe(false)
     downloaders.resolve({ list: [{ id: 'old-private-downloader', name: '旧账号下载器', enabled: true }] })

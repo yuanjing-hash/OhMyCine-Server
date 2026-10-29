@@ -13,6 +13,26 @@ package services
 // change nine function digests without adding E/R/A references or changing the
 // legacy/catalog gates, pinned facts, publication fences or write receivers.
 var catalogRuntimeAccessAllowlist = map[string]string{
+	// Version replacement review: see backend/media-version-upgrade.md and
+	// verification/version-upgrade-implementation-20261029.md in the active task.
+	// Intent snapshots/codecs are private data only.
+	// Prepare and readiness/snapshot checks use withCatalogRead/PinCatalogTx;
+	// exact-ID reads never treat a partial directory as authoritative absence.
+	"internal/services/media_version_upgrade_snapshot.go:declaration(mediaUpgradePrivateAsset)":     "model:A=1|c07adffcfa97e82f",
+	"internal/services/media_version_upgrade_snapshot.go:declaration(mediaUpgradePrivateEntry)":     "model:E=1|c1f3ed19a5f2bc99",
+	"internal/services/media_version_upgrade.go:declaration(mediaUpgradeSnapshot)":                  "model:A=1,model:E=1|486f14f10266e682",
+	"internal/services/media_version_upgrade.go:MediaVersionUpgradeService.Prepare":                 "model:A=2,model:E=3,query:Find:A=1,query:Find:E=1,query:First:E=1,query:Where:E=2|929eed2911bb679c",
+	"internal/services/media_version_upgrade.go:mediaUpgradeDTO":                                    "model:E=1|0a7affe9b84c4385",
+	"internal/services/media_version_upgrade.go:exclusiveUpgradeSubtitle":                           "model:A=1,model:E=1|f3887e4a52e58b57",
+	"internal/services/media_version_upgrade.go:MediaVersionUpgradeService.validateSnapshotTx":      "model:A=1,model:E=2,query:Find:A=1,query:Find:E=1|f2b6b038be13d7b3",
+	"internal/services/media_version_recycle.go:MediaVersionUpgradeService.captureRecycleItems":     "model:A=1,model:E=1|187f617d6b1cd038",
+	"internal/services/media_version_upgrade_worker.go:MediaVersionUpgradeService.replacementReady": "model:E=1,query:Find:E=1|8c8ae580fc88de4a",
+	"internal/services/media_version_upgrade_worker.go:MediaVersionUpgradeService.recycleOld":       "model:E=1|3e87a97d14b05343",
+	// Exact catalog writer uses the normal prepared delta/tombstones in versioned
+	// mode. Direct legacy Delete/Count are behind explicit !versioned gates and
+	// scoped to the frozen old entry/asset/now-unreferenced recognition IDs.
+	"internal/services/media_version_upgrade_publish.go:MediaVersionUpgradeService.publishUpgradeRemoval": "model:A=1,model:E=3,model:R=1,query:Delete:A=1,query:Delete:E=1,query:Delete:R=1,query:Find:E=1,query:Model:E=1|64eada22d62bbea4",
+
 	// Existing acquisition projection: task ownership/resource checks and this
 	// exact work lookup share withCatalogReadTx. Readability is checked before
 	// PinCatalogTx; VisibleEntries is bounded to one authorized library/work.

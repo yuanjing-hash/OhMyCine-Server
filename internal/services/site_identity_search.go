@@ -223,10 +223,8 @@ func (s *SiteService) searchMediaIdentitySitePage(ctx context.Context, actor Act
 				rejections.add("duplicate", item.Title)
 				continue
 			}
-			var bindErr error
-			if cloudShare {
-				bindErr = s.bindShareSearchIdentity(item.Token, actor.User.ID, siteShareIdentity{TMDBID: input.TMDBID, MediaType: input.MediaType, Title: verified.Title, Names: names, Season: cloneInt(input.Season), Year: cloneInt(verified.ReleaseYear), SeasonCount: verified.Snapshot.SeasonCount})
-			} else {
+			bindErr := s.bindContentSearchIdentity(item.Token, actor.User.ID, siteShareIdentity{TMDBID: input.TMDBID, MediaType: input.MediaType, Title: verified.Title, Names: names, Season: cloneInt(input.Season), Year: cloneInt(verified.ReleaseYear), SeasonCount: verified.Snapshot.SeasonCount})
+			if bindErr == nil && !cloudShare {
 				bindErr = s.bindClaimRecognition(item.Token, actor.User.ID, input.TMDBID, input.MediaType, mediaIdentitySourceDirectID, mediaIdentityStatusVerified, false)
 			}
 			if bindErr != nil {

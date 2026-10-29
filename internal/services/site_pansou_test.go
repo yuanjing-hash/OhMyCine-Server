@@ -73,6 +73,11 @@ func TestPanSouMixedClaimsLegacyAndPublicMagnetRoutes(t *testing.T) {
 	for _, item := range groups[0].Items {
 		byType[item.ResultType] = item
 	}
+	for kind, want := range map[string]sitepkg.PayloadKind{"115": sitepkg.PayloadShare, "quark": sitepkg.PayloadShare, "magnet": sitepkg.PayloadMagnet, "baidu": sitepkg.PayloadShare} {
+		if byType[kind].PayloadKind != want {
+			t.Fatalf("%s safe payload projection=%q want=%q", kind, byType[kind].PayloadKind, want)
+		}
+	}
 	if byType["baidu"].AcquisitionAvailable == nil || *byType["baidu"].AcquisitionAvailable || byType["baidu"].AcquisitionReason == "" {
 		t.Fatal("view-only type did not block acquisition")
 	}
@@ -84,6 +89,19 @@ func TestPanSouMixedClaimsLegacyAndPublicMagnetRoutes(t *testing.T) {
 		recommendation, err := s.RecommendSiteRoute(context.Background(), actor, SourceRouteRecommendationInput{ResultToken: byType[kind].Token})
 		if err != nil || recommendation.SourceKind != want {
 			t.Fatalf("%s recommendation=%+v err=%v", kind, recommendation, err)
+		}
+		previewKind := want
+		if kind == "magnet" {
+			previewKind = "url"
+		}
+		if recommendation.PreviewSourceKind != previewKind {
+			t.Fatalf("%s lost the validated preview kind: %+v", kind, recommendation)
+		}
+		if kind == "magnet" {
+			preview, err := s.downloads.PreviewRoutes(context.Background(), actor, DownloadRoutePreviewInput{DownloaderID: qbit.ID, SourceKind: recommendation.PreviewSourceKind, SiteID: &created.ID})
+			if err != nil || preview.SourceKind != recommendation.PreviewSourceKind {
+				t.Fatalf("magnet recommendation cannot be previewed: %+v, %v", preview, err)
+			}
 		}
 	}
 	if _, err := s.RecommendSiteRoute(context.Background(), actor, SourceRouteRecommendationInput{ResultToken: byType["baidu"].Token}); ErrorCode(err) != CodeDownloadSourceInvalid {

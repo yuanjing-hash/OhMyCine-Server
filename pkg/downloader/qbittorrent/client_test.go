@@ -14,6 +14,7 @@ import (
 )
 
 func TestClientSubmitTelemetryAndSafeControls(t *testing.T) {
+	const nativeHash = "0123456789abcdef0123456789abcdef01234567"
 	var mu sync.Mutex
 	added := false
 	stop, start, deleted := false, false, false
@@ -62,7 +63,7 @@ func TestClientSubmitTelemetryAndSafeControls(t *testing.T) {
 				_, _ = io.WriteString(w, "[]")
 				return
 			}
-			_ = json.NewEncoder(w).Encode([]torrentInfo{{Hash: "hash-1", Name: "Movie", State: "stalledUP", Progress: .5, Downloaded: 50, TotalSize: 100, DL: 10, UL: 2, ETA: 5, Ratio: &ratio, SeedTime: &seeded, Uploaded: &uploaded}})
+			_ = json.NewEncoder(w).Encode([]torrentInfo{{Hash: nativeHash, Name: "Movie", State: "stalledUP", Progress: .5, Downloaded: 50, TotalSize: 100, DL: 10, UL: 2, ETA: 5, Ratio: &ratio, SeedTime: &seeded, Uploaded: &uploaded}})
 		case "/api/v2/torrents/pause", "/api/v2/torrents/resume":
 			http.NotFound(w, r)
 		case "/api/v2/torrents/stop":
@@ -93,7 +94,7 @@ func TestClientSubmitTelemetryAndSafeControls(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if task.ID != "hash-1" || task.Progress == nil || *task.Progress != 50 || task.DownloadSpeed == nil || *task.DownloadSpeed != 10 || task.Ratio == nil || *task.Ratio != 1.25 || task.SeededSeconds == nil || *task.SeededSeconds != 3600 || task.UploadedBytes == nil || *task.UploadedBytes != 125 || !task.Seeding {
+	if task.ID != nativeHash || task.Progress == nil || *task.Progress != 50 || task.DownloadSpeed == nil || *task.DownloadSpeed != 10 || task.Ratio == nil || *task.Ratio != 1.25 || task.SeededSeconds == nil || *task.SeededSeconds != 3600 || task.UploadedBytes == nil || *task.UploadedBytes != 125 || !task.Seeding {
 		t.Fatalf("task=%+v", task)
 	}
 	if _, err := client.Submit(context.Background(), downloader.SubmitRequest{Source: downloader.Source{Kind: downloader.SourceTorrent, Filename: "movie.torrent", Torrent: []byte("d4:infoe")}, SavePath: `D:\Downloads`, Tag: "omc-torrent"}); err != nil {
@@ -121,6 +122,8 @@ func TestClientDeletesOnlyExactManagedTag(t *testing.T) {
 		case "/api/v2/auth/login":
 			http.SetCookie(w, &http.Cookie{Name: "SID", Value: "session"})
 			_, _ = io.WriteString(w, "Ok.")
+		case "/api/v2/torrents/info":
+			_, _ = io.WriteString(w, "[]")
 		case "/api/v2/torrents/deleteTags":
 			requests++
 			_ = r.ParseForm()
@@ -473,7 +476,7 @@ func TestClientReportsUnsupportedOrFailedCategoryUpdateSafely(t *testing.T) {
 	}
 }
 
-func TestClientFallsBackWhenMetadataStopConditionIsUnsupported(t *testing.T) {
+func TestClientRefusesWhenMetadataStopConditionIsUnsupported(t *testing.T) {
 	addCount := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -500,15 +503,15 @@ func TestClientFallsBackWhenMetadataStopConditionIsUnsupported(t *testing.T) {
 	}))
 	defer server.Close()
 	client, _ := New(downloader.Config{BaseURL: server.URL})
-	if _, err := client.Submit(context.Background(), downloader.SubmitRequest{Source: downloader.Source{Kind: downloader.SourceURL, URL: "magnet:?xt=urn:btih:legacy"}, SavePath: `D:\Staging`, Tag: "omc-legacy", MetadataOnly: true}); err != nil {
-		t.Fatal(err)
+	if _, err := client.Submit(context.Background(), downloader.SubmitRequest{Source: downloader.Source{Kind: downloader.SourceURL, URL: "magnet:?xt=urn:btih:legacy"}, SavePath: `D:\Staging`, Tag: "omc-legacy", MetadataOnly: true}); err == nil {
+		t.Fatal("unsupported metadata stop condition started real content download")
 	}
-	if addCount != 2 {
+	if addCount != 1 {
 		t.Fatalf("add count=%d", addCount)
 	}
 }
 
-func TestClientFallsBackWhenLegacyAddReturnsFailsForStopCondition(t *testing.T) {
+func TestClientRefusesWhenLegacyAddReturnsFailsForStopCondition(t *testing.T) {
 	addCount := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -535,10 +538,10 @@ func TestClientFallsBackWhenLegacyAddReturnsFailsForStopCondition(t *testing.T) 
 	}))
 	defer server.Close()
 	client, _ := New(downloader.Config{BaseURL: server.URL})
-	if _, err := client.Submit(context.Background(), downloader.SubmitRequest{Source: downloader.Source{Kind: downloader.SourceURL, URL: "magnet:?xt=urn:btih:legacy"}, SavePath: `D:\Staging`, Tag: "omc-legacy", MetadataOnly: true}); err != nil {
-		t.Fatal(err)
+	if _, err := client.Submit(context.Background(), downloader.SubmitRequest{Source: downloader.Source{Kind: downloader.SourceURL, URL: "magnet:?xt=urn:btih:legacy"}, SavePath: `D:\Staging`, Tag: "omc-legacy", MetadataOnly: true}); err == nil {
+		t.Fatal("unsupported metadata stop condition started real content download")
 	}
-	if addCount != 2 {
+	if addCount != 1 {
 		t.Fatalf("add count=%d", addCount)
 	}
 }
@@ -614,17 +617,21 @@ func TestClientRejectsUnsafeManifestPaths(t *testing.T) {
 }
 
 func TestClientRetryAdoptsTaskCreatedByEarlierFailedLocalRecord(t *testing.T) {
+	const nativeHash = "abcdef0123456789abcdef0123456789abcdef01"
 	addCount := 0
+	tagReconciled := false
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/api/v2/auth/login":
 			http.SetCookie(w, &http.Cookie{Name: "SID", Value: "session"})
 			_, _ = io.WriteString(w, "Ok.")
 		case "/api/v2/torrents/info":
-			if r.URL.Query().Get("tag") != "omc-old-failed-task" {
+			if r.URL.Query().Get("tag") == "omc-old-failed-task" {
+				tagReconciled = true
+			} else if r.URL.Query().Get("limit") != "2049" {
 				t.Fatalf("retry did not reconcile by stable tag: %s", r.URL.RawQuery)
 			}
-			_ = json.NewEncoder(w).Encode([]torrentInfo{{Hash: "existing-provider-hash", Name: "Existing", State: "downloading"}})
+			_ = json.NewEncoder(w).Encode([]torrentInfo{{Hash: nativeHash, Name: "Existing", State: "downloading"}})
 		case "/api/v2/torrents/add":
 			addCount++
 			_, _ = io.WriteString(w, "Ok.")
@@ -635,10 +642,10 @@ func TestClientRetryAdoptsTaskCreatedByEarlierFailedLocalRecord(t *testing.T) {
 	defer server.Close()
 	client, _ := New(downloader.Config{BaseURL: server.URL})
 	task, err := client.Submit(context.Background(), downloader.SubmitRequest{Source: downloader.Source{Kind: downloader.SourceURL, URL: "magnet:?xt=urn:btih:old"}, SavePath: `D:\Staging`, Tag: "omc-old-failed-task", MetadataOnly: true})
-	if err != nil || task.ID != "existing-provider-hash" {
+	if err != nil || task.ID != nativeHash {
 		t.Fatalf("task=%+v err=%v", task, err)
 	}
-	if addCount != 0 {
+	if addCount != 0 || !tagReconciled {
 		t.Fatalf("retry duplicated provider submission %d time(s)", addCount)
 	}
 }

@@ -25,6 +25,8 @@ import (
 )
 
 type Agent struct {
+	admissionOnce      sync.Once
+	admission          *operationAdmission
 	config             Config
 	store              *Store
 	sealingPrivateKey  *ecdh.PrivateKey
@@ -32,6 +34,8 @@ type Agent struct {
 	now                func() time.Time
 	exportMu           sync.Mutex
 	exports            map[string]struct{}
+	exportCancels      map[string]context.CancelFunc
+	exportOwners       map[string]string
 	storageMu          sync.Mutex
 	storageRuns        map[string]struct{}
 	storageFactory     storageDriverFactory

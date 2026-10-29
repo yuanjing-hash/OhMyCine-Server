@@ -50,6 +50,9 @@ func TestTorznabCapsSearchAndTorrentResolution(t *testing.T) {
 		t.Fatalf("search failed: %+v err=%v", page, err)
 	}
 	item := page.Items[0]
+	if item.PayloadKind != site.PayloadTorrent {
+		t.Fatalf("torrent adapter lost payload projection: %q", item.PayloadKind)
+	}
 	if item.Seeders == nil || *item.Seeders != 8 || item.Leechers == nil || *item.Leechers != 2 || item.Completed == nil || *item.Completed != 5 || item.SizeBytes != 2048 {
 		t.Fatalf("Torznab attrs were not parsed: %+v", item)
 	}

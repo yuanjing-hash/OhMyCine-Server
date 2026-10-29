@@ -89,6 +89,8 @@ const reasons: Record<string, string> = {
   include_keyword: '缺少要求的关键词', exclude_keyword: '命中排除关键词', resolution: '分辨率不符合', video_codec: '视频编码不符合',
   quality: '片源质量不符合', release_group: '发布组不符合', excluded_release_group: '命中排除发布组', seeders: '做种数不符合',
   size: '文件大小不符合或未知', age: '发布时间不符合或未知', submit_failed: '提交下载失败', search_failed: '站点搜索失败',
+  content_preparation_failed: '实际文件或执行路线未能核实', share_selection_failed: '分享文件选择未完成',
+  subtitle_unconfirmed: '对应字幕未确认、按偏好继续下载的视频数', subtitle_required: '没有已确认的所需字幕', candidate_budget: '本轮实际文件核验预算已用尽',
   site_failed: '站点搜索失败', site_unavailable: '站点不可用', no_route: '没有可用下载路线', route_unavailable: '没有可用下载路线',
   claim_conflict: '缺集已有任务占用', resource_claimed: '资源已有任务占用', no_episode_overlap: '不覆盖缺集', title_mismatch: '标题不匹配',
   result_expired: '搜索结果已过期', permission_denied: '当前权限不允许', disabled: '已停用', cancelled: '执行被取消',
@@ -118,7 +120,7 @@ const operations: Record<string, string> = {
   download_classification: '下载预分类', pan115_offline_download: '115 离线下载', pan115_share_ingest: '115 分享摄取',
   pan115_cloud_transfer: '115 云端整理', media_transfer: '媒体整理', seeding_management: '做种管理', task_queue: '系统任务队列',
   follow_search: '自动追更', automatic_follow: '自动追更', media_server_refresh: '媒体服务器刷新', site_search: '站点搜索',
-  media_reorganization: '修正识别与重新整理', download_staging_cleanup: '下载暂存清理', pan115_recycle_cleanup: '115 回收站清理',
+  media_version_upgrade: '版本洗版', media_reorganization: '修正识别与重新整理', download_staging_cleanup: '下载暂存清理', pan115_recycle_cleanup: '115 回收站清理',
   pan115_multi_device_playback: '115 多设备播放', pan115_playback_cleanup: '115 临时副本清理', plugin_repository: '插件仓库', plugin_runtime: '插件运行时',
   unified_schedule: '计划任务', plugin_execution: '插件执行', server_update: '软件更新',
 }

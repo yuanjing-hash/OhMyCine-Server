@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/rs/zerolog"
@@ -56,6 +57,7 @@ func TestFollowScreenshotTorznabTitlesKeepExactEpisode(t *testing.T) {
 
 type followPreviewDriver struct {
 	*previewFixtureDriver
+	readMu sync.Mutex
 	reads  []string
 	onRead func()
 }
@@ -65,7 +67,9 @@ func (d *followPreviewDriver) InspectShare(ctx context.Context, raw string) (clo
 }
 
 func (d *followPreviewDriver) InspectShareDirectory(ctx context.Context, raw, id string) (cloud.ShareSnapshot, error) {
+	d.readMu.Lock()
 	d.reads = append(d.reads, raw+":"+id)
+	d.readMu.Unlock()
 	if d.onRead != nil {
 		d.onRead()
 	}
@@ -159,7 +163,7 @@ func newFollowPreviewFixture(t *testing.T) (*followCoverageFixture, *followPrevi
 		if id == "unusable" {
 			seeders = 10
 		}
-		adapter.items = append(adapter.items, sitepkg.Result{TorrentID: "https://115.com/s/" + id + "?password=test", Title: "Fixture.Show.S01E11-E15.1080p.WEB-DL", SourceKind: RouteSource115Share, CloudProvider: "115", ResultType: "115", Seeders: &seeders})
+		adapter.items = append(adapter.items, sitepkg.Result{PayloadKind: sitepkg.PayloadShare, TorrentID: "https://115.com/s/" + id + "?password=test", Title: "Fixture.Show.S01E11-E15.1080p.WEB-DL", SourceKind: RouteSource115Share, CloudProvider: "115", ResultType: "115", Seeders: &seeders})
 	}
 	sites.adapters["pansou_tg"] = adapter
 	shareSite, err := sites.Create(context.Background(), f.actor, SiteInput{Name: "Follow previews", Kind: "pansou_tg", BaseURL: "https://follow-preview.example.test", CloudConfig: &sitepkg.CloudConfig{SourceScope: "plugin"}, Enabled: true, Priority: 1, TimeoutSeconds: 12, RateLimitPerMinute: 120}, RequestContext{})

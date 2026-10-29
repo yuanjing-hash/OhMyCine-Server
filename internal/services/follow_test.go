@@ -372,6 +372,7 @@ func TestFollowWorkerUsesCoverageIdentitySearchAndDownloadPipeline(t *testing.T)
 	defer upstream.Close()
 
 	sites, adapter, fixtureActor, store, downloads, downloaders := siteFixture(t)
+	sites.now = func() time.Time { return current }
 	var businessLog bytes.Buffer
 	logger := zerolog.New(zerolog.SyncWriter(&businessLog)).With().Timestamp().Logger()
 	sites.log, downloads.log = logger, logger
@@ -383,6 +384,13 @@ func TestFollowWorkerUsesCoverageIdentitySearchAndDownloadPipeline(t *testing.T)
 	sites.SetMetadataSettings(metadata)
 	downloads.SetMetadataSettings(metadata)
 	adapter.searchTitle = "Fixture.Show.S01E02.1080p.WEB-DL.HEVC-GROUP"
+	adapter.downloadTorrent = inspectionTorrentWithSize(32<<20, "Fixture.Show.S01E02.1080p.mkv")
+	adapter.searchPayloadKind = sitepkg.PayloadTorrent
+	registry := downloadpkg.NewRegistry()
+	if err := registry.Register(models.DownloaderTypeQBittorrent, downloadpkg.Capabilities{Pause: true, Resume: true, SelectiveFiles: true}, func(downloadpkg.Config) (downloadpkg.Client, error) { return &stubDownloadClient{}, nil }); err != nil {
+		t.Fatal(err)
+	}
+	downloaders.registry = registry
 
 	var administrator models.Role
 	if err := queue.db.First(&administrator, "code = ?", authz.RoleAdministrator).Error; err != nil {
@@ -587,9 +595,10 @@ func TestFollowWorkerUsesCoverageIdentitySearchAndDownloadPipeline(t *testing.T)
 	// Exercise the actual submitted identity through completion and the real
 	// Transfer trust gate. A successful Follow submission alone cannot establish
 	// that the later intake consumes the same source/lock/season facts.
-	completion := &followCompletedDownloadClient{stubDownloadClient: &stubDownloadClient{seedTask: &downloadpkg.Task{ID: "follow-provider", Status: "completed", Completed: true}}, manifest: downloadpkg.Manifest{Name: adapter.searchTitle, Complete: true, Files: []downloadpkg.File{{RelativePath: adapter.searchTitle + ".mkv", Size: 2 * 1024 * 1024 * 1024}}}}
+	index := 0
+	completion := &followSelectedCompletedClient{metadataDownloadClient: &metadataDownloadClient{stubDownloadClient: &stubDownloadClient{seedTask: &downloadpkg.Task{ID: "follow-provider", Status: "completed", Completed: true}}}, manifest: downloadpkg.Manifest{Name: "Fixture Show", Complete: true, Files: []downloadpkg.File{{RelativePath: "Fixture Show/Fixture.Show.S01E02.1080p.mkv", Size: 32 << 20, NativeIndex: &index}}}}
 	downloaders.registry = downloadpkg.NewRegistry()
-	if err := downloaders.registry.Register(models.DownloaderTypeQBittorrent, downloadpkg.Capabilities{Seeding: true}, func(downloadpkg.Config) (downloadpkg.Client, error) { return completion, nil }); err != nil {
+	if err := downloaders.registry.Register(models.DownloaderTypeQBittorrent, downloadpkg.Capabilities{Seeding: true, SelectiveFiles: true}, func(downloadpkg.Config) (downloadpkg.Client, error) { return completion, nil }); err != nil {
 		t.Fatal(err)
 	}
 	downloads.SetTransferService(NewTransferService(queue.db, queue.audit, queue, logger))
@@ -673,7 +682,11 @@ func TestFollowWorkerUsesCoverageIdentitySearchAndDownloadPipeline(t *testing.T)
 	}
 	delete(adapter.searchErr, "https://follow-worker.example.test")
 	adapter.searchTitle = "Fixture.Show.S01E03.1080p.WEB-DL.HEVC-GROUP"
+	adapter.downloadTorrent = inspectionTorrentWithSize(32<<20, "Fixture.Show.S01E03.1080p.mkv")
 	adapter.downloadErr = sitepkg.ErrUnavailable
+	// The same fixture resource ID evolves; expire its old read facts before
+	// asserting that the later provider failure remains distinguishable.
+	current = current.Add(6 * time.Minute)
 	if _, err := follows.Enqueue(context.Background(), actor, subscription.ID, "manual", RequestContext{}); err != nil {
 		t.Fatal(err)
 	}

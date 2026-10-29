@@ -99,7 +99,7 @@ func schemaMigrationsThrough109() []migration {
 }
 
 func schemaMigrations() []migration {
-	return append(schemaMigrationsThrough109(), migration{Version: 110, Apply: migrateProviderDeletion}, migration{Version: 111, Apply: migrateCloudEmptyCleanup}, migration{Version: 112, Apply: migrateTGCloudSites}, migration{Version: 113, Apply: migrateMediaCatalogExclusions}, migration{Version: 114, Apply: migrateDownloaderOrder}, migration{Version: 115, Apply: migrateUserResourceAccessPolicies}, migration{Version: 116, Apply: migratePluginAccountSummary}, migration{Version: 117, Apply: migratePluginCatalogueSnapshots}, migration{Version: 118, Apply: migrateSiteSearchTimeout}, migration{Version: 119, Apply: migrateQuarkProviderTypes, DisableForeignKeys: true}, migration{Version: 120, Apply: migrateProviderObservations}, migration{Version: 121, Apply: migrateQuarkAccountBudgets}, migration{Version: 122, Apply: migrateSubscriptionCalendar})
+	return append(schemaMigrationsThrough109(), migration{Version: 110, Apply: migrateProviderDeletion}, migration{Version: 111, Apply: migrateCloudEmptyCleanup}, migration{Version: 112, Apply: migrateTGCloudSites}, migration{Version: 113, Apply: migrateMediaCatalogExclusions}, migration{Version: 114, Apply: migrateDownloaderOrder}, migration{Version: 115, Apply: migrateUserResourceAccessPolicies}, migration{Version: 116, Apply: migratePluginAccountSummary}, migration{Version: 117, Apply: migratePluginCatalogueSnapshots}, migration{Version: 118, Apply: migrateSiteSearchTimeout}, migration{Version: 119, Apply: migrateQuarkProviderTypes, DisableForeignKeys: true}, migration{Version: 120, Apply: migrateProviderObservations}, migration{Version: 121, Apply: migrateQuarkAccountBudgets}, migration{Version: 122, Apply: migrateSubscriptionCalendar}, migration{Version: 123, Apply: migrateMediaVersionUpgrades}, migration{Version: 124, Apply: migrateFollowPolicyDefaults}, migration{Version: 125, Apply: migrateBTSelectionGroups}, migration{Version: 126, Apply: migrateProviderOperations})
 }
 
 func migratePluginAccountSummary(db *gorm.DB) error {
@@ -1973,6 +1973,7 @@ func seedQueuePolicies(db *gorm.DB) error {
 		{JobType: "media_artifact", Concurrency: 4, ResourceConcurrency: 1, MaxAttempts: 4, LeaseSeconds: 30},
 		{JobType: "strm_reconcile", Concurrency: 4, ResourceConcurrency: 1, MaxAttempts: 3, LeaseSeconds: 30},
 		{JobType: "media_server_refresh", Concurrency: 4, ResourceConcurrency: 1, MaxAttempts: 5, LeaseSeconds: 30},
+		{JobType: "media_version_upgrade", Concurrency: 2, ResourceConcurrency: 1, MaxAttempts: 5, LeaseSeconds: 30},
 		{JobType: "media_reorganization", Concurrency: 2, ResourceConcurrency: 1, MaxAttempts: 5, LeaseSeconds: 30},
 		{JobType: "media_library_repair", Concurrency: 2, ResourceConcurrency: 1, MaxAttempts: 5, LeaseSeconds: 30},
 		{JobType: "media_library_structure_diagnosis", Concurrency: 2, ResourceConcurrency: 1, MaxAttempts: 3, LeaseSeconds: 60},

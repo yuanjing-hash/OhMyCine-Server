@@ -151,6 +151,15 @@ func (s *TransferService) Enqueue(download models.DownloadTask, manifest downloa
 }
 
 func (s *TransferService) EnqueuePackage(download models.DownloadTask, manifest, sourceManifest downloadpkg.Manifest) error {
+	if download.BTSelectionGroupID != "" {
+		var group models.BTSelectionGroup
+		if err := s.db.First(&group, "id = ?", download.BTSelectionGroupID).Error; err != nil {
+			return err
+		}
+		if group.CleanupState != "" {
+			return downloadpkg.Error("downloader_selection_group_cleanup_pending", true, nil)
+		}
+	}
 	if download.TargetLibraryID == nil || download.TargetStorageID == nil {
 		return nil
 	}
@@ -287,6 +296,9 @@ func (w *TransferWorker) Run(ctx context.Context, runtime JobRuntime, job Claime
 	}
 	if err := w.service.db.First(&download, "id = ?", task.DownloadTaskID).Error; err != nil {
 		return w.fail(task, "transfer_download_missing", "原下载任务不存在")
+	}
+	if download.BTSelectionGroupID != "" && download.TransferMode != models.MediaLibraryTransferSymlink {
+		download.TransferMode = models.MediaLibraryTransferCopy
 	}
 	ctx = serverlog.WithBusinessFields(ctx, transferBusinessFields(task, download))
 	if download.Phase == models.DownloadTaskStatusCancelled {

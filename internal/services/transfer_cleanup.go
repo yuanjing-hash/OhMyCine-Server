@@ -56,6 +56,25 @@ func (w *TransferWorker) finishCompletedTransfer(ctx context.Context, task model
 	} else if err != nil {
 		return WorkerResult{ErrorCode: "transfer_download_missing", ErrorMessage: "原下载任务不存在"}
 	}
+	if download.BTSelectionGroupID != "" {
+		if w.service.seeding != nil {
+			if err := w.service.seeding.AfterTransfer(ctx, download); err != nil {
+				next := time.Now().UTC().Add(time.Minute)
+				return WorkerResult{RetryAt: &next, ErrorCode: "shared_source_cleanup_schedule_failed", ErrorMessage: "共享源策略检查将自动重试"}
+			}
+		}
+		// A reference never owns the physical package. Source data stays in its
+		// stable managed workspace for other references and seeding. Cleanup
+		// requires a separate fenced group-wide policy, not a task's move flag.
+		if normalizeExecutionLocation(download.ExecutionLocation) == models.NodeLocationRemote {
+			if err := cleanupCrossSourceManagedRoot(task, download); err != nil {
+				next := time.Now().UTC().Add(time.Minute)
+				return WorkerResult{RetryAt: &next, ErrorCode: "node_staging_cleanup_failed", ErrorMessage: "本任务接收暂存清理将自动重试"}
+			}
+		}
+		_ = w.service.db.Model(&models.TransferTask{}).Where("id = ?", task.ID).Updates(map[string]any{"cleanup_status": models.TransferCleanupDeferred, "cleanup_error_code": "shared_source_retained", "updated_at": time.Now().UTC()}).Error
+		return WorkerResult{}
+	}
 	if download.ProviderType != models.DownloaderTypePan115Offline && download.ProviderType != models.DownloaderTypeQuarkShare && w.service.seeding != nil {
 		if err := w.service.seeding.AfterTransfer(ctx, download); err != nil {
 			next := time.Now().UTC().Add(time.Minute)
@@ -161,6 +180,9 @@ func (s *TransferService) CleanupAfterSeeding(ctx context.Context, downloadTaskI
 	var download models.DownloadTask
 	if err := s.db.First(&download, "id = ?", downloadTaskID).Error; err != nil {
 		return err
+	}
+	if download.BTSelectionGroupID != "" {
+		return nil
 	}
 	if deleteData {
 		extras, err := transferCleanupDifference(task)
