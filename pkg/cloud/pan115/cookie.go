@@ -2,6 +2,7 @@ package pan115
 
 import (
 	"errors"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 )
@@ -13,6 +14,32 @@ type Cookie struct {
 	CID  string
 	SEID string
 	KID  string
+}
+
+// CredentialResourceAccount is only a credential-bound mutual-exclusion
+// namespace. It is not a successful login/probe or cross-interface identity.
+func CredentialResourceAccount(raw string) (string, error) {
+	parsed, err := ParseCookie(raw)
+	if err != nil {
+		return "", err
+	}
+	return credentialResourceAccount(parsed)
+}
+func credentialResourceAccount(cookie Cookie) (string, error) {
+	value, suffix, hasSuffix := strings.Cut(cookie.UID, "_")
+	if value == "" || hasSuffix && suffix == "" {
+		return "", errors.New("115 credential account is invalid")
+	}
+	for _, char := range value {
+		if char < '0' || char > '9' {
+			return "", errors.New("115 credential account is invalid")
+		}
+	}
+	id, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || id <= 0 {
+		return "", errors.New("115 credential account is invalid")
+	}
+	return strconv.FormatInt(id, 10), nil
 }
 
 func ParseCookie(raw string) (Cookie, error) {

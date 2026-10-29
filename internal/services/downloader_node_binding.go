@@ -123,12 +123,72 @@ func (s *DownloaderService) nodeDownloaderClientWithBinding(record models.Downlo
 		return nil, err
 	}
 	credential := nodeprotocol.DownloaderCredential{ProviderType: record.Type, BaseURL: binding.BaseURL, Username: username, Password: password, DownloaderSaveRoot: binding.DownloaderSaveRoot, NodeMountRoot: binding.NodeMountRoot}
+	scopeBytes := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%d\x00%s\x00%s\x00%s\x00%s", binding.ID, binding.Revision, binding.NodeID, binding.BaseURL, binding.DownloaderSaveRoot, binding.NodeMountRoot)))
+	scope := fmt.Sprintf("%x", scopeBytes[:])
 	return nodeclient.NewDownloaderClient(client, record.ID, binding.DownloaderSaveRoot, localRoot, taskID, func(ctx context.Context, taskID, operationKey, action string) (nodeprotocol.CredentialGrantEnvelope, error) {
-		return s.transferNodes.sealDownloaderGrant(ctx, node, binding, taskID, operationKey, action, credential)
-	})
+		scoped := credential
+		scoped.SourceKey = nodeclient.DownloaderSourceGrantKey(ctx)
+		scoped.SourceScope = nodeclient.DownloaderSourceGrantScope(ctx)
+		return s.transferNodes.sealDownloaderGrant(ctx, node, binding, taskID, operationKey, action, scoped)
+	}, scope)
 }
 
-func (s *DownloaderService) clientForTask(ctx context.Context, record models.Downloader, task models.DownloadTask, localRoot string) (downloadpkg.Client, error) {
+func (s *DownloaderService) clientForTask(ctx context.Context, record models.Downloader, task models.DownloadTask, localRoot string) (out downloadpkg.Client, resultErr error) {
+	defer func() {
+		if resultErr != nil {
+			return
+		}
+		if scoped, ok := out.(downloadpkg.TaskOperationBinder); ok {
+			if resultErr = scoped.BindTaskOperation(task.ID); resultErr != nil {
+				return
+			}
+		}
+		required := task.ContentSelectionRequired || task.BTSelectionGroupID != ""
+		if task.SourceCiphertext == "" {
+			if required {
+				resultErr = appError(CodeDownloadSourceInvalid, "精确文件选择的来源记录丢失", nil)
+			} else if legacyCompletedManifestAccess(ctx, task) {
+				out, resultErr = bindLegacyCompletedManifest(out, task)
+			}
+			return
+		}
+		var plain string
+		plain, resultErr = s.credentials.Decrypt(downloadSourcePurpose(task.ID), task.SourceCiphertext)
+		if resultErr != nil {
+			if !required && legacyCompletedManifestAccess(ctx, task) {
+				out, resultErr = bindLegacyCompletedManifest(out, task)
+			}
+			return
+		}
+		var source downloadSourceEnvelope
+		if json.Unmarshal([]byte(plain), &source) != nil {
+			resultErr = appError(CodeDownloadSourceInvalid, "下载来源记录无效", nil)
+			if !required && legacyCompletedManifestAccess(ctx, task) {
+				out, resultErr = bindLegacyCompletedManifest(out, task)
+			}
+			return
+		}
+		hasSelection := source.ContentSelection != nil || source.SelectionMode != "" || source.ContentSelectionDigest != ""
+		if required != hasSelection {
+			resultErr = appError(CodeDownloadSourceInvalid, "精确文件选择标记与来源记录不一致，已阻止整包访问", nil)
+			return
+		}
+		if resultErr = validateStoredContentSelection(source); resultErr != nil {
+			return
+		}
+		if source.ContentSelection != nil {
+			frozen := downloadpkg.Source{Kind: source.Kind, URL: source.URL, Torrent: source.Torrent, ContentSelection: source.ContentSelection, AllFilesVerified: source.SelectionMode == "verified_all"}
+			if source.SelectionMode == "verified_all" && s.verifiedAllExecutor(record, frozen) {
+				out, resultErr = downloadpkg.BindVerifiedAll(out, frozen)
+			} else if task.BTSelectionGroupID != "" {
+				out, resultErr = s.bindBTSelectionGroup(out, record, task, frozen)
+			} else {
+				out, resultErr = downloadpkg.BindSelection(out, frozen, task.ProviderTag)
+			}
+		} else if legacyCompletedManifestAccess(ctx, task) {
+			out, resultErr = bindLegacyCompletedManifest(out, task)
+		}
+	}()
 	taskLocation := normalizeExecutionLocation(task.ExecutionLocation)
 	if taskLocation != normalizeExecutionLocation(record.ExecutionLocation) {
 		return nil, appError(CodeDownloaderUnavailable, "下载任务冻结的运行位置与下载器当前配置不一致", nil)
@@ -150,7 +210,11 @@ func (s *DownloaderService) clientForTask(ctx context.Context, record models.Dow
 		if isCloudShareDownloader(record.Type) {
 			return s.nodeStorageSourceClient(ctx, record, task)
 		}
-		return s.nodeDownloaderClientWithBinding(record, binding, localRoot, task.ID)
+		remote, err := s.nodeDownloaderClientWithBinding(record, binding, localRoot, task.ID)
+		if err == nil && task.BTSelectionGroupID != "" {
+			err = remote.SetSelectionGroupWorkspace(task.BTSelectionGroupID)
+		}
+		return remote, err
 	}
 	if record.Type == models.DownloaderTypeQuarkShare && task.StagingProviderDirectoryID != "" {
 		if task.StagingStorageID == nil || record.StorageID == nil || *task.StagingStorageID != *record.StorageID {

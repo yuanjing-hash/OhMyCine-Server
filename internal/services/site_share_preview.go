@@ -435,15 +435,21 @@ func (s *SiteService) submitShareSelection(ctx context.Context, actor Actor, pre
 	planRaw, _ := json.Marshal([]any{actor.User.ID, input.DownloaderID, input.MediaLibraryID, input.ProfileID, digest})
 	planHash := sha256.Sum256(planRaw)
 	planDigest := hex.EncodeToString(planHash[:])
-	s.vaultMu.Lock()
-	preview, ok := s.sharePreviews[previewToken]
-	if !ok || (preview.SubmissionDigest != "" && preview.SubmissionDigest != planDigest) {
+	if strings.HasPrefix(previewToken, "selection-") {
+		if err := s.reserveContentSubmission(actor, previewToken, planDigest); err != nil {
+			return DownloadTaskSummary{}, err
+		}
+	} else {
+		s.vaultMu.Lock()
+		preview, ok := s.sharePreviews[previewToken]
+		if !ok || (preview.SubmissionDigest != "" && preview.SubmissionDigest != planDigest) {
+			s.vaultMu.Unlock()
+			return DownloadTaskSummary{}, appError(CodeInvalidRequest, "本次预览已提交其他选择，请保持原选择重试，或重新预览", nil)
+		}
+		preview.SubmissionDigest = planDigest
+		s.sharePreviews[previewToken] = preview
 		s.vaultMu.Unlock()
-		return DownloadTaskSummary{}, appError(CodeInvalidRequest, "本次预览已提交其他选择，请保持原选择重试，或重新预览", nil)
 	}
-	preview.SubmissionDigest = planDigest
-	s.sharePreviews[previewToken] = preview
-	s.vaultMu.Unlock()
 	results := []DownloadTaskSummary{}
 	var lastErr error
 	pending := 0
@@ -472,7 +478,7 @@ func (s *SiteService) submitShareSelection(ctx context.Context, actor Actor, pre
 		child := input
 		child.Source.ShareSelection = &group
 		child.DisplayName = path.Base(group.Files[0].RelativePath)
-		if input.FollowSubscriptionID == "" {
+		if input.FollowSubscriptionID == "" && !input.PreserveExistingVersions {
 			child.RecognitionOverride = nil
 		}
 		created, err := s.downloads.submit(ctx, actor.User.ID, child, request, models.DownloadSourceOriginShare, key, "")

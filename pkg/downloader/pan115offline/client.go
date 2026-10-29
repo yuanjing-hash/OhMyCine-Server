@@ -5,13 +5,14 @@ import (
 	"errors"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/downloader"
 )
 
-var Capabilities = downloader.Capabilities{Cancel: true, DeleteData: true, DownloadSpeed: false, UploadSpeed: false, ETA: true, NativeOffline: true, ShareReceive: true, OutputConstraint: downloader.OutputConstraintProviderStorage}
+var Capabilities = downloader.Capabilities{SelectiveFiles: true, Cancel: true, DeleteData: true, DownloadSpeed: false, UploadSpeed: false, ETA: true, NativeOffline: true, ShareReceive: true, OutputConstraint: downloader.OutputConstraintProviderStorage}
 
 const (
 	maxStorageParentDepth       = 128
@@ -19,9 +20,11 @@ const (
 )
 
 type Client struct {
-	driver      cloud.NativeOfflineDriver
-	rootID      string
-	directoryID string
+	scopeMu        sync.Mutex
+	operationScope string
+	driver         cloud.NativeOfflineDriver
+	rootID         string
+	directoryID    string
 }
 
 func New(config downloader.Config) (downloader.Client, error) {
@@ -42,6 +45,9 @@ func (c *Client) Test(ctx context.Context) (downloader.Health, error) {
 }
 
 func (c *Client) Submit(ctx context.Context, request downloader.SubmitRequest) (downloader.Task, error) {
+	if request.Source.ContentSelection != nil {
+		return c.submitSelected(ctx, request)
+	}
 	if request.MetadataOnly {
 		return downloader.Task{}, downloader.Error("downloader_source_unsupported", false, nil)
 	}
@@ -69,6 +75,10 @@ func (c *Client) Submit(ctx context.Context, request downloader.SubmitRequest) (
 	tag := strings.TrimSpace(request.Tag)
 	if !validTaskTag(tag) {
 		return downloader.Task{}, downloader.Error("downloader_source_invalid", false, errors.New("offline task tag is invalid"))
+	}
+	ctx, err = c.taskOperationContext(ctx, tag)
+	if err != nil {
+		return downloader.Task{}, err
 	}
 	taskRoot, err := c.ensureTaskDirectory(ctx, mutations, c.directoryID, tag)
 	if err != nil {
@@ -335,6 +345,9 @@ func (c *Client) itemWithinDirectory(ctx context.Context, itemID, directoryID st
 }
 
 func (c *Client) Get(ctx context.Context, id string) (downloader.Task, error) {
+	if selectedTask(id) {
+		return downloader.Task{}, downloader.Error("downloader_selection_required", false, nil)
+	}
 	if prefix, itemID, ok := providerDirectoryTask(id); ok {
 		item, err := c.driver.Stat(ctx, itemID)
 		if err != nil {
@@ -353,6 +366,9 @@ func (c *Client) Get(ctx context.Context, id string) (downloader.Task, error) {
 }
 
 func (c *Client) Manifest(ctx context.Context, id string) (downloader.Manifest, error) {
+	if selectedTask(id) {
+		return downloader.Manifest{}, downloader.Error("downloader_selection_required", false, nil)
+	}
 	if _, itemID, ok := providerDirectoryTask(id); ok {
 		return c.manifestFromItem(ctx, itemID)
 	}
@@ -447,6 +463,9 @@ func (c *Client) Resume(context.Context, string) error {
 }
 
 func (c *Client) Cancel(ctx context.Context, id string, deleteData bool) error {
+	if selectedTask(id) {
+		return downloader.Error("downloader_selection_required", false, nil)
+	}
 	if _, itemID, ok := providerDirectoryTask(id); ok {
 		if !deleteData {
 			return nil
@@ -457,7 +476,11 @@ func (c *Client) Cancel(ctx context.Context, id string, deleteData bool) error {
 		}
 		return mapError(mutations.Recycle(ctx, itemID))
 	}
-	return mapError(c.driver.CancelOffline(ctx, id, deleteData))
+	scoped, err := c.taskOperationContext(ctx, "")
+	if err != nil {
+		return err
+	}
+	return mapError(c.driver.CancelOffline(scoped, id, deleteData))
 }
 
 func providerDirectoryTask(id string) (string, string, bool) {

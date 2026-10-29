@@ -157,6 +157,9 @@ func (s *SeedingService) SetStagingCleanup(cleanup func(context.Context, string,
 // removed without asking the provider to delete data. Copy/symlink continue
 // through durable seeding management.
 func (s *SeedingService) AfterTransfer(ctx context.Context, download models.DownloadTask) error {
+	if download.BTSelectionGroupID != "" {
+		return s.Enqueue(download)
+	}
 	if normalizeExecutionLocation(download.ExecutionLocation) == models.NodeLocationRemote {
 		// Node downloads are copied over the data plane even when the final local
 		// organization mode is move. The original bytes still back qB seeding and
@@ -198,7 +201,7 @@ func (s *SeedingService) AfterTransfer(ctx context.Context, download models.Down
 // that no unselected video or unmatched subtitle needs conservative retention.
 func (s *SeedingService) Enqueue(download models.DownloadTask) error {
 	remote := normalizeExecutionLocation(download.ExecutionLocation) == models.NodeLocationRemote
-	if !remote && download.TransferMode != models.MediaLibraryTransferCopy && download.TransferMode != models.MediaLibraryTransferSymlink {
+	if download.BTSelectionGroupID == "" && !remote && download.TransferMode != models.MediaLibraryTransferCopy && download.TransferMode != models.MediaLibraryTransferSymlink {
 		return nil
 	}
 	if download.DownloaderID == nil || download.ProviderTaskID == "" {
@@ -222,6 +225,9 @@ func (s *SeedingService) Enqueue(download models.DownloadTask) error {
 	}
 	now, id := time.Now().UTC(), uuid.NewString()
 	deleteData := (remote || download.TransferMode == models.MediaLibraryTransferCopy) && s.transferAllowsWholePackageCleanup(download.ID)
+	if download.BTSelectionGroupID != "" {
+		deleteData = false
+	}
 	record := models.SeedingTask{ID: id, OwnerID: download.OwnerID, DownloadTaskID: download.ID, ExecutionLocation: normalizeExecutionLocation(download.ExecutionLocation), NodeID: download.NodeID, NodeName: download.NodeName, DownloaderID: download.DownloaderID, DownloaderName: download.DownloaderName, ProviderType: download.ProviderType, ProviderTaskID: download.ProviderTaskID, TransferMode: download.TransferMode, DeleteData: deleteData, CleanupEnabled: download.SeedingCleanupEnabled, MinimumSeedMinutes: download.SeedingMinimumMinutes, MinimumRatio: download.SeedingMinimumRatio, CompletionMode: download.SeedingCompletionMode, Phase: models.SeedingTaskStatusQueued, CreatedAt: now, UpdatedAt: now}
 	_, err = s.queue.EnqueueWith(EnqueueJobInput{OwnerID: download.OwnerID, JobType: "seeding", DisplayName: "做种：" + download.DisplayName, Provider: download.ProviderType, ResourceKey: "downloader:" + *download.DownloaderID, Payload: seedingJobPayload{SeedingTaskID: id}}, func(tx *gorm.DB, job models.Job) error {
 		record.JobID = job.ID
@@ -420,6 +426,14 @@ func seedingProgressMessage(task models.SeedingTask) string {
 }
 
 func (s *SeedingService) enforceSafeDeleteData(task *models.SeedingTask) {
+	if task != nil && task.DeleteData {
+		var download models.DownloadTask
+		if s.db.Select("bt_selection_group_id").First(&download, "id = ?", task.DownloadTaskID).Error == nil && download.BTSelectionGroupID != "" {
+			task.DeleteData = false
+			_ = s.db.Model(&models.SeedingTask{}).Where("id = ?", task.ID).Update("delete_data", false).Error
+			return
+		}
+	}
 	if task == nil || !task.DeleteData || s.transferAllowsWholePackageCleanup(task.DownloadTaskID) {
 		return
 	}
@@ -514,6 +528,9 @@ func (w *SeedingWorker) Run(ctx context.Context, _ JobRuntime, job ClaimedJob) W
 		return w.fail(task, "seeding_download_missing", "原下载任务不存在", ctx)
 	}
 	ctx = serverlog.WithBusinessFields(ctx, map[string]any{"resource_name": download.DisplayName})
+	if download.BTSelectionGroupID != "" {
+		return w.runSelectionGroupSeeding(ctx, task, download)
+	}
 	if task.LastSampledAt == nil {
 		serverlog.RecordBusiness(ctx, w.service.log, serverlog.OperationSeedingManagement, serverlog.BusinessEvent{Code: "seeding.start", Stage: "monitor", Outcome: "started", Message: "开始检查“" + serverlog.BusinessDisplayName(download.DisplayName) + "”在下载器“" + serverlog.BusinessDisplayName(task.DownloaderName) + "”的做种状态"})
 	}

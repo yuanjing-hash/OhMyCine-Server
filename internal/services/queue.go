@@ -1334,7 +1334,7 @@ func (s *QueueService) finishLease(id, token, status, code, message string, next
 // the ordinary bounded failure budget. Empty-code retry_at is scheduled work.
 func retryWaitConsumesFailureBudget(code string) bool {
 	switch strings.TrimSpace(code) {
-	case "", "pan115_auth_expired", "pan115_cookie_invalid", "credentials_required", "media_library_not_ready", "download_tracking_persist_wait", quarkReorganizationPending, quarkStructurePending:
+	case "", "pan115_auth_expired", "pan115_cookie_invalid", "credentials_required", "media_library_not_ready", "download_tracking_persist_wait", quarkReorganizationPending, quarkStructurePending, CodeMediaUpgradePending, CodeMediaUpgradeSeedingBusy, "media_upgrade_artifacts_pending":
 		return false
 	default:
 		return true

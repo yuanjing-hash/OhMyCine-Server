@@ -20,16 +20,18 @@ import (
 const (
 	VersionV1 = 1
 
-	CapabilityQBittorrentControl = "qbittorrent_control"
-	CapabilityPan115Offline      = "pan115_offline"
-	CapabilityPan115ShareReceive = "pan115_share_receive"
-	CapabilityPan115Read         = "pan115_read"
-	CapabilityPan115Upload       = "pan115_upload"
-	CapabilityQuarkReadV2        = "quark_tv_read_v2"
-	CapabilityQuarkUploadV2      = "quark_agent_upload_v2"
-	CapabilityQuarkShareV2       = "quark_share_receive_v2"
-	CapabilityContentDigestV2    = "content_digest_v2"
-	CapabilityRangeExport        = "range_export"
+	CapabilityQBittorrentControl    = "qbittorrent_control"
+	CapabilitySelectiveFilesV1      = "selective_files_v1"
+	CapabilitySelectiveFilesUnionV1 = "selective_files_union_v1"
+	CapabilityPan115Offline         = "pan115_offline"
+	CapabilityPan115ShareReceive    = "pan115_share_receive"
+	CapabilityPan115Read            = "pan115_read"
+	CapabilityPan115Upload          = "pan115_upload"
+	CapabilityQuarkReadV2           = "quark_tv_read_v2"
+	CapabilityQuarkUploadV2         = "quark_agent_upload_v2"
+	CapabilityQuarkShareV2          = "quark_share_receive_v2"
+	CapabilityContentDigestV2       = "content_digest_v2"
+	CapabilityRangeExport           = "range_export"
 
 	OperationPending   = "pending"
 	OperationRunning   = "running"

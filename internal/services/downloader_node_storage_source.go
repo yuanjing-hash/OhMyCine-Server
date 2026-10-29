@@ -115,7 +115,13 @@ func (s *DownloaderService) nodeStorageSourceClient(ctx context.Context, record 
 			return s.transferNodes.sealStorageSourceGrant(callCtx, nodeRecord, sourceStorage, task.ID, operationKey, actions, uri)
 		},
 		func(callCtx context.Context, remote nodeprotocol.OperationResponse, action *nodeprotocol.StorageSourceActionResponse) error {
-			return s.observeNodeStorageSource(callCtx, task.ID, remote, action)
+			if err := s.observeNodeStorageSource(callCtx, task.ID, remote, action); err != nil {
+				return err
+			}
+			if sourceKind == nodeprotocol.StorageSourceKindPan115OfflineMagnet && action != nil && action.Status == nodeprotocol.StorageSourceCompleted {
+				return s.completeNodeOfflineAccess(callCtx, sourceStorage, task.ID, remote.OperationKey, sourceURI)
+			}
+			return nil
 		})
 }
 
@@ -361,6 +367,23 @@ func (s *TransferNodeService) sealStorageSourceGrant(ctx context.Context, node m
 	if err != nil {
 		return nodeprotocol.CredentialGrantEnvelope{}, appError(CodeConnectionUnavailable, "来源 115 凭据不可用", err)
 	}
+	if _, submit := seen[nodeprotocol.StorageSourceGrantOfflineSubmit]; submit {
+		guard, err := credentialOfflineGuard(s.db, s.credentials, connection, cookie, nil)
+		if err != nil {
+			return nodeprotocol.CredentialGrantEnvelope{}, err
+		}
+		if err := guard.BeginOfflineAccess(ctx, nodeOfflineAccess(taskID, operationKey, sourceURI)); err != nil {
+			return nodeprotocol.CredentialGrantEnvelope{}, err
+		}
+	} else if _, status := seen[nodeprotocol.StorageSourceGrantOfflineStatus]; status {
+		guard, err := credentialOfflineGuard(s.db, s.credentials, connection, cookie, nil)
+		if err != nil {
+			return nodeprotocol.CredentialGrantEnvelope{}, err
+		}
+		if err := guard.BeginOfflineAccess(ctx, nodeOfflineAccess(taskID, operationKey, sourceURI)); err != nil {
+			return nodeprotocol.CredentialGrantEnvelope{}, err
+		}
+	}
 	raw, err := json.Marshal(nodeprotocol.StorageSourceCredential{ProviderType: nodeprotocol.StorageProviderPan115, Cookie: cookie, SourceURI: sourceURI})
 	if err != nil {
 		return nodeprotocol.CredentialGrantEnvelope{}, err
@@ -375,7 +398,16 @@ func (s *TransferNodeService) sealStorageSourceGrant(ctx context.Context, node m
 	}
 	storageID := storage.ID
 	record := models.NodeCredentialGrant{ID: grantID, NodeID: node.ID, TaskID: taskID, OperationKey: operationKey, StorageID: &storageID, CredentialRevision: connection.Revision, ExpiresAt: grant.ExpiresAt, CreatedAt: now}
-	if err := s.db.WithContext(ctx).Create(&record).Error; err != nil {
+	if err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var current models.Connection
+		if err := tx.Select("id", "revision", "enabled", "provider", "account_id", "credential_ciphertext").First(&current, connection.ID).Error; err != nil {
+			return err
+		}
+		if !current.Enabled || current.Provider != connection.Provider || current.Revision != connection.Revision || current.AccountID != connection.AccountID || current.CredentialCiphertext != connection.CredentialCiphertext {
+			return appError(CodeConnectionUnavailable, "115 授权范围已变化", nil)
+		}
+		return tx.Create(&record).Error
+	}); err != nil {
 		return nodeprotocol.CredentialGrantEnvelope{}, err
 	}
 	return envelope, nil

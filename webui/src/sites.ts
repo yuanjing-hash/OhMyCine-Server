@@ -52,6 +52,7 @@ export function normalizeCloudSiteConfig(value?: CloudSiteConfig): CloudSiteConf
   }
 }
 export function resultSiteType(item: Pick<PTSearchResult, 'source_kind' | 'result_type'>, fallback: PTSearchGroup['site_type']): PTSearchGroup['site_type'] {
+  if (fallback === 'pt' || item.source_kind === 'pt') return 'pt'
   if (fallback !== 'cloud_share') return fallback
   if (item.source_kind === 'bt' || item.result_type === 'magnet') return 'bt'
   if (item.source_kind === '115_share' || item.source_kind === 'quark_share' || item.result_type && item.result_type !== 'magnet') return 'cloud_share'
@@ -60,12 +61,45 @@ export function resultSiteType(item: Pick<PTSearchResult, 'source_kind' | 'resul
 export function siteEffectiveEnabled(site: Pick<SiteSummary, 'enabled' | 'effective_enabled'>) {
   return site.enabled && site.effective_enabled !== false
 }
-export function resultTypeLabel(item: Pick<PTSearchResult, 'result_type' | 'source_kind' | 'cloud_provider'>, fallback = '资源') {
+export function resultTypeLabel(item: Pick<PTSearchResult, 'payload_kind' | 'result_type' | 'source_kind' | 'cloud_provider'>, fallback = '资源') {
   if (item.result_type) return discoveryTypeLabel(item.result_type)
   if (item.cloud_provider) return discoveryTypeLabel(item.cloud_provider)
   if (item.source_kind === '115_share') return '115'
   if (item.source_kind === 'quark_share') return '夸克'
-  return item.source_kind === 'bt' ? '磁力' : fallback
+  if (item.payload_kind === 'magnet') return '磁力'
+  if (item.payload_kind === 'torrent') return 'BT 种子'
+  return item.source_kind === 'bt' ? '公共 BT' : fallback
+}
+
+export type ResourcePayloadKind = 'torrent' | 'magnet' | 'share' | 'unknown'
+export const torrentResourceTypeOptions = [['pt', 'PT'], ['torrent', 'BT 种子'], ['magnet', '磁力'], ['115', '115'], ['quark', '夸克']] as const
+
+export function resultPayloadKind(item: Pick<PTSearchResult, 'payload_kind' | 'result_type' | 'source_kind'>): ResourcePayloadKind {
+  if (item.payload_kind === 'torrent' || item.payload_kind === 'magnet' || item.payload_kind === 'share') return item.payload_kind
+  if (item.result_type === 'magnet' || item.result_type === 'torrent') return item.result_type
+  if (item.source_kind === '115_share' || item.source_kind === 'quark_share' || item.result_type === '115' || item.result_type === 'quark') return 'share'
+  return 'unknown'
+}
+
+export function resultMatchesResourceTypes(item: PTSearchResult, siteType: PTSearchGroup['site_type'], selected: readonly string[]) {
+  if (!selected.length) return true
+  const privatePT = resultSiteType(item, siteType) === 'pt'
+  const payload = resultPayloadKind(item)
+  return selected.some(type => {
+    if (type === 'pt') return privatePT
+    if (type === 'torrent') return !privatePT && payload === 'torrent'
+    if (type === 'magnet') return payload === 'magnet'
+    if (type === '115') return item.source_kind === '115_share' || !item.source_kind && item.result_type === '115'
+    if (type === 'quark') return item.source_kind === 'quark_share' || !item.source_kind && item.result_type === 'quark'
+    return item.result_type === type
+  })
+}
+
+export function resultPreviewSourceKind(item: PTSearchResult, recommended?: string) {
+  if (recommended === 'url' || recommended === 'torrent' || recommended === '115_share' || recommended === 'quark_share') return recommended
+  if (item.source_kind === '115_share' || item.source_kind === 'quark_share') return item.source_kind
+  if (item.source_kind === 'pt') return 'torrent'
+  return resultPayloadKind(item) === 'magnet' ? 'url' : 'torrent'
 }
 export function safeDiscoveryPostURL(value?: string) {
   return value && /^https:\/\/t\.me\/[A-Za-z0-9_]{3,64}\/[1-9]\d{0,19}$/.test(value) ? value : undefined
@@ -194,12 +228,14 @@ export interface CookieCloudSyncIssue {
 }
 
 export interface PTSearchResult {
+	content_inspection?: boolean
   share_validation?: ShareValidation
   source_kind?: string
   cloud_provider?: string
   channel?: string
   post_url?: string
   result_type?: string
+  payload_kind?: ResourcePayloadKind
   origins?: DiscoveryOrigin[]
   acquisition_available?: boolean
   acquisition_reason?: string
@@ -485,7 +521,7 @@ export function filterAndSortTorrentResults(groups: readonly PTSearchGroup[], fi
   return scoped
     .flatMap(group => group.items.map(item => ({ item, group })))
     .filter(({ group, item }) => filters.enabledSiteTypes.includes(resultSiteType(item, group.site_type)))
-    .filter(({ item }) => !filters.resultTypes?.length || !item.result_type || filters.resultTypes.includes(item.result_type))
+    .filter(({ item, group }) => resultMatchesResourceTypes(item, group.site_type, filters.resultTypes ?? []))
     .filter(({ item }) => !resolution || item.specifications?.resolution === resolution || item.quality === resolution)
     .filter(({ item, group }) => resultSiteType(item, group.site_type) === 'cloud_share' || !promotion || item.promotion?.toLowerCase() === promotion)
     .filter(({ item, group }) => resultSiteType(item, group.site_type) === 'cloud_share' || filters.minimumSeeders == null || (item.seeders ?? -1) >= filters.minimumSeeders)

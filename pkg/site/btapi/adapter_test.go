@@ -29,7 +29,7 @@ func TestYTSAndEZTVAPISearchProducePrivateMagnetIdentities(t *testing.T) {
 			adapter := NewForTest(test.kind, test.profile, server.Client(), server.URL)
 			adapter.profile.AllowedHosts = append(adapter.profile.AllowedHosts, requestHost(t, server.URL))
 			page, err := adapter.Search(context.Background(), site.Config{BaseURL: server.URL}, site.Query{Keyword: test.keyword, Page: 1})
-			if err != nil || len(page.Items) != 1 || page.Items[0].TorrentID == "" || page.Items[0].Seeders == nil || page.Items[0].SizeBytes == 0 {
+			if err != nil || len(page.Items) != 1 || page.Items[0].TorrentID == "" || page.Items[0].PayloadKind != site.PayloadMagnet || page.Items[0].Seeders == nil || page.Items[0].SizeBytes == 0 {
 				t.Fatalf("page=%+v err=%v", page, err)
 			}
 			source, err := adapter.ResolveSource(context.Background(), site.Config{}, page.Items[0].TorrentID)

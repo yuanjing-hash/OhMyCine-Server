@@ -59,7 +59,7 @@ func TestMigrationReleased118To122PreservesAuthorizationHistoryAndConfiguration(
 			}
 		}
 		var versions []int
-		if err := db.Table("schema_migrations").Where("version >= ?", 116).Order("version").Pluck("version", &versions).Error; err != nil || !reflect.DeepEqual(versions, []int{116, 117, 118, 119, 120, 121, 122}) {
+		if err := db.Table("schema_migrations").Where("version >= ?", 116).Order("version").Pluck("version", &versions).Error; err != nil || !reflect.DeepEqual(versions, []int{116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126}) {
 			t.Fatalf("released migration identities lost or new ones repeated: %v %v", versions, err)
 		}
 		for _, model := range []any{&models.ProviderObservationScope{}, &models.ProviderObservationBatch{}, &models.ProviderObservationItem{}} {

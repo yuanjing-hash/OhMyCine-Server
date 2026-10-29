@@ -35,6 +35,7 @@ type followCandidate struct {
 	EpisodeBoundsDeclared bool
 	Fingerprint           string
 	QualityRank           int
+	SubtitleRank          int
 }
 
 type FollowSearchWorker struct {
@@ -213,9 +214,20 @@ func (w *FollowSearchWorker) Run(ctx context.Context, runtime JobRuntime, job Cl
 	submitFailures := 0
 	lastSubmitMessage := ""
 	pool := append([]followCandidate(nil), candidates...)
+	ready := []preparedFollowCandidate{}
+	preparationTokens := map[string]struct{}{}
+	defer func() {
+		for token := range preparationTokens {
+			// A candidate popped for submission can still fail a fresh readiness,
+			// route or permission check. Retire all unused preparations, not only
+			// those left in the ready list; reserved unknown handoffs stay pinned.
+			w.sites.discardContentPreparation(actor, token)
+		}
+	}()
 	prepareCtx, stopPreparation := context.WithTimeout(ctx, followCandidatePreparationTimeout)
 	defer stopPreparation()
-	for attempted := 0; submitted < snapshot.MaxResourcesPerRun; attempted++ {
+	attempted := 0
+	for submitted < snapshot.MaxResourcesPerRun {
 		// The final failed preparation can exhaust the pool. Preserve a stop
 		// that occurred during that read before treating exhaustion as no match.
 		if ctx.Err() != nil {
@@ -225,20 +237,69 @@ func (w *FollowSearchWorker) Run(ctx context.Context, runtime JobRuntime, job Cl
 		if err != nil || !followRunExecutable(current, run.LifecycleRevision) {
 			return w.stopRun(run, models.FollowRunCancelled, "follow_inactive", "订阅已暂停或删除")
 		}
-		selected := selectFollowCandidates(pool, missing, 1)
-		if len(selected) == 0 {
-			break
+		if len(ready) == 0 && len(pool) > 0 && attempted < maxFollowCandidateAttempts && prepareCtx.Err() == nil {
+			window := min(len(pool), maxFollowCandidateAttempts-attempted)
+			batch := append([]followCandidate(nil), pool[:window]...)
+			pool = pool[window:]
+			attempted += window
+			prepared := w.prepareFollowCandidates(prepareCtx, actor, snapshot, batch, missing)
+			for _, item := range prepared {
+				if item.ContentSelectionToken != "" {
+					preparationTokens[item.ContentSelectionToken] = struct{}{}
+				}
+				if item.Err != nil {
+					if ErrorCode(item.Err) == codeContentNoMissingFiles {
+						filterSummary["no_missing_coverage"]++
+						if isCloudShareSource(item.Candidate.Item.SourceKind) {
+							filterSummary["share_selection_failed"]++
+						}
+						w.record(ctx, "follow.content_no_missing_files", "selection", "skipped", "已完整检查，该资源没有符合本次缺集及字幕策略的实际文件", nil)
+						continue
+					}
+					submitFailures++
+					filterSummary["content_preparation_failed"]++
+					filterSummary["submit_failed"]++
+					if isCloudShareSource(item.Candidate.Item.SourceKind) {
+						filterSummary["share_selection_failed"]++
+					}
+					lastSubmitMessage = safeErrorMessage(item.Err, "资源实际文件或入库路线未能核实")
+					w.sites.discardContentPreparation(actor, item.ContentSelectionToken)
+					w.record(ctx, "follow.content_preparation_failed", "selection", "failed", "实际文件、缺集、字幕或路线未能核实，继续检查其他候选", map[string]any{"error_code": ErrorCode(item.Err), "site_id": item.Candidate.SiteID})
+				} else {
+					ready = append(ready, item)
+				}
+			}
+			// Always re-check cancellation/lifecycle after the bounded read batch.
+			continue
 		}
-		if attempted >= maxFollowCandidateAttempts || prepareCtx.Err() != nil && ctx.Err() == nil {
-			filterSummary["candidate_budget"]++
-			submitFailures++
-			lastSubmitMessage = "本轮资源核验已达到预算，剩余候选将在后续追更中重新检查"
+		preparedCandidates := make([]followCandidate, 0, len(ready))
+		for _, item := range ready {
+			preparedCandidates = append(preparedCandidates, item.Candidate)
+		}
+		selected := selectFollowCandidates(preparedCandidates, missing, 1)
+		if len(selected) == 0 {
+			if len(ready) > 0 {
+				for _, item := range ready {
+					w.sites.discardContentPreparation(actor, item.ContentSelectionToken)
+				}
+				ready = nil
+				if len(pool) > 0 && attempted < maxFollowCandidateAttempts && prepareCtx.Err() == nil {
+					continue
+				}
+			}
+			if len(pool) > 0 && (attempted >= maxFollowCandidateAttempts || prepareCtx.Err() != nil && ctx.Err() == nil) {
+				filterSummary["candidate_budget"]++
+				submitFailures++
+				lastSubmitMessage = "本轮资源核验已达到预算，剩余候选将在后续追更中重新检查"
+			}
 			break
 		}
 		candidate := selected[0]
-		for index, item := range pool {
-			if item.Fingerprint == candidate.Fingerprint && item.Season == candidate.Season {
-				pool = append(pool[:index], pool[index+1:]...)
+		var prepared preparedFollowCandidate
+		for index, item := range ready {
+			if item.Candidate.Fingerprint == candidate.Fingerprint && item.Candidate.Season == candidate.Season {
+				prepared = item
+				ready = append(ready[:index], ready[index+1:]...)
 				break
 			}
 		}
@@ -261,6 +322,20 @@ func (w *FollowSearchWorker) Run(ctx context.Context, runtime JobRuntime, job Cl
 			w.record(candidateCtx, "follow.coverage_changed", "selection", "skipped", "该资源已不覆盖本轮剩余缺集，未提交下载", nil)
 			continue
 		}
+		if candidate.Item.ContentInspection && len(episodes) != len(candidate.Episodes) {
+			w.sites.discardContentPreparation(actor, prepared.ContentSelectionToken)
+			refined, refineErr := w.sites.prepareFollowContent(prepareCtx, actor, candidate.Item.Token, candidate.Season, episodes, effectiveSubtitlePolicy(snapshot.Filters.Subtitles))
+			if refineErr != nil {
+				submitFailures++
+				filterSummary["content_preparation_failed"]++
+				lastSubmitMessage = safeErrorMessage(refineErr, "本次剩余缺集文件核验失败")
+				continue
+			}
+			prepared.ContentSelectionToken, prepared.UnconfirmedSubtitles = refined.SelectionToken, refined.UnconfirmedSubtitles
+			preparationTokens[refined.SelectionToken] = struct{}{}
+			episodes = refined.Episodes
+			candidate.Fingerprint = followFingerprint(candidate.SiteID, fmt.Sprintf("%s:%d:%v:%s", candidate.Item.ResourceFingerprint, candidate.Season, episodes, refined.Digest), 0, nil)
+		}
 		libraryID := snapshot.MediaLibraryID
 		// Search may outlive an authorization edit. Each new resource submission
 		// uses the owner's current authority; accepted tasks retain their plan.
@@ -268,7 +343,7 @@ func (w *FollowSearchWorker) Run(ctx context.Context, runtime JobRuntime, job Cl
 		if err != nil {
 			return w.block(run, subscription, CodePermissionDenied, "订阅用户或权限不可用")
 		}
-		recommendation, routeErr := w.sites.RecommendSiteRoute(prepareCtx, actor, SourceRouteRecommendationInput{ResultToken: candidate.Item.Token, MediaLibraryID: &libraryID})
+		recommendation, routeErr := w.sites.RecommendSiteRoute(prepareCtx, actor, SourceRouteRecommendationInput{ResultToken: candidate.Item.Token, MediaLibraryID: &libraryID, ContentSelectionToken: prepared.ContentSelectionToken})
 		if routeErr != nil || recommendation.Recommended == nil {
 			submitFailures++
 			filterSummary["submit_failed"]++
@@ -279,19 +354,9 @@ func (w *FollowSearchWorker) Run(ctx context.Context, runtime JobRuntime, job Cl
 			w.record(candidateCtx, "follow.route_unavailable", "route", "failed", "资源未提交：没有可用的下载器与目标媒体库路线", map[string]any{"error_code": ErrorCode(routeErr)})
 			continue
 		}
-		previewToken := ""
-		var selectedEntryTokens []string
-		if isCloudShareSource(candidate.Item.SourceKind) {
-			var selectionDigest string
-			previewToken, selectedEntryTokens, episodes, selectionDigest, err = w.sites.prepareFollowShare(prepareCtx, actor, candidate.Item.Token, recommendation.Recommended.DownloaderID, candidate.Season, episodes, candidate.Item.Title)
-			if err != nil {
-				submitFailures++
-				filterSummary["share_selection_failed"]++
-				lastSubmitMessage = safeErrorMessage(err, "无法核实分享中的本次缺集文件")
-				w.record(candidateCtx, "follow.share_selection_failed", "selection", "failed", "分享未能核实本次缺集文件，继续核对其他候选", map[string]any{"error_code": ErrorCode(err)})
-				continue
-			}
-			candidate.Fingerprint = followFingerprint(candidate.SiteID, fmt.Sprintf("%s:%d:%v:%s", candidate.Fingerprint, candidate.Season, episodes, selectionDigest), 0, nil)
+		if prepared.UnconfirmedSubtitles > 0 {
+			filterSummary["subtitle_unconfirmed"] += prepared.UnconfirmedSubtitles
+			w.record(candidateCtx, "follow.subtitle_unconfirmed", "selection", "confirmed", "已按字幕偏好筛选；部分视频没有已确认的对应字幕，按当前优先策略继续下载", map[string]any{"unconfirmed_count": prepared.UnconfirmedSubtitles})
 		}
 		claimed, recovering, err := w.reserveEpisodes(run, subscription.ID, candidate, episodes)
 		if err != nil || !claimed {
@@ -331,7 +396,7 @@ func (w *FollowSearchWorker) Run(ctx context.Context, runtime JobRuntime, job Cl
 			}
 			submitCtx := serverlog.WithBusinessFields(candidateCtx, map[string]any{"downloader_id": downloaderID, "downloader_name": downloaderName, "library_name": libraryName})
 			w.record(submitCtx, "follow.route", "route", "planned", fmt.Sprintf("选择资源 %s，下载器：%s，目标媒体库：%s；%s，覆盖本轮 %d 集", serverlog.BusinessDisplayName(candidate.Item.Title), serverlog.BusinessDisplayName(downloaderName), serverlog.BusinessDisplayName(libraryName), serverlog.BusinessDisplayName(routeLabel), len(episodes)), map[string]any{"episode_count": len(episodes)})
-			download, err = w.sites.Download(submitCtx, actor, SiteDownloadInput{PreviewToken: previewToken, SelectedEntryTokens: selectedEntryTokens, ResultToken: candidate.Item.Token, DownloaderID: downloaderID, MediaLibraryID: &libraryID, Priority: snapshot.DownloadPriority, FollowSubscriptionID: subscription.ID, FollowResourceFingerprint: candidate.Fingerprint, Season: &season, Episode: singleEpisode, BeforeSubmit: func() error {
+			download, err = w.sites.Download(submitCtx, actor, SiteDownloadInput{ContentSelectionToken: prepared.ContentSelectionToken, PreviewToken: prepared.PreviewToken, SelectedEntryTokens: prepared.SelectedEntryTokens, ResultToken: candidate.Item.Token, DownloaderID: downloaderID, MediaLibraryID: &libraryID, Priority: snapshot.DownloadPriority, FollowSubscriptionID: subscription.ID, FollowResourceFingerprint: candidate.Fingerprint, Season: &season, Episode: singleEpisode, BeforeSubmit: func() error {
 				current, currentErr := w.currentSubscription(subscription.ID)
 				if currentErr != nil || !followRunExecutable(current, run.LifecycleRevision) {
 					return appError(CodeConflict, "订阅已暂停或删除", currentErr)
@@ -464,7 +529,7 @@ func (w *FollowSearchWorker) searchCandidates(ctx context.Context, actor Actor, 
 						rejections.add("episode_not_confirmed", item.Title)
 						continue
 					}
-					if isCloudShareSource(item.SourceKind) {
+					if isCloudShareSource(item.SourceKind) || item.ContentInspection {
 						// This is a bounded inspection candidate, not title-based coverage.
 						// Only actual analyzed leaves may later reserve these missing keys.
 						candidate.Episodes = nil
@@ -476,7 +541,7 @@ func (w *FollowSearchWorker) searchCandidates(ctx context.Context, actor Actor, 
 						sort.Ints(candidate.Episodes)
 					}
 					candidateKey := candidate.Fingerprint
-					if isCloudShareSource(item.SourceKind) {
+					if isCloudShareSource(item.SourceKind) || item.ContentInspection {
 						candidateKey = fmt.Sprintf("%s:%d", candidateKey, season)
 					}
 					if _, duplicate := seen[candidateKey]; duplicate {
@@ -509,7 +574,7 @@ func (w *FollowSearchWorker) searchCandidates(ctx context.Context, actor Actor, 
 
 func buildFollowCandidate(item SiteSearchResult, siteID uint, sitePriority, season int, snapshot FollowExecutionSnapshot) (followCandidate, string, bool) {
 	parsed, err := mediarecognition.Parse(mediarecognition.InputFacts{PackageName: item.Title, SourceKind: mediarecognition.SourceDownload, MediaTypeHint: mediarecognition.MediaTypeTV, SeasonHint: &season})
-	cloudShare := isCloudShareSource(item.SourceKind)
+	cloudShare := isCloudShareSource(item.SourceKind) || item.ContentInspection
 	if !cloudShare && (err != nil || parsed.Season == nil || *parsed.Season != season || !followEpisodeDeclarationIsUnambiguous(item.Title, season)) {
 		return followCandidate{}, "episode_unproven", false
 	}
@@ -620,7 +685,7 @@ func followEpisodeDeclarationIsUnambiguous(title string, season int) bool {
 // smuggle unknown/future episodes alongside a known missing one. Cloud shares
 // instead prove and select each actual missing file in prepareFollowShare.
 func constrainFollowCandidateCoverage(candidate followCandidate, coverage MediaCoverageSeason) (followCandidate, bool) {
-	if isCloudShareSource(candidate.Item.SourceKind) {
+	if isCloudShareSource(candidate.Item.SourceKind) || candidate.Item.ContentInspection {
 		return candidate, true
 	}
 	confirmed := make(map[int]struct{}, len(coverage.Episodes))
@@ -693,6 +758,9 @@ func followCandidateLess(left, right followCandidate) bool {
 	}
 	if left.QualityRank != right.QualityRank {
 		return left.QualityRank < right.QualityRank
+	}
+	if left.SubtitleRank != right.SubtitleRank {
+		return left.SubtitleRank < right.SubtitleRank
 	}
 	ls, rs := -1, -1
 	if left.Item.Seeders != nil {

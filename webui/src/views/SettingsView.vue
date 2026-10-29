@@ -7,6 +7,7 @@ import DirectoryPickerDialog from '@/components/DirectoryPickerDialog.vue'
 import SecretInput from '@/components/SecretInput.vue'
 import ServerUpdatePanel from '@/components/ServerUpdatePanel.vue'
 import ServerBrowserPanel from '@/components/ServerBrowserPanel.vue'
+import FollowPolicyDefaultsPanel from '@/components/FollowPolicyDefaultsPanel.vue'
 import { credentialLoader } from '@/credentials'
 import { useAuthStore } from '@/stores/auth'
 import { notify } from '@/toast'
@@ -224,6 +225,7 @@ onMounted(load)
       <div class="semantic-inset mt-6 grid gap-4 p-4 md:grid-cols-[1fr_auto]"><div><label class="label">TMDB API 地址</label><input v-model="apiBaseURL" class="input font-mono text-xs" :disabled="!canUpdate" /><p class="text-subtle mb-0 mt-2 text-xs">默认短域名只在网络故障时回退旧域名；自定义地址不会跨域回退。</p></div><div class="flex flex-wrap items-end gap-2"><button class="btn-secondary" type="button" :disabled="saving || !metadata.tmdb_configured" @click="testAndSetRoute('api')">测试并启用</button><button class="btn-secondary" type="button" :disabled="saving || apiBaseURL === defaultTMDBAPIBaseURL || !metadata.tmdb_configured" @click="testAndSetRoute('api', true)">恢复默认</button></div></div>
       <div class="semantic-inset mt-4 grid gap-4 p-4 md:grid-cols-[1fr_auto]"><div><label class="label">TMDB 图片地址</label><input v-model="imageBaseURL" class="input font-mono text-xs" :disabled="!canUpdate" /><p class="text-subtle mb-0 mt-2 text-xs">图片通道独立测试；失败不会改变 API 地址或当前图片地址。</p></div><div class="flex flex-wrap items-end gap-2"><button class="btn-secondary" type="button" :disabled="saving" @click="testAndSetRoute('image')">测试并启用</button><button class="btn-secondary" type="button" :disabled="saving || imageBaseURL === defaultTMDBImageBaseURL" @click="testAndSetRoute('image', true)">恢复默认</button></div></div>
     </form>
+    <FollowPolicyDefaultsPanel :can-update="canUpdate" />
     <form v-if="aiSettings" class="panel mt-6" @submit.prevent="saveAISettings">
       <div class="flex flex-wrap items-start justify-between gap-4">
         <div><h2 class="m-0 text-lg">AI 媒体识别辅助</h2><p class="text-subtle mb-0 mt-1 text-sm">仅在普通识别出现低置信度、候选冲突或标题极度混乱时辅助判断；不会直接执行下载或文件操作。</p></div>

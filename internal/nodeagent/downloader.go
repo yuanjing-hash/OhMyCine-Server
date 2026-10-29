@@ -58,8 +58,21 @@ func (a *Agent) downloaderAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_ = grant
+	// Keep status/cancel/pause control available while data lanes are full.
+	if input.Action != nodeprotocol.DownloaderActionGet && input.Action != nodeprotocol.DownloaderActionCancel && input.Action != nodeprotocol.DownloaderActionPause {
+		release, err := a.acquireOperation(r.Context())
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, "node_operation_busy", "节点执行队列暂时不可用")
+			return
+		}
+		defer release()
+		if !grant.ExpiresAt.After(a.now()) {
+			writeError(w, http.StatusForbidden, nodeprotocol.ErrorCredentialExpired, "临时授权已经过期")
+			return
+		}
+	}
 
-	mutating := input.Action == nodeprotocol.DownloaderActionSubmit || input.Action == nodeprotocol.DownloaderActionPause || input.Action == nodeprotocol.DownloaderActionResume || input.Action == nodeprotocol.DownloaderActionCancel || input.Action == nodeprotocol.DownloaderActionDeleteTag || input.Action == nodeprotocol.DownloaderActionEnsureCategory || input.Action == nodeprotocol.DownloaderActionUpdateCategory || input.Action == nodeprotocol.DownloaderActionSetCategory
+	mutating := input.Action == nodeprotocol.DownloaderActionSelectionGroupCleanup || input.Action == nodeprotocol.DownloaderActionSelectionGroup || input.Action == nodeprotocol.DownloaderActionSubmit || input.Action == nodeprotocol.DownloaderActionPause || input.Action == nodeprotocol.DownloaderActionResume || input.Action == nodeprotocol.DownloaderActionCancel || input.Action == nodeprotocol.DownloaderActionDeleteTag || input.Action == nodeprotocol.DownloaderActionEnsureCategory || input.Action == nodeprotocol.DownloaderActionUpdateCategory || input.Action == nodeprotocol.DownloaderActionSetCategory
 	digest := ""
 	if mutating {
 		digest, err = input.Digest()
@@ -85,7 +98,9 @@ func (a *Agent) downloaderAction(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	response, actionErr := a.executeDownloaderAction(r.Context(), serverID, input, credential)
+	executionCtx, cancelExecution := context.WithTimeout(r.Context(), grant.ExpiresAt.Sub(a.now()))
+	defer cancelExecution()
+	response, actionErr := a.executeDownloaderAction(executionCtx, serverID, input, credential)
 	if actionErr != nil {
 		code, _ := downloadpkg.ErrorInfo(actionErr)
 		if mutating {
@@ -130,10 +145,18 @@ func (a *Agent) downloaderCredential(ctx context.Context, serverID string, input
 }
 
 func (a *Agent) executeDownloaderAction(ctx context.Context, serverID string, input nodeprotocol.DownloaderActionRequest, credential nodeprotocol.DownloaderCredential) (nodeprotocol.DownloaderActionResponse, error) {
-	client, err := qbittorrent.New(downloadpkg.Config{BaseURL: credential.BaseURL, Username: credential.Username, Password: credential.Password})
+	base, err := qbittorrent.New(downloadpkg.Config{BaseURL: credential.BaseURL, Username: credential.Username, Password: credential.Password})
 	if err != nil {
 		return nodeprotocol.DownloaderActionResponse{}, err
 	}
+	bound, err := a.bindManagedSelection(ctx, serverID, input, base)
+	if err != nil {
+		return nodeprotocol.DownloaderActionResponse{}, err
+	}
+	client := bound.(interface {
+		downloadpkg.Client
+		downloadpkg.MetadataClient
+	})
 	response := nodeprotocol.DownloaderActionResponse{RequestID: input.RequestID}
 	switch input.Action {
 	case nodeprotocol.DownloaderActionTest:
@@ -142,14 +165,56 @@ func (a *Agent) executeDownloaderAction(ctx context.Context, serverID string, in
 			response.Health = &nodeprotocol.DownloaderHealth{Version: health.Version}
 		}
 		return response, err
-	case nodeprotocol.DownloaderActionSubmit:
+	case nodeprotocol.DownloaderActionSubmit, nodeprotocol.DownloaderActionSelectionGroup, nodeprotocol.DownloaderActionSelectionGroupCleanup:
+		if input.Submit.SourceEnvelope != nil {
+			opened, err := nodeprotocol.OpenDownloaderSource(input.Submit.SourceEnvelope, credential.SourceKey, nodeprotocol.DownloaderSourceBinding{ServerID: serverID, TaskID: input.TaskID, OperationKey: input.OperationKey, DownloaderID: input.DownloaderID, SavePath: input.Submit.SavePath, Tag: input.Submit.Tag, ConfigurationScope: credential.SourceScope})
+			if err != nil || opened.Kind != input.Submit.Source.Kind || opened.ContentSelection == nil {
+				return response, downloadpkg.Error(nodeprotocol.ErrorPlanConflict, false, err)
+			}
+			copySubmit := *input.Submit
+			copySubmit.Source = opened
+			input.Submit = &copySubmit
+		} else if input.Submit.Source.ContentSelection != nil {
+			return response, downloadpkg.Error("node_selection_source_envelope_required", false, nil)
+		}
 		localRoot, err := mapDownloaderPath(credential.DownloaderSaveRoot, credential.NodeMountRoot, input.Submit.SavePath)
 		if err != nil {
 			return response, downloadpkg.Error(nodeprotocol.ErrorPathMappingInvalid, false, err)
 		}
-		task, err := client.Submit(ctx, downloadpkg.SubmitRequest{Source: downloadpkg.Source{Kind: input.Submit.Source.Kind, URL: input.Submit.Source.URL, Torrent: input.Submit.Source.Torrent, Filename: input.Submit.Source.Filename}, SavePath: input.Submit.SavePath, Tag: input.Submit.Tag, MetadataOnly: input.Submit.MetadataOnly})
+		source := downloadpkg.Source{Kind: input.Submit.Source.Kind, URL: input.Submit.Source.URL, Torrent: input.Submit.Source.Torrent, Filename: input.Submit.Source.Filename, ContentSelection: input.Submit.Source.ContentSelection}
+		if input.Action == nodeprotocol.DownloaderActionSelectionGroupCleanup {
+			task, err := a.executeSelectionGroupCleanup(ctx, serverID, input, credential, base, source, localRoot)
+			if err == nil {
+				response.Task = protocolDownloaderTask(task)
+			}
+			return response, err
+		}
+		if input.Action == nodeprotocol.DownloaderActionSelectionGroup {
+			task, err := a.executeSelectionGroup(ctx, serverID, input, credential, base, source, localRoot)
+			if err == nil {
+				response.Task = protocolDownloaderTask(task)
+			}
+			return response, err
+		}
+		var selection *downloadpkg.SelectionContext
+		if source.ContentSelection != nil {
+			manifest, err := downloadpkg.ValidateContentSource(source)
+			if err != nil {
+				return response, err
+			}
+			if input.Submit.Tag != "omc-"+input.TaskID {
+				return response, downloadpkg.Error(nodeprotocol.ErrorPlanConflict, false, nil)
+			}
+			selection = &downloadpkg.SelectionContext{Tag: input.Submit.Tag, Selection: *source.ContentSelection, RootName: manifest.Name, MultiFile: manifest.MultiFile}
+		}
+		task, err := client.Submit(ctx, downloadpkg.SubmitRequest{Source: source, SavePath: input.Submit.SavePath, Tag: input.Submit.Tag, MetadataOnly: input.Submit.MetadataOnly})
 		if err != nil {
 			return response, err
+		}
+		if selection != nil {
+			if err := a.store.saveDownloadSelection(ctx, serverID, input.DownloaderID, input.TaskID, task.ID, *selection); err != nil {
+				return response, downloadpkg.Error(nodeprotocol.ErrorPlanConflict, false, err)
+			}
 		}
 		if err := a.store.SaveManagedDownload(ctx, ManagedDownload{ServerID: serverID, DownloaderID: input.DownloaderID, TaskID: input.TaskID, ProviderTaskID: task.ID, Tag: input.Submit.Tag, DownloaderSavePath: input.Submit.SavePath, NodeLocalRoot: localRoot}, a.now()); err != nil {
 			return response, downloadpkg.Error("node_persistence_failed", true, err)
@@ -168,9 +233,23 @@ func (a *Agent) executeDownloaderAction(ctx context.Context, serverID string, in
 	case nodeprotocol.DownloaderActionResume:
 		return response, client.Resume(ctx, input.ProviderTaskID)
 	case nodeprotocol.DownloaderActionCancel:
+		a.exportMu.Lock()
+		for key, owner := range a.exportOwners {
+			if owner == input.TaskID {
+				a.exportCancels[key]()
+			}
+		}
+		a.exportMu.Unlock()
 		return response, client.Cancel(ctx, input.ProviderTaskID, input.DeleteData)
 	case nodeprotocol.DownloaderActionDeleteTag:
-		return response, client.DeleteManagedTag(ctx, input.ManagedTag)
+		var grouped int
+		if err := a.store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM managed_download_group_refs WHERE paired_server_id=? AND downloader_id=? AND task_id=?`, serverID, input.DownloaderID, input.TaskID).Scan(&grouped); err != nil || grouped != 0 {
+			return response, downloadpkg.Error(nodeprotocol.ErrorPlanConflict, false, err)
+		}
+		if _, _, err := a.store.downloadSelection(ctx, serverID, input.DownloaderID, input.TaskID); err == nil {
+			return response, downloadpkg.Error(nodeprotocol.ErrorPlanConflict, false, nil)
+		}
+		return response, base.DeleteManagedTag(ctx, input.ManagedTag)
 	case nodeprotocol.DownloaderActionManifest:
 		now := a.now()
 		if page, exportErr := a.store.FileExportManifest(ctx, serverID, input.OperationKey, 1, 1, now); exportErr == nil && page.Summary.TaskID == input.TaskID {
@@ -192,10 +271,10 @@ func (a *Agent) executeDownloaderAction(ctx context.Context, serverID string, in
 			return response, err
 		}
 		if task, getErr := client.Get(ctx, input.ProviderTaskID); getErr == nil && task.Completed {
-			if err := a.verifyManagedManifest(ctx, serverID, input.DownloaderID, input.ProviderTaskID, credential.NodeMountRoot, manifest); err != nil {
+			if err := a.verifyManagedManifest(ctx, serverID, input.DownloaderID, input.ProviderTaskID, credential.NodeMountRoot, manifest, input.TaskID); err != nil {
 				return response, downloadpkg.Error(nodeprotocol.ErrorPathMappingInvalid, false, err)
 			}
-			download, err := a.store.ManagedDownload(ctx, serverID, input.DownloaderID, input.ProviderTaskID)
+			download, err := a.managedDownloadForTask(ctx, serverID, input.DownloaderID, input.TaskID, input.ProviderTaskID)
 			if err != nil || download.TaskID != input.TaskID {
 				return response, downloadpkg.Error(nodeprotocol.ErrorPlanConflict, false, err)
 			}
@@ -234,8 +313,14 @@ func (a *Agent) executeDownloaderAction(ctx context.Context, serverID string, in
 	}
 }
 
-func (a *Agent) verifyManagedManifest(ctx context.Context, serverID, downloaderID, providerTaskID, mountRoot string, manifest downloadpkg.Manifest) error {
-	download, err := a.store.ManagedDownload(ctx, serverID, downloaderID, providerTaskID)
+func (a *Agent) verifyManagedManifest(ctx context.Context, serverID, downloaderID, providerTaskID, mountRoot string, manifest downloadpkg.Manifest, taskIDs ...string) error {
+	var download ManagedDownload
+	var err error
+	if len(taskIDs) > 0 {
+		download, err = a.managedDownloadForTask(ctx, serverID, downloaderID, taskIDs[0], providerTaskID)
+	} else {
+		download, err = a.store.ManagedDownload(ctx, serverID, downloaderID, providerTaskID)
+	}
 	if err != nil {
 		return errors.New("node_managed_download_not_found")
 	}
@@ -332,7 +417,7 @@ func protocolDownloaderTask(task downloadpkg.Task) *nodeprotocol.DownloaderTask 
 func protocolDownloaderManifest(manifest downloadpkg.Manifest) *nodeprotocol.DownloaderManifest {
 	files := make([]nodeprotocol.DownloaderFile, 0, len(manifest.Files))
 	for _, file := range manifest.Files {
-		files = append(files, nodeprotocol.DownloaderFile{RelativePath: file.RelativePath, Size: file.Size})
+		files = append(files, nodeprotocol.DownloaderFile{RelativePath: file.RelativePath, Size: file.Size, NativeIndex: file.NativeIndex})
 	}
 	return &nodeprotocol.DownloaderManifest{Name: manifest.Name, Files: files, Complete: manifest.Complete}
 }

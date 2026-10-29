@@ -71,7 +71,7 @@ func TestAdapterAuthenticatedSearchAndDownload(t *testing.T) {
 		t.Fatalf("page=%+v", page)
 	}
 	result := page.Items[0]
-	if result.TorrentID != "12345" || result.SizeBytes != 13421772800 || result.Promotion != "free" || result.Seeders == nil || *result.Seeders != 42 || result.Leechers == nil || *result.Leechers != 3 || result.Completed == nil || *result.Completed != 108 {
+	if result.PayloadKind != site.PayloadTorrent || result.TorrentID != "12345" || result.SizeBytes != 13421772800 || result.Promotion != "free" || result.Seeders == nil || *result.Seeders != 42 || result.Leechers == nil || *result.Leechers != 3 || result.Completed == nil || *result.Completed != 108 {
 		t.Fatalf("result=%+v", result)
 	}
 	if result.Published == nil || result.Published.Year() != 2026 || !strings.Contains(result.Quality, "1080p") {

@@ -394,15 +394,17 @@ func (a *API) CreateDiscoveryDownload(c *gin.Context) {
 	actor, _ := middleware.ActorFrom(c)
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 128<<10)
 	var payload struct {
-		PreviewToken        string   `json:"preview_token"`
-		SelectedEntryTokens []string `json:"selected_entry_tokens"`
-		ResultToken         string   `json:"result_token"`
-		DownloaderID        string   `json:"downloader_id"`
-		MediaLibraryID      *uint    `json:"media_library_id"`
-		ProfileID           uint     `json:"profile_id"`
-		Priority            int      `json:"priority"`
-		ExpectedTMDBID      *int64   `json:"expected_tmdb_id"`
-		ExpectedMediaType   string   `json:"expected_media_type"`
+		ContentSelectionToken string   `json:"content_selection_token,omitempty"`
+		ContentMode           string   `json:"content_mode,omitempty"`
+		PreviewToken          string   `json:"preview_token"`
+		SelectedEntryTokens   []string `json:"selected_entry_tokens"`
+		ResultToken           string   `json:"result_token"`
+		DownloaderID          string   `json:"downloader_id"`
+		MediaLibraryID        *uint    `json:"media_library_id"`
+		ProfileID             uint     `json:"profile_id"`
+		Priority              int      `json:"priority"`
+		ExpectedTMDBID        *int64   `json:"expected_tmdb_id"`
+		ExpectedMediaType     string   `json:"expected_media_type"`
 	}
 	if err := strictJSON(c, &payload); err != nil {
 		writeError(c, a.log, invalid("种子资源下载参数无效", err))
@@ -412,7 +414,7 @@ func (a *API) CreateDiscoveryDownload(c *gin.Context) {
 		writeError(c, a.log, &services.AppError{Code: services.CodeInvalidRequest, Message: "期望媒体身份参数不完整"})
 		return
 	}
-	input := services.SiteDownloadInput{PreviewToken: payload.PreviewToken, SelectedEntryTokens: payload.SelectedEntryTokens, ResultToken: payload.ResultToken, DownloaderID: payload.DownloaderID, MediaLibraryID: payload.MediaLibraryID, ProfileID: payload.ProfileID, Priority: payload.Priority}
+	input := services.SiteDownloadInput{ContentMode: payload.ContentMode, ContentSelectionToken: payload.ContentSelectionToken, PreviewToken: payload.PreviewToken, SelectedEntryTokens: payload.SelectedEntryTokens, ResultToken: payload.ResultToken, DownloaderID: payload.DownloaderID, MediaLibraryID: payload.MediaLibraryID, ProfileID: payload.ProfileID, Priority: payload.Priority}
 	if payload.ExpectedTMDBID != nil {
 		if err := a.sites.BindExpectedIdentity(c.Request.Context(), actor, payload.ResultToken, payload.ExpectedMediaType, *payload.ExpectedTMDBID, input); err != nil {
 			writeError(c, a.log, err)
@@ -446,12 +448,19 @@ func (a *API) RecognizePTResult(c *gin.Context) {
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 4<<10)
 	var payload struct {
 		ResultToken string `json:"result_token"`
+		TitleOnly   bool   `json:"title_only,omitempty"`
 	}
 	if err := strictJSON(c, &payload); err != nil {
 		writeError(c, a.log, invalid("种子资源识别参数无效", err))
 		return
 	}
-	item, err := a.sites.RecognizeResult(c.Request.Context(), actor, payload.ResultToken)
+	var item services.SiteRecognitionSummary
+	var err error
+	if payload.TitleOnly {
+		item, err = a.sites.RecognizeTitleResult(c.Request.Context(), actor, payload.ResultToken)
+	} else {
+		item, err = a.sites.RecognizeResult(c.Request.Context(), actor, payload.ResultToken)
+	}
 	if err != nil {
 		writeError(c, a.log, err)
 		return

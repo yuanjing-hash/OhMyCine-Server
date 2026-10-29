@@ -7,6 +7,7 @@ import (
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/authz"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
 	downloadpkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/downloader"
+	sitepkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/site"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/site/builtin"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/site/pansou"
 )
@@ -19,9 +20,17 @@ const (
 )
 
 type SourceRouteRecommendationInput struct {
-	ResultToken    string `json:"result_token"`
-	MediaLibraryID *uint  `json:"media_library_id,omitempty"`
-	ExpectedBytes  *int64 `json:"expected_bytes,omitempty"`
+	ContentSelectionToken string `json:"content_selection_token,omitempty"`
+	ResultToken           string `json:"result_token"`
+	MediaLibraryID        *uint  `json:"media_library_id,omitempty"`
+	ExpectedBytes         *int64 `json:"expected_bytes,omitempty"`
+}
+
+type sourceRouteFacts struct {
+	Source            string
+	Payload           sitepkg.PayloadKind
+	RequiresSelection bool
+	SelectionSource   *downloadpkg.Source
 }
 
 type SourceRouteSelection struct {
@@ -43,9 +52,10 @@ type SourceRouteChoice struct {
 }
 
 type SourceRouteRecommendation struct {
-	SourceKind  string                `json:"source_kind"`
-	Recommended *SourceRouteSelection `json:"recommended"`
-	Choices     []SourceRouteChoice   `json:"choices"`
+	SourceKind        string                `json:"source_kind"`
+	PreviewSourceKind string                `json:"preview_source_kind"`
+	Recommended       *SourceRouteSelection `json:"recommended"`
+	Choices           []SourceRouteChoice   `json:"choices"`
 }
 
 type FollowRoutePreviewInput struct {
@@ -137,15 +147,31 @@ func (s *SiteService) RecommendSiteRoute(ctx context.Context, actor Actor, input
 			return SourceRouteRecommendation{}, appError(code, reason, nil)
 		}
 	}
-	return s.downloads.recommendSourceRoute(ctx, actor, claim.SiteID, input.MediaLibraryID, claim.SourceKind, input.ExpectedBytes)
+	facts := sourceRouteFacts{Source: claim.SourceKind, Payload: claim.PayloadKind}
+	if input.ContentSelectionToken != "" {
+		selected, err := s.ResolveContentSelection(ctx, actor, ContentSelectionInput{ResultToken: input.ResultToken, SelectionToken: input.ContentSelectionToken}, claim)
+		if err != nil {
+			return SourceRouteRecommendation{}, err
+		}
+		input.ExpectedBytes = &selected.SelectedBytes
+		facts.RequiresSelection = selected.Torrent != nil
+		if selected.Torrent != nil && selected.Manifest != nil {
+			proof := downloadpkg.Source{Kind: downloadpkg.SourceTorrent, Torrent: selected.Manifest.MetainfoBytes, ContentSelection: selected.Torrent}
+			if selected.AllFilesVerified && selected.OriginalMagnet != "" {
+				proof.Kind, proof.URL, proof.AllFilesVerified = downloadpkg.SourceURL, selected.OriginalMagnet, true
+			}
+			facts.SelectionSource = &proof
+		}
+	}
+	return s.downloads.recommendSourceRoute(ctx, actor, claim.SiteID, input.MediaLibraryID, facts, input.ExpectedBytes)
 }
 
 func (s *DownloadService) RecommendSourceRoute(ctx context.Context, actor Actor, siteID uint, libraryID *uint, expectedBytes ...*int64) (SourceRouteRecommendation, error) {
-	result, err := s.recommendSourceRoute(ctx, actor, siteID, libraryID, "", expectedBytes...)
+	result, err := s.recommendSourceRoute(ctx, actor, siteID, libraryID, sourceRouteFacts{}, expectedBytes...)
 	if err != nil || result.SourceKind != RouteSource115Share {
 		return result, err
 	}
-	quark, err := s.recommendSourceRoute(ctx, actor, siteID, libraryID, RouteSourceQuarkShare, expectedBytes...)
+	quark, err := s.recommendSourceRoute(ctx, actor, siteID, libraryID, sourceRouteFacts{Source: RouteSourceQuarkShare}, expectedBytes...)
 	if err != nil {
 		return result, err
 	}
@@ -155,7 +181,7 @@ func (s *DownloadService) RecommendSourceRoute(ctx context.Context, actor Actor,
 	if result.Recommended == nil {
 		var site models.Site
 		if s.db.First(&site, siteID).Error == nil && site.Kind == pansou.Kind {
-			bt, err := s.recommendSourceRoute(ctx, actor, siteID, libraryID, RouteSourceBT, expectedBytes...)
+			bt, err := s.recommendSourceRoute(ctx, actor, siteID, libraryID, sourceRouteFacts{Source: RouteSourceBT}, expectedBytes...)
 			if err == nil && bt.Recommended != nil {
 				return bt, nil
 			}
@@ -164,7 +190,7 @@ func (s *DownloadService) RecommendSourceRoute(ctx context.Context, actor Actor,
 	return result, nil
 }
 
-func (s *DownloadService) recommendSourceRoute(ctx context.Context, actor Actor, siteID uint, libraryID *uint, claimedSource string, expectedBytes ...*int64) (SourceRouteRecommendation, error) {
+func (s *DownloadService) recommendSourceRoute(ctx context.Context, actor Actor, siteID uint, libraryID *uint, facts sourceRouteFacts, expectedBytes ...*int64) (SourceRouteRecommendation, error) {
 	if !actor.Can(authz.PermissionDownloadsCreate) || !actor.Can(authz.PermissionDiscoveryRead) {
 		return SourceRouteRecommendation{}, appError(CodePermissionDenied, "无权选择下载路线", nil)
 	}
@@ -186,11 +212,11 @@ func (s *DownloadService) recommendSourceRoute(ctx context.Context, actor Actor,
 	if err != nil {
 		return SourceRouteRecommendation{}, err
 	}
-	if source == RouteSource115Share && claimedSource != "" {
-		if claimedSource != RouteSource115Share && claimedSource != RouteSourceQuarkShare && !(site.Kind == pansou.Kind && claimedSource == RouteSourceBT) {
+	if source == RouteSource115Share && facts.Source != "" {
+		if facts.Source != RouteSource115Share && facts.Source != RouteSourceQuarkShare && !(site.Kind == pansou.Kind && facts.Source == RouteSourceBT) {
 			return SourceRouteRecommendation{}, appError(CodeDownloadSourceInvalid, "分享来源与搜索凭证不一致", nil)
 		}
-		source = claimedSource
+		source = facts.Source
 	}
 	var downloaders []models.Downloader
 	if err := s.db.WithContext(ctx).Where("enabled = ?", true).Order("sort_order, id").Find(&downloaders).Error; err != nil {
@@ -232,20 +258,36 @@ func (s *DownloadService) recommendSourceRoute(ctx context.Context, actor Actor,
 	result := SourceRouteRecommendation{SourceKind: source, Choices: make([]SourceRouteChoice, 0, len(visibleLibraries)*len(visibleDownloaders))}
 	choiceByDownloader := make(map[string]map[uint]SourceRouteChoice, len(visibleDownloaders))
 	previewSourceKind := routeSourceDownloadKind(source)
-	if site.SourceType == "plugin" && site.Kind == pluginResourceKind {
+	if source == RouteSourceBT && sitepkg.NormalizePayloadKind(facts.Payload) == sitepkg.PayloadMagnet {
+		previewSourceKind = downloadpkg.SourceURL
+	} else if sitepkg.NormalizePayloadKind(facts.Payload) == sitepkg.PayloadUnknown && site.SourceType == "plugin" && site.Kind == pluginResourceKind {
 		// A plugin resource resolves directly to a magnet. SiteService.Download
 		// verifies its saved plugin provenance before accepting a 115 route.
 		previewSourceKind = downloadpkg.SourceURL
 	}
-	if site.Kind == pansou.Kind && source == RouteSourceBT {
+	if sitepkg.NormalizePayloadKind(facts.Payload) == sitepkg.PayloadUnknown && site.Kind == pansou.Kind && source == RouteSourceBT {
 		previewSourceKind = downloadpkg.SourceURL
 	}
+	// The result-bound recommendation owns this projection. Clients must not
+	// turn a validated magnet back into a torrent when checking another target.
+	result.PreviewSourceKind = previewSourceKind
 	for _, downloader := range visibleDownloaders {
 		if !routeDownloaderApplicable(source, downloader) {
 			continue
 		}
 		byLibrary := make(map[uint]SourceRouteChoice, len(visibleLibraries))
 		preview, previewErr := s.PreviewRoutes(ctx, actor, DownloadRoutePreviewInput{DownloaderID: downloader.ID, SourceKind: previewSourceKind, SiteID: &siteID, ExpectedBytes: size})
+		if facts.RequiresSelection {
+			var capabilityErr error
+			if facts.SelectionSource != nil {
+				capabilityErr = s.downloader.validateContentSelectionExecutor(downloader, *facts.SelectionSource)
+			} else {
+				capabilityErr = s.downloader.validateContentSelectionExecutor(downloader)
+			}
+			if capabilityErr != nil {
+				previewErr = capabilityErr
+			}
+		}
 		for _, library := range visibleLibraries {
 			choice := SourceRouteChoice{DownloaderID: downloader.ID, DownloaderName: downloader.Name, DownloaderType: downloader.Type, MediaLibraryID: library.ID, LibraryName: library.Name}
 			if previewErr != nil {

@@ -62,6 +62,7 @@ type SiteService struct {
 	shareValidations     map[string]siteShareValidationEntry
 	sharePreviewSlots    chan struct{}
 	shareAnalysisFlights map[string]chan struct{}
+	contentInspection    *siteContentInspection
 	identitySnapshots    map[string]identitySearchSnapshot
 }
 
@@ -82,6 +83,7 @@ type siteResultClaim struct {
 	PluginClaimID             string
 	TorrentID, Title          string
 	SourceKind, CloudProvider string
+	PayloadKind               sitepkg.PayloadKind
 	ResultType                string
 	AuthorizationScope        string
 	PluginLifecycle           string
@@ -204,6 +206,8 @@ type SiteSearchOption struct {
 	Reason       string `json:"reason,omitempty"`
 }
 type SiteSearchResult struct {
+	ContentInspection    bool                          `json:"content_inspection,omitempty"`
+	PayloadKind          sitepkg.PayloadKind           `json:"payload_kind,omitempty"`
 	ResultType           string                        `json:"result_type,omitempty"`
 	Origins              []sitepkg.ResultOrigin        `json:"origins,omitempty"`
 	AcquisitionAvailable *bool                         `json:"acquisition_available,omitempty"`
@@ -288,6 +292,12 @@ type SiteSearchDetail struct {
 	Revision         uint64 `json:"revision"`
 }
 type SiteDownloadInput struct {
+	ContentSelectionToken string
+	ContentMode           string
+	// Internal-only replacement intent. Public handlers never deserialize these.
+	PreserveExistingVersions  bool
+	ReplacementIdentity       *DownloadRecognitionIdentity
+	AfterPersist              func(*gorm.DB, models.DownloadTask) error
 	PreviewToken              string
 	SelectedEntryTokens       []string
 	ResultToken, DownloaderID string
@@ -1024,6 +1034,13 @@ func (s *SiteService) BindExpectedIdentity(ctx context.Context, actor Actor, res
 	if err != nil {
 		return appError(tmdb.ErrorCode(err), "TMDB 作品身份无法解析", nil)
 	}
+	if len(selections) == 1 && selections[0].ContentSelectionToken != "" {
+		expected := siteShareIdentity{TMDBID: tmdbID, MediaType: mediaType, Title: verified.Title, Names: names, Year: cloneInt(verified.ReleaseYear), SeasonCount: verified.Snapshot.SeasonCount}
+		if claim.SearchIdentity != nil && claim.SearchIdentity.TMDBID == tmdbID && claim.SearchIdentity.MediaType == mediaType {
+			expected.Season = cloneInt(claim.SearchIdentity.Season)
+		}
+		return s.bindExpectedContentSelection(ctx, actor, claim, token, expected, selections[0])
+	}
 	if isCloudShareSource(claimCloudSource(claim)) {
 		expected := siteShareIdentity{TMDBID: tmdbID, MediaType: mediaType, Title: verified.Title, Names: names, Year: cloneInt(verified.ReleaseYear), SeasonCount: verified.Snapshot.SeasonCount}
 		if claim.SearchIdentity != nil && claim.SearchIdentity.TMDBID == tmdbID && claim.SearchIdentity.MediaType == mediaType {
@@ -1035,7 +1052,7 @@ func (s *SiteService) BindExpectedIdentity(ctx context.Context, actor Actor, res
 		if len(selections) == 1 && (selections[0].PreviewToken != "" || len(selections[0].SelectedEntryTokens) > 0) {
 			return s.bindExpectedShareSelection(ctx, actor, claim, token, expected, selections[0])
 		}
-		if err := s.bindShareSearchIdentity(token, actor.User.ID, expected); err != nil {
+		if err := s.bindContentSearchIdentity(token, actor.User.ID, expected); err != nil {
 			return err
 		}
 		claim, err = s.resolveAvailableClaim(token, actor.User.ID)
@@ -1214,6 +1231,7 @@ func (s *SiteService) searchSite(ctx context.Context, actor Actor, record models
 			SiteID:             record.ID,
 			TorrentID:          item.TorrentID,
 			SourceKind:         item.SourceKind,
+			PayloadKind:        sitepkg.NormalizePayloadKind(item.PayloadKind),
 			CloudProvider:      item.CloudProvider,
 			ResultType:         item.ResultType,
 			AuthorizationScope: discoveryAuthorizationScope(actor),
@@ -1250,7 +1268,7 @@ func (s *SiteService) searchSite(ctx context.Context, actor Actor, record models
 		if record.Kind == pansou.Kind {
 			acquisition = &available
 		}
-		group.Items = append(group.Items, SiteSearchResult{ResultType: item.ResultType, Origins: item.Origins, AcquisitionAvailable: acquisition, AcquisitionReason: reason, ShareValidation: s.cachedShareValidation(ctx, actor, item.TorrentID), SourceKind: item.SourceKind, CloudProvider: item.CloudProvider, Channel: item.Channel, PostURL: item.PostURL, ResourceFingerprint: item.Fingerprint, Token: token, Title: item.Title, Subtitle: item.Subtitle, SizeBytes: item.SizeBytes, Published: item.Published, Seeders: item.Seeders, Leechers: item.Leechers, Completed: item.Completed, Promotion: item.Promotion, Quality: item.Quality, Tags: item.Tags, Specifications: specifications, ExpiresAt: expires})
+		group.Items = append(group.Items, SiteSearchResult{ContentInspection: item.SourceKind != "external_link" && sitepkg.NormalizePayloadKind(item.PayloadKind) != sitepkg.PayloadUnknown, PayloadKind: sitepkg.NormalizePayloadKind(item.PayloadKind), ResultType: item.ResultType, Origins: item.Origins, AcquisitionAvailable: acquisition, AcquisitionReason: reason, ShareValidation: s.cachedShareValidation(ctx, actor, item.TorrentID), SourceKind: item.SourceKind, CloudProvider: item.CloudProvider, Channel: item.Channel, PostURL: item.PostURL, ResourceFingerprint: item.Fingerprint, Token: token, Title: item.Title, Subtitle: item.Subtitle, SizeBytes: item.SizeBytes, Published: item.Published, Seeders: item.Seeders, Leechers: item.Leechers, Completed: item.Completed, Promotion: item.Promotion, Quality: item.Quality, Tags: item.Tags, Specifications: specifications, ExpiresAt: expires})
 	}
 	return group
 }
@@ -1291,7 +1309,7 @@ func (s *SiteService) searchPluginResource(ctx context.Context, actor Actor, rec
 	group.HasNext = page.HasNext
 	expires := s.now().Add(ptResultTTL)
 	for _, item := range page.Items {
-		token, tokenErr := s.issueClaim(siteResultClaim{ActorID: actor.User.ID, SiteID: record.ID, TorrentID: item.ID, Title: item.Title, MediaTypeHint: safeRecognitionMediaTypeHint(input.MediaType), ExpiresAt: expires})
+		token, tokenErr := s.issueClaim(siteResultClaim{ActorID: actor.User.ID, SiteID: record.ID, PayloadKind: sitepkg.PayloadMagnet, TorrentID: item.ID, Title: item.Title, MediaTypeHint: safeRecognitionMediaTypeHint(input.MediaType), ExpiresAt: expires})
 		if tokenErr != nil {
 			group.Partial, group.IncompleteReason = true, CodeSearchResultLimit
 			continue
@@ -1319,7 +1337,7 @@ func (s *SiteService) searchPluginResource(ctx context.Context, actor Actor, rec
 		if parsed, parseErr := mediarecognition.Parse(mediarecognition.InputFacts{PackageName: item.Title, SourceKind: mediarecognition.SourceDownload, MediaTypeHint: mediarecognition.MediaType(safeRecognitionMediaTypeHint(input.MediaType))}); parseErr == nil {
 			specifications = siteRecognitionSpecifications(parsed.Specifications, parsed.ReleaseGroup)
 		}
-		group.Items = append(group.Items, SiteSearchResult{Token: token, Title: item.Title, SizeBytes: item.SizeBytes, Published: published, Seeders: &item.Seeders, Tags: append([]string(nil), item.Tags...), Specifications: specifications, ExpiresAt: expires})
+		group.Items = append(group.Items, SiteSearchResult{ContentInspection: true, PayloadKind: sitepkg.PayloadMagnet, Token: token, Title: item.Title, SizeBytes: item.SizeBytes, Published: published, Seeders: &item.Seeders, Tags: append([]string(nil), item.Tags...), Specifications: specifications, ExpiresAt: expires})
 	}
 	return group
 }
@@ -1704,6 +1722,9 @@ func (s *SiteService) Download(ctx context.Context, actor Actor, input SiteDownl
 	if !actor.Can(authz.PermissionDownloadsCreate) {
 		return DownloadTaskSummary{}, appError(CodePermissionDenied, "无权创建下载任务", nil)
 	}
+	if err := validateSiteContentMode(input, ""); err != nil {
+		return DownloadTaskSummary{}, err
+	}
 	token := strings.TrimSpace(input.ResultToken)
 	claim, err := s.reserveClaim(token, actor.User.ID)
 	if err != nil {
@@ -1863,7 +1884,23 @@ func (s *SiteService) Download(ctx context.Context, actor Actor, input SiteDownl
 
 	var previewGuard func(*gorm.DB) error
 	stage = "share_check"
-	if input.PreviewToken != "" || len(input.SelectedEntryTokens) > 0 {
+	if err := validateSiteContentMode(input, source.Kind); err != nil {
+		return DownloadTaskSummary{}, err
+	}
+	if input.ContentSelectionToken != "" {
+		if input.PreviewToken != "" || len(input.SelectedEntryTokens) > 0 {
+			return DownloadTaskSummary{}, appError(CodeInvalidRequest, "不能混用两次文件选择凭证", nil)
+		}
+		selection, selectionErr := s.ResolveContentSelection(ctx, actor, ContentSelectionInput{ResultToken: input.ResultToken, SelectionToken: input.ContentSelectionToken}, claim)
+		if selectionErr != nil {
+			return DownloadTaskSummary{}, selectionErr
+		}
+		source, selectionErr = applyContentSelection(claim, source, selection)
+		if selectionErr != nil {
+			return DownloadTaskSummary{}, selectionErr
+		}
+		previewGuard = selection.Guard
+	} else if input.PreviewToken != "" || len(input.SelectedEntryTokens) > 0 {
 		selection, guard, selectionErr := s.resolveShareSelection(ctx, actor, input, claim, source)
 		if selectionErr != nil {
 			return DownloadTaskSummary{}, selectionErr
@@ -1893,9 +1930,17 @@ func (s *SiteService) Download(ctx context.Context, actor Actor, input SiteDownl
 			return nil
 		}
 	}
+	if input.ReplacementIdentity != nil {
+		if err := s.validateUpgradeSource(ctx, actor, claim, source, input.ReplacementIdentity); err != nil {
+			return DownloadTaskSummary{}, err
+		}
+	}
 	var recognitionOverride *DownloadRecognitionIdentity
 	if (source.ShareSelection == nil || input.FollowSubscriptionID != "") && claim.ManualTMDBID != nil && claim.ManualMediaType != "" {
 		recognitionOverride = &DownloadRecognitionIdentity{TMDBID: *claim.ManualTMDBID, MediaType: claim.ManualMediaType, Source: claim.RecognitionSource, Status: claim.RecognitionStatus, Locked: claim.RecognitionLocked, Season: cloneInt(input.Season), Episode: cloneInt(input.Episode)}
+	}
+	if input.ReplacementIdentity != nil {
+		recognitionOverride = input.ReplacementIdentity
 	}
 	if input.BeforeSubmit != nil {
 		if err := input.BeforeSubmit(); err != nil {
@@ -1964,10 +2009,14 @@ func (s *SiteService) Download(ctx context.Context, actor Actor, input SiteDownl
 			return nil
 		}
 	}
-	submitInput := SubmitDownloadInput{SourceSiteID: claimedSite.ID, DownloaderID: input.DownloaderID, MediaLibraryID: input.MediaLibraryID, ProfileID: input.ProfileID, DisplayName: claim.Title, Priority: input.Priority, Source: source, PluginID: pluginID, PluginVersion: pluginVersion, PluginConnectionID: pluginConnectionID, PluginResourceClaimID: resourceClaimID, RecognitionOverride: recognitionOverride, FollowSubscriptionID: input.FollowSubscriptionID, FollowResourceFingerprint: input.FollowResourceFingerprint, ForceRecognitionOverride: input.FollowSubscriptionID != "", BeforePersist: beforePersist}
+	submitInput := SubmitDownloadInput{SourceSiteID: claimedSite.ID, DownloaderID: input.DownloaderID, MediaLibraryID: input.MediaLibraryID, ProfileID: input.ProfileID, DisplayName: claim.Title, Priority: input.Priority, Source: source, PluginID: pluginID, PluginVersion: pluginVersion, PluginConnectionID: pluginConnectionID, PluginResourceClaimID: resourceClaimID, RecognitionOverride: recognitionOverride, FollowSubscriptionID: input.FollowSubscriptionID, FollowResourceFingerprint: input.FollowResourceFingerprint, ForceRecognitionOverride: input.FollowSubscriptionID != "" || input.ReplacementIdentity != nil, BeforePersist: beforePersist, AfterPersist: input.AfterPersist, PreserveExistingVersions: input.PreserveExistingVersions}
 	stage = "enqueue"
 	if source.ShareSelection != nil {
-		result, err = s.submitShareSelection(ctx, actor, input.PreviewToken, submitInput, request)
+		previewToken := input.PreviewToken
+		if input.ContentSelectionToken != "" {
+			previewToken = input.ContentSelectionToken
+		}
+		result, err = s.submitShareSelection(ctx, actor, previewToken, submitInput, request)
 	} else {
 		result, err = s.downloads.Submit(ctx, actor, submitInput, request)
 	}

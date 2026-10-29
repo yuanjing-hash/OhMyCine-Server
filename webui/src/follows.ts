@@ -2,7 +2,10 @@ import { api, APIError } from '@/api/client'
 import type { MediaCoverage } from '@/discovery'
 
 export interface FollowSchedule { kind: 'interval'; minutes: number }
+export interface SubtitlePolicy { mode: 'ignore' | 'prefer' | 'require'; languages: string[] }
+export interface FollowPolicyDefaults { revision: number; subtitles: SubtitlePolicy; updated_at: string }
 export interface FollowFilters {
+  subtitles?: SubtitlePolicy
   resolutions: string[]; video_codecs: string[]; qualities: string[]
   include_keywords: string[]; exclude_keywords: string[]
   release_groups: string[]; exclude_release_groups: string[]
@@ -16,6 +19,7 @@ export interface FollowOption { id: string; name: string; type: string; connecti
 export interface FollowSiteOption { id: number; name: string; site_type: 'pt' | 'bt' | 'bt_resource' | 'cloud_share' }
 export interface FollowLibraryOption { id: number; name: string; storage_type: string; connection_id?: number }
 export interface FollowDefaults {
+  policy_defaults_revision?: number
   snapshot: FollowExecutionSnapshot; sites: FollowSiteOption[]; downloaders: FollowOption[]
   media_libraries: FollowLibraryOption[]; subscribed_seasons: number[]; coverage: MediaCoverage; unavailable_reason?: string
 }

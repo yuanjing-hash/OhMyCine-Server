@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	pathpkg "path"
 	"path/filepath"
@@ -20,19 +21,29 @@ type CredentialGrantFactory func(context.Context, string, string, string) (nodep
 // DownloaderClient implements the ordinary provider contract while ensuring
 // every qBittorrent request is executed by the paired Node.
 type DownloaderClient struct {
-	node         *Client
-	downloaderID string
-	saveRoot     string
-	localRoot    string
-	taskID       string
-	grant        CredentialGrantFactory
+	groupID        string
+	selectionScope string
+	node           *Client
+	downloaderID   string
+	saveRoot       string
+	localRoot      string
+	taskID         string
+	grant          CredentialGrantFactory
 }
 
-func NewDownloaderClient(node *Client, downloaderID, saveRoot, localRoot, taskID string, grant CredentialGrantFactory) (*DownloaderClient, error) {
+func NewDownloaderClient(node *Client, downloaderID, saveRoot, localRoot, taskID string, grant CredentialGrantFactory, selectionScopes ...string) (*DownloaderClient, error) {
 	if node == nil || strings.TrimSpace(downloaderID) == "" || strings.TrimSpace(saveRoot) == "" || grant == nil {
 		return nil, errors.New("node_downloader_config_invalid")
 	}
-	return &DownloaderClient{node: node, downloaderID: downloaderID, saveRoot: strings.TrimSpace(saveRoot), localRoot: strings.TrimSpace(localRoot), taskID: strings.TrimSpace(taskID), grant: grant}, nil
+	scope := sha256.Sum256([]byte(node.baseURL + "\x00" + node.nodeFingerprint + "\x00" + downloaderID + "\x00" + saveRoot + "\x00" + localRoot))
+	selectionScope := hex.EncodeToString(scope[:])
+	if len(selectionScopes) > 0 {
+		if !nodeprotocol.ValidDigest(selectionScopes[0]) {
+			return nil, errors.New("node_selection_scope_invalid")
+		}
+		selectionScope = selectionScopes[0]
+	}
+	return &DownloaderClient{selectionScope: selectionScope, node: node, downloaderID: downloaderID, saveRoot: strings.TrimSpace(saveRoot), localRoot: strings.TrimSpace(localRoot), taskID: strings.TrimSpace(taskID), grant: grant}, nil
 }
 
 func (c *DownloaderClient) Test(ctx context.Context) (downloadpkg.Health, error) {
@@ -57,9 +68,31 @@ func (c *DownloaderClient) Submit(ctx context.Context, request downloadpkg.Submi
 		RequestID: operationKey, TaskID: taskID, OperationKey: operationKey,
 		DownloaderID: c.downloaderID, Action: nodeprotocol.DownloaderActionSubmit,
 		Submit: &nodeprotocol.DownloaderSubmit{
-			Source:   nodeprotocol.DownloaderSource{Kind: request.Source.Kind, URL: request.Source.URL, Torrent: request.Source.Torrent, Filename: request.Source.Filename},
+			Source:   nodeprotocol.DownloaderSource{Kind: request.Source.Kind, URL: request.Source.URL, Torrent: request.Source.Torrent, Filename: request.Source.Filename, ContentSelection: request.Source.ContentSelection},
 			SavePath: joinRemoteRoot(c.saveRoot, taskID), Tag: request.Tag, MetadataOnly: request.MetadataOnly,
 		},
+	}
+	if request.Source.ContentSelection != nil {
+		if _, err := downloadpkg.ValidateContentSource(request.Source); err != nil {
+			return downloadpkg.Task{}, err
+		}
+		health, err := c.node.Health(ctx)
+		if err != nil {
+			return downloadpkg.Task{}, remoteDownloaderError(err, "")
+		}
+		if !health.Capabilities.Has(nodeprotocol.CapabilitySelectiveFilesV1) {
+			return downloadpkg.Task{}, downloadpkg.Error(nodeprotocol.ErrorCapabilityMissing, false, err)
+		}
+		envelope, key, err := nodeprotocol.SealDownloaderSource(input.Submit.Source, nodeprotocol.DownloaderSourceBinding{ServerID: c.node.identity.ServerID, TaskID: input.TaskID, OperationKey: input.OperationKey, DownloaderID: input.DownloaderID, SavePath: input.Submit.SavePath, Tag: input.Submit.Tag, ConfigurationScope: c.selectionScope})
+		if err != nil {
+			return downloadpkg.Task{}, downloadpkg.Error("downloader_selection_wire_limit", false, err)
+		}
+		input.Submit.SourceEnvelope = envelope
+		input.Submit.Source = nodeprotocol.DownloaderSource{Kind: input.Submit.Source.Kind}
+		ctx = context.WithValue(ctx, sourceGrantKeyContext{}, sourceGrantValue{key: key, scope: c.selectionScope})
+		if raw, err := json.Marshal(input); err != nil || len(raw) > nodeprotocol.MaxWireBodyBytes {
+			return downloadpkg.Task{}, downloadpkg.Error("downloader_selection_wire_limit", false, err)
+		}
 	}
 	response, err := c.call(ctx, input)
 	if err != nil || response.Task == nil {
@@ -109,7 +142,7 @@ func (c *DownloaderClient) Manifest(ctx context.Context, id string) (downloadpkg
 	}
 	files := make([]downloadpkg.File, 0, len(response.Manifest.Files))
 	for _, file := range response.Manifest.Files {
-		files = append(files, downloadpkg.File{RelativePath: file.RelativePath, Size: file.Size})
+		files = append(files, downloadpkg.File{RelativePath: file.RelativePath, Size: file.Size, NativeIndex: file.NativeIndex})
 	}
 	return downloadpkg.Manifest{Name: response.Manifest.Name, Files: files, Complete: response.Manifest.Complete}, nil
 }
@@ -278,12 +311,18 @@ func (c *DownloaderClient) categoryAction(ctx context.Context, action, providerT
 }
 
 func (c *DownloaderClient) call(ctx context.Context, input nodeprotocol.DownloaderActionRequest) (nodeprotocol.DownloaderActionResponse, error) {
+	if err := downloadpkg.CheckSelectionFence(ctx); err != nil {
+		return nodeprotocol.DownloaderActionResponse{}, err
+	}
 	envelope, err := c.grant(ctx, input.TaskID, input.OperationKey, input.Action)
 	if err != nil {
 		return nodeprotocol.DownloaderActionResponse{}, err
 	}
 	input.GrantID = envelope.GrantID
 	if err := c.node.PutCredentialGrant(ctx, envelope); err != nil {
+		return nodeprotocol.DownloaderActionResponse{}, err
+	}
+	if err := downloadpkg.CheckSelectionFence(ctx); err != nil {
 		return nodeprotocol.DownloaderActionResponse{}, err
 	}
 	return c.node.DownloaderAction(ctx, input)
@@ -309,7 +348,11 @@ func joinRemoteRoot(root, child string) string {
 	if strings.Contains(root, "\\") && !strings.Contains(root, "/") {
 		separator = "\\"
 	}
-	return strings.TrimRight(root, "/\\") + separator + strings.Trim(child, "/\\")
+	child = strings.ReplaceAll(strings.Trim(child, "/\\"), `\`, "/")
+	if separator == `\` {
+		child = strings.ReplaceAll(child, "/", `\`)
+	}
+	return strings.TrimRight(root, "/\\") + separator + child
 }
 
 func (c *DownloaderClient) boundTaskID() string {
@@ -320,6 +363,9 @@ func (c *DownloaderClient) boundTaskID() string {
 }
 
 func (c *DownloaderClient) remoteTaskRoot() string {
+	if c.groupID != "" {
+		return joinRemoteRoot(c.saveRoot, ".omc-bt/"+c.groupID)
+	}
 	if c.taskID == "" {
 		return c.saveRoot
 	}
@@ -391,7 +437,12 @@ func remoteDownloaderError(err error, fallback string) error {
 	}
 	var remote *RemoteError
 	if errors.As(err, &remote) {
-		retryable := remote.Code == nodeprotocol.ErrorNodeOffline || remote.Code == nodeprotocol.ErrorCredentialExpired || remote.Code == nodeprotocol.ErrorExportPreparing || remote.Code == "node_request_failed" || remote.Code == "downloader_unavailable" || remote.Code == "downloader_rate_limited"
+		// Ownership cannot be repaired by replaying the same source or control.
+		// Preserve these terminal results across the Node HTTP boundary.
+		if remote.Code == "downloader_selection_identity_required" || remote.Code == "downloader_selection_owner_conflict" {
+			return downloadpkg.Error(remote.Code, false, err)
+		}
+		retryable := remote.Code == nodeprotocol.ErrorNodeOffline || remote.Code == nodeprotocol.ErrorCredentialExpired || remote.Code == nodeprotocol.ErrorExportPreparing || remote.Code == "node_request_failed" || remote.Code == "downloader_unavailable" || remote.Code == "downloader_rate_limited" || remote.Code == "node_operation_busy" || remote.Code == "downloader_selection_submission_unconfirmed" || remote.Code == "downloader_selection_stop_unconfirmed" || remote.Code == "downloader_selection_group_busy" || remote.Code == "downloader_selection_group_cleanup_pending" || remote.Code == "downloader_selection_cleanup_unconfirmed"
 		return downloadpkg.Error(remote.Code, retryable, err)
 	}
 	return downloadpkg.Error(nodeprotocol.ErrorNodeOffline, true, err)

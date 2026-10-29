@@ -151,7 +151,7 @@ func parseYTS(body []byte, page int) (site.Page, error) {
 				published = &value
 			}
 			tags := compact([]string{torrent.Quality, torrent.Type})
-			result.Items = append(result.Items, site.Result{TorrentID: btrss.EncodeIdentity("magnet", magnet), Title: title, SizeBytes: torrent.SizeBytes, Published: published, Seeders: &seeders, Leechers: &leechers, Quality: torrent.Quality, Tags: tags})
+			result.Items = append(result.Items, site.Result{PayloadKind: site.PayloadMagnet, TorrentID: btrss.EncodeIdentity("magnet", magnet), Title: title, SizeBytes: torrent.SizeBytes, Published: published, Seeders: &seeders, Leechers: &leechers, Quality: torrent.Quality, Tags: tags})
 		}
 	}
 	limit := payload.Data.Limit
@@ -230,7 +230,7 @@ func parseEZTV(body []byte, keyword string, page int) (site.Page, error) {
 			value := time.Unix(torrent.DateReleased, 0).UTC()
 			published = &value
 		}
-		result.Items = append(result.Items, site.Result{TorrentID: btrss.EncodeIdentity("magnet", magnet), Title: title, SizeBytes: int64(torrent.SizeBytes), Published: published, Seeders: &seeders, Leechers: &leechers})
+		result.Items = append(result.Items, site.Result{PayloadKind: site.PayloadMagnet, TorrentID: btrss.EncodeIdentity("magnet", magnet), Title: title, SizeBytes: int64(torrent.SizeBytes), Published: published, Seeders: &seeders, Leechers: &leechers})
 	}
 	limit := payload.Limit
 	if limit <= 0 {

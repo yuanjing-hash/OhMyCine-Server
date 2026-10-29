@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"path"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -68,7 +69,7 @@ type siteShareAnalyzedFile struct {
 	Group              int
 }
 
-func (s *SiteService) bindShareSearchIdentity(token string, actorID uint, identity siteShareIdentity) error {
+func (s *SiteService) bindContentSearchIdentity(token string, actorID uint, identity siteShareIdentity) error {
 	s.vaultMu.Lock()
 	defer s.vaultMu.Unlock()
 	claim, ok := s.vault[token]
@@ -180,15 +181,21 @@ func shareGroupMatchesIdentity(group SiteShareAnalysisGroup, identity *siteShare
 	return group.MediaType != "movie" || group.Year == nil || identity.Year == nil || absInt(*group.Year-*identity.Year) <= 1
 }
 
+var sharePackageRangeSuffix = regexp.MustCompile(`(?i)(?:\s*[\[【(（]\s*(?:\d{1,3}\s*[-~–]\s*\d{1,3}|(?:全\s*)?\d{1,3}\s*集(?:全)?|全集)\s*[\]】)）])+\s*$`)
+var shareTechnicalDirectory = regexp.MustCompile(`(?i)^(?:[\[\] _.,+()-]*(?:2160p|1080p|720p|480p|4k|hevc|av1|h[ .]?26[45]|x26[45]|bluray|bdrip|web[- ]?dl|webrip|remux|aac|dts|flac|10bit|8bit|hdr10|hdr|dv))+[\[\] _.,+()-]*$`)
+
 func genericShareDirectory(name string) bool {
 	switch strings.ToLower(strings.TrimSpace(name)) {
 	case "movies", "movie", "tv", "series", "collection", "collections", "video", "videos", "电影", "电视剧", "剧集", "合集", "视频":
 		return true
 	}
-	return false
+	return shareTechnicalDirectory.MatchString(name)
 }
 
 func stripShareDirectoryCounter(name string) string {
+	// A real parent may describe an entire package. Its range is not an episode
+	// declaration for every leaf, and must not hide the parent's actual work name.
+	name = strings.TrimSpace(sharePackageRangeSuffix.ReplaceAllString(name, ""))
 	match := followShareCounterPattern.FindString(name)
 	if match == "" {
 		return name
@@ -228,6 +235,10 @@ func shareFileFacts(entry SiteSharePreviewEntry, claim siteResultClaim) (siteSha
 	numeric := numericErr == nil
 	if numeric {
 		file.Title, file.Year, file.Season = "", nil, nil
+		number, _ := strconv.Atoi(stem)
+		if followBareEpisodePattern.MatchString(stem) && number >= 1 && number <= 200 {
+			file.Episodes = []int{number}
+		}
 	}
 	for dir := path.Dir(entry.Path); dir != "." && dir != "/"; dir = path.Dir(dir) {
 		name := path.Base(dir)
@@ -363,15 +374,6 @@ func (s *SiteService) analyzeShareEntries(ctx context.Context, actor Actor, clai
 			groupFiles[index] = append(groupFiles[index], recognitionSourceFile{RelativePath: entry.Path, Size: entry.Size})
 		}
 	}
-	// Reserve time for the final actor/configuration fence. Metadata exhaustion
-	// changes identity status only; the completely read tree remains evidence.
-	lookupDeadline := time.Now().Add(10 * time.Second)
-	if deadline, ok := ctx.Deadline(); ok && deadline.Add(-2*time.Second).Before(lookupDeadline) {
-		lookupDeadline = deadline.Add(-2 * time.Second)
-	}
-	lookupCtx, cancelLookup := context.WithDeadline(ctx, lookupDeadline)
-	defer cancelLookup()
-	metadataLookups := 0
 	for i := range analysis.Groups {
 		group := &analysis.Groups[i]
 		sort.Ints(group.Episodes)
@@ -382,30 +384,10 @@ func (s *SiteService) analyzeShareEntries(ctx context.Context, actor Actor, clai
 			}
 		}
 		group.Episodes = unique
-		if shareGroupMatchesIdentity(*group, claim.SearchIdentity) {
-			group.TMDBID = cloneInt64(&claim.SearchIdentity.TMDBID)
-			group.Title, group.Status, group.IdentityStatus = claim.SearchIdentity.Title, mediaRecognitionStatusMatched, mediaIdentityStatusVerified
-		} else if lookupCtx.Err() == nil && metadataLookups < 8 {
-			metadataLookups++
-			actual := claim
-			actual.Title, actual.Subtitle, actual.MediaTypeHint = group.Title, "", group.MediaType
-			if group.Year != nil {
-				actual.Title += fmt.Sprintf(" (%d)", *group.Year)
-			}
-			summary, err := s.recognizeSiteClaim(lookupCtx, actor, actual, "", groupFiles[i])
-			if err == nil {
-				group.Status, group.IdentityStatus, group.TMDBID, group.ErrorCode, group.PosterURL = summary.Status, summary.IdentityStatus, summary.TMDBID, summary.ErrorCode, summary.PosterURL
-				if summary.Status == mediaRecognitionStatusMatched {
-					group.Title, group.MediaType, group.Year = summary.Title, summary.MediaType, summary.Year
-					if group.MediaType == "tv" && group.Season == nil && summary.SeasonCount == 1 {
-						one := 1
-						group.Season = &one
-					}
-				}
-			}
-		} else {
-			group.ErrorCode = "share_recognition_budget"
-		}
+	}
+	s.recognizeContentGroups(ctx, actor, claim, analysis.Groups, groupFiles)
+	for i := range analysis.Groups {
+		group := &analysis.Groups[i]
 		if claim.RecognitionLocked && claim.ManualTMDBID != nil && group.TMDBID != nil && (*group.TMDBID != *claim.ManualTMDBID || group.MediaType != claim.ManualMediaType) {
 			group.Status, group.ErrorCode = mediaRecognitionStatusUnrecognized, CodeSiteResultIdentityMismatch
 		}

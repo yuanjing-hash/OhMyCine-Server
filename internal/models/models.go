@@ -1810,6 +1810,8 @@ type CookieCloudPayload struct {
 // DownloadTask is the durable provider fact linked one-to-one to a queue Job.
 // SourceCiphertext may contain PT passkeys and is never exposed or logged.
 type DownloadTask struct {
+	ContentSelectionRequired           bool       `gorm:"<-:create;not null;default:false" json:"-"`
+	BTSelectionGroupID                 string     `gorm:"size:64;not null;default:'';index" json:"-"`
 	ID                                 string     `gorm:"primaryKey;size:36" json:"id"`
 	OwnerID                            uint       `gorm:"not null;index" json:"owner_id"`
 	JobID                              string     `gorm:"size:36;not null;uniqueIndex" json:"job_id"`

@@ -219,6 +219,13 @@ func (a *Agent) startStorageUpload(serverID string, input nodeprotocol.StorageAc
 }
 
 func (a *Agent) runStorageUpload(ctx context.Context, serverID string, input nodeprotocol.StorageActionRequest, plan nodeprotocol.StorageUploadPlan, grant nodeprotocol.CredentialGrant, credential nodeprotocol.StorageCredential) {
+	ctx, cancel := a.ownedOperationContext(ctx, serverID, input.OperationKey, input.PlanDigest, grant.ExpiresAt)
+	defer cancel()
+	release, admissionErr := a.acquireOperation(ctx)
+	if admissionErr != nil {
+		return
+	}
+	defer release()
 	response := nodeprotocol.StorageActionResponse{RequestID: input.RequestID, OperationKey: input.OperationKey, PlanDigest: input.PlanDigest, Status: nodeprotocol.StorageActionRunning, TotalFiles: len(plan.Files), Files: make([]nodeprotocol.StorageUploadFileResult, 0, len(plan.Files))}
 	_ = a.store.UpdateActionReceipt(ctx, serverID, input.RequestID, response, a.now())
 	_ = a.store.UpdateOperationExecution(ctx, serverID, input.OperationKey, input.PlanDigest, nodeprotocol.OperationRunning, nodeprotocol.PhaseUploadingTarget, "", nil, a.now())

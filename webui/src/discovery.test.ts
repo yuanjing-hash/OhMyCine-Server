@@ -31,7 +31,8 @@ describe('discovery contracts', () => {
     expect(explore).toContain("const mode = ref<'media' | 'resources'>")
     expect(explore).toContain('>搜索</button>')
     expect(explore).toContain('>直接搜索</button>')
-    expect(explore).toContain("route.query.identity === 'tmdb'")
+    // Identity binding and route reuse are exercised through mounted requests
+    // in search-intent-view.test.ts; a raw route flag must not be the authority.
     expect(explore).toContain('mediaIdentitySearchURL')
     expect(explore).toContain('new AbortController()')
     expect(explore).toContain('{ signal: controller.signal }')

@@ -358,6 +358,11 @@ func main() {
 	if cfg.Environment != "production" {
 		services.RegisterFakeWorkers(registry)
 	}
+	versionUpgrades := services.NewMediaVersionUpgradeService(db, libraries, sites, queue)
+	api.SetMediaVersionUpgradeService(versionUpgrades)
+	if err := registry.Register(services.JobTypeMediaVersionUpgrade, services.NewMediaVersionUpgradeWorker(versionUpgrades)); err != nil {
+		log.Fatal().Err(err).Msg("register media version upgrade worker")
+	}
 	if err := registry.Register("download", services.NewDownloadWorker(downloads)); err != nil {
 		logging.OperationServerLifecycle.Event(log.Fatal()).Err(err).Str("error_code", "download_worker_registration_failed").Msg(logging.OperationServerLifecycle.Message("下载任务 Worker 注册失败"))
 	}

@@ -47,6 +47,9 @@ func (c *Client) Test(ctx context.Context) (downloader.Health, error) {
 	return downloader.Health{Version: "夸克分享接收"}, nil
 }
 func (c *Client) Submit(ctx context.Context, r downloader.SubmitRequest) (downloader.Task, error) {
+	if r.Source.ContentSelection != nil {
+		return downloader.Task{}, downloader.Error("downloader_selective_files_unsupported", false, nil)
+	}
 	if (r.Source.Kind != downloader.SourceQuarkShare && r.Source.Kind != downloader.SourceProviderItem) || r.MetadataOnly || !strings.HasPrefix(r.Tag, "omc-") || len(r.Tag) > 64 || strings.ContainsAny(r.Tag, "/\\\x00\r\n") {
 		return downloader.Task{}, downloader.Error("downloader_source_unsupported", false, nil)
 	}

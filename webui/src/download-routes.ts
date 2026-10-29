@@ -50,14 +50,15 @@ export interface DownloadRouteChoice extends RecommendedDownloadPair {
 }
 export interface DownloadRouteRecommendation {
   source_kind: 'pt' | 'bt' | '115_share' | 'quark_share'
+  preview_source_kind?: 'url' | 'torrent' | '115_share' | 'quark_share'
   recommended: RecommendedDownloadPair | null
   choices: DownloadRouteChoice[]
 }
 
-export function recommendDownloadRoute(resultToken: string, mediaLibraryID?: number, expectedBytes?: number, signal?: AbortSignal) {
+export function recommendDownloadRoute(resultToken: string, mediaLibraryID?: number, expectedBytes?: number, signal?: AbortSignal, contentSelectionToken?: string) {
   return api<DownloadRouteRecommendation>('/api/v1/sites/routes/recommend', {
     method: 'POST',
-    body: JSON.stringify({ result_token: resultToken, media_library_id: mediaLibraryID || undefined, expected_bytes: expectedBytes }),
+    body: JSON.stringify({ result_token: resultToken, media_library_id: mediaLibraryID || undefined, expected_bytes: expectedBytes, content_selection_token: contentSelectionToken }),
     signal,
   })
 }

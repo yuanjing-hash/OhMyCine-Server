@@ -99,6 +99,14 @@ func (s *Store) migrate(ctx context.Context) error {
 		{8, []string{
 			`CREATE TABLE cloud_operation_receipts (paired_server_id TEXT NOT NULL, operation_key TEXT NOT NULL, receipt_id TEXT NOT NULL, revision INTEGER NOT NULL, binding TEXT NOT NULL, ciphertext BLOB NOT NULL, PRIMARY KEY(paired_server_id,operation_key,receipt_id))`,
 		}},
+		{9, []string{
+			`CREATE TABLE managed_download_selections(paired_server_id TEXT NOT NULL,downloader_id TEXT NOT NULL,task_id TEXT NOT NULL,provider_task_id TEXT NOT NULL,binding_json TEXT NOT NULL,PRIMARY KEY(paired_server_id,downloader_id,task_id))`,
+		}},
+		{10, []string{
+			`CREATE TABLE managed_download_groups(paired_server_id TEXT NOT NULL,downloader_id TEXT NOT NULL,group_id TEXT NOT NULL,configuration_scope TEXT NOT NULL,workspace TEXT NOT NULL,provider_task_id TEXT NOT NULL DEFAULT '',snapshot_json TEXT NOT NULL,epoch INTEGER NOT NULL,revision INTEGER NOT NULL,snapshot_digest TEXT NOT NULL,cleanup_state TEXT NOT NULL DEFAULT '',cleanup_key TEXT NOT NULL DEFAULT '',cleanup_digest TEXT NOT NULL DEFAULT '',lease_owner TEXT NOT NULL DEFAULT '',lease_until DATETIME,PRIMARY KEY(paired_server_id,downloader_id,group_id))`,
+			`CREATE UNIQUE INDEX idx_managed_group_provider ON managed_download_groups(paired_server_id,downloader_id,provider_task_id) WHERE provider_task_id<>'' AND cleanup_state<>'completed'`,
+			`CREATE TABLE managed_download_group_refs(paired_server_id TEXT NOT NULL,downloader_id TEXT NOT NULL,task_id TEXT NOT NULL,group_id TEXT NOT NULL,binding_json TEXT NOT NULL,node_local_root TEXT NOT NULL,PRIMARY KEY(paired_server_id,downloader_id,task_id))`,
+		}},
 	}
 	for _, migration := range migrations {
 		var applied int

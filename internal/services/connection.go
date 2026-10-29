@@ -729,6 +729,9 @@ func (s *ConnectionService) cachedDriver(id uint) (models.Connection, cloudpkg.D
 		BeforeCall:   func(ctx context.Context) error { return s.guardConnectionCredential(ctx, record.ID, record.Revision) },
 		OnCallResult: func(err error) { s.recordConnectionCredentialFailure(record.ID, record.Revision, err) },
 	}
+	if record.Provider == cloudpkg.ProviderPan115 {
+		config.Operations = NewProviderOperationStore(s.db, s.credentials, id, record.Provider, record.AccountID)
+	}
 	if record.Provider == cloudpkg.ProviderQuark {
 		config.Cookie = ""
 		config.Credentials = json.RawMessage(cookie)

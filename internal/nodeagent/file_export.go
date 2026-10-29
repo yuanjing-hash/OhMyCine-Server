@@ -190,9 +190,11 @@ func randomFileToken() (string, error) {
 }
 
 func (a *Agent) startFileExport(serverID, operationKey, mountRoot string, download ManagedDownload, manifest downloadpkg.Manifest) {
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Hour)
 	a.exportMu.Lock()
 	if _, running := a.exports[operationKey]; running {
 		a.exportMu.Unlock()
+		cancel()
 		return
 	}
 	// A request can pass the caller's initial lookup while another request is
@@ -200,18 +202,30 @@ func (a *Agent) startFileExport(serverID, operationKey, mountRoot string, downlo
 	// request cannot wastefully rebuild an export that has just completed.
 	if page, err := a.store.FileExportManifest(context.Background(), serverID, operationKey, 1, 1, a.now()); err == nil && page.Summary.TaskID == download.TaskID {
 		a.exportMu.Unlock()
+		cancel()
 		return
 	}
 	a.exports[operationKey] = struct{}{}
+	if a.exportCancels == nil {
+		a.exportCancels = map[string]context.CancelFunc{}
+		a.exportOwners = map[string]string{}
+	}
+	a.exportCancels[operationKey], a.exportOwners[operationKey] = cancel, download.TaskID
 	a.exportMu.Unlock()
 	go func() {
 		defer func() {
 			a.exportMu.Lock()
 			delete(a.exports, operationKey)
+			delete(a.exportCancels, operationKey)
+			delete(a.exportOwners, operationKey)
 			a.exportMu.Unlock()
 		}()
-		ctx, cancel := context.WithTimeout(context.Background(), 6*time.Hour)
 		defer cancel()
+		release, admissionErr := a.acquireOperation(ctx)
+		if admissionErr != nil {
+			return
+		}
+		defer release()
 		now := a.now()
 		record, err := buildFileExport(ctx, mountRoot, serverID, operationKey, download, manifest, now, now.Add(fileExportLifetime))
 		if err != nil {

@@ -65,6 +65,9 @@ func TestJackettManualSearchUsesWebResultSetAndPaginatesLocally(t *testing.T) {
 		t.Fatalf("explicit Jackett all-indexer search = %+v, err=%v", direct, err)
 	}
 	conan := second.Items[0]
+	if conan.PayloadKind != site.PayloadTorrent {
+		t.Fatalf("Jackett payload projection lost: %q", conan.PayloadKind)
+	}
 	if len(conan.Tags) != 0 || conan.Subtitle != "" || conan.SizeBytes != 123456789 || conan.Published == nil || conan.Seeders == nil || *conan.Seeders != 8 || conan.Leechers == nil || *conan.Leechers != 3 || conan.Completed == nil || *conan.Completed != 5 {
 		t.Fatalf("Jackett result facts were lost: %+v", conan)
 	}

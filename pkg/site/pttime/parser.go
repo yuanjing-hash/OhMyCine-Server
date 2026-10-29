@@ -65,7 +65,7 @@ func parseTorrentPage(body []byte) ([]site.Result, int, bool, error) {
 }
 
 func parseTorrentResult(id string, anchor, row *html.Node) site.Result {
-	result := site.Result{TorrentID: id, Title: torrentAnchorTitle(anchor)}
+	result := site.Result{PayloadKind: site.PayloadTorrent, TorrentID: id, Title: torrentAnchorTitle(anchor)}
 	text := clean(nodeText(row), 4096)
 	result.SizeBytes = parseSize(text)
 	result.Quality = qualitySummary(result.Title)

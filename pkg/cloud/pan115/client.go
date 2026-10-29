@@ -196,6 +196,7 @@ func (s *sdkAdapter) ListTreeFolders(pickCode string, page, limit int64) ([]bulk
 }
 
 type Client struct {
+	selective       *selectiveOfflineState
 	sdk             sdkClient
 	downloadHTTP    *http.Client
 	listRate        *rate.Limiter
@@ -233,6 +234,10 @@ func New(config cloud.Config) (cloud.Driver, error) {
 	if err != nil {
 		return nil, cloud.Error(cloud.CodeCookieInvalid, false, err)
 	}
+	resourceAccount, err := credentialResourceAccount(parsed)
+	if err != nil {
+		return nil, cloud.Error(cloud.CodeCookieInvalid, false, err)
+	}
 	credential := &pan115sdk.Credential{UID: parsed.UID, CID: parsed.CID, SEID: parsed.SEID, KID: parsed.KID}
 	httpClient := &http.Client{
 		Timeout:       defaultTimeout,
@@ -243,6 +248,7 @@ func New(config cloud.Config) (cloud.Driver, error) {
 	// for offline submission and remains compatible with the read APIs.
 	sdk := pan115sdk.New(pan115sdk.WithClient(httpClient), pan115sdk.UA(pan115sdk.UA115Browser)).ImportCredential(credential)
 	return &Client{
+		selective:  &selectiveOfflineState{store: config.Operations, account: resourceAccount},
 		beforeCall: config.BeforeCall, onCallResult: config.OnCallResult,
 		sdk: &sdkAdapter{sdk}, downloadHTTP: newDownloadHTTPClient(), listRate: rate.NewLimiter(rate.Every(2*time.Second), 1),
 		interactiveRate: rate.NewLimiter(rate.Every(250*time.Millisecond), 1), pipelineRate: rate.NewLimiter(rate.Every(250*time.Millisecond), 1),
@@ -710,6 +716,15 @@ func (c *Client) SubmitOffline(ctx context.Context, uri, directoryID string) (cl
 	if uri == "" || len(uri) > 8192 || strings.ContainsAny(uri, "\x00\r\n") {
 		return cloud.OfflineTask{}, cloud.Error(cloud.CodeResponseInvalid, false, errors.New("offline URI is invalid"))
 	}
+	if c.ordinaryStore() != nil {
+		hash, err := ordinaryURIHash(uri)
+		if err != nil {
+			return cloud.OfflineTask{}, err
+		}
+		if hash != "" {
+			return c.submitOrdinaryOffline(ctx, uri, directoryID, hash)
+		}
+	}
 	var hashes []string
 	err := c.waitAndCall(ctx, c.offlineRate, func() error {
 		var err error
@@ -729,6 +744,9 @@ func (c *Client) SubmitOffline(ctx context.Context, uri, directoryID string) (cl
 		return cloud.OfflineTask{}, cloud.Error(cloud.CodeResponseInvalid, true, errors.New("115 returned no offline task identity"))
 	}
 	taskID := strings.TrimSpace(hashes[0])
+	if err := c.checkOrdinaryOwner(ctx, taskID, ""); err != nil {
+		return cloud.OfflineTask{}, err
+	}
 	c.offlinePages.Store(taskID, int64(1))
 	return cloud.OfflineTask{ID: taskID, Status: "queued", ProviderStatus: 0}, nil
 }
@@ -778,6 +796,20 @@ func offlineInfoHash(uri string) (string, bool) {
 }
 
 func (c *Client) GetOffline(ctx context.Context, taskID string) (cloud.OfflineTask, error) {
+	if err := c.checkOrdinaryOwner(ctx, taskID, ""); err != nil {
+		return cloud.OfflineTask{}, err
+	}
+	task, err := c.getOfflineNative(ctx, taskID)
+	if err == nil {
+		err = c.checkOrdinaryOwner(ctx, task.ID, "")
+	}
+	if err != nil {
+		return cloud.OfflineTask{}, err
+	}
+	return task, nil
+}
+
+func (c *Client) getOfflineNative(ctx context.Context, taskID string) (cloud.OfflineTask, error) {
 	taskID = strings.TrimSpace(taskID)
 	if taskID == "" {
 		return cloud.OfflineTask{}, cloud.Error(cloud.CodeResponseInvalid, false, errors.New("offline task identity is empty"))
@@ -851,6 +883,9 @@ func (c *Client) CancelOffline(ctx context.Context, taskID string, deleteFiles b
 	taskID = strings.TrimSpace(taskID)
 	if taskID == "" {
 		return cloud.Error(cloud.CodeResponseInvalid, false, errors.New("offline task identity is empty"))
+	}
+	if hash, ok := nativeV1Hash(taskID); ok && c.ordinaryStore() != nil {
+		return c.cancelOrdinaryOffline(ctx, hash, deleteFiles)
 	}
 	if err := c.waitAndCall(ctx, c.offlineRate, func() error { return c.sdk.DeleteOfflineTasks([]string{taskID}, deleteFiles) }); err != nil {
 		return mapError(err)

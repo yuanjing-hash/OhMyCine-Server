@@ -483,7 +483,7 @@ func ScanLocal(ctx context.Context, storageRoot, relativeRoot string, recursive 
 			return nil
 		}
 		providerRel := "/" + filepath.ToSlash(rel)
-		if shouldIgnore(providerRel, ignores) {
+		if IsManagedTrashPath(providerRel) || shouldIgnore(providerRel, ignores) {
 			if entry.IsDir() {
 				return filepath.SkipDir
 			}
@@ -587,7 +587,7 @@ func InspectLocalFile(ctx context.Context, libraryRoot, path string, extensions,
 		return File{}, false, nil
 	}
 	providerRel := "/" + filepath.ToSlash(rel)
-	if shouldIgnore(providerRel, ignores) {
+	if IsManagedTrashPath(providerRel) || shouldIgnore(providerRel, ignores) {
 		return File{}, false, nil
 	}
 	extensionsSet := map[string]struct{}{}

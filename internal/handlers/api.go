@@ -15,6 +15,7 @@ import (
 )
 
 type API struct {
+	versionUpgrades       *services.MediaVersionUpgradeService
 	config                config.Config
 	auth                  *services.AuthService
 	admin                 *services.AdminService
@@ -795,4 +796,8 @@ func pathID(c *gin.Context) (uint, bool) {
 }
 func invalid(message string, err error) error {
 	return &services.AppError{Code: services.CodeInvalidRequest, Message: message, Cause: err}
+}
+
+func (a *API) SetMediaVersionUpgradeService(service *services.MediaVersionUpgradeService) {
+	a.versionUpgrades = service
 }

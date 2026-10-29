@@ -587,7 +587,11 @@ OhMyCine 插件停用后的派生站点进入不可用状态并保留配置，�
 
 ### Search result automatic recognition
 
-Resource search progressively recognizes current-page PT/BT/cloud-share claims with two concurrent workers and a per-item timeout. Ordinary detection buttons are removed; manual correction remains. The existing actor-scoped media coverage endpoint supplies work-level library badges, with per-search identity deduplication and explicit unknown/permission/error states. Search changes and unmount abort old work; stale JSON/SSE results cannot repopulate a new search. Manual confirmation wins over late automatic results both in the UI and in the Server claim vault under its write lock. Library evidence is never persisted in browser search sessions. Cloud recognition automatically reads the actual complete share tree through a current same-provider receiver and returns the shared `share_analysis` contract; actual sparse episodes, distinct works/seasons and incomplete-read states replace advertised title ranges. Manual preview remains an explicit fresh read with its selected receiver. PT/BT recognition remains title-based.
+Resource search keeps submitted intent separate from the editable title and bound TMDB identity. Editing the title or reusing the route invalidates old identity, progress, result actions and dialogs; late success/error/finally responses cannot restore the previous work. Resource-type filters (PT, public BT torrent, magnet, 115, Quark) are independent from Site categories. Safe adapter-owned payload facts and result-bound route recommendations determine preview behavior, so a PanSou magnet is not coerced into a torrent source by its Site label.
+
+Results advertising `content_inspection` use independent bounded title, actual-content and coverage queues. Title-only recognition cannot be blocked by a slow share or magnet metadata request. The common content API returns actual safe filenames, exact sparse season/episode facts and typed subtitle evidence. Complete enumeration and unresolved media identity remain separate visible states. The Server inspects torrents/magnets itself and reads shares through an authorized provider association; search never creates external downloader metadata tasks. Older Server responses retain the existing combined recognition protocol.
+
+Opaque preview/file/selection tokens stay in memory and are invalidated on actor, query, source, result or configuration drift. Final acquisition revalidates selected actual leaves and the chosen execution route; only selected bytes contribute to capacity preview. A filename advertising subtitles remains a release claim, not a verified embedded track. The executable contract is [Resource Content OpenAPI](../api/resource-content.openapi.json).
 
 ## 只读插件账号展示
 
@@ -598,3 +602,21 @@ Resource search progressively recognizes current-page PT/BT/cloud-share claims w
 系统设置的“检查组件状态”只读取安装元数据和最近启动原因，不启动浏览器、不请求站点、不清除失败。组件已安装不能等同于运行健康或账号登录成功。修正部署后明确重试插件登录，才能重新验证启动和当前镜像页面。
 
 启动原因通过 companion → Go → UI 的固定词汇传递：`browser_sandbox_unavailable`、`browser_profile_unavailable`、`browser_dependencies_missing`、`browser_executable_unavailable`、`browser_launch_timeout`，未知为 `browser_launch_failed`。插件登录的对应错误前缀为 `resource_`，系统面板与插件交互复用固定中文提示。任何未知状态和原因均收敛为安全回退，不显示原始异常、argv、路径、代理、URL 或凭据，不把启动故障误报为密码错误或登录失效。部署修改、服务重建及真实账号验收仍是独立操作，参见 [浏览器组件部署](../deployment/browser-companion.md)。
+
+
+## 单电影／单集版本洗版
+
+媒体详情的每个实际文件版本提供右键菜单、可见更多按钮与键盘菜单入口。洗版先准备精确旧entry的替换上下文，再进入带固定电影／季集的普通资源搜索；不会把单集操作升级为整部剧删除。候选使用同一内容预览和文件选择流程，确认时只提交结果与不透明选择凭证，目标库和旧版本由Server冻结。
+
+新版本先以保留旧版方式获取和入库。本次实际输出、目录发布和必需产物就绪以后，才回收选中的旧视频及独占配对字幕；观看逻辑身份保留。新版本失败时旧版仍可用；回收失败单独显示等待核对／重试，不能再次下载。未实现普通回收的Storage通过能力检查明确不可执行，不能改成永久删除。本地回收使用受管可恢复目录，并排除正常扫描。
+
+
+## 实际文件与获取选项
+
+资源类型筛选与站点类型独立，支持PT、BT种子、磁力、115和夸克。资源卡使用站点适配器验证的类型，PanSou这个站点名称不能决定实际链接是什么。改变查询文本或路由身份立即退役旧作品上下文、弹窗和选择；晚返回的成功、失败和结束回调都不能覆盖新查询。
+
+标题、云分享内容、种子内容、磁力元数据和库内覆盖采用独立有界物理请求额度。页面超时、重置及卸载只撤销UI所有权，底层请求实际结束才归还名额；重挂页面不能绕过同Server的额度。只读文件检查不创建外部下载器任务。卡片逐步展示真实文件名、稀疏季集与字幕证据，未能完成识别和文件未能读取分别显示。
+
+新协议的手动获取默认选文件，提交不透明选择凭证。BT／PT用户可明确勾选整资源获取，界面说明内部文件未验证；内容读取失败不能自动勾选，分享转存、自动追更和洗版不提供此降级。选择了具体文件的任务不能因为执行器能力不足改下载整包。
+
+默认设置和每条订阅共用字幕策略控件：忽略、优先或必须，允许排序语言。默认优先简中再繁中，缺字幕可继续但提示；“必须”要求实际配对字幕证据，不把视频标题里的CHS或音轨语言当已核实字幕。保存默认只影响随后新建的表单，既有订阅继续使用冻结策略。

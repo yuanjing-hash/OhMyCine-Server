@@ -119,11 +119,11 @@ func TestRSSCompatibilityElementsAndMagnetNormalization(t *testing.T) {
 		t.Fatalf("compat feed failed: %+v err=%v", page, err)
 	}
 	torrentKind, _, torrentOK := DecodeIdentity(page.Items[0].TorrentID)
-	if !torrentOK || torrentKind != "torrent" {
+	if !torrentOK || torrentKind != "torrent" || page.Items[0].PayloadKind != site.PayloadTorrent {
 		t.Fatalf("torrent_url was not parsed: %+v", page.Items[0])
 	}
 	kind, value, ok := DecodeIdentity(page.Items[1].TorrentID)
-	if !ok || kind != "magnet" || value != "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567" {
+	if !ok || kind != "magnet" || value != "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567" || page.Items[1].PayloadKind != site.PayloadMagnet {
 		t.Fatalf("magnet was not normalized: %q %q", kind, value)
 	}
 	if _, ok := NormalizeMagnet("magnet:?xt=urn:btih:bad"); ok {

@@ -119,7 +119,7 @@ func (a *Adapter) Search(ctx context.Context, config site.Config, query site.Que
 			result.Skipped++
 			continue
 		}
-		result.Items = append(result.Items, site.Result{TorrentID: identity, Title: row.title, Subtitle: row.subtitle, SizeBytes: parseSize(row.size), Published: parseTime(row.published), Seeders: parseInt(row.seeders), Leechers: parseInt(row.leechers), Completed: parseInt(row.completed), Tags: row.tags})
+		result.Items = append(result.Items, site.Result{PayloadKind: site.PayloadMagnet, TorrentID: identity, Title: row.title, Subtitle: row.subtitle, SizeBytes: parseSize(row.size), Published: parseTime(row.published), Seeders: parseInt(row.seeders), Leechers: parseInt(row.leechers), Completed: parseInt(row.completed), Tags: row.tags})
 	}
 	return result, nil
 }

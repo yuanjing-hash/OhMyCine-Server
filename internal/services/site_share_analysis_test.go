@@ -313,8 +313,12 @@ func TestFollowInvalidShareTreesDoNotExhaustPreviewCapacity(t *testing.T) {
 	if run.Selected != 1 || run.Candidates != 33 {
 		t.Fatalf("preview capacity hid valid candidate: %+v", run)
 	}
-	if len(f.worker.sites.sharePreviews) != 1 {
-		t.Fatalf("unusable previews retained: %d", len(f.worker.sites.sharePreviews))
+	state := f.worker.sites.contents()
+	state.mu.Lock()
+	previews := len(state.previews)
+	state.mu.Unlock()
+	if previews != 1 || len(f.worker.sites.sharePreviews) != 0 {
+		t.Fatalf("unusable previews retained: modern=%d legacy=%d", previews, len(f.worker.sites.sharePreviews))
 	}
 }
 
