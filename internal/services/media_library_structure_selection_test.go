@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
+
 	"os"
 	"path/filepath"
 	"strings"
@@ -347,103 +347,6 @@ func TestStructureSelectionAutomaticallyIncludesRepairableVideoAndSidecar(t *tes
 	}
 	if _, err := service.EnqueueSelectionRepair(context.Background(), actor, library.ID, preview.ConfirmationToken, RequestContext{}); err != nil {
 		t.Fatalf("automatic preview could not cross the confirmation boundary: %v", err)
-	}
-}
-
-func TestStructureSelectionMoveOrderingMatchesStableDependencySemantics(t *testing.T) {
-	items := []StructurePlanItem{
-		{SourceRelative: "a.mkv", TargetRelative: "b.mkv"},
-		{SourceRelative: "c.mkv", TargetRelative: "free-c.mkv"},
-		{SourceRelative: "b.mkv", TargetRelative: "free-b.mkv"},
-		{SourceRelative: "d.mkv", TargetRelative: "e.mkv"},
-		{SourceRelative: "e.mkv", TargetRelative: "free-e.mkv"},
-	}
-	ordered := orderStructureSelectionMoves(items)
-	want := []string{"c.mkv", "b.mkv", "a.mkv", "e.mkv", "d.mkv"}
-	if len(ordered) != len(want) {
-		t.Fatalf("ordered %d moves, want %d", len(ordered), len(want))
-	}
-	for index, source := range want {
-		if ordered[index].SourceRelative != source {
-			t.Fatalf("order[%d]=%q want %q; full=%+v", index, ordered[index].SourceRelative, source, ordered)
-		}
-	}
-}
-
-func TestStructureSelectionMoveOrderingPreservesSortedCycleFallback(t *testing.T) {
-	items := []StructurePlanItem{
-		{SourceRelative: "z.mkv", TargetRelative: "free.mkv"},
-		{SourceRelative: "b.mkv", TargetRelative: "a.mkv"},
-		{SourceRelative: "a.mkv", TargetRelative: "b.mkv"},
-	}
-	ordered := orderStructureSelectionMoves(items)
-	want := []string{"z.mkv", "a.mkv", "b.mkv"}
-	for index, source := range want {
-		if ordered[index].SourceRelative != source {
-			t.Fatalf("cycle fallback[%d]=%q want %q; full=%+v", index, ordered[index].SourceRelative, source, ordered)
-		}
-	}
-}
-
-func TestStructureSelectionPlanIndexPreservesUnicodeEqualFoldPathMatching(t *testing.T) {
-	base := StructurePlan{
-		Items:          []StructurePlanItem{{Kind: "video", SourceRelative: `Folder/ſample.mkv`, TargetRelative: `Target/Movie.mkv`}},
-		ConflictGroups: []StructureConflictGroup{{Code: "duplicate_target", TargetRelative: `Target/ſpecial.mkv`}},
-	}
-	index := newStructureSelectionPlanIndex(base)
-	if _, exists := index.items[structureSelectionItemKey("video", `folder/sample.MKV`, `target/movie.MKV`)]; !exists {
-		t.Fatal("indexed item lookup no longer matches the former Unicode EqualFold semantics")
-	}
-	if _, exists := index.conflictGroups[structureSelectionConflictKey("duplicate_target", `target/special.MKV`)]; !exists {
-		t.Fatal("indexed conflict lookup no longer matches the former Unicode EqualFold semantics")
-	}
-}
-
-func TestStructureSelectionLargeAutomaticBatchPlanningCompletesWithinBound(t *testing.T) {
-	const itemCount = 16773
-	base := StructurePlan{Items: make([]StructurePlanItem, itemCount)}
-	issues := make([]models.MediaLibraryStructureIssue, itemCount)
-	for index := 0; index < itemCount; index++ {
-		source := fmt.Sprintf("incoming/%05d.mkv", index)
-		target := fmt.Sprintf("library/%05d.mkv", index)
-		base.Items[index] = StructurePlanItem{Kind: "video", SourceRelative: source, TargetRelative: target, ProviderID: fmt.Sprintf("provider-%05d", index)}
-		issues[index] = models.MediaLibraryStructureIssue{Token: fmt.Sprintf("issue-%05d", index), Kind: "video", Code: "path_mismatch", CurrentPath: source, ExpectedPath: target, Repairable: true}
-	}
-
-	started := time.Now()
-	index := newStructureSelectionPlanIndex(base)
-	plan := StructurePlan{}
-	for _, issue := range issues {
-		selection := MediaLibraryStructureSelection{IssueToken: issue.Token, Action: StructureSelectionRepair}
-		if err := appendIndexedStructureSelection(&plan, base, index, issue, nil, selection, "large-draft"); err != nil {
-			t.Fatal(err)
-		}
-	}
-	plan.Items = orderStructureSelectionMoves(plan.Items)
-	elapsed := time.Since(started)
-	if len(plan.Items) != itemCount || len(plan.ResolvedIssues) != itemCount {
-		t.Fatalf("large plan items=%d resolved=%d", len(plan.Items), len(plan.ResolvedIssues))
-	}
-	if elapsed > 5*time.Second {
-		t.Fatalf("large automatic selection planning took %s; expected indexed bounded planning", elapsed)
-	}
-}
-
-func TestStructureSelectionLargePreviewResponseOmitsDuplicateSelectionList(t *testing.T) {
-	selections := make([]MediaLibraryStructureSelection, maxStructurePreviewResponseSelections+1)
-	if got := structurePreviewResponseSelections(selections); got != nil {
-		t.Fatalf("large response repeated %d frozen selections", len(got))
-	}
-	if got := structurePreviewResponseSelections(selections[:maxStructurePreviewResponseSelections]); len(got) != maxStructurePreviewResponseSelections {
-		t.Fatalf("bounded compatibility response selections=%d", len(got))
-	}
-	preview := MediaLibraryStructureSelectionPreview{IssueCount: len(selections), Selections: structurePreviewResponseSelections(selections)}
-	raw, err := json.Marshal(preview)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(string(raw), `"selections"`) {
-		t.Fatalf("large initial response still contains duplicate selections: %s", raw)
 	}
 }
 

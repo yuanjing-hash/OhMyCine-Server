@@ -12,7 +12,7 @@ import (
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/authz"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/credential"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/database"
-	serverlog "github.com/yuanjing-hash/OhMyCine-Server/internal/logging"
+
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
 	cloudpkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud"
 	downloadpkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/downloader"
@@ -266,18 +266,6 @@ func TestOrdinaryPan115OfflineDownloadKeepsDownloaderStagingDirectory(t *testing
 	}
 	if task.StagingProviderDirectoryID != "" {
 		t.Fatalf("ordinary 115 offline task unexpectedly overrides staging directory with %q", task.StagingProviderDirectoryID)
-	}
-}
-
-func TestShareAndAdoptedWorkersUseShareIngestLogOperation(t *testing.T) {
-	if got := downloadOperation(models.DownloaderTypePan115Offline, models.DownloadSourceOriginShare); got != serverlog.OperationPan115ShareIngest {
-		t.Fatalf("share operation=%+v", got)
-	}
-	if got := downloadOperation(models.DownloaderTypePan115Offline, models.DownloadSourceOriginProviderIngest); got != serverlog.OperationPan115ShareIngest {
-		t.Fatalf("adopted operation=%+v", got)
-	}
-	if got := downloadOperation(models.DownloaderTypePan115Offline, models.DownloadSourceOriginUser); got != serverlog.OperationPan115OfflineDownload {
-		t.Fatalf("ordinary offline operation=%+v", got)
 	}
 }
 

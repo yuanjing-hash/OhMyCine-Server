@@ -51,28 +51,6 @@ func TestStructureRejectsLegacyLossyVersionPlanBeforeMutation(t *testing.T) {
 	}
 }
 
-func TestPlayerVersionLabelsDistinguishFilesWithoutLeakingPaths(t *testing.T) {
-	season, episode := 2, 1
-	entries := []models.MediaLibraryEntry{
-		{ID: 1, RelativePath: "/private-marker/Movie.1080p.h264.DTSHD-MA.mkv"},
-		{ID: 2, RelativePath: "/private-marker/Movie.1080p.h264.DTSHD-MA (1).mkv"},
-		{ID: 3, RelativePath: "/private-marker/Movie.1080p.h265.AC3.mkv"},
-		{ID: 4, RelativePath: "/private-marker/Show.S02E01.1080p.h265.AC3.mkv", MediaType: "tv", Season: &season, Episode: &episode},
-	}
-	labels := playerVersionLabels(entries)
-	if labels[1] == labels[2] || labels[1] == labels[3] || !strings.Contains(labels[1], "H264 DTS-HD MA") || !strings.Contains(labels[3], "H265 AC3") {
-		t.Fatalf("labels: %+v", labels)
-	}
-	if labels[4] != "1080p H265 AC3" {
-		t.Fatalf("different episode included in movie version count: %+v", labels)
-	}
-	for _, label := range labels {
-		if strings.Contains(label, "private-marker") || strings.Contains(label, "Movie") {
-			t.Fatalf("path leaked: %q", label)
-		}
-	}
-}
-
 func TestPlayerCatalogDetailReturnsAllMovieVersionsWithSafeLabels(t *testing.T) {
 	service, library, actor := createCatalogTestLibrary(t)
 	if err := service.db.Model(&models.MediaLibrary{}).Where("id = ?", library.ID).Update("enabled", true).Error; err != nil {

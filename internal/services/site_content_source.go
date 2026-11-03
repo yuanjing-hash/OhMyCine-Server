@@ -5,12 +5,15 @@ import (
 
 	downloadpkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/downloader"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/resourcecontent"
+	sitepkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/site"
 )
 
 // applyContentSelection replaces only acquisition material, after the ordinary
 // Site handoff has revalidated its trusted origin and current native source.
 // It preserves the entire original info dictionary and selects existing rows.
 func applyContentSelection(claim siteResultClaim, source DownloadSourceInput, selected ResolvedContentSelection) (DownloadSourceInput, error) {
+	// Never carry authority from a previous application across a new claim.
+	source.selectionOrigin = nil
 	if selected.Torrent != nil && selected.Manifest != nil {
 		if err := selected.Torrent.ValidateAgainst(*selected.Manifest); err != nil {
 			return source, contentInspectionExpired()
@@ -28,6 +31,13 @@ func applyContentSelection(claim siteResultClaim, source DownloadSourceInput, se
 			}
 		}
 		verifiedAll := selected.AllFilesVerified && selected.OriginalMagnet != "" && source.Kind == downloadpkg.SourceURL && source.URL == selected.OriginalMagnet
+		if !verifiedAll && source.Kind == downloadpkg.SourceURL && claim.SourceKind == RouteSourceBT && claim.PayloadKind == sitepkg.PayloadMagnet && !selected.Manifest.Private {
+			digest, err := selected.Torrent.Digest()
+			if err != nil {
+				return source, contentInspectionExpired()
+			}
+			source.selectionOrigin = &selectedSourceOrigin{OwnerID: claim.ActorID, SiteID: claim.SiteID, SiteRevision: claim.SiteRevision, SourceKind: claim.SourceKind, OriginalKind: source.Kind, Identity: identity, SelectionDigest: digest}
+		}
 		if !verifiedAll {
 			source.Kind, source.URL = downloadpkg.SourceTorrent, ""
 		}

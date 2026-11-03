@@ -5,10 +5,11 @@ import "time"
 // FollowPolicyDefaults affects only newly prepared subscription snapshots.
 // Existing subscriptions and runs retain their own frozen filters.
 type FollowPolicyDefaults struct {
-	ID            uint `gorm:"primaryKey"`
-	Revision      uint64
-	SubtitlesJSON string
-	UpdatedAt     time.Time
+	ID                    uint `gorm:"primaryKey"`
+	Revision              uint64
+	SubtitlesJSON         string
+	AcquisitionPreference string `gorm:"not null;default:'transfer_first'"`
+	UpdatedAt             time.Time
 }
 
 func (FollowPolicyDefaults) TableName() string { return "follow_policy_defaults" }

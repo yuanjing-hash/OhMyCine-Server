@@ -289,6 +289,9 @@ func (d *previewFixtureDriver) InspectShareDirectory(_ context.Context, raw stri
 		snapshot.Items = []cloud.ShareItem{{ID: "private-dir", Name: "Movies", IsDir: true}}
 	} else {
 		snapshot.Items = []cloud.ShareItem{{ID: "private-one", Name: "Seven.Samurai.1954.mkv", Size: 100}, {ID: "private-two", Name: "Other.mkv", Size: 200}}
+		if strings.Contains(raw, "/collection?") {
+			snapshot.Items = append(snapshot.Items, cloud.ShareItem{ID: "private-subtitle", Name: "Other.zh.ass", Size: 1})
+		}
 	}
 	return snapshot, nil
 }
@@ -428,6 +431,8 @@ func TestCloudSharePreviewSelectionAuthorizationAndPersistence(t *testing.T) {
 	}
 
 	// A collection creates independent pipelines and retry resolves their persisted keys.
+	adapter.resolved.ShareURL = "https://115.com/s/collection?password=abcd"
+	claim.TorrentID, src.URL = adapter.resolved.ShareURL, adapter.resolved.ShareURL
 	batchToken, _ := service.issueClaim(claim)
 	batchPreview, err := service.PreviewShare(context.Background(), f.actor, batchToken, f.downloader.ID)
 	if err != nil {
@@ -437,6 +442,31 @@ func TestCloudSharePreviewSelectionAuthorizationAndPersistence(t *testing.T) {
 	batch, err := service.Download(context.Background(), f.actor, batchInput, RequestContext{})
 	if err != nil || len(batch.SelectionTasks) != 2 {
 		t.Fatalf("collection not split: %+v %v", batch, err)
+	}
+	subtitles := 0
+	for _, summary := range batch.SelectionTasks {
+		var task models.DownloadTask
+		if err := f.db.First(&task, "id = ?", summary.ID).Error; err != nil {
+			t.Fatal(err)
+		}
+		plaintext, err := f.store.Decrypt(downloadSourcePurpose(task.ID), task.SourceCiphertext)
+		var source downloadSourceEnvelope
+		if err != nil || json.Unmarshal([]byte(plaintext), &source) != nil || source.ShareSelection == nil {
+			t.Fatal("collection lost encrypted selection", err)
+		}
+		ids := map[string]bool{}
+		for _, file := range source.ShareSelection.Files {
+			ids[file.ID] = true
+		}
+		if ids["private-subtitle"] {
+			subtitles++
+			if !ids["private-two"] || ids["private-one"] || len(ids) != 2 {
+				t.Fatal("subtitle crossed independent movie scope")
+			}
+		}
+	}
+	if subtitles != 1 {
+		t.Fatal("collection lost or duplicated matching subtitle")
 	}
 	selection, _, err := service.resolveShareSelection(context.Background(), f.actor, batchInput, claim, src)
 	if err != nil {
@@ -450,21 +480,6 @@ func TestCloudSharePreviewSelectionAuthorizationAndPersistence(t *testing.T) {
 	}
 	if _, err := service.PreviewShare(context.Background(), f.actor, token, f.downloader.ID); err == nil {
 		t.Fatal("consumed claim replayed")
-	}
-}
-
-func TestSelectedSharePackagesKeepIndependentMoviesAndSubtitles(t *testing.T) {
-	if got := siteResultMediaTypeHint("cloud_share", "名称: [LGNB全球顶级封装][名侦探柯南剧场版M11：绀碧之棺][BD-REMUX][Detective.Conan.Jolly.Roger.in.the.Deep.Azure.2007.Bluray.REMUX.1080p]", "tv"); got != "movie" {
-		t.Fatalf("search TV hint overrode theatrical evidence: %s", got)
-	}
-	if got := siteResultMediaTypeHint("cloud_share", "Detective.Conan.S01E01.1080p", "tv"); got != "tv" {
-		t.Fatalf("ordinary TV changed: %s", got)
-	}
-
-	selection := cloud.ShareSelection{Version: 1, Files: []cloud.ShareTreeItem{{ID: "a", RelativePath: "Movies/A.2000.mkv", Size: 10}, {ID: "b", RelativePath: "Movies/B.2001.mkv", Size: 20}, {ID: "sub", RelativePath: "Movies/B.2001.zh.ass", Size: 1}}}
-	groups := selectedSharePackages(selection)
-	if len(groups) != 2 || len(groups[0].Files) != 1 || len(groups[1].Files) != 2 || groups[1].Files[1].ID != "sub" {
-		t.Fatalf("scope merged or lost: %+v", groups)
 	}
 }
 

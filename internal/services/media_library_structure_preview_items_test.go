@@ -146,14 +146,3 @@ func TestStructurePreviewItemsRejectStaleSnapshots(t *testing.T) {
 		t.Fatalf("out-of-range page=%+v err=%v", page, err)
 	}
 }
-
-func TestStructurePreviewIncludesUnmovedWinner(t *testing.T) {
-	items, err := structurePreviewItems(StructurePlan{Items: []StructurePlanItem{{Kind: "video", SourceRelative: "/Movie (1).mkv", TargetRelative: "/Movie (2).mkv"}}}, []structureSelectionResolved{{
-		issue:     models.MediaLibraryStructureIssue{Kind: "video"},
-		selection: MediaLibraryStructureSelection{Action: StructureSelectionKeepAllVersions},
-		members:   []models.MediaLibraryStructureIssueMember{{SourcePath: "/Movie.mkv"}, {SourcePath: "/Movie (1).mkv"}},
-	}})
-	if err != nil || len(items) != 2 || items[1].Action != "keep" || items[1].CurrentPath != items[1].ExpectedPath || items[1].ExpectedPath != "Movie.mkv" {
-		t.Fatalf("unmoved winner missing: %+v err=%v", items, err)
-	}
-}

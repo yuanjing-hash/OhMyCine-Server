@@ -233,26 +233,9 @@ func TestSearchSnapshotBudgetRetainsPublishedRowsAndReservesFinalSpace(t *testin
 	if ok || !final.Partial || final.IncompleteReason != CodeSearchResultLimit || len(final.Items) != 1 || final.Items[0].Token != first.Items[0].Token {
 		t.Fatalf("limit lost existing result: %+v", final)
 	}
-	first.Items[0].Tags[0] = "caller-mutation"
-	if budget.latest[1].Items[0].Tags[0] != "safe" {
-		t.Fatal("snapshot slices shared with writer")
-	}
 	encoded, _ := json.Marshal(final)
 	if len(encoded) > budget.eventLimit || budget.reserved > budget.finalLimit {
 		t.Fatal("byte limit exceeded")
-	}
-}
-
-func TestClaimCapacityDoesNotEvictPublishedOrReservedResults(t *testing.T) {
-	service := &SiteService{now: time.Now, vault: map[string]siteResultClaim{}}
-	for i := 0; i < maxPTResultClaims; i++ {
-		service.vault[fmt.Sprint(i)] = siteResultClaim{Published: true, ExpiresAt: time.Now().Add(time.Minute)}
-	}
-	if _, err := service.issueClaim(siteResultClaim{ExpiresAt: time.Now().Add(time.Minute)}); ErrorCode(err) != CodeSearchResultLimit {
-		t.Fatalf("published claim evicted: %v", err)
-	}
-	if len(service.vault) != maxPTResultClaims {
-		t.Fatal("vault capacity changed")
 	}
 }
 

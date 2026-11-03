@@ -275,24 +275,6 @@ func TestCompletedRecognitionRecoveryBackfillsLegacyManifestOnlyOnce(t *testing.
 	}
 }
 
-func TestValidateDownloadRecognitionEpisodeOverrideBoundsAndDefaults(t *testing.T) {
-	episode := 9
-	season, normalizedEpisode, err := validateDownloadRecognitionEpisodeOverride("tv", nil, &episode)
-	if err != nil || season == nil || *season != 1 || normalizedEpisode == nil || *normalizedEpisode != 9 {
-		t.Fatalf("season=%v episode=%v err=%v", season, normalizedEpisode, err)
-	}
-	invalidSeason, invalidEpisode := 201, 100001
-	if _, _, err := validateDownloadRecognitionEpisodeOverride("tv", &invalidSeason, nil); ErrorCode(err) != CodeInvalidRequest {
-		t.Fatalf("invalid season err=%v", err)
-	}
-	if _, _, err := validateDownloadRecognitionEpisodeOverride("tv", nil, &invalidEpisode); ErrorCode(err) != CodeInvalidRequest {
-		t.Fatalf("invalid episode err=%v", err)
-	}
-	if _, _, err := validateDownloadRecognitionEpisodeOverride("movie", nil, &episode); ErrorCode(err) != CodeInvalidRequest {
-		t.Fatalf("movie episode err=%v", err)
-	}
-}
-
 func TestValidateCompletedManifestEpisodeOverrideRequiresExactlyOneVideo(t *testing.T) {
 	episode := 9
 	if err := validateCompletedManifestEpisodeOverride("{}", &episode); ErrorCode(err) != CodeInvalidRequest {

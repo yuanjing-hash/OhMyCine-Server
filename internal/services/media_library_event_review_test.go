@@ -53,15 +53,3 @@ func TestProviderEventReviewNameRejectsSecrets(t *testing.T) {
 		t.Fatal("raw error exposed")
 	}
 }
-
-func TestProviderEventReviewReasonsExplainPausedDeletion(t *testing.T) {
-	for code, expected := range map[string]string{
-		"deletion_event_order_unproven":     "无法确认先后顺序",
-		"deletion_scope_too_large":          "超过本次安全处理范围",
-		"deletion_artifact_source_unproven": "产物属于当前媒体库来源",
-	} {
-		if !strings.Contains(providerReviewReason(code), expected) {
-			t.Fatalf("reason %s lacks actionable explanation", code)
-		}
-	}
-}

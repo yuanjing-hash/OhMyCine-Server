@@ -88,6 +88,7 @@ func (a *stubResolverAdapter) ResolveSource(_ context.Context, _ sitepkg.Config,
 func (a *stubSiteAdapter) Kind() string {
 	if a.kind == "" {
 		return "pttime"
+
 	}
 	return a.kind
 }
@@ -425,7 +426,10 @@ func validSiteInput(name, baseURL string) SiteInput {
 
 func TestSiteCredentialsAreEncryptedAndRedacted(t *testing.T) {
 	service, _, actor, store, _, _ := siteFixture(t)
-	created, err := service.Create(context.Background(), actor, validSiteInput("PTTime", "https://one.example.test"), RequestContext{})
+	input := validSiteInput("PTTime", "https://one.example.test")
+	input.BrowserEmulation = true
+	input.BrowserServiceURL = "http://solver.internal.example:8191"
+	created, err := service.Create(context.Background(), actor, input, RequestContext{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -444,7 +448,7 @@ func TestSiteCredentialsAreEncryptedAndRedacted(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, forbidden := range []string{"server-only-secret", "passkey-server-only", "credential_ciphertext", "Cookie", "Passkey"} {
+	for _, forbidden := range []string{"server-only-secret", "passkey-server-only", "credential_ciphertext", "Cookie", "Passkey", input.BrowserServiceURL, "browser_service_url"} {
 		if strings.Contains(string(encoded), forbidden) {
 			t.Fatalf("summary leaked %q: %s", forbidden, encoded)
 		}
@@ -452,28 +456,24 @@ func TestSiteCredentialsAreEncryptedAndRedacted(t *testing.T) {
 	if !strings.Contains(string(encoded), `"base_url"`) || strings.Contains(string(encoded), `"BaseURL"`) {
 		t.Fatalf("summary uses unstable JSON contract: %s", encoded)
 	}
-}
-
-func TestSiteSummaryReportsExactCredentialFieldsAndFailsClosed(t *testing.T) {
-	service, _, actor, _, _, _ := siteFixture(t)
-	input := validSiteInput("Cookie only", "https://cookie-only.example.test")
-	input.Passkey = ""
-	created, err := service.Create(context.Background(), actor, input, RequestContext{})
-	if err != nil {
-		t.Fatal(err)
+	if !created.BrowserServiceConfigured || !created.CredentialConfigured || !created.CookieConfigured || !created.PasskeyConfigured || created.APIKeyConfigured {
+		t.Fatalf("unexpected configured fields: %+v", created)
 	}
-	if !created.CredentialConfigured || !created.CookieConfigured || created.PasskeyConfigured || created.APIKeyConfigured {
-		t.Fatalf("unexpected per-field flags: %+v", created)
+	cleared, err := service.Update(context.Background(), actor, created.ID, SiteUpdateInput{Revision: created.Revision, ClearPasskey: true}, RequestContext{})
+	if err != nil || !cleared.CredentialConfigured || !cleared.CookieConfigured || cleared.PasskeyConfigured || cleared.APIKeyConfigured {
+		t.Fatalf("unexpected cookie-only flags: %+v err=%v", cleared, err)
+	}
+	invalid := input
+	invalid.Name, invalid.BrowserServiceURL = "Invalid browser URL", "file:///tmp/browser"
+	if _, err := service.Create(context.Background(), actor, invalid, RequestContext{}); ErrorCode(err) != CodeSiteURLInvalid {
+		t.Fatalf("invalid browser service URL err=%v", err)
 	}
 	if err := service.db.Model(&models.Site{}).Where("id = ?", created.ID).Update("credential_ciphertext", "not-a-valid-envelope").Error; err != nil {
 		t.Fatal(err)
 	}
 	items, err := service.List(actor)
-	if err != nil || len(items) != 1 {
-		t.Fatalf("items=%+v err=%v", items, err)
-	}
-	if !items[0].CredentialConfigured || items[0].CookieConfigured || items[0].PasskeyConfigured || items[0].APIKeyConfigured {
-		t.Fatalf("decrypt failure must keep aggregate presence but fail closed per field: %+v", items[0])
+	if err != nil || len(items) != 1 || !items[0].CredentialConfigured || items[0].CookieConfigured || items[0].PasskeyConfigured || items[0].APIKeyConfigured {
+		t.Fatalf("decrypt failure did not fail closed: items=%+v err=%v", items, err)
 	}
 }
 
@@ -544,6 +544,9 @@ func TestSiteSearchIsolatesFailuresAndBindsClaimsToActor(t *testing.T) {
 		statuses[group.SiteName] = group.Status
 		if len(group.Items) == 1 {
 			token = group.Items[0].Token
+			if group.Items[0].PayloadKind != sitepkg.PayloadUnknown || group.Items[0].ContentInspection {
+				t.Fatal("legacy adapter advertised content inspection")
+			}
 		}
 	}
 	if statuses["Working"] != "success" || statuses["Broken"] != "error" || token == "" {
@@ -1246,44 +1249,5 @@ func TestSiteDownloadClaimAllowsOnlyOneConcurrentConsumer(t *testing.T) {
 	}
 	if adapter.downloads != 1 {
 		t.Fatalf("provider download calls=%d", adapter.downloads)
-	}
-}
-
-func TestSiteAdapterErrorsAreStable(t *testing.T) {
-	for err, code := range map[error]string{sitepkg.ErrAuthentication: CodeSiteAuthentication, sitepkg.ErrRateLimited: CodeSiteRateLimited, sitepkg.ErrInvalidReply: CodeSiteResponseInvalid, sitepkg.ErrUnavailable: CodeSiteUnavailable} {
-		if got := ErrorCode(siteAdapterError(err, "failed")); got != code {
-			t.Fatalf("err=%v got=%s want=%s", err, got, code)
-		}
-	}
-	if !errors.Is(sitepkg.ErrUnavailable, sitepkg.ErrUnavailable) {
-		t.Fatal("sentinel sanity")
-	}
-}
-
-func TestNormalizeBrowserServiceAllowsGlobalCloakWithoutPerSiteFallback(t *testing.T) {
-	value, err := normalizeBrowserService(true, "")
-	if err != nil || value != "" {
-		t.Fatalf("value=%q err=%v", value, err)
-	}
-	if _, err := normalizeBrowserService(true, "file:///tmp/browser"); ErrorCode(err) != CodeSiteURLInvalid {
-		t.Fatalf("invalid service err=%v", err)
-	}
-}
-
-func TestSiteSummaryNeverReturnsBrowserServiceURL(t *testing.T) {
-	service, _, actor, _, _, _ := siteFixture(t)
-	input := validSiteInput("Rendered PT", "https://rendered.example.test")
-	input.BrowserEmulation = true
-	input.BrowserServiceURL = "http://solver.internal.example:8191"
-	created, err := service.Create(context.Background(), actor, input, RequestContext{})
-	if err != nil || !created.BrowserServiceConfigured {
-		t.Fatalf("created=%+v err=%v", created, err)
-	}
-	raw, err := json.Marshal(created)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(string(raw), input.BrowserServiceURL) || strings.Contains(string(raw), "browser_service_url") {
-		t.Fatalf("browser service URL leaked: %s", raw)
 	}
 }

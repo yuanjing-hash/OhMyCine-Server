@@ -426,7 +426,6 @@ func (a *Adapter) Search(ctx context.Context, c site.Config, q site.Query) (site
 		page.Truncated = true
 		page.Warnings = append(page.Warnings, site.SearchWarning{Code: "pansou_snapshot_truncated", Message: "本批结果超过1000条，已保留前1000条；请缩小关键词或类型后重搜"})
 	}
-	page.Warnings = append(page.Warnings, site.SearchWarning{Code: "pansou_received_batch", Message: "已收到本次PanSou响应；上游未提供逐插件完成凭据"})
 	var random [24]byte
 	if _, err := rand.Read(random[:]); err != nil {
 		return site.Page{}, site.ErrUnavailable

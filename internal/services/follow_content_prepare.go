@@ -60,6 +60,9 @@ func (w *FollowSearchWorker) prepareFollowCandidates(ctx context.Context, actor 
 				return
 			}
 			prepared.Recommendation = recommendation
+			// The executable route was resolved from the frozen source, not the
+			// site's display name or category (a PanSou site can also return BT).
+			prepared.Candidate.AcquisitionTier = followAcquisitionTier(snapshot.Filters.AcquisitionPreference, recommendation.SourceKind)
 			// Compatibility for an old result contract; never use this branch after a
 			// new manifest failed. Current native search results advertise inspection.
 			if !candidate.Item.ContentInspection && isCloudShareSource(candidate.Item.SourceKind) {

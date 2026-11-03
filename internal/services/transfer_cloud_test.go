@@ -46,25 +46,6 @@ func newFakeMutationCloudDriver() *fakeMutationCloudDriver {
 	return &fakeMutationCloudDriver{items: map[string]cloudpkg.Item{}, nextID: 100, statErrors: map[string]error{}, paths: map[string]string{}}
 }
 
-func TestUniqueCloudTargetDirectoriesBuildsDeterministicDAG(t *testing.T) {
-	targets := []transferTargetItem{
-		{Relative: "剧集/作品/Season 02/E02.mkv"},
-		{Relative: "剧集/作品/Season 01/E01.mkv"},
-		{Relative: "剧集/作品/Season 02/E01.mkv"},
-		{Relative: "Movie.mkv"},
-	}
-	got := uniqueCloudTargetDirectories(targets)
-	want := []string{"剧集/作品/Season 01", "剧集/作品/Season 02"}
-	if len(got) != len(want) {
-		t.Fatalf("directories=%v want=%v", got, want)
-	}
-	for index := range want {
-		if got[index] != want[index] {
-			t.Fatalf("directories=%v want=%v", got, want)
-		}
-	}
-}
-
 func TestValidCloudNestedDirectoryIdentityRejectsProviderRootForNestedPath(t *testing.T) {
 	root := cloudpkg.Item{ID: "library-root", IsDir: true}
 	if validCloudNestedDirectoryIdentity(root.ID, "电影/动画电影", root) {
@@ -75,26 +56,6 @@ func TestValidCloudNestedDirectoryIdentityRejectsProviderRootForNestedPath(t *te
 	}
 	if !validCloudNestedDirectoryIdentity(root.ID, "电影/动画电影", cloudpkg.Item{ID: "category", IsDir: true}) {
 		t.Fatal("valid nested directory was rejected")
-	}
-}
-
-func TestEnsureCloudDirectoryReusesCurrentAttemptValidation(t *testing.T) {
-	driver := newFakeMutationCloudDriver()
-	driver.items["root"] = cloudpkg.Item{ID: "root", ParentID: "0", Name: "library", IsDir: true}
-	driver.items["season"] = cloudpkg.Item{ID: "season", ParentID: "root", Name: "Season 01", IsDir: true}
-	state := cloudTransferState{Version: cloudTransferStateVersion, Directories: map[string]string{".": "root", "Season 01": "season"}, Items: map[string]cloudTransferItemState{}}
-	validated := map[string]struct{}{".": {}}
-	worker := &TransferWorker{}
-	task := models.TransferTask{}
-	if _, err := worker.ensureCloudDirectory(context.Background(), driver, &task, &state, "Season 01", validated); err != nil {
-		t.Fatal(err)
-	}
-	firstCalls := driver.statCalls
-	if _, err := worker.ensureCloudDirectory(context.Background(), driver, &task, &state, "Season 01", validated); err != nil {
-		t.Fatal(err)
-	}
-	if firstCalls == 0 || driver.statCalls != firstCalls {
-		t.Fatalf("directory was revalidated per file: first=%d total=%d", firstCalls, driver.statCalls)
 	}
 }
 
@@ -351,6 +312,10 @@ func TestCloudTransferWorkerMovesAndCopiesWithinOneConnection(t *testing.T) {
 	for _, mode := range []string{models.MediaLibraryTransferMove, models.MediaLibraryTransferCopy} {
 		t.Run(mode, func(t *testing.T) {
 			fixture := newCloudTransferFixture(t, mode, models.MediaLibraryConflictOverwrite, false)
+			if mode == models.MediaLibraryTransferCopy {
+				fixture.driver.items["source-subtitle"] = cloudpkg.Item{ID: "source-subtitle", ParentID: "source-root", Name: "Movie.2024.zh-CN.vtt", Size: 22, SHA1: "SUBTITLE-SHA1"}
+				fixture.manifest.Files = append(fixture.manifest.Files, downloadpkg.File{RelativePath: "Movie.2024.zh-CN.vtt", ProviderItemID: "source-subtitle", ProviderParentID: "source-root", Size: 22, SHA1: "SUBTITLE-SHA1"})
+			}
 			result := fixture.run(t)
 			if result.ErrorCode != "" || result.Wait != nil || result.RetryAt != nil {
 				t.Fatalf("result=%+v", result)
@@ -368,6 +333,9 @@ func TestCloudTransferWorkerMovesAndCopiesWithinOneConnection(t *testing.T) {
 			if mode == models.MediaLibraryTransferMove && (!sourceExists || source.ParentID == "source-root") {
 				t.Fatalf("move did not relocate the source: %+v", source)
 			}
+			if mode == models.MediaLibraryTransferCopy && fixture.driver.copyBatchCalls != 1 {
+				t.Fatalf("copy batch calls=%d want=1", fixture.driver.copyBatchCalls)
+			}
 			if mode == models.MediaLibraryTransferCopy && !sourceExists {
 				t.Fatal("copy removed the source")
 			}
@@ -375,7 +343,7 @@ func TestCloudTransferWorkerMovesAndCopiesWithinOneConnection(t *testing.T) {
 			if err := fixture.queue.db.Where("download_task_id = ?", fixture.download.ID).First(&transfer).Error; err != nil {
 				t.Fatal(err)
 			}
-			if transfer.Phase != models.TransferTaskStatusCompleted || transfer.ProcessedFiles != 1 || transfer.CloudStateJSON == "" {
+			if transfer.Phase != models.TransferTaskStatusCompleted || transfer.ProcessedFiles != len(fixture.manifest.Files) || transfer.CloudStateJSON == "" {
 				t.Fatalf("transfer=%+v", transfer)
 			}
 			if strings.Contains(transfer.PlanSummaryJSON, fixture.sourceID) || strings.Contains(transfer.PlanSummaryJSON, found.ID) {
@@ -553,19 +521,6 @@ func TestCloudTransferMoveBatchPartialResultPersistsOnlyRemainingIntent(t *testi
 	}
 }
 
-func TestCloudTransferCopyUsesBatchPrestageForUniqueFiles(t *testing.T) {
-	fixture := newCloudTransferFixture(t, models.MediaLibraryTransferCopy, models.MediaLibraryConflictOverwrite, false)
-	fixture.driver.items["source-subtitle"] = cloudpkg.Item{ID: "source-subtitle", ParentID: "source-root", Name: "Movie.2024.zh-CN.vtt", Size: 22, SHA1: "SUBTITLE-SHA1"}
-	fixture.manifest.Files = append(fixture.manifest.Files, downloadpkg.File{RelativePath: "Movie.2024.zh-CN.vtt", ProviderItemID: "source-subtitle", ProviderParentID: "source-root", Size: 22, SHA1: "SUBTITLE-SHA1"})
-	result := fixture.run(t)
-	if result.ErrorCode != "" || result.Wait != nil || result.RetryAt != nil {
-		t.Fatalf("result=%+v", result)
-	}
-	if fixture.driver.copyBatchCalls != 1 {
-		t.Fatalf("copy batch calls=%d want=1", fixture.driver.copyBatchCalls)
-	}
-}
-
 func TestCloudTransferCopyDoesNotBatchCollidingTemporaryNames(t *testing.T) {
 	fixture := newCloudTransferFixture(t, models.MediaLibraryTransferCopy, models.MediaLibraryConflictOverwrite, false)
 	if err := fixture.service.Enqueue(fixture.download, fixture.manifest); err != nil {
@@ -704,43 +659,6 @@ func TestCloudTransferExistingTargetLeafUsesBoundedPathResolutionAndCachedBounda
 	// three stats regardless of the number of files in that directory.
 	if fixture.driver.statCalls != 3 {
 		t.Fatalf("target ancestry proof stats=%d want one cached three-node proof", fixture.driver.statCalls)
-	}
-}
-
-func TestCloudConflictListingCacheIsSharedAcrossAttempt(t *testing.T) {
-	driver := newFakeMutationCloudDriver()
-	driver.items["target"] = cloudpkg.Item{ID: "target", ParentID: "root", Name: "target", IsDir: true}
-	driver.items["existing"] = cloudpkg.Item{ID: "existing", ParentID: "target", Name: "Movie.mkv", Size: 9}
-	state := cloudTransferState{Directories: map[string]string{".": "root", "Movies": "target"}, Items: map[string]cloudTransferItemState{}}
-	targets := []transferTargetItem{{File: downloadpkg.File{ProviderItemID: "source", Size: 10}, Relative: "Movies/Movie.mkv"}}
-	worker := &TransferWorker{}
-	ctx := withCloudDirectoryAttempt(context.Background(), driver, "")
-	if _, _, err := worker.cloudConflicts(ctx, driver, targets, state, models.MediaLibraryTransferMove); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err := worker.cloudConflicts(ctx, driver, targets, state, models.MediaLibraryTransferMove); err != nil {
-		t.Fatal(err)
-	}
-	if driver.listCalls != 1 {
-		t.Fatalf("repeated conflict check listed target %d times", driver.listCalls)
-	}
-}
-
-func TestCloudDirectoryAttemptCacheIsInvalidatedAfterMutation(t *testing.T) {
-	driver := newFakeMutationCloudDriver()
-	driver.items["target"] = cloudpkg.Item{ID: "target", ParentID: "root", Name: "target", IsDir: true}
-	ctx := withCloudDirectoryAttempt(context.Background(), driver, "")
-	if _, err := listCloudTargetDirectoryCached(ctx, driver, "target"); err != nil {
-		t.Fatal(err)
-	}
-	driver.items["added"] = cloudpkg.Item{ID: "added", ParentID: "target", Name: "Movie.mkv", Size: 9}
-	invalidateCloudDirectoryListings(ctx, "target")
-	items, err := listCloudTargetDirectoryCached(ctx, driver, "target")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if driver.listCalls != 2 || len(items) != 1 || items[0].ID != "added" {
-		t.Fatalf("list calls=%d items=%+v", driver.listCalls, items)
 	}
 }
 

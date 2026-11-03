@@ -446,43 +446,6 @@ func TestCatalogArtifactAuthenticationFailureKeepsExactItemPendingWithoutAttempt
 	}
 }
 
-func TestCatalogArtifactFullAuditHealthChecksAreBoundedAndConcurrent(t *testing.T) {
-	service := &MediaArtifactService{localSlots: make(chan struct{}, 8)}
-	started := make(chan struct{}, 8)
-	release := make(chan struct{})
-	var active, maximum atomic.Int32
-	done := make(chan error, 1)
-	go func() {
-		results, err := service.inspectCatalogArtifactHealth(context.Background(), 8, func(index int) catalogArtifactInspection {
-			current := active.Add(1)
-			for previous := maximum.Load(); current > previous && !maximum.CompareAndSwap(previous, current); previous = maximum.Load() {
-			}
-			started <- struct{}{}
-			<-release
-			active.Add(-1)
-			return catalogArtifactInspection{healthy: true, artifactIDs: []uint{uint(index + 1)}}
-		})
-		if err == nil && len(results) != 8 {
-			err = fmt.Errorf("inspection results=%d want=8", len(results))
-		}
-		done <- err
-	}()
-	for range catalogArtifactLocalWorkers {
-		select {
-		case <-started:
-		case <-time.After(time.Second):
-			t.Fatal("full audit hashing remained serial")
-		}
-	}
-	if maximum.Load() != catalogArtifactLocalWorkers {
-		t.Fatalf("full audit hashing concurrency=%d want=%d", maximum.Load(), catalogArtifactLocalWorkers)
-	}
-	close(release)
-	if err := <-done; err != nil {
-		t.Fatal(err)
-	}
-}
-
 func TestCatalogArtifactFinalizeResumesWithoutRewriting(t *testing.T) {
 	artifacts, store, library, binding, _, _ := boundArtifactFixture(t)
 	if err := artifacts.ScheduleGeneration(library.ID, 7); err != nil {

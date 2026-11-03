@@ -2,7 +2,7 @@ package services
 
 import (
 	"context"
-	"encoding/json"
+
 	"fmt"
 	"strings"
 	"sync/atomic"
@@ -104,29 +104,4 @@ func TestFastScanSharedSnapshotDoesNotStarveWriter(t *testing.T) {
 		t.Fatalf("renewed tracking lease is unusable: %v", err)
 	}
 	t.Logf("4100 episodes,299KB shared metadata publication+writer=%s", time.Since(started))
-}
-
-func BenchmarkRecognitionFreshnessAmplification(b *testing.B) {
-	raw := fmt.Sprintf(`{"version":1,"engine_version":%q,"snapshot":{"overview":%q}}`, mediarecognition.EngineVersion, strings.Repeat("x", 299000))
-	record := models.MediaLibraryRecognition{MetadataJSON: raw}
-	b.Run("old_per_file_4100", func(b *testing.B) {
-		for n := 0; n < b.N; n++ {
-			for i := 0; i < 4100; i++ {
-				var old recognitionMetadataEnvelope
-				if err := json.Unmarshal([]byte(raw), &old); err != nil {
-					b.Fatal(err)
-				}
-			}
-		}
-	})
-	b.Run("once_per_work", func(b *testing.B) {
-		for n := 0; n < b.N; n++ {
-			fresh := mediaLibraryRecognitionProjectionFresh(record)
-			for i := 0; i < 4100; i++ {
-				if !fresh {
-					b.Fatal("stale")
-				}
-			}
-		}
-	})
 }

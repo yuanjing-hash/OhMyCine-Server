@@ -176,6 +176,9 @@ func (s *DownloadService) ProviderEventsChanged(_ context.Context, connectionID 
 }
 
 type DownloadSourceInput struct {
+	// Admission-only authority minted by verified content selection. It cannot
+	// be deserialized from HTTP or reconstructed from a stored source string.
+	selectionOrigin  *selectedSourceOrigin
 	AllFilesVerified bool                       `json:"-"`
 	ContentSelection *resourcecontent.Selection `json:"-"`
 	ShareSelection   *cloud.ShareSelection
@@ -468,7 +471,7 @@ func (s *DownloadService) submit(ctx context.Context, ownerID uint, input Submit
 		if err := s.db.WithContext(ctx).First(&site, input.SourceSiteID).Error; err != nil {
 			return DownloadTaskSummary{}, appError(CodeSiteUnavailable, "站点不存在或已停用", err)
 		}
-		if err := validateSiteDownloadSource(downloaderRecord, source.Kind, site); err != nil {
+		if err := validateSelectedSiteDownloadSource(downloaderRecord, source, input.Source.selectionOrigin, ownerID, site); err != nil {
 			return DownloadTaskSummary{}, err
 		}
 	}
@@ -693,7 +696,7 @@ func (s *DownloadService) submit(ctx context.Context, ownerID uint, input Submit
 			if err := tx.First(&site, input.SourceSiteID).Error; err != nil {
 				return appError(CodeSiteUnavailable, "站点不存在或已停用", err)
 			}
-			if err := validateSiteDownloadSource(downloaderRecord, source.Kind, site); err != nil {
+			if err := validateSelectedSiteDownloadSource(downloaderRecord, source, input.Source.selectionOrigin, ownerID, site); err != nil {
 				return err
 			}
 		}

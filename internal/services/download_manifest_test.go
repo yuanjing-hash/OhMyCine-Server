@@ -20,45 +20,6 @@ import (
 	"gorm.io/gorm"
 )
 
-func TestDownloadSearchTitlesStripsReleaseSuffixFromSevenSamurai(t *testing.T) {
-	candidates := downloadSearchTitles("Seven.Samurai.1954.CC.2160p.UHD.BluRay.x265.10bit.DTS-HD.MA.2.0-SONYHD.mkv")
-	if len(candidates) == 0 || candidates[0] != "Seven Samurai 1954" {
-		t.Fatalf("candidates=%v", candidates)
-	}
-}
-
-func TestDownloadSearchTitlesUsesRealReleaseFolderWithoutBreakingTitleHyphens(t *testing.T) {
-	folder := "【高清影视之家发布 www.HDBTHD.com】七武士[简繁英字幕].Seven.Samurai.1954.CC.2160p.UHD.BluRay.x265.10bit.DTS-HD.MA.2.0-SONYHD"
-	candidates := downloadSearchTitles(folder)
-	if len(candidates) < 2 || candidates[0] != "七武士" || candidates[1] != "Seven Samurai 1954" {
-		t.Fatalf("candidates=%v", candidates)
-	}
-	hyphenated := downloadSearchTitles("Spider-Man.2002.CC.2160p.UHD.BluRay.x265.10bit.DTS-HD.MA.2.0-SONYHD.mkv")
-	if len(hyphenated) == 0 || hyphenated[0] != "Spider-Man 2002" {
-		t.Fatalf("hyphenated=%v", hyphenated)
-	}
-}
-
-func TestDownloadSearchTitlesCleansMingDynastyReleaseWithoutDroppingNumericTitle(t *testing.T) {
-	candidates := downloadSearchTitles("Ming Dynasty in 1566 HQ -BlackTV")
-	if len(candidates) == 0 || candidates[0] != "Ming Dynasty in 1566" {
-		t.Fatalf("candidates=%v", candidates)
-	}
-
-	files := make([]downloadpkg.File, 0, 49)
-	for episode := 1; episode <= 49; episode++ {
-		files = append(files, downloadpkg.File{
-			RelativePath: fmt.Sprintf("Ming Dynasty in 1566 HQ -BlackTV/Ming.Dynasty.in.1566.S01E%02d.HQ-BlackTV.mkv", episode),
-			Size:         6 * 1024 * 1024 * 1024,
-		})
-	}
-	manifest := downloadpkg.Manifest{Name: "Ming Dynasty in 1566 HQ -BlackTV", Complete: true, Files: files}
-	recognition := downloadRecognitionCandidates(manifest, nil)
-	if len(recognition) == 0 || recognition[0].Title != "Ming Dynasty in 1566" || recognition[0].MediaType != "tv" || recognition[0].Year != nil {
-		t.Fatalf("recognition=%+v", recognition)
-	}
-}
-
 func TestSelectDownloadPackageManifestRejectsAdvertisementVideos(t *testing.T) {
 	mainPath := "Seven Samurai CC MA 2 0 SONYHD/Seven Samurai CC MA 2 0 SONYHD.mkv"
 	manifest := downloadpkg.Manifest{

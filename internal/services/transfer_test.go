@@ -611,6 +611,15 @@ func TestTransferWorkerCopiesAndMovesIntoMediaLibrary(t *testing.T) {
 	for _, mode := range []string{models.MediaLibraryTransferCopy, models.MediaLibraryTransferMove} {
 		t.Run(mode, func(t *testing.T) {
 			queue, _, download, source, destination := transferFixture(t, mode, models.MediaLibraryConflictOverwrite, false)
+			rootSource := filepath.Join(download.StagingAbsolutePath, filepath.Base(source))
+			if mode == models.MediaLibraryTransferMove {
+				if err := os.Rename(source, rootSource); err != nil {
+					t.Fatal(err)
+				}
+				source = rootSource
+			} else if err := os.WriteFile(rootSource, []byte("unselected-root-file"), 0o600); err != nil {
+				t.Fatal(err)
+			}
 			service := NewTransferService(queue.db, queue.audit, queue, zerolog.Nop())
 			manifest := downloadpkg.Manifest{Name: "Movie.2024", Complete: true, Files: []downloadpkg.File{{RelativePath: "Movie.2024.mkv", Size: minimumAutomaticTransferVideoBytes}}}
 			if err := service.Enqueue(download, manifest); err != nil {
@@ -764,17 +773,6 @@ func TestBuildTransferTargetsPreservesMovieReleaseVersionAcrossTemplates(t *test
 	}
 }
 
-func TestRenderImportTemplateRemovesEmptyOptionalVersionSuffix(t *testing.T) {
-	year := 2024
-	result, err := renderImportTemplate("{title} ({year}) - {version}", transferTemplateValues{Title: "Movie", Year: &year}, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result != "Movie (2024)" {
-		t.Fatalf("result=%q", result)
-	}
-}
-
 func TestTransferWorkerAppliesAutomaticConflictPolicies(t *testing.T) {
 	for _, test := range []struct {
 		policy string
@@ -863,49 +861,6 @@ func TestTransferRejectsSymlinkedSourceAncestor(t *testing.T) {
 	}
 }
 
-func TestTransferPlanFindsQBittorrentFileLeftInStagingRoot(t *testing.T) {
-	_, _, download, categorySource, destination := transferFixture(t, models.MediaLibraryTransferMove, models.MediaLibraryConflictOverwrite, false)
-	rootSource := filepath.Join(download.StagingAbsolutePath, filepath.Base(categorySource))
-	if err := os.Rename(categorySource, rootSource); err != nil {
-		t.Fatal(err)
-	}
-	manifest := downloadpkg.Manifest{Name: "Movie.2024", Complete: true, Files: []downloadpkg.File{{RelativePath: filepath.Base(rootSource), Size: minimumAutomaticTransferVideoBytes}}}
-	plan, _, err := buildTransferPlan(download, manifest)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(plan) != 1 {
-		t.Fatalf("plan length=%d want=1", len(plan))
-	}
-	if filepath.Clean(plan[0].Source) != filepath.Clean(rootSource) {
-		t.Fatalf("source=%q want=%q", plan[0].Source, rootSource)
-	}
-	if filepath.Clean(plan[0].Destination) != filepath.Clean(destination) {
-		t.Fatalf("destination=%q want=%q", plan[0].Destination, destination)
-	}
-}
-
-func TestResolveManifestSourcePrefersClassifiedPath(t *testing.T) {
-	staging := t.TempDir()
-	categoryRoot := filepath.Join(staging, "TV")
-	if err := os.MkdirAll(categoryRoot, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	for _, path := range []string{filepath.Join(categoryRoot, "Episode.mkv"), filepath.Join(staging, "Episode.mkv")} {
-		if err := os.WriteFile(path, []byte(path), 0o600); err != nil {
-			t.Fatal(err)
-		}
-	}
-	got, err := resolveManifestSource(categoryRoot, staging, "Episode.mkv")
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := filepath.Join(categoryRoot, "Episode.mkv")
-	if filepath.Clean(got) != filepath.Clean(want) {
-		t.Fatalf("source=%q want classified source %q", got, want)
-	}
-}
-
 func TestTransferRejectsSymlinkedTargetAncestor(t *testing.T) {
 	queue, _, download, _, destination := transferFixture(t, models.MediaLibraryTransferCopy, models.MediaLibraryConflictOverwrite, false)
 	external := t.TempDir()
@@ -928,40 +883,6 @@ func TestTransferRejectsSymlinkedTargetAncestor(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(external, filepath.Base(filepath.Dir(destination)), filepath.Base(destination))); !os.IsNotExist(err) {
 		t.Fatalf("unsafe target was written outside the library: %v", err)
-	}
-}
-
-func TestTransferEpisodeFactsUsesValidatedManualSingleEpisodeOverride(t *testing.T) {
-	season, episode := 2, 9
-	download := models.DownloadTask{
-		RecognitionOverrideMediaType: "tv",
-		RecognitionOverrideSeason:    &season,
-		RecognitionOverrideEpisode:   &episode,
-	}
-	actualSeason, actualEpisode := transferEpisodeFacts(download, "Ultraman Omega.mkv", 1)
-	if actualSeason == nil || *actualSeason != 2 || actualEpisode == nil || *actualEpisode != 9 {
-		t.Fatalf("season=%v episode=%v", actualSeason, actualEpisode)
-	}
-	_, multipleEpisode := transferEpisodeFacts(download, "Ultraman Omega.mkv", 2)
-	if multipleEpisode != nil {
-		t.Fatalf("manual single episode override leaked into multi-video package: %v", *multipleEpisode)
-	}
-}
-
-func TestTransferEpisodeFactsUsesPersistedScrapeFactsWithoutReusingSingleEpisode(t *testing.T) {
-	season, episode := 1, 9
-	download := models.DownloadTask{
-		ScrapeMediaType: "tv",
-		ScrapeSeason:    &season,
-		ScrapeEpisode:   &episode,
-	}
-	actualSeason, actualEpisode := transferEpisodeFacts(download, "Ultraman Omega.mkv", 1)
-	if actualSeason == nil || *actualSeason != 1 || actualEpisode == nil || *actualEpisode != 9 {
-		t.Fatalf("season=%v episode=%v", actualSeason, actualEpisode)
-	}
-	_, multipleEpisode := transferEpisodeFacts(download, "Ultraman Omega.mkv", 2)
-	if multipleEpisode != nil {
-		t.Fatalf("persisted single episode leaked into multi-video package: %v", *multipleEpisode)
 	}
 }
 

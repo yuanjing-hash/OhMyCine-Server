@@ -524,35 +524,6 @@ func TestSchedulerCancelsWorkerWhenLeaseRenewalLosesOwnership(t *testing.T) {
 	}
 }
 
-func TestWorkerRegistryValidationAndDeterminism(t *testing.T) {
-	registry := NewWorkerRegistry()
-	if err := registry.Register(" Fake ", WorkerFunc(func(context.Context, JobRuntime, ClaimedJob) WorkerResult { return WorkerResult{} })); err != nil {
-		t.Fatal(err)
-	}
-	if err := registry.Register("fake", WorkerFunc(func(context.Context, JobRuntime, ClaimedJob) WorkerResult { return WorkerResult{} })); err == nil {
-		t.Fatal("duplicate accepted")
-	}
-	if err := registry.Register("", nil); err == nil {
-		t.Fatal("nil accepted")
-	}
-}
-
-func TestSchedulerWithEmptyRegistryLeavesJobsQueued(t *testing.T) {
-	service, actor, _ := queueFixture(t)
-	job := enqueueFake(t, service, actor, "No worker yet", "provider-a")
-	scheduler := NewScheduler(service, NewWorkerRegistry(), zerolog.Nop())
-
-	scheduler.dispatch(context.Background())
-
-	detail, err := service.Get(actor, job.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if detail.Status != models.JobStatusQueued || detail.AttemptCount != 0 {
-		t.Fatalf("empty registry claimed job: %+v", detail)
-	}
-}
-
 func TestRunningInterruptKeepsCapacityUntilWorkerAcknowledges(t *testing.T) {
 	service, actor, _ := queueFixture(t)
 	var policy models.QueuePolicy

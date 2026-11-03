@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"github.com/rs/zerolog"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -134,6 +136,53 @@ func TestDownloadSelectionGroupDurableUnionLateRestoreCancelAndAckRecovery(t *te
 		return task, downloadpkg.Source{Kind: envelope.Kind, Torrent: raw, ContentSelection: sel}, group
 	}
 	a, sourceA, groupA := makeTask(0, 10, "a.mkv")
+	if err = os.MkdirAll(root, 0700); err != nil {
+		t.Fatal(err)
+	}
+	// Reuse the admitted group and its current ref for workspace authority checks.
+	if err = queue.db.Model(groupA).Update("owner_id", actor.User.ID+1).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err = downloads.prepareBTSelectionWorkspace(context.Background(), a, config); err == nil {
+		t.Fatal("foreign owner prepared the group workspace")
+	}
+	if err = queue.db.Model(groupA).Update("owner_id", actor.User.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	missingRef := a
+	missingRef.ID = uuid.NewString()
+	if err = downloads.prepareBTSelectionWorkspace(context.Background(), missingRef, config); err == nil {
+		t.Fatal("missing current ref prepared the group workspace")
+	}
+	if err = queue.db.Model(&models.BTSelectionRef{}).Where("task_id = ?", a.ID).Update("state", "released").Error; err != nil {
+		t.Fatal(err)
+	}
+	if err = downloads.prepareBTSelectionWorkspace(context.Background(), a, config); err == nil {
+		t.Fatal("released ref prepared the group workspace")
+	}
+	if err = queue.db.Model(&models.BTSelectionRef{}).Where("task_id = ?", a.ID).Update("state", "queued").Error; err != nil {
+		t.Fatal(err)
+	}
+	t.Run("reparse-parent", func(t *testing.T) {
+		outside, link := t.TempDir(), filepath.Join(root, ".omc-bt")
+		err := os.Symlink(outside, link)
+		if err != nil && runtime.GOOS == "windows" {
+			_, err = exec.Command("cmd.exe", "/d", "/c", "mklink", "/J", link, outside).CombinedOutput()
+		}
+		if err != nil {
+			t.Skipf("host cannot create reparse fixture: %v", err)
+		}
+		defer os.Remove(link)
+		if err = downloads.prepareBTSelectionWorkspace(context.Background(), a, config); err == nil {
+			t.Fatal("reparse parent prepared the group workspace")
+		}
+		if _, err = os.Stat(filepath.Join(outside, groupA.ID)); !os.IsNotExist(err) {
+			t.Fatal("workspace was created outside its owned root")
+		}
+	})
+	if err = downloads.prepareBTSelectionWorkspace(context.Background(), a, config); err != nil {
+		t.Fatal(err)
+	}
 	boundA, err := service.bindBTSelectionGroup(provider, config, a, sourceA)
 	if err != nil {
 		t.Fatal(err)
@@ -281,6 +330,9 @@ func TestDownloadSelectionGroupDurableUnionLateRestoreCancelAndAckRecovery(t *te
 	}
 	if _, e := downloads.prepareBTSelectionGroup(actor.User.ID, config, downloadSourceEnvelope{Kind: sourceB.Kind, Torrent: sourceB.Torrent, ContentSelection: sourceB.ContentSelection, SelectionMode: "files"}, root, SubmitDownloadInput{SourceSiteID: 7}); e == nil {
 		t.Fatal("new admission overlapped uncertain cleanup")
+	}
+	if err = downloads.prepareBTSelectionWorkspace(context.Background(), b, config); err == nil {
+		t.Fatal("workspace preparation overlapped uncertain cleanup")
 	}
 	// Reopen the authority and reconcile the original deletion. There is no
 	// second native mutation, and only the delivered move ref's file is removed.

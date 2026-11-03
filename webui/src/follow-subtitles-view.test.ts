@@ -3,6 +3,7 @@ import { expect, it, vi, afterEach } from 'vitest'
 import { mount, flushPromises, type VueWrapper } from '@vue/test-utils'
 import SubtitlePolicyEditor from './components/SubtitlePolicyEditor.vue'
 import FollowPolicyDefaultsPanel from './components/FollowPolicyDefaultsPanel.vue'
+import AcquisitionPreferenceEditor from './components/AcquisitionPreferenceEditor.vue'
 import type { SubtitlePolicy } from './follows'
 const { request } = vi.hoisted(() => ({ request: vi.fn() }))
 vi.mock('@/api/client', async original => ({ ...await original<object>(), api: request }))
@@ -30,4 +31,18 @@ it('does not expose a save action without settings-update permission', async () 
   const wrapper = mount(FollowPolicyDefaultsPanel, { props: { canUpdate: false } }); wrappers.push(wrapper); await flushPromises()
   expect(wrapper.find('fieldset').attributes('disabled')).toBeDefined()
   expect(wrapper.find('button').exists()).toBe(false)
+})
+
+it('preserves old snapshot omission until edited and submits the independent global preference', async () => {
+  const editor = mount(AcquisitionPreferenceEditor); wrappers.push(editor)
+  expect(editor.find('select').element.value).toBe('existing_order')
+  expect(editor.emitted('update:modelValue')).toBeUndefined()
+  await editor.find('select').setValue('transfer_first')
+  expect(editor.emitted('update:modelValue')?.[0]).toEqual(['transfer_first'])
+  request.mockResolvedValueOnce({ revision: 9, subtitles: { mode: 'prefer', languages: ['zh-Hans'] }, acquisition_preference: 'transfer_first', updated_at: '' }).mockRejectedValueOnce(new Error('conflict'))
+  const defaults = mount(FollowPolicyDefaultsPanel, { props: { canUpdate: true } }); wrappers.push(defaults); await flushPromises()
+  await defaults.findComponent(AcquisitionPreferenceEditor).find('select').setValue('existing_order')
+  await defaults.find('form').trigger('submit'); await flushPromises()
+  expect(JSON.parse(String(request.mock.calls[1]?.[1].body))).toMatchObject({ revision: 9, acquisition_preference: 'existing_order' })
+  expect(defaults.findComponent(AcquisitionPreferenceEditor).find('select').element.value).toBe('existing_order')
 })

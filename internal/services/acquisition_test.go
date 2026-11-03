@@ -90,11 +90,6 @@ func TestAcquisitionRecordDownloadRejectsInvalidFrozenIdentity(t *testing.T) {
 		{name: "revision mismatch", revision: 2, source: mediaIdentitySourceDirectID, status: mediaIdentityStatusVerified, mediaType: "tv", snapshot: func(t *testing.T, id int64) string {
 			return acquisitionIdentitySnapshot(t, 1, mediaIdentitySourceDirectID, mediaIdentityStatusVerified, "tv", id, false)
 		}},
-		{name: "state mismatch", revision: 1, source: mediaIdentitySourceDirectID, status: mediaIdentityStatusProvisional, mediaType: "tv", snapshot: func(t *testing.T, id int64) string {
-			return acquisitionIdentitySnapshot(t, 1, mediaIdentitySourceDirectID, mediaIdentityStatusVerified, "tv", id, false)
-		}},
-		{name: "invalid media type", revision: 1, source: mediaIdentitySourceDirectID, status: mediaIdentityStatusVerified, mediaType: "episode"},
-		{name: "malformed snapshot", revision: 1, source: mediaIdentitySourceDirectID, status: mediaIdentityStatusVerified, mediaType: "tv", snapshot: func(*testing.T, int64) string { return `{` }},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

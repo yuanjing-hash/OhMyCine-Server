@@ -2,7 +2,9 @@ package services
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"reflect"
 	"testing"
 	"time"
 
@@ -130,25 +132,6 @@ func TestStructureReviewGroupsRecognitionAndPersistsPerDiagnosis(t *testing.T) {
 	}
 }
 
-func TestStructureReviewFirstMutationInvalidatesPreviewCreatedWithoutSession(t *testing.T) {
-	s, actor, library, diagnostics := prepareStructureSelectionConflicts(t, 1)
-	page, err := s.StructureIssues(context.Background(), actor, library.ID, MediaLibraryStructureIssueQuery{Page: 1, PageSize: 50, Actionable: true, ReviewState: "pending"})
-	if err != nil || len(page.List) != 1 {
-		t.Fatalf("issues=%+v err=%v", page, err)
-	}
-	issue := page.List[0]
-	preview, err := s.PreviewSelectionRepair(context.Background(), actor, library.ID, MediaLibraryStructureSelectionInput{Revision: diagnostics.Revision, ReviewRevision: 0, Selections: []MediaLibraryStructureSelection{{IssueToken: issue.Token, Action: StructureSelectionSkip}}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.SaveStructureReviewChoice(context.Background(), actor, library.ID, issue.Token, MediaLibraryStructureReviewChoiceInput{DiagnosisRevision: diagnostics.Revision, ReviewRevision: 0, Action: StructureSelectionSkip}, RequestContext{}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.EnqueueSelectionRepair(context.Background(), actor, library.ID, preview.ConfirmationToken, RequestContext{}); ErrorCode(err) != CodeConflict {
-		t.Fatalf("preview created before the review session survived its first mutation: %v", err)
-	}
-}
-
 func TestStructureReviewSubmissionAdvancesRevisionAndFreezesChoice(t *testing.T) {
 	s, actor, library, diagnostics := prepareStructureSelectionConflicts(t, 1)
 	page, err := s.StructureIssues(context.Background(), actor, library.ID, MediaLibraryStructureIssueQuery{Page: 1, PageSize: 50, Actionable: true, ReviewState: "pending"})
@@ -156,9 +139,16 @@ func TestStructureReviewSubmissionAdvancesRevisionAndFreezesChoice(t *testing.T)
 		t.Fatalf("issues=%+v err=%v", page, err)
 	}
 	issue := page.List[0]
+	stale, err := s.PreviewSelectionRepair(context.Background(), actor, library.ID, MediaLibraryStructureSelectionInput{Revision: diagnostics.Revision, ReviewRevision: 0, Selections: []MediaLibraryStructureSelection{{IssueToken: issue.Token, Action: StructureSelectionSkip}}})
+	if err != nil {
+		t.Fatal(err)
+	}
 	saved, err := s.SaveStructureReviewChoice(context.Background(), actor, library.ID, issue.Token, MediaLibraryStructureReviewChoiceInput{DiagnosisRevision: diagnostics.Revision, ReviewRevision: 0, Action: StructureSelectionSkip}, RequestContext{})
 	if err != nil || saved.ReviewRevision != 1 {
 		t.Fatalf("save=%+v err=%v", saved, err)
+	}
+	if _, err := s.EnqueueSelectionRepair(context.Background(), actor, library.ID, stale.ConfirmationToken, RequestContext{}); ErrorCode(err) != CodeConflict {
+		t.Fatalf("pre-session preview survived first review mutation: %v", err)
 	}
 	preview, err := s.PreviewSelectionRepair(context.Background(), actor, library.ID, MediaLibraryStructureSelectionInput{Revision: diagnostics.Revision, ReviewRevision: saved.ReviewRevision})
 	if err != nil {
@@ -316,9 +306,23 @@ func TestStructureReviewBulkSkipCoversOneCategoryAcrossAllPages(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	var jobsBefore int64
+	var choicesBefore, choicesAfter []models.MediaLibraryStructureReviewChoice
+	if err := s.db.Order("id").Find(&choicesBefore).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.Model(&models.Job{}).Count(&jobsBefore).Error; err != nil {
+		t.Fatal(err)
+	}
 	reloaded, err := s.StructureIssues(context.Background(), actor, library.ID, MediaLibraryStructureIssueQuery{Page: 1, PageSize: 1, Actionable: true, ReviewState: "pending"})
 	if err != nil || reloaded.Total != 0 || reloaded.PendingTotal != 0 || reloaded.HandledTotal != 275 || reloaded.PendingRepairableCount != 0 || reloaded.PendingClassifications != (StructureIssueClassifications{}) || reloaded.HandledClassifications.LocationMismatch != 50 {
 		t.Fatalf("skip all/reload=%+v err=%v", reloaded, err)
+	}
+	if err := s.db.Order("id").Find(&choicesAfter).Error; err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(choicesBefore, choicesAfter) {
+		t.Fatal("reading review pages changed persisted user decisions")
 	}
 	if _, err := s.DeleteStructureReviewChoice(context.Background(), actor, library.ID, handled.List[0].Token, MediaLibraryStructureReviewChoiceInput{DiagnosisRevision: diagnostics.Revision, ReviewRevision: allSkipped.ReviewRevision}, RequestContext{}); err != nil {
 		t.Fatal(err)
@@ -329,5 +333,23 @@ func TestStructureReviewBulkSkipCoversOneCategoryAcrossAllPages(t *testing.T) {
 	}
 	if _, err := s.SaveStructureReviewBulk(context.Background(), actor, library.ID, MediaLibraryStructureReviewBulkInput{DiagnosisRevision: diagnostics.Revision, ReviewRevision: result.ReviewRevision, Codes: []string{"naming_mismatch"}, Action: StructureSelectionKeepRecommended}, RequestContext{}); ErrorCode(err) != CodeInvalidRequest {
 		t.Fatalf("keep recommended accepted for naming mismatch: %v", err)
+	}
+	var jobsAfter int64
+	if err := s.db.Model(&models.Job{}).Count(&jobsAfter).Error; err != nil || jobsAfter != jobsBefore {
+		t.Fatalf("review enqueued business work: before=%d after=%d err=%v", jobsBefore, jobsAfter, err)
+	}
+	sentinel := errors.New("isolated session read failure")
+	key := "review-summary-read-failure"
+	if err := s.db.Callback().Query().Before("gorm:query").Register(key, func(tx *gorm.DB) {
+		if tx.Statement.Table == "media_library_structure_review_sessions" {
+			_ = tx.AddError(sentinel)
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.db.Callback().Query().Remove(key) })
+	_, err = s.StructureIssues(context.Background(), actor, library.ID, MediaLibraryStructureIssueQuery{Page: 1, PageSize: 50, Actionable: true, ReviewState: "pending"})
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("session error became healthy zero totals: %v", err)
 	}
 }

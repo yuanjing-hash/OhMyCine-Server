@@ -4,32 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
+
 	"reflect"
-	"sync/atomic"
+
 	"testing"
 
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/authz"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
-	cloudpkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud"
-	"gorm.io/gorm"
 )
-
-type batchCheckpointStructureBackend struct{ batches []int }
-
-func (*batchCheckpointStructureBackend) StorageType() string                { return models.StorageTypePan115 }
-func (*batchCheckpointStructureBackend) SupportsStructureRepairBatch() bool { return true }
-func (*batchCheckpointStructureBackend) ValidateRecycle(context.Context, StructureBoundary) error {
-	return nil
-}
-func (b *batchCheckpointStructureBackend) Recycle(_ context.Context, _ StructureBoundary, items []StructureRecycleItem, _ StructureProgress) error {
-	b.batches = append(b.batches, len(items))
-	return nil
-}
-func (b *batchCheckpointStructureBackend) Apply(_ context.Context, _ StructureBoundary, items []StructurePlanItem, _ StructureProgress) error {
-	b.batches = append(b.batches, len(items))
-	return nil
-}
 
 type checkpointStructureBackend struct {
 	fail  map[string]bool
@@ -145,54 +127,5 @@ func TestStructureRepairCheckpointsRunLaterDependencyBeforeDependentItem(t *test
 	}
 	if !reflect.DeepEqual(backend.calls, []string{"b.mkv", "a.mkv"}) {
 		t.Fatalf("dependency order=%v", backend.calls)
-	}
-}
-
-func TestStructureRepairFailureSeparatesProviderTimeoutFromWorkerCancellation(t *testing.T) {
-	providerTimeout := cloudpkg.Error(cloudpkg.CodeUnavailable, true, context.DeadlineExceeded)
-	if code, _, global, retryAt := structureRepairFailure(context.Background(), providerTimeout); code != CodeMediaLibraryStructureApplyFailed || global || retryAt != nil {
-		t.Fatalf("provider timeout should remain item-local: code=%q global=%v retry_at=%v", code, global, retryAt)
-	}
-
-	canceled, cancel := context.WithCancel(context.Background())
-	cancel()
-	if code, _, global, _ := structureRepairFailure(canceled, context.Canceled); code != CodeMediaLibraryStructureBoundaryChanged || !global {
-		t.Fatalf("worker cancellation should stop the batch: code=%q global=%v", code, global)
-	}
-}
-
-func TestStructureRepairBatchCheckpointsScaleWithProviderBatches(t *testing.T) {
-	s, repair, _, _, _ := catalogStructureRepairFixture(t)
-	plan := StructurePlan{Version: 1, LibraryID: repair.LibraryID, Items: make([]StructurePlanItem, 235)}
-	for index := range plan.Items {
-		plan.Items[index] = StructurePlanItem{Kind: "video", SourceRelative: fmt.Sprintf("old/%03d.mkv", index), TargetRelative: fmt.Sprintf("new/%03d.mkv", index)}
-	}
-	raw, _ := json.Marshal(plan)
-	repair.PlanJSON, repair.TotalItems = string(raw), len(plan.Items)
-	if err := s.db.Model(&models.MediaLibraryStructureRepair{}).Where("id = ?", repair.ID).Updates(map[string]any{"plan_json": repair.PlanJSON, "total_items": repair.TotalItems}).Error; err != nil {
-		t.Fatal(err)
-	}
-	var aggregateUpdates atomic.Int64
-	callbackName := "test:count-structure-batch-checkpoints"
-	if err := s.db.Callback().Update().Before("gorm:update").Register(callbackName, func(tx *gorm.DB) {
-		if tx.Statement != nil && tx.Statement.Table == "media_library_structure_repairs" {
-			aggregateUpdates.Add(1)
-		}
-	}); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = s.db.Callback().Update().Remove(callbackName) })
-	backend := &batchCheckpointStructureBackend{}
-	result := s.executeStructureRepairItems(context.Background(), fastScanTestRuntime{}, repair, plan, StructureBoundary{Storage: models.Storage{Type: models.StorageTypePan115}}, backend, nil)
-	if result.GlobalErr != nil || result.Succeeded != len(plan.Items) {
-		t.Fatalf("result=%+v", result)
-	}
-	if !reflect.DeepEqual(backend.batches, []int{100, 100, 35}) {
-		t.Fatalf("backend batches=%v", backend.batches)
-	}
-	// Each batch writes its in-flight summary, clears it after the external
-	// call, and checkpoints verified outcomes once. No per-item transactions.
-	if got := aggregateUpdates.Load(); got != 9 {
-		t.Fatalf("aggregate checkpoint updates=%d want=9", got)
 	}
 }

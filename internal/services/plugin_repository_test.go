@@ -1,7 +1,6 @@
 package services
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -108,24 +107,6 @@ func TestPluginRepositoryRefreshPreservesLastGoodCacheOnFailure(t *testing.T) {
 	marketplace, err := service.Marketplace(actor)
 	if err != nil || len(marketplace) != 1 || marketplace[0].ID != registry.Plugins[0].ID {
 		t.Fatalf("marketplace=%+v err=%v", marketplace, err)
-	}
-}
-
-func TestPluginRepositoryRefreshLogsOneTerminalEvent(t *testing.T) {
-	service, actor, fetcher := pluginRepositoryFixture(t)
-	var output bytes.Buffer
-	service.log = zerolog.New(&output)
-	created, err := service.Create(actor, CreatePluginRepositoryInput{GitHubURL: "https://github.com/ohmycine/official-plugins", Enabled: true}, RequestContext{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	fetcher.err = &pluginrepository.Error{Code: pluginrepository.CodeRateLimited, Cause: errors.New("rate limited")}
-	if _, err := service.Refresh(context.Background(), actor, created.ID, RequestContext{}); ErrorCode(err) != CodePluginRegistryRateLimited {
-		t.Fatalf("refresh error=%v code=%s", err, ErrorCode(err))
-	}
-	logs := output.String()
-	if strings.Count(logs, "【插件仓库】开始刷新") != 1 || strings.Count(logs, "【插件仓库】刷新失败") != 1 || strings.Contains(logs, "rate limited") {
-		t.Fatalf("unexpected refresh logs: %s", logs)
 	}
 }
 

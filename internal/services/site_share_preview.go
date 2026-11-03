@@ -284,7 +284,11 @@ func sharePreviewProviderError(err error) error {
 	case "quark_share_too_large":
 		message = "夸克分享内容过多，请选择更小的分享"
 	}
-	return appError(code, message, nil)
+	safe := appError(code, message, nil)
+	if until, reason, ok := cloud.RetryTiming(err); ok {
+		return cloud.WithRetryNotBefore(safe, until, reason)
+	}
+	return safe
 }
 func (s *SiteService) resolveSharePreview(ctx context.Context, actor Actor, token string) (siteSharePreview, error) {
 	s.vaultMu.Lock()

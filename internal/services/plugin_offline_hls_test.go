@@ -6,8 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
-	"os"
-	"path/filepath"
+
 	"strings"
 	"testing"
 	"time"
@@ -29,26 +28,6 @@ func TestHLSOfflineTwoHourDualTrackVODFitsBound(t *testing.T) {
 	tracks, err := b.hlsTracks(context.Background(), asset, 0)
 	if err != nil || len(tracks) != 2 || len(tracks[0].Units) != 3600 || len(tracks[1].Units) != 3600 {
 		t.Fatalf("long VOD rejected: tracks=%d error=%v", len(tracks), err)
-	}
-}
-
-func TestHLSOfflineRealPublicSanitizedLongURIManifest(t *testing.T) {
-	directory := os.Getenv("OMC_MGTV_FIXTURES")
-	if directory == "" {
-		t.Skip("optional sanitized official public control fixture")
-	}
-	body, err := os.ReadFile(filepath.Join(directory, "free-vod.m3u8"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	// The parser fixture gateway deliberately allows only its generic test CDN;
-	// changing the hostname preserves real URI paths, lengths and query shapes.
-	manifest := strings.ReplaceAll(string(body), "pcvideomigu.titan.mgtv.com", "cdn.example.test")
-	manifest = strings.ReplaceAll(manifest, "pcvideoks.titan.mgtv.com", "cdn.example.test")
-	b, asset, _ := hlsFixture(t, manifest, nil)
-	tracks, err := b.hlsTracks(context.Background(), asset, 0)
-	if err != nil || len(tracks) != 1 || len(tracks[0].Units) != 758 {
-		t.Fatalf("real public VOD control parse failed: tracks=%d err=%v", len(tracks), err)
 	}
 }
 

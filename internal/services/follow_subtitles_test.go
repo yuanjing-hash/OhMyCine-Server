@@ -39,15 +39,16 @@ func TestFollowPolicyDefaultsAreDurableCASAndDoNotRewriteSnapshots(t *testing.T)
 	actor.Permissions[authz.PermissionSettingsUpdate] = struct{}{}
 	service := NewFollowService(queue.db, queue.audit, queue, nil, nil)
 	first, err := service.PolicyDefaults(context.Background(), actor)
-	if err != nil || first.Revision != 1 || first.Subtitles.Mode != "prefer" || !reflect.DeepEqual(first.Subtitles.Languages, []string{"zh-Hans", "zh-Hant"}) {
+	if err != nil || first.Revision != 1 || first.AcquisitionPreference != FollowAcquisitionTransferFirst || first.Subtitles.Mode != "prefer" || !reflect.DeepEqual(first.Subtitles.Languages, []string{"zh-Hans", "zh-Hant"}) {
 		t.Fatalf("defaults=%+v err=%v", first, err)
 	}
 	record := models.FollowSubscription{ID: "legacy-subtitles", OwnerID: actor.User.ID, MediaType: "tv", TMDBID: 10, Title: "Legacy", Status: models.FollowStatusActive, Revision: 1, ExecutionSnapshotJSON: `{"version":2,"filters":{"min_seeders":1}}`}
 	if err := queue.db.Create(&record).Error; err != nil {
 		t.Fatal(err)
 	}
-	changed, err := service.UpdatePolicyDefaults(context.Background(), actor, UpdateFollowPolicyDefaultsInput{Revision: first.Revision, Subtitles: SubtitlePolicy{Mode: "require", Languages: []string{"en"}}}, RequestContext{})
-	if err != nil || changed.Revision != 2 {
+	pref := FollowAcquisitionExistingOrder
+	changed, err := service.UpdatePolicyDefaults(context.Background(), actor, UpdateFollowPolicyDefaultsInput{Revision: first.Revision, Subtitles: SubtitlePolicy{Mode: "require", Languages: []string{"en"}}, AcquisitionPreference: &pref}, RequestContext{})
+	if err != nil || changed.Revision != 2 || changed.AcquisitionPreference != pref {
 		t.Fatalf("updated=%+v err=%v", changed, err)
 	}
 	if _, err := service.UpdatePolicyDefaults(context.Background(), actor, UpdateFollowPolicyDefaultsInput{Revision: 1, Subtitles: SubtitlePolicy{Mode: "ignore"}}, RequestContext{}); ErrorCode(err) != CodeConflict {
@@ -57,6 +58,14 @@ func TestFollowPolicyDefaultsAreDurableCASAndDoNotRewriteSnapshots(t *testing.T)
 	saved, err := reloaded.PolicyDefaults(context.Background(), actor)
 	if err != nil || saved.Subtitles.Mode != "require" {
 		t.Fatal("defaults not durable")
+	}
+	oldClient, err := service.UpdatePolicyDefaults(context.Background(), actor, UpdateFollowPolicyDefaultsInput{Revision: saved.Revision, Subtitles: SubtitlePolicy{Mode: "prefer", Languages: []string{"en"}}}, RequestContext{})
+	if err != nil || oldClient.AcquisitionPreference != pref {
+		t.Fatal("old client cleared independent preference", err)
+	}
+	invalid := "wrong"
+	if _, err := service.UpdatePolicyDefaults(context.Background(), actor, UpdateFollowPolicyDefaultsInput{Revision: oldClient.Revision, Subtitles: SubtitlePolicy{Mode: "ignore"}, AcquisitionPreference: &invalid}, RequestContext{}); ErrorCode(err) != CodeFollowConfigurationInvalid {
+		t.Fatal("unknown preference accepted")
 	}
 	var original models.FollowSubscription
 	if err := queue.db.First(&original, "id = ?", record.ID).Error; err != nil || original.ExecutionSnapshotJSON != record.ExecutionSnapshotJSON {

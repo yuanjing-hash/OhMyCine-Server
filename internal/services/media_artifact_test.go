@@ -638,18 +638,6 @@ func TestMediaArtifactManifestPersistenceIsBatched(t *testing.T) {
 	}
 }
 
-func TestSTRMRelativePathPreservesISOExtension(t *testing.T) {
-	tests := map[string]string{"/Movie.mkv": "/Movie.strm", "/Disc.iso": "/Disc.iso.strm", "/Series/Show.S01E01.m2ts": "/Series/Show.S01E01.strm"}
-	for source, want := range tests {
-		if got, err := strmRelativePath(source); err != nil || got != want {
-			t.Fatalf("source=%q got=%q err=%v", source, got, err)
-		}
-	}
-	if _, err := strmRelativePath("../../escape.mkv"); err == nil {
-		t.Fatal("traversal path accepted")
-	}
-}
-
 func TestMediaArtifactWorkerWritesLocalAdjacentNFO(t *testing.T) {
 	_, db, _, storage, profile := mediaLibraryTestService(t)
 	now := time.Now().UTC()

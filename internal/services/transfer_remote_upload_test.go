@@ -51,12 +51,17 @@ func TestRemoteUploadBatchesHaveNoWholeTaskFileLimit(t *testing.T) {
 		}
 	}
 	manifest := downloadpkg.Manifest{RemoteExportOperationKey: "qb:file_export:batch-test", RemoteExportDigest: strings.Repeat("b", 64)}
-	batches, err := buildRemoteUploadBatches(rows, models.Storage{ID: 9}, models.DownloadTask{ID: uuid.NewString(), TargetProviderRootID: "library-root"}, manifest)
+	storage := models.Storage{ID: 9, Type: models.StorageTypeQuark, RootPath: "storage-root"}
+	task := models.DownloadTask{ID: uuid.NewString(), TargetProviderRootID: "library-root", TargetRelativeRoot: "/nested/library"}
+	batches, err := buildRemoteUploadBatches(rows, storage, task, manifest)
 	if err != nil {
 		t.Fatal(err)
 	}
 	covered := 0
 	for index, batch := range batches {
+		if batch.plan.TargetRootRelativePath != task.TargetRelativeRoot || batch.plan.TargetRootID != task.TargetProviderRootID {
+			t.Fatal("frozen Quark target locator changed")
+		}
 		if batch.index != index || len(batch.rows) == 0 || len(batch.rows) > nodeprotocol.MaxStorageUploadFiles || len(batch.plan.Files) != len(batch.rows) {
 			t.Fatalf("invalid batch %d: rows=%d plan=%d", index, len(batch.rows), len(batch.plan.Files))
 		}
@@ -68,6 +73,14 @@ func TestRemoteUploadBatchesHaveNoWholeTaskFileLimit(t *testing.T) {
 	}
 	if covered != len(rows) || len(batches) != 3 {
 		t.Fatalf("covered=%d batches=%d, want files=%d batches=3", covered, len(batches), len(rows))
+	}
+	task.TargetRelativeRoot = ""
+	if _, err = buildRemoteUploadBatches(rows[:1], storage, task, manifest); err == nil {
+		t.Fatal("upload child accepted without frozen path")
+	}
+	task.TargetProviderRootID = storage.RootPath
+	if batches, err = buildRemoteUploadBatches(rows[:1], storage, task, manifest); err != nil || batches[0].plan.TargetRootRelativePath != "/" {
+		t.Fatalf("upload root compatibility failed: %v", err)
 	}
 }
 
@@ -106,6 +119,14 @@ func TestRemoteUploadOperationIsStableAndOnlyRenewsLease(t *testing.T) {
 		if !errors.As(err, &failure) || failure.code != nodeprotocol.ErrorPlanConflict {
 			t.Fatalf("changed immutable payload err=%v failure=%+v", err, failure)
 		}
+	}
+	late := nodeprotocol.OperationResponse{OperationKey: second.OperationKey, PlanDigest: second.PlanDigest, Status: nodeprotocol.OperationCompleted, Phase: nodeprotocol.PhaseCompleted, LeaseEpoch: first.LeaseEpoch, Revision: 4}
+	if err := validateRemoteOperationResponse(late, second); err != nil {
+		t.Fatalf("completed lost acknowledgement was rejected: %v", err)
+	}
+	late.Status = nodeprotocol.OperationRunning
+	if err := validateRemoteOperationResponse(late, second); err == nil {
+		t.Fatal("running operation with stale lease was accepted")
 	}
 }
 
@@ -184,26 +205,5 @@ func TestRemoteUploadResponsePersistsTerminalReceiptsAndSummary(t *testing.T) {
 	var managed []models.MediaManagedItem
 	if err := fixture.queue.db.Where("transfer_task_id = ?", task.ID).Find(&managed).Error; err != nil || len(managed) != 1 || managed[0].ProviderItemID != "uploaded-movie" {
 		t.Fatalf("managed=%+v err=%v", managed, err)
-	}
-}
-
-func TestRemoteUploadOperationKeyIsStablePerBatch(t *testing.T) {
-	taskID := uuid.NewString()
-	firstKey := remoteUploadOperationKey(taskID, 0)
-	if firstKey != remoteUploadOperationKey(taskID, 0) || firstKey == remoteUploadOperationKey(taskID, 1) {
-		t.Fatal("remote upload operation key is not stable per batch")
-	}
-}
-
-func TestRemoteUploadAcceptsCompletedLostAckWithOlderLeaseOnly(t *testing.T) {
-	record := models.RemoteOperation{OperationKey: "storage:upload:lost-ack", PlanDigest: strings.Repeat("a", 64), LeaseEpoch: 3}
-	completed := nodeprotocol.OperationResponse{OperationKey: record.OperationKey, PlanDigest: record.PlanDigest, Status: nodeprotocol.OperationCompleted, Phase: nodeprotocol.PhaseCompleted, LeaseEpoch: 2, Revision: 4}
-	if err := validateRemoteOperationResponse(completed, record); err != nil {
-		t.Fatalf("completed lost acknowledgement was rejected: %v", err)
-	}
-	running := completed
-	running.Status = nodeprotocol.OperationRunning
-	if err := validateRemoteOperationResponse(running, record); err == nil {
-		t.Fatal("running operation with stale lease was accepted")
 	}
 }

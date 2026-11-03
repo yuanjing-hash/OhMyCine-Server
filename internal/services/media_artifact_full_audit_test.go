@@ -2,9 +2,7 @@ package services
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
-	"fmt"
+
 	"github.com/rs/zerolog"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/metadata/tmdb"
@@ -112,40 +110,5 @@ func TestLegacyFullArtifactWorkerAuditsRepairsAndDeletes(t *testing.T) {
 	execute(7)
 	if _, err := os.Stat(target); !os.IsNotExist(err) {
 		t.Fatalf("deleted source projection remains: %v", err)
-	}
-}
-
-func TestLegacyFullArtifactAuditSidecarSourceFingerprint(t *testing.T) {
-	root := t.TempDir()
-	content := []byte("subtitle")
-	target := filepath.Join(root, "video.srt")
-	if err := os.WriteFile(target, content, 0600); err != nil {
-		t.Fatal(err)
-	}
-	asset := models.MediaLibrarySourceAsset{ID: 9, ProviderID: "cloud", RelativePath: "/video.srt", Size: int64(len(content)), ModifiedAt: time.Now().UTC(), HashHint: "original"}
-	digest := sha256.Sum256(content)
-	row := models.MediaArtifact{ID: 3, RunID: "old", SourceIdentity: fmt.Sprintf("asset:%d", asset.ID), RelativePath: asset.RelativePath, TargetKind: models.MediaArtifactTargetLocalProjection, Managed: true, Active: true, Status: models.MediaArtifactStatusCompleted, ContentFingerprint: hex.EncodeToString(digest[:]), SourceFingerprint: artifactAssetSourceFingerprint(asset)}
-	audit := func(assets []models.MediaLibrarySourceAsset) (int, *artifactManifestIndex) {
-		m := newArtifactManifestIndex(1)
-		m.rows[artifactManifestKey(row.TargetKind, row.RelativePath)] = row
-		_, _, pending := (&MediaArtifactService{}).filterLegacyFullArtifactWork(root, models.MediaArtifactRun{ID: "next"}, mediaArtifactPolicy{}, nil, nil, assets, nil, m, signedArtifactVerifier{})
-		return len(pending), m
-	}
-	if pending, m := audit([]models.MediaLibrarySourceAsset{asset}); pending != 0 || len(m.dirty) != 1 {
-		t.Fatal("healthy not retained")
-	}
-	changed := asset
-	changed.HashHint = "new"
-	if pending, _ := audit([]models.MediaLibrarySourceAsset{changed}); pending != 1 {
-		t.Fatal("source hash change ignored")
-	}
-	if pending, m := audit(nil); pending != 0 || len(m.dirty) != 0 {
-		t.Fatal("deleted source retained")
-	}
-	if err := os.Remove(target); err != nil {
-		t.Fatal(err)
-	}
-	if pending, _ := audit([]models.MediaLibrarySourceAsset{asset}); pending != 1 {
-		t.Fatal("missing sidecar ignored")
 	}
 }

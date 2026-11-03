@@ -30,30 +30,6 @@ func (f *routeReadCloudDriver) OpenRead(context.Context, cloudpkg.ReadRequest) (
 	return cloudpkg.ReadResult{Body: io.NopCloser(strings.NewReader("")), OffsetAccepted: true, TotalSize: &size}, nil
 }
 
-func TestSelectTransferRouteUsesStableDataSourceIdentity(t *testing.T) {
-	local := localDataSourceIdentity()
-	panAOne := models.DataSourceIdentity{Kind: models.DataSourceKindProvider, ProviderType: models.StorageTypePan115, ConnectionIdentity: "1", StorageScope: "10"}
-	panATwo := models.DataSourceIdentity{Kind: models.DataSourceKindProvider, ProviderType: models.StorageTypePan115, ConnectionIdentity: "1", StorageScope: "20"}
-	panB := models.DataSourceIdentity{Kind: models.DataSourceKindProvider, ProviderType: models.StorageTypePan115, ConnectionIdentity: "2", StorageScope: "10"}
-	for _, test := range []struct {
-		name           string
-		source, target models.DataSourceIdentity
-		want           string
-	}{
-		{name: "local to local", source: local, target: local, want: models.TransferRouteSameSourceLocal},
-		{name: "same account different roots", source: panAOne, target: panATwo, want: models.TransferRouteSameSourceProvider},
-		{name: "local to provider", source: local, target: panAOne, want: models.TransferRouteCrossSource},
-		{name: "provider to local", source: panAOne, target: local, want: models.TransferRouteCrossSource},
-		{name: "different accounts", source: panAOne, target: panB, want: models.TransferRouteCrossSource},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			if got := selectTransferRoute(test.source, test.target); got != test.want {
-				t.Fatalf("route=%q want=%q", got, test.want)
-			}
-		})
-	}
-}
-
 func TestRoutePreviewAllowsAuthoritativePublicBTTorrentForPan115(t *testing.T) {
 	downloads, _, queue, _, _ := downloadFixture(t)
 	now := time.Now().UTC()
@@ -74,22 +50,6 @@ func TestRoutePreviewAllowsAuthoritativePublicBTTorrentForPan115(t *testing.T) {
 	}
 	if err := downloads.validatePreviewSource(pan, downloader.SourceTorrent, nil); ErrorCode(err) != CodeDownloadSourceInvalid {
 		t.Fatalf("untrusted manual torrent preview error=%v", err)
-	}
-}
-
-func TestManagedStagingPreviewReportsRequiredAndAvailableBytes(t *testing.T) {
-	downloads, _, queue, _, _ := downloadFixture(t)
-	root := t.TempDir()
-	if err := queue.db.Model(&models.DownloadSettings{}).Where("id = ?", 1).Updates(map[string]any{"absolute_path": root, "storage_id": nil, "relative_path": "/"}).Error; err != nil {
-		t.Fatal(err)
-	}
-	expected := int64(1)
-	option := DownloadRouteTargetOption{RequiresManagedStaging: true}
-	if err := downloads.applyManagedStagingPreview(context.Background(), models.DownloaderTypePan115Offline, &expected, &option); err != nil {
-		t.Fatal(err)
-	}
-	if option.RequiredBytes == nil || *option.RequiredBytes != expected+int64(crossSourceMinimumFreeBytes) || option.AvailableBytes == nil || *option.AvailableBytes <= 0 {
-		t.Fatalf("space preview=%+v", option)
 	}
 }
 

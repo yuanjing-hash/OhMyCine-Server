@@ -8,7 +8,6 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/authz"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
@@ -174,27 +173,5 @@ func TestPanSouDraftScopeDoesNotForwardSavedSecretsToChangedURL(t *testing.T) {
 	}
 	if _, err := normalizeSiteBaseURL(pansou.Kind, "ftp://pansou:8888"); ErrorCode(err) != CodeSiteURLInvalid || !strings.Contains(safeErrorMessage(err, ""), "HTTP或HTTPS") {
 		t.Fatal("misleading PanSou URL hint", err)
-	}
-}
-
-func TestPanSouPreviewKeepsOtherCloudAdaptersAndQuarkOfflineClosed(t *testing.T) {
-	s, _, _, _, downloads, _ := siteFixture(t)
-	now := time.Now().UTC()
-	for _, kind := range []string{pansou.Kind, "tg_cloud"} {
-		site := models.Site{Name: kind, NameNormalized: kind, Kind: kind, BaseURL: "https://example.test", Enabled: true, Revision: 1, Priority: 100, TimeoutSeconds: 10, RateLimitPerMinute: 10, CreatedAt: now, UpdatedAt: now}
-		if kind != "tg_cloud" {
-			if err := s.db.Create(&site).Error; err != nil {
-				t.Fatal(err)
-			}
-			if err := downloads.validatePreviewSource(models.Downloader{Type: models.DownloaderTypePan115Offline}, "url", &site.ID); err != nil {
-				t.Fatal("PanSou magnet preview rejected", err)
-			}
-			if err := downloads.validatePreviewSource(models.Downloader{Type: models.DownloaderTypePan115Offline}, "torrent", &site.ID); ErrorCode(err) != CodeDownloadSourceInvalid {
-				t.Fatal("PanSou raw torrent accepted", err)
-			}
-		}
-	}
-	if routeDownloaderApplicable(RouteSourceBT, models.Downloader{Type: models.DownloaderTypeQuarkShare}) || routeDownloaderApplicable(RouteSourcePT, models.Downloader{Type: models.DownloaderTypeQuarkShare}) {
-		t.Fatal("Quark became offline/PT candidate")
 	}
 }

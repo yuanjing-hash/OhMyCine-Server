@@ -2022,6 +2022,8 @@ type ScheduleRun struct {
 }
 
 type FollowRun struct {
+	RetryNotBefore        *time.Time `json:"-"`
+	RetryCode             string     `gorm:"size:48;not null;default:''" json:"-"`
 	ID                    string     `gorm:"primaryKey;size:36" json:"id"`
 	SubscriptionID        string     `gorm:"size:36;not null;index" json:"subscription_id"`
 	OwnerID               uint       `gorm:"not null;index" json:"owner_id"`

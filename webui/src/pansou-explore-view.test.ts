@@ -30,6 +30,25 @@ function fixture(result: (page: number) => PTSearchGroup = group) {
 function render() { return mount(ExploreView, { global: { stubs: { RouterLink: true } } }) }
 afterEach(() => { request.mockReset(); sessionStorage.clear(); localStorage.clear(); routeQuery.site_id = '7'; vi.unstubAllGlobals() })
 
+it('renders an ordinary received batch neutrally and retains real partial warnings', async () => {
+  fixture()
+  const ordinary = render()
+  try {
+    await flushPromises()
+    expect(ordinary.text()).toContain('已收到本次响应，返回 1 条结果')
+    expect(ordinary.text()).not.toContain('上游未提供逐插件完成凭据')
+    expect(ordinary.findAll('p.semantic-warning').map(item => item.text()).join('')).not.toContain('盘搜')
+  } finally { ordinary.unmount() }
+  sessionStorage.clear()
+  fixture(page => ({ ...group(page), partial: true, truncated: true, warnings: [{ code: 'fixture_partial', message: '部分来源读取失败' }] }))
+  const partial = render()
+  try {
+    await flushPromises()
+    expect(partial.findAll('p.semantic-warning').map(item => item.text()).join('')).toContain('部分来源读取失败')
+    expect(partial.text()).toContain('结果达到本次保存上限')
+  } finally { partial.unmount() }
+})
+
 it('uses a single-site snapshot for paging, freezes the applied type filter and updates real response progress', async () => {
   const paths = fixture()
   const wrapper = render()

@@ -34,18 +34,19 @@ type FollowSchedule struct {
 }
 
 type FollowFilters struct {
-	Subtitles            *SubtitlePolicy `json:"subtitles,omitempty"`
-	Resolutions          []string        `json:"resolutions"`
-	VideoCodecs          []string        `json:"video_codecs"`
-	Qualities            []string        `json:"qualities"`
-	IncludeKeywords      []string        `json:"include_keywords"`
-	ExcludeKeywords      []string        `json:"exclude_keywords"`
-	ReleaseGroups        []string        `json:"release_groups"`
-	ExcludeReleaseGroups []string        `json:"exclude_release_groups"`
-	MinSeeders           int             `json:"min_seeders"`
-	MaxAgeHours          *int            `json:"max_age_hours"`
-	MinSizeBytes         *int64          `json:"min_size_bytes"`
-	MaxSizeBytes         *int64          `json:"max_size_bytes"`
+	AcquisitionPreference string          `json:"acquisition_preference,omitempty"`
+	Subtitles             *SubtitlePolicy `json:"subtitles,omitempty"`
+	Resolutions           []string        `json:"resolutions"`
+	VideoCodecs           []string        `json:"video_codecs"`
+	Qualities             []string        `json:"qualities"`
+	IncludeKeywords       []string        `json:"include_keywords"`
+	ExcludeKeywords       []string        `json:"exclude_keywords"`
+	ReleaseGroups         []string        `json:"release_groups"`
+	ExcludeReleaseGroups  []string        `json:"exclude_release_groups"`
+	MinSeeders            int             `json:"min_seeders"`
+	MaxAgeHours           *int            `json:"max_age_hours"`
+	MinSizeBytes          *int64          `json:"min_size_bytes"`
+	MaxSizeBytes          *int64          `json:"max_size_bytes"`
 }
 
 type FollowExecutionSnapshot struct {
@@ -104,6 +105,7 @@ type UpdateFollowInput struct {
 }
 
 type FollowSummary struct {
+	Wait             *FollowWait             `json:"wait,omitempty"`
 	ID               string                  `json:"id"`
 	OwnerID          uint                    `json:"owner_id"`
 	MediaType        string                  `json:"media_type"`
@@ -133,6 +135,7 @@ type FollowPage struct {
 	PageSize int             `json:"page_size"`
 }
 type FollowRunSummary struct {
+	Wait                 *FollowWait    `json:"wait,omitempty"`
 	ID                   string         `json:"id"`
 	JobID                string         `json:"job_id"`
 	Trigger              string         `json:"trigger"`
@@ -303,6 +306,7 @@ func (s *FollowService) Defaults(ctx context.Context, actor Actor, tmdbID int64)
 	}
 	result.PolicyDefaultsRevision = policyDefaults.Revision
 	result.Snapshot.Filters.Subtitles = &policyDefaults.Subtitles
+	result.Snapshot.Filters.AcquisitionPreference = policyDefaults.AcquisitionPreference
 	type routeChoices struct {
 		source       string
 		byDownloader map[string]map[uint]SourceRouteChoice
@@ -451,6 +455,9 @@ func (s *FollowService) List(actor Actor, page, pageSize int, status string) (Fo
 		}
 		list = append(list, item)
 	}
+	if err := s.projectCurrentWaits(rows, list); err != nil {
+		return FollowPage{}, err
+	}
 	return FollowPage{List: list, Total: total, Page: page, PageSize: pageSize}, nil
 }
 
@@ -459,7 +466,15 @@ func (s *FollowService) Get(actor Actor, id string) (FollowSummary, error) {
 	if err != nil {
 		return FollowSummary{}, err
 	}
-	return followSummaryForActor(actor, record)
+	item, err := followSummaryForActor(actor, record)
+	if err != nil {
+		return item, err
+	}
+	items := []FollowSummary{item}
+	if err = s.projectCurrentWaits([]models.FollowSubscription{record}, items); err != nil {
+		return FollowSummary{}, err
+	}
+	return items[0], nil
 }
 
 func (s *FollowService) Update(ctx context.Context, actor Actor, id string, input UpdateFollowInput, request RequestContext) (FollowSummary, error) {
@@ -584,7 +599,8 @@ func (s *FollowService) Delete(actor Actor, id string, request RequestContext) e
 }
 
 func (s *FollowService) Runs(actor Actor, id string) ([]FollowRunSummary, error) {
-	if _, err := s.load(actor, id, "read"); err != nil {
+	record, err := s.load(actor, id, "read")
+	if err != nil {
 		return nil, err
 	}
 	var rows []models.FollowRun
@@ -593,18 +609,25 @@ func (s *FollowService) Runs(actor Actor, id string) ([]FollowRunSummary, error)
 	}
 	result := make([]FollowRunSummary, 0, len(rows))
 	for _, row := range rows {
+		visible := row.OwnerID == record.OwnerID
 		summary := map[string]int{}
 		_ = json.Unmarshal([]byte(row.FilterSummaryJSON), &summary)
 		var snapshot FollowExecutionSnapshot
 		if err := json.Unmarshal([]byte(row.ExecutionSnapshotJSON), &snapshot); err != nil {
 			row.ErrorMessage = ""
+			visible = false
 		} else {
 			access := jobResourceAccess{LibraryID: snapshot.MediaLibraryID, SiteIDs: snapshot.SiteIDs}
 			if !access.visible(actor) {
 				row.ErrorMessage = ""
+				visible = false
 			}
 		}
-		result = append(result, FollowRunSummary{ID: row.ID, JobID: row.JobID, Trigger: row.Trigger, Status: row.Status, SubscriptionRevision: row.SubscriptionRevision, SearchedNamesCount: row.SearchedNamesCount, Candidates: row.Candidates, Selected: row.Selected, FilterSummary: summary, ErrorCode: row.ErrorCode, ErrorMessage: row.ErrorMessage, StartedAt: row.StartedAt, FinishedAt: row.FinishedAt, CreatedAt: row.CreatedAt})
+		var wait *FollowWait
+		if visible {
+			wait = followRunWait(row, s.now())
+		}
+		result = append(result, FollowRunSummary{Wait: wait, ID: row.ID, JobID: row.JobID, Trigger: row.Trigger, Status: row.Status, SubscriptionRevision: row.SubscriptionRevision, SearchedNamesCount: row.SearchedNamesCount, Candidates: row.Candidates, Selected: row.Selected, FilterSummary: summary, ErrorCode: row.ErrorCode, ErrorMessage: row.ErrorMessage, StartedAt: row.StartedAt, FinishedAt: row.FinishedAt, CreatedAt: row.CreatedAt})
 	}
 	return result, nil
 }
@@ -857,6 +880,9 @@ func (s *FollowService) validateSnapshotWithRoutes(actor Actor, tmdbID int64, in
 		}
 	}
 	var err error
+	if err = validateAcquisitionPreference(input.Filters.AcquisitionPreference, true); err != nil {
+		return input, nil, err
+	}
 	input.Filters.Subtitles, err = normalizeSubtitlePolicy(input.Filters.Subtitles)
 	if err != nil {
 		return input, nil, err

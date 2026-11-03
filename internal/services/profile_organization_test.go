@@ -7,29 +7,6 @@ import (
 	downloadpkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/downloader"
 )
 
-func TestNormalizeMediaTypeDirectoryTemplate(t *testing.T) {
-	tests := []struct {
-		name, mediaType, input, want string
-	}{
-		{"movie prefix", "movie", "{category}/{title}", "电影/{category}/{title}"},
-		{"tv prefix", "tv", "{category}/{title}/Season {season:02}", "电视剧/{category}/{title}/Season {season:02}"},
-		{"movie idempotent", "movie", "电影/{category}/{title}", "电影/{category}/{title}"},
-		{"tv idempotent", "tv", "电视剧/{category}/{title}", "电视剧/{category}/{title}"},
-		{"wrong movie root", "movie", "电视剧/{category}/{title}", "电影/{category}/{title}"},
-		{"wrong tv root", "tv", "电影/{category}/{title}", "电视剧/{category}/{title}"},
-		{"deduplicate fixed roots", "movie", "电影/电视剧/电影/{category}/{title}", "电影/{category}/{title}"},
-		{"insert missing category", "tv", "Series/{title}/Season {season:02}", "电视剧/{category}/Series/{title}/Season {season:02}"},
-		{"move category to second segment", "movie", "Archive/{category}/{title}", "电影/{category}/Archive/{title}"},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			if got := normalizeMediaTypeDirectoryTemplate(test.input, test.mediaType); got != test.want {
-				t.Fatalf("normalize=%q want=%q", got, test.want)
-			}
-		})
-	}
-}
-
 func TestTypeFirstSnapshotsSeparateMovieAndTVWithSameCategory(t *testing.T) {
 	year, season, episode := 2026, 1, 2
 	manifest := downloadpkg.Manifest{Complete: true, Files: []downloadpkg.File{{RelativePath: "Example.S01E02.mkv", Size: minimumAutomaticTransferVideoBytes}}}

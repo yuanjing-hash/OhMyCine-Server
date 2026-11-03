@@ -6,7 +6,7 @@ import (
 	"encoding/hex"
 	"os"
 	"path/filepath"
-	"strings"
+
 	"sync"
 	"testing"
 	"time"
@@ -101,58 +101,34 @@ func TestRemoteNodeMaterializationResumesVerifiedChunksAndPersistsCompletion(t *
 	if len(reader.reads) != 0 {
 		t.Fatalf("completed file was downloaded again: %v", reader.reads)
 	}
-}
-
-func TestRemoteNodeMaterializationRedownloadsCorruptCompletedChunk(t *testing.T) {
-	content := make([]byte, nodeprotocol.FileChunkSize+7)
-	for index := range content {
-		content[index] = byte((index + 17) % 253)
-	}
-	chunks := remoteTestChunks(content)
-	bitmap := make([]byte, (len(chunks)+7)/8)
-	bitmapSet(bitmap, 0)
-	checkpoint := models.RemoteTransferFile{CompletedBitmap: bitmap}
-	partial, err := os.CreateTemp(t.TempDir(), "remote-partial-")
-	if err != nil {
+	// A completed local result is still hash-bound; same-size corruption fails before any remote read.
+	corrupt := append([]byte(nil), content...)
+	corrupt[0] ^= 0xff
+	if err := os.WriteFile(destination, corrupt, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = partial.Close() }()
-	if err := partial.Truncate(int64(len(content))); err != nil {
+	if err := worker.pullRemoteFile(context.Background(), materializeTestRuntime{}, reader, manifest, file, chunks, root, destination, &saved); err == nil || len(reader.reads) != 0 {
+		t.Fatal("same-size completed corruption was trusted or silently redownloaded", err, reader.reads)
+	}
+	if err := os.Remove(destination); err != nil {
 		t.Fatal(err)
 	}
-	if err := reconcileRemoteBitmap(partial, &checkpoint, chunks); err != nil {
+	remaining, err := remoteMaterializationRemainingBytes(queue.db, saved.TransferTaskID, root, manifest)
+	if err != nil || remaining != uint64(len(content)) {
+		t.Fatalf("missing completed file remaining=%d want=%d err=%v", remaining, len(content), err)
+	}
+	// The saved bitmap cannot authorize corrupt partial bytes after the final file disappeared.
+	if err := os.WriteFile(partial, make([]byte, len(content)), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if bitmapHas(checkpoint.CompletedBitmap, 0) {
-		t.Fatal("corrupt completed chunk remained trusted")
-	}
-}
-
-func TestRemoteNodeMaterializationDoesNotTrustMissingCompletedFile(t *testing.T) {
-	queue, _, download, _, _ := transferFixture(t, models.MediaLibraryTransferCopy, models.MediaLibraryConflictOverwrite, false)
-	service := NewTransferService(queue.db, queue.audit, queue, zerolog.Nop())
-	if err := service.Enqueue(download, downloadpkg.Manifest{Name: "Movie", Complete: true, Files: []downloadpkg.File{{RelativePath: "Movie.mkv", Size: minimumAutomaticTransferVideoBytes}}}); err != nil {
+	if err := worker.pullRemoteFile(context.Background(), materializeTestRuntime{}, reader, manifest, file, chunks, root, destination, &saved); err != nil {
 		t.Fatal(err)
 	}
-	var transfer models.TransferTask
-	if err := queue.db.Where("download_task_id = ?", download.ID).First(&transfer).Error; err != nil {
-		t.Fatal(err)
+	if len(reader.reads) != len(chunks) {
+		t.Fatalf("corrupt partial retained completed chunks: %v", reader.reads)
 	}
-	content := []byte("verified remote media")
-	sum := sha256.Sum256(content)
-	file := downloadpkg.File{RelativePath: "Movie.mkv", Size: int64(len(content)), SHA256: hex.EncodeToString(sum[:]), RemoteFileToken: "file:missing-completed"}
-	manifest := downloadpkg.Manifest{Files: []downloadpkg.File{file}}
-	checkpoint := models.RemoteTransferFile{TransferTaskID: transfer.ID, DownloadTaskID: download.ID, OperationKey: "qb:file_export:missing", ManifestDigest: strings.Repeat("a", 64), FileToken: file.RemoteFileToken, RelativePath: file.RelativePath, Size: file.Size, SHA256: file.SHA256, ChunkSize: nodeprotocol.FileChunkSize, ChunkCount: 1, CompletedBitmap: []byte{1}, Status: "completed", CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()}
-	if err := queue.db.Create(&checkpoint).Error; err != nil {
+	if err := verifyRemoteMaterializedFile(destination, file); err != nil {
 		t.Fatal(err)
-	}
-
-	remaining, err := remoteMaterializationRemainingBytes(queue.db, checkpoint.TransferTaskID, t.TempDir(), manifest)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if remaining != uint64(len(content)) {
-		t.Fatalf("remaining=%d, want %d for a missing completed file", remaining, len(content))
 	}
 }
 

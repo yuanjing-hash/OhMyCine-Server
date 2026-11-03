@@ -22,7 +22,6 @@ import (
 
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
 	cloud "github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud"
-	downloader "github.com/yuanjing-hash/OhMyCine-Server/pkg/downloader"
 )
 
 // This fake keeps disjoint route namespaces and rejects every management call
@@ -198,32 +197,6 @@ func (p *quarkTransferPublisher) ReconcileTransferBatch(_ context.Context, id st
 		}
 	}
 	return nil
-}
-
-func TestQuarkTransferExistingPipelineMovesCanonicalIdentityAndRetainsPackage(t *testing.T) {
-	f := setQuarkTransferRoute(t, newCloudTransferFixture(t, models.MediaLibraryTransferMove, models.MediaLibraryConflictAsk, false))
-	provider := makeQuarkTransferFake(f.driver)
-	f.service.connections.drivers[f.connection] = provider
-	publisher := &quarkTransferPublisher{dbFixture: f}
-	f.service.SetMediaLibraryReconciler(publisher)
-	result := f.run(t)
-	if result.ErrorCode != "" || result.RetryAt != nil || result.Wait != nil {
-		t.Fatalf("result=%+v", result)
-	}
-	i := provider.items[f.sourceID]
-	if i.ParentID == "source-root" || i.Name != "Movie (2024).mkv" || publisher.calls != 1 {
-		t.Fatalf("item=%+v publish=%d", i, publisher.calls)
-	}
-	if _, ok := provider.items["source-root"]; !ok || len(provider.recycled) != 0 {
-		t.Fatal("unverified Quark recycle was attempted")
-	}
-	var task models.TransferTask
-	if err := f.queue.db.First(&task, "download_task_id = ?", f.download.ID).Error; err != nil {
-		t.Fatal(err)
-	}
-	if task.CleanupStatus != models.TransferCleanupSkipped || task.CleanupErrorCode != "quark_recycle_unavailable" {
-		t.Fatalf("cleanup=%s %s", task.CleanupStatus, task.CleanupErrorCode)
-	}
 }
 
 func TestQuarkTransferDoesNotOfferOverwriteAndRejectsCopyBeforeWriting(t *testing.T) {
@@ -414,29 +387,6 @@ func setupQuarkUploadCatalog(t *testing.T, transfers *TransferService, library *
 	return s
 }
 
-func TestQuarkMaterializationRestartsUnverifiedPartialAndKeepsDigestReceipt(t *testing.T) {
-	f := makeQuarkTransferFake(newFakeMutationCloudDriver())
-	f.contents["file"] = []byte("payload")
-	root := t.TempDir()
-	destination := filepath.Join(root, "video.mkv")
-	if err := os.WriteFile(destination+".partial", []byte("bad"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	digest, err := materializeQuarkFile(context.Background(), nil, f, downloader.File{ProviderItemID: "file", Size: 7}, root, destination)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := verifyMaterializedSHA256(destination, 7, digest); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(destination, []byte("payloae"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	if err := verifyMaterializedSHA256(destination, 7, digest); err == nil {
-		t.Fatal("same-size staging corruption accepted")
-	}
-}
-
 func TestQuarkCrossSourceResumeUsesPersistedSHA256AndPublishesLocalTarget(t *testing.T) {
 	f := setQuarkTransferRoute(t, newCloudTransferFixture(t, models.MediaLibraryTransferCopy, models.MediaLibraryConflictAsk, false))
 	provider := makeQuarkTransferFake(f.driver)
@@ -478,6 +428,13 @@ func TestQuarkCrossSourceResumeUsesPersistedSHA256AndPublishesLocalTarget(t *tes
 	}
 	runtime := workerRuntime{queue: f.queue, job: *claimed}
 	worker := NewTransferWorker(f.service)
+	partial := filepath.Join(staging, crossSourceRootName, task.ID, filepath.FromSlash(f.manifest.Files[0].RelativePath)) + ".partial"
+	if err := os.MkdirAll(filepath.Dir(partial), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(partial, []byte("unverified partial"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	_, managed, err := worker.materializePan115Source(context.Background(), runtime, task, f.download, f.manifest)
 	if err != nil {
 		t.Fatal(err)
@@ -613,6 +570,12 @@ func TestQuarkTransferPublishesVersionedCatalogAndRealSignedSTRM(t *testing.T) {
 	var task models.TransferTask
 	if err := f.queue.db.First(&task, "download_task_id = ?", f.download.ID).Error; err != nil || task.CatalogPublishedAt == nil {
 		t.Fatalf("publication not durable: %v", err)
+	}
+	if _, ok := provider.items["source-root"]; !ok || len(provider.recycled) != 0 {
+		t.Fatal("unverified Quark recycle was attempted")
+	}
+	if task.CleanupStatus != models.TransferCleanupSkipped || task.CleanupErrorCode != "quark_recycle_unavailable" {
+		t.Fatalf("cleanup=%s %s", task.CleanupStatus, task.CleanupErrorCode)
 	}
 	if err := f.queue.Complete(claim.Job.ID, claim.LeaseToken); err != nil {
 		t.Fatal(err)

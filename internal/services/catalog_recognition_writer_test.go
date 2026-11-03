@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -26,49 +27,6 @@ func recognitionSnapshotClient(t *testing.T, service *MediaLibraryService, handl
 	metadata := NewMetadataSettingsService(service.db, NewAuditService(service.db), nil, tmdb.Credential{Kind: tmdb.CredentialKindReadAccessToken, Value: "deployment-token"})
 	metadata.clientFactory = func(tmdb.Credential, string, string) (*tmdb.Client, error) { return client, nil }
 	service.SetMetadataSettingsService(metadata)
-}
-
-func TestCatalogRecognitionValidationUsesExactHeadWithoutEntryRescan(t *testing.T) {
-	f, store, library := historySnapshotFixture(t)
-	records, source, err := f.libraries.catalogMetadataContext(context.Background(), library.ID, f.movieWork)
-	if err != nil {
-		t.Fatal(err)
-	}
-	entryQueries := 0
-	callback := "test:recognition_membership_query"
-	if err := store.writeDB.Callback().Query().After("gorm:query").Register(callback, func(tx *gorm.DB) {
-		if strings.Contains(tx.Statement.SQL.String(), "catalog_entry_facts") {
-			entryQueries++
-		}
-	}); err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = store.writeDB.Callback().Query().Remove(callback) }()
-	validate := func() error {
-		return store.writeDB.Transaction(func(tx *gorm.DB) error {
-			reader, err := PinCatalogTx(tx, []uint{library.ID})
-			if err != nil {
-				return err
-			}
-			return validateCatalogRecognitionContext(tx, reader, source, records)
-		})
-	}
-	if err := validate(); err != nil {
-		t.Fatal(err)
-	}
-	if entryQueries != 0 {
-		t.Fatalf("writer rescanned entry membership: %d", entryQueries)
-	}
-	c, token := catalogCandidate(t, store, library, "delta", source.Head.Revision)
-	changed := records[0]
-	changed.Title = "Concurrent correction"
-	if err := store.AppendBatch(context.Background(), c.ID, token, CatalogFactBatch{Recognitions: []models.CatalogRecognitionFact{CatalogRecognitionFromLegacy(changed)}}); err != nil {
-		t.Fatal(err)
-	}
-	catalogPublish(t, store, c, token)
-	if err := validate(); !errors.Is(err, ErrCatalogFence) {
-		t.Fatalf("stale head accepted: %v", err)
-	}
 }
 
 func TestCatalogRecognitionManualDeltaPreservesFileOverridesAndExactSummary(t *testing.T) {
@@ -212,13 +170,20 @@ func TestCatalogRecognitionClearOverrideKeepsManualOnUnavailableLookup(t *testin
 	if err := f.libraries.persistRecognitionResult(record, source.Profile, result, true, source); err != nil {
 		t.Fatal(err)
 	}
-	recognitionSnapshotClient(t, f.libraries, func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusServiceUnavailable) })
-	_, err = f.libraries.ClearRecognitionOverride(context.Background(), f.actor, library.ID, encodeRecognitionToken(record.ID), RequestContext{})
+	var attempts atomic.Int64
+	recognitionSnapshotClient(t, f.libraries, func(w http.ResponseWriter, _ *http.Request) {
+		attempts.Add(1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	})
+	_, err = f.libraries.ClearCatalogRecognitionOverride(context.Background(), f.actor, library.ID, f.movieWork, RequestContext{})
 	if err == nil {
 		t.Fatal("unavailable lookup unexpectedly cleared manual authority")
 	}
 	if err := store.Read(context.Background(), []uint{library.ID}, func(r *CatalogReader) error { return r.Recognitions().First(&record, record.ID).Error }); err != nil {
 		t.Fatal(err)
+	}
+	if attempts.Load() == 0 {
+		t.Fatal("effective manual entry never reached replacement recognition")
 	}
 	if !record.ManualOverride || record.Title != "权威电影" {
 		t.Fatalf("failed clear lost manual result=%+v", record)

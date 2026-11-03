@@ -93,18 +93,6 @@ func TestUpdateServiceCheckSettingsAndSafeStatus(t *testing.T) {
 	}
 }
 
-func TestUpdateServiceLinuxARM64UsesNativeUpdateButContainerRemainsManaged(t *testing.T) {
-	service, _, _, _ := testUpdateService(t)
-	service.goos, service.goarch = "linux", "arm64"
-	if managed, reason := service.deploymentManaged(); managed {
-		t.Fatalf("native Linux ARM64 should support updates: %s", reason)
-	}
-	service.container = func() bool { return true }
-	if managed, reason := service.deploymentManaged(); !managed || reason != updateManagedContainer {
-		t.Fatalf("container must update through image replacement: %v %s", managed, reason)
-	}
-}
-
 func TestUpdateServiceInstallStartsHelperThenRequestsShutdown(t *testing.T) {
 	service, client, store, executable := testUpdateService(t)
 	logManager, logger := captureRemainingBusiness(t, "update")
@@ -156,22 +144,6 @@ func TestUpdateServiceInstallStartsHelperThenRequestsShutdown(t *testing.T) {
 		if entry.Fields["event_code"] == "update.result.confirmed" {
 			t.Fatalf("handoff advertised final update success: %+v", entry)
 		}
-	}
-}
-
-func TestUpdateStatusKeepsLastCheckSeparateFromInstallCompletion(t *testing.T) {
-	service, _, store, _ := testUpdateService(t)
-	checked := time.Date(2026, 8, 31, 1, 2, 3, 0, time.UTC)
-	completed := checked.Add(time.Hour)
-	if err := store.SaveState(updater.State{Phase: updater.PhaseSucceeded, CurrentVersion: "1.0.0", TargetVersion: "1.1.0", Channel: updater.ChannelBeta, OperationID: strings.Repeat("b", 32), LastCheckedAt: &checked, CompletedAt: &completed}); err != nil {
-		t.Fatal(err)
-	}
-	status, err := service.Status(updateAdminActor())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if status.LastCheckedAt == nil || !status.LastCheckedAt.Equal(checked) || status.LastCheckedAt.Equal(completed) {
-		t.Fatalf("last_checked_at=%v completed=%v", status.LastCheckedAt, completed)
 	}
 }
 

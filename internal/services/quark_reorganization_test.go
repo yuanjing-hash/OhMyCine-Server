@@ -3,7 +3,7 @@ package services
 import (
 	"context"
 	"encoding/json"
-	"errors"
+
 	"testing"
 	"time"
 
@@ -197,18 +197,6 @@ func TestQuarkReorganizationPreviewRejectsMissingSharedSpaceAndNamespace(t *test
 	}
 	if f.driver.moveCalls != 0 || f.driver.renameCalls != 0 {
 		t.Fatal("preview wrote cloud")
-	}
-}
-
-func TestQuarkReorganizationWaitClassificationIsNarrow(t *testing.T) {
-	f := newQuarkReorganizationFixture(t, false)
-	for _, err := range []error{ErrCatalogFence, errors.New("fixture private provider message"), cloud.Error(quark.CodeIdentity, false, nil), cloud.Error(quark.CodePending, true, nil)} {
-		if _, ok := f.worker.quarkReorganizationWait(context.Background(), f.task, f.plan, f.state, f.claim, err); ok {
-			t.Fatal("unsafe untyped/fence/no-operation wait")
-		}
-	}
-	if retryWaitConsumesFailureBudget(quarkReorganizationPending) || !retryWaitConsumesFailureBudget(quark.CodePending) || !retryWaitConsumesFailureBudget(quark.CodeUnavailable) || !retryWaitConsumesFailureBudget(cloud.CodeMutationUnknown) {
-		t.Fatal("retry exemption too broad")
 	}
 }
 

@@ -58,13 +58,15 @@ func normalizeSubtitlePolicy(input *SubtitlePolicy) (*SubtitlePolicy, error) {
 }
 
 type FollowPolicyDefaultsSummary struct {
-	Revision  uint64         `json:"revision"`
-	Subtitles SubtitlePolicy `json:"subtitles"`
-	UpdatedAt time.Time      `json:"updated_at"`
+	AcquisitionPreference string         `json:"acquisition_preference"`
+	Revision              uint64         `json:"revision"`
+	Subtitles             SubtitlePolicy `json:"subtitles"`
+	UpdatedAt             time.Time      `json:"updated_at"`
 }
 type UpdateFollowPolicyDefaultsInput struct {
-	Revision  uint64         `json:"revision"`
-	Subtitles SubtitlePolicy `json:"subtitles"`
+	AcquisitionPreference *string        `json:"acquisition_preference,omitempty"`
+	Revision              uint64         `json:"revision"`
+	Subtitles             SubtitlePolicy `json:"subtitles"`
 }
 
 func (s *FollowService) policyDefaults(ctx context.Context) (FollowPolicyDefaultsSummary, error) {
@@ -80,7 +82,10 @@ func (s *FollowService) policyDefaults(ctx context.Context) (FollowPolicyDefault
 	if err != nil {
 		return FollowPolicyDefaultsSummary{}, err
 	}
-	return FollowPolicyDefaultsSummary{Revision: row.Revision, Subtitles: *normalized, UpdatedAt: row.UpdatedAt}, nil
+	if err := validateAcquisitionPreference(row.AcquisitionPreference, false); err != nil {
+		return FollowPolicyDefaultsSummary{}, err
+	}
+	return FollowPolicyDefaultsSummary{Revision: row.Revision, Subtitles: *normalized, AcquisitionPreference: row.AcquisitionPreference, UpdatedAt: row.UpdatedAt}, nil
 }
 func (s *FollowService) PolicyDefaults(ctx context.Context, actor Actor) (FollowPolicyDefaultsSummary, error) {
 	if !actor.Can(authz.PermissionSettingsRead) {
@@ -100,8 +105,19 @@ func (s *FollowService) UpdatePolicyDefaults(ctx context.Context, actor Actor, i
 		return FollowPolicyDefaultsSummary{}, err
 	}
 	raw, _ := json.Marshal(policy)
+	if input.AcquisitionPreference != nil {
+		if err := validateAcquisitionPreference(*input.AcquisitionPreference, false); err != nil {
+			return FollowPolicyDefaultsSummary{}, err
+		}
+	}
 	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		result := tx.Model(&models.FollowPolicyDefaults{}).Where("id = 1 AND revision = ?", input.Revision).Updates(map[string]any{"revision": input.Revision + 1, "subtitles_json": string(raw), "updated_at": s.now()})
+		updates := map[string]any{"revision": input.Revision + 1, "subtitles_json": string(raw), "updated_at": s.now()}
+		// Older clients only edit subtitles. Omission must preserve the current
+		// independent preference rather than reset the administrator's choice.
+		if input.AcquisitionPreference != nil {
+			updates["acquisition_preference"] = *input.AcquisitionPreference
+		}
+		result := tx.Model(&models.FollowPolicyDefaults{}).Where("id = 1 AND revision = ?", input.Revision).Updates(updates)
 		if result.Error != nil {
 			return result.Error
 		}

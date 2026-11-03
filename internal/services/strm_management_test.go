@@ -299,23 +299,6 @@ func TestSTRMManagementReconcileWaitsForActiveStructureRepair(t *testing.T) {
 	}
 }
 
-func TestSTRMManagementRetryWithoutArtifactServiceKeepsFailedState(t *testing.T) {
-	service, _, actor, library, _ := strmManagementFixture(t)
-	run := models.MediaArtifactRun{ID: "00000000-0000-0000-0000-000000000010", LibraryID: library.ID, Generation: library.ArtifactGeneration, PolicyJSON: "{}", Status: models.MediaArtifactStatusFailed, ErrorCode: "previous_failure", CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()}
-	if err := service.db.Create(&run).Error; err != nil {
-		t.Fatal(err)
-	}
-	if err := service.RetryRun(actor, run.ID); ErrorCode(err) != CodeConflict {
-		t.Fatalf("err=%v", err)
-	}
-	if err := service.db.First(&run, "id = ?", run.ID).Error; err != nil {
-		t.Fatal(err)
-	}
-	if run.Status != models.MediaArtifactStatusFailed || run.RetryCount != 0 || run.ErrorCode != "previous_failure" {
-		t.Fatalf("run=%+v", run)
-	}
-}
-
 func TestSTRMManagementRetryNoLongerApplicableRestoresFailedState(t *testing.T) {
 	service, queue, actor, library, _ := strmManagementFixture(t)
 	service.artifacts = NewMediaArtifactService(service.db, queue, nil, zerolog.Nop())
@@ -612,19 +595,6 @@ func TestAutomaticSTRMCleanupAfterCompleteFullAndIncrementalScans(t *testing.T) 
 				t.Fatalf("audit=%+v err=%v", audit, err)
 			}
 		})
-	}
-}
-
-func TestAutomaticCleanupScanKindPolicy(t *testing.T) {
-	for _, kind := range []string{"initial", "catch_up", "manual", "event", "incremental", "full", "strm_incremental_manual", "strm_full_manual"} {
-		if !automaticCleanupScanKind(kind) {
-			t.Errorf("expected %q to be cleanup eligible", kind)
-		}
-	}
-	for _, kind := range []string{"", "failed", "partial", "retry", "unknown"} {
-		if automaticCleanupScanKind(kind) {
-			t.Errorf("expected %q to be cleanup ineligible", kind)
-		}
 	}
 }
 

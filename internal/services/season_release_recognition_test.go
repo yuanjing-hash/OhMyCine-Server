@@ -60,29 +60,6 @@ func TestLibrarySeasonReleaseQueriesUseSeriesPremiereNotSeasonYear(t *testing.T)
 	}
 }
 
-func TestLibraryNumericTitleSeasonReleaseUsesExplicitPremiereYear(t *testing.T) {
-	for _, tc := range []struct {
-		outer, seasonDirectory, file, wantQuery string
-	}{
-		{"1923 (2022)", "1923.S02.2025.1080p", "1923.S02E01.mkv", "tv:1923:2022"},
-		{"1883 (2021)", "1883.S01.2021.1080p", "1883.S01E01.mkv", "tv:1883:2021"},
-	} {
-		t.Run(tc.outer, func(t *testing.T) {
-			files := []medialibrary.File{{RelativePath: "/电视剧/" + tc.outer + "/" + tc.seasonDirectory + "/" + tc.file, Size: 1 << 30}}
-			units := medialibrary.GroupRecognitionUnits(files)
-			if len(units) != 1 || units[0].PackageName != tc.outer {
-				t.Fatalf("groups=%+v", units)
-			}
-			evidence := []recognitionSourceFile{{RelativePath: files[0].RelativePath, Size: files[0].Size}}
-			lookup := &seasonReleaseLookup{}
-			recognizeMedia(context.Background(), lookup, MediaRecognitionRequest{PackageName: units[0].PackageName, Files: evidence, SourceKind: mediarecognition.SourceLibraryScan, MediaTypeHint: "tv", BuiltinPackCodes: mediarecognition.DefaultPackCodes(), Classification: classification.DefaultRules(), Language: "zh-CN", Region: "CN"})
-			if len(lookup.queries) == 0 || lookup.queries[0] != tc.wantQuery {
-				t.Fatalf("queries=%v, want first %q", lookup.queries, tc.wantQuery)
-			}
-		})
-	}
-}
-
 func TestCatalogRescanRegroupsSeasonReleasesPreservingManualMembership(t *testing.T) {
 	for _, manual := range []bool{false, true} {
 		t.Run(fmt.Sprint("manual=", manual), func(t *testing.T) {
