@@ -1526,6 +1526,7 @@ func (c *Client) waitAndCall(ctx context.Context, limiter *rate.Limiter, call fu
 		// in flight. Otherwise a late 405/429 would be silently dropped and the
 		// next operation could bypass the shared account recovery state.
 		c.recordOutcome(err)
+		err = c.withRecoveryTiming(err)
 		if c.onCallResult != nil {
 			c.onCallResult(mapError(err))
 		}
@@ -1574,8 +1575,9 @@ func (c *Client) waitForRecovery(ctx context.Context) error {
 	}
 	now := c.now()
 	if c.circuitTil.After(now) {
+		until := c.recoveryDeadlineLocked()
 		c.stateMu.Unlock()
-		return errCircuitOpen
+		return cloud.WithRetryNotBefore(errCircuitOpen, until, cloud.RetryReasonProviderCooldown)
 	}
 	until := c.backoffTil
 	c.stateMu.Unlock()
@@ -1586,10 +1588,34 @@ func (c *Client) waitForRecovery(ctx context.Context) error {
 	defer timer.Stop()
 	select {
 	case <-ctx.Done():
-		return ctx.Err()
+		return c.withRecoveryTiming(ctx.Err())
 	case <-timer.C:
 		return nil
 	}
+}
+
+func (c *Client) recoveryDeadlineLocked() time.Time {
+	until := c.backoffTil
+	if c.circuitTil.After(until) {
+		until = c.circuitTil
+	}
+	return until
+}
+
+func (c *Client) withRecoveryTiming(err error) error {
+	if err == nil {
+		return nil
+	}
+	if code, _ := cloud.ErrorInfo(mapError(err)); code != cloud.CodeRateLimited && code != cloud.CodeUnavailable {
+		return err
+	}
+	c.stateMu.Lock()
+	until, now := c.recoveryDeadlineLocked(), c.now()
+	c.stateMu.Unlock()
+	if !until.After(now) {
+		return err
+	}
+	return cloud.WithRetryNotBefore(err, until, cloud.RetryReasonProviderCooldown)
 }
 
 func (c *Client) recordOutcome(err error) {

@@ -57,9 +57,11 @@ func TestFollowScreenshotTorznabTitlesKeepExactEpisode(t *testing.T) {
 
 type followPreviewDriver struct {
 	*previewFixtureDriver
-	readMu sync.Mutex
-	reads  []string
-	onRead func()
+	readMu    sync.Mutex
+	reads     []string
+	onRead    func()
+	readErr   error
+	readItems []cloud.ShareItem
 }
 
 func (d *followPreviewDriver) InspectShare(ctx context.Context, raw string) (cloud.ShareSnapshot, error) {
@@ -75,6 +77,12 @@ func (d *followPreviewDriver) InspectShareDirectory(ctx context.Context, raw, id
 	}
 	if ctx.Err() != nil {
 		return cloud.ShareSnapshot{}, ctx.Err()
+	}
+	if d.readErr != nil {
+		return cloud.ShareSnapshot{}, d.readErr
+	}
+	if d.readItems != nil {
+		return cloud.ShareSnapshot{ShareCode: "follow", ReceiveCode: "test", Items: d.readItems}, nil
 	}
 	result := cloud.ShareSnapshot{ShareCode: "follow", ReceiveCode: "test"}
 	if id == "0" {

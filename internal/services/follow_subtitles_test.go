@@ -39,7 +39,7 @@ func TestFollowPolicyDefaultsAreDurableCASAndDoNotRewriteSnapshots(t *testing.T)
 	actor.Permissions[authz.PermissionSettingsUpdate] = struct{}{}
 	service := NewFollowService(queue.db, queue.audit, queue, nil, nil)
 	first, err := service.PolicyDefaults(context.Background(), actor)
-	if err != nil || first.Revision != 1 || first.Subtitles.Mode != "prefer" || !reflect.DeepEqual(first.Subtitles.Languages, []string{"zh-Hans", "zh-Hant"}) {
+	if err != nil || first.Revision != 1 || first.AcquisitionPreference != FollowAcquisitionTransferFirst || first.Subtitles.Mode != "prefer" || !reflect.DeepEqual(first.Subtitles.Languages, []string{"zh-Hans", "zh-Hant"}) {
 		t.Fatalf("defaults=%+v err=%v", first, err)
 	}
 	record := models.FollowSubscription{ID: "legacy-subtitles", OwnerID: actor.User.ID, MediaType: "tv", TMDBID: 10, Title: "Legacy", Status: models.FollowStatusActive, Revision: 1, ExecutionSnapshotJSON: `{"version":2,"filters":{"min_seeders":1}}`}
@@ -68,5 +68,28 @@ func TestFollowPolicyDefaultsAreDurableCASAndDoNotRewriteSnapshots(t *testing.T)
 	}
 	if _, err := service.UpdatePolicyDefaults(context.Background(), actor, UpdateFollowPolicyDefaultsInput{Revision: 2, Subtitles: SubtitlePolicy{Mode: "ignore"}}, RequestContext{}); ErrorCode(err) != CodePermissionDenied {
 		t.Fatal("settings update bypass")
+	}
+}
+
+func TestFollowPolicyPreferenceCASPreservesOldClientAndRejectsUnknown(t *testing.T) {
+	queue, actor, _ := queueFixture(t)
+	actor.Permissions[authz.PermissionSettingsRead] = struct{}{}
+	actor.Permissions[authz.PermissionSettingsUpdate] = struct{}{}
+	s := NewFollowService(queue.db, queue.audit, queue, nil, nil)
+	pref := FollowAcquisitionExistingOrder
+	updated, err := s.UpdatePolicyDefaults(context.Background(), actor, UpdateFollowPolicyDefaultsInput{Revision: 1, Subtitles: SubtitlePolicy{Mode: "ignore"}, AcquisitionPreference: &pref}, RequestContext{})
+	if err != nil || updated.AcquisitionPreference != pref {
+		t.Fatalf("update=%+v err=%v", updated, err)
+	}
+	updated, err = s.UpdatePolicyDefaults(context.Background(), actor, UpdateFollowPolicyDefaultsInput{Revision: 2, Subtitles: SubtitlePolicy{Mode: "prefer", Languages: []string{"en"}}}, RequestContext{})
+	if err != nil || updated.AcquisitionPreference != pref {
+		t.Fatal("old client cleared independent preference", err)
+	}
+	pref = "wrong"
+	if _, err = s.UpdatePolicyDefaults(context.Background(), actor, UpdateFollowPolicyDefaultsInput{Revision: 3, Subtitles: SubtitlePolicy{Mode: "ignore"}, AcquisitionPreference: &pref}, RequestContext{}); ErrorCode(err) != CodeFollowConfigurationInvalid {
+		t.Fatal("unknown preference accepted")
+	}
+	if validateAcquisitionPreference("", true) != nil || validateAcquisitionPreference("", false) == nil {
+		t.Fatal("legacy omission/default validation diverged")
 	}
 }

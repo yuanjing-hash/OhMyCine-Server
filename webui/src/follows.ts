@@ -3,8 +3,10 @@ import type { MediaCoverage } from '@/discovery'
 
 export interface FollowSchedule { kind: 'interval'; minutes: number }
 export interface SubtitlePolicy { mode: 'ignore' | 'prefer' | 'require'; languages: string[] }
-export interface FollowPolicyDefaults { revision: number; subtitles: SubtitlePolicy; updated_at: string }
+export type AcquisitionPreference = 'transfer_first' | 'existing_order'
+export interface FollowPolicyDefaults { revision: number; subtitles: SubtitlePolicy; acquisition_preference: AcquisitionPreference; updated_at: string }
 export interface FollowFilters {
+	acquisition_preference?: AcquisitionPreference
   subtitles?: SubtitlePolicy
   resolutions: string[]; video_codecs: string[]; qualities: string[]
   include_keywords: string[]; exclude_keywords: string[]
@@ -32,7 +34,9 @@ export interface FollowRoutePreview {
   }>
 }
 export type FollowStatus = 'active' | 'paused' | 'completed' | 'blocked'
+export interface FollowWait { not_before: string; reason: 'provider_cooldown'; recorded_at: string; server_time: string }
 export interface FollowSummary {
+	 wait?: FollowWait
   id: string; owner_id: number; media_type: 'tv'; tmdb_id: number; title: string; year?: number; poster_ref?: string
   status: FollowStatus; revision: number; snapshot: FollowExecutionSnapshot
   progress_target: number; progress_present: number; progress_missing: number
@@ -41,6 +45,7 @@ export interface FollowSummary {
 }
 export interface FollowPage { list: FollowSummary[]; total: number; page: number; page_size: number }
 export interface FollowRunSummary {
+	 wait?: FollowWait
   id: string; job_id: string; trigger: 'scheduled' | 'manual' | 'created'
   status: 'queued' | 'running' | 'no_match' | 'submitted' | 'completed' | 'failed' | 'cancelled' | 'stale'
   subscription_revision: number; searched_names_count: number; candidates: number; selected: number

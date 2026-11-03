@@ -16,16 +16,16 @@ func TestFollowPolicyDefaultsRoutesEnforceAuthCSRFAndCAS(t *testing.T) {
 	client.setup(t)
 	status, envelope := client.request(t, http.MethodGet, "/api/v1/settings/follows", nil, true)
 	var policy services.FollowPolicyDefaultsSummary
-	if status != http.StatusOK || json.Unmarshal(envelope.Data, &policy) != nil || policy.Revision != 1 || policy.Subtitles.Mode != "prefer" {
+	if status != http.StatusOK || json.Unmarshal(envelope.Data, &policy) != nil || policy.Revision != 1 || policy.Subtitles.Mode != "prefer" || policy.AcquisitionPreference != services.FollowAcquisitionTransferFirst {
 		t.Fatalf("defaults %d %s", status, envelope.Data)
 	}
-	payload := map[string]any{"revision": 1, "subtitles": map[string]any{"mode": "require", "languages": []string{"zh-CN", "zh-Hans"}}}
+	payload := map[string]any{"revision": 1, "subtitles": map[string]any{"mode": "require", "languages": []string{"zh-CN", "zh-Hans"}}, "acquisition_preference": services.FollowAcquisitionExistingOrder}
 	status, _ = client.request(t, http.MethodPatch, "/api/v1/settings/follows", payload, false)
 	if status != http.StatusForbidden {
 		t.Fatal("missing csrf accepted")
 	}
 	status, envelope = client.request(t, http.MethodPatch, "/api/v1/settings/follows", payload, true)
-	if status != http.StatusOK || json.Unmarshal(envelope.Data, &policy) != nil || policy.Revision != 2 || len(policy.Subtitles.Languages) != 1 || policy.Subtitles.Languages[0] != "zh-Hans" {
+	if status != http.StatusOK || json.Unmarshal(envelope.Data, &policy) != nil || policy.Revision != 2 || len(policy.Subtitles.Languages) != 1 || policy.Subtitles.Languages[0] != "zh-Hans" || policy.AcquisitionPreference != services.FollowAcquisitionExistingOrder {
 		t.Fatalf("updated %d %s", status, envelope.Data)
 	}
 	status, _ = client.request(t, http.MethodPatch, "/api/v1/settings/follows", payload, true)

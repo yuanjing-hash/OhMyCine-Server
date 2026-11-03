@@ -36,6 +36,7 @@ type followCandidate struct {
 	Fingerprint           string
 	QualityRank           int
 	SubtitleRank          int
+	AcquisitionTier       int
 }
 
 type FollowSearchWorker struct {
@@ -213,7 +214,10 @@ func (w *FollowSearchWorker) Run(ctx context.Context, runtime JobRuntime, job Cl
 	submitted := 0
 	submitFailures := 0
 	lastSubmitMessage := ""
+	retryObserved := []followRetryObservation{}
+	candidateBudgetReached := false
 	pool := append([]followCandidate(nil), candidates...)
+	sort.SliceStable(pool, func(i, j int) bool { return followCandidateLess(pool[i], pool[j]) })
 	ready := []preparedFollowCandidate{}
 	preparationTokens := map[string]struct{}{}
 	defer func() {
@@ -239,6 +243,16 @@ func (w *FollowSearchWorker) Run(ctx context.Context, runtime JobRuntime, job Cl
 		}
 		if len(ready) == 0 && len(pool) > 0 && attempted < maxFollowCandidateAttempts && prepareCtx.Err() == nil {
 			window := min(len(pool), maxFollowCandidateAttempts-attempted)
+			if snapshot.Filters.AcquisitionPreference == FollowAcquisitionTransferFirst {
+				// Prepare the preferred tier first within the existing total budget.
+				// Failed read-only shares may fall through; uncertain writes may not.
+				for index := 1; index < window; index++ {
+					if pool[index].AcquisitionTier != pool[0].AcquisitionTier {
+						window = index
+						break
+					}
+				}
+			}
 			batch := append([]followCandidate(nil), pool[:window]...)
 			pool = pool[window:]
 			attempted += window
@@ -263,6 +277,7 @@ func (w *FollowSearchWorker) Run(ctx context.Context, runtime JobRuntime, job Cl
 						filterSummary["share_selection_failed"]++
 					}
 					lastSubmitMessage = safeErrorMessage(item.Err, "资源实际文件或入库路线未能核实")
+					observeFollowRetry(&retryObserved, item.Err, item.Candidate, lastSubmitMessage)
 					w.sites.discardContentPreparation(actor, item.ContentSelectionToken)
 					w.record(ctx, "follow.content_preparation_failed", "selection", "failed", "实际文件、缺集、字幕或路线未能核实，继续检查其他候选", map[string]any{"error_code": ErrorCode(item.Err), "site_id": item.Candidate.SiteID})
 				} else {
@@ -289,6 +304,7 @@ func (w *FollowSearchWorker) Run(ctx context.Context, runtime JobRuntime, job Cl
 			}
 			if len(pool) > 0 && (attempted >= maxFollowCandidateAttempts || prepareCtx.Err() != nil && ctx.Err() == nil) {
 				filterSummary["candidate_budget"]++
+				candidateBudgetReached = true
 				submitFailures++
 				lastSubmitMessage = "本轮资源核验已达到预算，剩余候选将在后续追更中重新检查"
 			}
@@ -329,6 +345,7 @@ func (w *FollowSearchWorker) Run(ctx context.Context, runtime JobRuntime, job Cl
 				submitFailures++
 				filterSummary["content_preparation_failed"]++
 				lastSubmitMessage = safeErrorMessage(refineErr, "本次剩余缺集文件核验失败")
+				observeFollowRetry(&retryObserved, refineErr, candidate, lastSubmitMessage)
 				continue
 			}
 			prepared.ContentSelectionToken, prepared.UnconfirmedSubtitles = refined.SelectionToken, refined.UnconfirmedSubtitles
@@ -351,6 +368,7 @@ func (w *FollowSearchWorker) Run(ctx context.Context, runtime JobRuntime, job Cl
 			if routeErr != nil {
 				lastSubmitMessage = safeErrorMessage(routeErr, lastSubmitMessage)
 			}
+			observeFollowRetry(&retryObserved, routeErr, candidate, lastSubmitMessage)
 			w.record(candidateCtx, "follow.route_unavailable", "route", "failed", "资源未提交：没有可用的下载器与目标媒体库路线", map[string]any{"error_code": ErrorCode(routeErr)})
 			continue
 		}
@@ -433,6 +451,7 @@ func (w *FollowSearchWorker) Run(ctx context.Context, runtime JobRuntime, job Cl
 			filterSummary["submit_failed"]++
 			submitFailures++
 			lastSubmitMessage = safeErrorMessage(err, "资源提交失败")
+			observeFollowRetry(&retryObserved, err, candidate, lastSubmitMessage)
 			w.record(candidateCtx, "follow.submit_failed", "submit", "failed", "资源未能提交；只有明确未创建任务的拒绝才继续选择其他资源，不确定结果保留原资源占用", map[string]any{"error_code": ErrorCode(err)})
 			if !definitive {
 				break
@@ -448,6 +467,15 @@ func (w *FollowSearchWorker) Run(ctx context.Context, runtime JobRuntime, job Cl
 			delete(missing, [2]int{candidate.Season, episode})
 		}
 		w.record(candidateCtx, "follow.submitted", "submit", "accepted", "下载请求已接受，后续下载与入库请查看关联任务；本轮未提前确认入库完成", map[string]any{"related_task_id": download.ID, "related_job_id": download.JobID, "action": download.submissionOutcome})
+	}
+	relevantMessage, relevantFailures := applyFollowRetryObservations(&run, retryObserved, missing)
+	// Candidate failures remain in process logs/counters. Once their coordinates
+	// have accepted tasks, they no longer describe a terminal submission failure.
+	// This does not claim that accepted downloads have completed media import.
+	if len(missing) == 0 || relevantFailures == 0 && !candidateBudgetReached {
+		submitFailures, lastSubmitMessage = 0, ""
+	} else if !candidateBudgetReached {
+		lastSubmitMessage = relevantMessage
 	}
 	if submitted == 0 {
 		if submitFailures > 0 {
@@ -641,7 +669,7 @@ func buildFollowCandidate(item SiteSearchResult, siteID uint, sitePriority, seas
 	if fingerprint == "" {
 		fingerprint = followFingerprint(siteID, item.Title, item.SizeBytes, item.Published)
 	}
-	return followCandidate{SiteID: siteID, SitePriority: sitePriority, Item: item, Season: season, Episodes: episodes, CompleteSeason: completeSeason, EpisodeBoundsDeclared: boundsDeclared, Fingerprint: fingerprint, QualityRank: qualityPreferenceRank(item, snapshot)}, "", true
+	return followCandidate{SiteID: siteID, SitePriority: sitePriority, Item: item, Season: season, Episodes: episodes, CompleteSeason: completeSeason, EpisodeBoundsDeclared: boundsDeclared, Fingerprint: fingerprint, QualityRank: qualityPreferenceRank(item, snapshot), AcquisitionTier: followAcquisitionTier(snapshot.Filters.AcquisitionPreference, item.SourceKind)}, "", true
 }
 
 func explicitFollowEpisodeRange(title string, season int) (int, int, bool) {
@@ -735,7 +763,7 @@ func selectFollowCandidates(candidates []followCandidate, missing map[[2]int]str
 				}
 			}
 			excess := len(candidate.Episodes) - coverage
-			if coverage > bestCoverage || (coverage == bestCoverage && coverage > 0 && (best < 0 || excess < bestExcess || excess == bestExcess && followCandidateLess(candidate, pool[best]))) {
+			if coverage > 0 && (best < 0 || candidate.AcquisitionTier < pool[best].AcquisitionTier || candidate.AcquisitionTier == pool[best].AcquisitionTier && (coverage > bestCoverage || coverage == bestCoverage && (excess < bestExcess || excess == bestExcess && followCandidateLess(candidate, pool[best])))) {
 				best, bestCoverage, bestExcess = index, coverage, excess
 			}
 		}
@@ -753,6 +781,9 @@ func selectFollowCandidates(candidates []followCandidate, missing map[[2]int]str
 }
 
 func followCandidateLess(left, right followCandidate) bool {
+	if left.AcquisitionTier != right.AcquisitionTier {
+		return left.AcquisitionTier < right.AcquisitionTier
+	}
 	if left.SitePriority != right.SitePriority {
 		return left.SitePriority < right.SitePriority
 	}
@@ -950,7 +981,7 @@ func (w *FollowSearchWorker) finish(run models.FollowRun, subscription models.Fo
 		selectedCount = selected[0]
 	}
 	err := w.follows.db.Transaction(func(tx *gorm.DB) error {
-		if err := tx.Model(&models.FollowRun{}).Where("id = ?", run.ID).Updates(map[string]any{"status": runStatus, "searched_names_count": queryNames, "candidates": candidates, "selected": selectedCount, "filter_summary_json": string(summaryRaw), "error_code": code, "error_message": message, "finished_at": now, "updated_at": now}).Error; err != nil {
+		if err := tx.Model(&models.FollowRun{}).Where("id = ?", run.ID).Updates(map[string]any{"status": runStatus, "searched_names_count": queryNames, "candidates": candidates, "selected": selectedCount, "filter_summary_json": string(summaryRaw), "error_code": code, "error_message": message, "retry_not_before": run.RetryNotBefore, "retry_code": run.RetryCode, "finished_at": now, "updated_at": now}).Error; err != nil {
 			return err
 		}
 		if err := tx.Model(&models.FollowSubscription{}).Where("id = ?", subscription.ID).Updates(map[string]any{"last_run_id": run.ID, "last_run_at": now, "updated_at": now}).Error; err != nil {

@@ -1942,6 +1942,10 @@ Server 可生成 Linux bash 或 Windows PowerShell 完整命令；命令先校�
 
 ## 来源感知下载路由
 
+订阅通过可选 `filters.acquisition_preference` 冻结资源获取顺序：新默认 `transfer_first` 先选择符合实际缺集及质量/字幕约束且路线可执行的分享，再选择其他渠道；旧快照省略该字段时保持原顺序。来源 tier 在有界准备及 greedy 覆盖比较之前生效，接受后按剩余实际文件重新收窄，不改变未知写入的占用和停止回退规则。独立全局默认使用既有权限及 revision CAS，仅影响新表单。
+
+提供方只通过中立可选错误合同报告真实本地冷却截止，115 从受保护的 backoff/circuit 状态读取；业务层不解析文案或周期猜时间。FollowRun 持久化安全期限和原因，当前列表按 owner/订阅/revision/lifecycle/LastRunID 批量投影，历史保留自己的事实。网页当前倒计时共用一个时钟，运行历史显示记录时间及截止事实；列表读取不访问提供方，到时不自动重发。普通 PanSou `received` 是正常状态，只有实际失败/截断等进入警告。字段、迁移及兼容细节见 [Follow 等待与来源偏好](../api/follow-wait-and-preference.md)。
+
 下载器通过 `sort_order,id` 形成管理员可调整的全局顺序。站点搜索结果的来源由 Server 保存的站点和用户绑定结果令牌决定：PT 固定首个可用 qBittorrent，115 分享固定首个可转存的 115 下载器；公开 BT 在所选目标库上按顺序检查兼容下载器，只有明确未创建任务的提交拒绝才尝试下一个。任务建立后不换下载器。手动入库优先选媒体库列表中排序最靠前且可路由的库，切换目标库会重新计算。订阅从下一次运行起按每条结果选路，旧版固定下载器快照会读取为来源优先策略，已有任务的路线保持冻结。
 
 Server 管理网页调用 `POST /api/v1/sites/routes/recommend` 和 `POST /api/v1/follows/routes/preview`；Player 使用 `POST /api/v1/player/discovery/routes/recommend` 和 `POST /api/v1/player/discovery/follows/routes/preview`。推荐只返回当前用户可见的安全路线信息，不返回站点凭据或下载来源；最终提交再次校验。管理员可通过 `PUT /api/v1/downloaders/order` 提交完整下载器顺序。新的订阅写入使用版本 2 的 `routing_policy=source_priority`，旧版固定 `downloader_id` 写入收到明确的升级错误。

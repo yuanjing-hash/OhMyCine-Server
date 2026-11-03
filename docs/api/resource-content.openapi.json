@@ -1135,12 +1135,16 @@
           "updated_at": {
             "type": "string",
             "format": "date-time"
+          },
+          "acquisition_preference": {
+            "$ref": "#/components/schemas/AcquisitionPreference"
           }
         },
         "required": [
           "revision",
           "subtitles",
-          "updated_at"
+          "updated_at",
+          "acquisition_preference"
         ],
         "additionalProperties": false
       },
@@ -1156,6 +1160,14 @@
           },
           "subtitles": {
             "$ref": "#/components/schemas/SubtitlePolicy"
+          },
+          "acquisition_preference": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/AcquisitionPreference"
+              }
+            ],
+            "description": "Optional for old clients. Omission preserves the stored preference in the same atomic revision CAS."
           }
         },
         "required": [
@@ -1166,7 +1178,7 @@
       },
       "FollowSubtitleFilterExtension": {
         "type": "object",
-        "description": "Additive extension of the existing subscription snapshot filters. Omission preserves legacy ignore; changing global defaults never rewrites existing snapshots.",
+        "description": "Additive snapshot filter extensions. Omitted subtitles preserve legacy ignore; omitted/empty acquisition preference preserves existing order. Global defaults never rewrite frozen snapshots.",
         "properties": {
           "subtitles": {
             "allOf": [
@@ -1175,6 +1187,9 @@
               }
             ],
             "nullable": true
+          },
+          "acquisition_preference": {
+            "$ref": "#/components/schemas/AcquisitionPreference"
           }
         }
       },
@@ -1289,6 +1304,56 @@
           "data"
         ],
         "additionalProperties": false
+      },
+      "AcquisitionPreference": {
+        "type": "string",
+        "enum": [
+          "transfer_first",
+          "existing_order"
+        ],
+        "description": "Actual executable share tier before greedy coverage, or the existing order. Omission/empty legacy snapshots retain existing ordering."
+      },
+      "FollowWait": {
+        "type": "object",
+        "properties": {
+          "not_before": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Actual local gate deadline recorded by the provider adapter; no promise of upstream recovery."
+          },
+          "reason": {
+            "type": "string",
+            "enum": [
+              "provider_cooldown"
+            ]
+          },
+          "recorded_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Finished run recording time, not an upstream event timestamp."
+          },
+          "server_time": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Current local response clock for browser alignment."
+          }
+        },
+        "required": [
+          "not_before",
+          "reason",
+          "recorded_at",
+          "server_time"
+        ],
+        "additionalProperties": false
+      },
+      "FollowWaitSummaryExtension": {
+        "type": "object",
+        "description": "Additive fields of existing Follow list/detail/run summaries. Current wait matches authorized LastRunID/owner/subscription/revision/lifecycle/error; history retains its own recorded bound. Missing timing is omitted. Rendering never calls a provider or changes next_run_at. See follow-wait-and-preference.md.",
+        "properties": {
+          "wait": {
+            "$ref": "#/components/schemas/FollowWait"
+          }
+        }
       }
     },
     "parameters": {
