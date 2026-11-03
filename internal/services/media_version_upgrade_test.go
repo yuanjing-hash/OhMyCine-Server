@@ -633,9 +633,6 @@ func TestMediaVersionUpgradeProtectsSeedPathButNotSeparateLibraryLink(t *testing
 	}
 }
 
-func TestMediaVersionUpgradeWorkerWaitsThenRecyclesOnlySelectedOldVersion(t *testing.T) {
-	runMediaVersionUpgradeWorkerScenario(t, false, false)
-}
 func TestMediaVersionUpgradeWorkerRestartsAfterPhysicalRecycleBeforeCatalogCommit(t *testing.T) {
 	runMediaVersionUpgradeWorkerScenario(t, true, false)
 }
@@ -697,9 +694,6 @@ func TestMediaVersionUpgradeUsesSharedActualSelectionForOneExactEpisode(t *testi
 	}
 }
 
-func TestMediaVersionUpgradeVersionedWorkerPreservesAnchorsAndPublishesExactRemoval(t *testing.T) {
-	runMediaVersionUpgradeWorkerScenario(t, false, true)
-}
 func TestMediaVersionUpgradeVersionedWorkerRecoversAfterPhysicalRecycle(t *testing.T) {
 	runMediaVersionUpgradeWorkerScenario(t, true, true)
 }

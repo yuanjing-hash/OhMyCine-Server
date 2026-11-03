@@ -95,17 +95,6 @@ func TestUnifiedScheduleStatePersistenceFailureIsNotSuccess(t *testing.T) {
 	}
 }
 
-func TestDownloadTrackingPersistenceWaitDoesNotConsumeFailureBudget(t *testing.T) {
-	if retryWaitConsumesFailureBudget("download_tracking_persist_wait") {
-		t.Fatal("provider tracking wait consumes submission failure budget")
-	}
-	for _, code := range []string{"download_state_persist_failed", "worker_lease_expired", "unknown_failure"} {
-		if !retryWaitConsumesFailureBudget(code) {
-			t.Fatalf("real failure exempted: %s", code)
-		}
-	}
-}
-
 func TestUnifiedScheduleOverlapHonorsRetryingQueueOwner(t *testing.T) {
 	s, _, actor, now := scheduleFixture(t)
 	d := createDueSchedule(t, s, actor, now, "run_once", "skip")

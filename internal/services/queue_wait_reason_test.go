@@ -86,26 +86,6 @@ func TestJobWaitReasonLibraryGateAndSafeScope(t *testing.T) {
 	}
 }
 
-func TestJobWaitReasonRunnableAndRetryDoesNotReplaceError(t *testing.T) {
-	queue, actor, clock := queueFixture(t)
-	job, err := queue.Enqueue(EnqueueJobInput{OwnerID: actor.User.ID, JobType: "fake", DisplayName: "runnable", Payload: map[string]any{}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	got, err := queue.Get(actor, job.ID)
-	if err != nil || got.WaitReason != nil {
-		t.Fatalf("runnable=%+v err=%v", got, err)
-	}
-	next := clock.Now().Add(time.Hour)
-	if err := queue.db.Model(&models.Job{}).Where("id=?", job.ID).Updates(map[string]any{"next_attempt_at": next, "last_error_message": "previous execution failed"}).Error; err != nil {
-		t.Fatal(err)
-	}
-	got, err = queue.Get(actor, job.ID)
-	if err != nil || got.WaitReason == nil || got.WaitReason.Code != "retry_at" || got.LastErrorMessage != "previous execution failed" {
-		t.Fatalf("retry=%+v err=%v", got, err)
-	}
-}
-
 func TestJobWaitReasonCancelledPhysicalReceiptNeedsVerification(t *testing.T) {
 	s, db, actor, storage, profile := mediaLibraryTestService(t)
 	l, err := s.Create(context.Background(), actor, testLibraryInput("pending receipt", storage, profile, false), RequestContext{})

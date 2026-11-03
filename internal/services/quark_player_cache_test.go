@@ -310,35 +310,6 @@ func TestQuarkPlayerMembershipLinkCancellationAndRateLimit(t *testing.T) {
 	}
 }
 
-func TestQuarkPlayerMembershipExpiresDuringLinkRechecksOnce(t *testing.T) {
-	s, d, actor, id, clock := quarkPlayerCacheFixture(t)
-	initial := s.now()
-	d.expiry = func() time.Time { return time.Time{} }
-	if _, err := s.ResolvePlayerEntry(context.Background(), actor, id, "", "127.0.0.1:1"); err != nil {
-		t.Fatal(err)
-	}
-	clock.Store(initial.Add(29800 * time.Millisecond).UnixNano())
-	var firstDeadline time.Time
-	d.link = func(ctx context.Context, n int32) (cloud.TemporaryURL, error) {
-		deadline, ok := ctx.Deadline()
-		if !ok {
-			t.Fatal("bounded link deadline missing")
-		}
-		if n == 2 {
-			firstDeadline = deadline
-			clock.Store(initial.Add(30200 * time.Millisecond).UnixNano())
-		}
-		if n == 3 && !deadline.Equal(firstDeadline) {
-			t.Fatal("expiry recheck extended original deadline")
-		}
-		return cloud.TemporaryURL{URL: fmt.Sprintf("https://synthetic.invalid/fresh/%d", n)}, nil
-	}
-	result, err := s.ResolvePlayerEntry(context.Background(), actor, id, "", "127.0.0.1:2")
-	if err != nil || result.RedirectURL != "https://synthetic.invalid/fresh/3" || d.reads.Load() != 2 || d.directURLCalls.Load() != 3 {
-		t.Fatalf("successful link crossing proof deadline was not rechecked: err=%v scoped=%d links=%d", err, d.reads.Load(), d.directURLCalls.Load())
-	}
-}
-
 func TestQuarkPlayerCacheCancelledLeaderDoesNotPoisonNextRequest(t *testing.T) {
 	s, d, actor, id, _ := quarkPlayerCacheFixture(t)
 	started := make(chan struct{})

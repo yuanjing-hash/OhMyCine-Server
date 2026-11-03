@@ -38,7 +38,7 @@ func analysisEntries(paths ...string) []SiteSharePreviewEntry {
 func TestShareAnalysisUsesActualSparseFilesAndSharedFollowSelection(t *testing.T) {
 	s := NewSiteService(nil, nil, nil, nil, zerolog.Nop())
 	claim := siteResultClaim{Title: "🎬 Incorrect Work (2026) S02E01-E99", SearchIdentity: analysisIdentity()}
-	entries := analysisEntries("Fixture Show(81)/11.mkv", "Fixture Show(81)/13.mkv", "Fixture Show(81)/14.mp4", "Fixture Show(81)/14.mkv", "Fixture Show(81)/11.zh.srt", "Fixture Show(81)/2026.S01E01.2160p.zip", "Fixture Show(81)/sample.mkv", "Fixture Show(81)/16.mkv")
+	entries := analysisEntries("Fixture Show(81)/11.mkv", "Fixture Show(81)/13.mkv", "Fixture Show(81)/14..mp4", "Fixture Show(81)/14.mkv", "Fixture Show(81)/11.zh.srt", "Fixture Show(81)/2026.S01E01.2160p.zip", "Fixture Show(81)/sample.mkv", "Fixture Show(81)/16.mkv")
 	analysis, files := s.analyzeShareEntries(context.Background(), Actor{}, claim, entries)
 	if !analysis.Complete || analysis.VideoCount != 5 || analysis.IgnoredCount != 3 || analysis.UnresolvedCount != 0 || len(analysis.Groups) != 1 || !reflect.DeepEqual(analysis.Groups[0].Episodes, []int{11, 13, 14, 16}) || analysis.Groups[0].Season == nil || *analysis.Groups[0].Season != 1 {
 		t.Fatalf("analysis=%+v groups=%+v", analysis, analysis.Groups)
@@ -53,9 +53,9 @@ func TestShareAnalysisUsesActualSparseFilesAndSharedFollowSelection(t *testing.T
 func TestShareAnalysisKeepsMixedWorksSeasonsAndUnresolvedLeavesSeparate(t *testing.T) {
 	s := NewSiteService(nil, nil, nil, nil, zerolog.Nop())
 	claim := siteResultClaim{Title: "Fixture Show S01E01-E99", SearchIdentity: analysisIdentity()}
-	entries := analysisEntries("Fixture Show/S01/11.mkv", "Fixture Show/S02/12.mkv", "Other Work/S01/13.mkv", "14.mkv", "Fixture Show(81)/2026.mkv", "Fixture Show/S02/Fixture.Show.S01E15.mkv", "Fixture Show/Other.Work.S01E16.mkv", "Fixture Show/S01/1080.mkv", "Fixture Show/S01/0.mkv", "Fixture Show/S01/201.mkv")
+	entries := analysisEntries("Fixture Show/S01/11.mkv", "Fixture Show/S02/12.mkv", "Other Work/S01/13.mkv", "14.mkv", "Fixture Show(81)/2026.mkv", "Fixture Show/S02/Fixture.Show.S01E15.mkv", "Fixture Show/Other.Work.S01E16.mkv", "Fixture Show/S01/1080.mkv", "Fixture Show/S01/0.mkv", "Fixture Show/S01/201.mkv", "Fixture Show/S01/14.5.mkv")
 	analysis, files := s.analyzeShareEntries(context.Background(), Actor{}, claim, entries)
-	if len(analysis.Groups) != 3 || analysis.UnresolvedCount != 8 {
+	if len(analysis.Groups) != 3 || analysis.UnresolvedCount != 9 {
 		t.Fatalf("analysis=%+v groups=%+v files=%+v", analysis, analysis.Groups, files)
 	}
 	_, episodes := selectAnalyzedFollowFiles(SiteSharePreviewSummary{Entries: entries, ShareAnalysis: analysis}, files, claim.SearchIdentity, 1, []int{11, 12, 13, 14, 15, 16})

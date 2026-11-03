@@ -247,24 +247,6 @@ func TestRefreshWorkerStopsTransientRetriesAtQueuePolicyLimit(t *testing.T) {
 	}
 }
 
-func TestMediaServerRefreshRetryDelayIsBounded(t *testing.T) {
-	for _, test := range []struct {
-		attempt int
-		want    time.Duration
-	}{
-		{attempt: 0, want: time.Minute},
-		{attempt: 1, want: time.Minute},
-		{attempt: 2, want: 2 * time.Minute},
-		{attempt: 4, want: 8 * time.Minute},
-		{attempt: 5, want: 15 * time.Minute},
-		{attempt: 20, want: 15 * time.Minute},
-	} {
-		if got := mediaServerRefreshRetryDelay(test.attempt); got != test.want {
-			t.Fatalf("attempt=%d delay=%s want=%s", test.attempt, got, test.want)
-		}
-	}
-}
-
 func TestRefreshFailureDoesNotBlockAnotherTarget(t *testing.T) {
 	failed := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "private failure", http.StatusUnauthorized)

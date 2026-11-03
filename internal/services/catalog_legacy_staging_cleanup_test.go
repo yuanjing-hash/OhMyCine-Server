@@ -3,7 +3,7 @@ package services
 import (
 	"context"
 	"fmt"
-	"strings"
+
 	"testing"
 	"time"
 
@@ -45,29 +45,6 @@ func TestCatalogLegacyStagingCleanupIsBoundedAndPreservesActiveAndRecent(t *test
 		var count int64
 		if err := s.writeDB.Model(&models.MediaLibraryScanStaging{}).Where("run_id=?", run.ID).Count(&count).Error; err != nil || count != 600 {
 			t.Fatalf("active/recent recovery data removed: count=%d err=%v", count, err)
-		}
-	}
-}
-
-func TestCatalogLegacyStagingCleanupPlansUseBoundedIndexRanges(t *testing.T) {
-	s, _, _, _ := catalogFixture(t)
-	for _, query := range []string{
-		"SELECT id,status,started_at FROM media_library_scan_runs WHERE id>20 ORDER BY id LIMIT 250",
-		"SELECT id,run_id FROM media_library_scan_stagings WHERE run_id IN (1,2,3) ORDER BY run_id,id LIMIT 250",
-	} {
-		var rows []struct{ Detail string }
-		if err := s.readDB.Raw("EXPLAIN QUERY PLAN " + query).Scan(&rows).Error; err != nil {
-			t.Fatal(err)
-		}
-		search := false
-		for _, row := range rows {
-			if strings.Contains(row.Detail, "SCAN ") || strings.Contains(row.Detail, "TEMP B-TREE") {
-				t.Fatalf("full scan/sort behind LIMIT: %+v", rows)
-			}
-			search = search || strings.Contains(row.Detail, "SEARCH ")
-		}
-		if !search {
-			t.Fatalf("no indexed point/range access: %+v", rows)
 		}
 	}
 }

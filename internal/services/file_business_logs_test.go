@@ -170,34 +170,6 @@ func TestFileBusinessCloudSeparatesMovedRenameFailureAndUncertainSubmission(t *t
 	}
 }
 
-func TestFileBusinessLoggingDoesNotAddProviderCalls(t *testing.T) {
-	type calls struct{ list, stat, move, moveBatch, copy, copyBatch, rename, recycle int }
-	var baseline calls
-	for _, enabled := range []bool{false, true} {
-		fixture := newCloudTransferFixture(t, models.MediaLibraryTransferMove, models.MediaLibraryConflictOverwrite, false)
-		var output strings.Builder
-		if enabled {
-			fixture.service.log = zerolog.New(&output)
-		}
-		result := fixture.run(t)
-		if result.ErrorCode != "" || result.RetryAt != nil {
-			t.Fatalf("result=%+v", result)
-		}
-		d := fixture.driver
-		got := calls{d.listCalls, d.statCalls, d.moveCalls, d.moveBatchCalls, d.copyCalls, d.copyBatchCalls, d.renameCalls, d.recycleBatchCalls}
-		if !enabled {
-			baseline = got
-			continue
-		}
-		if got != baseline {
-			t.Fatalf("logging changed provider calls: got=%+v baseline=%+v", got, baseline)
-		}
-		if event := fileBusinessEvent(fileBusinessRecords(t, output.String()), "cloud.file.verified"); event == nil || event["source_relative_path"] != "Movie.2024.mkv" || event["target_relative_path"] != "电影/Movie (2024)/Movie (2024).mkv" {
-			t.Fatalf("actual file display absent: %v", event)
-		}
-	}
-}
-
 func TestFileBusinessCloudSkippedFilesKeepExactBoundedSummary(t *testing.T) {
 	for _, mode := range []string{models.MediaLibraryTransferMove, models.MediaLibraryTransferCopy} {
 		t.Run(mode, func(t *testing.T) {

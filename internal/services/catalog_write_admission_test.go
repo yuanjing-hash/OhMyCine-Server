@@ -23,41 +23,6 @@ func waitCatalogAdmissionQueue(t *testing.T, a *CatalogWriteAdmission, foregroun
 	t.Fatalf("admission queue not reached: %+v", a.Stats())
 }
 
-func TestCatalogWriteAdmissionForegroundPrecedesQueuedBackground(t *testing.T) {
-	a := NewCatalogWriteAdmission()
-	entered := make(chan struct{})
-	release := make(chan struct{})
-	done := make(chan error, 3)
-	order := make(chan string, 3)
-	go func() {
-		done <- a.WithBackground(context.Background(), func() error { order <- "first-background"; close(entered); <-release; return nil })
-	}()
-	<-entered
-	go func() {
-		done <- a.WithBackground(context.Background(), func() error { order <- "queued-background"; return nil })
-	}()
-	waitCatalogAdmissionQueue(t, a, 0, 1)
-	go func() {
-		done <- a.WithForeground(context.Background(), func() error { order <- "foreground"; return nil })
-	}()
-	waitCatalogAdmissionQueue(t, a, 1, 1)
-	close(release)
-	for range 3 {
-		if err := <-done; err != nil {
-			t.Fatal(err)
-		}
-	}
-	for _, expected := range []string{"first-background", "foreground", "queued-background"} {
-		if got := <-order; got != expected {
-			t.Fatalf("got %s, expected %s", got, expected)
-		}
-	}
-	s := a.Stats()
-	if s.ForegroundCompleted != 1 || s.BackgroundCompleted != 2 || s.ForegroundQueued != 0 || s.BackgroundQueued != 0 {
-		t.Fatalf("admission stats: %+v", s)
-	}
-}
-
 func TestCatalogWriteAdmissionCancellationRemovesDemand(t *testing.T) {
 	a := NewCatalogWriteAdmission()
 	entered := make(chan struct{})

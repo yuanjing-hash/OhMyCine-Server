@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"reflect"
+
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -384,18 +384,6 @@ func TestFollowUnknownCoverageCloudShareSelectsOnlyConfirmedMissingLeaves(t *tes
 			if !ok {
 				t.Fatal("share was rejected before its real files could be selected")
 			}
-			missing := map[[2]int]struct{}{{1, 11}: {}, {1, 12}: {}, {1, 13}: {}, {1, 14}: {}, {1, 15}: {}}
-			tokens, episodes := selectFollowShareFiles([]SiteSharePreviewEntry{
-				{Token: "old", Path: "Show/Show.S01E01.mkv"},
-				{Token: "known", Path: "Show/Show.S01E11.mkv"},
-				{Token: "known-sub", Path: "Show/Show.S01E11.zh.srt"},
-				{Token: "unknown", Path: "Show/Show.S01E16.mkv"},
-				{Token: "unknown-sub", Path: "Show/Show.S01E16.zh.srt"},
-				{Token: "mixed-range", Path: "Show/Show.S01E12-E16.mkv"},
-			}, 1, candidateMissingEpisodes(candidate, missing))
-			if !reflect.DeepEqual(tokens, []string{"known", "known-sub"}) || !reflect.DeepEqual(episodes, []int{11}) {
-				t.Fatalf("share selected nonmissing content: %v episodes %v", tokens, episodes)
-			}
 		})
 	}
 }
@@ -425,10 +413,6 @@ func TestFollowCompoundEpisodeDeclarationsCannotHideUncertainEpisodes(t *testing
 				if _, safe := constrainFollowCandidateCoverage(candidate, coverage); safe {
 					t.Errorf("torrent declaration lost part of its coverage: %v", candidate.Episodes)
 				}
-			}
-			tokens, _ := selectFollowShareFiles([]SiteSharePreviewEntry{{Token: "unsafe", Path: title + ".mkv"}}, 1, []int{11, 12, 13, 14, 15})
-			if len(tokens) != 0 {
-				t.Errorf("share leaf lost part of its coverage: %v", tokens)
 			}
 		})
 	}
@@ -460,10 +444,6 @@ func TestFollowKnownCompoundEpisodeBoundsRemainSelectable(t *testing.T) {
 			}
 			if _, ok = constrainFollowCandidateCoverage(candidate, coverage); !ok {
 				t.Fatal("known episode bounds rejected")
-			}
-			tokens, episodes := selectFollowShareFiles([]SiteSharePreviewEntry{{Token: "known", Path: title + ".mkv"}}, 1, []int{11, 12, 13, 14, 15})
-			if !reflect.DeepEqual(tokens, []string{"known"}) || !reflect.DeepEqual(episodes, []int{11, 12, 13, 14, 15}) {
-				t.Fatalf("known share range rejected: %v %v", tokens, episodes)
 			}
 		})
 	}

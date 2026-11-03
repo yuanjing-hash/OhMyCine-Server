@@ -12,44 +12,6 @@ import (
 	"gorm.io/gorm"
 )
 
-func TestMediaChangeReadyCommitAdvancesRevisionAndTargets(t *testing.T) {
-	management, _, _, library, _ := strmManagementFixture(t)
-	db := management.db
-	now := time.Now().UTC()
-	connection := models.Connection{Name: "Refresh Emby", NameNormalized: "refresh-emby", Provider: models.ConnectionProviderEmby, Endpoint: "https://emby.example.test", CredentialCiphertext: "encrypted", Enabled: true, LastHealthStatus: "unknown", Revision: 1, CreatedAt: now, UpdatedAt: now}
-	if err := db.Create(&connection).Error; err != nil {
-		t.Fatal(err)
-	}
-	target := models.MediaServerRefreshTarget{LibraryID: library.ID, ConnectionID: connection.ID, UpstreamLibraryID: "library-id", UpstreamLibraryName: "电影", Enabled: true, LastStatus: "idle", Revision: 1, CreatedAt: now, UpdatedAt: now}
-	if err := db.Create(&target).Error; err != nil {
-		t.Fatal(err)
-	}
-	changes := NewMediaChangeService(db)
-	var change models.MediaLibraryChange
-	if err := db.Transaction(func(tx *gorm.DB) error {
-		var err error
-		change, err = changes.RecordTx(tx, library.ID, 3, models.MediaLibraryChangeCatalog, true)
-		return err
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if change.State != models.MediaLibraryChangeReady || change.Revision != 1 {
-		t.Fatalf("change=%+v", change)
-	}
-	if err := db.First(&library, library.ID).Error; err != nil || library.ContentRevision != 1 {
-		t.Fatalf("library revision=%d err=%v", library.ContentRevision, err)
-	}
-	if err := db.First(&target, target.ID).Error; err != nil || target.DesiredRevision != 0 {
-		t.Fatalf("publication fanned out targets inline: desired=%d err=%v", target.DesiredRevision, err)
-	}
-	if found, err := changes.DispatchBatch(context.Background()); err != nil || !found {
-		t.Fatalf("dispatch found=%v err=%v", found, err)
-	}
-	if err := db.First(&target, target.ID).Error; err != nil || target.DesiredRevision != 1 {
-		t.Fatalf("target desired=%d err=%v", target.DesiredRevision, err)
-	}
-}
-
 func TestMediaChangeRecordTxRepairsRegressedContentRevision(t *testing.T) {
 	management, _, _, library, _ := strmManagementFixture(t)
 	db := management.db

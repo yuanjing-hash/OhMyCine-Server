@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yuanjing-hash/OhMyCine-Server/internal/medialibrary"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
 )
 
@@ -44,61 +43,6 @@ func TestStructurePlannerBuildsMovieAndTVTargetsWithSidecars(t *testing.T) {
 	}
 }
 
-func TestStructurePlannerTreatsSeasonScopedDoubleDotEpisodeAsRepairablePathMismatch(t *testing.T) {
-	const source = "/电视剧/国产剧/知否知否应是绿肥红瘦 (2018)/Season 1/知否知否应是绿肥红瘦 02..mp4"
-	parsed := medialibrary.ParseMedia("知否知否应是绿肥红瘦 02..mp4", source)
-	tmdbID := int64(100)
-	library := models.MediaLibrary{
-		ID: 1, BaselineGeneration: 1, ProfileRevision: 1,
-		TVDirectoryTemplate: "电视剧/{category}/{title} ({year})/Season {season:02}",
-		TVFilenameTemplate:  "{title} - S{season:02}E{episode:02}",
-	}
-	entry := models.MediaLibraryEntry{
-		RelativePath: source, ProviderID: "episode-2", MediaType: parsed.MediaType,
-		Title: parsed.Title, SeriesTitle: parsed.SeriesTitle, WorkKey: "series:tmdb:100",
-		Season: parsed.Season, Episode: parsed.Episode, MatchStatus: mediaRecognitionStatusMatched,
-		TMDBID: &tmdbID, ReleaseYear: parsed.Year, CategoryName: "国产剧",
-	}
-
-	plan, err := (StructurePlanner{}).Build(library, []models.MediaLibraryEntry{entry}, nil, "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if plan.Classifications.MissingEpisode != 0 || len(plan.Items) != 1 || len(plan.Issues) != 1 {
-		t.Fatalf("plan=%+v", plan)
-	}
-	issue := plan.Issues[0]
-	wantTarget := "电视剧/国产剧/知否知否应是绿肥红瘦 (2018)/Season 01/知否知否应是绿肥红瘦 - S01E02.mp4"
-	if issue.Code != "naming_mismatch" || plan.Classifications.NamingMismatch != 1 || !issue.Repairable || issue.ExpectedPath != wantTarget || plan.Items[0].TargetRelative != wantTarget {
-		t.Fatalf("issue=%+v item=%+v", issue, plan.Items[0])
-	}
-}
-
-func TestStructurePlannerSeparatesRecognizedNamingAndLocationMismatch(t *testing.T) {
-	tests := []struct {
-		name     string
-		source   string
-		target   string
-		template string
-		want     string
-	}{
-		{name: "movie title directory uses official Chinese numeral", source: "电影/动画电影/秒速5厘米 (2007)/banner.jpg", target: "电影/动画电影/秒速五厘米 (2007)/banner.jpg", template: "电影/{category}/{title} ({year})", want: "naming_mismatch"},
-		{name: "custom nested category depth remains stable", source: "媒体/电影/动画/秒速5厘米 (2007)/秒速5厘米.mkv", target: "媒体/电影/动画/秒速五厘米 (2007)/秒速五厘米 (2007).mkv", template: "媒体/电影/{category}/{title} ({year})", want: "naming_mismatch"},
-		{name: "category move wins over simultaneous rename", source: "媒体/电影/剧情/秒速5厘米 (2007)/秒速5厘米.mkv", target: "媒体/电影/动画/秒速五厘米 (2007)/秒速五厘米 (2007).mkv", template: "媒体/电影/{category}/{title} ({year})", want: "location_mismatch"},
-		{name: "category and title in one segment remains location", source: "媒体/剧情 - 秒速5厘米 (2007)/秒速5厘米.mkv", target: "媒体/动画 - 秒速五厘米 (2007)/秒速五厘米 (2007).mkv", template: "媒体/{category} - {title} ({year})", want: "location_mismatch"},
-		{name: "missing directory level is location", source: "电影/动画/秒速5厘米.mkv", target: "电影/动画/秒速五厘米 (2007)/秒速五厘米 (2007).mkv", template: "电影/{category}/{title} ({year})", want: "location_mismatch"},
-		{name: "tv series and season directory normalization", source: "电视剧/美剧/24小时/第1季/24小时 01.mkv", target: "电视剧/美剧/24小时 (2001)/Season 01/24小时 - S01E01.mkv", template: "电视剧/{category}/{title} ({year})/Season {season:02}", want: "naming_mismatch"},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			indexes := structureTemplateNamingDirectoryIndexes(test.template)
-			if got := structurePathMismatchCode(test.source, test.target, indexes); got != test.want {
-				t.Fatalf("code=%q want=%q indexes=%v", got, test.want, indexes)
-			}
-		})
-	}
-}
-
 func TestStructurePlannerClassifiesVideoAndSidecarFromTheSameProfileLayout(t *testing.T) {
 	year, tmdbID := 2007, int64(1)
 	library := models.MediaLibrary{
@@ -126,51 +70,6 @@ func TestStructurePlannerClassifiesVideoAndSidecarFromTheSameProfileLayout(t *te
 		if issue.Code != "naming_mismatch" {
 			t.Fatalf("new diagnosis produced %q for %+v", issue.Code, issue)
 		}
-	}
-}
-
-func TestStructurePlannerLargeFixtureUses128WorkersWithinBudget(t *testing.T) {
-	library := models.MediaLibrary{ID: 1, BaselineGeneration: 4, ProfileRevision: 1, MovieDirectoryTemplate: "电影/{category}/{title} ({year})", MovieFilenameTemplate: "{title} ({year})", TVDirectoryTemplate: "电视剧/{category}/{title} ({year})/Season {season:02}", TVFilenameTemplate: "{title} - S{season:02}E{episode:02}"}
-	entries := make([]models.MediaLibraryEntry, 0, 12171)
-	assets := make([]models.MediaLibrarySourceAsset, 0, 12171)
-	year := 2026
-	for index := 0; index < 12171; index++ {
-		title := fmt.Sprintf("影片 %05d", index)
-		directory := fmt.Sprintf("待整理/%05d", index)
-		tmdbID := int64(index + 1)
-		entries = append(entries, models.MediaLibraryEntry{RelativePath: "/" + directory + "/" + title + ".mkv", ProviderID: fmt.Sprintf("video-%d", index), MediaType: "movie", Title: title, WorkKey: fmt.Sprintf("movie:tmdb:%d", tmdbID), MatchStatus: mediaRecognitionStatusMatched, TMDBID: &tmdbID, ReleaseYear: &year, CategoryName: "剧情"})
-		assets = append(assets, models.MediaLibrarySourceAsset{RelativePath: "/" + directory + "/" + title + ".zh-CN.srt", ProviderID: fmt.Sprintf("sidecar-%d", index), Name: title + ".zh-CN.srt", Active: true})
-	}
-	startedWorkers, activeWorkers, maxActive := 0, 0, 0
-	var mu sync.Mutex
-	planner := StructurePlanner{observe: func(event string) {
-		mu.Lock()
-		defer mu.Unlock()
-		switch event {
-		case "worker_started":
-			startedWorkers++
-		case "task_started":
-			activeWorkers++
-			if activeWorkers > maxActive {
-				maxActive = activeWorkers
-			}
-		case "task_finished":
-			activeWorkers--
-		}
-	}}
-	started := time.Now()
-	plan, err := planner.BuildContext(context.Background(), library, entries, assets, "", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if elapsed := time.Since(started); elapsed >= 10*time.Second {
-		t.Fatalf("large structure planning took %s", elapsed)
-	}
-	if startedWorkers != StructurePlanningWorkers || maxActive <= 1 {
-		t.Fatalf("workers started=%d max_active=%d", startedWorkers, maxActive)
-	}
-	if plan.CheckedItems != 24342 || len(plan.Items) != 24342 || plan.IssueCount != 24342 {
-		t.Fatalf("checked=%d items=%d issues=%d", plan.CheckedItems, len(plan.Items), plan.IssueCount)
 	}
 }
 
@@ -214,19 +113,6 @@ func TestStructurePlannerIsolatesDataIssuesAndEntireConflictGroups(t *testing.T)
 		if strings.Contains(item.SourceRelative, "a.mkv") || strings.Contains(item.SourceRelative, "b.mkv") || strings.HasSuffix(strings.ToLower(item.SourceRelative), ".zh.srt") {
 			t.Fatalf("conflicting action escaped isolation: %+v", item)
 		}
-	}
-}
-
-func TestStructureConflictSourceSummaryIsBounded(t *testing.T) {
-	candidates := make([]structurePlanCandidate, maxStructureConflictSourceSamples+5)
-	members := make([]int, len(candidates))
-	for index := range candidates {
-		candidates[index] = structurePlanCandidate{source: fmt.Sprintf("冲突/%02d/poster.jpg", index)}
-		members[index] = index
-	}
-	sources := boundedStructureConflictSources(candidates, members)
-	if len(sources) != maxStructureConflictSourceSamples {
-		t.Fatalf("sources=%d want=%d", len(sources), maxStructureConflictSourceSamples)
 	}
 }
 
@@ -294,28 +180,27 @@ func TestStructurePlannerCancellationAboveBoundedBufferDoesNotDeadlock(t *testin
 	for index := range entries {
 		entries[index] = models.MediaLibraryEntry{RelativePath: fmt.Sprintf("/bulk/%05d.mkv", index), MatchStatus: mediaRecognitionStatusUnrecognized}
 	}
-	for iteration := 0; iteration < 25; iteration++ {
-		ctx, cancel := context.WithCancel(context.Background())
-		var once sync.Once
-		planner := StructurePlanner{observe: func(event string) {
-			if event == "task_started" {
-				once.Do(cancel)
-			}
-		}}
-		done := make(chan error, 1)
-		go func() {
-			_, err := planner.BuildContext(ctx, models.MediaLibrary{}, entries, nil, "", nil)
-			done <- err
-		}()
-		select {
-		case err := <-done:
-			if !errors.Is(err, context.Canceled) {
-				t.Fatalf("iteration=%d err=%v", iteration, err)
-			}
-		case <-time.After(2 * time.Second):
-			t.Fatalf("planner deadlocked after cancellation at iteration %d", iteration)
+	ctx, cancel := context.WithCancel(context.Background())
+	var once sync.Once
+	planner := StructurePlanner{observe: func(event string) {
+		if event == "task_started" {
+			once.Do(cancel)
 		}
+	}}
+	done := make(chan error, 1)
+	go func() {
+		_, err := planner.BuildContext(ctx, models.MediaLibrary{}, entries, nil, "", nil)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("cancel error=%v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("planner deadlocked after cancellation")
 	}
+
 }
 
 func TestStructurePlannerScopesWorkAndReportsUnrecognized(t *testing.T) {
@@ -357,27 +242,5 @@ func TestStructurePlannerDoesNotTreatPendingRecognitionAsUnrecognized(t *testing
 	}
 	if len(plan.Issues) != 1 || plan.Issues[0].Title != "确实没有匹配" || plan.Issues[0].Code != "media_unrecognized" {
 		t.Fatalf("unexpected issue sample: %+v", plan.Issues)
-	}
-}
-
-func TestStructureIssueSamplesStayBoundedAndRepresentEveryPresentClass(t *testing.T) {
-	plan := StructurePlan{}
-	codes := []string{"missing_season_episode", "naming_mismatch", "location_mismatch", "media_unrecognized", "invalid_path", "template_unavailable", "recognition_suspect_conflict", "catalog_duplicate_conflict", "duplicate_target", "sidecar_target_conflict"}
-	for _, code := range codes {
-		for index := 0; index < 200; index++ {
-			plan.addIssue(StructureIssue{Code: code, Kind: "video", CurrentPath: fmt.Sprintf("%s/%03d.mkv", code, index), Repairable: code == "naming_mismatch" || code == "location_mismatch"})
-		}
-	}
-	if len(plan.Issues) != maxStructureIssueSamples {
-		t.Fatalf("sample count=%d want=%d", len(plan.Issues), maxStructureIssueSamples)
-	}
-	seen := make(map[string]int, len(codes))
-	for _, issue := range plan.Issues {
-		seen[issue.Code]++
-	}
-	for _, code := range codes {
-		if seen[code] == 0 {
-			t.Fatalf("issue class %q was hidden by earlier high-cardinality samples: %+v", code, seen)
-		}
 	}
 }

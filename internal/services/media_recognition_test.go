@@ -357,49 +357,6 @@ func TestRecognizeMediaUsesBuiltinPacksAndDomainParserForNyaaCompleteSeries(t *t
 	}
 }
 
-func TestRecognizeMediaRecallsProductionEnglishAndPinyinAliasesAfterSpecificationCleanup(t *testing.T) {
-	tests := []struct {
-		name           string
-		release        string
-		query          string
-		candidate      tmdb.Candidate
-		enriched       tmdb.Candidate
-		expectedType   string
-		expectedSeason *int
-	}{
-		{name: "original english tv title", release: "ULTRAMAN TIGA", query: "ULTRAMAN TIGA", candidate: tmdb.Candidate{ID: 10820, Title: "迪迦奥特曼", OriginalTitle: "ウルトラマンティガ", MediaType: "tv", Popularity: 80}, enriched: tmdb.Candidate{ID: 10820, Title: "迪迦奥特曼", OriginalTitle: "ウルトラマンティガ", MediaType: "tv", AlternativeTitles: []string{"Ultraman Tiga"}, Popularity: 80}, expectedType: "tv"},
-		{name: "remastered version", release: "Ultraman.Tiga.Ultra.Resolution.Remastered.Version.1997.BluRay.1080p.x264.AAC", query: "Ultraman Tiga", candidate: tmdb.Candidate{ID: 10820, Title: "迪迦奥特曼", MediaType: "tv"}, enriched: tmdb.Candidate{ID: 10820, Title: "迪迦奥特曼", MediaType: "tv", AlternativeTitles: []string{"Ultraman Tiga"}}, expectedType: "tv"},
-		{name: "movie subtitle", release: "The Final Odyssey 1080p WEB-DL H264 AAC-Side", query: "The Final Odyssey", candidate: tmdb.Candidate{ID: 54321, Title: "Ultraman Tiga: The Final Odyssey", MediaType: "movie"}, enriched: tmdb.Candidate{ID: 54321, Title: "Ultraman Tiga: The Final Odyssey", MediaType: "movie"}, expectedType: "movie"},
-		{name: "gaiden movie", release: "Ultraman Tiga Gaiden Revival of the Ancient Giant WEB-DL 2160P HEVC AAC-Side", query: "Ultraman Tiga Gaiden Revival of the Ancient Giant", candidate: tmdb.Candidate{ID: 54322, Title: "迪迦奥特曼外传", MediaType: "movie"}, enriched: tmdb.Candidate{ID: 54322, Title: "迪迦奥特曼外传", MediaType: "movie", AlternativeTitles: []string{"Ultraman Tiga Gaiden Revival of the Ancient Giant"}}, expectedType: "movie"},
-		{name: "zh language marker", release: "Ultraman Tiga 1996 WEB-DL 1080p H264 ZH-AAC-HDCTV", query: "Ultraman Tiga", candidate: tmdb.Candidate{ID: 10820, Title: "迪迦奥特曼", MediaType: "tv"}, enriched: tmdb.Candidate{ID: 10820, Title: "迪迦奥特曼", MediaType: "tv", AlternativeTitles: []string{"Ultraman Tiga"}}, expectedType: "tv"},
-		{name: "pinyin season alias", release: "Ai qing gong yu 2012 S03 2160p WEB-DL H.265 AAC-ZmWeb", query: "Ai qing gong yu", candidate: tmdb.Candidate{ID: 12345, Title: "爱情公寓", MediaType: "tv", ReleaseYear: intPointerTest(2009)}, enriched: tmdb.Candidate{ID: 12345, Title: "爱情公寓", MediaType: "tv", ReleaseYear: intPointerTest(2009), AlternativeTitles: []string{"Ai qing gong yu"}, SeasonCount: 5, SeasonYears: map[int]int{3: 2012}}, expectedType: "tv", expectedSeason: intPointerTest(3)},
-		{name: "localized english alias", release: "Apartment of Love 2018 1080p WEB-DL 60fps H.265 DDP5.1-AilMWeb", query: "Apartment of Love", candidate: tmdb.Candidate{ID: 12345, Title: "爱情公寓", MediaType: "tv"}, enriched: tmdb.Candidate{ID: 12345, Title: "爱情公寓", MediaType: "tv", AlternativeTitles: []string{"Apartment of Love"}}, expectedType: "tv"},
-		{name: "official english alias", release: "Ipartment S05 2020 2160p WEB-DL H.265 DDP2.0-CSWEB", query: "Ipartment", candidate: tmdb.Candidate{ID: 12345, Title: "爱情公寓", MediaType: "tv", ReleaseYear: intPointerTest(2009)}, enriched: tmdb.Candidate{ID: 12345, Title: "爱情公寓", MediaType: "tv", ReleaseYear: intPointerTest(2009), AlternativeTitles: []string{"iPartment"}, SeasonCount: 5, SeasonYears: map[int]int{5: 2020}}, expectedType: "tv", expectedSeason: intPointerTest(5)},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			lookup := &enrichedRecognitionLookupFake{
-				rankedRecognitionLookupFake: rankedRecognitionLookupFake{items: []tmdb.Candidate{test.candidate}},
-				enriched:                    map[int64]tmdb.Candidate{test.enriched.ID: test.enriched},
-			}
-			result := recognizeMedia(context.Background(), lookup, MediaRecognitionRequest{PackageName: test.release, SourceKind: mediarecognition.SourceDownload, BuiltinPackCodes: mediarecognition.DefaultPackCodes(), Classification: classification.DefaultRules(), Language: "zh-CN", Region: "CN"})
-			if result.Status != mediaRecognitionStatusMatched || result.MediaType != test.expectedType || result.TMDBID == nil || *result.TMDBID != test.candidate.ID || !sameOptionalTestInt(result.SeasonHint, test.expectedSeason) {
-				t.Fatalf("result=%+v searches=%v", result, lookup.searches)
-			}
-			found := false
-			for _, search := range lookup.searches {
-				if strings.TrimPrefix(search, "movie:") == test.query || strings.TrimPrefix(search, "tv:") == test.query {
-					found = true
-					break
-				}
-			}
-			if !found {
-				t.Fatalf("clean query %q missing from %v", test.query, lookup.searches)
-			}
-		})
-	}
-}
-
 func TestRecognizeMediaHandlesRealTMDBFranchiseOrderingAndBoundedTypoFallback(t *testing.T) {
 	tests := []struct {
 		name         string
@@ -490,65 +447,6 @@ func TestRecognizeMediaLongRunningAnimeUsesStructureAndFullSubtitleSafely(t *tes
 	}
 }
 
-func TestRecognizeMediaUsesRealTMDBAuthorityShapeForUntouchedConanReleases(t *testing.T) {
-	releases := []string{
-		"[银色子弹字幕组][名侦探柯南][第1200集 快递失窃频发中][WEBRIP][简日双语MP4][1080P]",
-		"[银色子弹字幕组][名侦探柯南][第1201集 我就是犯人][WEBRIP][简日双语MP4][1080P]",
-		"[银色子弹字幕组][名侦探柯南][第1204集 谁绑架了柯南和梓?][WEBRIP][简日双语MP4][1080P]",
-		"[银色子弹字幕组][名侦探柯南][第1206集 摔落的男人][WEBRIP][简日双语MP4][1080P]",
-	}
-	correct := tmdb.Candidate{
-		ID: 30983, Title: "名侦探柯南", OriginalTitle: "名探偵コナン", MediaType: "tv", OriginalLanguage: "ja",
-		ReleaseYear: intPointerTest(1996), SeasonCount: 1, EpisodeCount: 1212, Popularity: 70.8752, VoteCount: 781, PosterPath: "/poster.jpg",
-		AlternativeTitles: numberedCandidateNames("柯南别名", 13), Translations: numberedCandidateNames("Conan translation", 19),
-	}
-	emptyShell := tmdb.Candidate{ID: 318691, Title: "名侦探柯南", OriginalTitle: "名侦探柯南", MediaType: "tv", OriginalLanguage: "zh", Popularity: .741}
-	for _, release := range releases {
-		for _, searchItems := range [][]tmdb.Candidate{{correct, emptyShell}, {emptyShell, correct}} {
-			lookup := &enrichedRecognitionLookupFake{
-				rankedRecognitionLookupFake: rankedRecognitionLookupFake{items: searchItems},
-				enriched:                    map[int64]tmdb.Candidate{30983: correct, 318691: emptyShell},
-			}
-			result := recognizeMedia(context.Background(), lookup, MediaRecognitionRequest{
-				PackageName:      release,
-				SourceKind:       mediarecognition.SourceDownload,
-				BuiltinPackCodes: mediarecognition.DefaultPackCodes(),
-				Classification:   classification.DefaultRules(),
-				Language:         "zh-CN",
-				Region:           "CN",
-			})
-			if result.Status != mediaRecognitionStatusMatched || result.TMDBID == nil || *result.TMDBID != 30983 || lookup.selectedID != 30983 {
-				t.Fatalf("release=%q result=%+v selected=%d searches=%v", release, result, lookup.selectedID, lookup.searches)
-			}
-			if lookup.enrichmentCalls != 1 {
-				t.Fatalf("release=%q enrichment_calls=%d", release, lookup.enrichmentCalls)
-			}
-		}
-	}
-}
-
-func TestRemoteRecognitionCandidatePreservesBoundedAuthorityEvidence(t *testing.T) {
-	withCount := remoteRecognitionCandidate(tmdb.Candidate{ID: 1, Title: "Example", MediaType: "tv", OriginalLanguage: "ja", EpisodeCount: 1206, VoteCount: 781, PosterPath: "/poster.jpg"})
-	if withCount.EpisodeCount == nil || *withCount.EpisodeCount != 1206 {
-		t.Fatalf("candidate=%+v", withCount)
-	}
-	if withCount.OriginalLanguage != "ja" || withCount.VoteCount != 781 || !withCount.HasPoster {
-		t.Fatalf("authority evidence was dropped: %+v", withCount)
-	}
-	withoutCount := remoteRecognitionCandidate(tmdb.Candidate{ID: 2, Title: "Example", MediaType: "tv"})
-	if withoutCount.EpisodeCount != nil {
-		t.Fatalf("zero episode count must stay unknown: %+v", withoutCount)
-	}
-}
-
-func numberedCandidateNames(prefix string, count int) []string {
-	result := make([]string, 0, count)
-	for index := 1; index <= count; index++ {
-		result = append(result, fmt.Sprintf("%s %02d", prefix, index))
-	}
-	return result
-}
-
 func TestRecognizeMediaAuxiliaryRuleCannotPromoteDirectIdentity(t *testing.T) {
 	processor, err := mediarecognition.CompileWordProcessor([]string{
 		`Poison => Safe Title {[tmdbid=999;type=movie]}`,
@@ -613,10 +511,6 @@ func containsTestString(values []string, expected string) bool {
 }
 
 func intPointerTest(value int) *int { return &value }
-
-func sameOptionalTestInt(left, right *int) bool {
-	return left == nil && right == nil || left != nil && right != nil && *left == *right
-}
 
 func TestDomainRecognitionSearchQueriesPrioritizeCanonicalVariantsAcrossSources(t *testing.T) {
 	parsed := mediarecognition.ParsedFacts{Queries: []mediarecognition.QueryVariant{

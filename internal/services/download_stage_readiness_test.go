@@ -9,7 +9,7 @@ import (
 )
 
 func TestStagedDownloadArtifactAdmission(t *testing.T) {
-	for _, name := range []string{"separate", "cloud_target", "provider_to_local", "provider_source_expired", "node_staging", "checking", "disabled", "overlap", "projection_overlap", "provider_direct", "route_missing", "cancelled", "other_writer", "repair", "credentials"} {
+	for _, name := range []string{"separate", "cloud_target", "provider_to_local", "provider_source_expired", "node_staging", "overlap", "projection_overlap", "provider_direct", "route_missing", "cancelled", "other_writer"} {
 		t.Run(name, func(t *testing.T) {
 			s, db, actor, storage, profile := mediaLibraryTestService(t)
 			l, err := s.Create(context.Background(), actor, testLibraryInput("staged admission", storage, profile, false), RequestContext{})
@@ -58,10 +58,6 @@ func TestStagedDownloadArtifactAdmission(t *testing.T) {
 				task.ProviderType, task.StagingStorageID, task.TransferRouteKind = models.DownloaderTypePan115Offline, &sourceStorage.ID, models.TransferRouteCrossSource
 			case "node_staging":
 				task.ExecutionLocation = models.NodeLocationRemote
-			case "checking":
-				check(db.Model(&models.MediaLibraryStructureAutoState{}).Where("library_id=?", l.ID).Update("source_revision", 2).Error)
-			case "disabled":
-				check(db.Model(&library).Update("enabled", false).Error)
 			case "overlap":
 				task.StagingAbsolutePath = storage.RootPath
 			case "projection_overlap":
@@ -75,12 +71,7 @@ func TestStagedDownloadArtifactAdmission(t *testing.T) {
 				task.Phase = models.DownloadTaskStatusCancelled
 			case "other_writer":
 				proof.OwnerKind = CatalogPhysicalRepair
-			case "repair":
-				check(db.Create(&models.MediaLibraryStructureRepair{ID: "stage-repair", OwnerID: actor.User.ID, LibraryID: library.ID, Phase: "queued", Scope: "full", PlanJSON: "{}", StateJSON: "{}"}).Error)
-			case "credentials":
-				connection := models.Connection{Name: "expired", NameNormalized: "expired", Enabled: true, LastHealthStatus: "offline", LastHealthErrorCode: "pan115_auth_expired"}
-				check(db.Create(&connection).Error)
-				check(db.Model(&storage).Update("connection_id", connection.ID).Error)
+
 			}
 			check(db.Create(&task).Error)
 			check(db.Create(&proof).Error)

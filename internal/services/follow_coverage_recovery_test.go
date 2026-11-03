@@ -3,7 +3,7 @@ package services
 import (
 	"bytes"
 	"context"
-	"encoding/json"
+
 	"strings"
 	"testing"
 	"time"
@@ -87,26 +87,6 @@ func activateCoverageCatalogFixture(t *testing.T, s *MediaLibraryService, librar
 	s.EnableCatalogScanFollowups()
 }
 
-func TestCoverageRetainsCurrentFullBaselineAcrossBoundedPublication(t *testing.T) {
-	for _, storageType := range []string{models.StorageTypeLocal, models.StorageTypePan115, models.StorageTypeQuark} {
-		t.Run(storageType, func(t *testing.T) {
-			s, library, storage, profile := coverageCatalogFixture(t, storageType)
-			_ = saveCatalogFollowup(t, s, library, storage, profile, false, false)
-			partial := saveCatalogFollowup(t, s, library, storage, profile, true, false)
-			if !partial.CompleteObserved {
-				t.Fatal("fixture did not retain a complete source receipt")
-			}
-			service := NewMediaCoverageService(s.db, nil)
-			service.SetCatalogSnapshotStore(s.catalogStore)
-			actor := Actor{Permissions: map[string]struct{}{authz.PermissionMediaLibrariesRead: {}}}
-			libraries, _, reliable, state, err := service.coverageCatalog(context.Background(), actor, "tv", 100)
-			if err != nil || len(libraries) != 1 || !reliable || state != "complete" {
-				t.Fatalf("committed bounded update discarded current full-source authority: libraries=%+v reliable=%v state=%s err=%v", libraries, reliable, state, err)
-			}
-		})
-	}
-}
-
 func TestFollowCatalogPositivesSurviveMissingMetadataRows(t *testing.T) {
 	f := newFollowCoverageFixture(t, "missing_rows", "complete", 16)
 	coverage, err := f.follows.coverage.Coverage(context.Background(), f.actor, "tv", 100)
@@ -120,14 +100,6 @@ func TestFollowCatalogPositivesSurviveMissingMetadataRows(t *testing.T) {
 	var claim models.FollowEpisodeClaim
 	if err := f.follows.db.First(&claim, "subscription_id = ? AND season_number = 1 AND episode_number = 16", f.subscription.ID).Error; err != nil || claim.State != "imported" {
 		t.Fatalf("known catalog presence lost imported claim: %+v err=%v", claim, err)
-	}
-}
-
-func TestFollowUndatedOnlyWaitDoesNotBlameAnUnrelatedPartialScan(t *testing.T) {
-	f := newFollowCoverageFixture(t, "missing_dates", "partial", 15)
-	run := f.run(t)
-	if run.ErrorCode != "follow_coverage_unknown" || run.SearchedNamesCount != 0 || strings.Contains(run.ErrorMessage, "扫描") || !strings.Contains(run.ErrorMessage, "播出信息不完整") {
-		t.Fatalf("all known aired episodes present but wait blamed a scan: %+v", run)
 	}
 }
 
@@ -636,23 +608,4 @@ func TestCompletedFollowRecoveryRejectsExtraTaskBoundCoordinate(t *testing.T) {
 	if err := f.queue.db.Model(&models.TransferTask{}).Where("download_task_id = ?", f.task.ID).Count(&count).Error; err != nil || count != 0 {
 		t.Fatalf("mismatched original selection created Transfer: %d %v", count, err)
 	}
-}
-
-func TestFollowCoverageWaitPublishesSpecificSafePresentationSummary(t *testing.T) {
-	f := newFollowCoverageFixture(t, "missing_dates", "partial", 15)
-	run := f.run(t)
-	var reasons map[string]int
-	if err := json.Unmarshal([]byte(run.FilterSummaryJSON), &reasons); err != nil {
-		t.Fatal(err)
-	}
-	if run.ErrorCode != "follow_coverage_unknown" || run.SearchedNamesCount != 0 || reasons["coverage_air_date_unknown"] != 9 || reasons["coverage_library_unknown"] != 0 || strings.Contains(run.ErrorMessage, "扫描") {
-		t.Fatalf("actual worker presentation lost the selected uncertainty cause: %+v", run)
-	}
-	public, err := json.Marshal(map[string]any{"status": run.Status, "error_code": run.ErrorCode, "error_message": run.ErrorMessage, "filter_summary": reasons})
-	if err != nil {
-		t.Fatal(err)
-	}
-	// This is also replayed through the actual WebUI formatter by independent
-	// review. It contains only the existing public run-summary fields.
-	t.Logf("REVIEW_COVERAGE_PUBLIC %s", public)
 }

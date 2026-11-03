@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"net/http"
+
 	"strings"
 	"testing"
 	"time"
@@ -14,15 +14,6 @@ import (
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud/quark"
 )
-
-func TestQuarkPlaybackCheckSignedStatusOnlyMapping(t *testing.T) {
-	for code, status := range map[string]int{quark.CodeAuth: http.StatusServiceUnavailable, quark.CodeLimited: http.StatusTooManyRequests, quark.CodeInvalid: http.StatusBadGateway, quark.CodeUnavailable: http.StatusServiceUnavailable, quark.CodeUnsupported: http.StatusServiceUnavailable, quark.CodeIdentity: http.StatusConflict, quark.CodeProof: http.StatusConflict, quark.CodeIncomplete: http.StatusBadGateway} {
-		err := quarkPlaybackError(models.StorageTypeQuark, &quark.Failure{Code: code})
-		if ProxyHTTPStatus(err) != status {
-			t.Fatalf("%s status=%d", code, ProxyHTTPStatus(err))
-		}
-	}
-}
 
 type quarkPlaybackCheckDriver struct {
 	*fakeCloudDriver

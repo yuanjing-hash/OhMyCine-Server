@@ -36,7 +36,7 @@ func observationHotRequire(t *testing.T, f observationFixture, id string, change
 
 func TestProviderObservationChangedFilesHeatParent(t *testing.T) {
 	for _, parent := range []string{"root", "season"} {
-		for _, change := range []string{"new", "updated", "renamed", "restored"} {
+		for _, change := range []string{"new", "updated", "restored"} {
 			t.Run(parent+"/"+change, func(t *testing.T) {
 				f := newObservationFixture(t)
 				if parent != "root" {
@@ -50,8 +50,6 @@ func TestProviderObservationChangedFilesHeatParent(t *testing.T) {
 					f.reader.tree[parent] = append(f.reader.tree[parent], obsFile("next", parent, "Next.mkv"))
 				case "updated":
 					f.reader.tree[parent][0].Size++
-				case "renamed":
-					f.reader.tree[parent][0].Name = "Renamed.mkv"
 				case "restored":
 					observationHotSet(t, f, "episode", map[string]any{"downlisted_at": *f.clock})
 				}

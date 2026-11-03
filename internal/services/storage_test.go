@@ -37,6 +37,12 @@ func TestStorageUpdateRevalidatesAndProbesUnchangedRoot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := service.Create(actor, StorageInput{Name: "Media", Type: "local", RootPath: t.TempDir(), Enabled: true}, RequestContext{}); ErrorCode(err) != CodeStorageNameConflict {
+		t.Fatalf("duplicate name code=%q error=%v", ErrorCode(err), err)
+	}
+	if _, err := service.Create(actor, StorageInput{Name: "Other", Type: "local", RootPath: root, Enabled: true}, RequestContext{}); ErrorCode(err) != CodeStoragePathConflict {
+		t.Fatalf("duplicate root code=%q error=%v", ErrorCode(err), err)
+	}
 	if err := os.Remove(root); err != nil {
 		t.Fatal(err)
 	}
@@ -87,44 +93,5 @@ func TestStorageListReconcilesStalePan115CapabilitiesFromCurrentDriver(t *testin
 	}
 	if reconciled.Capabilities == stale.Capabilities || !strings.Contains(reconciled.Capabilities, `"native_offline_download":true`) {
 		t.Fatalf("stale capability snapshot was not materialized: %s", reconciled.Capabilities)
-	}
-}
-
-func TestStorageConstraintErrorMapsUniqueColumnsToStableCodes(t *testing.T) {
-	db, err := database.Open(":memory:")
-	if err != nil {
-		t.Fatal(err)
-	}
-	sqlDB, _ := db.DB()
-	t.Cleanup(func() { _ = sqlDB.Close() })
-	if err := database.Migrate(db); err != nil {
-		t.Fatal(err)
-	}
-	now := time.Now().UTC()
-	base := models.Storage{
-		Name: "Media", NameNormalized: "media", Type: models.StorageTypeLocal,
-		RootPath: `C:\Media`, RootPathNormalized: `c:\media`, Enabled: true,
-		Capabilities: `{}`, CreatedAt: now, UpdatedAt: now,
-	}
-	if err := db.Create(&base).Error; err != nil {
-		t.Fatal(err)
-	}
-
-	duplicateName := base
-	duplicateName.ID = 0
-	duplicateName.RootPath = `D:\Media`
-	duplicateName.RootPathNormalized = `d:\media`
-	err = db.Create(&duplicateName).Error
-	if code := ErrorCode(storageConstraintError(err)); code != CodeStorageNameConflict {
-		t.Fatalf("duplicate name code=%q error=%v", code, err)
-	}
-
-	duplicateRoot := base
-	duplicateRoot.ID = 0
-	duplicateRoot.Name = "Other"
-	duplicateRoot.NameNormalized = "other"
-	err = db.Create(&duplicateRoot).Error
-	if code := ErrorCode(storageConstraintError(err)); code != CodeStoragePathConflict {
-		t.Fatalf("duplicate root code=%q error=%v", code, err)
 	}
 }

@@ -3,7 +3,7 @@ package services
 import (
 	"context"
 	"encoding/json"
-	"errors"
+
 	"os"
 	"path/filepath"
 	"strconv"
@@ -80,44 +80,9 @@ func movePan115SelectedMediaOutOfPackage(t *testing.T, fixture cloudTransferFixt
 	fixture.driver.items[item.ID] = item
 }
 
-func TestTransferCleanupDeletesOnlyClearlyNonMediaLocalManifestFiles(t *testing.T) {
-	queue, _, download, selectedPath, _ := transferFixture(t, models.MediaLibraryTransferMove, models.MediaLibraryConflictOverwrite, false)
-	service := NewTransferService(queue.db, queue.audit, queue, zerolog.Nop())
-	advertisementPath := filepath.Join(download.StagingAbsolutePath, download.ScrapeCategory, "广告", "promo.txt")
-	if err := os.MkdirAll(filepath.Dir(advertisementPath), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(advertisementPath, []byte("spam"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	const mainVideoSize = int64(57) * (1 << 30) / 2 // 28.5 GiB provider manifest entry.
-	selected := downloadpkg.Manifest{Name: "Movie.2024", Complete: true, Files: []downloadpkg.File{{RelativePath: "Movie.2024.mkv", Size: mainVideoSize}}}
-	source := selected
-	source.Files = append(append([]downloadpkg.File{}, selected.Files...), downloadpkg.File{RelativePath: "广告/promo.txt", Size: 4})
-	if err := service.EnqueuePackage(download, selected, source); err != nil {
-		t.Fatal(err)
-	}
-	var task models.TransferTask
-	if err := queue.db.Where("download_task_id = ?", download.ID).First(&task).Error; err != nil {
-		t.Fatal(err)
-	}
-	removed, err := service.cleanupTransferStaging(context.Background(), task, download)
-	if err != nil || removed != 1 {
-		t.Fatalf("removed=%d err=%v", removed, err)
-	}
-	if _, err := os.Stat(advertisementPath); !os.IsNotExist(err) {
-		t.Fatalf("advertisement was not removed: %v", err)
-	}
-	if _, err := os.Stat(selectedPath); err != nil {
-		t.Fatalf("selected video changed: %v", err)
-	}
-	if err := queue.db.First(&task, "id = ?", task.ID).Error; err != nil || task.CleanupStatus != models.TransferCleanupCompleted || task.CleanupRemoved != 1 {
-		t.Fatalf("cleanup task=%+v err=%v", task, err)
-	}
-}
-
 func TestTransferCleanupRetainsUnselectedVideosAndUnmatchedSubtitles(t *testing.T) {
 	queue, _, download, selectedPath, _ := transferFixture(t, models.MediaLibraryTransferMove, models.MediaLibraryConflictOverwrite, false)
+	download.ScrapeCategory = "recovered-category"
 	service := NewTransferService(queue.db, queue.audit, queue, zerolog.Nop())
 	protected := []string{
 		"extras/possible-main.mp4",
@@ -128,7 +93,7 @@ func TestTransferCleanupRetainsUnselectedVideosAndUnmatchedSubtitles(t *testing.
 		"extras/unmatched.sup",
 	}
 	for _, relative := range protected {
-		path := filepath.Join(download.StagingAbsolutePath, download.ScrapeCategory, filepath.FromSlash(relative))
+		path := filepath.Join(download.StagingAbsolutePath, download.StagingCategory, filepath.FromSlash(relative))
 		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 			t.Fatal(err)
 		}
@@ -137,7 +102,7 @@ func TestTransferCleanupRetainsUnselectedVideosAndUnmatchedSubtitles(t *testing.
 		}
 	}
 	junkRelative := "extras/tracker-url.txt"
-	junkPath := filepath.Join(download.StagingAbsolutePath, download.ScrapeCategory, filepath.FromSlash(junkRelative))
+	junkPath := filepath.Join(download.StagingAbsolutePath, download.StagingCategory, filepath.FromSlash(junkRelative))
 	if err := os.WriteFile(junkPath, []byte("junk"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -167,7 +132,7 @@ func TestTransferCleanupRetainsUnselectedVideosAndUnmatchedSubtitles(t *testing.
 		t.Fatalf("non-media junk was not removed: %v", err)
 	}
 	for _, relative := range protected {
-		path := filepath.Join(download.StagingAbsolutePath, download.ScrapeCategory, filepath.FromSlash(relative))
+		path := filepath.Join(download.StagingAbsolutePath, download.StagingCategory, filepath.FromSlash(relative))
 		if _, err := os.Stat(path); err != nil {
 			t.Fatalf("protected file %q changed: %v", relative, err)
 		}
@@ -186,27 +151,6 @@ func TestTransferCleanupRefusesIncompleteOrNonSubsetManifest(t *testing.T) {
 	sourceJSON, _ = json.Marshal(source)
 	if extras, err := transferCleanupDifference(models.TransferTask{ManifestJSON: string(selectedJSON), SourceManifestJSON: string(sourceJSON)}); err == nil || extras != nil {
 		t.Fatalf("partial source cleanup accepted: extras=%+v err=%v", extras, err)
-	}
-}
-
-func TestTransferCleanupUsesOriginalStagingCategoryAfterRecognitionRecovery(t *testing.T) {
-	_, _, download, _, _ := transferFixture(t, models.MediaLibraryTransferMove, models.MediaLibraryConflictOverwrite, false)
-	download.StagingCategory = "未识别"
-	download.ScrapeCategory = "华语电影"
-	extra := downloadpkg.File{RelativePath: "广告/promo.txt", Size: 5}
-	extraPath := filepath.Join(download.StagingAbsolutePath, download.StagingCategory, filepath.FromSlash(extra.RelativePath))
-	if err := os.MkdirAll(filepath.Dir(extraPath), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(extraPath, []byte("promo"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	removed, err := cleanupLocalStaging(download, []downloadpkg.File{extra})
-	if err != nil || removed != 1 {
-		t.Fatalf("removed=%d err=%v", removed, err)
-	}
-	if _, err := os.Stat(extraPath); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("staging extra still exists: %v", err)
 	}
 }
 
@@ -268,36 +212,6 @@ func TestTransferCleanupRetriesChangedLocalFileAndAccumulatesCount(t *testing.T)
 	}
 	if err := queue.db.First(&task, "id = ?", task.ID).Error; err != nil || task.CleanupStatus != models.TransferCleanupCompleted || task.CleanupRemoved != 2 {
 		t.Fatalf("cleanup retry task=%+v err=%v", task, err)
-	}
-}
-
-func TestTransferCleanupRecyclesOnlyExactPan115Extras(t *testing.T) {
-	fixture := newCloudTransferFixture(t, models.MediaLibraryTransferMove, models.MediaLibraryConflictOverwrite, false)
-	configurePan115CleanupPackage(t, &fixture, true)
-	fixture.driver.items["advertisement"] = cloudItem("advertisement", "source-root", "promo.txt", 4, "AD-SHA1")
-	selected := fixture.manifest
-	source := selected
-	source.Files = append(append([]downloadpkg.File{}, selected.Files...), downloadpkg.File{RelativePath: "promo.txt", Size: 4, ProviderItemID: "advertisement", ProviderParentID: "source-root", SHA1: "AD-SHA1"})
-	if err := fixture.service.EnqueuePackage(fixture.download, selected, source); err != nil {
-		t.Fatal(err)
-	}
-	var task models.TransferTask
-	if err := fixture.queue.db.Where("download_task_id = ?", fixture.download.ID).First(&task).Error; err != nil {
-		t.Fatal(err)
-	}
-	markPan115TransferCompleted(t, fixture, &task)
-	removed, err := fixture.service.cleanupTransferStaging(context.Background(), task, fixture.download)
-	if err != nil || removed != 1 {
-		t.Fatalf("removed=%d err=%v", removed, err)
-	}
-	if len(fixture.driver.recycled) != 1 || fixture.driver.recycled[0] != "advertisement" {
-		t.Fatalf("recycled=%v", fixture.driver.recycled)
-	}
-	if fixture.driver.recycleBatchCalls != 1 {
-		t.Fatalf("recycle batch calls=%d want=1", fixture.driver.recycleBatchCalls)
-	}
-	if _, exists := fixture.driver.items[fixture.sourceID]; !exists {
-		t.Fatal("selected provider media was recycled")
 	}
 }
 

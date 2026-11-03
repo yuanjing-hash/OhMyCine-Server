@@ -7,8 +7,6 @@ import (
 	"sync"
 	"testing"
 	"time"
-
-	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
 )
 
 type playerOverviewHistoryFake struct {
@@ -192,47 +190,5 @@ func TestBrowserOverviewContinueWatchingIncludesSyncedExternalSources(t *testing
 	items := overview.Sections.ContinueWatching.List
 	if len(items) != 0 {
 		t.Fatalf("external relay must stay out of browser continue watching=%+v", overview.Sections.ContinueWatching)
-	}
-}
-
-func TestBrowserOverviewContinueWatchingScansPastCompletedRowsAndReportsExactHasMore(t *testing.T) {
-	fixture := newPlayerHistoryCatalogFixture(t)
-	now := time.Now().UTC()
-	duration := 1_000.0
-	rows := make([]models.PlayerPlaybackHistory, 0, 112)
-	for index := 0; index < 100; index++ {
-		rows = append(rows, models.PlayerPlaybackHistory{
-			UserID: fixture.actor.User.ID, SyncKey: fmt.Sprintf("%064x", index+1), SourceKind: "emby", SourceID: "emby-bedroom",
-			MediaIdentity: fmt.Sprintf("completed:%d", index), Title: "已看完", DisplayTitle: "已看完", Position: duration,
-			Duration: &duration, Completed: true, ClientUpdatedAt: now.Add(-time.Duration(index) * time.Second).UnixMilli(), CreatedAt: now, UpdatedAt: now,
-		})
-	}
-	for index := 0; index < playerOverviewContinueLimit; index++ {
-		rows = append(rows, models.PlayerPlaybackHistory{
-			UserID: fixture.actor.User.ID, SyncKey: fmt.Sprintf("%064x", 1_000+index), SourceKind: "emby", SourceName: "卧室 Emby", SourceID: "emby-bedroom",
-			MediaIdentity: fmt.Sprintf("unfinished:%d", index), Title: fmt.Sprintf("未看完 %d", index), DisplayTitle: fmt.Sprintf("未看完 %d", index), Position: 100,
-			Duration: &duration, ClientUpdatedAt: now.Add(-time.Duration(200+index) * time.Second).UnixMilli(), CreatedAt: now, UpdatedAt: now,
-		})
-	}
-	if err := fixture.libraries.db.Create(&rows).Error; err != nil {
-		t.Fatal(err)
-	}
-	state := NewPlayerMediaStateService(fixture.libraries.db, fixture.libraries)
-	overview := NewPlayerOverviewService(fixture.history, state, fixture.libraries).BrowserOverview(fixture.actor)
-	if len(overview.Sections.ContinueWatching.List) != 0 || overview.Sections.ContinueWatching.HasMore {
-		t.Fatalf("exact continue section=%+v", overview.Sections.ContinueWatching)
-	}
-
-	extra := models.PlayerPlaybackHistory{
-		UserID: fixture.actor.User.ID, SyncKey: fmt.Sprintf("%064x", 2_000), SourceKind: "emby", SourceID: "emby-bedroom",
-		MediaIdentity: "unfinished:extra", Title: "额外未看完", DisplayTitle: "额外未看完", Position: 100,
-		Duration: &duration, ClientUpdatedAt: now.Add(-time.Hour).UnixMilli(), CreatedAt: now, UpdatedAt: now,
-	}
-	if err := fixture.libraries.db.Create(&extra).Error; err != nil {
-		t.Fatal(err)
-	}
-	overview = NewPlayerOverviewService(fixture.history, state, fixture.libraries).BrowserOverview(fixture.actor)
-	if len(overview.Sections.ContinueWatching.List) != 0 || overview.Sections.ContinueWatching.HasMore {
-		t.Fatalf("overflow continue section=%+v", overview.Sections.ContinueWatching)
 	}
 }

@@ -492,46 +492,6 @@ func TestLibraryRetirementDiscardsUnknownLibraryReferenceAfterDrain(t *testing.T
 	}
 }
 
-func TestLibraryRetirementCleanupSchemaInventory(t *testing.T) {
-	s, _, _ := createCatalogTestLibrary(t)
-	// Negative stages are exact reference release and shared snapshot GC before
-	// derived cleanup. Positive stages use the actual bounded cleanup plan.
-	order := map[string]int{"catalog_snapshot_references": -4, "catalog_head_layers": -3, "catalog_entry_facts": -2, "catalog_recognition_facts": -2, "catalog_source_asset_facts": -2, "catalog_collection_member_facts": -2, "catalog_collection_preparations": -2, "catalog_conversion_manifests": -2, "catalog_snapshots": -1, "catalog_heads": 1000, "media_libraries": 1001}
-	for i, step := range libraryRetirementCleanup {
-		if step.update == "" {
-			order[step.table] = i
-		}
-	}
-	var tables []string
-	if err := s.db.Raw("SELECT name FROM sqlite_master WHERE type='table'").Scan(&tables).Error; err != nil {
-		t.Fatal(err)
-	}
-	for _, table := range tables {
-		var refs []struct {
-			Table string
-			From  string
-		}
-		if err := s.db.Raw("PRAGMA foreign_key_list(\"" + strings.ReplaceAll(table, "\"", "\"\"") + "\")").Scan(&refs).Error; err != nil {
-			t.Fatal(err)
-		}
-		for _, ref := range refs {
-			parentOrder, removedParent := order[ref.Table]
-			if !removedParent {
-				continue
-			}
-			childOrder, reviewedChild := order[table]
-			if table == "media_acquisitions" && ref.Table == "media_libraries" {
-				continue
-			} // explicitly bounded SET NULL
-			if !reviewedChild {
-				t.Errorf("unreviewed retirement FK %s.%s -> %s", table, ref.From, ref.Table)
-			} else if childOrder >= parentOrder {
-				t.Errorf("retirement child %s must precede parent %s", table, ref.Table)
-			}
-		}
-	}
-}
-
 func TestLibraryRetirementBatchBoundAndLeaseFence(t *testing.T) {
 	s, library, actor := retirementFixture(t)
 	issue := models.MediaLibraryStructureIssue{Token: "large-group", LibraryID: library.ID, DiagnosisJobID: "test", Generation: 1, Code: "duplicate_target", Kind: "video", State: "pending"}

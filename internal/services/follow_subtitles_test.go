@@ -46,8 +46,9 @@ func TestFollowPolicyDefaultsAreDurableCASAndDoNotRewriteSnapshots(t *testing.T)
 	if err := queue.db.Create(&record).Error; err != nil {
 		t.Fatal(err)
 	}
-	changed, err := service.UpdatePolicyDefaults(context.Background(), actor, UpdateFollowPolicyDefaultsInput{Revision: first.Revision, Subtitles: SubtitlePolicy{Mode: "require", Languages: []string{"en"}}}, RequestContext{})
-	if err != nil || changed.Revision != 2 {
+	pref := FollowAcquisitionExistingOrder
+	changed, err := service.UpdatePolicyDefaults(context.Background(), actor, UpdateFollowPolicyDefaultsInput{Revision: first.Revision, Subtitles: SubtitlePolicy{Mode: "require", Languages: []string{"en"}}, AcquisitionPreference: &pref}, RequestContext{})
+	if err != nil || changed.Revision != 2 || changed.AcquisitionPreference != pref {
 		t.Fatalf("updated=%+v err=%v", changed, err)
 	}
 	if _, err := service.UpdatePolicyDefaults(context.Background(), actor, UpdateFollowPolicyDefaultsInput{Revision: 1, Subtitles: SubtitlePolicy{Mode: "ignore"}}, RequestContext{}); ErrorCode(err) != CodeConflict {
@@ -57,6 +58,14 @@ func TestFollowPolicyDefaultsAreDurableCASAndDoNotRewriteSnapshots(t *testing.T)
 	saved, err := reloaded.PolicyDefaults(context.Background(), actor)
 	if err != nil || saved.Subtitles.Mode != "require" {
 		t.Fatal("defaults not durable")
+	}
+	oldClient, err := service.UpdatePolicyDefaults(context.Background(), actor, UpdateFollowPolicyDefaultsInput{Revision: saved.Revision, Subtitles: SubtitlePolicy{Mode: "prefer", Languages: []string{"en"}}}, RequestContext{})
+	if err != nil || oldClient.AcquisitionPreference != pref {
+		t.Fatal("old client cleared independent preference", err)
+	}
+	invalid := "wrong"
+	if _, err := service.UpdatePolicyDefaults(context.Background(), actor, UpdateFollowPolicyDefaultsInput{Revision: oldClient.Revision, Subtitles: SubtitlePolicy{Mode: "ignore"}, AcquisitionPreference: &invalid}, RequestContext{}); ErrorCode(err) != CodeFollowConfigurationInvalid {
+		t.Fatal("unknown preference accepted")
 	}
 	var original models.FollowSubscription
 	if err := queue.db.First(&original, "id = ?", record.ID).Error; err != nil || original.ExecutionSnapshotJSON != record.ExecutionSnapshotJSON {
@@ -68,28 +77,5 @@ func TestFollowPolicyDefaultsAreDurableCASAndDoNotRewriteSnapshots(t *testing.T)
 	}
 	if _, err := service.UpdatePolicyDefaults(context.Background(), actor, UpdateFollowPolicyDefaultsInput{Revision: 2, Subtitles: SubtitlePolicy{Mode: "ignore"}}, RequestContext{}); ErrorCode(err) != CodePermissionDenied {
 		t.Fatal("settings update bypass")
-	}
-}
-
-func TestFollowPolicyPreferenceCASPreservesOldClientAndRejectsUnknown(t *testing.T) {
-	queue, actor, _ := queueFixture(t)
-	actor.Permissions[authz.PermissionSettingsRead] = struct{}{}
-	actor.Permissions[authz.PermissionSettingsUpdate] = struct{}{}
-	s := NewFollowService(queue.db, queue.audit, queue, nil, nil)
-	pref := FollowAcquisitionExistingOrder
-	updated, err := s.UpdatePolicyDefaults(context.Background(), actor, UpdateFollowPolicyDefaultsInput{Revision: 1, Subtitles: SubtitlePolicy{Mode: "ignore"}, AcquisitionPreference: &pref}, RequestContext{})
-	if err != nil || updated.AcquisitionPreference != pref {
-		t.Fatalf("update=%+v err=%v", updated, err)
-	}
-	updated, err = s.UpdatePolicyDefaults(context.Background(), actor, UpdateFollowPolicyDefaultsInput{Revision: 2, Subtitles: SubtitlePolicy{Mode: "prefer", Languages: []string{"en"}}}, RequestContext{})
-	if err != nil || updated.AcquisitionPreference != pref {
-		t.Fatal("old client cleared independent preference", err)
-	}
-	pref = "wrong"
-	if _, err = s.UpdatePolicyDefaults(context.Background(), actor, UpdateFollowPolicyDefaultsInput{Revision: 3, Subtitles: SubtitlePolicy{Mode: "ignore"}, AcquisitionPreference: &pref}, RequestContext{}); ErrorCode(err) != CodeFollowConfigurationInvalid {
-		t.Fatal("unknown preference accepted")
-	}
-	if validateAcquisitionPreference("", true) != nil || validateAcquisitionPreference("", false) == nil {
-		t.Fatal("legacy omission/default validation diverged")
 	}
 }

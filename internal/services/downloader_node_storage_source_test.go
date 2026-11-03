@@ -48,6 +48,25 @@ func TestNodeStorageSourcePlansFreezeLocalAndCrossAccountRoutes(t *testing.T) {
 		t.Fatalf("ordinary HTTP source err=%v", err)
 	}
 
+	quarkStorage := source
+	quarkStorage.Type, quarkStorage.RootPath = models.StorageTypeQuark, "storage-root"
+	selected, err := cloudpkg.EncodeSelectedShareSource("https://pan.quark.cn/s/abcd1234", cloudpkg.ShareSelection{Version: 1, Files: []cloudpkg.ShareTreeItem{{ID: "file-1", RelativePath: "movie.mkv", Size: 10}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	task := models.DownloadTask{ID: "task-1", ProviderTag: "omc-task-1", TargetStorageType: models.StorageTypeLocal, StagingRelativePath: "/nested/intake"}
+	plan, err := buildNodeStorageSourcePlan(quarkStorage, task, nodeprotocol.StorageSourceKindQuarkShareSelected, selected, "intake-id")
+	if err != nil || plan.DestinationRelativePath != task.StagingRelativePath || plan.OfflineDestinationID != "intake-id" {
+		t.Fatalf("frozen source path missing: %v", err)
+	}
+	task.StagingRelativePath = ""
+	if _, err = buildNodeStorageSourcePlan(quarkStorage, task, nodeprotocol.StorageSourceKindQuarkShareSelected, selected, "intake-id"); err == nil {
+		t.Fatal("child directory accepted without frozen path")
+	}
+	if plan, err = buildNodeStorageSourcePlan(quarkStorage, task, nodeprotocol.StorageSourceKindQuarkShareSelected, selected, quarkStorage.RootPath); err != nil || plan.DestinationRelativePath != "/" {
+		t.Fatalf("grant-root compatibility failed: %v", err)
+	}
+
 	raw, err := json.Marshal(cross)
 	if err != nil {
 		t.Fatal(err)

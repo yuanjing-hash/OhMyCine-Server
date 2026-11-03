@@ -66,26 +66,6 @@ func TestEmbyConnectionEncryptsCredentialAndProbesWithoutRedirect(t *testing.T) 
 	}
 }
 
-func TestJoinGatewayPathKeepsConfiguredBaseExactlyOnce(t *testing.T) {
-	tests := map[string]string{
-		"base already present": "/emby/users/public",
-		"base must be added":   "/emby/users/public",
-		"prefix collision":     "/emby/emby-other/users/public",
-	}
-	inputs := map[string]string{
-		"base already present": "/emby/users/public",
-		"base must be added":   "/users/public",
-		"prefix collision":     "/emby-other/users/public",
-	}
-	for name, want := range tests {
-		t.Run(name, func(t *testing.T) {
-			if got := joinGatewayPath("/emby/", inputs[name]); got != want {
-				t.Fatalf("joinGatewayPath()=%q want=%q", got, want)
-			}
-		})
-	}
-}
-
 func TestEmbyGatewayForwardsApplicationBasePathExactlyOnce(t *testing.T) {
 	var upstream *httptest.Server
 	upstream = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

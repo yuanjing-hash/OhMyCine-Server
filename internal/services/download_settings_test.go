@@ -13,14 +13,24 @@ import (
 
 func TestDownloadSettingsOwnUnifiedStagingBoundary(t *testing.T) {
 	queue, actor, _ := queueFixture(t)
+	service := NewDownloadSettingsService(queue.db, queue.audit)
+	if _, err := service.Get(actor); ErrorCode(err) != CodePermissionDenied {
+		t.Fatalf("read error=%v", err)
+	}
 	actor.Permissions[authz.PermissionSettingsRead] = struct{}{}
+	settings, err := service.Get(actor)
+	if err != nil || settings.Configured {
+		t.Fatalf("settings=%+v err=%v", settings, err)
+	}
+	if _, err := service.Snapshot(context.Background(), models.DownloaderTypeQBittorrent); ErrorCode(err) != CodeDownloadStagingRequired {
+		t.Fatalf("snapshot error=%v", err)
+	}
 	actor.Permissions[authz.PermissionSettingsUpdate] = struct{}{}
 	root := t.TempDir()
 	staging := filepath.Join(root, "incoming")
 	if err := os.Mkdir(staging, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	service := NewDownloadSettingsService(queue.db, queue.audit)
 	updated, err := service.Update(context.Background(), actor, UpdateDownloadSettingsInput{AbsolutePath: staging, Revision: 1}, RequestContext{})
 	if err != nil {
 		t.Fatal(err)
@@ -43,29 +53,7 @@ func TestDownloadSettingsOwnUnifiedStagingBoundary(t *testing.T) {
 	if err := queue.db.First(&record, 1).Error; err != nil || record.AbsolutePath != staging || record.StorageID != nil {
 		t.Fatalf("record=%+v err=%v", record, err)
 	}
-}
-
-func TestDownloadSettingsRequireConfigurationAndPermissions(t *testing.T) {
-	queue, actor, _ := queueFixture(t)
-	service := NewDownloadSettingsService(queue.db, queue.audit)
-	if _, err := service.Get(actor); ErrorCode(err) != CodePermissionDenied {
-		t.Fatalf("read error=%v", err)
-	}
-	actor.Permissions[authz.PermissionSettingsRead] = struct{}{}
-	settings, err := service.Get(actor)
-	if err != nil || settings.Configured {
-		t.Fatalf("settings=%+v err=%v", settings, err)
-	}
-	if _, err := service.Snapshot(context.Background(), models.DownloaderTypeQBittorrent); ErrorCode(err) != CodeDownloadStagingRequired {
-		t.Fatalf("snapshot error=%v", err)
-	}
-}
-
-func TestDownloadSettingsRejectRevisionOverflow(t *testing.T) {
-	queue, actor, _ := queueFixture(t)
-	actor.Permissions[authz.PermissionSettingsUpdate] = struct{}{}
-	service := NewDownloadSettingsService(queue.db, queue.audit)
-	if _, err := service.Update(context.Background(), actor, UpdateDownloadSettingsInput{AbsolutePath: t.TempDir(), Revision: math.MaxInt64}, RequestContext{}); ErrorCode(err) != CodeConflict {
+	if _, err := service.Update(context.Background(), actor, UpdateDownloadSettingsInput{AbsolutePath: staging, Revision: math.MaxInt64}, RequestContext{}); ErrorCode(err) != CodeConflict {
 		t.Fatalf("overflow error=%v", err)
 	}
 }

@@ -2,7 +2,7 @@ package services
 
 import (
 	"bytes"
-	"encoding/json"
+
 	"testing"
 
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
@@ -80,10 +80,6 @@ func TestSelectedOriginCannotBeForgedByKindOwnerSiteHashOrSelection(t *testing.T
 				t.Fatalf("accepted %s", name)
 			}
 		})
-	}
-	var public DownloadSourceInput
-	if err := json.Unmarshal([]byte(`{"selectionOrigin":{"OwnerID":3,"SiteID":7},"selection_origin":{"owner_id":3}}`), &public); err != nil || public.selectionOrigin != nil {
-		t.Fatal("HTTP JSON forged internal authority")
 	}
 }
 

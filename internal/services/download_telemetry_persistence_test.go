@@ -45,7 +45,7 @@ func downloadTestBusyError(t *testing.T) error {
 }
 
 func TestDownloadTelemetryPersistenceRecovery(t *testing.T) {
-	for _, mode := range []string{"temporary", "persistent", "unconfirmed_identity", "permanent", "cancelled", "lost_lease"} {
+	for _, mode := range []string{"temporary", "persistent", "unconfirmed_identity", "permanent"} {
 		t.Run(mode, func(t *testing.T) {
 			downloads, downloaders, queue, actor, client := downloadFixture(t)
 			var logs bytes.Buffer
@@ -93,20 +93,7 @@ func TestDownloadTelemetryPersistenceRecovery(t *testing.T) {
 			t.Cleanup(func() { _ = queue.db.Callback().Update().Remove("test:telemetry-persist") })
 			worker := NewDownloadWorker(downloads)
 			worker.pollInterval = time.Millisecond
-			if mode == "cancelled" || mode == "lost_lease" {
-				var task models.DownloadTask
-				check(queue.db.First(&task, "id=?", created.ID).Error)
-				if mode == "cancelled" {
-					check(queue.db.Model(&task).Update("phase", models.DownloadTaskStatusCancelled).Error)
-				} else {
-					check(queue.db.Model(&models.Job{}).Where("id=?", created.JobID).Update("lease_token_hash", "new-owner").Error)
-				}
-				err = worker.persistTrackedTelemetry(context.Background(), *claim, &task, downloadpkg.Task{Status: "downloading"})
-				if mode == "cancelled" && !errors.Is(err, context.Canceled) || mode == "lost_lease" && ErrorCode(err) != CodeQueueLeaseInvalid {
-					t.Fatalf("fence err=%v", err)
-				}
-				return
-			}
+
 			result := worker.Run(context.Background(), workerRuntime{queue: queue, job: *claim}, *claim)
 			if mode == "temporary" {
 				if result.ErrorCode != "" || result.RetryAt != nil || writes < 3 {

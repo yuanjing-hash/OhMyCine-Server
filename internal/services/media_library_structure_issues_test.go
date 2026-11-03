@@ -80,6 +80,48 @@ func TestStructureIssuesPersistAndPageBeyondLegacySampleLimit(t *testing.T) {
 	if recommended != 1 {
 		t.Fatalf("recommended members=%d", recommended)
 	}
+	// A subsequent diagnosis must aggregate exactly the same three conflict codes as its pages.
+	now = time.Now().UTC()
+	job, err := service.queue.Enqueue(EnqueueJobInput{OwnerID: actor.User.ID, JobType: JobTypeMediaLibraryStructureDiagnosis, DisplayName: "conflict counts", Payload: map[string]any{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	diagnosis := models.MediaLibraryStructureDiagnosis{LibraryID: library.ID, JobID: job.ID, Generation: library.BaselineGeneration + 1, Status: "issues", CreatedAt: now, UpdatedAt: now}
+	if err := service.db.Create(&diagnosis).Error; err != nil {
+		t.Fatal(err)
+	}
+	plan := StructurePlan{}
+	for index, code := range []string{"duplicate_target", "recognition_suspect_conflict", "recognition_suspect_conflict", "catalog_duplicate_conflict", "catalog_duplicate_conflict", "catalog_duplicate_conflict"} {
+		plan.addIssue(StructureIssue{Code: code, Kind: "conflict"})
+		row := models.MediaLibraryStructureIssue{LibraryID: library.ID, DiagnosisJobID: job.ID, Generation: library.BaselineGeneration + 1, Token: fmt.Sprintf("conflict-%d", index), Code: code, Kind: "conflict", State: "pending", CreatedAt: now, UpdatedAt: now}
+		if err := service.db.Create(&row).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if plan.Classifications.DuplicateTarget != 1 || plan.Classifications.RecognitionSuspectConflict != 2 || plan.Classifications.CatalogDuplicateConflict != 3 {
+		t.Fatalf("planner categories: %+v", plan.Classifications)
+	}
+	if err := service.db.Transaction(func(tx *gorm.DB) error { return refreshStructureSummaryTx(tx, library.ID, now) }); err != nil {
+		t.Fatal(err)
+	}
+	dto, err := service.diagnosticsForLibrary(context.Background(), library)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dto.IssueCount != 6 || dto.Classifications != plan.Classifications {
+		t.Fatalf("API counters differ: %+v", dto)
+	}
+	for code, want := range map[string]int{"duplicate_target": 1, "recognition_suspect_conflict": 2, "catalog_duplicate_conflict": 3} {
+		if err := service.withCatalogRead(context.Background(), library.ID, func(tx *gorm.DB, reader *CatalogReader) error {
+			page, err := service.structureIssuesTx(tx, reader, library.ID, MediaLibraryStructureIssueQuery{Code: code, Page: 1, PageSize: 50})
+			if err == nil && int(page.Total) != want {
+				t.Fatalf("%s page=%+v want=%d", code, page, want)
+			}
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
 }
 
 func TestStructureIssuesUseBoundedBatchStatements(t *testing.T) {

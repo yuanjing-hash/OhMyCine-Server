@@ -3,6 +3,7 @@ package services
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -11,6 +12,15 @@ import (
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
 	"gorm.io/gorm/logger"
 )
+
+type performanceLogger struct {
+	logger.Interface
+	queries atomic.Int64
+}
+
+func (l *performanceLogger) Trace(context.Context, time.Time, func() (string, int64), error) {
+	l.queries.Add(1)
+}
 
 func TestFastScanPrunesCatalogInBoundedBatches(t *testing.T) {
 	service, db, actor, storage, profile := mediaLibraryTestService(t)

@@ -89,41 +89,6 @@ func TestCookieCloudSummaryCredentialFieldsFailClosedOnDecryptError(t *testing.T
 	}
 }
 
-func TestCookieCloudSyncDiscoversAndCreatesSupportedSite(t *testing.T) {
-	sites, _, actor, store, _, _ := siteFixture(t)
-	service := NewCookieCloudService(sites.db, sites.audit, store, sites, zerolog.Nop())
-	if _, err := service.Update(context.Background(), actor, CookieCloudSettingsInput{
-		Mode: "local", UUID: "fixture-user", Password: "fixture-password",
-		AuthHeader: "fixture-shared-auth", Revision: 1,
-	}, RequestContext{}); err != nil {
-		t.Fatal(err)
-	}
-	payload := cryptoJSCookieCloudFixture(t, "fixture-user", "fixture-password", map[string]any{
-		"cookie_data": map[string]any{"pttime": []map[string]string{
-			{"domain": ".pttime.org", "name": "uid", "value": "2"},
-			{"domain": ".pttime.org", "name": "token", "value": "discovered-secret"},
-		}},
-	})
-	if err := service.Receive("fixture-user", payload, "legacy", "fixture-shared-auth"); err != nil {
-		t.Fatal(err)
-	}
-	result, err := service.Sync(context.Background(), actor, RequestContext{})
-	if err != nil || result.Created != 1 || result.Updated != 0 || result.Failed != 0 {
-		t.Fatalf("result=%+v err=%v", result, err)
-	}
-	var record models.Site
-	if err := sites.db.Where("kind = ?", "pttime").First(&record).Error; err != nil {
-		t.Fatal(err)
-	}
-	if record.BaseURL != "https://www.pttime.org" || record.Name != "PTTime" {
-		t.Fatalf("record=%+v", record)
-	}
-	credential, err := sites.decryptCredential(record)
-	if err != nil || credential.Cookie != "token=discovered-secret; uid=2" {
-		t.Fatalf("credential=%+v err=%v", credential, err)
-	}
-}
-
 func TestCookieCloudSyncDiscoversMultipleCatalogSites(t *testing.T) {
 	sites, _, actor, store, _, _ := siteFixture(t)
 	for _, kind := range []string{"sewerpt", "panda"} {
@@ -156,6 +121,10 @@ func TestCookieCloudSyncDiscoversMultipleCatalogSites(t *testing.T) {
 	}
 	if len(records) != 3 || records[0].Kind != "panda" || records[0].Name != "熊猫高清 · PandaPT" || records[1].Kind != "pttime" || records[1].Name != "PTTime" || records[2].Kind != "sewerpt" || records[2].Name != "下水道 · SewerPT" {
 		t.Fatalf("records=%+v", records)
+	}
+	credential, err := sites.decryptCredential(records[1])
+	if err != nil || records[1].BaseURL != "https://www.pttime.org" || credential.Cookie != "token=one; uid=1" {
+		t.Fatalf("discovered credential=%+v err=%v", credential, err)
 	}
 }
 

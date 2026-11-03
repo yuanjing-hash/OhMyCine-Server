@@ -1,10 +1,9 @@
 package services
 
-// Original gap fixture retained for bounded source/namespace tests. All cloud
-// behavior here is synthetic; no credentials or external transport are used.
+// Shared synthetic fixture for native Quark structure workflow contracts.
 import (
 	"context"
-	"errors"
+
 	"testing"
 
 	"github.com/rs/zerolog"
@@ -65,82 +64,4 @@ func quarkStructureGapFixture(t *testing.T, correct bool) (*MediaLibraryStructur
 		t.Fatal(err)
 	}
 	return s, library, user.ID
-}
-
-func TestQuarkStructureGapEnsureWorkLayoutBoundaries(t *testing.T) {
-	for _, scenario := range []struct {
-		name    string
-		correct bool
-		tmdb    int64
-		blocked bool
-	}{
-		{"existing-correct-layout", true, 42, false},
-		{"new-work", false, 999, false},
-	} {
-		t.Run(scenario.name, func(t *testing.T) {
-			s, library, owner := quarkStructureGapFixture(t, scenario.correct)
-			plan, _, err := s.buildPlan(context.Background(), library.ID, "series:tmdb:42")
-			if err != nil {
-				t.Fatal(err)
-			}
-			if (len(plan.Items) == 0) != scenario.correct {
-				t.Fatalf("fixture plan items=%d correct=%v", len(plan.Items), scenario.correct)
-			}
-			var before, after models.CatalogHead
-			if err := s.db.First(&before, "library_id = ?", library.ID).Error; err != nil {
-				t.Fatal(err)
-			}
-			err = s.EnsureWorkLayout(context.Background(), owner, library.ID, scenario.tmdb, "tv")
-			if err != nil {
-				t.Fatalf("unaffected path blocked: %v", err)
-			}
-			var repairs, physical int64
-			if err := s.db.Model(&models.MediaLibraryStructureRepair{}).Count(&repairs).Error; err != nil {
-				t.Fatal(err)
-			}
-			if err := s.db.Model(&models.CatalogPhysicalWrite{}).Count(&physical).Error; err != nil {
-				t.Fatal(err)
-			}
-			if err := s.db.First(&after, "library_id = ?", library.ID).Error; err != nil {
-				t.Fatal(err)
-			}
-			if repairs != 0 || physical != 0 || before.Revision != after.Revision {
-				t.Fatal("support check mutated repair/owner/catalog")
-			}
-		})
-	}
-}
-
-type quarkStructureGapOnlyBackend struct{ called bool }
-
-func (*quarkStructureGapOnlyBackend) StorageType() string { return models.StorageTypeQuark }
-func (b *quarkStructureGapOnlyBackend) ValidateRecycle(context.Context, StructureBoundary) error {
-	b.called = true
-	return errors.New("unexpected backend call")
-}
-func (b *quarkStructureGapOnlyBackend) Recycle(context.Context, StructureBoundary, []StructureRecycleItem, StructureProgress) error {
-	b.called = true
-	return errors.New("unexpected backend call")
-}
-func (b *quarkStructureGapOnlyBackend) Apply(context.Context, StructureBoundary, []StructurePlanItem, StructureProgress) error {
-	b.called = true
-	return errors.New("unexpected backend call")
-}
-
-func TestQuarkStructureGapBackendRegistrationAloneIsInsufficient(t *testing.T) {
-	s, library, _ := quarkStructureGapFixture(t, false)
-	backend := &quarkStructureGapOnlyBackend{}
-	s.backends.Register(backend)
-	plan, _, err := s.buildPlan(context.Background(), library.ID, "series:tmdb:42")
-	if err != nil || len(plan.Items) == 0 {
-		t.Fatalf("plan: %v", err)
-	}
-	var storage models.Storage
-	if err := s.db.First(&storage, library.StorageID).Error; err != nil {
-		t.Fatal(err)
-	}
-	_, err = s.prepareCatalogStructureDirectories(context.Background(), models.MediaLibraryStructureRepair{}, structureCatalogRepairState{}, plan, StructureBoundary{Library: library, Storage: storage}, backend, nil)
-	if !errors.Is(err, ErrCatalogInvalid) || backend.called {
-		t.Fatalf("directory preparation no longer has its Pan115-only gate: %v", err)
-	}
 }

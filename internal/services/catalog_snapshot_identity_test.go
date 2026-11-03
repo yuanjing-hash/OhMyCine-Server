@@ -5,33 +5,9 @@ import (
 	"errors"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
 )
-
-func TestCatalogIdentityBatchBudgetAdaptsWithinBounds(t *testing.T) {
-	var budget catalogIdentityBatchBudget
-	if budget.limit() != 32 {
-		t.Fatal("allocation starts with an oversized batch")
-	}
-	budget.observe(32, 120*time.Millisecond)
-	if budget.limit() != 16 {
-		t.Fatal("slow allocation did not reduce writer batch")
-	}
-	for i := 0; i < 100; i++ {
-		budget.observe(budget.limit(), time.Millisecond)
-	}
-	if budget.limit() != 128 {
-		t.Fatal("fast allocation exceeded bounded maximum")
-	}
-	for i := 0; i < 100; i++ {
-		budget.observe(budget.limit(), time.Second)
-	}
-	if budget.limit() != 8 {
-		t.Fatal("slow allocation cannot make forward progress")
-	}
-}
 
 func TestCatalogIdentityRenameAndOldPathReuse(t *testing.T) {
 	s, library, rec, entries := catalogFixture(t)

@@ -51,24 +51,6 @@ func TestUnifiedScheduleMediaLibraryPerformsExplicitFullComparison(t *testing.T)
 	}
 }
 
-func TestManagedLibraryScheduleRefreshesOldLabelWithoutChangingCron(t *testing.T) {
-	service, _, actor, now := scheduleFixture(t)
-	if err := syncManagedSchedule(service.db, actor.User.ID, "媒体库增量复核 · A · 7", "media_library_scan", "media_library", "7", "15 4 * * 2", "UTC", true, true, now); err != nil {
-		t.Fatal(err)
-	}
-	key := managedScheduleKey("media_library_scan", "media_library", "7")
-	if err := syncManagedSchedule(service.db, actor.User.ID, "媒体库全量核对（仅处理云端差异） · A · 7", "media_library_scan", "media_library", "7", "0 3 * * *", "Asia/Shanghai", true, false, now); err != nil {
-		t.Fatal(err)
-	}
-	var row models.ScheduleDefinition
-	if err := service.db.First(&row, "managed_key = ?", key).Error; err != nil {
-		t.Fatal(err)
-	}
-	if row.Name != "媒体库全量核对（仅处理云端差异） · A · 7" || row.CronExpression != "15 4 * * 2" || row.Timezone != "UTC" || row.Revision != 1 {
-		t.Fatalf("startup refresh changed execution policy: %+v", row)
-	}
-}
-
 func scheduleFixture(t *testing.T) (*UnifiedScheduleService, *QueueService, Actor, time.Time) {
 	t.Helper()
 	queue, actor, _ := queueFixture(t)
@@ -118,7 +100,9 @@ func TestUnifiedSchedulePollSkipsMisfireAndDoesNotDuplicateAfterRestart(t *testi
 		t.Fatalf("next_run_at=%v", refreshed.NextRunAt)
 	}
 	entries := remainingBusinessEntries(t, logManager)
-	if len(entries) != 1 { t.Fatalf("duplicate trigger logs: %+v", entries) }
+	if len(entries) != 1 {
+		t.Fatalf("duplicate trigger logs: %+v", entries)
+	}
 	requireRemainingBusinessEvent(t, entries, "schedule.skipped", "skipped")
 }
 

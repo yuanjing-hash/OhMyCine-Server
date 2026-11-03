@@ -438,16 +438,20 @@ func TestCompletedLegacyFollowIdentityCannotOverwriteNewManualRevision(t *testin
 	}
 }
 
-func TestDownloadIdentityBindingRejectsContradictoryDirectLock(t *testing.T) {
-	if validDownloadIdentityBinding(DownloadRecognitionIdentity{TMDBID: 100, MediaType: "tv", Source: mediaIdentitySourceDirectID, Status: mediaIdentityStatusVerified, Locked: true}) {
-		t.Fatal("submission permits direct_id+locked while Transfer rejects it")
-	}
-}
-
 func TestCompletedIdentityUsesRealManualCorrectionBeforeOldScrapeProjection(t *testing.T) {
 	f := newLegacyFollowIdentityFixture(t)
-	season, episode := 1, 12
-	corrected, err := f.downloads.OverrideRecognition(context.Background(), f.actor, f.task.ID, DownloadRecognitionOverrideInput{TMDBID: 101, MediaType: "tv", Season: &season, Episode: &episode}, RequestContext{})
+	episode := 12
+	invalidSeason, invalidEpisode := 201, 100001
+	for _, input := range []DownloadRecognitionOverrideInput{
+		{TMDBID: 101, MediaType: "tv", Season: &invalidSeason},
+		{TMDBID: 101, MediaType: "tv", Episode: &invalidEpisode},
+		{TMDBID: 101, MediaType: "movie", Episode: &episode},
+	} {
+		if _, err := f.downloads.OverrideRecognition(context.Background(), f.actor, f.task.ID, input, RequestContext{}); ErrorCode(err) != CodeInvalidRequest {
+			t.Fatalf("invalid episode correction err=%v", err)
+		}
+	}
+	corrected, err := f.downloads.OverrideRecognition(context.Background(), f.actor, f.task.ID, DownloadRecognitionOverrideInput{TMDBID: 101, MediaType: "tv", Episode: &episode}, RequestContext{})
 	if err != nil || corrected.JobStatus != models.JobStatusQueued {
 		t.Fatalf("real manual correction failed: %+v %v", corrected, err)
 	}
@@ -467,7 +471,7 @@ func TestCompletedIdentityUsesRealManualCorrectionBeforeOldScrapeProjection(t *t
 		t.Fatalf("real manual correction was rejected by old projection: %+v", result)
 	}
 	var current models.DownloadTask
-	if err := f.queue.db.First(&current, "id = ?", f.task.ID).Error; err != nil || current.ScrapeTMDBID == nil || *current.ScrapeTMDBID != 101 || current.ScrapeTitle != "另一部剧" || current.IdentityRevision != 2 || current.IdentitySource != mediaIdentitySourceManual || !current.IdentityLocked || current.ScrapeEpisode == nil || *current.ScrapeEpisode != 12 || current.CompletedManifestJSON != f.task.CompletedManifestJSON {
+	if err := f.queue.db.First(&current, "id = ?", f.task.ID).Error; err != nil || current.ScrapeTMDBID == nil || *current.ScrapeTMDBID != 101 || current.ScrapeTitle != "另一部剧" || current.IdentityRevision != 2 || current.IdentitySource != mediaIdentitySourceManual || !current.IdentityLocked || current.ScrapeEpisode == nil || *current.ScrapeEpisode != 12 || current.ScrapeSeason == nil || *current.ScrapeSeason != 1 || current.CompletedManifestJSON != f.task.CompletedManifestJSON {
 		t.Fatalf("manual identity/episode not preserved: %+v %v", current, err)
 	}
 	var count int64

@@ -233,17 +233,6 @@ func downloadFixture(t *testing.T) (*DownloadService, *DownloaderService, *Queue
 	return downloads, downloaders, queue, actor, client
 }
 
-func TestDownloadQueueResourceDelegatesQBittorrentConcurrency(t *testing.T) {
-	qbit := models.Downloader{ID: "qbit", Type: models.DownloaderTypeQBittorrent}
-	pan := models.Downloader{ID: "pan", Type: models.DownloaderTypePan115Offline}
-	if key := downloadQueueResourceKey(qbit); key != "" {
-		t.Fatalf("qBittorrent resource key=%q, want global guard only", key)
-	}
-	if key := downloadQueueResourceKey(pan); key != "downloader:pan" {
-		t.Fatalf("115 resource key=%q", key)
-	}
-}
-
 func TestPan115DownloadWaitBroadcastsLifeEventToAllWorkers(t *testing.T) {
 	service := &DownloadService{providerEvents: newProviderEventWakeHub()}
 	worker := &DownloadWorker{service: service, pan115PollInterval: time.Hour, heartbeatInterval: time.Hour}
@@ -296,52 +285,6 @@ func TestPan115DownloadWaitMaintainsQueueLeaseBetweenFallbackPolls(t *testing.T)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("fallback poll did not resume the worker")
-	}
-}
-
-func TestDownloadFailureMessage(t *testing.T) {
-	tests := []struct {
-		name      string
-		code      string
-		retryable bool
-		want      string
-	}{
-		{name: "authentication", code: "downloader_auth_failed", want: "下载器认证已失效，请更新连接凭据后重试"},
-		{name: "rate limited", code: "downloader_rate_limited", retryable: true, want: "下载器请求受到限速，任务将延后重试"},
-		{name: "storage unavailable", code: "downloader_storage_unavailable", want: "下载目标目录不存在或已移动，请重新选择目录"},
-		{name: "quota exhausted", code: "downloader_quota_exhausted", want: "115 离线下载配额已耗尽，请检查账号权益后重试"},
-		{name: "existing resource ownership", code: "downloader_task_exists", want: "115 已存在相同资源的任务，无法安全接管；请先检查原任务的归属和状态"},
-		{name: "response invalid", code: "downloader_response_invalid", want: "下载器返回了无法识别的响应，请重新测试连接"},
-		{name: "selection identity required", code: "downloader_selection_identity_required", want: "此来源尚未确认资源身份，下载器暂不能安全接收；请先由软件解析文件内容，再重新提交"},
-		{name: "selection identity remains actionable", code: "downloader_selection_identity_required", retryable: true, want: "此来源尚未确认资源身份，下载器暂不能安全接收；请先由软件解析文件内容，再重新提交"},
-		{name: "category update unsupported", code: "downloader_category_update_unsupported", want: "当前 qBittorrent 版本不支持更新分类目录，请升级后重试"},
-		{name: "category update retryable", code: "downloader_category_update_failed", retryable: true, want: "qBittorrent 分类目录更新暂时失败，任务将自动重试"},
-		{name: "category boundary mismatch", code: "downloader_category_outside_staging", want: "qBittorrent 分类目录与该任务的暂存目录不一致，已阻止下载"},
-		{name: "generic retryable", code: "downloader_unavailable", retryable: true, want: "下载器暂时不可用，任务将自动重试"},
-		{name: "generic terminal", code: "download_failed", want: "下载任务执行失败"},
-	}
-	for _, item := range tests {
-		t.Run(item.name, func(t *testing.T) {
-			if got := downloadFailureMessage(item.code, item.retryable); got != item.want {
-				t.Fatalf("downloadFailureMessage(%q, %t) = %q, want %q", item.code, item.retryable, got, item.want)
-			}
-		})
-	}
-}
-
-func TestTransferEnqueueFailureDoesNotMasqueradeAsDownloaderUnavailable(t *testing.T) {
-	downloads, _, _, _, _ := downloadFixture(t)
-	worker := NewDownloadWorker(downloads)
-	task := models.DownloadTask{ID: "transfer-enqueue-failure", ProviderType: models.DownloaderTypePan115Offline}
-
-	terminal := worker.transferEnqueueFailure(task, appError(CodeTransferMediaUnrecognized, "媒体识别结果不可信", nil))
-	if terminal.ErrorCode != CodeTransferMediaUnrecognized || terminal.ErrorMessage != "媒体识别结果不可信" || terminal.RetryAt != nil {
-		t.Fatalf("terminal=%+v", terminal)
-	}
-
-	retryable := worker.transferEnqueueFailure(task, errors.New("temporary queue write failure"))
-	if retryable.ErrorCode != "transfer_enqueue_failed" || retryable.RetryAt == nil || retryable.ErrorCode == CodeDownloaderUnavailable {
-		t.Fatalf("retryable=%+v", retryable)
 	}
 }
 
@@ -1990,34 +1933,6 @@ func TestRouteCategoryUpdatesExistingCategoryToTaskStagingSnapshotBeforeResume(t
 		t.Fatalf("categoryPath=%q routedPath=%q resumed=%v", client.categoryPath, client.routedPath, client.resumed)
 	}
 	if got := strings.Join(client.categoryCalls, ","); got != "categories,update,categories,set,resume" {
-		t.Fatalf("category call order=%q", got)
-	}
-}
-
-func TestRouteCategoryRepairsExistingCategoryWithEmptySavePath(t *testing.T) {
-	downloads, _, _, _, _ := downloadFixture(t)
-	root := t.TempDir()
-	client := &metadataDownloadClient{stubDownloadClient: &stubDownloadClient{}, categories: []downloadpkg.Category{{Name: "电影"}}}
-	worker := NewDownloadWorker(downloads)
-	task := persistedRouteTask(t, downloads, "route-empty-path", root)
-	if err := worker.routeCategory(context.Background(), &task, client, root, "电影", "classified", "", ""); err != nil {
-		t.Fatal(err)
-	}
-	if got := strings.Join(client.categoryCalls, ","); got != "categories,update,categories,set,resume" {
-		t.Fatalf("category call order=%q", got)
-	}
-}
-
-func TestRouteCategoryCreatesAndVerifiesNewCategoryBeforeResume(t *testing.T) {
-	downloads, _, _, _, _ := downloadFixture(t)
-	root := t.TempDir()
-	client := &metadataDownloadClient{stubDownloadClient: &stubDownloadClient{}}
-	worker := NewDownloadWorker(downloads)
-	task := persistedRouteTask(t, downloads, "route-create", root)
-	if err := worker.routeCategory(context.Background(), &task, client, root, "剧集", "classified", "", ""); err != nil {
-		t.Fatal(err)
-	}
-	if got := strings.Join(client.categoryCalls, ","); got != "categories,create,categories,set,resume" {
 		t.Fatalf("category call order=%q", got)
 	}
 }

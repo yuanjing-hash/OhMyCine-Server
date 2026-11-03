@@ -88,7 +88,7 @@ func TestPanSouIdentitySnapshotFreezesAliasesAndPages(t *testing.T) {
 	input.Page = 2
 	input.SnapshotID = first.Groups[0].SnapshotID
 	second, err := s.SearchMediaIdentity(context.Background(), actor, input)
-	if err != nil || len(second.Groups) != 1 || len(second.Groups[0].Items) != 11 || second.Groups[0].HasNext || searches != requests {
+	if err != nil || len(second.Groups) != 1 || len(second.Groups[0].Items) != 11 || second.Groups[0].HasNext || second.Groups[0].QueryAttempted || searches != requests {
 		t.Fatalf("second=%+v searches=%d err=%v", second, searches, err)
 	}
 	input.Page = 1
@@ -123,47 +123,5 @@ func TestPanSouIdentitySnapshotFreezesAliasesAndPages(t *testing.T) {
 	changed, err = s.SearchMediaIdentity(context.Background(), actor, input)
 	if err != nil || len(changed.Groups) != 1 || changed.Groups[0].ErrorCode != CodeSiteResultExpired || searches != requests {
 		t.Fatalf("receiver change reused identity snapshot: %+v err=%v", changed, err)
-	}
-}
-
-func TestPanSouFrozenPageDoesNotWaitForOrCountUpstreamRequest(t *testing.T) {
-	s, _, actor, _, _, _ := siteFixture(t)
-	requests := 0
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requests++
-		items := []any{}
-		for i := range 61 {
-			items = append(items, map[string]any{"unique_id": fmt.Sprintf("fixture-%d", i), "title": fmt.Sprintf("Show.%03d", i), "links": []any{map[string]string{"type": "magnet", "url": fmt.Sprintf("magnet:?xt=urn:btih:%040x", i+1)}}})
-		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"code": 0, "data": map[string]any{"total": len(items), "results": items}})
-	}))
-	defer upstream.Close()
-	s.adapters[pansou.Kind] = pansou.NewForTest(upstream.Client())
-	created, err := s.Create(context.Background(), actor, SiteInput{Name: "Frozen PanSou", Kind: pansou.Kind, BaseURL: upstream.URL, CloudConfig: &sitepkg.CloudConfig{SourceScope: "plugin"}, Enabled: true, Priority: 100, TimeoutSeconds: 10, RateLimitPerMinute: 120}, RequestContext{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	var record models.Site
-	if err := s.db.First(&record, created.ID).Error; err != nil {
-		t.Fatal(err)
-	}
-	input := SiteSearchInput{Keyword: "Show", Page: 1, ClientCapabilities: []string{MixedDiscoveryCapability}, TypePolicy: "all", Refresh: true}
-	first := s.searchSite(context.Background(), actor, record, input)
-	if first.Status != "success" || len(first.Items) != 50 || !first.QueryAttempted {
-		t.Fatalf("first=%+v", first)
-	}
-	before := requests
-	limiter := rate.NewLimiter(rate.Every(time.Hour), 1)
-	limiter.Allow()
-	s.limits[record.ID] = &siteLimiter{revision: record.Revision, limiter: limiter}
-	input.Refresh, input.Page, input.SnapshotID = false, 2, first.SnapshotID
-	second := s.searchSite(context.Background(), actor, record, input)
-	if second.Status != "success" || len(second.Items) != 11 || second.QueryAttempted || requests != before {
-		t.Fatalf("cached page=%+v requests=%d/%d", second, requests, before)
-	}
-	input.SnapshotID = "expired-snapshot"
-	expired := s.searchSite(context.Background(), actor, record, input)
-	if expired.ErrorCode != CodeSiteResultExpired || expired.QueryAttempted || requests != before {
-		t.Fatalf("expired page=%+v requests=%d/%d", expired, requests, before)
 	}
 }

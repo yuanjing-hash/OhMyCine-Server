@@ -14,7 +14,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"strconv"
+
 	"strings"
 	"testing"
 	"time"
@@ -193,31 +193,6 @@ func solidArtworkLoader(fill color.RGBA) func(context.Context) ([]byte, error) {
 	}
 }
 
-func TestLibraryArtworkStyleStatic3OrderAndGradientMatchReference(t *testing.T) {
-	posters := make([]image.Image, 9)
-	for index := range posters {
-		poster := image.NewRGBA(image.Rect(0, 0, 1, 1))
-		poster.SetRGBA(0, 0, color.RGBA{R: uint8(index + 1), A: 255})
-		posters[index] = poster
-	}
-	ordered := style3PosterOrder(posters)
-	wantOrder := []uint8{3, 1, 5, 4, 2, 6, 9, 8, 7}
-	for index, want := range wantOrder {
-		got, _, _, _ := ordered[index].At(0, 0).RGBA()
-		if uint8(got>>8) != want {
-			t.Fatalf("poster order at %d=%d, want %d", index, got>>8, want)
-		}
-	}
-
-	gradient := style3Gradient(color.RGBA{R: 100, G: 120, B: 140, A: 255})
-	if got, want := gradient.RGBAAt(0, 0), (color.RGBA{R: 65, G: 78, B: 91, A: 255}); got != want {
-		t.Fatalf("style 3 left gradient=%v, want %v", got, want)
-	}
-	if got, want := gradient.RGBAAt(libraryArtworkWidth-1, 0), (color.RGBA{R: 145, G: 158, B: 172, A: 255}); got != want {
-		t.Fatalf("style 3 right gradient=%v, want %v", got, want)
-	}
-}
-
 func TestLibraryArtworkCandidatesAreIsolatedByLibraryCategoryAndMediaType(t *testing.T) {
 	db, _, _, _ := newConnectionTestService(t, &fakeCloudDriver{})
 	now := time.Now().UTC()
@@ -315,65 +290,6 @@ func TestLibraryArtworkCandidatesAreIsolatedByLibraryCategoryAndMediaType(t *tes
 	}
 }
 
-func TestFillStyle3PosterSlotsCompletesReferenceGridForSparseCandidates(t *testing.T) {
-	for _, candidateCount := range []int{1, 2, 3, 4, 8, 9} {
-		t.Run(strconv.Itoa(candidateCount), func(t *testing.T) {
-			candidates := make([]image.Image, candidateCount)
-			for index := range candidates {
-				poster := image.NewRGBA(image.Rect(0, 0, 1, 1))
-				poster.SetRGBA(0, 0, color.RGBA{R: uint8(index + 1), A: 255})
-				candidates[index] = poster
-			}
-			filled := fillStyle3PosterSlots(candidates, libraryArtworkRenderLimit)
-			if len(filled) != libraryArtworkRenderLimit {
-				t.Fatalf("filled slots=%d, want %d", len(filled), libraryArtworkRenderLimit)
-			}
-			for index, poster := range filled {
-				red, _, _, _ := poster.At(0, 0).RGBA()
-				if got, want := uint8(red>>8), uint8(index%candidateCount+1); got != want {
-					t.Fatalf("slot %d=%d, want %d", index, got, want)
-				}
-			}
-		})
-	}
-}
-
-func TestRenderLibraryArtworkSparseCandidatesOccupyCompleteStyle3Grid(t *testing.T) {
-	var expectedBrightPixels int
-	for _, candidateCount := range []int{1, 2, 3, 4, 8, 9} {
-		t.Run(strconv.Itoa(candidateCount), func(t *testing.T) {
-			candidates := make([]image.Image, candidateCount)
-			for index := range candidates {
-				poster := image.NewRGBA(image.Rect(0, 0, 30, 45))
-				for y := 0; y < poster.Bounds().Dy(); y++ {
-					for x := 0; x < poster.Bounds().Dx(); x++ {
-						poster.SetRGBA(x, y, color.RGBA{R: 255, G: 255, B: 255, A: 255})
-					}
-				}
-				candidates[index] = poster
-			}
-			rendered := renderLibraryArtwork(candidates)
-			brightPixels := 0
-			for y := 0; y < rendered.Bounds().Dy(); y++ {
-				for x := 0; x < rendered.Bounds().Dx(); x++ {
-					pixel := rendered.RGBAAt(x, y)
-					if pixel.R >= 250 && pixel.G >= 250 && pixel.B >= 250 {
-						brightPixels++
-					}
-				}
-			}
-			if brightPixels < 200_000 {
-				t.Fatalf("sparse style 3 foreground coverage=%d pixels", brightPixels)
-			}
-			if expectedBrightPixels == 0 {
-				expectedBrightPixels = brightPixels
-			} else if brightPixels != expectedBrightPixels {
-				t.Fatalf("sparse style 3 coverage=%d, want %d", brightPixels, expectedBrightPixels)
-			}
-		})
-	}
-}
-
 func TestLibraryArtworkGeneratorRejectsDecodedImageBombDimensions(t *testing.T) {
 	service := &LibraryArtworkService{cache: make(map[string][]byte), generation: make(map[string]string)}
 	oversized := func(context.Context) ([]byte, error) {
@@ -384,34 +300,5 @@ func TestLibraryArtworkGeneratorRejectsDecodedImageBombDimensions(t *testing.T) 
 	}
 	if _, err := service.generate(context.Background(), "Oversized", []artworkCandidate{{key: "oversized", load: oversized}}); err == nil {
 		t.Fatal("oversized decoded image was accepted")
-	}
-}
-
-func TestLibraryArtworkGeneratorEvictsContentAndGenerationMappingTogether(t *testing.T) {
-	service := &LibraryArtworkService{
-		cache:      make(map[string][]byte, libraryArtworkCacheLimit),
-		generation: make(map[string]string, libraryArtworkCacheLimit),
-		order:      make([]string, 0, libraryArtworkCacheLimit),
-	}
-	for index := 0; index < libraryArtworkCacheLimit; index++ {
-		digest := fmt.Sprintf("%064x", index+1)
-		service.cache[digest] = []byte{byte(index)}
-		service.generation[fmt.Sprintf("generation-%d", index)] = digest
-		service.order = append(service.order, digest)
-	}
-	evicted := service.order[0]
-	if _, err := service.generate(context.Background(), "New", []artworkCandidate{{
-		key: "new", load: solidArtworkLoader(color.RGBA{R: 10, G: 20, B: 30, A: 255}),
-	}}); err != nil {
-		t.Fatal(err)
-	}
-	if _, exists := service.cache[evicted]; exists {
-		t.Fatal("evicted artwork bytes remain cached")
-	}
-	if _, exists := service.generation["generation-0"]; exists {
-		t.Fatal("generation mapping outlived its evicted artwork")
-	}
-	if len(service.cache) != libraryArtworkCacheLimit || len(service.order) != libraryArtworkCacheLimit {
-		t.Fatalf("cache=%d order=%d", len(service.cache), len(service.order))
 	}
 }

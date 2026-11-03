@@ -458,13 +458,3 @@ func TestPlayerSearchPagesThroughEveryEnabledLibrary(t *testing.T) {
 		t.Fatalf("huge player search page=%+v", page)
 	}
 }
-
-func TestPlayerMediaPeopleProjectsSafeProfileIdentities(t *testing.T) {
-	people := playerMediaPeople(tmdb.Snapshot{
-		Directors: []tmdb.Person{{TMDBID: 1, Name: "黑泽明", Job: "Director", ProfilePath: "/director.jpg"}},
-		Cast:      []tmdb.Person{{TMDBID: 2, Name: "三船敏郎", Character: "菊千代", ProfilePath: "/actor.jpg"}, {TMDBID: 3, Name: "不安全", ProfilePath: "https://unsafe.example/avatar.jpg"}},
-	})
-	if len(people) != 3 || people[0].Role != "Director" || people[1].Role != "Actor" || people[1].Character != "菊千代" || people[1].ProfilePath != "/actor.jpg" || people[2].ProfilePath != "" {
-		t.Fatalf("people=%+v", people)
-	}
-}

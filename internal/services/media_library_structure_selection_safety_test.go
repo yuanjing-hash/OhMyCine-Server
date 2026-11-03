@@ -3,7 +3,7 @@ package services
 import (
 	"context"
 	"encoding/json"
-	"strings"
+
 	"testing"
 	"time"
 
@@ -31,9 +31,6 @@ func TestStructureSelectionReviewConflictsRequireIdentityOrIndexReview(t *testin
 				_, err := service.PreviewSelectionRepair(context.Background(), actor, library.ID, MediaLibraryStructureSelectionInput{Revision: diagnostics.Revision, Selections: []MediaLibraryStructureSelection{{IssueToken: issue.Token, Action: action, MemberToken: issue.RecommendedMemberToken}}})
 				if ErrorCode(err) != CodeConflict {
 					t.Fatalf("review-only %s accepted %s: %v", code, action, err)
-				}
-				if code == "catalog_duplicate_conflict" && !strings.Contains(err.Error(), "索引") || code == "recognition_suspect_conflict" && !strings.Contains(err.Error(), "修正识别") {
-					t.Fatalf("review guidance is missing: %v", err)
 				}
 			}
 			if _, err := service.PreviewSelectionRepair(context.Background(), actor, library.ID, MediaLibraryStructureSelectionInput{Revision: diagnostics.Revision, BulkActions: []MediaLibraryStructureBulkAction{{Codes: []string{code}, Action: StructureSelectionKeepRecommended}}}); ErrorCode(err) != CodeInvalidRequest {

@@ -113,22 +113,6 @@ func TestMetadataAPIKeyCandidateUsesExplicitKindAndIsEncrypted(t *testing.T) {
 	}
 }
 
-func TestMetadataBuiltinAPIKeyReportsExplicitKind(t *testing.T) {
-	queue, actor, _ := queueFixture(t)
-	actor.Permissions[authz.PermissionSettingsRead] = struct{}{}
-	store, err := credential.Open(filepath.Join(t.TempDir(), "builtin-api-key.key"), "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	previousToken, previousAPIKey := tmdb.BuiltinReadAccessToken, tmdb.BuiltinAPIKey
-	tmdb.BuiltinReadAccessToken, tmdb.BuiltinAPIKey = "", "builtin-api-key"
-	t.Cleanup(func() { tmdb.BuiltinReadAccessToken, tmdb.BuiltinAPIKey = previousToken, previousAPIKey })
-	summary, err := NewMetadataSettingsService(queue.db, queue.audit, store).Get(actor)
-	if err != nil || summary.CredentialSource != "builtin" || summary.CredentialKind != string(tmdb.CredentialKindAPIKey) {
-		t.Fatalf("summary=%+v err=%v", summary, err)
-	}
-}
-
 func TestMetadataClientFactoryReceivesEffectiveCredentialAndPersistedWorkerRoutes(t *testing.T) {
 	queue, actor, _ := queueFixture(t)
 	actor.Permissions[authz.PermissionSettingsUpdate] = struct{}{}

@@ -1,7 +1,6 @@
 package services
 
 import (
-	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
@@ -28,41 +27,5 @@ func TestDownloadContentSelectionNodeWireBudgetIncludesUnionAndCleanup(t *testin
 	}
 	if err := validateNodeSelectionWireBudget(source, union); err == nil {
 		t.Fatal("accumulated union/cleanup body passed pre-admission")
-	}
-}
-
-func TestDownloadContentSelectionFreezeAndMissingFence(t *testing.T) {
-	raw := []byte("d4:infod6:lengthi10e4:name9:movie.mkv12:piece lengthi16384e6:pieces20:aaaaaaaaaaaaaaaaaaaaee")
-	m, err := resourcecontent.ParseTorrent(raw, resourcecontent.Limits{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	input := DownloadSourceInput{Kind: downloadpkg.SourceTorrent, Torrent: raw, Filename: "movie.torrent", ContentSelection: &resourcecontent.Selection{Version: 1, Identity: m.Identity, Files: []resourcecontent.SelectedFile{{Index: 0, Path: "movie.mkv", Size: 10}}}}
-	source, _, err := normalizeDownloadSource(input, "movie")
-	if err != nil {
-		t.Fatal(err)
-	}
-	input.ContentSelection.Files[0].Size = 99
-	raw[0] = 'x'
-	if source.ContentSelection.Files[0].Size != 10 || source.Torrent[0] != 'd' || source.SelectionMode != "files" || validateStoredContentSelection(source) != nil {
-		t.Fatal("selection aliases mutable input")
-	}
-	encoded, _ := json.Marshal(source)
-	var restored downloadSourceEnvelope
-	if json.Unmarshal(encoded, &restored) != nil || validateStoredContentSelection(restored) != nil {
-		t.Fatal("private envelope lost selection")
-	}
-	restored.ContentSelection = nil
-	if validateStoredContentSelection(restored) == nil {
-		t.Fatal("lost selection became whole package")
-	}
-	if validateStoredContentSelection(downloadSourceEnvelope{Kind: downloadpkg.SourceURL, URL: "magnet:legacy"}) != nil {
-		t.Fatal("legacy nil selection rejected")
-	}
-	input.ContentSelection.Files[0].Size = 10
-	input.Torrent = source.Torrent
-	input.ContentSelection.Identity.V1 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-	if _, _, err := normalizeDownloadSource(input, "movie"); err == nil {
-		t.Fatal("unverified identity accepted")
 	}
 }

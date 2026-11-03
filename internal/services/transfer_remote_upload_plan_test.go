@@ -23,6 +23,15 @@ func TestRemoteNodeUploadPlanFreezesConflictDecisionBeforeDispatch(t *testing.T)
 		t.Run(test.policy, func(t *testing.T) {
 			fixture := newUploadTransferFixture(t, test.policy, true)
 			worker := NewTransferWorker(fixture.service)
+			if test.policy == models.MediaLibraryConflictRename {
+				directory := fixture.driver.items[fixture.targetDirID]
+				delete(fixture.driver.items, fixture.targetDirID)
+				planned, conflicts, err := worker.planRemoteNodeUpload(context.Background(), fixture.download, fixture.manifest, test.policy)
+				if err != nil || conflicts != 0 || len(planned) != 1 || planned[0].Relative != "电影/Movie (2024).mkv" || planned[0].ConflictAction != remoteUploadFailIfExists || fixture.driver.uploadCalls != 0 {
+					t.Fatalf("missing directory mutated or renamed: conflicts=%d plan=%+v err=%v", conflicts, planned, err)
+				}
+				fixture.driver.items[fixture.targetDirID] = directory
+			}
 			planned, conflicts, err := worker.planRemoteNodeUpload(context.Background(), fixture.download, fixture.manifest, test.policy)
 			if err != nil {
 				t.Fatal(err)
@@ -66,20 +75,5 @@ func TestRemoteNodeUploadPersistedPlanMustCoverExactFrozenSourceSet(t *testing.T
 	})
 	if _, found, err := worker.loadRemoteUploadFiles(context.Background(), task, fixture.download, changed); err == nil || !found {
 		t.Fatalf("changed frozen source set accepted: found=%v err=%v", found, err)
-	}
-}
-
-func TestRemoteNodeUploadPlanDoesNotMutateOrRenameWhenTargetDirectoryIsMissing(t *testing.T) {
-	fixture := newUploadTransferFixture(t, models.MediaLibraryConflictRename, false)
-	delete(fixture.driver.items, fixture.targetDirID)
-	planned, conflicts, err := NewTransferWorker(fixture.service).planRemoteNodeUpload(context.Background(), fixture.download, fixture.manifest, models.MediaLibraryConflictRename)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if conflicts != 0 || len(planned) != 1 || planned[0].Relative != "电影/Movie (2024).mkv" || planned[0].ConflictAction != remoteUploadFailIfExists {
-		t.Fatalf("conflicts=%d plan=%+v", conflicts, planned)
-	}
-	if fixture.driver.uploadCalls != 0 {
-		t.Fatalf("planning performed upload: %d", fixture.driver.uploadCalls)
 	}
 }

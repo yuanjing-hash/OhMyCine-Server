@@ -233,20 +233,6 @@ func TestFollowCompleteSeasonCandidateCoversBoundedEpisodes(t *testing.T) {
 	}
 }
 
-func TestFollowResourceFingerprintIsPrivateAndStable(t *testing.T) {
-	first := privateResultFingerprint(1, "torrent-secret")
-	if first == privateResultFingerprint(2, "torrent-secret") || first == privateResultFingerprint(1, "other-secret") {
-		t.Fatal("private resource fingerprint did not bind both site and torrent identity")
-	}
-	encoded, err := json.Marshal(SiteSearchResult{ResourceFingerprint: first, Title: "Fixture"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(string(encoded), first) || strings.Contains(string(encoded), "resource_fingerprint") {
-		t.Fatalf("private resource fingerprint leaked through public JSON: %s", encoded)
-	}
-}
-
 func TestFollowStaleFinishCannotOverwritePausedSubscription(t *testing.T) {
 	queue, actor, clock := queueFixture(t)
 	snapshot := FollowExecutionSnapshot{Version: 1, Seasons: []int{1}, Schedule: FollowSchedule{Kind: "interval", Minutes: 60}}

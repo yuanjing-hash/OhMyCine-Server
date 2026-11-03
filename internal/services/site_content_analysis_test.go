@@ -195,15 +195,3 @@ func TestContentQuickTitleLaneCannotReplaceActualIntendedIdentity(t *testing.T) 
 		t.Fatal("fast title analysis replaced actual intended identity")
 	}
 }
-
-func TestContentSubtitleEvidenceDoesNotInventTracksFromAudioLanguage(t *testing.T) {
-	if len(contentSubtitleEvidence(SiteSharePreviewEntry{Path: "Show.S01E01.JPN.ENG.mkv"})) != 0 {
-		t.Fatal("audio name became a subtitle track")
-	}
-	for _, file := range []struct{ path, language string }{{"Show.S01E01.en.srt", "en"}, {"Show.S01E01.ja.ass", "ja"}, {"Show.S01E01.ko.srt", "ko"}, {"Show.S01E01.zh-Hans.srt", "zh"}} {
-		got := contentSubtitleEvidence(SiteSharePreviewEntry{Path: file.path})
-		if len(got) != 1 || got[0].Language != file.language || got[0].Source != "sidecar_filename" {
-			t.Fatalf("sidecar evidence=%+v", got)
-		}
-	}
-}

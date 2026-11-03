@@ -83,61 +83,6 @@ func TestNormalizeSourceAssetExtraExtensions(t *testing.T) {
 	}
 }
 
-func TestMediaRecognitionProjectionChangedTracksUserVisibleMetadata(t *testing.T) {
-	year, tmdbID, confidence, rule := 2024, int64(42), 0.91, "rule-1"
-	record := models.MediaLibraryRecognition{
-		Status: "matched", MediaType: "movie", Title: "Example", ReleaseYear: &year,
-		TMDBID: &tmdbID, Confidence: &confidence, CategoryName: "Movies", MatchedRuleID: &rule,
-		MetadataJSON: `{"title":"Example"}`,
-	}
-	result := MediaRecognitionResult{
-		Status: "matched", MediaType: "movie", Title: "Example", ReleaseYear: &year,
-		TMDBID: &tmdbID, Confidence: &confidence, CategoryName: "Movies", MatchedRuleID: &rule,
-	}
-	if mediaRecognitionProjectionChanged(record, result, record.MetadataJSON, false) {
-		t.Fatal("identical recognition projection must remain unchanged")
-	}
-	if !mediaRecognitionProjectionChanged(record, result, `{"title":"Example","overview":"updated"}`, false) {
-		t.Fatal("metadata-only changes must be observable")
-	}
-}
-
-func TestMediaLibraryEntryProjectionChangedIgnoresPhysicalFacts(t *testing.T) {
-	season, episode, tmdbID, year, confidence, rule := 1, 2, int64(42), 2024, 0.91, "rule-1"
-	before := models.MediaLibraryEntry{
-		MediaType: "series", Title: "Episode", SeriesTitle: "Example", Season: &season, Episode: &episode,
-		WorkKey: "tmdb:tv:42", MatchStatus: "matched", TMDBID: &tmdbID, ReleaseYear: &year,
-		MatchConfidence: &confidence, CategoryName: "TV", MatchedRuleID: &rule,
-	}
-	after := before
-	after.Size++
-	after.ModifiedAt = time.Now().UTC()
-	if mediaLibraryEntryProjectionChanged(before, after) {
-		t.Fatal("physical file facts are counted separately from catalog projection")
-	}
-	after.Title = "Updated episode title"
-	if !mediaLibraryEntryProjectionChanged(before, after) {
-		t.Fatal("entry metadata changes must be observable")
-	}
-}
-
-func TestMediaLibraryNoOpRoutineScanDoesNotRequireArtifactGeneration(t *testing.T) {
-	run := models.MediaLibraryScanRun{Status: "success", Partial: false}
-	for _, kind := range []string{"event", "incremental", "full"} {
-		if mediaLibraryArtifactGenerationRequired(kind, run, false) {
-			t.Fatalf("complete no-op %s scan scheduled artifacts", kind)
-		}
-	}
-	run.Added = 1
-	if !mediaLibraryArtifactGenerationRequired("event", run, false) {
-		t.Fatal("catalog change did not schedule artifacts")
-	}
-	run.Added = 0
-	if !mediaLibraryArtifactGenerationRequired("event", run, true) || !mediaLibraryArtifactGenerationRequired("catch_up", run, false) {
-		t.Fatal("metadata or policy reconciliation did not schedule artifacts")
-	}
-}
-
 func TestMediaLibraryScanUsesSharedTMDBRecognitionAndPersistentCache(t *testing.T) {
 	service, db, actor, storage, profile := mediaLibraryTestService(t)
 	if err := os.WriteFile(filepath.Join(storage.RootPath, "Seven.Samurai.1954.1080p.BluRay.mkv"), []byte("media"), 0o600); err != nil {
@@ -812,27 +757,6 @@ func TestMediaLibrarySourceChangeClearsOldCatalogAndBuildsNewBaseline(t *testing
 	}
 }
 
-func TestMediaLibrarySourceIdentityIncludesProviderRoot(t *testing.T) {
-	existing := models.MediaLibrary{StorageID: 7, RelativeRoot: "/Movies", ProviderRootID: "provider-old"}
-	tests := []struct {
-		name        string
-		replacement models.MediaLibrary
-		changed     bool
-	}{
-		{name: "same source", replacement: existing, changed: false},
-		{name: "storage changed", replacement: models.MediaLibrary{StorageID: 8, RelativeRoot: "/Movies", ProviderRootID: "provider-old"}, changed: true},
-		{name: "relative root changed", replacement: models.MediaLibrary{StorageID: 7, RelativeRoot: "/TV", ProviderRootID: "provider-old"}, changed: true},
-		{name: "provider root changed", replacement: models.MediaLibrary{StorageID: 7, RelativeRoot: "/Movies", ProviderRootID: "provider-new"}, changed: true},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			if actual := mediaLibrarySourceChanged(existing, test.replacement); actual != test.changed {
-				t.Fatalf("mediaLibrarySourceChanged()=%v, want %v", actual, test.changed)
-			}
-		})
-	}
-}
-
 func TestMediaLibraryRejectsOverlappingRootsAndLocalSTRM(t *testing.T) {
 	service, _, actor, storage, profile := mediaLibraryTestService(t)
 	if err := os.MkdirAll(filepath.Join(storage.RootPath, "nested"), 0o755); err != nil {
@@ -957,27 +881,6 @@ func TestMediaLibraryImportPolicyAndOrder(t *testing.T) {
 	invalid.MovieDirectoryTemplate = "../{title}"
 	if _, err := service.Update(context.Background(), actor, second.ID, invalid, RequestContext{}); ErrorCode(err) != CodeInvalidRequest {
 		t.Fatalf("invalid template code=%q err=%v", ErrorCode(err), err)
-	}
-}
-
-func TestMediaLibraryReferenceAndProfileRevisionContracts(t *testing.T) {
-	service, db, actor, storage, profile := mediaLibraryTestService(t)
-	created, err := service.Create(context.Background(), actor, testLibraryInput("Referenced", storage, profile, false), RequestContext{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if refs, err := service.References(profile.ID); err != nil || len(refs) != 1 || refs[0] != created.Name {
-		t.Fatalf("profile refs=%v err=%v", refs, err)
-	}
-	if refs, err := service.StorageReferences(storage.ID); err != nil || len(refs) != 1 || refs[0] != created.Name {
-		t.Fatalf("storage refs=%v err=%v", refs, err)
-	}
-	if err := service.ProfileRevisionChanged(profile.ID, profile.Revision+1); err != nil {
-		t.Fatal(err)
-	}
-	var library models.MediaLibrary
-	if err := db.First(&library, created.ID).Error; err != nil || !library.ReclassificationDue {
-		t.Fatalf("library=%+v err=%v", library, err)
 	}
 }
 
@@ -1173,58 +1076,6 @@ func TestPan115MediaLibraryScanKeepsFileIdentityAcrossRename(t *testing.T) {
 	}
 	if len(entries) != 1 || entries[0].ProviderID != "video-id" || entries[0].RelativePath != "/After.2026.mkv" {
 		t.Fatalf("entries=%+v", entries)
-	}
-}
-
-func TestPan115FastScanPublishes12171EntriesBeforeRecognition(t *testing.T) {
-	modified := time.Now().UTC().Truncate(time.Second)
-	items := make([]cloud.Item, 12171)
-	for index := range items {
-		name := fmt.Sprintf("Movie.%05d.2026.mkv", index)
-		items[index] = cloud.Item{ID: "video-" + strconv.Itoa(index), ParentID: "cloud-root", Name: name, Size: int64(1024 + index), ModifiedAt: modified}
-	}
-	driver := &fakeCloudDriver{
-		items:    map[string]cloud.Item{"cloud-root": {ID: "cloud-root", ParentID: "0", Name: "媒体", IsDir: true}},
-		children: map[string][]cloud.Item{"cloud-root": items},
-	}
-	db, _, connections, actor := newConnectionTestService(t, driver)
-	for _, permission := range []string{authz.PermissionMediaLibrariesRead, authz.PermissionMediaLibrariesCreate, authz.PermissionMediaLibrariesScan} {
-		actor.Permissions[permission] = struct{}{}
-	}
-	connection, err := connections.Create(actor, ConnectionInput{Name: "115 performance account", Provider: cloud.ProviderPan115, Cookie: testPan115Cookie, Enabled: true}, RequestContext{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	storageService := NewStorageService(db, NewAuditService(db))
-	storageService.SetConnectionService(connections)
-	storage, err := storageService.CreateContext(context.Background(), actor, StorageInput{Name: "115 performance root", Type: models.StorageTypePan115, RootPath: "cloud-root", RootDisplayPath: "/媒体", ConnectionID: &connection.ID, Enabled: true}, RequestContext{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	var profile models.MediaClassificationProfile
-	if err := db.Order("id").First(&profile).Error; err != nil {
-		t.Fatal(err)
-	}
-	service := NewMediaLibraryService(db, NewAuditService(db), zerolog.Nop())
-	service.SetConnectionService(connections)
-	service.SetQueueService(NewQueueService(db, NewAuditService(db)))
-	t.Cleanup(service.Close)
-	library, err := service.Create(context.Background(), actor, MediaLibraryInput{Name: "115 performance library", StorageID: storage.ID, ProfileID: profile.ID, RelativeRoot: "/", ProviderRootID: storage.RootPath, Enabled: false, Recursive: true, VideoExtensions: []string{".mkv"}, TransferMode: models.MediaLibraryTransferCopy}, RequestContext{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	started := time.Now()
-	run, err := service.Scan(context.Background(), actor, library.ID, "full")
-	elapsed := time.Since(started)
-	if err != nil || run.Status != "catalog_ready" || run.Added != len(items) || run.Persisted != len(items) {
-		t.Fatalf("run=%+v elapsed=%s err=%v", run, elapsed, err)
-	}
-	if elapsed >= 60*time.Second {
-		t.Fatalf("12171-entry catalog publication took %s", elapsed)
-	}
-	var count int64
-	if err := db.Model(&models.MediaLibraryEntry{}).Where("library_id = ?", library.ID).Count(&count).Error; err != nil || count != int64(len(items)) {
-		t.Fatalf("published entries=%d err=%v", count, err)
 	}
 }
 

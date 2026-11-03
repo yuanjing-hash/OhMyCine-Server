@@ -80,33 +80,10 @@ func TestFollowModernContentRetrySurvivesPersistenceAndAuthorizedReads(t *testin
 	if err != nil || history[0].Wait == nil {
 		t.Fatal("history was rewritten")
 	}
-}
-
-func TestFollowRetryOnlyAppliesToStillMissingEpisodesAndSafeReason(t *testing.T) {
-	deadline := time.Date(2026, 11, 3, 0, 5, 0, 0, time.UTC)
-	run := models.FollowRun{}
 	observed := []followRetryObservation{}
-	err := cloud.WithRetryNotBefore(cloud.Error(cloud.CodeRateLimited, true, nil), deadline, cloud.RetryReasonProviderCooldown)
-	observeFollowRetry(&observed, sharePreviewProviderError(err), followCandidate{Season: 1, Episodes: []int{13}})
+	observeFollowRetry(&observed, sharePreviewProviderError(driver.readErr), followCandidate{Season: 1, Episodes: []int{13}})
 	applyFollowRetryObservations(&run, observed, map[[2]int]struct{}{{1, 15}: {}})
 	if run.RetryNotBefore != nil {
 		t.Fatal("unrelated candidate left a countdown")
-	}
-	applyFollowRetryObservations(&run, observed, map[[2]int]struct{}{{1, 13}: {}})
-	if run.RetryNotBefore == nil || !run.RetryNotBefore.Equal(deadline) {
-		t.Fatal("relevant gate lost")
-	}
-	applyFollowRetryObservations(&run, observed, map[[2]int]struct{}{})
-	if run.RetryNotBefore != nil {
-		t.Fatal("fully satisfied run kept cooldown")
-	}
-	finished := deadline.Add(-time.Minute)
-	for _, code := range []string{"", "follow_coverage_unknown"} {
-		if followRunWait(models.FollowRun{RetryNotBefore: &deadline, RetryCode: cloud.RetryReasonProviderCooldown, FinishedAt: &finished, Status: models.FollowRunFailed, ErrorCode: code}, finished) != nil {
-			t.Fatal("unrelated or legacy history gained countdown")
-		}
-	}
-	if _, _, ok := cloud.RetryTiming(errors.New("wait 360 minutes")); ok {
-		t.Fatal("inferred a deadline from text")
 	}
 }

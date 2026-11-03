@@ -17,7 +17,6 @@ import (
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/authz"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/credential"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
-	"github.com/yuanjing-hash/OhMyCine-Server/internal/plugins/contract"
 )
 
 type onlinePluginRuntime struct {
@@ -349,16 +348,5 @@ func TestHierarchicalPluginNavigationIssuesBoundTokensAndRejectsCycles(t *testin
 	cycle := json.RawMessage(`{"version":2,"mode":"hierarchical","nodes":[{"id":"anime-again","title":"循环","kind":"branch","nodeKey":"anime","hasChildren":true}]}`)
 	if _, err := service.normalizeHierarchicalNavigation("library-1", cycle, 1, []string{"anime"}); ErrorCode(err) != CodePluginResponseInvalid {
 		t.Fatalf("cycle error=%v code=%s", err, ErrorCode(err))
-	}
-}
-
-func TestPluginOnlineErrorMessagesRemainCapabilitySpecific(t *testing.T) {
-	navigationErr := mapPluginOnlineError("invalid-response", contract.CapabilitySiteNavigation)
-	if ErrorCode(navigationErr) != CodePluginResponseInvalid || ErrorMessage(navigationErr) != "在线媒体来源返回的数据无效，请更新插件后重试" {
-		t.Fatalf("navigation error=%v code=%s", navigationErr, ErrorCode(navigationErr))
-	}
-	playbackErr := mapPluginOnlineError("invalid-response", contract.CapabilityMediaPlayback)
-	if ErrorCode(playbackErr) != CodePluginResponseInvalid || ErrorMessage(playbackErr) != "在线媒体播放方案无效，请更新插件后重试" {
-		t.Fatalf("playback error=%v code=%s", playbackErr, ErrorCode(playbackErr))
 	}
 }

@@ -98,7 +98,7 @@ func TestContentInspectionRejectsAccountChangeDuringRead(t *testing.T) {
 
 func TestContentInspectionParsesTorrentWithoutAnyDownloaderAndFreezesOriginalIndices(t *testing.T) {
 	s, stub, actor, _, downloads, downloaders := siteFixture(t)
-	raw := inspectionTorrent("Season 01/01.mkv", "Season 01/13.mkv", "Season 01/13.zh-Hans.srt", "Season 01/15.mkv")
+	raw := inspectionTorrentWithSize(32<<20, "Season 01/01.mkv", "Season 01/Fixture.Show.S01E13.JPN.ENG.mkv", "Season 01/Fixture.Show.S01E13.JPN.ENG.zh-Hans.srt", "Season 01/15.mkv", "Season 01/Fixture.Show.S01E13-E14.2160p.mkv")
 	s.adapters["mikan"] = &stubResolverAdapter{stubSiteAdapter: &stubSiteAdapter{kind: "mikan"}, resolved: sitepkg.Source{Torrent: raw}}
 	created, err := s.Create(context.Background(), actor, SiteInput{Name: "Content fixture", Kind: "mikan", BaseURL: "https://mikanani.me", Enabled: true, Priority: 1, TimeoutSeconds: 15, RateLimitPerMinute: 120}, RequestContext{})
 	if err != nil {
@@ -107,17 +107,23 @@ func TestContentInspectionParsesTorrentWithoutAnyDownloaderAndFreezesOriginalInd
 	claim := siteResultClaim{ActorID: actor.User.ID, SiteID: created.ID, SiteRevision: created.Revision, TorrentID: "42", Title: "Advertisement 1-99", SearchIdentity: analysisIdentity(), ExpiresAt: s.now().Add(time.Minute)}
 	token := issueAnalysisClaim(t, s, claim)
 	preview, err := s.PreviewContent(context.Background(), actor, ContentPreviewInput{ResultToken: token})
-	if err != nil || !preview.Complete || preview.TotalCount != 4 {
+	if err != nil || !preview.Complete || preview.TotalCount != 5 {
 		t.Fatalf("content=%+v err=%v", preview, err)
 	}
 	var selected []string
 	for _, file := range preview.Files {
-		if strings.HasSuffix(file.Path, "/13.mkv") || strings.HasSuffix(file.Path, "/15.mkv") {
+		if strings.HasSuffix(file.Path, ".zh-Hans.srt") && (len(file.Subtitles) != 1 || file.Subtitles[0].Language != "zh" || file.Subtitles[0].Source != "sidecar_filename") {
+			t.Fatalf("actual sidecar lost language evidence: %+v", file)
+		}
+		if strings.HasSuffix(file.Path, "/Fixture.Show.S01E13.JPN.ENG.mkv") || strings.HasSuffix(file.Path, "/15.mkv") {
 			selected = append(selected, file.Token)
+			if len(file.Subtitles) != 0 {
+				t.Fatal("audio language became a subtitle track")
+			}
 		}
 	}
 	resolved, err := s.ResolveContentSelection(context.Background(), actor, ContentSelectionInput{ResultToken: token, PreviewToken: preview.Token, SelectedEntryTokens: selected}, claim)
-	if err != nil || resolved.Torrent == nil || resolved.SelectedBytes != 200 || len(resolved.Torrent.Files) != 2 || resolved.Torrent.Files[0].Index != 1 || resolved.Torrent.Files[1].Index != 3 {
+	if err != nil || resolved.Torrent == nil || resolved.SelectedBytes != 2*(32<<20) || len(resolved.Torrent.Files) != 2 || resolved.Torrent.Files[0].Index != 1 || resolved.Torrent.Files[1].Index != 3 {
 		t.Fatalf("selected=%+v err=%v", resolved, err)
 	}
 	original, _ := resourcecontent.ParseTorrent(raw, resourcecontent.Limits{})
@@ -131,6 +137,10 @@ func TestContentInspectionParsesTorrentWithoutAnyDownloaderAndFreezesOriginalInd
 	s.db.Model(&models.DownloadTask{}).Count(&count)
 	if count != 0 {
 		t.Fatal("inspection submitted a task")
+	}
+	prepared, err := s.prepareFollowContent(context.Background(), actor, token, 1, []int{13, 14}, SubtitlePolicy{Mode: "prefer", Languages: []string{"zh-Hans"}})
+	if err != nil || !reflect.DeepEqual(prepared.Episodes, []int{13}) {
+		t.Fatalf("overlapping actual leaves were selected: prepared=%+v err=%v", prepared, err)
 	}
 	client := &stubDownloadClient{}
 	registry := downloadpkg.NewRegistry()
@@ -155,11 +165,7 @@ func TestContentInspectionParsesTorrentWithoutAnyDownloaderAndFreezesOriginalInd
 	if err := s.db.Create(&library).Error; err != nil {
 		t.Fatal(err)
 	}
-	receipt, err := s.SelectContent(context.Background(), actor, ContentSelectionInput{ResultToken: token, PreviewToken: preview.Token, SelectedEntryTokens: selected})
-	if err != nil {
-		t.Fatal(err)
-	}
-	queued, err := s.Download(context.Background(), actor, SiteDownloadInput{ResultToken: token, ContentSelectionToken: receipt.Token, DownloaderID: downloader.ID, MediaLibraryID: &library.ID}, RequestContext{})
+	queued, err := s.Download(context.Background(), actor, SiteDownloadInput{ResultToken: token, ContentMode: "files", ContentSelectionToken: prepared.SelectionToken, DownloaderID: downloader.ID, MediaLibraryID: &library.ID}, RequestContext{})
 	if err != nil {
 		t.Fatalf("actual opaque handoff failed: %v", err)
 	}
@@ -172,7 +178,7 @@ func TestContentInspectionParsesTorrentWithoutAnyDownloaderAndFreezesOriginalInd
 		t.Fatal(err)
 	}
 	var frozen downloadSourceEnvelope
-	if json.Unmarshal([]byte(plaintext), &frozen) != nil || frozen.ContentSelection == nil || frozen.SelectionMode != "files" || !bytes.Equal(frozen.Torrent, raw) || frozen.ContentSelection.Files[0].Index != 1 || frozen.ContentSelection.Files[1].Index != 3 {
+	if json.Unmarshal([]byte(plaintext), &frozen) != nil || frozen.ContentSelection == nil || frozen.SelectionMode != "files" || !bytes.Equal(frozen.Torrent, raw) || frozen.ContentSelection.Files[0].Index != 1 || len(frozen.ContentSelection.Files) != 2 || frozen.ContentSelection.Files[1].Index != 2 {
 		t.Fatal("Site handoff lost the exact selected indices or original torrent")
 	}
 	if client.submits != 0 {

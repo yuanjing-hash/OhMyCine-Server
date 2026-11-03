@@ -254,13 +254,58 @@ func TestPanSouSnapshotBindsReceiverConfigurationWithoutHealthOrTokenChurn(t *te
 	}
 }
 
+type reviewShareAuthorizationRecovery struct {
+	cloud.ShareBrowseDriver
+	resume         func()
+	resumes, reads int
+}
+
+func (d *reviewShareAuthorizationRecovery) ResumeAuthorizations(context.Context) error {
+	d.resumes++
+	d.resume()
+	return nil
+}
+
+func (d *reviewShareAuthorizationRecovery) InspectShare(ctx context.Context, raw string) (cloud.ShareSnapshot, error) {
+	return d.InspectShareDirectory(ctx, raw, "0")
+}
+
+func (d *reviewShareAuthorizationRecovery) InspectShareDirectory(context.Context, string, string) (cloud.ShareSnapshot, error) {
+	d.reads++
+	return cloud.ShareSnapshot{ShareCode: "fixture", Items: []cloud.ShareItem{{ID: "leaf", Name: "Show.S01E12.mkv", Size: 10}}}, nil
+}
+
 func TestPanSouReceiverSummaryAndPreviewRejectMissingProofBeforeProviderRead(t *testing.T) {
 	s, _, actor, _, downloads, downloaders := siteFixture(t)
 	receiver, storage, connection := seedPanSouReceiver(t, s, models.ConnectionProviderQuark)
 	if summary := downloaders.summary(actor, receiver); !summary.Capabilities.ShareReceive {
 		t.Fatal("ready receiver was hidden", summary)
 	}
-	saveQuarkTestBundle(t, downloaders.connections, connection.ID, func(c *quark.Credentials) { c.Proofs = nil })
+	connections := downloaders.connections
+	saveQuarkTestBundle(t, connections, connection.ID, func(bundle *quark.Credentials) { bundle.Agent.IdentityVerified = false })
+	_, native, err := connections.cachedDriver(connection.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	driver := &reviewShareAuthorizationRecovery{ShareBrowseDriver: native.(cloud.ShareBrowseDriver), resume: func() {
+		saveQuarkTestBundle(t, connections, connection.ID, func(bundle *quark.Credentials) { bundle.Agent.IdentityVerified = true })
+	}}
+	connections.drivers[connection.ID] = driver
+	if summary := downloaders.summary(actor, receiver); summary.Capabilities.ShareReceive || driver.resumes != 0 || driver.reads != 0 {
+		t.Fatal("summary resumed pending authorization or advertised unverified identity")
+	}
+	claim := siteResultClaim{ActorID: actor.User.ID, SourceKind: RouteSourceQuarkShare, CloudProvider: "quark", TorrentID: "https://pan.quark.cn/s/fixture"}
+	entries, _, _, err := s.inspectResultShare(context.Background(), actor, claim, claim.TorrentID, receiver.ID, true, RequestContext{})
+	if err != nil || len(entries) != 1 || driver.resumes != 1 || driver.reads != 1 {
+		t.Fatalf("explicit preview did not recover saved proof: entries=%d resumes=%d reads=%d err=%v", len(entries), driver.resumes, driver.reads, err)
+	}
+	saveQuarkTestBundle(t, connections, connection.ID, func(bundle *quark.Credentials) {
+		bundle.Agent.IdentityVerified = false
+		bundle.Proofs = nil
+	})
+	// Credential checkpoints invalidate the cached driver. Rebind the same
+	// recovery spy for this later phase of the shared receiver lifecycle.
+	connections.drivers[connection.ID] = driver
 	if summary := downloaders.summary(actor, receiver); summary.Capabilities.ShareReceive {
 		t.Fatal("unproved receiver advertised share receive", summary)
 	}
@@ -276,10 +321,9 @@ func TestPanSouReceiverSummaryAndPreviewRejectMissingProofBeforeProviderRead(t *
 	if err != nil || len(preview.Options) != 1 || preview.Options[0].Enabled || preview.Options[0].ReasonCode == "" {
 		t.Fatalf("unproved preview=%+v err=%v", preview, err)
 	}
-	claim := siteResultClaim{ActorID: actor.User.ID, SourceKind: RouteSourceQuarkShare, CloudProvider: "quark", TorrentID: "https://pan.quark.cn/s/fixture"}
 	_, _, _, err = s.inspectResultShare(context.Background(), actor, claim, claim.TorrentID, receiver.ID, true, RequestContext{})
-	if ErrorCode(err) != CodeDownloaderUnavailable {
-		t.Fatalf("unproved share reached provider: %v", err)
+	if ErrorCode(err) != CodeDownloaderUnavailable || driver.resumes != 2 || driver.reads != 1 {
+		t.Fatalf("authorization recovery bypassed root proof: resumes=%d reads=%d err=%v", driver.resumes, driver.reads, err)
 	}
 }
 
