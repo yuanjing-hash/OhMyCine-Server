@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"unicode"
 )
 
 type Magnet struct {
@@ -33,6 +34,9 @@ func ParseMagnet(raw string) (Magnet, error) {
 	m := Magnet{DisplayName: q.Get("dn"), Trackers: []string{}, Peers: []string{}}
 	if len(m.DisplayName) > 1024 {
 		return Magnet{}, invalid("magnet_name_limit", ErrLimitExceeded)
+	}
+	if strings.ContainsFunc(m.DisplayName, unicode.IsControl) {
+		return Magnet{}, invalid("magnet_name_invalid", ErrInvalidMetainfo)
 	}
 	for _, topic := range q["xt"] {
 		lower := strings.ToLower(topic)
@@ -83,6 +87,44 @@ func ParseMagnet(raw string) (Magnet, error) {
 		}
 	}
 	return m, nil
+}
+
+// NormalizeMagnet retains validated peer-discovery hints separately from its
+// complete stable identity. Unknown source/webseed parameters are not retained
+// or fetched. Canonicalization never weakens either hash of a hybrid magnet.
+func NormalizeMagnet(raw string) (string, Identity, error) {
+	if len(raw) > 16<<10 {
+		return "", Identity{}, invalid("magnet_size", ErrLimitExceeded)
+	}
+	m, err := ParseMagnet(strings.TrimSpace(raw))
+	if err != nil {
+		return "", Identity{}, err
+	}
+	topics := []string{}
+	if m.Identity.V1 != "" {
+		topics = append(topics, "xt=urn:btih:"+m.Identity.V1)
+	}
+	if m.Identity.V2 != "" {
+		topics = append(topics, "xt=urn:btmh:1220"+m.Identity.V2)
+	}
+	query := url.Values{}
+	if m.DisplayName != "" {
+		query.Set("dn", m.DisplayName)
+	}
+	for _, tracker := range m.Trackers {
+		query.Add("tr", tracker)
+	}
+	for _, peer := range m.Peers {
+		query.Add("x.pe", peer)
+	}
+	normalized := "magnet:?" + strings.Join(topics, "&")
+	if hints := query.Encode(); hints != "" {
+		normalized += "&" + hints
+	}
+	if len(normalized) > 16<<10 {
+		return "", Identity{}, invalid("magnet_size", ErrLimitExceeded)
+	}
+	return normalized, m.Identity, nil
 }
 
 func validHostPort(address string) bool {

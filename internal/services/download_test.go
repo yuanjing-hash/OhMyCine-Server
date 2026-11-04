@@ -41,6 +41,7 @@ type stubDownloadClient struct {
 	deletedTags []string
 	submitWait  <-chan struct{}
 	submitSeen  chan<- struct{}
+	submitErr   error
 }
 
 type metadataDownloadClient struct {
@@ -141,6 +142,9 @@ func (c *stubDownloadClient) Submit(_ context.Context, request downloadpkg.Submi
 	defer c.mu.Unlock()
 	c.submits++
 	c.source = request.Source
+	if c.submitErr != nil {
+		return downloadpkg.Task{}, c.submitErr
+	}
 	return downloadpkg.Task{ID: "provider-hash", Status: "downloading"}, nil
 }
 func (c *stubDownloadClient) Get(context.Context, string) (downloadpkg.Task, error) {
@@ -1409,6 +1413,8 @@ func TestTorrentSourceValidation(t *testing.T) {
 
 func TestDownloadWorkerReconcilesExistingProviderTaskWithoutResubmit(t *testing.T) {
 	downloads, downloaders, queue, actor, client := downloadFixture(t)
+	var businessLog bytes.Buffer
+	downloads.log = zerolog.New(zerolog.SyncWriter(&businessLog)).With().Timestamp().Logger()
 	root := t.TempDir()
 	storage := models.Storage{Name: "Staging", NameNormalized: "staging", Type: models.StorageTypeLocal, RootPath: root, RootPathNormalized: strings.ToLower(root), Enabled: true, Capabilities: `{}`, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()}
 	if err := queue.db.Create(&storage).Error; err != nil {
@@ -1423,17 +1429,30 @@ func TestDownloadWorkerReconcilesExistingProviderTaskWithoutResubmit(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := queue.db.Model(&models.DownloadTask{}).Where("id = ?", created.ID).Updates(map[string]any{"provider_task_id": "provider-hash", "phase": models.DownloadTaskStatusDownloading}).Error; err != nil {
-		t.Fatal(err)
-	}
-	client.mu.Lock()
-	client.gets, client.submits = 1, 0 // next provider sample is completed
-	client.mu.Unlock()
 	claimed, err := queue.Claim([]string{"download"})
 	if err != nil || claimed == nil {
 		t.Fatalf("claim=%+v err=%v", claimed, err)
 	}
 	worker := NewDownloadWorker(downloads)
+	client.submitErr = downloadpkg.WithFailureStage(downloadpkg.Error("downloader_unavailable", true, cloudpkg.Error(cloudpkg.CodeUnavailable, true, errors.Join(context.DeadlineExceeded, errors.New("private-output-id")))), downloadpkg.FailureOfflineSubmission)
+	first := worker.Run(context.Background(), workerRuntime{queue: queue, job: *claimed}, *claimed)
+	if first.ErrorCode != "downloader_unavailable" || first.RetryAt == nil || !strings.Contains(first.ErrorMessage, "原离线任务") || !strings.Contains(first.ErrorMessage, "超时") {
+		t.Fatalf("submit failure=%+v", first)
+	}
+	var failed models.DownloadTask
+	if err := queue.db.First(&failed, "id = ?", created.ID).Error; err != nil || failed.ProviderTaskID != "" || failed.LastErrorMessage != first.ErrorMessage || failed.LastSampledAt != nil {
+		t.Fatalf("submit failure reached telemetry or lost diagnostic: %+v err=%v", failed, err)
+	}
+	if !strings.Contains(businessLog.String(), `"event_code":"download.provider_submit_failed"`) || !strings.Contains(businessLog.String(), `"phase":"offline_submission"`) || !strings.Contains(businessLog.String(), `"request_timeout":true`) || strings.Contains(businessLog.String()+first.ErrorMessage, "private-output-id") {
+		t.Fatalf("missing or unsafe submit diagnostic: %s", businessLog.String())
+	}
+	// A later confirmed original identity resumes telemetry without Submit.
+	if err := queue.db.Model(&models.DownloadTask{}).Where("id = ?", created.ID).Updates(map[string]any{"provider_task_id": "provider-hash", "phase": models.DownloadTaskStatusDownloading}).Error; err != nil {
+		t.Fatal(err)
+	}
+	client.mu.Lock()
+	client.gets, client.submitErr = 1, nil // next original-task sample is completed
+	client.mu.Unlock()
 	worker.pollInterval = time.Millisecond
 	result := worker.Run(context.Background(), workerRuntime{queue: queue, job: *claimed}, *claimed)
 	if result.ErrorCode != "" || result.RetryAt != nil {
@@ -1442,7 +1461,7 @@ func TestDownloadWorkerReconcilesExistingProviderTaskWithoutResubmit(t *testing.
 	client.mu.Lock()
 	submits := client.submits
 	client.mu.Unlock()
-	if submits != 0 {
+	if submits != 1 {
 		t.Fatalf("restart reconciliation resubmitted provider task %d time(s)", submits)
 	}
 }

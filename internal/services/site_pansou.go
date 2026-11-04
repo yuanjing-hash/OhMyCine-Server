@@ -11,6 +11,7 @@ import (
 
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/authz"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/resourcecontent"
 	sitepkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/site"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/site/pansou"
 )
@@ -209,15 +210,61 @@ func (s *SiteService) ResultLink(ctx context.Context, actor Actor, token string)
 		return SiteResultLink{}, appError(CodePermissionDenied, "无权查看这个搜索结果", nil)
 	}
 	var row models.Site
-	if err := s.db.WithContext(ctx).First(&row, claim.SiteID).Error; err != nil || !row.Enabled || row.Revision != claim.SiteRevision || row.Kind != pansou.Kind {
+	if err := s.db.WithContext(ctx).First(&row, claim.SiteID).Error; err != nil || !row.Enabled || row.Revision != claim.SiteRevision {
 		return SiteResultLink{}, appError(CodeSiteResultExpired, "站点配置或搜索结果已失效，请重新搜索", nil)
 	}
 	if claim.AuthorizationScope != "" && claim.AuthorizationScope != discoveryAuthorizationScope(actor) {
 		return SiteResultLink{}, appError(CodeSiteResultExpired, "权限范围已变化，请重新搜索", nil)
 	}
-	kind, normalized, _, err := pansou.NormalizeResource(claim.ResultType, claim.TorrentID, "")
+	if claim.SourceKind == RouteSourcePT {
+		return SiteResultLink{}, appError(CodeDownloadSourceInvalid, "私有来源不能复制为公开磁力链接", nil)
+	}
+	// This copy route never fetches an opaque adapter ID, downloads a torrent,
+	// or starts metadata discovery. Native adapters may locally decode only
+	// an already held magnet through their explicit optional capability.
+	if row.Kind != pansou.Kind {
+		sourceKind, routeErr := routeSourceForSite(row)
+		if routeErr != nil || sourceKind != RouteSourceBT {
+			return SiteResultLink{}, appError(CodeDownloadSourceInvalid, "该结果暂无法复制公开磁力链接", nil)
+		}
+	}
+	if claim.MetadataPrivate {
+		return SiteResultLink{}, appError(CodeDownloadSourceInvalid, "该资源已确认包含私有元数据，不能复制公开磁力链接", nil)
+	}
+	resource := claim.TorrentID
+	if row.Kind != pansou.Kind {
+		if row.SourceType == "plugin" {
+			if available, code, message := s.pluginResourceSearchAvailability(row); !available {
+				return SiteResultLink{}, appError(code, message, nil)
+			}
+			if _, err := s.contentPluginLifecycle(s.db.WithContext(ctx), actor, claim, row); err != nil {
+				return SiteResultLink{}, err
+			}
+		}
+		normalized, identity, normalizeErr := resourcecontent.NormalizeMagnet(resource)
+		if normalizeErr != nil || identity.V1 == "" {
+			linker, ok := s.adapters[row.Kind].(sitepkg.PublicMagnetLinker)
+			if !ok {
+				return SiteResultLink{}, appError(CodeDownloadSourceInvalid, "该结果暂未提供可复制的公开磁力链接，请重新搜索", nil)
+			}
+			magnet, err := linker.PublicMagnetLink(resource)
+			if err != nil {
+				return SiteResultLink{}, appError(CodeDownloadSourceInvalid, "该结果暂未提供可复制的公开磁力链接，请重新搜索", nil)
+			}
+			normalized, identity, normalizeErr = resourcecontent.NormalizeMagnet(magnet)
+		}
+		declared := strings.ToLower(strings.TrimSpace(claim.ResultType))
+		if normalizeErr != nil || identity.V1 == "" || declared != "" && declared != "magnet" {
+			return SiteResultLink{}, appError(CodeDownloadSourceInvalid, "该结果暂未提供可复制的公开磁力链接，请重新搜索", nil)
+		}
+		return SiteResultLink{normalized, "magnet", claim.ExpiresAt}, nil
+	}
+	kind, normalized, _, err := pansou.NormalizeResource(claim.ResultType, resource, "")
 	if err != nil {
 		return SiteResultLink{}, appError(CodeDownloadSourceInvalid, "该结果不是受支持的公开资源链接", nil)
+	}
+	if kind == "magnet" && claim.SourceKind != RouteSourceBT {
+		return SiteResultLink{}, appError(CodeDownloadSourceInvalid, "该结果暂未提供可复制的公开磁力链接，请重新搜索", nil)
 	}
 	return SiteResultLink{normalized, kind, claim.ExpiresAt}, nil
 }

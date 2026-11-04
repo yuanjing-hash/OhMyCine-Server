@@ -544,6 +544,120 @@
           }
         }
       }
+    },
+    "/api/v1/discovery/results/link": {
+      "post": {
+        "operationId": "sessionDiscoveryResultLink",
+        "summary": "Copy the actual recognized public resource link from a current owned result token. No source fetch, metadata task or download submission.",
+        "security": [
+          {
+            "sessionCookie": []
+          },
+          {
+            "secureSessionCookie": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DiscoveryResultLinkInput"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success in the standard envelope; Cache-Control: no-store. Existing discovery.read, current Site/source/actor scope and expiry checks apply.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-store"
+                  ]
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DiscoveryResultLinkResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Safe permission, expired-source or actual public-link-unavailable error. No private URL, header or credential is returned.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CSRFToken"
+          }
+        ]
+      }
+    },
+    "/api/v1/player/discovery/results/link": {
+      "post": {
+        "operationId": "playerDiscoveryResultLink",
+        "summary": "Copy the actual recognized public resource link from a current owned result token. No source fetch, metadata task or download submission.",
+        "security": [
+          {
+            "playerDevice": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DiscoveryResultLinkInput"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success in the standard envelope; Cache-Control: no-store. Existing discovery.read, current Site/source/actor scope and expiry checks apply.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "no-store"
+                  ]
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DiscoveryResultLinkResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Safe permission, expired-source or actual public-link-unavailable error. No private URL, header or credential is returned.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -1350,8 +1464,65 @@
         "type": "object",
         "description": "Additive fields of existing Follow list/detail/run summaries. Current wait matches authorized LastRunID/owner/subscription/revision/lifecycle/error; history retains its own recorded bound. Missing timing is omitted. Rendering never calls a provider or changes next_run_at. See follow-wait-and-preference.md.",
         "properties": {
+          "owner_name": {
+            "type": "string",
+            "description": "Subscription list/detail and successful mutation summaries only: current safe owner display label, batch resolved after own/all scoping. No user directory access is granted. Missing on old Server versions."
+          },
           "wait": {
             "$ref": "#/components/schemas/FollowWait"
+          }
+        }
+      },
+      "DiscoveryResultLinkInput": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "result_token"
+        ],
+        "properties": {
+          "result_token": {
+            "type": "string",
+            "description": "Existing actor-bound result token; raw URLs or adapter/provider IDs are not accepted."
+          }
+        }
+      },
+      "DiscoveryResultLinkResponse": {
+        "type": "object",
+        "required": [
+          "code",
+          "message",
+          "data"
+        ],
+        "properties": {
+          "code": {
+            "type": "integer",
+            "enum": [
+              0
+            ]
+          },
+          "message": {
+            "type": "string"
+          },
+          "data": {
+            "type": "object",
+            "required": [
+              "url",
+              "result_type",
+              "expires_at"
+            ],
+            "properties": {
+              "url": {
+                "type": "string",
+                "description": "Canonical actual public resource URI from the current owned claim, including native magnet carriers decoded only by an explicit bounded local adapter capability. Native magnets retain the existing 16 KiB source limit; PanSou and other resource links retain their 8 KiB limit. PT/proven-private metadata, detail/torrent/unknown IDs cannot become public magnets. No network or metadata read occurs for copy."
+              },
+              "result_type": {
+                "type": "string"
+              },
+              "expires_at": {
+                "type": "string",
+                "format": "date-time"
+              }
+            }
           }
         }
       }

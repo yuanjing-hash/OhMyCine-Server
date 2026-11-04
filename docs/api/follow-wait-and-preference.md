@@ -72,3 +72,57 @@ rewrite any frozen snapshot, encrypted credential, receipt or subtitle policy.
 Ordinary successful PanSou responses remain `completion=received` and use the
 neutral received explanation. They do not imply completion of all upstream
 plugins. Real source, timeout, alias and truncation warnings remain warnings.
+
+## Bounded inspection progress
+
+Run `filter_summary` adds `candidate_checks_started` (candidate checks that entered
+the four-reader preparation window), `candidate_checks_deferred` (checks interrupted
+by that window or not started) and `content_rejected` (invalid or unsafe actual
+metadata). `candidate_budget` counts exhausted windows, so a value of 1 does not
+mean one resource was checked. `selected` remains accepted task returns; content
+read failures and unstarted checks do not count as failed download submissions.
+
+`follow_candidate_budget` means more inspection is deferred to later scheduled
+checks. `follow_content_unavailable` means actual files or their identities remain
+unverified. These additive error codes retain the existing `failed` or `submitted`
+run status for compatibility and use neutral waiting labels. Actual route/submit
+failures keep `follow_submit_failed`/`follow_submit_partial`. Confirmed unsuitable
+content remains a resource rejection or no-match. Real provider cooldown evidence
+can accompany any of these unfinished outcomes; no deadline is invented.
+
+An internal versioned Job checkpoint retains only the last started candidate's
+fingerprint and season, scoped to the owner, subscription/configuration/lifecycle
+and definite missing set. A later bounded run resumes its read order after that
+candidate and wraps safely; a missing/old checkpoint or changed scope starts from
+the normal order. This is scheduling progress, never cached inspection proof.
+Within each prepared window, verified executable shares keep `transfer_first`
+priority. Every selected leaf, current permission, source expiry, route and claim
+is rechecked, and unknown writes keep their original reservation.
+
+Modern inspectable BT/PT/magnet results may enter this bounded check when their
+work name is plausible but title season/episode facts are absent. Unrelated work
+names, contradictory known seasons and conflicting verified identities still
+reject. Actual file verification supplies acquisition facts, never a post range.
+
+Content retries wait for a canceled physical read to finish cleanup before
+starting a replacement read. The same applies to shared actual-file identity
+lookups. Only successful content reads are cached. Fixed safe errors distinguish
+busy queues, finite read timeout, unavailable magnet metadata, invalid metainfo,
+unsafe paths, hash mismatch, limits and unsupported format; none expose source
+URLs, tracker/peer information or upstream error bodies. The engine keeps its
+existing two active/32 pending sessions and one-minute total including queue wait.
+
+
+## Subscription owner display
+
+Subscription list/detail and successful create/edit/pause/resume summaries add
+optional `owner_name`. It is the current display name with the account username
+when different; username is the fallback for an empty display name. A missing
+account is explicitly shown as `已删除账号`. Existing `owner_id` is unchanged.
+This local projection is display-only, never authorization or execution identity.
+
+Owner names are resolved in one bounded batch after existing own/all subscription
+scoping. No user-directory permission is required and no user directory, roles,
+login state or credential fields are returned. Clients talking to an older Server
+can show `账号 #<owner_id>` when the optional field is absent. Renaming an account
+changes the current label without rewriting the subscription or its frozen plan.

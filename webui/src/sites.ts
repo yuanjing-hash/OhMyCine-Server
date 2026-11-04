@@ -117,11 +117,13 @@ export function discoveryOrigins(item: Pick<PTSearchResult, 'origins' | 'channel
 }
 function hasDiscoveryControl(value: string, rejectSpace = false) { return Array.from(value).some(character => character.charCodeAt(0) <= (rejectSpace ? 32 : 31) || character.charCodeAt(0) === 127) }
 export function safeDiscoveryLink(value: unknown): string | undefined {
-  if (typeof value !== 'string' || value.length > 8192 || hasDiscoveryControl(value, true)) return undefined
+  if (typeof value !== 'string' || value.length > 16 * 1024 || hasDiscoveryControl(value, true)) return undefined
   try {
     const url = new URL(value)
+    if (url.protocol === 'magnet:' && url.searchParams.has('xt')) return value
+    if (value.length > 8192) return undefined
     if ((url.protocol === 'http:' || url.protocol === 'https:') && url.hostname && !url.username && !url.password) return value
-    if ((url.protocol === 'magnet:' && url.searchParams.has('xt')) || url.protocol === 'ed2k:') return value
+    if (url.protocol === 'ed2k:') return value
   } catch { /* Malformed links never become a navigation target. */ }
   return undefined
 }

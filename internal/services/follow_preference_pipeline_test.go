@@ -32,7 +32,7 @@ func (a *preferenceMixedAdapter) ResolveSource(ctx context.Context, cfg sitepkg.
 }
 
 func TestFollowTransferFirstUsesVerifiedShareThenOnlyRemainingTorrentLeaf(t *testing.T) {
-	for _, mode := range []string{"accepted", "read-rejected", "cooldown-recovered", "uncertain-write"} {
+	for _, mode := range []string{"accepted", "title-unknown", "wrong-title", "preparation-deadline", "read-rejected", "cooldown-recovered", "uncertain-write"} {
 		t.Run(mode, func(t *testing.T) {
 			f, driver := newFollowPreviewFixture(t)
 			// This fixture's final library is on 115. Give its same-storage native
@@ -48,6 +48,12 @@ func TestFollowTransferFirstUsesVerifiedShareThenOnlyRemainingTorrentLeaf(t *tes
 			base.items = base.items[1:]
 			base.items = append(base.items, sitepkg.Result{PayloadKind: sitepkg.PayloadMagnet, Title: "Fixture.Show.S01E13-E15.1080p.WEB-DL", SourceKind: RouteSourceBT, ResultType: "magnet"})
 			adapter := &preferenceMixedAdapter{followSharesAdapter: base, metainfo: inspectionTorrentWithSize(32<<20, "Fixture.Show.S01E13.mkv", "Fixture.Show.S01E15.mkv")}
+			if mode == "title-unknown" {
+				base.items[len(base.items)-1].Title = "Fixture.Show.1080p.WEB-DL"
+				adapter.metainfo = inspectionTorrentWithSize(32<<20, "Fixture.Show.S01E13.mkv", "Fixture.Show.S01E15.mkv", "Other.Work.S01E12.mkv", "Fixture.Show.S01E16.mkv")
+			} else if mode == "wrong-title" {
+				base.items[len(base.items)-1].Title = "Other.Work.1080p.WEB-DL"
+			}
 			f.worker.sites.adapters["pansou_tg"] = adapter
 			// Enable the preference on a frozen fixture snapshot before the run.
 			var subscription models.FollowSubscription
@@ -59,6 +65,12 @@ func TestFollowTransferFirstUsesVerifiedShareThenOnlyRemainingTorrentLeaf(t *tes
 				t.Fatal(err)
 			}
 			snapshot.Filters.AcquisitionPreference = FollowAcquisitionTransferFirst
+			if mode == "preparation-deadline" {
+				// Both candidates enter one read window; the magnet stays owned
+				// until cancellation while the share has time to prepare normally.
+				snapshot.Filters.AcquisitionPreference = FollowAcquisitionExistingOrder
+				f.worker.preparationTimeout = 2 * time.Second
+			}
 			snapshot.MaxResourcesPerRun = 2
 			raw, _ := json.Marshal(snapshot)
 			for _, model := range []any{&models.FollowSubscription{}, &models.FollowRun{}} {
@@ -82,9 +94,13 @@ func TestFollowTransferFirstUsesVerifiedShareThenOnlyRemainingTorrentLeaf(t *tes
 				t.Fatal(err)
 			}
 			base.items[len(base.items)-1].TorrentID = "magnet:?xt=urn:btih:" + manifest.Identity.V1
-			f.worker.sites.SetResourceContentResolver(contentResolverFunc(func(_ context.Context, input resourcecontent.ResolveRequest) (resourcecontent.Manifest, error) {
+			f.worker.sites.SetResourceContentResolver(contentResolverFunc(func(ctx context.Context, input resourcecontent.ResolveRequest) (resourcecontent.Manifest, error) {
 				if input.URI != base.items[len(base.items)-1].TorrentID {
 					return resourcecontent.Manifest{}, errors.New("fixture magnet identity mismatch")
+				}
+				if mode == "preparation-deadline" {
+					<-ctx.Done()
+					return resourcecontent.Manifest{}, ctx.Err()
 				}
 				return manifest, nil
 			}))
@@ -114,11 +130,23 @@ func TestFollowTransferFirstUsesVerifiedShareThenOnlyRemainingTorrentLeaf(t *tes
 				t.Fatal(err)
 			}
 			want := 2
-			if mode == "read-rejected" || mode == "cooldown-recovered" {
+			if mode == "read-rejected" || mode == "cooldown-recovered" || mode == "wrong-title" || mode == "preparation-deadline" {
 				want = 1
 			}
 			if run.Selected != want || len(tasks) != want {
 				t.Fatalf("mode=%s selected=%d tasks=%d error=%s", mode, run.Selected, len(tasks), run.ErrorMessage)
+			}
+			if mode == "wrong-title" && adapter.torrentReads != 0 {
+				t.Fatal("unrelated title admitted a content read")
+			}
+			if mode == "preparation-deadline" {
+				var reasons map[string]int
+				if err := json.Unmarshal([]byte(run.FilterSummaryJSON), &reasons); err != nil {
+					t.Fatal(err)
+				}
+				if run.Status != models.FollowRunSubmitted || run.ErrorCode != "follow_candidate_budget" || reasons["candidate_checks_started"] != 2 || reasons["candidate_checks_deferred"] != 1 || reasons["submit_failed"] != 0 || reasons["content_preparation_failed"] != 0 {
+					t.Fatalf("spent read window invalidated prepared share or invented a submit failure: run=%+v reasons=%v", run, reasons)
+				}
 			}
 			if mode == "cooldown-recovered" {
 				if run.Status != models.FollowRunSubmitted || run.ErrorCode != "" || run.ErrorMessage != "" || run.RetryNotBefore != nil {

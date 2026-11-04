@@ -23,7 +23,7 @@ func selectedAdapterError(err error) error {
 		return nil
 	}
 	if code, _ := cloud.ErrorInfo(err); code == cloud.CodeMutationUnknown {
-		return downloader.Error("downloader_selection_result_unknown", true, nil)
+		return downloader.Error("downloader_selection_result_unknown", true, err)
 	}
 	return mapError(err)
 }
@@ -80,14 +80,14 @@ func (c *Client) submitSelected(ctx context.Context, request downloader.SubmitRe
 		directory = c.directoryID
 	}
 	if _, err := c.validateDirectory(ctx, directory); err != nil {
-		return downloader.Task{}, err
+		return downloader.Task{}, downloader.WithFailureStage(err, downloader.FailureTargetValidation)
 	}
 	snapshot, err := c.driver.(cloud.SelectiveOfflineDriver).SubmitSelectedOffline(ctx, cloud.SelectiveOfflineRequest{Authority: cloud.SelectiveOfflineAuthority{Tag: request.Tag, StorageRootID: c.rootID, Selection: *request.Source.ContentSelection}, ParentID: directory, Torrent: append([]byte(nil), request.Source.Torrent...)})
 	if err != nil {
-		return downloader.Task{}, selectedAdapterError(err)
+		return downloader.Task{}, downloader.WithFailureStage(selectedAdapterError(err), downloader.FailureSelectionSubmission)
 	}
 	if err = selectedSnapshot(snapshot, snapshot.Task.ID, downloader.SelectionContext{Tag: request.Tag, Selection: *request.Source.ContentSelection, RootName: manifest.Name, MultiFile: manifest.MultiFile}); err != nil {
-		return downloader.Task{}, err
+		return downloader.Task{}, downloader.WithFailureStage(err, downloader.FailureSelectionSubmission)
 	}
 	return mapTask(snapshot.Task), nil
 }

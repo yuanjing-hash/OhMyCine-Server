@@ -3,6 +3,7 @@ package downloader
 import (
 	"context"
 	"errors"
+	"net"
 	"sort"
 	"strings"
 	"sync"
@@ -280,4 +281,67 @@ func ErrorInfo(err error) (code string, retryable bool) {
 		return provider.Code, provider.Retryable
 	}
 	return "downloader_unavailable", true
+}
+
+const (
+	FailureTargetValidation    = "target_validation"
+	FailureTaskDirectory       = "task_directory"
+	FailureOfflineSubmission   = "offline_submission"
+	FailureSelectionSubmission = "selection_submission"
+)
+
+// FailureDiagnostic is a finite observation of the adapter boundary. Reaching
+// a submission boundary is not proof that a provider write was dispatched.
+// Timeout/Canceled are true only when the error chain positively reports them.
+// No provider identity, URL, body or raw error crosses this projection.
+type FailureDiagnostic struct {
+	Stage        string
+	ProviderCode string
+	Timeout      bool
+	Canceled     bool
+}
+
+type failureStageError struct {
+	stage string
+	cause error
+}
+
+func (e *failureStageError) Error() string { code, _ := ErrorInfo(e.cause); return code }
+func (e *failureStageError) Unwrap() error { return e.cause }
+
+// WithFailureStage preserves the original semantic/recovery error chain. It
+// must never grant retry or undispatched-write authority from a stage label.
+func WithFailureStage(err error, stage string) error {
+	if err == nil {
+		return nil
+	}
+	switch stage {
+	case FailureTargetValidation, FailureTaskDirectory, FailureOfflineSubmission, FailureSelectionSubmission:
+		return &failureStageError{stage: stage, cause: err}
+	default:
+		return err
+	}
+}
+
+func FailureDiagnosticFromError(err error) (FailureDiagnostic, bool) {
+	var staged *failureStageError
+	if !errors.As(err, &staged) {
+		return FailureDiagnostic{}, false
+	}
+	diagnostic := FailureDiagnostic{Stage: staged.stage, Timeout: errors.Is(err, context.DeadlineExceeded), Canceled: errors.Is(err, context.Canceled)}
+	var network net.Error
+	if errors.As(err, &network) && network.Timeout() {
+		diagnostic.Timeout = true
+	}
+	var provider *cloud.ProviderError
+	if errors.As(err, &provider) {
+		switch provider.Code {
+		case cloud.CodeCookieInvalid, cloud.CodeAuthExpired, cloud.CodeRateLimited, cloud.CodeUnavailable,
+			cloud.CodeResponseInvalid, cloud.CodeNotFound, cloud.CodeOfflineNoQuota, cloud.CodeOfflineBadLink,
+			cloud.CodeOfflineTaskExists, cloud.CodeShareExpired, cloud.CodeSharePassword, cloud.CodeShareInvalid,
+			cloud.CodeShareEmpty, cloud.CodeShareTooLarge, cloud.CodeShareUnknown, cloud.CodeConflict, cloud.CodeMutationUnknown:
+			diagnostic.ProviderCode = provider.Code
+		}
+	}
+	return diagnostic, true
 }

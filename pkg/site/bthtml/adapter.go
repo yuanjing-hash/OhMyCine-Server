@@ -67,6 +67,13 @@ func NewForTest(kind string, profile Profile, client *http.Client, baseURL strin
 
 func (a *Adapter) Kind() string { return a.kind }
 
+func (a *Adapter) PublicMagnetLink(identity string) (string, error) {
+	if magnet, ok := btrss.DecodeMagnetIdentity(identity); ok {
+		return magnet, nil
+	}
+	return "", site.ErrNotFound
+}
+
 func (a *Adapter) Test(ctx context.Context, config site.Config) (site.Health, error) {
 	if _, err := a.Search(ctx, config, site.Query{Keyword: "anime", Page: 1}); err != nil {
 		return site.Health{}, err
@@ -119,7 +126,7 @@ func (a *Adapter) Search(ctx context.Context, config site.Config, query site.Que
 			result.Skipped++
 			continue
 		}
-		result.Items = append(result.Items, site.Result{PayloadKind: site.PayloadMagnet, TorrentID: identity, Title: row.title, Subtitle: row.subtitle, SizeBytes: parseSize(row.size), Published: parseTime(row.published), Seeders: parseInt(row.seeders), Leechers: parseInt(row.leechers), Completed: parseInt(row.completed), Tags: row.tags})
+		result.Items = append(result.Items, site.Result{PayloadKind: site.PayloadMagnet, TorrentID: identity, Fingerprint: btrss.StableResourceIdentity(identity), Title: row.title, Subtitle: row.subtitle, SizeBytes: parseSize(row.size), Published: parseTime(row.published), Seeders: parseInt(row.seeders), Leechers: parseInt(row.leechers), Completed: parseInt(row.completed), Tags: row.tags})
 	}
 	return result, nil
 }

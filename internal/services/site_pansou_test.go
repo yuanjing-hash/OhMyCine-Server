@@ -6,13 +6,20 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/authz"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/resourcecontent"
 	sitepkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/site"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/site/btapi"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/site/bthtml"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/site/btrss"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/site/pansou"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/site/torznab"
 )
 
 func TestPanSouAutomaticTypesUseOrdinaryResourceRights(t *testing.T) {
@@ -45,8 +52,10 @@ func TestPanSouAutomaticTypesUseOrdinaryResourceRights(t *testing.T) {
 func TestPanSouMixedClaimsLegacyAndPublicMagnetRoutes(t *testing.T) {
 	s, _, actor, _, _, downloaders := siteFixture(t)
 	var requested []string
+	requests := 0
 	const magnet = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567"
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
 		var input struct {
 			Types []string `json:"cloud_types"`
 		}
@@ -109,9 +118,111 @@ func TestPanSouMixedClaimsLegacyAndPublicMagnetRoutes(t *testing.T) {
 	if _, err := s.Download(context.Background(), actor, SiteDownloadInput{ResultToken: byType["baidu"].Token, DownloaderID: qbit.ID}, RequestContext{}); ErrorCode(err) != CodeDownloadSourceInvalid {
 		t.Fatal("view-only enqueued", err)
 	}
+	beforeCopy := requests
 	link, err := s.ResultLink(context.Background(), actor, byType["baidu"].Token)
 	if err != nil || link.ResultType != "baidu" || !strings.Contains(link.URL, "pwd=abcd") {
 		t.Fatalf("link=%+v err=%v", link, err)
+	}
+	magnetLink, err := s.ResultLink(context.Background(), actor, byType["magnet"].Token)
+	if err != nil || magnetLink.ResultType != "magnet" || magnetLink.URL != magnet || requests != beforeCopy {
+		t.Fatalf("copy did not reuse the actual public magnet without an upstream request: %+v err=%v requests=%d", magnetLink, err, requests-beforeCopy)
+	}
+	// Native payloads stay private to adapters. Copy supports only their local
+	// magnet capability; detail/torrent/unknown identities cannot cause a fetch.
+	fullMagnet := magnet + "&tr=https%3A%2F%2Ftracker.example.test%2Fannounce&dn=Copy.Fixture"
+	largeHints := url.Values{"xt": {"urn:btih:0123456789abcdef0123456789abcdef01234567"}, "dn": {"Native.Full.Hints"}}
+	for index := 0; index < 6; index++ {
+		largeHints.Add("tr", fmt.Sprintf("https://tracker%d.example.test/%s", index, strings.Repeat("a", 1500)))
+	}
+	largeMagnet := "magnet:?" + largeHints.Encode()
+	s.adapters["mikan"] = btrss.NewForProfile("mikan", btrss.MikanProfile())
+	s.adapters["yts"] = btapi.NewForProfile("yts", btapi.YTSProfile())
+	s.adapters["thepiratebay"] = bthtml.NewForProfile("thepiratebay", bthtml.PirateBayProfile())
+	s.adapters["torznab"] = torznab.New()
+	for index, scenario := range []struct {
+		kind, source, identity, expected string
+	}{
+		{"mikan", RouteSourceBT, magnet, magnet},
+		{"mikan", RouteSourceBT, fullMagnet, fullMagnet},
+		{"mikan", RouteSourceBT, btrss.EncodeIdentity("magnet", fullMagnet), fullMagnet},
+		{"mikan", RouteSourceBT, largeMagnet, largeMagnet},
+		{"mikan", RouteSourceBT, btrss.EncodeIdentity("magnet", largeMagnet), largeMagnet},
+		{pansou.Kind, RouteSourceBT, largeMagnet, ""},
+		{"yts", RouteSourceBT, btrss.EncodeIdentity("magnet", fullMagnet), fullMagnet},
+		{"thepiratebay", RouteSourceBT, btrss.EncodeIdentity("magnet", fullMagnet), fullMagnet},
+		{"torznab", RouteSourceBT, btrss.EncodeIdentity("magnet", fullMagnet), fullMagnet},
+		{"mikan", RouteSourceBT, "opaque-adapter-id", ""},
+		{"mikan", RouteSourceBT, "https://t.me/fixture/123", ""},
+		{"thepiratebay", RouteSourceBT, btrss.EncodeIdentity("detail", "https://copy.example.test/detail"), ""},
+		{"mikan", RouteSourceBT, btrss.EncodeIdentity("torrent", "https://copy.example.test/file.torrent"), ""},
+		{"pttime", RouteSourcePT, fullMagnet, ""},
+	} {
+		record := models.Site{Name: fmt.Sprintf("Copy %d", index), NameNormalized: fmt.Sprintf("copy-%d", index), Kind: scenario.kind, Enabled: true, Revision: 1, BaseURL: "https://copy.example.test"}
+		if err := s.db.Create(&record).Error; err != nil {
+			t.Fatal(err)
+		}
+		copyToken, err := s.issueClaim(siteResultClaim{ActorID: actor.User.ID, SiteID: record.ID, SiteRevision: record.Revision, SourceKind: scenario.source, PayloadKind: sitepkg.PayloadMagnet, TorrentID: scenario.identity, ExpiresAt: s.now().Add(time.Minute)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		copied, err := s.ResultLink(context.Background(), actor, copyToken)
+		if scenario.expected != "" {
+			actual, parseErr := url.Parse(copied.URL)
+			expected, _ := url.Parse(scenario.expected)
+			if err != nil || parseErr != nil || actual.Scheme != "magnet" || copied.ResultType != "magnet" || actual.Query().Encode() != expected.Query().Encode() {
+				t.Fatalf("public native magnet unavailable: %+v err=%v", copied, err)
+			}
+		} else if ErrorCode(err) != CodeDownloadSourceInvalid || copied.URL != "" {
+			t.Fatalf("opaque, post or private source gained public-copy authority: kind=%s error=%v", scenario.kind, err)
+		}
+	}
+	// Actual verified private metainfo remains private after presentation/cache
+	// retirement and an ordinary claim reserve/release. Copy adds no read.
+	publicRaw := inspectionTorrentWithSize(32<<20, "Fixture.Show.S01E13.mkv")
+	privateRaw := append(append(append([]byte(nil), publicRaw[:len(publicRaw)-2]...), []byte("7:privatei1e")...), 'e', 'e')
+	privateManifest, err := resourcecontent.ParseTorrent(privateRaw, resourcecontent.Limits{})
+	if err != nil || !privateManifest.Private {
+		t.Fatalf("invalid private fixture: %v", err)
+	}
+	privateMagnet := "magnet:?xt=urn:btih:" + privateManifest.Identity.V1
+	nativeAdapter := s.adapters["mikan"]
+	s.adapters["mikan"] = &stubSiteAdapter{kind: "mikan"}
+	privateSite, err := s.Create(context.Background(), actor, SiteInput{Name: "Known private", Kind: "mikan", BaseURL: "https://mikanani.me", Enabled: true, Priority: 100, TimeoutSeconds: 12, RateLimitPerMinute: 120}, RequestContext{})
+	s.adapters["mikan"] = nativeAdapter
+	if err != nil {
+		t.Fatal(err)
+	}
+	privateToken, err := s.issueClaim(siteResultClaim{ActorID: actor.User.ID, SiteID: privateSite.ID, SiteRevision: privateSite.Revision, SourceKind: RouteSourceBT, PayloadKind: sitepkg.PayloadMagnet, TorrentID: btrss.EncodeIdentity("magnet", privateMagnet), Title: "Fixture.Show.S01E13", ExpiresAt: s.now().Add(time.Minute)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadataReads := 0
+	s.SetResourceContentResolver(contentResolverFunc(func(_ context.Context, input resourcecontent.ResolveRequest) (resourcecontent.Manifest, error) {
+		metadataReads++
+		if input.URI != privateMagnet {
+			return resourcecontent.Manifest{}, sitepkg.ErrInvalidReply
+		}
+		return privateManifest, nil
+	}))
+	preview, err := s.PreviewContent(context.Background(), actor, ContentPreviewInput{ResultToken: privateToken})
+	if err != nil || !preview.Complete || metadataReads != 1 {
+		t.Fatalf("private metadata was not inspected: %+v %v", preview, err)
+	}
+	s.discardContentPreview(actor, preview.Token)
+	state := s.contents()
+	state.mu.Lock()
+	state.cache = map[string]inspectedContent{}
+	state.mu.Unlock()
+	if _, err := s.reserveClaim(privateToken, actor.User.ID); err != nil {
+		t.Fatal(err)
+	}
+	s.finishClaim(privateToken, false)
+	if copied, err := s.ResultLink(context.Background(), actor, privateToken); ErrorCode(err) != CodeDownloadSourceInvalid || copied.URL != "" || metadataReads != 1 {
+		t.Fatalf("known private fact was lost or copy initiated metadata: %+v %v reads=%d", copied, err, metadataReads)
+	}
+	var copiedTasks int64
+	if err := s.db.Model(&models.DownloadTask{}).Count(&copiedTasks).Error; err != nil || copiedTasks != 0 || requests != beforeCopy {
+		t.Fatalf("copy performed download/upstream work: tasks=%d requests=%d error=%v", copiedTasks, requests-beforeCopy, err)
 	}
 	foreign := actor
 	foreign.User.ID++

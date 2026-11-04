@@ -337,54 +337,82 @@ func TestPrivateMagnetCannotAuthorizeOwnTracker(t *testing.T) {
 }
 
 func TestUDPTrackerProtocol(t *testing.T) {
-	tracker, err := net.ListenPacket("udp4", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer tracker.Close()
-	finished := make(chan error, 1)
-	go func() {
-		buffer := make([]byte, 4096)
-		_ = tracker.SetDeadline(time.Now().Add(2 * time.Second))
-		n, peer, e := tracker.ReadFrom(buffer)
-		if e != nil {
-			finished <- e
-			return
-		}
-		if n != 16 || binary.BigEndian.Uint64(buffer[:8]) != 0x41727101980 {
-			finished <- fmt.Errorf("invalid connect")
-			return
-		}
-		response := make([]byte, 16)
-		copy(response[4:8], buffer[12:16])
-		binary.BigEndian.PutUint64(response[8:], 123)
-		_, _ = tracker.WriteTo(response, peer)
-		n, peer, e = tracker.ReadFrom(buffer)
-		if e != nil {
-			finished <- e
-			return
-		}
-		if n < 98 || binary.BigEndian.Uint64(buffer[:8]) != 123 || binary.BigEndian.Uint64(buffer[56:64]) != 0 || binary.BigEndian.Uint64(buffer[72:80]) != 0 || binary.BigEndian.Uint32(buffer[80:84]) != 0 || !bytes.Contains(buffer[98:n], []byte("key=secret")) {
-			finished <- fmt.Errorf("invalid metadata announce")
-			return
-		}
-		response = make([]byte, 26)
-		binary.BigEndian.PutUint32(response[:4], 1)
-		copy(response[4:8], buffer[12:16])
-		copy(response[20:24], net.IPv4(127, 0, 0, 1).To4())
-		binary.BigEndian.PutUint16(response[24:], 1234)
-		_, _ = tracker.WriteTo(response, peer)
-		finished <- nil
-	}()
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	peers := []string{}
-	err = discoverTracker(ctx, &loopbackNetwork{}, "udp://"+tracker.LocalAddr().String()+"/announce?key=secret", Identity{V1: strings.Repeat("a", 40)}, func(p string) bool { peers = append(peers, p); return true })
-	if err != nil || len(peers) != 1 || peers[0] != "127.0.0.1:1234" {
-		t.Fatal(err, peers)
-	}
-	if e := <-finished; e != nil {
-		t.Fatal(e)
+	for _, scenario := range []struct {
+		name, network, address, ip string
+		malformed                  bool
+	}{
+		{"ipv4", "udp4", "127.0.0.1:0", "127.0.0.1", false},
+		{"ipv6", "udp6", "[::1]:0", "::1", false},
+		{"ipv4-bad-stride", "udp4", "127.0.0.1:0", "127.0.0.1", true},
+		{"ipv6-bad-stride", "udp6", "[::1]:0", "::1", true},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			tracker, err := net.ListenPacket(scenario.network, scenario.address)
+			if err != nil {
+				if scenario.network == "udp6" {
+					t.Skip("IPv6 loopback unavailable", err)
+				}
+				t.Fatal(err)
+			}
+			defer tracker.Close()
+			finished := make(chan error, 1)
+			go func() {
+				buffer := make([]byte, 4096)
+				_ = tracker.SetDeadline(time.Now().Add(2 * time.Second))
+				n, peer, e := tracker.ReadFrom(buffer)
+				if e != nil {
+					finished <- e
+					return
+				}
+				if n != 16 || binary.BigEndian.Uint64(buffer[:8]) != 0x41727101980 {
+					finished <- fmt.Errorf("invalid connect")
+					return
+				}
+				response := make([]byte, 16)
+				copy(response[4:8], buffer[12:16])
+				binary.BigEndian.PutUint64(response[8:], 123)
+				_, _ = tracker.WriteTo(response, peer)
+				n, peer, e = tracker.ReadFrom(buffer)
+				if e != nil {
+					finished <- e
+					return
+				}
+				if n < 98 || binary.BigEndian.Uint64(buffer[:8]) != 123 || binary.BigEndian.Uint64(buffer[56:64]) != 0 || binary.BigEndian.Uint64(buffer[72:80]) != 0 || binary.BigEndian.Uint32(buffer[80:84]) != 0 || !bytes.Contains(buffer[98:n], []byte("key=secret")) {
+					finished <- fmt.Errorf("invalid metadata announce")
+					return
+				}
+				ip := net.ParseIP(scenario.ip).To16()
+				if scenario.network == "udp4" {
+					ip = ip.To4()
+				}
+				compact := append(append([]byte(nil), ip...), 4, 210) // port 1234
+				if scenario.malformed {
+					compact = compact[:len(compact)-1]
+					if scenario.network == "udp6" {
+						compact = []byte{127, 0, 0, 1, 4, 210} // Legal v4 stride is invalid on this v6 connection.
+					}
+				}
+				response = make([]byte, 20)
+				binary.BigEndian.PutUint32(response[:4], 1)
+				copy(response[4:8], buffer[12:16])
+				_, _ = tracker.WriteTo(append(response, compact...), peer)
+				finished <- nil
+			}()
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			peers := []string{}
+			err = discoverTracker(ctx, &loopbackNetwork{}, "udp://"+tracker.LocalAddr().String()+"/announce?key=secret", Identity{V1: strings.Repeat("a", 40)}, func(p string) bool { peers = append(peers, p); return true })
+			if scenario.malformed {
+				if !errors.Is(err, ErrInvalidMetainfo) || len(peers) != 0 {
+					t.Fatal("malformed compact peers accepted", err, peers)
+				}
+			} else if err != nil || len(peers) != 1 || peers[0] != net.JoinHostPort(scenario.ip, "1234") {
+				t.Fatal(err, peers)
+			}
+			if e := <-finished; e != nil {
+				t.Fatal(e)
+			}
+		})
 	}
 }
 

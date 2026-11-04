@@ -7,7 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -19,6 +21,17 @@ import (
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/resourcecontent"
 	sitepkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/site"
 )
+
+type contentWaitObservedContext struct {
+	context.Context
+	once    sync.Once
+	waiting chan struct{}
+}
+
+func (c *contentWaitObservedContext) Done() <-chan struct{} {
+	c.once.Do(func() { close(c.waiting) })
+	return c.Context.Done()
+}
 
 func inspectionTorrent(paths ...string) []byte {
 	return inspectionTorrentWithSize(100, paths...)
@@ -112,7 +125,11 @@ func TestContentInspectionParsesTorrentWithoutAnyDownloaderAndFreezesOriginalInd
 	}
 	var selected []string
 	for _, file := range preview.Files {
-		if strings.HasSuffix(file.Path, ".zh-Hans.srt") && (len(file.Subtitles) != 1 || file.Subtitles[0].Language != "zh" || file.Subtitles[0].Source != "sidecar_filename") {
+		if strings.HasSuffix(file.Path, ".zh-Hans.srt") && !reflect.DeepEqual(file.Subtitles, []ContentSubtitleEvidence{
+			{Language: "zh", Script: "Hans", Source: "sidecar_filename"},
+			{Language: "en", Source: "sidecar_filename"},
+			{Language: "ja", Source: "sidecar_filename"},
+		}) {
 			t.Fatalf("actual sidecar lost language evidence: %+v", file)
 		}
 		if strings.HasSuffix(file.Path, "/Fixture.Show.S01E13.JPN.ENG.mkv") || strings.HasSuffix(file.Path, "/15.mkv") {
@@ -123,7 +140,15 @@ func TestContentInspectionParsesTorrentWithoutAnyDownloaderAndFreezesOriginalInd
 		}
 	}
 	resolved, err := s.ResolveContentSelection(context.Background(), actor, ContentSelectionInput{ResultToken: token, PreviewToken: preview.Token, SelectedEntryTokens: selected}, claim)
-	if err != nil || resolved.Torrent == nil || resolved.SelectedBytes != 2*(32<<20) || len(resolved.Torrent.Files) != 2 || resolved.Torrent.Files[0].Index != 1 || resolved.Torrent.Files[1].Index != 3 {
+	if err != nil || resolved.Torrent == nil {
+		t.Fatalf("selected=%+v err=%v", resolved, err)
+	}
+	selectedFiles := append([]resourcecontent.SelectedFile(nil), resolved.Torrent.Files...)
+	sort.Slice(selectedFiles, func(i, j int) bool { return selectedFiles[i].Index < selectedFiles[j].Index })
+	if resolved.SelectedBytes != 2*(32<<20) || !reflect.DeepEqual(selectedFiles, []resourcecontent.SelectedFile{
+		{Index: 1, Path: "Season 01/Fixture.Show.S01E13.JPN.ENG.mkv", Size: 32 << 20},
+		{Index: 3, Path: "Season 01/15.mkv", Size: 32 << 20},
+	}) {
 		t.Fatalf("selected=%+v err=%v", resolved, err)
 	}
 	original, _ := resourcecontent.ParseTorrent(raw, resourcecontent.Limits{})
@@ -302,13 +327,19 @@ func TestContentInspectionSingleflightWaiterCancellation(t *testing.T) {
 	all, cancelAll := context.WithCancel(context.Background())
 	allStarted := make(chan struct{})
 	allStopped := make(chan struct{})
+	allowCleanup := make(chan struct{})
+	oldResult := make(chan error, 1)
+	var cleaned atomic.Bool
 	go func() {
-		_, _ = s.readContentShared(all, "other-scope", func(ctx context.Context) (inspectedContent, error) {
+		_, err := s.readContentShared(all, "other-scope", func(ctx context.Context) (inspectedContent, error) {
 			close(allStarted)
 			<-ctx.Done()
 			close(allStopped)
+			<-allowCleanup
+			cleaned.Store(true)
 			return inspectedContent{}, ctx.Err()
 		})
+		oldResult <- err
 	}()
 	<-allStarted
 	cancelAll()
@@ -316,6 +347,34 @@ func TestContentInspectionSingleflightWaiterCancellation(t *testing.T) {
 	case <-allStopped:
 	case <-time.After(time.Second):
 		t.Fatal("last waiter left an owned read running")
+	}
+	retryResult := make(chan error, 1)
+	retryContext := &contentWaitObservedContext{Context: context.Background(), waiting: make(chan struct{})}
+	go func() {
+		_, err := s.readContentShared(retryContext, "other-scope", func(context.Context) (inspectedContent, error) {
+			if !cleaned.Load() {
+				return inspectedContent{}, errors.New("retry overlapped retiring metadata I/O")
+			}
+			return inspectedContent{RootName: "fresh retry", ExpiresAt: time.Now().Add(time.Minute)}, nil
+		})
+		retryResult <- err
+	}()
+	select {
+	case <-retryContext.waiting:
+	case <-time.After(time.Second):
+		t.Fatal("retry did not reach the retiring read")
+	}
+	close(allowCleanup)
+	if err := <-oldResult; !errors.Is(err, context.Canceled) {
+		t.Fatalf("old flight cancellation=%v", err)
+	}
+	select {
+	case err := <-retryResult:
+		if err != nil {
+			t.Fatalf("retry joined a canceled flight: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("retry did not start after old I/O joined")
 	}
 }
 

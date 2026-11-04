@@ -206,7 +206,15 @@ func (s *SiteService) searchMediaIdentitySitePage(ctx context.Context, actor Act
 				continue
 			}
 			cloudShare := isCloudShareSource(item.SourceKind)
-			if !cloudShare && !mediaIdentityResultMatches(item.Title, names, input.MediaType, verified.ReleaseYear, input.Season) {
+			titleMatched := mediaIdentityResultMatches(item.Title, names, input.MediaType, verified.ReleaseYear, input.Season)
+			matches := titleMatched
+			if item.ContentInspection {
+				// An inspectable collection may omit season/episode facts in its
+				// post title. A plausible work name only admits a bounded read;
+				// actual selected leaves must still prove the requested identity.
+				matches = mediaIdentityInspectionPlausible(item.Title, names, input.MediaType, verified.ReleaseYear, input.Season)
+			}
+			if contentSearchIdentityConflict(claim, input.TMDBID, input.MediaType) || !cloudShare && !matches {
 				s.deleteClaim(item.Token)
 				target.Skipped++
 				rejections.add("identity_mismatch", item.Title)
@@ -224,7 +232,7 @@ func (s *SiteService) searchMediaIdentitySitePage(ctx context.Context, actor Act
 				continue
 			}
 			bindErr := s.bindContentSearchIdentity(item.Token, actor.User.ID, siteShareIdentity{TMDBID: input.TMDBID, MediaType: input.MediaType, Title: verified.Title, Names: names, Season: cloneInt(input.Season), Year: cloneInt(verified.ReleaseYear), SeasonCount: verified.Snapshot.SeasonCount})
-			if bindErr == nil && !cloudShare {
+			if bindErr == nil && !cloudShare && (!item.ContentInspection || titleMatched) {
 				bindErr = s.bindClaimRecognition(item.Token, actor.User.ID, input.TMDBID, input.MediaType, mediaIdentitySourceDirectID, mediaIdentityStatusVerified, false)
 			}
 			if bindErr != nil {
@@ -319,6 +327,9 @@ func mediaIdentityResultMatches(title string, names []tmdb.SearchName, mediaType
 		return false
 	}
 	candidate := identitySearchKey(parsed.CanonicalTitle)
+	if candidate == "" {
+		return false
+	}
 	matched := false
 	for _, name := range names {
 		key := identitySearchKey(name.Value)
@@ -338,6 +349,21 @@ func mediaIdentityResultMatches(title string, names []tmdb.SearchName, mediaType
 		return false
 	}
 	return season == nil || parsed.Season != nil && *season == *parsed.Season
+}
+
+func mediaIdentityInspectionPlausible(title string, names []tmdb.SearchName, mediaType string, year, season *int) bool {
+	if !mediaIdentityResultMatches(title, names, mediaType, year, nil) {
+		return false
+	}
+	parsed, err := mediarecognition.Parse(mediarecognition.InputFacts{PackageName: title, SourceKind: mediarecognition.SourceDownload})
+	return err == nil && (season == nil || parsed.Season == nil || *parsed.Season == *season)
+}
+
+func contentSearchIdentityConflict(claim siteResultClaim, tmdbID int64, mediaType string) bool {
+	if claim.ManualTMDBID != nil && (claim.RecognitionLocked || claim.RecognitionStatus == mediaIdentityStatusVerified) && (*claim.ManualTMDBID != tmdbID || claim.ManualMediaType != mediaType) {
+		return true
+	}
+	return claim.SearchIdentity != nil && (claim.SearchIdentity.TMDBID != tmdbID || claim.SearchIdentity.MediaType != mediaType)
 }
 
 func identitySearchKey(value string) string {

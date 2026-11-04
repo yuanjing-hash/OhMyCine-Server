@@ -160,3 +160,11 @@ type Adapter interface {
 type SourceResolver interface {
 	ResolveSource(context.Context, Config, string) (Source, error)
 }
+
+// PublicMagnetLinker optionally decodes an already held native result into its
+// public magnet. Implementations must be bounded and purely local: no network,
+// credentials, torrent fetch, metadata inspection or downloader operation.
+// SiteService remains responsible for actor, source and expiry authorization.
+type PublicMagnetLinker interface {
+	PublicMagnetLink(string) (string, error)
+}

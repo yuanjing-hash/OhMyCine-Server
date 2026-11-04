@@ -45,6 +45,13 @@ const statuses: Record<string, string> = {
 export const executionStatusLabel = (value: string) => statuses[value] ?? '其他执行状态'
 export const followCoverageWaitingLabel = '等待剧集状态确认'
 export const isFollowCoverageWaiting = (summary?: { status: string; error_code?: string }) => summary?.status === 'failed' && summary.error_code === 'follow_coverage_unknown'
+export function followWaitingLabel(summary?: { status: string; error_code?: string }) {
+  if (isFollowCoverageWaiting(summary)) return followCoverageWaitingLabel
+  if (!summary || !['failed', 'submitted'].includes(summary.status)) return ''
+  if (summary.error_code === 'follow_candidate_budget') return summary.status === 'submitted' ? '已提交下载，其余候选延后核验' : '本轮核验结束，等待继续检查'
+  if (summary.error_code === 'follow_content_unavailable') return summary.status === 'submitted' ? '已提交下载，其余实际文件待核实' : '等待实际文件核验'
+  return ''
+}
 export const executionTriggerLabel = (value: string) => ({ scheduled: '计划触发', manual: '手动触发', created: '新建订阅触发', event: '事件触发', retry: '重试触发' } as Record<string, string>)[value] ?? '其他触发方式'
 export const logLevelLabel = (value: string) => ({ debug: '调试', info: '信息', warn: '警告', error: '错误' } as Record<string, string>)[value] ?? '其他级别'
 
@@ -52,6 +59,7 @@ const stages: Record<string, string> = {
   planning: '制定执行计划', coverage: '核对在库与缺集', search: '站点搜索', searching: '站点搜索', site_search: '站点搜索',
   filtering: '筛选资源', filter: '筛选资源', selection: '选择资源', routing: '选择下载路线', route: '选择下载路线',
   submission: '提交下载', submit: '提交下载', download: '下载', waiting: '等待后续处理', reconciliation: '核对执行结果',
+  target_validation: '验证目标目录', task_directory: '准备任务目录', offline_submission: '提交或核对原离线任务', selection_submission: '提交或核对原精准选集任务',
   enumeration: '枚举媒体', enumerating: '从数据源枚举', enumeration_complete: '数据源枚举完成', processing: '本地并发处理',
   staging: '分批落库', publishing: '发布基础目录', scope_reconciliation: '增量范围对账', scope_fallback: '改用全量对账',
   catalog_ready: '基础目录可用', recognition: '媒体识别', recognition_queued: '等待后台识别', recognition_running: '后台识别',
@@ -90,7 +98,8 @@ const reasons: Record<string, string> = {
   quality: '片源质量不符合', release_group: '发布组不符合', excluded_release_group: '命中排除发布组', seeders: '做种数不符合',
   size: '文件大小不符合或未知', age: '发布时间不符合或未知', submit_failed: '提交下载失败', search_failed: '站点搜索失败',
   content_preparation_failed: '实际文件或执行路线未能核实', share_selection_failed: '分享文件选择未完成',
-  subtitle_unconfirmed: '对应字幕未确认、按偏好继续下载的视频数', subtitle_required: '没有已确认的所需字幕', candidate_budget: '本轮实际文件核验预算已用尽',
+  subtitle_unconfirmed: '对应字幕未确认、按偏好继续下载的视频数', subtitle_required: '没有已确认的所需字幕', candidate_budget: '达到核验上限的轮次',
+  candidate_checks_started: '已开始核验的候选数', candidate_checks_deferred: '延后核验的候选数', content_rejected: '实际文件元数据未通过安全校验的资源数',
   site_failed: '站点搜索失败', site_unavailable: '站点不可用', no_route: '没有可用下载路线', route_unavailable: '没有可用下载路线',
   claim_conflict: '缺集已有任务占用', resource_claimed: '资源已有任务占用', no_episode_overlap: '不覆盖缺集', title_mismatch: '标题不匹配',
   result_expired: '搜索结果已过期', permission_denied: '当前权限不允许', disabled: '已停用', cancelled: '执行被取消',

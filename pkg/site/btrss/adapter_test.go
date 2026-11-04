@@ -2,7 +2,9 @@ package btrss
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -10,8 +12,23 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/resourcecontent"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/site"
 )
+
+type magnetHintProbe struct {
+	resourcecontent.Network
+	request resourcecontent.DiscoveryRequest
+	called  bool
+}
+
+func (p *magnetHintProbe) Discover(_ context.Context, request resourcecontent.DiscoveryRequest, _ func(string) bool) error {
+	p.request, p.called = request, true
+	return nil
+}
+func (*magnetHintProbe) DialContext(context.Context, string, string) (net.Conn, error) {
+	return nil, resourcecontent.ErrUnavailable // No live peer/DNS traffic in this fixture.
+}
 
 func TestNyaaRSSSearchAndResolveTorrent(t *testing.T) {
 	var server *httptest.Server
@@ -109,7 +126,13 @@ func TestBuiltInProfilesGenerateExpectedQueryAndConstrainSources(t *testing.T) {
 }
 
 func TestRSSCompatibilityElementsAndMagnetNormalization(t *testing.T) {
-	feed := `<?xml version="1.0"?><rss><channel><item><title>AnimeTosho torrent</title><torrent_url>https://animetosho.org/storage/a.torrent</torrent_url></item><item><title>AnimeTosho magnet</title><magnet_uri>magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&amp;dn=private</magnet_uri></item></channel></rss>`
+	bare := "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&xt=urn:btmh:1220" + strings.Repeat("a", 64)
+	magnet := bare + "&dn=Example+title&x.pe=8.8.8.8%3A6881&xs=http%3A%2F%2F127.0.0.1%2Fignored"
+	// Exercise a valid URI larger than the former opaque envelope's 8 KiB cap.
+	for i := 0; i < 6; i++ {
+		magnet += "&tr=" + url.QueryEscape(fmt.Sprintf("https://tracker%d.example/", i)+strings.Repeat("a", 1500))
+	}
+	feed := `<?xml version="1.0"?><rss><channel><item><title>AnimeTosho torrent</title><torrent_url>https://animetosho.org/storage/a.torrent</torrent_url></item><item><title>AnimeTosho magnet</title><magnet_uri>` + strings.ReplaceAll(magnet, "&", "&amp;") + `</magnet_uri></item></channel></rss>`
 	server := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) { _, _ = writer.Write([]byte(feed)) }))
 	defer server.Close()
 	profile := AnimeToshoProfile()
@@ -123,16 +146,26 @@ func TestRSSCompatibilityElementsAndMagnetNormalization(t *testing.T) {
 		t.Fatalf("torrent_url was not parsed: %+v", page.Items[0])
 	}
 	kind, value, ok := DecodeIdentity(page.Items[1].TorrentID)
-	if !ok || kind != "magnet" || value != "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567" || page.Items[1].PayloadKind != site.PayloadMagnet {
-		t.Fatalf("magnet was not normalized: %q %q", kind, value)
+	if !ok || kind != "magnet" || page.Items[1].PayloadKind != site.PayloadMagnet || page.Items[1].Fingerprint != EncodeIdentity("magnet", bare) || len(page.Items[1].TorrentID) <= 8192 {
+		t.Fatal("magnet identity, full hints or bounded envelope were lost")
 	}
-	if _, ok := NormalizeMagnet("magnet:?xt=urn:btih:bad"); ok {
-		t.Fatal("invalid infohash accepted")
+	source, err := adapter.ResolveSource(context.Background(), site.Config{BaseURL: server.URL}, page.Items[1].TorrentID)
+	if err != nil || source.Magnet != value || strings.Contains(source.Magnet, "xs=") {
+		t.Fatal("resolved source lost or broadened transport hints", err)
 	}
-	if _, ok := NormalizeMagnet((&url.URL{Scheme: "https", Host: "example.test"}).String()); ok {
-		t.Fatal("non-magnet accepted")
+	probe := &magnetHintProbe{Network: resourcecontent.NewPublicNetwork()}
+	engine := resourcecontent.NewEngine(resourcecontent.EngineConfig{Network: probe, Discoverer: probe, Timeout: time.Second})
+	_, err = engine.Resolve(context.Background(), resourcecontent.ResolveRequest{URI: source.Magnet})
+	m := probe.request.Magnet
+	if !errors.Is(err, resourcecontent.ErrUnavailable) || !probe.called || probe.request.Private || m.Identity.V1 != "0123456789abcdef0123456789abcdef01234567" || m.Identity.V2 != strings.Repeat("a", 64) || m.DisplayName != "Example title" || len(m.Trackers) != 6 || len(m.Peers) != 1 || m.Peers[0] != "8.8.8.8:6881" {
+		t.Fatal("actual Engine discovery did not receive the resolved full hints", err)
 	}
-	if strings.Contains(page.Items[0].TorrentID, "private") {
-		t.Fatal("private display name leaked into normalized identity")
+	for _, raw := range []string{"magnet:?xt=urn:btih:bad", "https://example.test", bare + "&xt=urn:btih:" + strings.Repeat("f", 40), bare + "&tr=" + url.QueryEscape("https://user:secret@tracker.example/announce"), bare + "&dn=%0A", "magnet:?xt=urn:btmh:1220" + strings.Repeat("a", 64)} {
+		if _, ok := NormalizeMagnet(raw); ok {
+			t.Fatal("invalid, credential-bearing or unsupported source accepted")
+		}
+	}
+	if normalized, ok := NormalizeMagnet("magnet:?xt=urn:btih:" + strings.Repeat("A", 32)); !ok || normalized != "magnet:?xt=urn:btih:"+strings.Repeat("0", 40) {
+		t.Fatal("Base32 v1 compatibility lost")
 	}
 }

@@ -29,7 +29,9 @@ async function render(rows: FollowSummary[], canExecute = false) {
 it('uses one shared corrected clock, reaches zero without retrying, and disposes its timer', async () => {
   vi.useFakeTimers(); vi.setSystemTime(new Date('2026-01-01T00:00:00Z')) // deliberately skewed browser clock
   const startInterval = vi.spyOn(globalThis, 'setInterval'), stopInterval = vi.spyOn(globalThis, 'clearInterval')
-  const wrapper = await render([item, { ...item, id: 'f2' }])
+  const wrapper = await render([{ ...item, owner_name: '小王（reader）' }, { ...item, id: 'f2', owner_id: 42 }])
+  expect(wrapper.text()).toContain('订阅人：小王（reader）')
+  expect(wrapper.text()).toContain('订阅人：账号 #42')
   expect(wrapper.text()).toContain('还需 1 分 5 秒')
   expect(wrapper.text()).toContain('下次检查')
   expect(startInterval).toHaveBeenCalledTimes(1)

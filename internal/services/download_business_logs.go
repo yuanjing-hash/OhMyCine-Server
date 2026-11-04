@@ -75,7 +75,7 @@ func (w *DownloadWorker) recordDownloadEnd(ctx context.Context, task models.Down
 		outcome, message = "waiting", "本次执行暂时等待恢复，原任务保留；重试时按原任务身份继续核对"
 	case result.ErrorCode != "":
 		outcome, message = "failed", "本次下载执行失败："+downloadFailureMessage(result.ErrorCode, false)
-		if result.ErrorCode == CodeTransferMediaUnrecognized && result.ErrorMessage != "" {
+		if result.ErrorMessage != "" {
 			message = "本次下载执行失败：" + result.ErrorMessage
 		}
 	case task.Phase == models.DownloadTaskStatusCompleted:

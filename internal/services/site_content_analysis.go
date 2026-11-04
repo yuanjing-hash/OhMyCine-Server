@@ -17,6 +17,7 @@ type contentGroupRecognition struct {
 type contentGroupFlight struct {
 	done    chan struct{}
 	cancel  context.CancelFunc
+	work    context.Context
 	waiters int
 	result  SiteRecognitionSummary
 	err     error
@@ -63,75 +64,91 @@ func (s *SiteService) recognizeContentGroup(ctx context.Context, actor Actor, cl
 
 func (s *SiteService) readContentGroupShared(ctx context.Context, key string, load func(context.Context) (SiteRecognitionSummary, error)) (SiteRecognitionSummary, error) {
 	state := s.contents()
-	state.mu.Lock()
-	if saved, ok := state.groupCache[key]; ok && saved.ExpiresAt.After(s.now()) {
-		state.mu.Unlock()
-		return saved.Summary, nil
-	}
-	flight := state.groupFlights[key]
-	if flight == nil {
-		if len(state.groupFlights) >= 32 {
-			state.mu.Unlock()
-			return SiteRecognitionSummary{}, appError(CodeSiteUnavailable, "作品核验排队较多，请稍后重试", nil)
-		}
-		work, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
-		flight = &contentGroupFlight{done: make(chan struct{}), cancel: cancel}
-		state.groupFlights[key] = flight
-		go func() {
-			summary, err := load(work)
-			owned := work.Err() == nil
-			cancel()
-			state.mu.Lock()
-			defer state.mu.Unlock()
-			flight.result, flight.err = summary, err
-			delete(state.groupFlights, key)
-			if err == nil && owned {
-				ttl := 30 * time.Second
-				if summary.Status == mediaRecognitionStatusMatched {
-					ttl = 5 * time.Minute
-				}
-				for id, saved := range state.groupCache {
-					if !saved.ExpiresAt.After(s.now()) {
-						delete(state.groupCache, id)
-					}
-				}
-				if len(state.groupCache) >= 512 {
-					oldest := ""
-					var expiry time.Time
-					for id, saved := range state.groupCache {
-						if oldest == "" || saved.ExpiresAt.Before(expiry) {
-							oldest, expiry = id, saved.ExpiresAt
-						}
-					}
-					delete(state.groupCache, oldest)
-				}
-				state.groupCache[key] = contentGroupRecognition{Summary: summary, ExpiresAt: s.now().Add(ttl)}
-			}
-			close(flight.done)
-		}()
-	}
-	flight.waiters++
-	state.mu.Unlock()
-	defer func() {
-		state.mu.Lock()
-		defer state.mu.Unlock()
-		flight.waiters--
-		if flight.waiters == 0 {
-			select {
-			case <-flight.done:
-			default:
-				flight.cancel()
-			}
-		}
-	}()
-	select {
-	case <-ctx.Done():
-		return SiteRecognitionSummary{}, ctx.Err()
-	case <-flight.done:
+	for {
 		if err := ctx.Err(); err != nil {
 			return SiteRecognitionSummary{}, err
 		}
-		return flight.result, flight.err
+		state.mu.Lock()
+		if saved, ok := state.groupCache[key]; ok && saved.ExpiresAt.After(s.now()) {
+			state.mu.Unlock()
+			return saved.Summary, nil
+		}
+		flight := state.groupFlights[key]
+		if flight != nil && flight.work.Err() != nil {
+			state.mu.Unlock()
+			select {
+			case <-ctx.Done():
+				return SiteRecognitionSummary{}, ctx.Err()
+			case <-flight.done:
+				continue
+			}
+		}
+		if flight == nil {
+			if len(state.groupFlights) >= 32 {
+				state.mu.Unlock()
+				return SiteRecognitionSummary{}, appError(CodeSiteUnavailable, "作品核验排队较多，请稍后重试", nil)
+			}
+			work, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+			flight = &contentGroupFlight{done: make(chan struct{}), cancel: cancel, work: work}
+			state.groupFlights[key] = flight
+			go func() {
+				summary, err := load(work)
+				owned := work.Err() == nil
+				cancel()
+				state.mu.Lock()
+				defer state.mu.Unlock()
+				flight.result, flight.err = summary, err
+				if state.groupFlights[key] == flight {
+					delete(state.groupFlights, key)
+				}
+				if err == nil && owned {
+					ttl := 30 * time.Second
+					if summary.Status == mediaRecognitionStatusMatched {
+						ttl = 5 * time.Minute
+					}
+					for id, saved := range state.groupCache {
+						if !saved.ExpiresAt.After(s.now()) {
+							delete(state.groupCache, id)
+						}
+					}
+					if len(state.groupCache) >= 512 {
+						oldest := ""
+						var expiry time.Time
+						for id, saved := range state.groupCache {
+							if oldest == "" || saved.ExpiresAt.Before(expiry) {
+								oldest, expiry = id, saved.ExpiresAt
+							}
+						}
+						delete(state.groupCache, oldest)
+					}
+					state.groupCache[key] = contentGroupRecognition{Summary: summary, ExpiresAt: s.now().Add(ttl)}
+				}
+				close(flight.done)
+			}()
+		}
+		flight.waiters++
+		state.mu.Unlock()
+		defer func() {
+			state.mu.Lock()
+			defer state.mu.Unlock()
+			flight.waiters--
+			if flight.waiters == 0 {
+				select {
+				case <-flight.done:
+				default:
+					flight.cancel()
+				}
+			}
+		}()
+		select {
+		case <-ctx.Done():
+			return SiteRecognitionSummary{}, ctx.Err()
+		case <-flight.done:
+			if err := ctx.Err(); err != nil {
+				return SiteRecognitionSummary{}, err
+			}
+			return flight.result, flight.err
+		}
 	}
 }
 

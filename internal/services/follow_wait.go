@@ -17,7 +17,7 @@ type FollowWait struct {
 }
 
 func followRunWait(run models.FollowRun, now time.Time) *FollowWait {
-	if run.RetryNotBefore == nil || run.RetryNotBefore.IsZero() || run.RetryCode != cloud.RetryReasonProviderCooldown || run.FinishedAt == nil || (run.Status != models.FollowRunFailed && run.Status != models.FollowRunSubmitted) || (run.ErrorCode != "follow_submit_failed" && run.ErrorCode != "follow_submit_partial") {
+	if run.RetryNotBefore == nil || run.RetryNotBefore.IsZero() || run.RetryCode != cloud.RetryReasonProviderCooldown || run.FinishedAt == nil || (run.Status != models.FollowRunFailed && run.Status != models.FollowRunSubmitted) || (run.ErrorCode != "follow_submit_failed" && run.ErrorCode != "follow_submit_partial" && run.ErrorCode != "follow_content_unavailable" && run.ErrorCode != "follow_candidate_budget") {
 		return nil
 	}
 	return &FollowWait{NotBefore: run.RetryNotBefore.UTC(), Reason: run.RetryCode, RecordedAt: run.FinishedAt.UTC(), ServerTime: now.UTC()}

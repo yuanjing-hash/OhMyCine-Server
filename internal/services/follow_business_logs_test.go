@@ -11,6 +11,14 @@ type followProgressRuntime struct {
 	providerWakeRuntime
 	lastProgress             float64
 	lastProcessed, lastTotal int64
+	checkpoint               func(any) error
+}
+
+func (r *followProgressRuntime) Checkpoint(value any) error {
+	if r.checkpoint != nil {
+		return r.checkpoint(value)
+	}
+	return nil
 }
 
 func (r *followProgressRuntime) Heartbeat(progress *float64, processed, total *int64, _ *float64, _ *int64) error {

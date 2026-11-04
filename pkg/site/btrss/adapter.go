@@ -8,11 +8,11 @@ import (
 	"net/http"
 	"net/url"
 	"path"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/resourcecontent"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/site"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/site/rssfeed"
 )
@@ -21,8 +21,6 @@ const (
 	maxFeedBytes    = 4 << 20
 	maxTorrentBytes = 4 << 20
 )
-
-var btihPattern = regexp.MustCompile(`(?i)^[a-f0-9]{40}$|^[a-z2-7]{32}$`)
 
 type Profile struct {
 	SearchPath           string
@@ -78,6 +76,13 @@ func NewForTest(kind string, profile Profile, client *http.Client, baseURL strin
 
 func (a *Adapter) Kind() string { return a.kind }
 
+func (a *Adapter) PublicMagnetLink(identity string) (string, error) {
+	if magnet, ok := DecodeMagnetIdentity(identity); ok {
+		return magnet, nil
+	}
+	return "", site.ErrNotFound
+}
+
 func (a *Adapter) Test(ctx context.Context, config site.Config) (site.Health, error) {
 	body, err := a.requestFeed(ctx, config, "anime", 1)
 	if err != nil {
@@ -124,7 +129,7 @@ func (a *Adapter) Search(ctx context.Context, config site.Config, query site.Que
 			continue
 		}
 		kind, _, _ := DecodeIdentity(identity)
-		result.Items = append(result.Items, site.Result{PayloadKind: site.NormalizePayloadKind(site.PayloadKind(kind)), TorrentID: identity, Title: item.Title, Subtitle: item.Subtitle, SizeBytes: item.SizeBytes, Published: item.Published, Seeders: item.Seeders, Leechers: item.Leechers, Completed: item.Completed})
+		result.Items = append(result.Items, site.Result{PayloadKind: site.NormalizePayloadKind(site.PayloadKind(kind)), TorrentID: identity, Fingerprint: StableResourceIdentity(identity), Title: item.Title, Subtitle: item.Subtitle, SizeBytes: item.SizeBytes, Published: item.Published, Seeders: item.Seeders, Leechers: item.Leechers, Completed: item.Completed})
 	}
 	return result, nil
 }
@@ -262,20 +267,32 @@ func (a *Adapter) safeTorrentURL(baseURL, raw string) bool {
 }
 
 func NormalizeMagnet(raw string) (string, bool) {
-	parsed, err := url.Parse(strings.TrimSpace(raw))
-	if err != nil || !strings.EqualFold(parsed.Scheme, "magnet") || parsed.Opaque != "" || parsed.User != nil || len(raw) > 16<<10 {
+	normalized, identity, err := resourcecontent.NormalizeMagnet(raw)
+	// Keep the existing v1-capable source routes. Retaining a hybrid's v2 hash
+	// is not authorization to broaden these adapters to pure-v2 acquisition.
+	if err != nil || identity.V1 == "" {
 		return "", false
 	}
-	for _, xt := range parsed.Query()["xt"] {
-		const prefix = "urn:btih:"
-		if len(xt) > len(prefix) && strings.EqualFold(xt[:len(prefix)], prefix) {
-			hash := strings.ToLower(xt[len(prefix):])
-			if btihPattern.MatchString(hash) {
-				return "magnet:?xt=" + prefix + hash, true
-			}
-		}
+	return normalized, true
+}
+
+// StableResourceIdentity keeps the pre-hint private identity for logical
+// deduplication. TorrentID still carries the full material for source binding
+// and resolution. Plain v1 hashes retain their existing fingerprint input.
+func StableResourceIdentity(identity string) string {
+	kind, value, ok := DecodeIdentity(identity)
+	if !ok || kind != "magnet" {
+		return identity
 	}
-	return "", false
+	m, err := resourcecontent.ParseMagnet(value)
+	if err != nil || m.Identity.V1 == "" {
+		return identity
+	}
+	bare := "magnet:?xt=urn:btih:" + m.Identity.V1
+	if m.Identity.V2 != "" {
+		bare += "&xt=urn:btmh:1220" + m.Identity.V2
+	}
+	return EncodeIdentity("magnet", bare)
 }
 
 type sourceIdentity struct {
@@ -289,7 +306,8 @@ func EncodeIdentity(kind, value string) string {
 }
 
 func DecodeIdentity(value string) (string, string, bool) {
-	if value == "" || len(value) > 8192 {
+	// A bounded 16 KiB magnet plus the JSON/base64 envelope fits within 24 KiB.
+	if value == "" || len(value) > 24<<10 {
 		return "", "", false
 	}
 	raw, err := base64.RawURLEncoding.DecodeString(value)
@@ -301,6 +319,16 @@ func DecodeIdentity(value string) (string, string, bool) {
 		return "", "", false
 	}
 	return identity.Kind, identity.Value, true
+}
+
+// DecodeMagnetIdentity reads only the existing bounded native carrier. Detail
+// and torrent identities cannot trigger a fetch through this copy capability.
+func DecodeMagnetIdentity(identity string) (string, bool) {
+	kind, value, ok := DecodeIdentity(identity)
+	if !ok || kind != "magnet" {
+		return "", false
+	}
+	return NormalizeMagnet(value)
 }
 
 func controlledClient(config site.Config) (*http.Client, *url.URL, error) {

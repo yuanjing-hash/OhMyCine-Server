@@ -41,6 +41,13 @@ func NewForTest(client *http.Client, baseURL string) *Adapter {
 
 func (a *Adapter) Kind() string { return Kind }
 
+func (a *Adapter) PublicMagnetLink(identity string) (string, error) {
+	if magnet, ok := btrss.DecodeMagnetIdentity(identity); ok {
+		return magnet, nil
+	}
+	return "", site.ErrNotFound
+}
+
 func (a *Adapter) Test(ctx context.Context, config site.Config) (site.Health, error) {
 	body, err := a.request(ctx, config, url.Values{"t": {"caps"}})
 	if err != nil {
@@ -132,7 +139,7 @@ func (a *Adapter) Search(ctx context.Context, config site.Config, query site.Que
 			continue
 		}
 		kind, _, _ := btrss.DecodeIdentity(identity)
-		result.Items = append(result.Items, site.Result{PayloadKind: site.NormalizePayloadKind(site.PayloadKind(kind)), TorrentID: identity, Title: item.Title, Subtitle: item.Subtitle, SizeBytes: item.SizeBytes, Published: item.Published, Seeders: item.Seeders, Leechers: item.Leechers, Completed: item.Completed})
+		result.Items = append(result.Items, site.Result{PayloadKind: site.NormalizePayloadKind(site.PayloadKind(kind)), TorrentID: identity, Fingerprint: btrss.StableResourceIdentity(identity), Title: item.Title, Subtitle: item.Subtitle, SizeBytes: item.SizeBytes, Published: item.Published, Seeders: item.Seeders, Leechers: item.Leechers, Completed: item.Completed})
 	}
 	return result, nil
 }
