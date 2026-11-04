@@ -271,6 +271,9 @@ func (w *FollowSearchWorker) Run(ctx context.Context, runtime JobRuntime, job Cl
 			for index, item := range prepared {
 				if item.Started {
 					attempted++
+					if isCloudShareSource(batch[index].Item.SourceKind) {
+						filterSummary["share_checks_started"]++
+					}
 					checkpoint.PreparationAfter = &followCandidatePosition{Fingerprint: batch[index].Fingerprint, Season: batch[index].Season}
 				}
 				if item.ContentSelectionToken != "" {
@@ -412,6 +415,7 @@ func (w *FollowSearchWorker) Run(ctx context.Context, runtime JobRuntime, job Cl
 			return w.block(run, subscription, CodePermissionDenied, "订阅用户或权限不可用")
 		}
 		recommendation, routeErr := w.sites.RecommendSiteRoute(recheckCtx, actor, SourceRouteRecommendationInput{ResultToken: candidate.Item.Token, MediaLibraryID: &libraryID, ContentSelectionToken: prepared.ContentSelectionToken})
+		recommendation = followSeedRoute(recommendation, candidate.Item, snapshot)
 		stopRecheck()
 		if routeErr != nil || recommendation.Recommended == nil {
 			submitFailures++
@@ -575,7 +579,32 @@ func (w *FollowSearchWorker) searchCandidates(ctx context.Context, actor Actor, 
 	summary := map[string]int{}
 	queryNames := 0
 	seen := map[string]struct{}{}
-	for sitePriority, siteID := range snapshot.SiteIDs {
+	priorities := map[uint]int{}
+	for index, id := range snapshot.SiteIDs {
+		priorities[id] = index
+	}
+	orderedSites := append([]uint(nil), snapshot.SiteIDs...)
+	if snapshot.Filters.AcquisitionPreference == FollowAcquisitionTransferFirst {
+		var records []models.Site
+		if err := w.follows.db.WithContext(ctx).Select("id", "kind", "source_type", "plugin_id", "plugin_connection_id").Where("id IN ?", snapshot.SiteIDs).Find(&records).Error; err != nil {
+			summary["site_error"]++
+			return result, queryNames, summary
+		}
+		tiers := map[uint]int{}
+		for _, record := range records {
+			source, _ := routeSourceForSite(record)
+			tiers[record.ID] = followAcquisitionTier(snapshot.Filters.AcquisitionPreference, source)
+		}
+		sort.SliceStable(orderedSites, func(i, j int) bool { return tiers[orderedSites[i]] < tiers[orderedSites[j]] })
+	}
+	type seedRouteKey struct {
+		site    uint
+		source  string
+		payload string
+	}
+	seedRoutes := map[seedRouteKey]bool{}
+	for _, siteID := range orderedSites {
+		sitePriority := priorities[siteID]
 		for _, season := range snapshot.Seasons {
 			if ctx.Err() != nil {
 				summary["search_incomplete"]++
@@ -592,7 +621,78 @@ func (w *FollowSearchWorker) searchCandidates(ctx context.Context, actor Actor, 
 				continue
 			}
 			searchCtx := serverlog.WithBusinessFields(ctx, map[string]any{"site_id": siteID, "season": season})
-			grouped, err := w.sites.SearchMediaIdentity(searchCtx, actor, MediaIdentitySearchInput{MediaType: "tv", TMDBID: subscription.TMDBID, Season: &season, Page: 1, SiteID: &siteID, ClientCapabilities: []string{MixedDiscoveryCapability}, Refresh: true})
+			filtered := newFollowRejections()
+			qualify := func(item SiteSearchResult, report bool) (followCandidate, bool) {
+				canTryWithoutSeeders := false
+				if followSeederLimited(item, snapshot) {
+					key := seedRouteKey{siteID, item.SourceKind, string(item.PayloadKind)}
+					var cached bool
+					canTryWithoutSeeders, cached = seedRoutes[key]
+					if !cached {
+						library := snapshot.MediaLibraryID
+						route, routeErr := w.sites.RecommendSiteRoute(searchCtx, actor, SourceRouteRecommendationInput{ResultToken: item.Token, MediaLibraryID: &library})
+						if routeErr == nil {
+							canTryWithoutSeeders = followSeedRoute(route, item, snapshot).Recommended != nil
+							seedRoutes[key] = canTryWithoutSeeders
+						}
+					}
+				}
+				candidate, reason, ok := buildFollowCandidate(item, siteID, sitePriority, season, snapshot, canTryWithoutSeeders)
+				if ok {
+					candidate, ok = constrainFollowCandidateCoverage(candidate, coverage[season])
+					if !ok {
+						reason = "episode_not_confirmed"
+					}
+				}
+				if ok && len(candidateMissingEpisodes(candidate, missing)) == 0 {
+					ok, reason = false, "no_missing_coverage"
+				}
+				if !ok && report {
+					summary[reason]++
+					filtered.add(reason, item.Title)
+					if reason == "seeders" {
+						if item.Seeders == nil {
+							summary["seeders_unknown"]++
+						} else if *item.Seeders == 0 {
+							summary["seeders_zero"]++
+						}
+					}
+				}
+				if ok && report && canTryWithoutSeeders && followSeederLimited(item, snapshot) {
+					if item.Seeders == nil {
+						summary["seeders_unknown_offline"]++
+					} else if *item.Seeders == 0 {
+						summary["seeders_zero_offline"]++
+					}
+				}
+				return candidate, ok
+			}
+			input := MediaIdentitySearchInput{MediaType: "tv", TMDBID: subscription.TMDBID, Season: &season, Page: 1, SiteID: &siteID, ClientCapabilities: []string{MixedDiscoveryCapability}, Refresh: true}
+			input.resultPolicy = inspectionDigest([]any{subscription.ID, subscription.Revision, snapshot, coordinateList(missing)})
+			input.preferShares = snapshot.Filters.AcquisitionPreference == FollowAcquisitionTransferFirst
+			input.acceptResult = func(item SiteSearchResult) bool {
+				if isCloudShareSource(item.SourceKind) {
+					summary["share_results"]++
+				}
+				_, ok := qualify(item, true)
+				return ok
+			}
+			input.preferResult = func(next, previous SiteSearchResult) bool {
+				if isCloudShareSource(next.SourceKind) {
+					if compared := compareOptionalTime(next.Published, previous.Published); compared != 0 {
+						return compared > 0
+					}
+				}
+				left, ok := qualify(next, false)
+				if !ok {
+					return false
+				}
+				right, ok := qualify(previous, false)
+				left.Fingerprint, right.Fingerprint = "", "" // Same proven resource; compare observations, not their projection hashes.
+				return !ok || followCandidateLess(left, right)
+			}
+			grouped, err := w.sites.SearchMediaIdentity(searchCtx, actor, input)
+			filtered.record(searchCtx, w.record)
 			if err != nil {
 				summary["site_error"]++
 				w.record(searchCtx, "follow.search_preflight_failed", "search", "failed", "该站搜索未能完成预检或执行，不把它计为零结果", map[string]any{"error_code": ErrorCode(err)})
@@ -617,10 +717,8 @@ func (w *FollowSearchWorker) searchCandidates(ctx context.Context, actor Actor, 
 					continue
 				}
 				for _, item := range group.Items {
-					candidate, reason, ok := buildFollowCandidate(item, group.SiteID, sitePriority, season, snapshot)
+					candidate, ok := qualify(item, false)
 					if !ok {
-						summary[reason]++
-						rejections.add(reason, item.Title)
 						continue
 					}
 					candidate, ok = constrainFollowCandidateCoverage(candidate, coverage[season])
@@ -649,7 +747,6 @@ func (w *FollowSearchWorker) searchCandidates(ctx context.Context, actor Actor, 
 						rejections.add("duplicate", item.Title)
 						continue
 					}
-					seen[candidateKey] = struct{}{}
 					covers := false
 					for _, episode := range candidate.Episodes {
 						if _, ok := missing[[2]int{season, episode}]; ok {
@@ -662,6 +759,10 @@ func (w *FollowSearchWorker) searchCandidates(ctx context.Context, actor Actor, 
 						rejections.add("no_missing_coverage", item.Title)
 						continue
 					}
+					seen[candidateKey] = struct{}{}
+					if isCloudShareSource(item.SourceKind) {
+						summary["share_candidates"]++
+					}
 					result = append(result, candidate)
 				}
 				rejections.record(groupCtx, w.record)
@@ -672,7 +773,7 @@ func (w *FollowSearchWorker) searchCandidates(ctx context.Context, actor Actor, 
 	return result, queryNames, summary
 }
 
-func buildFollowCandidate(item SiteSearchResult, siteID uint, sitePriority, season int, snapshot FollowExecutionSnapshot) (followCandidate, string, bool) {
+func buildFollowCandidate(item SiteSearchResult, siteID uint, sitePriority, season int, snapshot FollowExecutionSnapshot, routeWithoutSeeders ...bool) (followCandidate, string, bool) {
 	parsed, err := mediarecognition.Parse(mediarecognition.InputFacts{PackageName: item.Title, SourceKind: mediarecognition.SourceDownload, MediaTypeHint: mediarecognition.MediaTypeTV, SeasonHint: &season})
 	cloudShare := isCloudShareSource(item.SourceKind) || item.ContentInspection
 	if !cloudShare && (err != nil || parsed.Season == nil || *parsed.Season != season || !followEpisodeDeclarationIsUnambiguous(item.Title, season)) {
@@ -722,7 +823,7 @@ func buildFollowCandidate(item SiteSearchResult, siteID uint, sitePriority, seas
 	if matchesAllowed(spec.ReleaseGroup, snapshot.Filters.ExcludeReleaseGroups) {
 		return followCandidate{}, "excluded_release_group", false
 	}
-	if !isCloudShareSource(item.SourceKind) && snapshot.Filters.MinSeeders > 0 && (item.Seeders == nil || *item.Seeders < snapshot.Filters.MinSeeders) {
+	if followSeederLimited(item, snapshot) && (len(routeWithoutSeeders) == 0 || !routeWithoutSeeders[0]) {
 		return followCandidate{}, "seeders", false
 	}
 	if (snapshot.Filters.MinSizeBytes != nil || snapshot.Filters.MaxSizeBytes != nil) && item.SizeBytes <= 0 {

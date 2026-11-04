@@ -20,9 +20,12 @@ type identitySearchSnapshot struct {
 	group   SiteSearchGroup
 }
 
-func identitySnapshotPage(group SiteSearchGroup, page int) SiteSearchGroup {
+func identitySnapshotPage(group SiteSearchGroup, page int, queryAttempted bool) SiteSearchGroup {
 	items := group.Items
 	group.Page = page
+	// This field describes the current request. A local cached projection
+	// must not inherit the upstream query performed to create the snapshot.
+	group.QueryAttempted = queryAttempted
 	group.Items = []SiteSearchResult{}
 	group.HasNext = false
 	start := (page - 1) * 50
@@ -64,7 +67,8 @@ func (s *SiteService) searchPanSouIdentitySite(ctx context.Context, actor Actor,
 		Policy         string
 		Types          []string
 		ReceivingScope string
-	}{discoveryAuthorizationScope(actor), record.ID, record.Revision, keyInput, names, policy.TypePolicy, policy.CloudTypes, policy.ScopeKey})
+		ResultPolicy   string
+	}{discoveryAuthorizationScope(actor), record.ID, record.Revision, keyInput, names, policy.TypePolicy, policy.CloudTypes, policy.ScopeKey, input.resultPolicy})
 	sum := sha256.Sum256(raw)
 	key := hex.EncodeToString(sum[:])
 	s.vaultMu.Lock()
@@ -82,12 +86,12 @@ func (s *SiteService) searchPanSouIdentitySite(ctx context.Context, actor Actor,
 				return failure
 			}
 			s.vaultMu.Unlock()
-			return identitySnapshotPage(entry.group, input.Page)
+			return identitySnapshotPage(entry.group, input.Page, false)
 		}
 		for _, entry := range s.identitySnapshots {
 			if entry.key == key {
 				s.vaultMu.Unlock()
-				return identitySnapshotPage(entry.group, input.Page)
+				return identitySnapshotPage(entry.group, input.Page, false)
 			}
 		}
 	}
@@ -120,8 +124,13 @@ func (s *SiteService) searchPanSouIdentitySite(ctx context.Context, actor Actor,
 			}
 		}
 		for _, item := range part.Items {
-			if _, ok := seen[item.ResourceFingerprint]; ok {
-				s.deleteClaim(item.Token)
+			if index, ok := seen[item.ResourceFingerprint]; ok {
+				if preferIdentityObservation(input, item, all.Items[index]) {
+					s.deleteClaim(all.Items[index].Token)
+					all.Items[index] = item
+				} else {
+					s.deleteClaim(item.Token)
+				}
 				continue
 			}
 			if len(all.Items) >= 1000 {
@@ -146,6 +155,9 @@ func (s *SiteService) searchPanSouIdentitySite(ctx context.Context, actor Actor,
 	}
 	sort.SliceStable(all.Items, func(i, j int) bool {
 		a, b := all.Items[i], all.Items[j]
+		if input.preferShares && isCloudShareSource(a.SourceKind) != isCloudShareSource(b.SourceKind) {
+			return isCloudShareSource(a.SourceKind)
+		}
 		if intValue(a.Seeders) != intValue(b.Seeders) {
 			return intValue(a.Seeders) > intValue(b.Seeders)
 		}
@@ -190,5 +202,5 @@ func (s *SiteService) searchPanSouIdentitySite(ctx context.Context, actor Actor,
 	}
 	s.identitySnapshots[all.SnapshotID] = identitySearchSnapshot{key, expires, *all}
 	s.vaultMu.Unlock()
-	return identitySnapshotPage(*all, input.Page)
+	return identitySnapshotPage(*all, input.Page, all.QueryAttempted)
 }

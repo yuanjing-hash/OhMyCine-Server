@@ -39,16 +39,17 @@ type SourceRouteSelection struct {
 }
 
 type SourceRouteChoice struct {
-	DownloaderID   string `json:"downloader_id"`
-	DownloaderName string `json:"downloader_name"`
-	DownloaderType string `json:"downloader_type"`
-	MediaLibraryID uint   `json:"media_library_id"`
-	LibraryName    string `json:"library_name"`
-	Enabled        bool   `json:"enabled"`
-	ReasonCode     string `json:"reason_code"`
-	ReasonMessage  string `json:"reason_message"`
-	RouteKind      string `json:"route_kind"`
-	RouteLabel     string `json:"route_label"`
+	DownloaderID         string `json:"downloader_id"`
+	DownloaderName       string `json:"downloader_name"`
+	DownloaderType       string `json:"downloader_type"`
+	MediaLibraryID       uint   `json:"media_library_id"`
+	LibraryName          string `json:"library_name"`
+	Enabled              bool   `json:"enabled"`
+	CanTryWithoutSeeders bool   `json:"can_try_without_seeders"`
+	ReasonCode           string `json:"reason_code"`
+	ReasonMessage        string `json:"reason_message"`
+	RouteKind            string `json:"route_kind"`
+	RouteLabel           string `json:"route_label"`
 }
 
 type SourceRouteRecommendation struct {
@@ -275,6 +276,9 @@ func (s *DownloadService) recommendSourceRoute(ctx context.Context, actor Actor,
 		if !routeDownloaderApplicable(source, downloader) {
 			continue
 		}
+		// Use current local executor capabilities; persisted presentation JSON
+		// and a successful connection test cannot grant source availability.
+		capabilities, _ := s.downloader.registry.Capabilities(downloader.Type)
 		byLibrary := make(map[uint]SourceRouteChoice, len(visibleLibraries))
 		preview, previewErr := s.PreviewRoutes(ctx, actor, DownloadRoutePreviewInput{DownloaderID: downloader.ID, SourceKind: previewSourceKind, SiteID: &siteID, ExpectedBytes: size})
 		if facts.RequiresSelection {
@@ -289,7 +293,7 @@ func (s *DownloadService) recommendSourceRoute(ctx context.Context, actor Actor,
 			}
 		}
 		for _, library := range visibleLibraries {
-			choice := SourceRouteChoice{DownloaderID: downloader.ID, DownloaderName: downloader.Name, DownloaderType: downloader.Type, MediaLibraryID: library.ID, LibraryName: library.Name}
+			choice := SourceRouteChoice{DownloaderID: downloader.ID, DownloaderName: downloader.Name, DownloaderType: downloader.Type, MediaLibraryID: library.ID, LibraryName: library.Name, CanTryWithoutSeeders: capabilities.CanTryWithoutSeeders}
 			if previewErr != nil {
 				choice.ReasonCode = ErrorCode(previewErr)
 				choice.ReasonMessage = safeErrorMessage(previewErr, "下载器当前无法接收此资源")

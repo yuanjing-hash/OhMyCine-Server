@@ -37,8 +37,11 @@ type Capabilities struct {
 	ETA                            bool   `json:"eta"`
 	Seeding                        bool   `json:"seeding"`
 	NativeOffline                  bool   `json:"native_offline"`
-	ShareReceive                   bool   `json:"share_receive"`
-	OutputConstraint               string `json:"output_constraint"`
+	// CanTryWithoutSeeders permits an execution attempt without a public live
+	// swarm count. It is not proof of source availability or accepted output.
+	CanTryWithoutSeeders bool   `json:"can_try_without_seeders"`
+	ShareReceive         bool   `json:"share_receive"`
+	OutputConstraint     string `json:"output_constraint"`
 }
 
 type Config struct {
@@ -295,10 +298,20 @@ const (
 // Timeout/Canceled are true only when the error chain positively reports them.
 // No provider identity, URL, body or raw error crosses this projection.
 type FailureDiagnostic struct {
-	Stage        string
-	ProviderCode string
-	Timeout      bool
-	Canceled     bool
+	Stage                string
+	ProviderCode         string
+	Timeout              bool
+	Canceled             bool
+	ProviderOperation    string
+	ProviderHTTPStatus   int
+	ProviderErrno        int
+	ProviderResponseKind string
+}
+
+// ProviderFailureDetailer exposes safe per-request facts through an error chain.
+// Implementations must never return URLs, response text or resource identities.
+type ProviderFailureDetailer interface {
+	ProviderFailureDetails() (operation string, httpStatus int, providerErrno int, responseKind string)
 }
 
 type failureStageError struct {
@@ -341,6 +354,24 @@ func FailureDiagnosticFromError(err error) (FailureDiagnostic, bool) {
 			cloud.CodeOfflineTaskExists, cloud.CodeShareExpired, cloud.CodeSharePassword, cloud.CodeShareInvalid,
 			cloud.CodeShareEmpty, cloud.CodeShareTooLarge, cloud.CodeShareUnknown, cloud.CodeConflict, cloud.CodeMutationUnknown:
 			diagnostic.ProviderCode = provider.Code
+		}
+	}
+	var detail ProviderFailureDetailer
+	if errors.As(err, &detail) {
+		operation, status, errno, kind := detail.ProviderFailureDetails()
+		switch operation {
+		case "submit", "reconcile", "cancel":
+			diagnostic.ProviderOperation = operation
+		}
+		if status >= 100 && status <= 599 {
+			diagnostic.ProviderHTTPStatus = status
+		}
+		if errno >= -2147483648 && errno <= 2147483647 {
+			diagnostic.ProviderErrno = errno
+		}
+		switch kind {
+		case "http_error", "provider_error", "invalid_response", "read_error", "response_too_large":
+			diagnostic.ProviderResponseKind = kind
 		}
 	}
 	return diagnostic, true

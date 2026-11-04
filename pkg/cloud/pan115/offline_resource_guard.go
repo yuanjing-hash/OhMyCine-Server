@@ -197,7 +197,7 @@ func (c *Client) reconcileOrdinarySubmit(ctx context.Context, g *ordinaryOffline
 		// ordinary cached-page lookup instead of scanning every account page.
 		task, err := c.getOfflineNative(ctx, g.Checkpoint.Input.Hash)
 		if err != nil {
-			return cloud.OfflineTask{}, selectedUnknown()
+			return cloud.OfflineTask{}, cloud.Error(cloud.CodeMutationUnknown, true, err)
 		}
 		g.Checkpoint.Task = &task
 		if err = c.releaseOrdinary(ctx, g); err != nil {
@@ -207,7 +207,7 @@ func (c *Client) reconcileOrdinarySubmit(ctx context.Context, g *ordinaryOffline
 	}
 	native, found, err := c.selectedNativeTask(ctx, g.Checkpoint.Input.Hash, "")
 	if err != nil {
-		return cloud.OfflineTask{}, err
+		return cloud.OfflineTask{}, cloud.Error(cloud.CodeMutationUnknown, true, err)
 	}
 	// Positive evidence in this exact task directory can reconcile a lost ACK.
 	// Absence is never permission to release or dispatch a replacement.
@@ -222,11 +222,27 @@ func (c *Client) reconcileOrdinarySubmit(ctx context.Context, g *ordinaryOffline
 	return task, nil
 }
 func (c *Client) submitOrdinaryOffline(ctx context.Context, uri, directory, hash string) (cloud.OfflineTask, error) {
+	return c.ordinaryOperation(ctx, hash, func() (cloud.OfflineTask, error) {
+		return c.submitOrdinaryOfflineOwned(ctx, uri, directory, hash)
+	})
+}
+
+// Cancellation stops admission immediately, but an entered context-less SDK
+// write must physically return before its owner classifies the original receipt
+// or releases this lock. Preserve a confirmed late task for the original worker's
+// normal identity persistence/cancellation cleanup. The ordinary SDK path has
+// finite HTTP timeouts and no retries; selected uploads have a different lifetime
+// and deliberately do not use this helper.
+func (c *Client) ordinaryOperation(ctx context.Context, hash string, call func() (cloud.OfflineTask, error)) (cloud.OfflineTask, error) {
 	release, err := c.lockOrdinaryResource(ctx, hash)
 	if err != nil {
 		return cloud.OfflineTask{}, err
 	}
 	defer release()
+	return call()
+}
+
+func (c *Client) submitOrdinaryOfflineOwned(ctx context.Context, uri, directory, hash string) (cloud.OfflineTask, error) {
 	input := ordinaryOfflineInput{Version: 1, Scope: ordinaryScope(ctx, []string{"submit", uri, directory}), Action: "submit", Hash: hash, URIDigest: selectedDigest(uri), DirectoryID: directory}
 	g, err := c.prepareOrdinary(ctx, input)
 	if err != nil {
@@ -237,7 +253,7 @@ func (c *Client) submitOrdinaryOffline(ctx context.Context, uri, directory, hash
 	}
 	dispatched := false
 	var hashes []string
-	err = c.waitAndCall(ctx, c.offlineRate, func() error {
+	err = c.waitAndCallOwned(ctx, c.offlineRate, func() error {
 		if e := c.checkOrdinaryOwner(ctx, hash, g.Receipt.ID); e != nil {
 			return e
 		}
@@ -271,14 +287,22 @@ func (c *Client) submitOrdinaryOffline(ctx context.Context, uri, directory, hash
 	if e := g.save(checkpointCtx, "unknown"); e != nil {
 		return cloud.OfflineTask{}, e
 	}
-	return c.reconcileOrdinarySubmit(checkpointCtx, g)
+	task, reconcileErr := c.reconcileOrdinarySubmit(checkpointCtx, g)
+	if reconcileErr != nil && err != nil {
+		// The reconciliation result controls retry/nonreplay; the original
+		// write failure contributes only its preserved, request-local facts.
+		reconcileErr = errors.Join(reconcileErr, mapError(err))
+	}
+	return task, reconcileErr
 }
 func (c *Client) cancelOrdinaryOffline(ctx context.Context, hash string, deleteFiles bool) error {
-	release, err := c.lockOrdinaryResource(ctx, hash)
-	if err != nil {
-		return err
-	}
-	defer release()
+	_, err := c.ordinaryOperation(ctx, hash, func() (cloud.OfflineTask, error) {
+		return cloud.OfflineTask{}, c.cancelOrdinaryOfflineOwned(ctx, hash, deleteFiles)
+	})
+	return err
+}
+
+func (c *Client) cancelOrdinaryOfflineOwned(ctx context.Context, hash string, deleteFiles bool) error {
 	action := "cancel"
 	if deleteFiles {
 		action = "cancel-data"
@@ -295,7 +319,7 @@ func (c *Client) cancelOrdinaryOffline(ctx context.Context, hash string, deleteF
 		return c.reconcileOrdinaryCancel(ctx, g)
 	}
 	dispatched := false
-	err = c.waitAndCall(ctx, c.offlineRate, func() error {
+	err = c.waitAndCallOwned(ctx, c.offlineRate, func() error {
 		if e := c.checkOrdinaryOwner(ctx, hash, g.Receipt.ID); e != nil {
 			return e
 		}

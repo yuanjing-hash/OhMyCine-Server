@@ -1,6 +1,7 @@
 package pan115
 
 import (
+	"bytes"
 	"context"
 	"encoding/base32"
 	"encoding/hex"
@@ -247,6 +248,9 @@ func New(config cloud.Config) (cloud.Driver, error) {
 	// fail" response for generic and iOS user agents. 115Browser is required
 	// for offline submission and remains compatible with the read APIs.
 	sdk := pan115sdk.New(pan115sdk.WithClient(httpClient), pan115sdk.UA(pan115sdk.UA115Browser)).ImportCredential(credential)
+	// Wrap the SDK-created transport, preserving its DNS/proxy/TLS and pooling
+	// configuration. Diagnostics never substitute another HTTP route.
+	httpClient.Transport = offlineDiagnosticTransport{base: httpClient.Transport}
 	return &Client{
 		selective:  &selectiveOfflineState{store: config.Operations, account: resourceAccount},
 		beforeCall: config.BeforeCall, onCallResult: config.OnCallResult,
@@ -265,6 +269,98 @@ func New(config cloud.Config) (cloud.Driver, error) {
 		// available for interactive/playback work.
 		callSlots: make(chan struct{}, maxInFlightCalls), backgroundRead: make(chan struct{}, maxBackgroundCalls), now: time.Now, jitter: defaultJitter, recyclePassword: strings.TrimSpace(config.RecyclePassword),
 	}, nil
+}
+
+// offlineWireFailure retains only finite response facts. SDK CheckErr otherwise
+// drops HTTP status and includes the complete (potentially secret) body in its
+// error. Its typed cause still controls definite-rejection/retry semantics.
+type offlineWireFailure struct {
+	operation, responseKind   string
+	httpStatus, providerErrno int
+	risk, transient           bool
+	cause                     error
+}
+
+func (e *offlineWireFailure) Error() string { return "115 offline request failed" }
+func (e *offlineWireFailure) Unwrap() error { return e.cause }
+func (e *offlineWireFailure) Timeout() bool {
+	var timeout interface{ Timeout() bool }
+	return errors.As(e.cause, &timeout) && timeout.Timeout()
+}
+func (e *offlineWireFailure) ProviderFailureDetails() (string, int, int, string) {
+	return e.operation, e.httpStatus, e.providerErrno, e.responseKind
+}
+
+type offlineDiagnosticTransport struct{ base http.RoundTripper }
+
+func (t offlineDiagnosticTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	response, err := t.base.RoundTrip(request)
+	operation := ordinaryWireOperation(request)
+	if err != nil || operation == "" {
+		return response, err
+	}
+	failure := &offlineWireFailure{operation: operation, httpStatus: response.StatusCode}
+	fail := func(kind string, cause error) (*http.Response, error) {
+		response.Body.Close()
+		failure.responseKind, failure.cause = kind, cause
+		return nil, failure
+	}
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		cause := error(pan115sdk.ErrUnexpected)
+		if response.StatusCode == 405 || response.StatusCode == 429 {
+			failure.risk = true
+			cause = cloud.Error(cloud.CodeRateLimited, true, cause)
+		}
+		failure.transient = response.StatusCode == 502 || response.StatusCode == 503 || response.StatusCode == 504
+		return fail("http_error", cause)
+	}
+	const limit = 2 << 20
+	raw, err := io.ReadAll(io.LimitReader(response.Body, limit+1))
+	if err != nil {
+		failure.transient = isTransientResponse(err)
+		return fail("read_error", err)
+	}
+	if len(raw) > limit {
+		return fail("response_too_large", pan115sdk.ErrUnexpected)
+	}
+	var envelope pan115sdk.BasicResp
+	if json.Unmarshal(raw, &envelope) != nil {
+		return fail("invalid_response", pan115sdk.ErrUnexpected)
+	}
+	if !envelope.State {
+		failure.providerErrno = int(envelope.Errno)
+		if failure.providerErrno == 0 {
+			failure.providerErrno = envelope.ErrNo
+		}
+		// Preserve the existing account-recovery classification before dropping
+		// the SDK's body-bearing error. Only these private booleans survive;
+		// neither the raw response nor its message becomes an error cause.
+		observed := pan115sdk.GetErr(failure.providerErrno, string(raw))
+		failure.risk, failure.transient = isRiskResponse(observed), isTransientResponse(observed)
+		return fail("provider_error", pan115sdk.GetErr(failure.providerErrno))
+	}
+	response.Body.Close()
+	response.Body = io.NopCloser(bytes.NewReader(raw))
+	return response, nil
+}
+
+func ordinaryWireOperation(request *http.Request) string {
+	if request.Method != http.MethodPost || request.URL.Scheme != "https" || request.URL.Host != "lixian.115.com" {
+		return ""
+	}
+	q := request.URL.Query()
+	if request.URL.Path == "/lixianssp/" && q.Get("ac") == "add_task_urls" {
+		return "submit"
+	}
+	if request.URL.Path == "/lixian/" && q.Get("ct") == "lixian" {
+		switch q.Get("ac") {
+		case "task_lists":
+			return "reconcile"
+		case "task_del":
+			return "cancel"
+		}
+	}
+	return ""
 }
 
 func (c *Client) Provider() string { return cloud.ProviderPan115 }
@@ -1478,6 +1574,18 @@ func (c *Client) guardCredential(ctx context.Context) error {
 }
 
 func (c *Client) waitAndCall(ctx context.Context, limiter *rate.Limiter, call func() error) error {
+	return c.waitAndCallMode(ctx, limiter, call, false)
+}
+
+// A durable resource-operation owner must not classify or release an SDK
+// write while its context-less call still runs. The outer operation keeps
+// original operation owns this finite physical completion join, so a confirmed
+// late identity can still reach the worker's existing cancellation cleanup.
+func (c *Client) waitAndCallOwned(ctx context.Context, limiter *rate.Limiter, call func() error) error {
+	return c.waitAndCallMode(ctx, limiter, call, true)
+}
+
+func (c *Client) waitAndCallMode(ctx context.Context, limiter *rate.Limiter, call func() error, join bool) error {
 	waitStarted := time.Now()
 	waitRecorded := false
 	defer func() {
@@ -1519,7 +1627,10 @@ func (c *Client) waitAndCall(ctx context.Context, limiter *rate.Limiter, call fu
 	go func() {
 		defer func() { <-c.callSlots }()
 		callStarted := time.Now()
-		err := call()
+		err := ctx.Err()
+		if err == nil {
+			err = call()
+		}
 		cloud.RecordProviderCall(ctx, time.Since(callStarted))
 		// Record the provider outcome in the calling generation even when the
 		// caller's context is cancelled while the context-less SDK call is still
@@ -1536,6 +1647,9 @@ func (c *Client) waitAndCall(ctx context.Context, limiter *rate.Limiter, call fu
 	case err := <-done:
 		return err
 	case <-ctx.Done():
+		if join {
+			return <-done
+		}
 		return ctx.Err()
 	}
 }
@@ -1686,12 +1800,24 @@ func defaultJitter() time.Duration {
 }
 
 func isRiskResponse(err error) bool {
+	var wire *offlineWireFailure
+	if errors.As(err, &wire) && wire.risk {
+		return true
+	}
 	message := strings.ToLower(err.Error())
 	return strings.Contains(message, "429") || strings.Contains(message, "405") || strings.Contains(message, "rate") || strings.Contains(message, "频繁") || strings.Contains(message, "风控")
 }
 
 func isTransientResponse(err error) bool {
+	var wire *offlineWireFailure
+	if errors.As(err, &wire) && wire.transient {
+		return true
+	}
 	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var timeout interface{ Timeout() bool }
+	if errors.As(err, &timeout) && timeout.Timeout() {
 		return true
 	}
 	message := strings.ToLower(err.Error())
