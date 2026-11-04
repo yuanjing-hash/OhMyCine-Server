@@ -2,12 +2,18 @@ package services
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sync"
+
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
+	"gorm.io/gorm"
 )
 
 type preparedFollowCandidate struct {
 	Candidate                           followCandidate
+	Started, Deferred                   bool
+	Stage                               string
 	ContentSelectionToken, PreviewToken string
 	SelectedEntryTokens                 []string
 	Recommendation                      SourceRouteRecommendation
@@ -19,20 +25,32 @@ type preparedFollowCandidate struct {
 // tasks and executor submissions happen later, serially in deterministic order.
 func (w *FollowSearchWorker) prepareFollowCandidates(ctx context.Context, actor Actor, snapshot FollowExecutionSnapshot, candidates []followCandidate, missing map[[2]int]struct{}) []preparedFollowCandidate {
 	result := make([]preparedFollowCandidate, len(candidates))
+	for index, candidate := range candidates {
+		result[index] = preparedFollowCandidate{Candidate: candidate, Deferred: true}
+	}
 	var wg sync.WaitGroup
 	permits := make(chan struct{}, 4)
 	for index, candidate := range candidates {
+		// Admit in input order. A canceled permit waiter has not inspected a
+		// resource and must remain available to the next bounded run.
+		select {
+		case permits <- struct{}{}:
+		case <-ctx.Done():
+			wg.Wait()
+			return result
+		}
+		if ctx.Err() != nil {
+			<-permits
+			break
+		}
 		wg.Add(1)
 		go func(i int, candidate followCandidate) {
 			defer wg.Done()
-			prepared := preparedFollowCandidate{Candidate: candidate}
-			defer func() { result[i] = prepared }()
-			select {
-			case permits <- struct{}{}:
-			case <-ctx.Done():
-				prepared.Err = ctx.Err()
-				return
-			}
+			prepared := preparedFollowCandidate{Candidate: candidate, Started: true, Stage: "content"}
+			defer func() {
+				prepared.Deferred = prepared.Err != nil && ctx.Err() != nil
+				result[i] = prepared
+			}()
 			defer func() { <-permits }()
 			episodes := candidateMissingEpisodes(candidate, missing)
 			if len(episodes) == 0 {
@@ -50,6 +68,7 @@ func (w *FollowSearchWorker) prepareFollowCandidates(ctx context.Context, actor 
 				prepared.Candidate.Episodes, prepared.Candidate.SubtitleRank = content.Episodes, content.SubtitleRank
 				prepared.Candidate.Fingerprint = followFingerprint(candidate.SiteID, fmt.Sprintf("%s:%d:%v:%s", candidate.Fingerprint, candidate.Season, content.Episodes, content.Digest), 0, nil)
 			}
+			prepared.Stage = "route"
 			recommendation, err := w.sites.RecommendSiteRoute(ctx, actor, SourceRouteRecommendationInput{ResultToken: candidate.Item.Token, MediaLibraryID: &libraryID, ContentSelectionToken: prepared.ContentSelectionToken})
 			if err != nil {
 				prepared.Err = err
@@ -66,6 +85,7 @@ func (w *FollowSearchWorker) prepareFollowCandidates(ctx context.Context, actor 
 			// Compatibility for an old result contract; never use this branch after a
 			// new manifest failed. Current native search results advertise inspection.
 			if !candidate.Item.ContentInspection && isCloudShareSource(candidate.Item.SourceKind) {
+				prepared.Stage = "content"
 				var digest string
 				prepared.PreviewToken, prepared.SelectedEntryTokens, episodes, digest, prepared.Err = w.sites.prepareFollowShare(ctx, actor, candidate.Item.Token, recommendation.Recommended.DownloaderID, candidate.Season, episodes, candidate.Item.Title)
 				if prepared.Err != nil {
@@ -78,4 +98,64 @@ func (w *FollowSearchWorker) prepareFollowCandidates(ctx context.Context, actor 
 	}
 	wg.Wait()
 	return result
+}
+
+// The cursor only schedules fresh read-only checks. It carries no source,
+// inspection proof, claim or permission authority, and is private Job state.
+type followCandidatePosition struct {
+	Fingerprint string `json:"fingerprint"`
+	Season      int    `json:"season"`
+}
+
+type followSearchCheckpoint struct {
+	Version          int                       `json:"version"`
+	Stage            string                    `json:"stage"`
+	Missing          []FollowEpisodeCoordinate `json:"missing"`
+	Selected         []string                  `json:"selected,omitempty"`
+	PreparationAfter *followCandidatePosition  `json:"preparation_after,omitempty"`
+	PreparationScope string                    `json:"preparation_scope"`
+}
+
+func (w *FollowSearchWorker) preparationCheckpoint(ctx context.Context, run models.FollowRun, subscription models.FollowSubscription, job models.Job, missing []FollowEpisodeCoordinate) (followSearchCheckpoint, error) {
+	scope := inspectionDigest([]any{run.OwnerID, run.SubscriptionID, run.SubscriptionRevision, run.LifecycleRevision, missing})
+	checkpoint := followSearchCheckpoint{Version: 1, Stage: "search", Missing: missing, PreparationScope: scope}
+	reuse := func(raw string) bool {
+		var saved followSearchCheckpoint
+		if json.Unmarshal([]byte(raw), &saved) == nil && saved.Version == 1 && saved.PreparationScope == scope && saved.PreparationAfter != nil && len(saved.PreparationAfter.Fingerprint) == 64 {
+			checkpoint.PreparationAfter = saved.PreparationAfter
+			return true
+		}
+		return false
+	}
+	if reuse(job.CheckpointJSON) || subscription.LastRunID == nil || *subscription.LastRunID == run.ID {
+		return checkpoint, nil
+	}
+	var previous models.Job
+	err := w.follows.db.WithContext(ctx).Model(&models.Job{}).Select("jobs.checkpoint_json").
+		Joins("JOIN follow_runs ON follow_runs.job_id = jobs.id").
+		Where("follow_runs.id = ? AND follow_runs.subscription_id = ? AND follow_runs.owner_id = ? AND follow_runs.subscription_revision = ? AND follow_runs.lifecycle_revision = ? AND jobs.job_type = ? AND jobs.resource_key = ?", *subscription.LastRunID, run.SubscriptionID, run.OwnerID, run.SubscriptionRevision, run.LifecycleRevision, JobTypeFollowSearch, "follow:"+run.SubscriptionID).Take(&previous).Error
+	if err != nil && err != gorm.ErrRecordNotFound {
+		return checkpoint, err
+	}
+	reuse(previous.CheckpointJSON)
+	return checkpoint, nil
+}
+
+func continueFollowCandidates(pool []followCandidate, after *followCandidatePosition) []followCandidate {
+	if after != nil {
+		for index, candidate := range pool {
+			if candidate.Fingerprint == after.Fingerprint && candidate.Season == after.Season {
+				return append(append([]followCandidate(nil), pool[index+1:]...), pool[:index+1]...)
+			}
+		}
+	}
+	return pool
+}
+
+func rejectedFollowContent(err error) bool {
+	switch ErrorCode(err) {
+	case "resource_content_invalid_metainfo", "resource_content_limit_exceeded", "resource_content_unsafe_path", "resource_content_hash_mismatch", "resource_content_unsupported":
+		return true
+	}
+	return false
 }

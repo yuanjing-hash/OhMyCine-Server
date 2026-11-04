@@ -159,7 +159,10 @@ func (f *followCoverageFixture) run(t *testing.T) models.FollowRun {
 	if err != nil || claimed == nil {
 		t.Fatalf("claim=%+v err=%v", claimed, err)
 	}
-	result := f.worker.Run(context.Background(), &followProgressRuntime{}, *claimed)
+	runtime := &followProgressRuntime{checkpoint: func(value any) error {
+		return f.follows.queue.SaveCheckpoint(claimed.Job.ID, claimed.LeaseToken, value)
+	}}
+	result := f.worker.Run(context.Background(), runtime, *claimed)
 	if result.ErrorCode != "" || result.RetryAt != nil {
 		t.Fatalf("worker result=%+v", result)
 	}

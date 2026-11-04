@@ -40,12 +40,14 @@ type followCandidate struct {
 }
 
 type FollowSearchWorker struct {
-	follows *FollowService
-	sites   *SiteService
+	follows            *FollowService
+	sites              *SiteService
+	preparationTimeout time.Duration
 }
 
 const maxFollowCandidateAttempts = 50
 const followCandidatePreparationTimeout = 2 * time.Minute
+const followCandidateRecheckTimeout = 65 * time.Second
 
 var followEpisodeRangePattern = regexp.MustCompile(`(?i)S(\d+)E(\d+)(?:[-~～‐‑‒–—](?:S(\d+))?E?|E)(\d+)`)
 var followEpisodeMarkerPattern = regexp.MustCompile(`(?i)(?:S\s*\d+\s*[ ._-]*)?E(?:P(?:ISODES?)?)?\s*\d+|\d+x\d+|第\s*[0-9零〇一二两兩三四五六七八九十百千]{1,12}\s*[集话話]|S\s*\d+`)
@@ -187,7 +189,10 @@ func (w *FollowSearchWorker) Run(ctx context.Context, runtime JobRuntime, job Cl
 	progress := float64(20)
 	processed, total := int64(1), int64(4)
 	_ = runtime.Heartbeat(&progress, &processed, &total, nil, nil)
-	_ = runtime.Checkpoint(map[string]any{"stage": "search", "missing": missingCoordinates})
+	checkpoint, err := w.preparationCheckpoint(ctx, run, subscription, job.Job, missingCoordinates)
+	if err != nil || runtime.Checkpoint(checkpoint) != nil {
+		return followPersistFailure()
+	}
 	searchCtx, stopSearch := context.WithTimeoutCause(context.WithValue(ctx, followSearchBudgetKey{}, true), w.sites.searchPolicyValue().Follow, errors.New(CodeSearchBudget))
 	candidates, queryNames, filterSummary := w.searchCandidates(searchCtx, actor, subscription, snapshot, missing, seenSeasons)
 	if unknown > 0 {
@@ -215,9 +220,11 @@ func (w *FollowSearchWorker) Run(ctx context.Context, runtime JobRuntime, job Cl
 	submitFailures := 0
 	lastSubmitMessage := ""
 	retryObserved := []followRetryObservation{}
+	preparationObserved := []followRetryObservation{}
 	candidateBudgetReached := false
 	pool := append([]followCandidate(nil), candidates...)
 	sort.SliceStable(pool, func(i, j int) bool { return followCandidateLess(pool[i], pool[j]) })
+	pool = continueFollowCandidates(pool, checkpoint.PreparationAfter)
 	ready := []preparedFollowCandidate{}
 	preparationTokens := map[string]struct{}{}
 	defer func() {
@@ -228,9 +235,14 @@ func (w *FollowSearchWorker) Run(ctx context.Context, runtime JobRuntime, job Cl
 			w.sites.discardContentPreparation(actor, token)
 		}
 	}()
-	prepareCtx, stopPreparation := context.WithTimeout(ctx, followCandidatePreparationTimeout)
+	preparationTimeout := w.preparationTimeout
+	if preparationTimeout <= 0 {
+		preparationTimeout = followCandidatePreparationTimeout
+	}
+	prepareCtx, stopPreparation := context.WithTimeout(ctx, preparationTimeout)
 	defer stopPreparation()
 	attempted := 0
+	deferredChecks := 0
 	for submitted < snapshot.MaxResourcesPerRun {
 		// The final failed preparation can exhaust the pool. Preserve a stop
 		// that occurred during that read before treating exhaustion as no match.
@@ -255,11 +267,18 @@ func (w *FollowSearchWorker) Run(ctx context.Context, runtime JobRuntime, job Cl
 			}
 			batch := append([]followCandidate(nil), pool[:window]...)
 			pool = pool[window:]
-			attempted += window
 			prepared := w.prepareFollowCandidates(prepareCtx, actor, snapshot, batch, missing)
-			for _, item := range prepared {
+			for index, item := range prepared {
+				if item.Started {
+					attempted++
+					checkpoint.PreparationAfter = &followCandidatePosition{Fingerprint: batch[index].Fingerprint, Season: batch[index].Season}
+				}
 				if item.ContentSelectionToken != "" {
 					preparationTokens[item.ContentSelectionToken] = struct{}{}
+				}
+				if item.Deferred {
+					deferredChecks++
+					continue
 				}
 				if item.Err != nil {
 					if ErrorCode(item.Err) == codeContentNoMissingFiles {
@@ -270,19 +289,37 @@ func (w *FollowSearchWorker) Run(ctx context.Context, runtime JobRuntime, job Cl
 						w.record(ctx, "follow.content_no_missing_files", "selection", "skipped", "已完整检查，该资源没有符合本次缺集及字幕策略的实际文件", nil)
 						continue
 					}
-					submitFailures++
-					filterSummary["content_preparation_failed"]++
-					filterSummary["submit_failed"]++
+					if rejectedFollowContent(item.Err) {
+						filterSummary["content_rejected"]++
+						w.record(ctx, "follow.content_rejected", "selection", "skipped", "实际文件元数据未通过安全校验，未创建下载任务", map[string]any{"error_code": ErrorCode(item.Err), "site_id": item.Candidate.SiteID})
+						continue
+					}
+					observed := &preparationObserved
+					if item.Stage == "route" {
+						submitFailures++
+						filterSummary["submit_failed"]++
+						observed = &retryObserved
+					} else {
+						filterSummary["content_preparation_failed"]++
+					}
 					if isCloudShareSource(item.Candidate.Item.SourceKind) {
 						filterSummary["share_selection_failed"]++
 					}
 					lastSubmitMessage = safeErrorMessage(item.Err, "资源实际文件或入库路线未能核实")
-					observeFollowRetry(&retryObserved, item.Err, item.Candidate, lastSubmitMessage)
+					observeFollowRetry(observed, item.Err, item.Candidate, lastSubmitMessage)
 					w.sites.discardContentPreparation(actor, item.ContentSelectionToken)
-					w.record(ctx, "follow.content_preparation_failed", "selection", "failed", "实际文件、缺集、字幕或路线未能核实，继续检查其他候选", map[string]any{"error_code": ErrorCode(item.Err), "site_id": item.Candidate.SiteID})
+					if item.Stage == "route" {
+						w.record(ctx, "follow.route_unavailable", "route", "failed", "资源未提交：下载器与目标媒体库路线未能核实，继续检查其他候选", map[string]any{"error_code": ErrorCode(item.Err), "site_id": item.Candidate.SiteID})
+					} else {
+						w.record(ctx, "follow.content_preparation_failed", "selection", "waiting", "实际文件、缺集或字幕未能核实，未提交下载；继续检查其他候选", map[string]any{"error_code": ErrorCode(item.Err), "site_id": item.Candidate.SiteID})
+					}
 				} else {
 					ready = append(ready, item)
 				}
+			}
+			checkpoint.Stage, checkpoint.Selected = "selection", nil
+			if err := runtime.Checkpoint(checkpoint); err != nil {
+				return followPersistFailure()
 			}
 			// Always re-check cancellation/lifecycle after the bounded read batch.
 			continue
@@ -302,11 +339,9 @@ func (w *FollowSearchWorker) Run(ctx context.Context, runtime JobRuntime, job Cl
 					continue
 				}
 			}
-			if len(pool) > 0 && (attempted >= maxFollowCandidateAttempts || prepareCtx.Err() != nil && ctx.Err() == nil) {
+			if (len(pool) > 0 || deferredChecks > 0) && (attempted >= maxFollowCandidateAttempts || prepareCtx.Err() != nil && ctx.Err() == nil) {
 				filterSummary["candidate_budget"]++
 				candidateBudgetReached = true
-				submitFailures++
-				lastSubmitMessage = "本轮资源核验已达到预算，剩余候选将在后续追更中重新检查"
 			}
 			break
 		}
@@ -322,7 +357,10 @@ func (w *FollowSearchWorker) Run(ctx context.Context, runtime JobRuntime, job Cl
 		stats.mu.Lock()
 		stats.chosen++
 		stats.mu.Unlock()
-		_ = runtime.Checkpoint(map[string]any{"stage": "submit", "missing": coordinateList(missing), "selected": candidateFingerprints(selected)})
+		checkpoint.Stage, checkpoint.Selected = "submit", candidateFingerprints(selected)
+		if err := runtime.Checkpoint(checkpoint); err != nil {
+			return followPersistFailure()
+		}
 		candidateCtx := serverlog.WithBusinessFields(ctx, map[string]any{"site_id": candidate.SiteID, "resource_name": candidate.Item.Title, "season": candidate.Season})
 		blocked, gateErr := followReadinessBlocked(w.follows.db, subscription.ID)
 		if gateErr != nil {
@@ -338,14 +376,26 @@ func (w *FollowSearchWorker) Run(ctx context.Context, runtime JobRuntime, job Cl
 			w.record(candidateCtx, "follow.coverage_changed", "selection", "skipped", "该资源已不覆盖本轮剩余缺集，未提交下载", nil)
 			continue
 		}
+		// A completed preparation keeps its authority only for the real source
+		// lifetime. Rechecks get a separate finite context, never the spent read
+		// window; SiteService still rechecks expiry, actor and exact selection.
+		recheckCtx, stopRecheck := context.WithTimeout(ctx, followCandidateRecheckTimeout)
 		if candidate.Item.ContentInspection && len(episodes) != len(candidate.Episodes) {
 			w.sites.discardContentPreparation(actor, prepared.ContentSelectionToken)
-			refined, refineErr := w.sites.prepareFollowContent(prepareCtx, actor, candidate.Item.Token, candidate.Season, episodes, effectiveSubtitlePolicy(snapshot.Filters.Subtitles))
+			refined, refineErr := w.sites.prepareFollowContent(recheckCtx, actor, candidate.Item.Token, candidate.Season, episodes, effectiveSubtitlePolicy(snapshot.Filters.Subtitles))
 			if refineErr != nil {
-				submitFailures++
+				stopRecheck()
+				if ErrorCode(refineErr) == codeContentNoMissingFiles {
+					filterSummary["no_missing_coverage"]++
+					continue
+				}
+				if rejectedFollowContent(refineErr) {
+					filterSummary["content_rejected"]++
+					continue
+				}
 				filterSummary["content_preparation_failed"]++
 				lastSubmitMessage = safeErrorMessage(refineErr, "本次剩余缺集文件核验失败")
-				observeFollowRetry(&retryObserved, refineErr, candidate, lastSubmitMessage)
+				observeFollowRetry(&preparationObserved, refineErr, candidate, lastSubmitMessage)
 				continue
 			}
 			prepared.ContentSelectionToken, prepared.UnconfirmedSubtitles = refined.SelectionToken, refined.UnconfirmedSubtitles
@@ -358,9 +408,11 @@ func (w *FollowSearchWorker) Run(ctx context.Context, runtime JobRuntime, job Cl
 		// uses the owner's current authority; accepted tasks retain their plan.
 		actor, err = w.follows.authorization.Resolve(run.OwnerID)
 		if err != nil {
+			stopRecheck()
 			return w.block(run, subscription, CodePermissionDenied, "订阅用户或权限不可用")
 		}
-		recommendation, routeErr := w.sites.RecommendSiteRoute(prepareCtx, actor, SourceRouteRecommendationInput{ResultToken: candidate.Item.Token, MediaLibraryID: &libraryID, ContentSelectionToken: prepared.ContentSelectionToken})
+		recommendation, routeErr := w.sites.RecommendSiteRoute(recheckCtx, actor, SourceRouteRecommendationInput{ResultToken: candidate.Item.Token, MediaLibraryID: &libraryID, ContentSelectionToken: prepared.ContentSelectionToken})
+		stopRecheck()
 		if routeErr != nil || recommendation.Recommended == nil {
 			submitFailures++
 			filterSummary["submit_failed"]++
@@ -468,14 +520,34 @@ func (w *FollowSearchWorker) Run(ctx context.Context, runtime JobRuntime, job Cl
 		}
 		w.record(candidateCtx, "follow.submitted", "submit", "accepted", "下载请求已接受，后续下载与入库请查看关联任务；本轮未提前确认入库完成", map[string]any{"related_task_id": download.ID, "related_job_id": download.JobID, "action": download.submissionOutcome})
 	}
+	filterSummary["candidate_checks_started"] = attempted
+	filterSummary["candidate_checks_deferred"] = deferredChecks + len(pool)
 	relevantMessage, relevantFailures := applyFollowRetryObservations(&run, retryObserved, missing)
 	// Candidate failures remain in process logs/counters. Once their coordinates
 	// have accepted tasks, they no longer describe a terminal submission failure.
 	// This does not claim that accepted downloads have completed media import.
-	if len(missing) == 0 || relevantFailures == 0 && !candidateBudgetReached {
+	if len(missing) == 0 || relevantFailures == 0 {
 		submitFailures, lastSubmitMessage = 0, ""
-	} else if !candidateBudgetReached {
+	} else {
 		lastSubmitMessage = relevantMessage
+	}
+	preparationRun := run
+	preparationMessage, preparationFailures := applyFollowRetryObservations(&preparationRun, preparationObserved, missing)
+	if preparationRun.RetryNotBefore != nil && (run.RetryNotBefore == nil || preparationRun.RetryNotBefore.After(*run.RetryNotBefore)) {
+		run.RetryNotBefore, run.RetryCode = preparationRun.RetryNotBefore, preparationRun.RetryCode
+	}
+	if submitFailures == 0 && len(missing) > 0 {
+		status := models.FollowRunFailed
+		if submitted > 0 {
+			status = models.FollowRunSubmitted
+		}
+		if candidateBudgetReached {
+			message := fmt.Sprintf("本轮已开始核验 %d 个候选，%d 个候选延后检查；后续追更将从检查进度继续，未核实内容未提交下载", attempted, filterSummary["candidate_checks_deferred"])
+			return w.finish(run, subscription, status, models.FollowStatusActive, "follow_candidate_budget", message, snapshot, queryNames, len(candidates), filterSummary, submitted)
+		}
+		if preparationFailures > 0 {
+			return w.finish(run, subscription, status, models.FollowStatusActive, "follow_content_unavailable", preparationMessage, snapshot, queryNames, len(candidates), filterSummary, submitted)
+		}
 	}
 	if submitted == 0 {
 		if submitFailures > 0 {
@@ -1001,6 +1073,8 @@ func (w *FollowSearchWorker) finish(run models.FollowRun, subscription models.Fo
 			eventType = "follow.search_failed"
 		} else if code == "follow_coverage_unknown" {
 			eventType = "follow.coverage_waiting"
+		} else if code == "follow_candidate_budget" || code == "follow_content_unavailable" {
+			eventType = "follow.content_waiting"
 		}
 	}
 	if eventType != "" {

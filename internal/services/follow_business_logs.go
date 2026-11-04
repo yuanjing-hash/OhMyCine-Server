@@ -113,11 +113,17 @@ func (w *FollowSearchWorker) recordRunEnd(ctx context.Context, runtime JobRuntim
 				if reasons["coverage_library_unknown"]+reasons["coverage_air_date_unknown"]+reasons["coverage_metadata_unknown"]+reasons["coverage_seasons_unavailable"] > 0 {
 					message = followCoverageWaitMessage(mediaCoverageUncertainty{Library: reasons["coverage_library_unknown"], AirDate: reasons["coverage_air_date_unknown"], Metadata: reasons["coverage_metadata_unknown"], Seasons: reasons["coverage_seasons_unavailable"]})
 				}
+			} else if persisted.ErrorCode == "follow_candidate_budget" || persisted.ErrorCode == "follow_content_unavailable" {
+				outcome, message = "waiting", persisted.ErrorMessage
 			}
 		}
 		if outcome == "finished" && (persisted.ErrorCode != "" || reasons["site_error"] > 0 || reasons["site_incomplete"] > 0 || reasons["search_incomplete"] > 0) {
 			outcome = "partial"
-			message += "；部分搜索或提交未成功，详见站点与资源记录"
+			if persisted.ErrorCode == "follow_candidate_budget" || persisted.ErrorCode == "follow_content_unavailable" {
+				message += "；" + persisted.ErrorMessage
+			} else {
+				message += "；部分搜索或提交未成功，详见站点与资源记录"
+			}
 		}
 		if persisted.Status == models.FollowRunNoMatch && reasons["site_error"] > 0 {
 			stats.mu.Lock()

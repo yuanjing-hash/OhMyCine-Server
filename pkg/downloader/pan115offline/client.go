@@ -66,11 +66,11 @@ func (c *Client) Submit(ctx context.Context, request downloader.SubmitRequest) (
 		return downloader.Task{}, downloader.Error("downloader_source_invalid", false, err)
 	}
 	if _, err := c.validateTarget(ctx); err != nil {
-		return downloader.Task{}, err
+		return downloader.Task{}, downloader.WithFailureStage(err, downloader.FailureTargetValidation)
 	}
 	mutations, ok := c.driver.(cloud.MutationDriver)
 	if !ok || !mutations.Capabilities().CreateDirectory {
-		return downloader.Task{}, downloader.Error("downloader_unavailable", false, nil)
+		return downloader.Task{}, downloader.WithFailureStage(downloader.Error("downloader_unavailable", false, nil), downloader.FailureTaskDirectory)
 	}
 	tag := strings.TrimSpace(request.Tag)
 	if !validTaskTag(tag) {
@@ -78,15 +78,15 @@ func (c *Client) Submit(ctx context.Context, request downloader.SubmitRequest) (
 	}
 	ctx, err = c.taskOperationContext(ctx, tag)
 	if err != nil {
-		return downloader.Task{}, err
+		return downloader.Task{}, downloader.WithFailureStage(err, downloader.FailureTaskDirectory)
 	}
 	taskRoot, err := c.ensureTaskDirectory(ctx, mutations, c.directoryID, tag)
 	if err != nil {
-		return downloader.Task{}, err
+		return downloader.Task{}, downloader.WithFailureStage(err, downloader.FailureTaskDirectory)
 	}
 	task, err := c.driver.SubmitOffline(ctx, sourceURL, taskRoot.ID)
 	if err != nil {
-		return downloader.Task{}, mapError(err)
+		return downloader.Task{}, downloader.WithFailureStage(mapError(err), downloader.FailureOfflineSubmission)
 	}
 	return mapTask(task), nil
 }

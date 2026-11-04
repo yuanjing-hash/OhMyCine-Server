@@ -1853,6 +1853,26 @@ func (w *DownloadWorker) Run(ctx context.Context, runtime JobRuntime, job Claime
 		metadataOnly := downloaderRecord.Type == models.DownloaderTypeQBittorrent && source.Kind == downloadpkg.SourceURL && strings.HasPrefix(strings.ToLower(strings.TrimSpace(source.URL)), "magnet:")
 		providerTask, err := client.Submit(ctx, downloadpkg.SubmitRequest{Source: source, SavePath: savePath, Tag: task.ProviderTag, MetadataOnly: metadataOnly, ProviderDirectoryID: task.StagingProviderDirectoryID})
 		if err != nil {
+			if diagnostic, ok := downloadpkg.FailureDiagnosticFromError(err); ok {
+				code, retryable := downloadpkg.ErrorInfo(err)
+				outcome := "failed"
+				if retryable {
+					outcome = "waiting"
+				}
+				if code == "downloader_share_result_unknown" || code == "downloader_selection_result_unknown" || code == "downloader_submit_unknown" {
+					outcome = "uncertain"
+				}
+				fields := map[string]any{"error_code": code, "phase": diagnostic.Stage}
+				if diagnostic.ProviderCode != "" {
+					fields["reason"] = diagnostic.ProviderCode
+				}
+				if diagnostic.Timeout {
+					fields["action"] = "request_timeout"
+				} else if diagnostic.Canceled {
+					fields["action"] = "request_canceled"
+				}
+				w.recordDownload(ctx, task, "download.provider_submit_failed", diagnostic.Stage, outcome, downloadFailureDescription(err, code, retryable), fields)
+			}
 			return w.failure(task, err)
 		}
 		if providerTask.ID == "" {
@@ -2782,8 +2802,13 @@ func (w *DownloadWorker) verifyCompleted(ctx context.Context, task *models.Downl
 		if persistErr := w.persistScrape(task, match, "completed_unrecognized", len(manifest.Files)); persistErr != nil {
 			return downloadpkg.Manifest{}, appError("download_state_persist_failed", "完成后刮削结果保存失败", persistErr)
 		}
-		w.recordDownload(ctx, *task, "download.manifest_unrecognized", "verify", "failed", "下载器虽已报告完成，但文件清单未得到可信媒体身份，已阻止自动入库；来源文件保留", map[string]any{"reason": code, "total_count": len(manifest.Files)})
-		return downloadpkg.Manifest{}, appError(CodeTransferMediaUnrecognized, "下载已完成，但媒体未识别，未自动入库；请修正识别条件后重试", nil)
+		message := downloadFailureMessage(CodeTransferMediaUnrecognized, false)
+		switch code {
+		case tmdb.ErrorNetworkUnavailable, CodeTMDBUnavailable, tmdb.ErrorNoMatch, tmdb.ErrorAuthFailed, mediaRecognitionCredentialMissing, CodeTMDBTokenInvalid, mediaRecognitionLowConfidence:
+			message = downloadFailureMessage(code, false)
+		}
+		w.recordDownload(ctx, *task, "download.manifest_unrecognized", "verify", "failed", message, map[string]any{"reason": code, "total_count": len(manifest.Files)})
+		return downloadpkg.Manifest{}, appError(CodeTransferMediaUnrecognized, message, err)
 	}
 	selected, err := selectDownloadPackageManifest(manifest, match.MediaType)
 	if err != nil {
@@ -3104,9 +3129,9 @@ func (w *DownloadWorker) failure(task models.DownloadTask, err error) WorkerResu
 	if retryable {
 		return w.failureRetryable(task, err)
 	}
-	message := downloadFailureMessage(code, false)
+	message := downloadFailureDescription(err, code, false)
 	var identityFailure *downloadIdentityFailure
-	if errors.As(err, &identityFailure) {
+	if errors.As(err, &identityFailure) || (applicationError != nil && code == CodeTransferMediaUnrecognized) {
 		message = ErrorMessage(err)
 	}
 	if errors.Is(err, errDownloadIdentityInvalid) {
@@ -3125,18 +3150,64 @@ func (w *DownloadWorker) failure(task models.DownloadTask, err error) WorkerResu
 	if identityFailure != nil {
 		event.Str("identity_stage", identityFailure.Stage).Str("identity_reason", identityFailure.Reason)
 	}
+	event = downloadFailureDiagnosticEvent(event, err)
 	event.Msg(operation.Message("执行失败"))
 	return WorkerResult{ErrorCode: code, ErrorMessage: message}
 }
 
 func (w *DownloadWorker) failureRetryable(task models.DownloadTask, err error) WorkerResult {
 	code, _ := downloadpkg.ErrorInfo(err)
-	message := downloadFailureMessage(code, true)
+	message := downloadFailureDescription(err, code, true)
 	_ = w.markFailure(task, code, message, false)
 	next := time.Now().UTC().Add(10 * time.Second)
 	operation := downloadOperation(task.ProviderType, task.SourceOrigin)
-	operation.Event(w.service.log.Warn()).Str("task_id", task.ID).Str("error_code", code).Time("retry_at", next).Msg(operation.Message("暂时失败，已安排自动重试"))
+	event := operation.Event(w.service.log.Warn()).Str("task_id", task.ID).Str("error_code", code).Time("retry_at", next)
+	downloadFailureDiagnosticEvent(event, err).Msg(operation.Message("暂时失败，已安排自动重试"))
 	return WorkerResult{RetryAt: &next, ErrorCode: code, ErrorMessage: message}
+}
+
+func downloadFailureDiagnosticEvent(event *zerolog.Event, err error) *zerolog.Event {
+	if diagnostic, ok := downloadpkg.FailureDiagnosticFromError(err); ok {
+		event.Str("download_stage", diagnostic.Stage)
+		if diagnostic.Timeout {
+			event.Bool("request_timeout", true)
+		}
+		if diagnostic.Canceled {
+			event.Bool("request_canceled", true)
+		}
+		if diagnostic.ProviderCode != "" {
+			event.Str("provider_error_code", diagnostic.ProviderCode)
+		}
+	}
+	return event
+}
+
+func downloadFailureDescription(err error, code string, retryable bool) string {
+	message := downloadFailureMessage(code, retryable)
+	diagnostic, ok := downloadpkg.FailureDiagnosticFromError(err)
+	if !ok {
+		return message
+	}
+	label := ""
+	switch diagnostic.Stage {
+	case downloadpkg.FailureTargetValidation:
+		label = "验证目标目录"
+	case downloadpkg.FailureTaskDirectory:
+		label = "准备任务目录"
+	case downloadpkg.FailureOfflineSubmission:
+		label = "提交或核对原离线任务"
+	case downloadpkg.FailureSelectionSubmission:
+		label = "提交或核对原精准选集任务"
+	}
+	if diagnostic.Timeout {
+		message = "请求超时；" + message
+	} else if diagnostic.Canceled {
+		message = "请求已取消；" + message
+	}
+	if diagnostic.ProviderCode != "" {
+		message += "（提供方错误码：" + diagnostic.ProviderCode + "）"
+	}
+	return "下载在“" + label + "”阶段未完成：" + message
 }
 
 // transferEnqueueFailure keeps transfer-domain failures out of the downloader
@@ -3165,10 +3236,16 @@ func (w *DownloadWorker) transferEnqueueFailure(task models.DownloadTask, err er
 
 func downloadFailureMessage(code string, retryable bool) string {
 	switch code {
-	case "downloader_share_result_unknown", quark.CodePending:
+	case "downloader_share_result_unknown":
+		return "云端转存结果尚未确认，正在核对原任务输出；不会重复提交转存"
+	case quark.CodePending:
 		return "夸克已接收操作，正在核对原任务输出；不会重复提交转存"
 	case "downloader_submit_unknown":
 		return "云端提交结果尚未确认，已保留原操作凭证；请核对原任务，不要重新转存"
+	case "downloader_selection_result_unknown":
+		return "精准选集提交结果尚未确认，已保留原操作凭证；仅核对原任务，不重复提交"
+	case "downloader_submission_unconfirmed":
+		return "下载器尚未确认原提交结果，保留原任务等待核对，不能据此重新提交"
 	case quark.CodeIdentity, quark.CodeProof:
 		return "夸克授权与受管目录无法对应，请在连接管理中重新验证共同目录"
 	case "quark_share_changed", "quark_share_selection_invalid":
@@ -3183,6 +3260,11 @@ func downloadFailureMessage(code string, retryable bool) string {
 		return "下载器认证已失效，请更新连接凭据后重试"
 	case "downloader_rate_limited":
 		return "下载器请求受到限速，任务将延后重试"
+	case "downloader_unavailable":
+		if retryable {
+			return "下载器暂时不可用，任务将按原状态自动重试"
+		}
+		return "下载器请求未取得可用结果，请检查连接和下载器状态"
 	case "downloader_source_invalid", "downloader_source_unsupported":
 		return "下载器拒绝了下载链接，请检查链接后重试"
 	case "downloader_selection_identity_required":
@@ -3214,6 +3296,16 @@ func downloadFailureMessage(code string, retryable bool) string {
 		return "下载已完成，但保存的文件清单无效，未执行入库"
 	case "download_completion_manifest_unavailable":
 		return "下载已完成，但暂时无法取得文件清单"
+	case tmdb.ErrorNetworkUnavailable:
+		return "下载已完成，但 TMDB 网络暂时不可用，媒体身份复核未完成；请稍后重试原任务，原文件已保留"
+	case CodeTMDBUnavailable:
+		return "下载已完成，但媒体元数据暂不可用，身份复核未完成；请检查元数据设置与原文件清单后重试，原文件已保留"
+	case tmdb.ErrorNoMatch:
+		return "下载已完成，但 TMDB 没有找到可确认的媒体身份，未自动入库；请核对识别条件，原文件和任务已保留"
+	case tmdb.ErrorAuthFailed, mediaRecognitionCredentialMissing, CodeTMDBTokenInvalid:
+		return "下载已完成，但 TMDB 凭据不可用，媒体身份复核未完成；请检查元数据设置，原文件已保留"
+	case mediaRecognitionLowConfidence:
+		return "下载已完成，但媒体身份匹配置信度不足，未自动入库；请核对识别条件，原文件已保留"
 	}
 	if retryable {
 		return "下载器暂时不可用，任务将自动重试"

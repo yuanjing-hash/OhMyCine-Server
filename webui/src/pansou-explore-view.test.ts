@@ -5,8 +5,10 @@ import ExploreView from './views/ExploreView.vue'
 import { saveTorrentSearchSession, type PTSearchGroup } from './sites'
 
 const request = vi.hoisted(() => vi.fn())
+const notice = vi.hoisted(() => vi.fn())
 const routeQuery = vi.hoisted(() => ({ mode: 'resources', site_id: '7' as string | undefined, title: 'Show' }))
 vi.mock('@/api/client', async original => ({ ...await original<object>(), api: request }))
+vi.mock('@/toast', () => ({ notify: notice }))
 vi.mock('@/stores/auth', () => ({ useAuthStore: () => ({ can: () => true }) }))
 vi.mock('vue-router', () => ({ useRoute: () => ({ query: routeQuery }), useRouter: () => ({ push: vi.fn(), replace: vi.fn() }) }))
 vi.mock('@/search-result-recognition', async () => {
@@ -28,7 +30,75 @@ function fixture(result: (page: number) => PTSearchGroup = group) {
   return paths
 }
 function render() { return mount(ExploreView, { global: { stubs: { RouterLink: true } } }) }
-afterEach(() => { request.mockReset(); sessionStorage.clear(); localStorage.clear(); routeQuery.site_id = '7'; vi.unstubAllGlobals() })
+afterEach(() => { request.mockReset(); notice.mockReset(); sessionStorage.clear(); localStorage.clear(); routeQuery.site_id = '7'; vi.unstubAllGlobals() })
+
+it.each(['typed', 'legacy'])('copies the actual public magnet through its owned token (%s result)', async representation => {
+  const hints = new URLSearchParams({ xt: 'urn:btih:0123456789abcdef0123456789abcdef01234567', dn: 'Fixture' })
+  for (let index = 0; index < 6; index++) hints.append('tr', `https://tracker${index}.example.test/${'a'.repeat(1500)}`)
+  const magnet = `magnet:?${hints}`
+  fixture(page => ({ ...group(page), items: [{ ...group(page).items[0]!, payload_kind: 'magnet', result_type: representation === 'legacy' ? undefined : 'magnet', post_url: 'https://t.me/fixture/123' }] }))
+  const implementation = request.getMockImplementation()!
+  request.mockImplementation((path: string, options?: RequestInit) => path === '/api/v1/discovery/results/link' ? Promise.resolve({ url: magnet, result_type: 'magnet' }) : implementation(path, options))
+  const writeText = vi.fn().mockResolvedValue(undefined)
+  vi.stubGlobal('navigator', { clipboard: { writeText } })
+  const wrapper = render()
+  try {
+    await flushPromises()
+    await wrapper.get('article').findAll('button').find(button => button.text() === '复制磁力链接')!.trigger('click')
+    await flushPromises()
+    const copies = request.mock.calls.filter(([path]) => path === '/api/v1/discovery/results/link')
+    expect(copies).toHaveLength(1)
+    expect(JSON.parse(String(copies[0]![1]!.body))).toEqual({ result_token: 'magnet-1' })
+    expect(writeText).toHaveBeenCalledExactlyOnceWith(magnet)
+    expect(notice).toHaveBeenCalledWith('磁力链接已复制', 'success')
+    expect(request.mock.calls.some(([path]) => path.includes('content-preview') || path.includes('downloads'))).toBe(false)
+  } finally { wrapper.unmount() }
+})
+
+it('never copies an original post as a magnet or offers the public-magnet action for a private result', async () => {
+  fixture(page => ({ ...group(page), items: [group(page).items[0]!, { ...group(page).items[0]!, token: 'private', title: 'Private result', source_kind: 'pt', payload_kind: 'magnet' }] }))
+  const implementation = request.getMockImplementation()!
+  request.mockImplementation((path: string, options?: RequestInit) => path === '/api/v1/discovery/results/link' ? Promise.resolve({ url: 'https://t.me/fixture/123', result_type: 'others' }) : implementation(path, options))
+  const writeText = vi.fn().mockResolvedValue(undefined)
+  vi.stubGlobal('navigator', { clipboard: { writeText } })
+  const wrapper = render()
+  try {
+    await flushPromises()
+    const cards = wrapper.findAll('article')
+    expect(cards.find(card => card.text().includes('Private result'))!.findAll('button').some(button => button.text() === '复制磁力链接')).toBe(false)
+    await cards.find(card => card.text().includes('磁力第 1 页'))!.findAll('button').find(button => button.text() === '复制磁力链接')!.trigger('click')
+    await flushPromises()
+    expect(writeText).not.toHaveBeenCalled()
+    expect(notice).toHaveBeenCalledWith('该结果暂未提供可复制的公开磁力链接，请重新搜索。', 'error')
+  } finally { wrapper.unmount() }
+})
+
+it.each(['unavailable', 'denied'])('offers temporary selectable text when clipboard access is %s', async access => {
+  const magnet = 'magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=Manual.Copy'
+  fixture()
+  const implementation = request.getMockImplementation()!
+  request.mockImplementation((path: string, options?: RequestInit) => path === '/api/v1/discovery/results/link' ? Promise.resolve({ url: magnet, result_type: 'magnet' }) : implementation(path, options))
+  const writeText = vi.fn().mockRejectedValue(new Error('browser permission denied'))
+  vi.stubGlobal('navigator', access === 'unavailable' ? {} : { clipboard: { writeText } })
+  const wrapper = render()
+  try {
+    await flushPromises()
+    expect(wrapper.find('textarea[aria-label="手动复制磁力链接"]').exists()).toBe(false)
+    await wrapper.get('article').findAll('button').find(button => button.text() === '复制磁力链接')!.trigger('click')
+    await flushPromises()
+    const field = wrapper.get('textarea[aria-label="手动复制磁力链接"]').element as HTMLTextAreaElement
+    expect(field.value).toBe(magnet)
+    expect(field.readOnly).toBe(true)
+    expect(field.selectionStart).toBe(0)
+    expect(field.selectionEnd).toBe(magnet.length)
+    expect(notice).not.toHaveBeenCalledWith('磁力链接已复制', 'success')
+    for (const storage of [sessionStorage, localStorage]) {
+      expect(Array.from({ length: storage.length }, (_, index) => storage.getItem(storage.key(index)!)).join('')).not.toContain(magnet)
+    }
+    await wrapper.findAll('button').find(button => button.text() === '关闭链接')!.trigger('click')
+    expect(wrapper.find('textarea[aria-label="手动复制磁力链接"]').exists()).toBe(false)
+  } finally { wrapper.unmount() }
+})
 
 it('renders an ordinary received batch neutrally and retains real partial warnings', async () => {
   fixture()

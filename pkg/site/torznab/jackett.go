@@ -110,7 +110,7 @@ func (a *Adapter) searchJackett(ctx context.Context, config site.Config, query s
 			continue
 		}
 		kind, _, _ := btrss.DecodeIdentity(identity)
-		item := site.Result{PayloadKind: site.NormalizePayloadKind(site.PayloadKind(kind)), TorrentID: identity, Title: title, Seeders: jackettCount(release.Seeders), Leechers: jackettCount(release.Peers), Completed: jackettCount(release.Grabs)}
+		item := site.Result{PayloadKind: site.NormalizePayloadKind(site.PayloadKind(kind)), TorrentID: identity, Fingerprint: btrss.StableResourceIdentity(identity), Title: title, Seeders: jackettCount(release.Seeders), Leechers: jackettCount(release.Peers), Completed: jackettCount(release.Grabs)}
 		if release.Size != nil && *release.Size > 0 {
 			item.SizeBytes = *release.Size
 		}

@@ -33,6 +33,8 @@ type inspectedContent struct {
 type contentReadFlight struct {
 	done           chan struct{}
 	cancel         context.CancelFunc
+	work           context.Context
+	retiring       bool
 	waiters        int
 	result         inspectedContent
 	err            error
@@ -112,95 +114,130 @@ func contentSourceDigest(claim siteResultClaim, record models.Site) string {
 // second waiter; the last waiter cancels and the protocol engine joins its I/O.
 func (s *SiteService) readContentShared(ctx context.Context, key string, load func(context.Context) (inspectedContent, error)) (inspectedContent, error) {
 	state := s.contents()
-	state.mu.Lock()
-	if cached, ok := state.cache[key]; ok && cached.ExpiresAt.After(s.now()) {
-		state.mu.Unlock()
-		return cached, nil
-	}
-	flight := state.flights[key]
-	if flight == nil {
-		if len(state.flights) >= 32 {
-			state.mu.Unlock()
-			return inspectedContent{}, appError(CodeSiteUnavailable, "内容检查排队较多，请稍后重试", nil)
+	for {
+		if err := ctx.Err(); err != nil {
+			return inspectedContent{}, err
 		}
-		work, cancel := context.WithTimeout(context.WithoutCancel(ctx), 60*time.Second)
-		flight = &contentReadFlight{done: make(chan struct{}), cancel: cancel, waiterContexts: map[uint64]context.Context{}}
-		state.flights[key] = flight
-		go func() {
-			ownedContext := contentOwnedContext{Context: work, beforeErr: func() {
-				state.mu.Lock()
-				defer state.mu.Unlock()
-				for _, waiting := range flight.waiterContexts {
-					if waiting.Err() == nil {
-						return
-					}
-				}
+		state.mu.Lock()
+		if cached, ok := state.cache[key]; ok && cached.ExpiresAt.After(s.now()) {
+			state.mu.Unlock()
+			return cached, nil
+		}
+		flight := state.flights[key]
+		if flight != nil {
+			live := false
+			for _, waiting := range flight.waiterContexts {
+				live = live || waiting.Err() == nil
+			}
+			if !live || flight.work.Err() != nil || flight.retiring {
+				// Keep the old physical flight admitted until its I/O has joined.
+				// A new retry must not attach to canceled work or overlap its cleanup.
+				flight.retiring = true
 				flight.cancel()
-			}}
-			result, err := load(ownedContext)
-			owned := work.Err() == nil
-			cancel()
-			state.mu.Lock()
-			flight.result, flight.err = result, err
-			delete(state.flights, key)
-			if err == nil && owned && result.ExpiresAt.After(s.now()) {
-				for id, cached := range state.cache {
-					if !cached.ExpiresAt.After(s.now()) {
-						delete(state.cache, id)
-					}
+				state.mu.Unlock()
+				select {
+				case <-ctx.Done():
+					return inspectedContent{}, ctx.Err()
+				case <-flight.done:
+					continue
 				}
-				for len(state.cache) > 0 && (len(state.cache) >= 128 || contentCacheSize(state.cache)+contentReadSize(result) > 32<<20) {
-					oldest := ""
-					var expiry time.Time
-					for id, cached := range state.cache {
-						if oldest == "" || cached.ExpiresAt.Before(expiry) {
-							oldest, expiry = id, cached.ExpiresAt
+			}
+		}
+		if flight == nil {
+			if len(state.flights) >= 32 {
+				state.mu.Unlock()
+				return inspectedContent{}, appError("resource_content_busy", "内容检查排队较多，请稍后重试；未创建下载任务", nil)
+			}
+			work, cancel := context.WithTimeout(context.WithoutCancel(ctx), 60*time.Second)
+			flight = &contentReadFlight{done: make(chan struct{}), cancel: cancel, work: work, waiterContexts: map[uint64]context.Context{}}
+			state.flights[key] = flight
+			go func() {
+				ownedContext := contentOwnedContext{Context: work, beforeErr: func() {
+					state.mu.Lock()
+					defer state.mu.Unlock()
+					for _, waiting := range flight.waiterContexts {
+						if waiting.Err() == nil {
+							return
 						}
 					}
-					delete(state.cache, oldest)
+					flight.retiring = true
+					flight.cancel()
+				}}
+				result, err := load(ownedContext)
+				owned := work.Err() == nil
+				if err != nil && errors.Is(work.Err(), context.DeadlineExceeded) {
+					err = appError("resource_content_timeout", "实际文件读取在本次有限窗口内未完成，可稍后重试；未创建下载任务", nil)
 				}
-				if contentReadSize(result) <= 32<<20 {
-					state.cache[key] = result
+				cancel()
+				state.mu.Lock()
+				flight.result, flight.err = result, err
+				if state.flights[key] == flight {
+					delete(state.flights, key)
 				}
+				if err == nil && owned && !flight.retiring && result.ExpiresAt.After(s.now()) {
+					for id, cached := range state.cache {
+						if !cached.ExpiresAt.After(s.now()) {
+							delete(state.cache, id)
+						}
+					}
+					for len(state.cache) > 0 && (len(state.cache) >= 128 || contentCacheSize(state.cache)+contentReadSize(result) > 32<<20) {
+						oldest := ""
+						var expiry time.Time
+						for id, cached := range state.cache {
+							if oldest == "" || cached.ExpiresAt.Before(expiry) {
+								oldest, expiry = id, cached.ExpiresAt
+							}
+						}
+						delete(state.cache, oldest)
+					}
+					if contentReadSize(result) <= 32<<20 {
+						state.cache[key] = result
+					}
+				}
+				close(flight.done)
+				state.mu.Unlock()
+			}()
+		}
+		flight.waiters++
+		waiterID := flight.nextWaiter
+		flight.nextWaiter++
+		flight.waiterContexts[waiterID] = ctx
+		state.mu.Unlock()
+		defer func() {
+			state.mu.Lock()
+			flight.waiters--
+			delete(flight.waiterContexts, waiterID)
+			if flight.waiters == 0 {
+				flight.retiring = true
+				flight.cancel()
 			}
-			close(flight.done)
 			state.mu.Unlock()
 		}()
-	}
-	flight.waiters++
-	waiterID := flight.nextWaiter
-	flight.nextWaiter++
-	flight.waiterContexts[waiterID] = ctx
-	state.mu.Unlock()
-	defer func() {
-		state.mu.Lock()
-		flight.waiters--
-		delete(flight.waiterContexts, waiterID)
-		if flight.waiters == 0 {
-			flight.cancel()
-		}
-		state.mu.Unlock()
-	}()
-	select {
-	case <-ctx.Done():
-		state.mu.Lock()
-		otherLive := false
-		for id, waiting := range flight.waiterContexts {
-			if id != waiterID && waiting.Err() == nil {
-				otherLive = true
-				break
+		select {
+		case <-ctx.Done():
+			state.mu.Lock()
+			otherLive := false
+			for id, waiting := range flight.waiterContexts {
+				if id != waiterID && waiting.Err() == nil {
+					otherLive = true
+					break
+				}
 			}
+			if !otherLive {
+				flight.retiring = true
+				flight.cancel()
+			}
+			state.mu.Unlock()
+			if !otherLive {
+				<-flight.done
+			}
+			return inspectedContent{}, ctx.Err()
+		case <-flight.done:
+			if err := ctx.Err(); err != nil {
+				return inspectedContent{}, err
+			}
+			return flight.result, flight.err
 		}
-		if !otherLive {
-			flight.cancel()
-		}
-		state.mu.Unlock()
-		if !otherLive {
-			<-flight.done
-		}
-		return inspectedContent{}, ctx.Err()
-	case <-flight.done:
-		return flight.result, flight.err
 	}
 }
 
@@ -325,6 +362,24 @@ func resourceContentError(err error) error {
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return err
 	}
+	var metadataError *resourcecontent.Error
+	if errors.As(err, &metadataError) && metadataError.Code == "resource_content_metadata_queue_full" {
+		return appError("resource_content_busy", "内置磁力解析队列已满，请稍后重试；未创建下载任务", nil)
+	}
+	switch {
+	case errors.Is(err, resourcecontent.ErrUnsafePath):
+		return appError("resource_content_unsafe_path", "实际文件清单含有不安全路径，未创建下载任务", nil)
+	case errors.Is(err, resourcecontent.ErrHashMismatch):
+		return appError("resource_content_hash_mismatch", "资源元数据与原始资源标识不符，未创建下载任务", nil)
+	case errors.Is(err, resourcecontent.ErrInvalidMetainfo):
+		return appError("resource_content_invalid_metainfo", "资源元数据格式无效，无法确认实际文件；未创建下载任务", nil)
+	case errors.Is(err, resourcecontent.ErrLimitExceeded):
+		return appError("resource_content_limit_exceeded", "资源元数据超过安全读取上限，未创建下载任务", nil)
+	case errors.Is(err, resourcecontent.ErrUnsupported):
+		return appError("resource_content_unsupported", "该资源的元数据格式暂不支持，未创建下载任务", nil)
+	case errors.Is(err, resourcecontent.ErrUnavailable):
+		return appError("resource_content_metadata_unavailable", "本次未取得可校验的磁力元数据，可稍后重试；未创建下载任务", nil)
+	}
 	return appError("resource_content_unavailable", "实际文件清单尚未取得或未通过校验，可稍后重试；未创建下载任务", nil)
 }
 
@@ -421,6 +476,18 @@ func (s *SiteService) PreviewContent(ctx context.Context, actor Actor, input Con
 	}
 	if _, err := s.validateContentClaim(ctx, actor, claim); err != nil {
 		return ContentPreviewSummary{}, err
+	}
+	if read.Manifest != nil && read.Manifest.Private {
+		// Retain this verified negative fact on the source claim itself. Preview
+		// eviction or a later release of an in-flight claim must not make known
+		// private material available through the explicit public-copy route.
+		s.vaultMu.Lock()
+		current, ok := s.vault[strings.TrimSpace(input.ResultToken)]
+		if ok && current.ActorID == actor.User.ID && current.ExpiresAt.After(s.now()) && contentSourceDigest(current, record) == sourceDigest {
+			current.MetadataPrivate = true
+			s.vault[strings.TrimSpace(input.ResultToken)] = current
+		}
+		s.vaultMu.Unlock()
 	}
 	if scope != nil {
 		if err := s.validateInspectionScope(ctx, actor, claim, *scope); err != nil {

@@ -2,11 +2,13 @@ package pan115offline
 
 import (
 	"context"
+	"errors"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/downloader"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/resourcecontent"
 	"strings"
 	"testing"
+	"time"
 )
 
 type selectedCloudFixture struct {
@@ -21,7 +23,7 @@ func (f *selectedCloudFixture) SupportsSelectiveOffline() bool { return f.suppor
 func (f *selectedCloudFixture) SubmitSelectedOffline(_ context.Context, r cloud.SelectiveOfflineRequest) (cloud.SelectiveOfflineSnapshot, error) {
 	f.submissions++
 	f.request = r
-	return f.result, nil
+	return f.result, f.submitErr
 }
 func (f *selectedCloudFixture) ObserveSelectedOffline(_ context.Context, id string, a cloud.SelectiveOfflineAuthority) (cloud.SelectiveOfflineSnapshot, error) {
 	f.observations++
@@ -88,6 +90,17 @@ func TestSelectedAdapterUsesOptionalDriverAndOwnManifestThroughoutBinding(t *tes
 	}
 	if Capabilities.SelectiveFileGroups || Capabilities.RemoteSelectiveFilesCapability != "" || !Capabilities.SelectiveFiles {
 		t.Fatal("unsupported group/Node capability advertised")
+	}
+	deadline := time.Now().UTC().Add(time.Minute)
+	driver.submitErr = cloud.WithRetryNotBefore(cloud.Error(cloud.CodeMutationUnknown, true, context.DeadlineExceeded), deadline, cloud.RetryReasonProviderCooldown)
+	_, err = bound.Submit(context.Background(), downloader.SubmitRequest{Source: source, Tag: "omc-plan", ProviderDirectoryID: "intake"})
+	code, retryable := downloader.ErrorInfo(err)
+	diagnostic, ok := downloader.FailureDiagnosticFromError(err)
+	if code != "downloader_selection_result_unknown" || !retryable || !ok || diagnostic.Stage != downloader.FailureSelectionSubmission || diagnostic.ProviderCode != cloud.CodeMutationUnknown || !diagnostic.Timeout || !errors.Is(err, context.DeadlineExceeded) || driver.submittedURI != "" {
+		t.Fatalf("selected failure lost unknown-result authority: code=%s diagnostic=%+v err=%v", code, diagnostic, err)
+	}
+	if until, _, ok := cloud.RetryTiming(err); !ok || !until.Equal(deadline) {
+		t.Fatal("selected failure lost provider cooldown")
 	}
 }
 func TestSelectedAdapterRejectsMissingLedgerAndGroupBeforeProviderWrite(t *testing.T) {

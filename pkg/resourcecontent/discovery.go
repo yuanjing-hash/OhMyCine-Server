@@ -97,11 +97,12 @@ func (d *discovery) discoverDHT(ctx context.Context, identity Identity, emit fun
 	guard := &discoveryPacketConn{PacketConn: conn, ctx: ctx, network: d.network, contacted: map[string]bool{}}
 	server, err := dht.NewServer(&dht.ServerConfig{
 		Conn: guard, Passive: true, NoSecurity: false, Logger: logger,
-		OnQuery:          func(*krpc.Msg, net.Addr) bool { return false },
-		StartingNodes:    func() ([]dht.Addr, error) { return starts, nil },
-		DefaultWant:      []krpc.Want{krpc.WantNodes},
-		QueryResendDelay: func() time.Duration { return time.Second },
-		SendLimiter:      rate.NewLimiter(8, 8),
+		OnQuery:       func(*krpc.Msg, net.Addr) bool { return false },
+		StartingNodes: func() ([]dht.Addr, error) { return starts, nil },
+		DefaultWant:   []krpc.Want{krpc.WantNodes},
+		// Keep the dependency's query reply window. With one default send,
+		// shortening QueryResendDelay aborts the query instead of retrying it.
+		SendLimiter: rate.NewLimiter(8, 8),
 	})
 	if err != nil {
 		_ = conn.Close()

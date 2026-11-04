@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api, APIError } from '@/api/client'
 import { Permissions } from '@/auth/generated-permissions'
@@ -21,7 +21,7 @@ import { notify } from '@/toast'
 import { buildDiscoveryMediaSearchPath, discoveryDetailRoute, mediaIdentitySearchURL, type DiscoveryMediaSearch, type DiscoveryMediaSearchFilter, type DiscoveryMediaType, type DiscoverySearchName, type DiscoveryWork } from '@/discovery'
 import { discoveryDownloadsPath, discoverySearchOptionsPath, filterAndSortTorrentResults, ptRecognitionEpisodeLabel, ptRecognitionErrorLabel, ptRecognitionSpecLabels, readTorrentSearchSession, readTorrentSearchSiteSelection, saveTorrentSearchSession, saveTorrentSearchSiteSelection, sitesPath, torrentRecognitionCandidatesPath, torrentRecognitionOverridePath, torrentSearchPath, torrentSearchStreamPath, torrentSearchURL, torrentSearchSessionKey, type PTRecognitionCandidate, type SearchSiteOption, type SiteSummary, type TorrentRecognitionResult, type TorrentResultDirection, type TorrentSearchGroup, type TorrentSearchProgress, type TorrentSearchResult, type TorrentSearchSession } from '@/sites'
 import type { DownloaderSummary, ListResponse, MediaLibraryDetail } from '@/types/api'
-import { discoveryOrigins, discoveryResultLinkPath, discoveryTypeOptions, resultPreviewSourceKind, resultTypeLabel, safeDiscoveryLink, torrentResourceTypeOptions, type DiscoveryTypePolicy } from '@/sites'
+import { discoveryOrigins, discoveryResultLinkPath, discoveryTypeOptions, resultPayloadKind, resultPreviewSourceKind, resultSiteType, resultTypeLabel, safeDiscoveryLink, torrentResourceTypeOptions, type DiscoveryTypePolicy } from '@/sites'
 
 const route = useRoute()
 const router = useRouter()
@@ -89,6 +89,8 @@ const panSouCloudTypes = ref<string[]>(['115', 'quark', 'magnet'])
 const appliedTypePolicy = ref<DiscoveryTypePolicy>()
 const appliedCloudTypes = ref<string[]>()
 const copyingToken = ref('')
+const manualCopy = ref<{ token: string; link: string; magnet: boolean; expiresAt: number } | null>(null)
+let manualCopyInput: HTMLTextAreaElement | null = null
 let availabilityRequest: AbortController | null = null
 let copyRequest: AbortController | null = null
 const selectedSiteIDs = ref<number[]>([])
@@ -99,6 +101,7 @@ const downloadDialog = ref<TorrentSearchResult | null>(null)
 const sharePreviewDialog = ref<TorrentSearchResult | null>(null)
 const shareValidations = ref<Record<string, ShareValidation>>({})
 const validationClock = ref(Date.now())
+watch(validationClock, now => { if (manualCopy.value && manualCopy.value.expiresAt <= now) closeManualCopy() })
 let validationTimer: number | undefined
 function rememberShareValidation(token: string, validation: ShareValidation) {
  const recent = Object.entries(shareValidations.value).filter(([, v]) => Date.parse(v.expires_at) > Date.now()).slice(-999)
@@ -560,20 +563,38 @@ function resourceActionLabel(item: TorrentSearchResult) {
   if (item.acquisition_available === false) return isCloudShareSource(item.source_kind) || item.source_kind === 'bt' || item.source_kind === 'pt' ? '暂不可入库' : '仅供查看'
   return isCloudShareSource(item.source_kind) ? '转存入库' : '入库'
 }
-async function copyResourceLink(item: TorrentSearchResult) {
+function publicMagnetResult(item: TorrentSearchResult, group: TorrentSearchGroup) {
+  return resultSiteType(item, group.site_type) !== 'pt' && resultPayloadKind(item) === 'magnet' && (item.source_kind === 'bt' || group.site_type === 'bt' || group.site_type === 'bt_resource')
+}
+function closeManualCopy() { manualCopy.value = null; manualCopyInput = null }
+function setManualCopyInput(element: unknown) { manualCopyInput = element instanceof HTMLTextAreaElement ? element : null }
+function selectManualCopy() { manualCopyInput?.focus(); manualCopyInput?.select() }
+async function copyResourceLink(item: TorrentSearchResult, magnetOnly = false) {
   const group = groups.value.find(group => group.items.some(value => value.token === item.token))
   if (resultExpired(item) || group && groupUnavailable(group)) return
   copyRequest?.abort()
+  closeManualCopy()
   const request = new AbortController()
   copyRequest = request
   copyingToken.value = item.token
   try {
-    const result = await api<{ url: string }>(discoveryResultLinkPath, { method: 'POST', signal: request.signal, body: JSON.stringify({ result_token: item.token }) })
+    const result = await api<{ url: string; result_type?: string; expires_at?: string }>(discoveryResultLinkPath, { method: 'POST', signal: request.signal, body: JSON.stringify({ result_token: item.token }) })
     if (copyRequest !== request || request.signal.aborted) return
     const link = safeDiscoveryLink(result.url)
-    if (!link) throw new Error('Server 返回的资源链接无效。')
-    await navigator.clipboard.writeText(link)
-    if (copyRequest === request) notify('资源链接已复制', 'success')
+    if (!link || magnetOnly && (result.result_type !== 'magnet' || new URL(link).protocol !== 'magnet:')) throw new Error(magnetOnly ? '该结果暂未提供可复制的公开磁力链接，请重新搜索。' : 'Server 返回的资源链接无效。')
+    const expiresAt = Math.min(Date.parse(item.expires_at), Date.parse(result.expires_at || item.expires_at))
+    if (!(expiresAt > Date.now())) throw new Error('搜索结果已过期，请重新搜索。')
+    let copied = false
+    if (navigator.clipboard?.writeText) {
+      try { await navigator.clipboard.writeText(link); copied = true } catch { /* HTTP LAN or browser permission may require manual copy. */ }
+    }
+    if (copyRequest !== request || request.signal.aborted) return
+    if (copied) notify(magnetOnly ? '磁力链接已复制' : '资源链接已复制', 'success')
+    else {
+      manualCopy.value = { token: item.token, link, magnet: magnetOnly, expiresAt }
+      await nextTick()
+      if (copyRequest === request && manualCopy.value?.token === item.token && !request.signal.aborted) selectManualCopy()
+    }
   } catch (reason) { if (!request.signal.aborted) notify(message(reason), 'error') }
   finally { if (copyRequest === request) { copyRequest = null; copyingToken.value = '' } }
 }
@@ -658,6 +679,7 @@ function retireResultInteractions() {
   siteOptionsRequest?.abort(); siteOptionsRequest = null
   siteSelectorOpen.value = false; siteOptionsLoading.value = false; siteOptionsError.value = ''
   copyRequest?.abort(); copyRequest = null; copyingToken.value = ''
+  closeManualCopy()
   downloadDialog.value = null; sharePreviewDialog.value = null; manualDialog.value = null
   downloaders.value = []; libraries.value = []; routeChoices.value = []; routeRecommendation.value = null; routePreview.value = null
   downloadForm.value = { downloaderID: '', mediaLibraryID: 0, priority: 0 }; downloadSiteID.value = undefined
@@ -763,6 +785,7 @@ onBeforeUnmount(() => {
   siteOptionsRequest?.abort()
   availabilityRequest?.abort()
   copyRequest?.abort()
+  closeManualCopy()
   interactionGeneration++
   cancelDownloadOptionRequests()
   routeRecommendationRequest?.abort()
@@ -889,7 +912,12 @@ onBeforeUnmount(() => {
               <span v-if="shareValidation(entry.item)?.status === 'unavailable'"> · {{ shareValidation(entry.item)?.message }}</span>
             </p>
             <p v-if="resourceUnavailable(entry.item)" class="semantic-warning mt-3 p-3 text-xs" role="status">{{ resourceUnavailable(entry.item) }}</p>
-            <footer class="mt-4 flex flex-wrap justify-end gap-2 border-t border-[var(--border)] pt-4"><button v-if="entry.item.result_type" class="btn-secondary" :disabled="copyingToken === entry.item.token || resultExpired(entry.item) || !!groupUnavailable(entry.group)" @click="copyResourceLink(entry.item)">{{ copyingToken === entry.item.token ? '正在读取…' : '复制资源链接' }}</button><button v-if="isCloudShareSource(entry.item.source_kind)" class="btn-secondary" :disabled="!auth.can(Permissions.DownloadsCreate) || !!resourceUnavailable(entry.item) || isPreviousPage(entry.group) && searching" @click="openSharePreview(entry.item)">预览分享链接内部内容</button><button class="btn-secondary" :disabled="!auth.can(Permissions.DiscoveryRead) || resultExpired(entry.item)" :title="resultExpired(entry.item) ? '搜索结果已过期，请重新搜索' : '重新读取作品识别及库内状态'" @click="resultRecognition.retry(entry.item.token)">重新检测</button><button class="btn-secondary" :disabled="!auth.can(Permissions.DownloadsCreate) || !!resourceUnavailable(entry.item) || isPreviousPage(entry.group) && searching" @click="openManualRecognition(entry.item)">手动检测</button><button class="btn-primary" :disabled="!auth.can(Permissions.DownloadsCreate) || !!resourceUnavailable(entry.item) || isPreviousPage(entry.group) && searching" :title="resourceUnavailable(entry.item)" @click="openDownload(entry.item)">{{ resourceActionLabel(entry.item) }}</button></footer>
+            <footer class="mt-4 flex flex-wrap justify-end gap-2 border-t border-[var(--border)] pt-4"><button v-if="entry.item.result_type || publicMagnetResult(entry.item, entry.group)" class="btn-secondary" :disabled="copyingToken === entry.item.token || resultExpired(entry.item) || !!groupUnavailable(entry.group)" @click="copyResourceLink(entry.item, publicMagnetResult(entry.item, entry.group))">{{ copyingToken === entry.item.token ? '正在读取…' : publicMagnetResult(entry.item, entry.group) ? '复制磁力链接' : '复制资源链接' }}</button><button v-if="isCloudShareSource(entry.item.source_kind)" class="btn-secondary" :disabled="!auth.can(Permissions.DownloadsCreate) || !!resourceUnavailable(entry.item) || isPreviousPage(entry.group) && searching" @click="openSharePreview(entry.item)">预览分享链接内部内容</button><button class="btn-secondary" :disabled="!auth.can(Permissions.DiscoveryRead) || resultExpired(entry.item)" :title="resultExpired(entry.item) ? '搜索结果已过期，请重新搜索' : '重新读取作品识别及库内状态'" @click="resultRecognition.retry(entry.item.token)">重新检测</button><button class="btn-secondary" :disabled="!auth.can(Permissions.DownloadsCreate) || !!resourceUnavailable(entry.item) || isPreviousPage(entry.group) && searching" @click="openManualRecognition(entry.item)">手动检测</button><button class="btn-primary" :disabled="!auth.can(Permissions.DownloadsCreate) || !!resourceUnavailable(entry.item) || isPreviousPage(entry.group) && searching" :title="resourceUnavailable(entry.item)" @click="openDownload(entry.item)">{{ resourceActionLabel(entry.item) }}</button></footer>
+            <section v-if="manualCopy?.token === entry.item.token" class="semantic-inset mt-3 p-3 text-sm" aria-label="手动复制链接" @keydown.esc.stop="closeManualCopy">
+              <p class="mb-2 mt-0" role="status">浏览器未允许自动复制，请选中链接后按 Ctrl+C，或长按复制。</p>
+              <textarea :ref="setManualCopyInput" :value="manualCopy.link" :aria-label="manualCopy.magnet ? '手动复制磁力链接' : '手动复制资源链接'" class="input min-h-24 w-full break-all font-mono text-xs" rows="3" readonly spellcheck="false" @focus="selectManualCopy" />
+              <div class="mt-2 flex gap-2"><button class="btn-secondary" type="button" @click="selectManualCopy">选中链接</button><button class="btn-secondary" type="button" @click="closeManualCopy">关闭链接</button></div>
+            </section>
           </article>
         </div>
         <footer v-if="activeGroup && (activeGroup.status === 'success' || retainedSiteIDs.includes(activeGroup.site_id)) && activeGroup.complete !== false" class="panel flex items-center justify-center gap-3"><button class="btn-secondary" :disabled="searching || !!groupUnavailable(activeGroup) || activeGroup.page <= 1" @click="previousPage(activeGroup)">上一页</button><span class="text-sm">{{ activeGroup.site_name }} · 第 {{ activeGroup.page }} 页</span><button class="btn-secondary" :disabled="searching || !!groupUnavailable(activeGroup) || !activeGroup.has_next" @click="nextPage(activeGroup)">下一页</button></footer>

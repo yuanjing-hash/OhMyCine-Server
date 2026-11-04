@@ -2,8 +2,10 @@ package pan115offline
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -18,6 +20,7 @@ type fakeDriver struct {
 	task         cloud.OfflineTask
 	items        map[string]cloud.Item
 	statErr      error
+	listErr      error
 	submitErr    error
 }
 
@@ -85,7 +88,7 @@ func (f *fakeDriver) Capabilities() cloud.Capabilities {
 }
 func (f *fakeDriver) Probe(context.Context) (cloud.Account, error) { return cloud.Account{}, nil }
 func (f *fakeDriver) List(context.Context, string, cloud.PageRequest) (cloud.Page, error) {
-	return cloud.Page{}, nil
+	return cloud.Page{}, f.listErr
 }
 func (f *fakeDriver) Stat(_ context.Context, id string) (cloud.Item, error) {
 	if f.statErr != nil {
@@ -210,15 +213,47 @@ func TestNativeOfflineAcceptsAccountRootAsTarget(t *testing.T) {
 }
 
 func TestNativeOfflinePreservesProviderErrorClassification(t *testing.T) {
-	driver := &fakeDriver{submitErr: cloud.Error(cloud.CodeResponseInvalid, false, errors.New("malformed provider response"))}
-	client, err := New(downloader.Config{CloudDriver: driver, ProviderStorageRootID: "root", ProviderDirectoryID: "target-id"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = client.Submit(context.Background(), downloader.SubmitRequest{Source: downloader.Source{Kind: downloader.SourceURL, URL: "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567"}, Tag: "omc-test"})
-	code, retryable := downloader.ErrorInfo(err)
-	if code != "downloader_response_invalid" || retryable {
-		t.Fatalf("code=%q retryable=%v err=%v", code, retryable, err)
+	deadline := time.Now().UTC().Add(time.Minute)
+	for _, item := range []struct {
+		name, stage, code, providerCode string
+		statErr, listErr, submitErr     error
+		retryable, timeout, canceled    bool
+	}{
+		{name: "target-canceled", stage: downloader.FailureTargetValidation, code: "downloader_storage_unavailable", providerCode: cloud.CodeUnavailable, statErr: cloud.Error(cloud.CodeUnavailable, true, context.Canceled), retryable: true, canceled: true},
+		{name: "directory-timeout", stage: downloader.FailureTaskDirectory, code: "downloader_unavailable", providerCode: cloud.CodeUnavailable, listErr: cloud.Error(cloud.CodeUnavailable, true, context.DeadlineExceeded), retryable: true, timeout: true},
+		{name: "submission-invalid", stage: downloader.FailureOfflineSubmission, code: "downloader_response_invalid", providerCode: cloud.CodeResponseInvalid, submitErr: cloud.Error(cloud.CodeResponseInvalid, false, errors.New("private-output-id malformed provider response"))},
+		{name: "submission-unknown", stage: downloader.FailureOfflineSubmission, code: "downloader_share_result_unknown", providerCode: cloud.CodeMutationUnknown, submitErr: cloud.WithRetryNotBefore(cloud.Error(cloud.CodeMutationUnknown, true, context.DeadlineExceeded), deadline, cloud.RetryReasonProviderCooldown), retryable: true, timeout: true},
+		{name: "unknown-provider-code", stage: downloader.FailureOfflineSubmission, code: "downloader_unavailable", submitErr: cloud.Error("private-output-id", false, errors.New("private-output-id"))},
+	} {
+		t.Run(item.name, func(t *testing.T) {
+			driver := &fakeDriver{statErr: item.statErr, listErr: item.listErr, submitErr: item.submitErr}
+			client, err := New(downloader.Config{CloudDriver: driver, ProviderStorageRootID: "root", ProviderDirectoryID: "target-id"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = client.Submit(context.Background(), downloader.SubmitRequest{Source: downloader.Source{Kind: downloader.SourceURL, URL: "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567"}, Tag: "omc-test"})
+			code, retryable := downloader.ErrorInfo(err)
+			diagnostic, ok := downloader.FailureDiagnosticFromError(err)
+			if code != item.code || retryable != item.retryable || !ok || diagnostic.Stage != item.stage || diagnostic.ProviderCode != item.providerCode || diagnostic.Timeout != item.timeout || diagnostic.Canceled != item.canceled {
+				t.Fatalf("code=%q retryable=%v diagnostic=%+v ok=%v err=%v", code, retryable, diagnostic, ok, err)
+			}
+			if (driver.submittedURI != "") != (item.stage == downloader.FailureOfflineSubmission) {
+				t.Fatal("read-side failure reached provider submission")
+			}
+			var provider *cloud.ProviderError
+			if !errors.As(err, &provider) || (item.timeout && !errors.Is(err, context.DeadlineExceeded)) || (item.canceled && !errors.Is(err, context.Canceled)) {
+				t.Fatal("stage wrapper lost original recovery cause")
+			}
+			if item.name == "submission-unknown" {
+				if until, reason, ok := cloud.RetryTiming(err); !ok || !until.Equal(deadline) || reason != cloud.RetryReasonProviderCooldown {
+					t.Fatal("stage wrapper lost provider cooldown")
+				}
+			}
+			raw, _ := json.Marshal(diagnostic)
+			if strings.Contains(string(raw)+err.Error(), "private-output-id") {
+				t.Fatal("private cause crossed diagnostic boundary")
+			}
+		})
 	}
 }
 

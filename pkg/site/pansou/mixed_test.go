@@ -2,6 +2,7 @@ package pansou
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -10,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/resourcecontent"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/site"
 )
 
@@ -62,6 +64,8 @@ func TestMixedConfigLegacyAndChannelModes(t *testing.T) {
 
 func TestMixedSourcesTypesOriginsAndExtractionCode(t *testing.T) {
 	var payload map[string]any
+	hintful := fixtureMagnet + "&dn=Original+title&tr=https%3A%2F%2Ftracker.example%2Fannounce&x.pe=8.8.8.8%3A6881"
+	complement := fixtureMagnet + "&tr=udp%3A%2F%2Ftracker.example%3A80%2Fannounce&x.pe=1.1.1.1%3A6881"
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/api/health" {
 			fmt.Fprint(w, `{"channels":["movies","@Shows"]}`)
@@ -70,7 +74,7 @@ func TestMixedSourcesTypesOriginsAndExtractionCode(t *testing.T) {
 		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 			t.Error(err)
 		}
-		fmt.Fprintf(w, `{"code":0,"data":{"total":4,"results":[{"channel":"movies","message_id":"19","title":"new title","datetime":"2026-10-22T00:00:00Z","links":[{"type":"quark","url":"https://pan.quark.cn/s/aabb"}]},{"unique_id":"gying-122","title":"older title","datetime":"2026-10-21T00:00:00Z","links":[{"type":"quark","url":"https://pan.quark.cn/s/aabb","password":"abcd"},{"type":"magnet","url":%q},{"type":"115","url":"https://pan.quark.cn/s/wrong"},{"type":"ed2k","url":"ed2k://|file|sample.mkv|1234|0123456789abcdef0123456789abcdef|/"}]}],"merged_by_type":{"baidu":[{"url":"https://pan.baidu.com/s/abc","password":"test","note":"Baidu title","source":"plugin:pansearch"}]}}}`, fixtureMagnet)
+		fmt.Fprintf(w, `{"code":0,"data":{"total":4,"results":[{"channel":"movies","message_id":"19","title":"new title","datetime":"2026-10-22T00:00:00Z","links":[{"type":"quark","url":"https://pan.quark.cn/s/aabb"},{"type":"magnet","url":%q,"source":"plugin:gying"}]},{"unique_id":"gying-122","title":"older title","datetime":"2026-10-21T00:00:00Z","links":[{"type":"quark","url":"https://pan.quark.cn/s/aabb","password":"abcd"},{"type":"magnet","url":%q},{"type":"115","url":"https://pan.quark.cn/s/wrong"},{"type":"ed2k","url":"ed2k://|file|sample.mkv|1234|0123456789abcdef0123456789abcdef|/"}]}],"merged_by_type":{"baidu":[{"url":"https://pan.baidu.com/s/abc","password":"test","note":"Baidu title","source":"plugin:pansearch"}],"magnet":[{"url":%q,"note":"same magnet","source":"plugin:pansearch"}]}}}`, fixtureMagnet, hintful, complement)
 	}))
 	defer server.Close()
 	adapter := NewForTest(server.Client())
@@ -95,6 +99,21 @@ func TestMixedSourcesTypesOriginsAndExtractionCode(t *testing.T) {
 	}
 	if byType["magnet"].SourceKind != "bt" || byType["magnet"].PostURL != "" || byType["baidu"].SourceKind != "external_link" || byType["ed2k"].SourceKind != "external_link" {
 		t.Fatal(byType)
+	}
+	resolved, err := adapter.ResolveSource(context.Background(), cfg, byType["magnet"].TorrentID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := resourcecontent.ParseMagnet(resolved.Magnet)
+	fingerprint := sha256.Sum256([]byte("magnet:0123456789abcdef0123456789abcdef01234567"))
+	if err != nil || m.DisplayName != "Original title" || len(m.Trackers) != 2 || len(m.Peers) != 2 || byType["magnet"].Fingerprint != fmt.Sprintf("%x", fingerprint) {
+		t.Fatal("dedup/re-resolution lost hints or changed the v1 fingerprint", err)
+	}
+	hybrid := fixtureMagnet + "&xt=urn:btmh:1220" + strings.Repeat("a", 64)
+	_, _, v1Identity, _ := NormalizeResource("magnet", fixtureMagnet, "")
+	_, fullHybrid, hybridIdentity, hybridErr := NormalizeResource("magnet", hybrid, "")
+	if hybridErr != nil || v1Identity == hybridIdentity || !strings.Contains(fullHybrid, "urn:btmh:1220") || preserveExtractionCode(fixtureMagnet, hybrid+"&tr=https%3A%2F%2Ftracker.example") != fixtureMagnet || preserveExtractionCode(hybrid, fixtureMagnet+"&xt=urn:btmh:1220"+strings.Repeat("b", 64)) != hybrid {
+		t.Fatal("incomplete or contradictory hybrid identity was merged")
 	}
 	encoded, _ := json.Marshal(page.Items)
 	if strings.Contains(string(encoded), "pwd=") || strings.Contains(string(encoded), fixtureMagnet) {

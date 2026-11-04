@@ -108,6 +108,7 @@ type FollowSummary struct {
 	Wait             *FollowWait             `json:"wait,omitempty"`
 	ID               string                  `json:"id"`
 	OwnerID          uint                    `json:"owner_id"`
+	OwnerName        string                  `json:"owner_name,omitempty"`
 	MediaType        string                  `json:"media_type"`
 	TMDBID           int64                   `json:"tmdb_id"`
 	Title            string                  `json:"title"`
@@ -455,6 +456,9 @@ func (s *FollowService) List(actor Actor, page, pageSize int, status string) (Fo
 		}
 		list = append(list, item)
 	}
+	if err := s.projectOwnerNames(list); err != nil {
+		return FollowPage{}, err
+	}
 	if err := s.projectCurrentWaits(rows, list); err != nil {
 		return FollowPage{}, err
 	}
@@ -471,6 +475,9 @@ func (s *FollowService) Get(actor Actor, id string) (FollowSummary, error) {
 		return item, err
 	}
 	items := []FollowSummary{item}
+	if err = s.projectOwnerNames(items); err != nil {
+		return FollowSummary{}, err
+	}
 	if err = s.projectCurrentWaits([]models.FollowSubscription{record}, items); err != nil {
 		return FollowSummary{}, err
 	}
@@ -579,7 +586,15 @@ func (s *FollowService) SetPaused(actor Actor, id string, paused bool, request R
 	if err := s.db.First(&updated, "id = ?", id).Error; err != nil {
 		return FollowSummary{}, err
 	}
-	return followSummaryForActor(actor, updated)
+	item, err := followSummaryForActor(actor, updated)
+	if err != nil {
+		return FollowSummary{}, err
+	}
+	items := []FollowSummary{item}
+	if err = s.projectOwnerNames(items); err != nil {
+		return FollowSummary{}, err
+	}
+	return items[0], nil
 }
 
 func (s *FollowService) Delete(actor Actor, id string, request RequestContext) error {
@@ -988,7 +1003,57 @@ func (s *FollowService) getSummary(id string) (FollowSummary, error) {
 		}
 		return FollowSummary{}, err
 	}
-	return followSummary(record)
+	item, err := followSummary(record)
+	if err != nil {
+		return FollowSummary{}, err
+	}
+	items := []FollowSummary{item}
+	if err = s.projectOwnerNames(items); err != nil {
+		return FollowSummary{}, err
+	}
+	return items[0], nil
+}
+
+// Resolve only owners of summaries already authorized by the caller. A page
+// uses one query and never loads credentials or requires user-directory access.
+func (s *FollowService) projectOwnerNames(items []FollowSummary) error {
+	if len(items) == 0 {
+		return nil
+	}
+	ids := make([]uint, 0, len(items))
+	seen := make(map[uint]struct{}, len(items))
+	for _, item := range items {
+		if _, exists := seen[item.OwnerID]; !exists {
+			ids = append(ids, item.OwnerID)
+			seen[item.OwnerID] = struct{}{}
+		}
+	}
+	var owners []struct {
+		ID          uint
+		Username    string
+		DisplayName string
+	}
+	if err := s.db.Model(&models.User{}).Select("id", "username", "display_name").Where("id IN ?", ids).Find(&owners).Error; err != nil {
+		return err
+	}
+	names := make(map[uint]string, len(owners))
+	for _, owner := range owners {
+		name, username := strings.TrimSpace(owner.DisplayName), strings.TrimSpace(owner.Username)
+		if name == "" {
+			name = username
+		} else if username != "" && name != username {
+			name += "（" + username + "）"
+		}
+		names[owner.ID] = name
+	}
+	for i := range items {
+		name, exists := names[items[i].OwnerID]
+		items[i].OwnerName = name
+		if !exists {
+			items[i].OwnerName = "已删除账号"
+		}
+	}
+	return nil
 }
 
 func followSummary(record models.FollowSubscription) (FollowSummary, error) {

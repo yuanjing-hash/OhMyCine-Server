@@ -330,6 +330,23 @@ func TestFollowUnusableSharesDoNotExhaustAcceptedResourceLimit(t *testing.T) {
 			if shares == 50 && reasons["candidate_budget"] != 1 {
 				t.Fatalf("bounded work was not reported: %+v", run)
 			}
+			if shares == 50 {
+				if reasons["candidate_checks_started"] != 50 || reasons["candidate_checks_deferred"] != 3 {
+					t.Fatalf("started and deferred checks were conflated: %v", reasons)
+				}
+				// A fresh worker/run must advance beyond the same first fifty
+				// read-only failures without treating their contents as verified.
+				f.advanceClock()
+				if _, err := f.follows.Enqueue(context.Background(), f.actor, f.subscription.ID, "manual", RequestContext{}); err != nil {
+					t.Fatal(err)
+				}
+				f.worker = NewFollowSearchWorker(f.follows, sites)
+				next := f.run(t)
+				if next.Selected != 1 || len(pt.requested) != 1 {
+					t.Fatalf("saved inspection progress starved later candidate: next=%+v requests=%v", next, pt.requested)
+				}
+				wantAccepted = 1
+			}
 			var tasks []models.DownloadTask
 			if err := sites.db.Where("follow_subscription_id = ?", f.subscription.ID).Find(&tasks).Error; err != nil {
 				t.Fatal(err)
@@ -337,7 +354,7 @@ func TestFollowUnusableSharesDoNotExhaustAcceptedResourceLimit(t *testing.T) {
 			if len(tasks) != wantAccepted {
 				t.Fatalf("accepted task count=%d", len(tasks))
 			}
-			if wantAccepted == 1 && (!strings.Contains(tasks[0].DisplayName, "E11") || run.Candidates != 6) {
+			if shares == 3 && (!strings.Contains(tasks[0].DisplayName, "E11") || run.Candidates != 6) {
 				t.Fatalf("wrong replacement candidate: run=%+v tasks=%+v", run, tasks)
 			}
 		})

@@ -1,8 +1,6 @@
 package pansou
 
 import (
-	"encoding/base32"
-	"encoding/hex"
 	"net/url"
 	"regexp"
 	"strings"
@@ -10,8 +8,8 @@ import (
 
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud/pan115"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud/quark"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/resourcecontent"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/site"
-	"github.com/yuanjing-hash/OhMyCine-Server/pkg/site/btrss"
 )
 
 var messageIDPattern = regexp.MustCompile(`^[0-9]{1,20}$`)
@@ -36,6 +34,9 @@ func preserveExtractionCode(newer, older string) string {
 	if err != nil {
 		return newer
 	}
+	if u.Scheme == "magnet" || v.Scheme == "magnet" {
+		return mergeMagnetHints(newer, older)
+	}
 	query := u.Query()
 	for _, key := range []string{"pwd", "password", "passcode", "accessCode", "code"} {
 		if query.Get(key) == "" && v.Query().Get(key) != "" {
@@ -44,6 +45,47 @@ func preserveExtractionCode(newer, older string) string {
 	}
 	u.RawQuery = query.Encode()
 	return u.String()
+}
+
+// Duplicate posts may provide complementary discovery hints. They are safe to
+// merge only for the same complete identity, within the original PanSou cap.
+func mergeMagnetHints(newer, older string) string {
+	current, err := resourcecontent.ParseMagnet(newer)
+	previous, oldErr := resourcecontent.ParseMagnet(older)
+	if err != nil || oldErr != nil || current.Identity != previous.Identity {
+		return newer
+	}
+	u, _ := url.Parse(newer)
+	query := u.Query()
+	merged := newer
+	add := func(key, value string, limit int) {
+		for _, saved := range query[key] {
+			if saved == value {
+				return
+			}
+		}
+		if len(query[key]) >= limit {
+			return
+		}
+		query.Add(key, value)
+		u.RawQuery = query.Encode()
+		candidate, _, normalizeErr := resourcecontent.NormalizeMagnet(u.String())
+		if normalizeErr != nil || len(candidate) > 8192 {
+			query[key] = query[key][:len(query[key])-1]
+			return
+		}
+		merged = candidate
+	}
+	if current.DisplayName == "" && previous.DisplayName != "" {
+		add("dn", previous.DisplayName, 1)
+	}
+	for _, tracker := range previous.Trackers {
+		add("tr", tracker, 16)
+	}
+	for _, peer := range previous.Peers {
+		add("x.pe", peer, 32)
+	}
+	return merged
 }
 func parseOrigin(raw string) site.ResultOrigin {
 	raw = strings.TrimSpace(raw)
@@ -81,17 +123,15 @@ func NormalizeResource(declared, raw, password string) (string, string, string, 
 	if normalized, identity, err := pan115.NormalizeShareLink(raw, password); err == nil {
 		return accept("115", normalized, identity)
 	}
-	if normalized, ok := btrss.NormalizeMagnet(raw); ok {
-		u, _ := url.Parse(normalized)
-		identity := strings.TrimPrefix(strings.ToLower(u.Query().Get("xt")), "urn:btih:")
-		if len(identity) == 32 {
-			decoded, err := base32.StdEncoding.WithPadding(base32.NoPadding).DecodeString(strings.ToUpper(identity))
-			if err != nil || len(decoded) != 20 {
-				return "", "", "", site.ErrInvalidReply
-			}
-			identity = hex.EncodeToString(decoded)
+	if normalized, hashes, err := resourcecontent.NormalizeMagnet(raw); err == nil && hashes.V1 != "" {
+		if len(normalized) > 8192 {
+			return "", "", "", site.ErrInvalidReply
 		}
-		return accept("magnet", "magnet:?xt=urn:btih:"+identity, identity)
+		identity := hashes.V1 // Preserve the existing v1 fingerprint namespace.
+		if hashes.V2 != "" {
+			identity += ":btmh:1220" + hashes.V2
+		}
+		return accept("magnet", normalized, identity)
 	}
 	if ed2kPattern.MatchString(raw) {
 		parts := strings.Split(raw, "|")

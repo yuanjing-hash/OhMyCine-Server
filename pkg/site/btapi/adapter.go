@@ -48,6 +48,13 @@ func NewForTest(kind string, profile Profile, client *http.Client, baseURL strin
 
 func (a *Adapter) Kind() string { return a.kind }
 
+func (a *Adapter) PublicMagnetLink(identity string) (string, error) {
+	if magnet, ok := btrss.DecodeMagnetIdentity(identity); ok {
+		return magnet, nil
+	}
+	return "", site.ErrNotFound
+}
+
 func (a *Adapter) Test(ctx context.Context, config site.Config) (site.Health, error) {
 	if _, err := a.Search(ctx, config, site.Query{Keyword: "anime", Page: 1}); err != nil {
 		return site.Health{}, err
@@ -151,7 +158,8 @@ func parseYTS(body []byte, page int) (site.Page, error) {
 				published = &value
 			}
 			tags := compact([]string{torrent.Quality, torrent.Type})
-			result.Items = append(result.Items, site.Result{PayloadKind: site.PayloadMagnet, TorrentID: btrss.EncodeIdentity("magnet", magnet), Title: title, SizeBytes: torrent.SizeBytes, Published: published, Seeders: &seeders, Leechers: &leechers, Quality: torrent.Quality, Tags: tags})
+			identity := btrss.EncodeIdentity("magnet", magnet)
+			result.Items = append(result.Items, site.Result{PayloadKind: site.PayloadMagnet, TorrentID: identity, Fingerprint: btrss.StableResourceIdentity(identity), Title: title, SizeBytes: torrent.SizeBytes, Published: published, Seeders: &seeders, Leechers: &leechers, Quality: torrent.Quality, Tags: tags})
 		}
 	}
 	limit := payload.Data.Limit
@@ -217,7 +225,7 @@ func parseEZTV(body []byte, keyword string, page int) (site.Page, error) {
 			continue
 		}
 		magnet, ok := btrss.NormalizeMagnet(torrent.MagnetURL)
-		if !ok {
+		if strings.TrimSpace(torrent.MagnetURL) == "" {
 			magnet, ok = magnetFromHash(torrent.Hash)
 		}
 		if !ok {
@@ -230,7 +238,8 @@ func parseEZTV(body []byte, keyword string, page int) (site.Page, error) {
 			value := time.Unix(torrent.DateReleased, 0).UTC()
 			published = &value
 		}
-		result.Items = append(result.Items, site.Result{PayloadKind: site.PayloadMagnet, TorrentID: btrss.EncodeIdentity("magnet", magnet), Title: title, SizeBytes: int64(torrent.SizeBytes), Published: published, Seeders: &seeders, Leechers: &leechers})
+		identity := btrss.EncodeIdentity("magnet", magnet)
+		result.Items = append(result.Items, site.Result{PayloadKind: site.PayloadMagnet, TorrentID: identity, Fingerprint: btrss.StableResourceIdentity(identity), Title: title, SizeBytes: int64(torrent.SizeBytes), Published: published, Seeders: &seeders, Leechers: &leechers})
 	}
 	limit := payload.Limit
 	if limit <= 0 {

@@ -294,26 +294,47 @@ func TestFollowOwnAndAllPermissionMatrixDoesNotRequireReadForMutations(t *testin
 	if err := queue.db.Create(&record).Error; err != nil {
 		t.Fatal(err)
 	}
+	otherRecord := record
+	otherRecord.ID, otherRecord.OwnerID = "follow-permission-other", otherUser.ID
+	if err := queue.db.Create(&otherRecord).Error; err != nil {
+		t.Fatal(err)
+	}
 	service := NewFollowService(queue.db, queue.audit, queue, nil, NewAuthorizationService(queue.db))
 	service.now = clock.Now
 	owner.Permissions = map[string]struct{}{authz.PermissionFollowsReadOwn: {}}
-	if _, err := service.Get(owner, record.ID); err != nil {
-		t.Fatal(err)
+	owned, err := service.Get(owner, record.ID)
+	if err != nil || owned.OwnerName != "Queue Owner（queue-owner）" {
+		t.Fatalf("own subscriber projection=%+v err=%v", owned, err)
+	}
+	ownPage, err := service.List(owner, 1, 100, "")
+	if err != nil || ownPage.Total != 1 || len(ownPage.List) != 1 || ownPage.List[0].OwnerID != owner.User.ID || ownPage.List[0].OwnerName != owned.OwnerName {
+		t.Fatalf("own page leaked or lost subscriber: %+v err=%v", ownPage, err)
 	}
 	other := Actor{User: otherUser, Permissions: map[string]struct{}{authz.PermissionFollowsReadOwn: {}}}
 	if _, err := service.Get(other, record.ID); ErrorCode(err) != CodePermissionDenied {
 		t.Fatalf("foreign own read error=%v", err)
 	}
 	other.Permissions = map[string]struct{}{authz.PermissionFollowsReadAll: {}}
-	if _, err := service.Get(other, record.ID); err != nil {
-		t.Fatal(err)
+	allPage, err := service.List(other, 1, 100, "")
+	if err != nil || allPage.Total != 2 || len(allPage.List) != 2 {
+		t.Fatalf("read_all page=%+v err=%v", allPage, err)
+	}
+	names := make(map[uint]string)
+	for _, item := range allPage.List {
+		names[item.OwnerID] = item.OwnerName
+	}
+	if names[owner.User.ID] != owned.OwnerName || names[otherUser.ID] != "Other（follow-other）" {
+		t.Fatalf("read_all cannot distinguish subscribers: %+v", names)
+	}
+	if item, err := service.Get(other, record.ID); err != nil || item.OwnerName != owned.OwnerName {
+		t.Fatalf("read_all subscriber=%+v err=%v", item, err)
 	}
 	if _, err := service.SetPaused(other, record.ID, true, RequestContext{}); ErrorCode(err) != CodePermissionDenied {
 		t.Fatalf("read_all mutated follow: %v", err)
 	}
 	other.Permissions = map[string]struct{}{authz.PermissionFollowsUpdateAll: {}}
 	paused, err := service.SetPaused(other, record.ID, true, RequestContext{})
-	if err != nil || paused.Status != models.FollowStatusPaused {
+	if err != nil || paused.Status != models.FollowStatusPaused || paused.OwnerName != owned.OwnerName {
 		t.Fatalf("update_all pause=%+v err=%v", paused, err)
 	}
 	var pausedRecord models.FollowSubscription

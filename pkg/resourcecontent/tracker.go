@@ -148,6 +148,14 @@ func discoverUDPTracker(ctx context.Context, network Network, u *url.URL, hash, 
 		return invalid("tracker_unavailable", ErrUnavailable)
 	}
 	defer conn.Close()
+	remote, ok := conn.RemoteAddr().(*net.UDPAddr)
+	if !ok || remote.IP.To16() == nil {
+		return invalid("tracker_address_invalid", ErrInvalidMetainfo)
+	}
+	ipSize := 16
+	if remote.IP.To4() != nil {
+		ipSize = 4
+	}
 	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
 	defer stop()
 	if deadline, ok := ctx.Deadline(); ok {
@@ -189,9 +197,9 @@ func discoverUDPTracker(ctx context.Context, network Network, u *url.URL, hash, 
 		return invalid("tracker_unavailable", ErrUnavailable)
 	}
 	n, err = conn.Read(buffer)
-	if err != nil || n < 20 || binary.BigEndian.Uint32(buffer[:4]) != 1 || string(buffer[4:8]) != string(tx[:]) || (n-20)%6 != 0 {
+	if err != nil || n < 20 || binary.BigEndian.Uint32(buffer[:4]) != 1 || string(buffer[4:8]) != string(tx[:]) || (n-20)%(ipSize+2) != 0 {
 		return invalid("tracker_response_invalid", ErrInvalidMetainfo)
 	}
-	emitCompactPeers(buffer[20:n], 4, network, emit)
+	emitCompactPeers(buffer[20:n], ipSize, network, emit)
 	return nil
 }

@@ -37,7 +37,7 @@ export type FollowStatus = 'active' | 'paused' | 'completed' | 'blocked'
 export interface FollowWait { not_before: string; reason: 'provider_cooldown'; recorded_at: string; server_time: string }
 export interface FollowSummary {
 	 wait?: FollowWait
-  id: string; owner_id: number; media_type: 'tv'; tmdb_id: number; title: string; year?: number; poster_ref?: string
+  id: string; owner_id: number; owner_name?: string; media_type: 'tv'; tmdb_id: number; title: string; year?: number; poster_ref?: string
   status: FollowStatus; revision: number; snapshot: FollowExecutionSnapshot
   progress_target: number; progress_present: number; progress_missing: number
   last_run_id?: string; last_run_at?: string; next_run_at?: string

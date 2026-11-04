@@ -43,14 +43,14 @@ describe('readable scoped execution logs', () => {
     expect(wrapper.text()).not.toContain('等待媒体库扫描')
     expect(filterReasonRows({ coverage_library_unknown: 3, coverage_seasons_unavailable: 1 })).toEqual([{ code: 'coverage_library_unknown', label: '在库覆盖依据待核实的集数', count: 3 }, { code: 'coverage_seasons_unavailable', label: '剧集清单暂不可用的季数', count: 1 }])
   })
-  it.each(['follow_coverage_unknown', 'follow_submit_failed'])('renders the exact coverage wait without hiding other failures (%s)', async code => {
+  it.each([['follow_coverage_unknown', '等待剧集状态确认'], ['follow_candidate_budget', '本轮核验结束，等待继续检查'], ['follow_content_unavailable', '等待实际文件核验'], ['follow_submit_failed', '本轮执行失败']])('renders waits without hiding execution failures (%s)', async (code, label) => {
     const ctx = await context()
     apiMock.mockResolvedValue(result({ summary: { title: '等待中的订阅', status: 'failed', error_code: code, error_message: '当前运行说明', filter_summary: { coverage_unknown: 9 } } }))
     const wrapper = mount(ExecutionLogsPanel, { props: { scope: { kind: 'follow', followId: 'f-1', runId: 'r-1' } }, global: { plugins: ctx.plugins } }); wrappers.push(wrapper)
     await flushPromises()
     const outcome = wrapper.get('.execution-summary__outcome')
-    expect(outcome.text()).toBe(code === 'follow_coverage_unknown' ? '等待剧集状态确认' : '本轮执行失败')
-    expect(outcome.classes().includes('semantic-danger-text')).toBe(code !== 'follow_coverage_unknown')
+    expect(outcome.text()).toBe(label)
+    expect(outcome.classes().includes('semantic-danger-text')).toBe(code === 'follow_submit_failed')
     expect(wrapper.text()).toContain('状态未确认、暂不下载的集数 9')
   })
 

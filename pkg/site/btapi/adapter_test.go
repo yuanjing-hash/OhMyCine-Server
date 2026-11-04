@@ -6,7 +6,9 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/resourcecontent"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/site"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/site/btrss"
 )
 
 func TestYTSAndEZTVAPISearchProducePrivateMagnetIdentities(t *testing.T) {
@@ -17,7 +19,7 @@ func TestYTSAndEZTVAPISearchProducePrivateMagnetIdentities(t *testing.T) {
 		keyword string
 	}{
 		{"yts", YTSProfile(), `{"status":"ok","data":{"movie_count":2,"limit":1,"page_number":1,"movies":[{"title_long":"Seven Samurai (1954)","torrents":[{"hash":"0123456789abcdef0123456789abcdef01234567","quality":"1080p","type":"bluray","seeds":42,"peers":3,"size_bytes":1234,"date_uploaded_unix":1700000000}]}]}}`, "Seven Samurai"},
-		{"eztv", EZTVProfile(), `{"torrents_count":200,"limit":100,"page":1,"torrents":[{"title":"Example Show S01E01 1080p","hash":"0123456789abcdef0123456789abcdef01234567","size_bytes":"4321","seeds":20,"peers":2,"date_released_unix":1700000000}]}`, "Example Show"},
+		{"eztv", EZTVProfile(), `{"torrents_count":200,"limit":100,"page":1,"torrents":[{"title":"Example Show S01E01 1080p","hash":"0123456789abcdef0123456789abcdef01234567","magnet_url":"magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&tr=https%3A%2F%2Ftracker.example%2Fannounce","size_bytes":"4321","seeds":20,"peers":2,"date_released_unix":1700000000},{"title":"Example Show invalid source","hash":"0123456789abcdef0123456789abcdef01234567","magnet_url":"magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&xt=urn:btih:ffffffffffffffffffffffffffffffffffffffff","size_bytes":"1"}]}`, "Example Show"},
 	}
 	for _, test := range tests {
 		t.Run(test.kind, func(t *testing.T) {
@@ -35,6 +37,10 @@ func TestYTSAndEZTVAPISearchProducePrivateMagnetIdentities(t *testing.T) {
 			source, err := adapter.ResolveSource(context.Background(), site.Config{}, page.Items[0].TorrentID)
 			if err != nil || source.Magnet == "" || source.Torrent != nil {
 				t.Fatalf("source=%+v err=%v", source, err)
+			}
+			m, err := resourcecontent.ParseMagnet(source.Magnet)
+			if err != nil || page.Items[0].Fingerprint != btrss.EncodeIdentity("magnet", "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567") || test.kind == "eztv" && (len(m.Trackers) != 1 || page.Skipped != 1) {
+				t.Fatal("source hints/identity changed or contradictory source fell back to a bare hash", err)
 			}
 		})
 	}

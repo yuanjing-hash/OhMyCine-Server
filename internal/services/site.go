@@ -87,6 +87,7 @@ type siteResultClaim struct {
 	ResultType                string
 	AuthorizationScope        string
 	PluginLifecycle           string
+	MetadataPrivate           bool // Monotonic actual-metainfo fact for this source claim.
 	Subtitle                  string
 	MediaTypeHint             string
 	ExpiresAt                 time.Time
