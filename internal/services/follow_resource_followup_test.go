@@ -243,12 +243,60 @@ func TestFollowParentCancellationStopsFurtherCandidatePreparation(t *testing.T) 
 
 type followResultsAdapter struct {
 	*stubSiteAdapter
-	items     []sitepkg.Result
-	requested []string
+	items          []sitepkg.Result
+	requested      []string
+	itemsByKeyword map[string][]sitepkg.Result
+	onSearch       func(string)
 }
 
 func (a *followResultsAdapter) Search(_ context.Context, _ sitepkg.Config, query sitepkg.Query) (sitepkg.Page, error) {
+	if a.onSearch != nil {
+		a.onSearch(query.Keyword)
+	}
+	if items, ok := a.itemsByKeyword[query.Keyword]; ok {
+		return sitepkg.Page{Page: query.Page, Items: items}, nil
+	}
 	return sitepkg.Page{Page: query.Page, Items: a.items}, nil
+}
+
+func TestFollowLaterEligibleAliasesKeepBetterObservationsAndDistinctVersions(t *testing.T) {
+	f := newFollowCoverageFixture(t, "missing_dates", "complete", 10)
+	zero, low, better, alternate, distinct := 0, 5, 30, 10, 25
+	result := func(id string, episode int, seeds *int) sitepkg.Result {
+		return sitepkg.Result{TorrentID: id, Title: fmt.Sprintf("Fixture.Show.S01E%02d.1080p.WEB-DL", episode), SizeBytes: 1024, Seeders: seeds}
+	}
+	adapter := &followResultsAdapter{stubSiteAdapter: f.adapter, itemsByKeyword: map[string][]sitepkg.Result{
+		"嫁金钗":          {result("same-resource", 11, &zero), result("alternate-version", 12, &alternate)},
+		"Fixture Show": {result("same-resource", 11, &low), result("same-resource", 11, &better), result("distinct-version", 13, &distinct)},
+	}}
+	f.worker.sites.adapters["pttime"] = adapter
+	var subscription models.FollowSubscription
+	if err := f.follows.db.First(&subscription, "id = ?", f.subscription.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	var snapshot FollowExecutionSnapshot
+	if err := json.Unmarshal([]byte(subscription.ExecutionSnapshotJSON), &snapshot); err != nil {
+		t.Fatal(err)
+	}
+	snapshot.Filters.MinSeeders = 1
+	raw, _ := json.Marshal(snapshot)
+	for _, table := range []string{"follow_subscriptions", "follow_runs"} {
+		column := "subscription_id"
+		if table == "follow_subscriptions" {
+			column = "id"
+		}
+		if err := f.follows.db.Table(table).Where(column+" = ?", subscription.ID).Update("execution_snapshot_json", string(raw)).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	run := f.run(t)
+	var reasons map[string]int
+	if err := json.Unmarshal([]byte(run.FilterSummaryJSON), &reasons); err != nil {
+		t.Fatal(err)
+	}
+	if run.Candidates != 3 || run.Selected != 2 || reasons["seeders_zero"] != 1 || !reflect.DeepEqual(adapter.requested, []string{"same-resource", "distinct-version"}) {
+		t.Fatalf("ineligible alias poisoned a later resource or its better metadata: run=%+v reasons=%v requested=%v", run, reasons, adapter.requested)
+	}
 }
 
 func (a *followResultsAdapter) Download(ctx context.Context, config sitepkg.Config, id string) ([]byte, string, error) {
@@ -256,7 +304,7 @@ func (a *followResultsAdapter) Download(ctx context.Context, config sitepkg.Conf
 	return a.stubSiteAdapter.Download(ctx, config, "42")
 }
 
-func setFollowFixtureSnapshot(t *testing.T, f *followCoverageFixture, sites []uint, limit int) {
+func setFollowFixtureSnapshot(t *testing.T, f *followCoverageFixture, sites []uint, limit int, preference ...string) {
 	t.Helper()
 	var record models.FollowSubscription
 	if err := f.follows.db.First(&record, "id = ?", f.subscription.ID).Error; err != nil {
@@ -270,6 +318,9 @@ func setFollowFixtureSnapshot(t *testing.T, f *followCoverageFixture, sites []ui
 		snapshot.SiteIDs = sites
 	}
 	snapshot.MaxResourcesPerRun = limit
+	if len(preference) > 0 {
+		snapshot.Filters.AcquisitionPreference = preference[0]
+	}
 	raw, err := json.Marshal(snapshot)
 	if err != nil {
 		t.Fatal(err)
@@ -292,8 +343,12 @@ func followSingleEpisodeResults() []sitepkg.Result {
 }
 
 func TestFollowUnusableSharesDoNotExhaustAcceptedResourceLimit(t *testing.T) {
-	for _, shares := range []int{3, 50} {
-		t.Run(fmt.Sprintf("shares-%d", shares), func(t *testing.T) {
+	for _, scenario := range []struct {
+		shares     int
+		preference string
+	}{{3, ""}, {50, ""}, {50, FollowAcquisitionTransferFirst}} {
+		shares := scenario.shares
+		t.Run(fmt.Sprintf("shares-%d-%s", shares, scenario.preference), func(t *testing.T) {
 			f := newFollowCoverageFixture(t, "missing_dates", "complete", 10)
 			sites := f.worker.sites
 			var original models.Site
@@ -311,7 +366,7 @@ func TestFollowUnusableSharesDoNotExhaustAcceptedResourceLimit(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			setFollowFixtureSnapshot(t, f, []uint{shareSite.ID, original.ID}, 1)
+			setFollowFixtureSnapshot(t, f, []uint{shareSite.ID, original.ID}, 1, scenario.preference)
 			run := f.run(t)
 			var reasons map[string]int
 			if err := json.Unmarshal([]byte(run.FilterSummaryJSON), &reasons); err != nil {

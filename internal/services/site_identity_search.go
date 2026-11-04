@@ -24,6 +24,12 @@ import (
 )
 
 type MediaIdentitySearchInput struct {
+	// Internal caller policy runs before equivalent observations are merged.
+	// It is never accepted from HTTP; its digest isolates cached projections.
+	resultPolicy       string
+	acceptResult       func(SiteSearchResult) bool
+	preferResult       func(SiteSearchResult, SiteSearchResult) bool
+	preferShares       bool
 	MediaType          string
 	TMDBID             int64
 	Season             *int
@@ -220,13 +226,17 @@ func (s *SiteService) searchMediaIdentitySitePage(ctx context.Context, actor Act
 				rejections.add("identity_mismatch", item.Title)
 				continue
 			}
+			if input.acceptResult != nil && !input.acceptResult(item) {
+				s.deleteClaim(item.Token)
+				continue
+			}
 			identity := claim.TorrentID
 			if (isCloudShareSource(item.SourceKind) || item.SourceKind == RouteSourceBT) && item.ResourceFingerprint != "" {
 				identity = item.ResourceFingerprint
 			}
 			key := strconv.FormatUint(uint64(group.SiteID), 10) + ":" + identity
 			index, duplicate := privateKeys[key]
-			if duplicate && (!isCloudShareSource(item.SourceKind) || compareOptionalTime(item.Published, target.Items[index].Published) <= 0) {
+			if duplicate && !preferIdentityObservation(input, item, target.Items[index]) {
 				s.deleteClaim(item.Token)
 				rejections.add("duplicate", item.Title)
 				continue
@@ -243,7 +253,8 @@ func (s *SiteService) searchMediaIdentitySitePage(ctx context.Context, actor Act
 			item.MatchedName = name.Value
 			item.ResourceFingerprint = privateResultFingerprint(group.SiteID, identity)
 			if duplicate {
-				// Another language query may find a newer post for the same evolving share.
+				// A later alias can carry a better eligible observation of the same
+				// resource. Keep that observation's own claim and complete material.
 				s.deleteClaim(target.Items[index].Token)
 				target.Items[index] = item
 				replaced++
@@ -255,14 +266,14 @@ func (s *SiteService) searchMediaIdentitySitePage(ctx context.Context, actor Act
 		}
 		rejections.record(aliasCtx, s.recordSearch)
 		if group.Status == "success" {
-			s.recordSearch(aliasCtx, "site.identity.finish", "identity", "confirmed", fmt.Sprintf("名称“%s”返回 %d 条可用结果，作品与季集验证、去重后新增 %d 条，替换同分享较旧帖子 %d 条，当前站点合计 %d 条", serverlog.BusinessDisplayName(name.Value), len(group.Items), kept, replaced, len(target.Items)), map[string]any{"result_count": len(group.Items), "identity_kept": kept, "updated_count": replaced, "deduplicated_count": len(target.Items)})
+			s.recordSearch(aliasCtx, "site.identity.finish", "identity", "confirmed", fmt.Sprintf("名称“%s”返回 %d 条可用结果，作品、季集及调用方规则核对后新增 %d 条，替换同资源的较优记录 %d 条，当前站点合计 %d 条", serverlog.BusinessDisplayName(name.Value), len(group.Items), kept, replaced, len(target.Items)), map[string]any{"result_count": len(group.Items), "identity_kept": kept, "updated_count": replaced, "deduplicated_count": len(target.Items)})
 		}
 		// PanSou builds one bounded multi-alias snapshot across its cached pages.
 		// Internal pages are not the requested client page and must not be emitted
 		// as cumulative SSE rows. The coordinator publishes its final projection.
 		if record.Kind != pansou.Kind {
 			snapshot := cloneSearchGroup(*target)
-			sortIdentitySearchItems(snapshot.Items)
+			sortIdentitySearchItems(snapshot.Items, input.preferShares)
 			if !publishSearchSnapshot(ctx, snapshot) {
 				target.Partial, target.IncompleteReason = true, CodeSearchResultLimit
 				break
@@ -289,8 +300,27 @@ func (s *SiteService) searchMediaIdentitySitePage(ctx context.Context, actor Act
 			target.IncompleteReason = CodeSearchSiteBudget
 		}
 	}
-	sortIdentitySearchItems(target.Items)
+	sortIdentitySearchItems(target.Items, input.preferShares)
 	return *target
+}
+
+func preferIdentityObservation(input MediaIdentitySearchInput, next, previous SiteSearchResult) bool {
+	if input.preferResult != nil {
+		return input.preferResult(next, previous)
+	}
+	if isCloudShareSource(next.SourceKind) {
+		return compareOptionalTime(next.Published, previous.Published) > 0
+	}
+	if (next.Seeders == nil) != (previous.Seeders == nil) {
+		return next.Seeders != nil
+	}
+	if intValue(next.Seeders) != intValue(previous.Seeders) {
+		return intValue(next.Seeders) > intValue(previous.Seeders)
+	}
+	if compared := compareOptionalTime(next.Published, previous.Published); compared != 0 {
+		return compared > 0
+	}
+	return next.SizeBytes > previous.SizeBytes
 }
 
 func privateResultFingerprint(siteID uint, torrentID string) string {
@@ -298,8 +328,11 @@ func privateResultFingerprint(siteID uint, torrentID string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func sortIdentitySearchItems(items []SiteSearchResult) {
+func sortIdentitySearchItems(items []SiteSearchResult, sharesFirst ...bool) {
 	sort.SliceStable(items, func(left, right int) bool {
+		if len(sharesFirst) > 0 && sharesFirst[0] && isCloudShareSource(items[left].SourceKind) != isCloudShareSource(items[right].SourceKind) {
+			return isCloudShareSource(items[left].SourceKind)
+		}
 		leftSeeders, rightSeeders := intValue(items[left].Seeders), intValue(items[right].Seeders)
 		if leftSeeders != rightSeeders {
 			return leftSeeders > rightSeeders

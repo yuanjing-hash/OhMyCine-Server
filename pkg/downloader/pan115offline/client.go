@@ -12,7 +12,7 @@ import (
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/downloader"
 )
 
-var Capabilities = downloader.Capabilities{SelectiveFiles: true, Cancel: true, DeleteData: true, DownloadSpeed: false, UploadSpeed: false, ETA: true, NativeOffline: true, ShareReceive: true, OutputConstraint: downloader.OutputConstraintProviderStorage}
+var Capabilities = downloader.Capabilities{SelectiveFiles: true, Cancel: true, DeleteData: true, DownloadSpeed: false, UploadSpeed: false, ETA: true, NativeOffline: true, CanTryWithoutSeeders: true, ShareReceive: true, OutputConstraint: downloader.OutputConstraintProviderStorage}
 
 const (
 	maxStorageParentDepth       = 128

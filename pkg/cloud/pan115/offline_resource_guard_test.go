@@ -2,6 +2,7 @@ package pan115
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -372,36 +373,79 @@ func (s *pendingOrdinaryACKSDK) AddOfflineTaskURIs(uris []string, dir string, op
 	return result, err
 }
 func TestOrdinaryOfflinePendingSDKCallKeepsResourceUntilPhysicalReturn(t *testing.T) {
-	c, s, store, r, uri := guardedFixture(t)
-	wire := &pendingOrdinaryACKSDK{guardedOfflineSDK: s, visible: make(chan struct{}), release: make(chan struct{}), blockedHash: r.Authority.Selection.Identity.V1}
-	c.sdk = wire
-	ctx := ordinaryTestContext("physical-owner")
-	first := make(chan error, 1)
-	go func() { _, err := c.SubmitOffline(ctx, uri, "ordinary"); first <- err }()
-	<-wire.visible
-	cold := selectedClient(s.selectedTestSDK, store)
-	cold.sdk = wire
-	waiting, cancel := context.WithTimeout(ctx, 75*time.Millisecond)
-	_, waitErr := cold.SubmitOffline(waiting, uri, "ordinary")
-	cancel()
-	interrupt, cancelInterrupt := context.WithTimeout(ctx, 75*time.Millisecond)
-	cancelErr := cold.CancelOffline(interrupt, r.Authority.Selection.Identity.V1, false)
-	cancelInterrupt()
-	other := selectedClient(s.selectedTestSDK, store)
-	other.sdk = wire
-	independent, cancelIndependent := context.WithTimeout(ordinaryTestContext("different-resource"), 200*time.Millisecond)
-	_, otherErr := other.SubmitOffline(independent, "magnet:?xt=urn:btih:"+strings.Repeat("f", 40), "other")
-	cancelIndependent()
-	_, ownerErr := store.ResourceClaim(context.Background(), offlineResourceKey(r.Authority.Selection.Identity.V1))
-	close(wire.release)
-	firstErr := <-first
-	if waitErr == nil || cancelErr == nil || ownerErr != nil || firstErr != nil {
-		t.Fatalf("pending SDK owner was released by another waiter: waiter=%v owner=%v original=%v", waitErr, ownerErr, firstErr)
-	}
-	if !errors.Is(otherErr, sdk.ErrOfflineInvalidLink) || wire.otherAdds != 1 || s.cancels != 0 {
-		t.Fatal("lock crossed resources or canceled a physical owner", otherErr)
-	}
-	if s.adds != 1 {
-		t.Fatal("pending operation submitted twice")
+	for _, scenario := range []struct {
+		name                string
+		cancelOwner, reject bool
+	}{{name: "active-owner"}, {name: "cancelled-owner", cancelOwner: true}, {name: "cancelled-refused-owner", cancelOwner: true, reject: true}} {
+		t.Run(scenario.name, func(t *testing.T) {
+			c, s, store, r, uri := guardedFixture(t)
+			if scenario.reject {
+				s.applyAdd, s.addErr = false, sdk.ErrNotLogin
+			}
+			wire := &pendingOrdinaryACKSDK{guardedOfflineSDK: s, visible: make(chan struct{}), release: make(chan struct{}), blockedHash: r.Authority.Selection.Identity.V1}
+			c.sdk = wire
+			base := ordinaryTestContext("physical-owner")
+			ctx, cancelOriginal := context.WithCancel(base)
+			defer cancelOriginal()
+			first := make(chan error, 1)
+			go func() { _, err := c.SubmitOffline(ctx, uri, "ordinary"); first <- err }()
+			<-wire.visible
+			var firstErr error
+			if scenario.cancelOwner {
+				cancelOriginal()
+				select {
+				case firstErr = <-first:
+					close(wire.release)
+					t.Fatal("cancelled writer dropped its pending physical result", firstErr)
+				case <-time.After(25 * time.Millisecond):
+				}
+			}
+			cold := selectedClient(s.selectedTestSDK, store)
+			cold.sdk = wire
+			waiting, cancel := context.WithTimeout(base, 75*time.Millisecond)
+			_, waitErr := cold.SubmitOffline(waiting, uri, "ordinary")
+			cancel()
+			interrupt, cancelInterrupt := context.WithTimeout(base, 75*time.Millisecond)
+			cancelErr := cold.CancelOffline(interrupt, r.Authority.Selection.Identity.V1, false)
+			cancelInterrupt()
+			other := selectedClient(s.selectedTestSDK, store)
+			other.sdk = wire
+			independent, cancelIndependent := context.WithTimeout(ordinaryTestContext("different-resource"), 200*time.Millisecond)
+			_, otherErr := other.SubmitOffline(independent, "magnet:?xt=urn:btih:"+strings.Repeat("f", 40), "other")
+			cancelIndependent()
+			owner, ownerErr := store.ResourceClaim(context.Background(), offlineResourceKey(r.Authority.Selection.Identity.V1))
+			close(wire.release)
+			firstErr = <-first
+			var recoverErr error
+			if scenario.reject {
+				settled, cancelSettled := context.WithTimeout(base, time.Second)
+				release, err := cold.lockOrdinaryResource(settled, r.Authority.Selection.Identity.V1)
+				cancelSettled()
+				if err != nil {
+					t.Fatal("late refusal did not settle", err)
+				}
+				release()
+				receipt, err := store.Load(base, owner.ID)
+				var checkpoint ordinaryOfflineCheckpoint
+				if err != nil || receipt.State != "failed" || json.Unmarshal(receipt.Payload, &checkpoint) != nil || !checkpoint.DefiniteRejection || checkpoint.Ack || s.task != nil {
+					t.Fatal("cancelled caller lost the late typed rejection")
+				}
+			} else {
+				_, recoverErr = cold.SubmitOffline(base, uri, "ordinary")
+			}
+			firstOK := firstErr == nil
+			if scenario.reject {
+				firstOK = errors.Is(firstErr, sdk.ErrNotLogin)
+			}
+			if waitErr == nil || cancelErr == nil || ownerErr != nil || !firstOK || recoverErr != nil {
+				t.Fatalf("pending SDK owner was released by another waiter: waiter=%v owner=%v original=%v", waitErr, ownerErr, firstErr)
+			}
+			if !errors.Is(otherErr, sdk.ErrOfflineInvalidLink) || wire.otherAdds != 1 || s.cancels != 0 {
+				t.Fatal("lock crossed resources or canceled a physical owner", otherErr)
+			}
+			if s.adds != 1 {
+				t.Fatal("pending operation submitted twice")
+			}
+		})
 	}
 }

@@ -1282,6 +1282,9 @@ func (s *DownloadService) cancelPipeline(ctx context.Context, actor Actor, id st
 		if strings.TrimSpace(task.ProviderTaskID) != cleanedProviderTaskID {
 			return errDownloadProviderIdentityChanged
 		}
+		if downloadSubmissionUnconfirmed(task) {
+			return pendingDownloadSubmissionControl()
+		}
 		var downloadJob models.Job
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&downloadJob, "id = ?", task.JobID).Error; err != nil {
 			return queueNotFound(err)
@@ -1419,6 +1422,9 @@ func (s *DownloadService) preflightCompletedHistoryDelete(taskID string) error {
 
 func (s *DownloadService) removeProviderTask(ctx context.Context, task models.DownloadTask, deleteData bool) (string, error) {
 	if strings.TrimSpace(task.ProviderTaskID) == "" {
+		if downloadSubmissionUnconfirmed(task) {
+			return "", pendingDownloadSubmissionControl()
+		}
 		if !deleteData {
 			return "not_submitted", nil
 		}
@@ -1447,6 +1453,29 @@ func (s *DownloadService) removeProviderTask(ctx context.Context, task models.Do
 		return "task_and_data_deleted", nil
 	}
 	return "task_deleted_data_retained", nil
+}
+
+// A missing provider identity is not proof that an entered submission did not
+// commit. Keep the original task/episode reservation until its existing recovery
+// path establishes an identity or a definitive rejection. This applies to every
+// executor; queued work that has not entered Submit remains cancellable.
+func downloadSubmissionUnconfirmed(task models.DownloadTask) bool {
+	if strings.TrimSpace(task.ProviderTaskID) != "" {
+		return false
+	}
+	if task.Phase == models.DownloadTaskStatusSubmitting {
+		return true
+	}
+	switch task.LastErrorCode {
+	case "downloader_submission_unconfirmed", "downloader_submit_unknown", "downloader_selection_result_unknown", "downloader_share_result_unknown":
+		return true
+	}
+	return false
+}
+
+func pendingDownloadSubmissionControl() error {
+	const code = "downloader_submission_unconfirmed"
+	return appError(code, "原下载提交结果尚未确认，已保留原任务及集数占用；请待原任务核对后重试控制操作", downloadpkg.Error(code, true, nil))
 }
 
 // deleteCompletedHistoryRecord removes durable pipeline history after the
@@ -2846,11 +2875,20 @@ func (w *DownloadWorker) Interrupt(ctx context.Context, job ClaimedJob, action s
 		return w.service.pluginDownloads.Interrupt(ctx, job, action)
 	}
 	if task.ProviderTaskID == "" {
+		if downloadSubmissionUnconfirmed(task) {
+			return pendingDownloadSubmissionControl()
+		}
 		updates := map[string]any{"phase": map[string]string{"pause": models.DownloadTaskStatusPaused, "cancel": models.DownloadTaskStatusCancelled}[action], "updated_at": time.Now().UTC()}
 		if action == "cancel" {
 			updates["last_error_code"], updates["last_error_message"], updates["scrape_status"] = "", "", ""
 		}
-		err := w.service.db.Model(&task).Updates(updates).Error
+		// Submission may enter after the read above. Never overwrite that new
+		// state (or a newly returned identity) with a false local cancellation.
+		changed := w.service.db.Model(&task).Where("provider_task_id = ? AND phase = ?", "", task.Phase).Updates(updates)
+		err := changed.Error
+		if err == nil && changed.RowsAffected == 0 {
+			return pendingDownloadSubmissionControl()
+		}
 		if err == nil {
 			serverlog.OperationDownloadTask.Event(w.service.log.Info()).Str("task_id", task.ID).Str("action", action).Msg(serverlog.OperationDownloadTask.Message("控制操作已完成"))
 		}
@@ -3178,6 +3216,18 @@ func downloadFailureDiagnosticEvent(event *zerolog.Event, err error) *zerolog.Ev
 		if diagnostic.ProviderCode != "" {
 			event.Str("provider_error_code", diagnostic.ProviderCode)
 		}
+		if diagnostic.ProviderOperation != "" {
+			event.Str("provider_operation", diagnostic.ProviderOperation)
+		}
+		if diagnostic.ProviderHTTPStatus != 0 {
+			event.Int("provider_http_status", diagnostic.ProviderHTTPStatus)
+		}
+		if diagnostic.ProviderErrno != 0 {
+			event.Int("provider_errno", diagnostic.ProviderErrno)
+		}
+		if diagnostic.ProviderResponseKind != "" {
+			event.Str("provider_response_kind", diagnostic.ProviderResponseKind)
+		}
 	}
 	return event
 }
@@ -3206,6 +3256,19 @@ func downloadFailureDescription(err error, code string, retryable bool) string {
 	}
 	if diagnostic.ProviderCode != "" {
 		message += "（提供方错误码：" + diagnostic.ProviderCode + "）"
+	}
+	if diagnostic.ProviderOperation != "" {
+		label := map[string]string{"submit": "提交响应", "reconcile": "原任务核对", "cancel": "取消响应"}[diagnostic.ProviderOperation]
+		message += "；" + label
+	}
+	if diagnostic.ProviderHTTPStatus != 0 {
+		message += fmt.Sprintf("，HTTP %d", diagnostic.ProviderHTTPStatus)
+	}
+	if diagnostic.ProviderErrno != 0 {
+		message += fmt.Sprintf("，提供方编号 %d", diagnostic.ProviderErrno)
+	}
+	if diagnostic.ProviderResponseKind != "" {
+		message += "，" + map[string]string{"http_error": "HTTP 返回失败", "provider_error": "提供方返回失败", "invalid_response": "响应格式无效", "read_error": "响应读取失败", "response_too_large": "响应超出限制"}[diagnostic.ProviderResponseKind]
 	}
 	return "下载在“" + label + "”阶段未完成：" + message
 }

@@ -203,6 +203,9 @@ func TestNativeOfflineAcceptsAccountRootAsTarget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if !Capabilities.CanTryWithoutSeeders {
+		t.Fatal("native offline attempt incorrectly depends on public seeders")
+	}
 	if _, err := client.Test(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -213,6 +216,9 @@ func TestNativeOfflineAcceptsAccountRootAsTarget(t *testing.T) {
 }
 
 func TestNativeOfflinePreservesProviderErrorClassification(t *testing.T) {
+	if _, ok := downloader.FailureDiagnosticFromError(downloader.Error("downloader_unavailable", true, nil)); ok {
+		t.Fatal("legacy adapter without a stage fabricated provider facts")
+	}
 	deadline := time.Now().UTC().Add(time.Minute)
 	for _, item := range []struct {
 		name, stage, code, providerCode string

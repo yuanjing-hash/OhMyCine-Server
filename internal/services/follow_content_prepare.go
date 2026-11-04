@@ -58,6 +58,20 @@ func (w *FollowSearchWorker) prepareFollowCandidates(ctx context.Context, actor 
 				return
 			}
 			libraryID := snapshot.MediaLibraryID
+			// Route eligibility is local/read-only. Reject an unavailable or
+			// live-swarm-only route before spending a heavy content read.
+			prepared.Stage = "route"
+			preflight, err := w.sites.RecommendSiteRoute(ctx, actor, SourceRouteRecommendationInput{ResultToken: candidate.Item.Token, MediaLibraryID: &libraryID})
+			preflight = followSeedRoute(preflight, candidate.Item, snapshot)
+			if err != nil {
+				prepared.Err = err
+				return
+			}
+			if preflight.Recommended == nil {
+				prepared.Err = appError(CodeDownloaderUnavailable, "没有符合订阅做种数策略与目标媒体库的可用路线", nil)
+				return
+			}
+			prepared.Stage = "content"
 			if candidate.Item.ContentInspection {
 				content, err := w.sites.prepareFollowContent(ctx, actor, candidate.Item.Token, candidate.Season, episodes, effectiveSubtitlePolicy(snapshot.Filters.Subtitles))
 				if err != nil {
@@ -70,6 +84,7 @@ func (w *FollowSearchWorker) prepareFollowCandidates(ctx context.Context, actor 
 			}
 			prepared.Stage = "route"
 			recommendation, err := w.sites.RecommendSiteRoute(ctx, actor, SourceRouteRecommendationInput{ResultToken: candidate.Item.Token, MediaLibraryID: &libraryID, ContentSelectionToken: prepared.ContentSelectionToken})
+			recommendation = followSeedRoute(recommendation, candidate.Item, snapshot)
 			if err != nil {
 				prepared.Err = err
 				return
@@ -118,6 +133,13 @@ type followSearchCheckpoint struct {
 
 func (w *FollowSearchWorker) preparationCheckpoint(ctx context.Context, run models.FollowRun, subscription models.FollowSubscription, job models.Job, missing []FollowEpisodeCoordinate) (followSearchCheckpoint, error) {
 	scope := inspectionDigest([]any{run.OwnerID, run.SubscriptionID, run.SubscriptionRevision, run.LifecycleRevision, missing})
+	var snapshot FollowExecutionSnapshot
+	if json.Unmarshal([]byte(run.ExecutionSnapshotJSON), &snapshot) == nil && snapshot.Filters.AcquisitionPreference == FollowAcquisitionTransferFirst {
+		// Old cursors were built from BT-first identity pages. Restart that
+		// scheduling cycle once at the new share-first boundary. Thereafter the
+		// cursor can still progress past failed shares to later source tiers.
+		scope = inspectionDigest([]any{scope, "transfer-first-source-order-v2"})
+	}
 	checkpoint := followSearchCheckpoint{Version: 1, Stage: "search", Missing: missing, PreparationScope: scope}
 	reuse := func(raw string) bool {
 		var saved followSearchCheckpoint
@@ -150,6 +172,29 @@ func continueFollowCandidates(pool []followCandidate, after *followCandidatePosi
 		}
 	}
 	return pool
+}
+
+func followSeederLimited(item SiteSearchResult, snapshot FollowExecutionSnapshot) bool {
+	return !isCloudShareSource(item.SourceKind) && snapshot.Filters.MinSeeders > 0 && (item.Seeders == nil || *item.Seeders < snapshot.Filters.MinSeeders)
+}
+
+func followSeedRoute(recommendation SourceRouteRecommendation, item SiteSearchResult, snapshot FollowExecutionSnapshot) SourceRouteRecommendation {
+	if !followSeederLimited(item, snapshot) {
+		return recommendation
+	}
+	recommendation.Choices = append([]SourceRouteChoice(nil), recommendation.Choices...)
+	recommendation.Recommended = nil
+	for index := range recommendation.Choices {
+		choice := &recommendation.Choices[index]
+		if choice.Enabled && !choice.CanTryWithoutSeeders {
+			choice.Enabled = false
+			choice.ReasonCode, choice.ReasonMessage = "follow_live_seeders_required", "此路线需要满足订阅的实时做种数限制"
+		}
+		if choice.Enabled && recommendation.Recommended == nil {
+			recommendation.Recommended = &SourceRouteSelection{DownloaderID: choice.DownloaderID, MediaLibraryID: choice.MediaLibraryID}
+		}
+	}
+	return recommendation
 }
 
 func rejectedFollowContent(err error) bool {

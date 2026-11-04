@@ -3,11 +3,17 @@ package pan115
 import (
 	"context"
 	"errors"
+	"io"
+	"net/http"
+	"os"
+	"strings"
 	"testing"
+	"testing/iotest"
 	"time"
 
 	pan115sdk "github.com/SheltonZhu/115driver/pkg/driver"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/downloader"
 	"golang.org/x/time/rate"
 )
 
@@ -62,7 +68,77 @@ func TestNewUses115BrowserUserAgentForCookieAPIs(t *testing.T) {
 	if got := adapter.Client.Header.Get("User-Agent"); got != pan115sdk.UA115Browser {
 		t.Fatalf("User-Agent = %q, want %q", got, pan115sdk.UA115Browser)
 	}
+	if adapter.Client.GetClient().Timeout != 15*time.Second || adapter.Client.RetryCount != 0 {
+		t.Fatal("ordinary SDK writer lost its finite timeout or zero-retry contract")
+	}
+	for _, scenario := range []struct {
+		name, body, code, kind    string
+		status, errno             int
+		definite, risk, transient bool
+	}{
+		{"http", "private-response-secret", cloud.CodeRateLimited, "http_error", 429, 0, false, true, false},
+		{"transient-http", "private-response-secret", cloud.CodeUnavailable, "http_error", 503, 0, false, false, true},
+		{"body-timeout", "", cloud.CodeUnavailable, "read_error", 200, 0, false, false, true},
+		{"non-json", "private-response-secret", cloud.CodeUnavailable, "invalid_response", 200, 0, false, false, false},
+		{"unknown-errno", `{"state":false,"errno":12345,"error":"private-response-secret"}`, cloud.CodeUnavailable, "provider_error", 200, 12345, false, false, false},
+		{"provider-risk", `{"state":false,"errno":12345,"error":"请求频繁 private-response-secret"}`, cloud.CodeRateLimited, "provider_error", 200, 12345, false, true, false},
+		{"typed-refusal", `{"state":false,"errno":"10004","error":"private-response-secret"}`, cloud.CodeOfflineBadLink, "provider_error", 200, 10004, true, false, false},
+		{"bounded", strings.Repeat("x", (2<<20)+1), cloud.CodeUnavailable, "response_too_large", 200, 0, false, false, false},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			calls := 0
+			body := &offlineTestBody{Reader: strings.NewReader(scenario.body)}
+			if scenario.name == "body-timeout" {
+				body.Reader = iotest.ErrReader(os.ErrDeadlineExceeded)
+			}
+			adapter.UserID = 1
+			adapter.Client.GetClient().Transport = offlineDiagnosticTransport{base: selectedRoundTrip(func(r *http.Request) (*http.Response, error) {
+				calls++
+				if ordinaryWireOperation(r) != "submit" || r.Header.Get("User-Agent") != pan115sdk.UA115Browser || r.Method != http.MethodPost {
+					t.Fatal("ordinary SDK request route changed")
+				}
+				if err := r.ParseForm(); err != nil || len(r.PostForm) != 1 || r.PostForm.Get("data") == "" || strings.Contains(r.PostForm.Get("data"), "magnet:") {
+					t.Fatal("ordinary SDK request is no longer the encrypted form")
+				}
+				return &http.Response{StatusCode: scenario.status, Header: http.Header{}, Body: body, Request: r}, nil
+			})}
+			_, wireErr := adapter.AddOfflineTaskURIs([]string{"magnet:?xt=urn:btih:" + testOfflineHash}, "root")
+			err := downloader.WithFailureStage(mapError(wireErr), downloader.FailureOfflineSubmission)
+			diagnostic, ok := downloader.FailureDiagnosticFromError(err)
+			code, _ := cloud.ErrorInfo(err)
+			if !ok || calls != 1 || !body.closed || code != scenario.code || diagnostic.ProviderOperation != "submit" || diagnostic.ProviderHTTPStatus != scenario.status || diagnostic.ProviderErrno != scenario.errno || diagnostic.ProviderResponseKind != scenario.kind || definiteOfflineRejection(wireErr) != scenario.definite {
+				t.Fatalf("bounded ordinary response diagnostic mismatch: code=%s diagnostic=%+v", code, diagnostic)
+			}
+			if strings.Contains(err.Error()+wireErr.Error(), "private-response-secret") {
+				t.Fatal("raw response escaped the native boundary")
+			}
+			if isRiskResponse(wireErr) != scenario.risk || isTransientResponse(wireErr) != scenario.transient {
+				t.Fatal("safe response projection changed account recovery classification")
+			}
+			if diagnostic.Timeout != (scenario.name == "body-timeout") {
+				t.Fatal("response wrapper lost the observed timeout property")
+			}
+		})
+	}
+	// A successful list body still reaches the unchanged SDK parser. Its
+	// transport facts belong to this request, never a shared last-response slot.
+	adapter.Client.GetClient().Transport = offlineDiagnosticTransport{base: selectedRoundTrip(func(r *http.Request) (*http.Response, error) {
+		if ordinaryWireOperation(r) != "reconcile" {
+			t.Fatal("wrong reconciliation request")
+		}
+		return &http.Response{StatusCode: 200, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{"state":true,"page":1,"page_count":1,"tasks":[]}`)), Request: r}, nil
+	})}
+	if page, err := adapter.ListOfflineTask(1); err != nil || page.Page != 1 || page.PageCount != 1 {
+		t.Fatal("successful SDK response was not restored", err)
+	}
 }
+
+type offlineTestBody struct {
+	io.Reader
+	closed bool
+}
+
+func (b *offlineTestBody) Close() error { b.closed = true; return nil }
 
 func TestSubmitOfflineUsesReturnedIdentityWithoutRecovery(t *testing.T) {
 	sdk := &offlineRecoverySDK{bulkSDK: &bulkSDK{}, addHashes: []string{testOfflineHash}}
