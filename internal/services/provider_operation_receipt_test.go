@@ -10,6 +10,7 @@ import (
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/database"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud/pan115"
 	"testing"
 )
 
@@ -133,7 +134,7 @@ func TestProviderOperationStoreInitialCacheBindsOnlyConfirmedAccount(t *testing.
 
 func TestConnectionFactoryInjectsNeutral115OperationStore(t *testing.T) {
 	driver := &fakeCloudDriver{account: cloud.Account{ID: "100"}}
-	_, _, service, actor := newConnectionTestService(t, driver)
+	db, _, service, actor := newConnectionTestService(t, driver)
 	created, err := service.Create(actor, ConnectionInput{Name: "scope", Provider: cloud.ProviderPan115, Cookie: testPan115Cookie, Enabled: true}, RequestContext{})
 	if err != nil {
 		t.Fatal(err)
@@ -153,6 +154,49 @@ func TestConnectionFactoryInjectsNeutral115OperationStore(t *testing.T) {
 	}
 	if _, ok := captured.Operations.(*providerOperationStore); !ok {
 		t.Fatal("neutral115 store not injected")
+	}
+	// A downloader's healthy Probe does not persist Connection.Test's confirmed
+	// account. Its first resource guard must still use the credential namespace.
+	if _, err := driver.Probe(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var connection models.Connection
+	if err := db.First(&connection, created.ID).Error; err != nil || connection.AccountID != "" {
+		t.Fatal("probe manufactured a confirmed account", err)
+	}
+	resources := captured.Operations.(cloud.ResourceOperationStore)
+	guard := pan115.NewOfflineAccessCoordinator(resources, "100", nil)
+	access := cloud.OfflineAccess{OperationID: "node:factory-original", URI: "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567", Remote: true}
+	if err := guard.BeginOfflineAccess(context.Background(), access); err != nil {
+		code, retryable := cloud.ErrorInfo(err)
+		t.Fatalf("healthy unconfirmed connection could not enter first guard: code=%s retryable=%v err=%v", code, retryable, err)
+	}
+	var rows []models.ProviderOperationReceipt
+	if err := db.Where("connection_id = ?", created.ID).Find(&rows).Error; err != nil || len(rows) != 1 {
+		t.Fatal("first resource owner not persisted", err)
+	}
+	owner, err := resources.ResourceClaim(context.Background(), rows[0].ResourceKey)
+	if err != nil || owner.AccountID != "100" || owner.State != "submitting" || owner.Kind != cloud.OfflineResourceGuardKind || bytes.Contains(rows[0].CheckpointCiphertext, []byte("factory-original")) {
+		t.Fatal("credential-scoped encrypted owner cannot be recovered", err)
+	}
+	if err := db.First(&connection, created.ID).Error; err != nil || connection.AccountID != "" || connection.LastHealthStatus != "unknown" {
+		t.Fatal("resource namespace promoted account or health confirmation", err)
+	}
+	// A confirmed account mismatch remains a conflict. Neither factory admission
+	// nor retry can silently rebind or replace the original resource receipt.
+	if err := db.Model(&connection).Update("account_id", "200").Error; err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := service.Driver(actor, created.ID); err == nil {
+		t.Fatal("confirmed account conflict reused a cached driver")
+	}
+	service.invalidate(created.ID)
+	if _, _, err := service.Driver(actor, created.ID); err == nil {
+		t.Fatal("confirmed account conflict admitted another driver")
+	}
+	var retained models.ProviderOperationReceipt
+	if err := db.First(&retained, "id = ?", rows[0].ID).Error; err != nil || retained.Revision != rows[0].Revision || !bytes.Equal(retained.CheckpointCiphertext, rows[0].CheckpointCiphertext) {
+		t.Fatal("factory conflict changed the original owner", err)
 	}
 }
 

@@ -710,13 +710,30 @@ func (s *ConnectionService) cachedDriver(id uint) (models.Connection, cloudpkg.D
 	if !isNativeCloudProvider(record.Provider) {
 		return record, nil, appError(CodeConnectionProviderUnsupported, "该连接不是存储驱动", nil)
 	}
+	var cookie, resourceAccount string
+	var err error
+	if record.Provider == cloudpkg.ProviderPan115 {
+		cookie, err = s.credentials.Decrypt(connectionPurpose(id, record.Provider), record.CredentialCiphertext)
+		if err != nil {
+			return record, nil, err
+		}
+		resourceAccount, err = pan115.CredentialResourceAccount(cookie)
+		if err != nil {
+			return record, nil, connectionProviderError(cloudpkg.Error(cloudpkg.CodeCookieInvalid, false, err))
+		}
+		if record.AccountID != "" && record.AccountID != resourceAccount {
+			return record, nil, appError(CodeConnectionUnavailable, "115 已确认账号与当前凭据不一致", nil)
+		}
+	}
 	cached := s.drivers[id]
 	if cached != nil && (s.driverRevisions[id] == record.Revision || s.driverRevisions[id] == 0) {
 		return record, cached, nil
 	}
-	cookie, err := s.credentials.Decrypt(connectionPurpose(id, record.Provider), record.CredentialCiphertext)
-	if err != nil {
-		return record, nil, err
+	if record.Provider != cloudpkg.ProviderPan115 {
+		cookie, err = s.credentials.Decrypt(connectionPurpose(id, record.Provider), record.CredentialCiphertext)
+		if err != nil {
+			return record, nil, err
+		}
 	}
 	recyclePassword := ""
 	if record.RecycleCredentialCiphertext != "" {
@@ -730,7 +747,9 @@ func (s *ConnectionService) cachedDriver(id uint) (models.Connection, cloudpkg.D
 		OnCallResult: func(err error) { s.recordConnectionCredentialFailure(record.ID, record.Revision, err) },
 	}
 	if record.Provider == cloudpkg.ProviderPan115 {
-		config.Operations = NewProviderOperationStore(s.db, s.credentials, id, record.Provider, record.AccountID)
+		// This is the credential-bound resource mutex namespace, not a successful
+		// login/probe fact. Downloader.Test does not populate Connection.AccountID.
+		config.Operations = NewProviderOperationStore(s.db, s.credentials, id, record.Provider, resourceAccount)
 	}
 	if record.Provider == cloudpkg.ProviderQuark {
 		config.Cookie = ""
