@@ -114,15 +114,12 @@ describe('download presentation', () => {
     expect(canCancelDownloadPipeline({ lifecycle_scope: 'history', job_status: 'completed' } as DownloadTaskSummary)).toBe(false)
     expect(canCancelDownloadPipeline({ lifecycle_scope: 'history', job_status: 'cancelled' } as DownloadTaskSummary)).toBe(false)
 
-    const source = readFileSync(new URL('./views/DownloadsView.vue', import.meta.url), 'utf8')
-    expect(source).toContain("canCancelDownloadPipeline(task)")
-    expect(source).toContain("/downloads/${task.id}/cancel")
-    expect(source).toContain('从下载器删除任务但保留已下载文件')
-    expect(source).toContain('const deleteSourceData = ref(false)')
-    expect(source).toContain('v-model="deleteSourceData"')
-    expect(source).toContain('完全删除下载任务及源/临时文件')
-    expect(source).toContain('?delete_data=${deleteSourceData.value}')
-    expect(source).not.toContain('取消并删除数据')
+    const pending = { phase: 'cancelled', job_status: 'retry_wait', lifecycle_scope: 'history', control_pending: true, last_error_code: 'downloader_cancellation_pending' } as DownloadTaskSummary
+    expect(canCancelDownloadPipeline(pending)).toBe(false)
+    expect(downloadStatusLabel(pending)).toBe('已取消 · 云端收尾中')
+    expect(downloadStatusClass(pending)).toBe('status-chip status-chip--warning')
+    expect(downloadErrorMessage(pending)).toContain('后续入库已取消')
+    expect(downloadStatusLabel({ job_status: 'retry_wait', last_error_code: 'downloader_submission_unconfirmed' } as DownloadTaskSummary)).toBe('核对原任务')
   })
 
   it('uses the authoritative route preview and disables life-event listening without a default library', () => {

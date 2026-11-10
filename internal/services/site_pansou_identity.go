@@ -178,7 +178,7 @@ func (s *SiteService) searchPanSouIdentitySite(ctx context.Context, actor Actor,
 		return failure
 	}
 	all.SnapshotID = hex.EncodeToString(token[:])
-	expires := s.now().Add(10 * time.Minute)
+	expires := s.now().Add(ptResultTTL)
 	all.SnapshotExpiresAt = &expires
 	s.vaultMu.Lock()
 	if s.identitySnapshots == nil {

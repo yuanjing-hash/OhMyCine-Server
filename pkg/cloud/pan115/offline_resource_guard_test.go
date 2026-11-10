@@ -108,6 +108,9 @@ func TestOrdinaryOfflineUnknownNeverReplaysOrReleasesOnAbsence(t *testing.T) {
 					t.Fatal("unknown add accepted")
 				}
 				_, _ = c.SubmitOffline(ctx, uri, "ordinary")
+				if _, err := c.ReconcileOfflineSubmission(ctx, uri, "ordinary"); err == nil || s.adds != 1 {
+					t.Fatal("read-only resolution re-dispatched unknown add", err)
+				}
 			} else {
 				if _, err := c.SubmitOffline(ctx, uri, "ordinary"); err != nil {
 					t.Fatal(err)
@@ -145,7 +148,7 @@ func TestOrdinaryOfflineKnownDuplicateAndPositiveOwnDirectoryRecovery(t *testing
 			if _, err := c.SubmitOffline(ctx, uri, "ordinary"); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := c.SubmitOffline(ctx, uri, "ordinary"); err != nil || s.adds != 1 {
+			if _, err := c.ReconcileOfflineSubmission(ctx, uri, ""); err != nil || s.adds != 1 {
 				t.Fatal("ordinary recovery replayed", err)
 			}
 		})

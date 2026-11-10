@@ -221,6 +221,41 @@ func (c *Client) reconcileOrdinarySubmit(ctx context.Context, g *ordinaryOffline
 	}
 	return task, nil
 }
+
+// ReconcileOfflineSubmission never prepares a missing receipt or sends Add.
+// Its physical resource lock joins any older in-flight owner before reading.
+func (c *Client) ReconcileOfflineSubmission(ctx context.Context, uri, directory string) (cloud.OfflineTask, error) {
+	hash, err := ordinaryURIHash(uri)
+	if err != nil || hash == "" || c.ordinaryStore() == nil || cloud.OfflineOperationScope(ctx) == "" {
+		return cloud.OfflineTask{}, selectedUnknown()
+	}
+	return c.ordinaryOperation(ctx, hash, func() (cloud.OfflineTask, error) {
+		scope := cloud.OfflineOperationScope(ctx)
+		id := "omc-offline-" + selectedDigest([]string{scope, "submit"})
+		store := c.ordinaryStore()
+		r, err := store.Load(ctx, id)
+		if err != nil {
+			return cloud.OfflineTask{}, selectedUnknown()
+		}
+		var saved ordinaryOfflineCheckpoint
+		if r.Provider != cloud.ProviderPan115 || r.AccountID != c.selective.account || r.Route != "cookie" || r.Kind != cloud.OfflineResourceGuardKind || json.Unmarshal(r.Payload, &saved) != nil || saved.Input.Version != 1 || saved.Input.Scope != scope || saved.Input.Action != "submit" || saved.Input.Hash != hash || saved.Input.URIDigest != selectedDigest(uri) || !selectedScalar(saved.Input.DirectoryID) || directory != "" && saved.Input.DirectoryID != directory {
+			return cloud.OfflineTask{}, selectedError(cloud.CodeResponseInvalid)
+		}
+		g := &ordinaryOfflineGuard{Store: store, Receipt: r, Checkpoint: saved, Resource: offlineResourceKey(hash)}
+		// A previously entered cancellation can own this same resource while
+		// its original ACK is being reconciled. Do not mistake it for a new
+		// submission or adopt an unrelated successor's native task.
+		if saved.Ack && saved.Task != nil && saved.Task.ID == hash {
+			current, claimErr := store.ResourceClaim(ctx, g.Resource)
+			var cancellation ordinaryOfflineCheckpoint
+			if claimErr == nil && current.Provider == cloud.ProviderPan115 && current.AccountID == c.selective.account && current.Route == "cookie" && current.Kind == cloud.OfflineResourceGuardKind && json.Unmarshal(current.Payload, &cancellation) == nil && cancellation.Input.Version == 1 && cancellation.Input.Scope == scope && cancellation.Input.Action == "cancel" && cancellation.Input.Hash == hash && !cancellation.Input.DeleteFiles {
+				return *saved.Task, nil
+			}
+		}
+		return c.reconcileOrdinarySubmit(ctx, g)
+	})
+}
+
 func (c *Client) submitOrdinaryOffline(ctx context.Context, uri, directory, hash string) (cloud.OfflineTask, error) {
 	return c.ordinaryOperation(ctx, hash, func() (cloud.OfflineTask, error) {
 		return c.submitOrdinaryOfflineOwned(ctx, uri, directory, hash)

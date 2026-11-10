@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"net/http"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/middleware"
@@ -16,6 +17,9 @@ func (a *API) PreviewResourceContent(c *gin.Context) {
 		writeError(c, a.log, invalid("内容检查参数无效", err))
 		return
 	}
+	// Raw metadata owns at most 60 seconds. Keep this response open for its
+	// bounded recognition and final authorization checks as well.
+	_ = http.NewResponseController(c.Writer).SetWriteDeadline(time.Now().Add(100 * time.Second))
 	value, err := a.sites.PreviewContent(c.Request.Context(), actor, input)
 	if err != nil {
 		writeError(c, a.log, err)

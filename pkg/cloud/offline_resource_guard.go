@@ -45,3 +45,9 @@ type OfflineAccessGuard interface {
 type OfflineFactReader interface {
 	OfflineFacts(context.Context, string) (OfflineTask, error)
 }
+
+// OfflineSubmissionReconciler resolves a previously entered ordinary operation
+// through its original scope and receipt, without dispatching a cloud mutation.
+type OfflineSubmissionReconciler interface {
+	ReconcileOfflineSubmission(context.Context, string, string) (OfflineTask, error)
+}

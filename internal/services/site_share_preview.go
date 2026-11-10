@@ -157,7 +157,7 @@ func (s *SiteService) previewShare(ctx context.Context, actor Actor, resultToken
 	if err != nil || current != digest {
 		return summary, sharePreviewExpired()
 	}
-	expiry := s.now().Add(5 * time.Minute)
+	expiry := s.now().Add(ptResultTTL)
 	if claim.ExpiresAt.Before(expiry) {
 		expiry = claim.ExpiresAt
 	}

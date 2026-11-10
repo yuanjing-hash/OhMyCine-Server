@@ -63,7 +63,18 @@ func (s *QueueService) SetRetryAccepted(fn func(*gorm.DB, models.Job, time.Time)
 }
 func (s *QueueService) SetEventHub(hub *QueueEventHub) { s.events = hub }
 func (s *QueueService) publish(job models.Job, eventType string) {
-	if s.events != nil {
+	if s.events == nil {
+		return
+	}
+	if eventType != "job.deleted" && job.JobType == "download" {
+		// Promotion/worker completion can hold a snapshot taken before Remove.
+		// Re-read the visibility tombstone so a delayed event cannot revive it.
+		var current models.Job
+		if err := s.db.Select("id", "history_cleared_at").First(&current, "id = ?", job.ID).Error; err != nil || current.HistoryClearedAt != nil {
+			return
+		}
+	}
+	if job.HistoryClearedAt == nil || eventType == "job.deleted" {
 		s.events.Publish(JobEvent{Type: eventType, JobID: job.ID, JobType: job.JobType, OwnerID: job.OwnerID, Status: job.Status, At: s.clock.Now()})
 	}
 }
@@ -533,7 +544,7 @@ func (s *QueueService) Reorder(actor Actor, jobType string, priority int, ordere
 	var jobs []models.Job
 	err := s.db.Transaction(func(tx *gorm.DB) error {
 		var laneCount int64
-		if err := tx.Model(&models.Job{}).Where("job_type = ? AND priority = ? AND status = ?", jobType, priority, models.JobStatusQueued).Count(&laneCount).Error; err != nil {
+		if err := tx.Model(&models.Job{}).Where("job_type = ? AND priority = ? AND status = ? AND history_cleared_at IS NULL", jobType, priority, models.JobStatusQueued).Count(&laneCount).Error; err != nil {
 			return err
 		}
 		if laneCount != int64(len(ordered)) {
@@ -581,7 +592,7 @@ func (s *QueueService) Lane(actor Actor, jobType string, priority int) ([]JobDTO
 	if !actor.Can(authz.PermissionJobsReadAll) && !actor.Can(authz.PermissionJobsReadOwn) {
 		return nil, appError(CodePermissionDenied, "没有查看任务的权限", nil)
 	}
-	q := s.db.Where("job_type = ? AND priority = ? AND status = ?", jobType, priority, models.JobStatusQueued)
+	q := s.db.Where("job_type = ? AND priority = ? AND status = ? AND history_cleared_at IS NULL", jobType, priority, models.JobStatusQueued)
 	if !actor.Can(authz.PermissionJobsReadAll) {
 		q = q.Where("owner_id = ?", actor.User.ID)
 	}
@@ -607,15 +618,32 @@ func (s *QueueService) Control(actor Actor, id, action string, request RequestCo
 	var job models.Job
 	interruptAfterCommit := false
 	err := s.db.Transaction(func(tx *gorm.DB) error {
-		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&job, "id = ?", id).Error; err != nil {
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&job, "id = ? AND history_cleared_at IS NULL", id).Error; err != nil {
 			return queueNotFound(err)
 		}
 		if !s.canControl(actor, job.OwnerID) {
 			return appError(CodePermissionDenied, "没有控制任务的权限", nil)
 		}
+		if _, pending, err := pendingDownloadControlTask(tx, job); err != nil {
+			return err
+		} else if pending && action != "cancel" {
+			return appError(CodeQueueStateConflict, "原云端操作正在取消收尾，可移除记录并保留文件", nil)
+		}
 		from := job.Status
 		if job.InterruptStatus != "" {
 			return appError(CodeQueueStateConflict, "任务控制正在与下载器确认，请稍候", nil)
+		}
+		if action == "cancel" && job.JobType == "download" {
+			var task models.DownloadTask
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&task, "job_id = ?", job.ID).Error; err != nil {
+				return err
+			}
+			if downloadSubmissionUnconfirmed(task) || task.LastErrorCode == downloadCancellationPending {
+				if err := savePendingDownloadControlTx(tx, &task, &job, false, actor.User.ID, now); err != nil {
+					return err
+				}
+				return s.audit.Record(tx, &actor.User.ID, "jobs.cancel", "job", job.ID, "success", map[string]any{"control_pending": true}, request)
+			}
 		}
 		updates := map[string]any{"revision": job.Revision + 1, "updated_at": now}
 		providerControl := (job.JobType == "download" || job.JobType == "seeding") && job.Provider != "" && job.Provider != models.DownloaderTypeFake
@@ -1276,6 +1304,17 @@ func (s *QueueService) finishLease(id, token, status, code, message string, next
 		if job.InterruptStatus != "" {
 			return s.acknowledgeInterruptTx(tx, job, now)
 		}
+		pendingControl, cancelled, controlErr := downloadControlCompletion(tx, job)
+		if controlErr != nil {
+			return controlErr
+		}
+		if pendingControl {
+			status, code, message = models.JobStatusRetryWait, downloadCancellationPending, downloadCancellationMessage
+			retry := now.Add(time.Minute)
+			next = &retry
+		} else if cancelled {
+			status, code, message, next = models.JobStatusCancelled, "", "", nil
+		}
 		finalStatus := status
 		finished := any(now)
 		if status == models.JobStatusRetryWait {
@@ -1334,7 +1373,7 @@ func (s *QueueService) finishLease(id, token, status, code, message string, next
 // the ordinary bounded failure budget. Empty-code retry_at is scheduled work.
 func retryWaitConsumesFailureBudget(code string) bool {
 	switch strings.TrimSpace(code) {
-	case "", "pan115_auth_expired", "pan115_cookie_invalid", "credentials_required", "media_library_not_ready", "download_tracking_persist_wait", quarkReorganizationPending, quarkStructurePending, CodeMediaUpgradePending, CodeMediaUpgradeSeedingBusy, "media_upgrade_artifacts_pending":
+	case "", downloadCancellationPending, "downloader_submission_unconfirmed", "downloader_submit_unknown", "downloader_selection_result_unknown", "downloader_share_result_unknown", "pan115_auth_expired", "pan115_cookie_invalid", "credentials_required", "media_library_not_ready", "download_tracking_persist_wait", quarkReorganizationPending, quarkStructurePending, CodeMediaUpgradePending, CodeMediaUpgradeSeedingBusy, "media_upgrade_artifacts_pending":
 		return false
 	default:
 		return true
@@ -1342,6 +1381,17 @@ func retryWaitConsumesFailureBudget(code string) bool {
 }
 
 func (s *QueueService) acknowledgeInterruptTx(tx *gorm.DB, job models.Job, now time.Time) error {
+	if _, pending, err := pendingDownloadControlTask(tx, job); err != nil {
+		return err
+	} else if pending {
+		updates := map[string]any{"status": models.JobStatusRetryWait, "interrupt_status": "", "cancellation_asked": false, "revision": job.Revision + 1, "next_attempt_at": now.Add(time.Minute), "finished_at": nil, "last_error_code": downloadCancellationPending, "last_error_message": downloadCancellationMessage, "updated_at": now}
+		releaseLease(updates)
+		if err := tx.Model(&job).Updates(updates).Error; err != nil {
+			return err
+		}
+		return closeAttempt(tx, job, models.JobStatusRetryWait, downloadCancellationPending, downloadCancellationMessage, now)
+	}
+
 	updates := map[string]any{"status": job.InterruptStatus, "interrupt_status": "", "cancellation_asked": false, "revision": job.Revision + 1, "checkpoint_json": clearProviderControlOrigin(job.CheckpointJSON), "last_error_code": "", "last_error_message": "", "updated_at": now}
 	if job.InterruptStatus == models.JobStatusCancelled {
 		updates["finished_at"] = now
@@ -1408,7 +1458,13 @@ func (s *QueueService) RecoverExpiredLeases() error {
 			code := codeQueueWorkerLeaseExpired
 			message := "Worker connection was lost; the job will resume from its checkpoint."
 			pendingInterrupt := job.InterruptStatus == models.JobStatusPaused || job.InterruptStatus == models.JobStatusCancelled
-			if pendingInterrupt {
+			_, controlPending, controlErr := pendingDownloadControlTask(tx, job)
+			if controlErr != nil {
+				return controlErr
+			}
+			if controlPending {
+				status, next, code, message = models.JobStatusQueued, nil, downloadCancellationPending, downloadCancellationMessage
+			} else if pendingInterrupt {
 				status = models.JobStatusQueued
 				next = nil
 				code = "worker_interrupt_recovered"
@@ -1442,6 +1498,23 @@ func (s *QueueService) RecoverExpiredLeases() error {
 				return err
 			}
 			job.Status = status
+			recovered = append(recovered, job)
+		}
+
+		var unresolved []models.Job
+		if err := tx.Model(&models.Job{}).Select("jobs.*").Joins("JOIN download_tasks t ON t.job_id=jobs.id AND t.owner_id=jobs.owner_id").Where("jobs.job_type = 'download' AND jobs.status = ? AND t.phase = ? AND t.provider_task_id = '' AND jobs.last_error_code IN ?", models.JobStatusFailed, models.DownloadTaskStatusSubmitting, []string{"downloader_submission_unconfirmed", "downloader_submit_unknown", "downloader_selection_result_unknown", "downloader_share_result_unknown"}).Limit(200).Find(&unresolved).Error; err != nil {
+			return err
+		}
+		for _, job := range unresolved {
+			updates := map[string]any{"status": models.JobStatusRetryWait, "next_attempt_at": now.Add(time.Minute), "finished_at": nil, "revision": job.Revision + 1, "updated_at": now}
+			releaseLease(updates)
+			if err := tx.Model(&job).Updates(updates).Error; err != nil {
+				return err
+			}
+			if err := recordJobEvent(tx, job.ID, "download.original_reconciliation_recovered", models.JobStatusFailed, models.JobStatusRetryWait, nil, job.LastErrorCode, now); err != nil {
+				return err
+			}
+			job.Status = models.JobStatusRetryWait
 			recovered = append(recovered, job)
 		}
 

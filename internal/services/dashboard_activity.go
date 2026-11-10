@@ -54,7 +54,7 @@ func (s *AdminService) DashboardActivity(ctx context.Context, actor Actor) (Dash
 	result.Waiting = tasks([]string{models.JobStatusQueued, models.JobStatusRetryWait, models.JobStatusPaused})
 	result.Attention = tasks([]string{models.JobStatusFailed, models.JobStatusWaitingUserAction})
 	result.Recent = loadPlayerOverviewSection(func() ([]BrowserMediaItem, bool, error) {
-		libraries := &MediaLibraryService{db: s.db.WithContext(ctx), catalogStore: s.catalogStore}
+		libraries := &MediaLibraryService{db: s.db.WithContext(ctx), catalogStore: s.catalogStore, metadata: s.metadata}
 		visible, err := libraries.PlayerLibraries(actor)
 		if err != nil {
 			return nil, false, err

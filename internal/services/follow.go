@@ -15,6 +15,7 @@ import (
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/medialibrary"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
 	downloadpkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/downloader"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/metadata/tmdb"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/site/builtin"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -105,6 +106,7 @@ type UpdateFollowInput struct {
 }
 
 type FollowSummary struct {
+	CaughtUp         bool                    `json:"caught_up"`
 	Wait             *FollowWait             `json:"wait,omitempty"`
 	ID               string                  `json:"id"`
 	OwnerID          uint                    `json:"owner_id"`
@@ -437,7 +439,35 @@ func (s *FollowService) List(actor Actor, page, pageSize int, status string) (Fo
 	if !actor.Can(authz.PermissionFollowsReadAll) {
 		query = query.Where("owner_id = ?", actor.User.ID)
 	}
-	if status != "" {
+	// Older completed rows still have a next check: they meant only caught up.
+	// Resolve their terminal state from current local facts before pagination.
+	finished := []string{}
+	finishedIDs := make(map[string]bool)
+	if status == "current" || status == models.FollowStatusCompleted {
+		var legacy []models.FollowSubscription
+		if err := query.Session(&gorm.Session{}).Where("status = ? AND next_run_at IS NOT NULL", models.FollowStatusCompleted).Order("id").Limit(1000).Find(&legacy).Error; err != nil {
+			return FollowPage{}, err
+		}
+		for id, metadata := range s.catalogMetadata(actor, legacy) {
+			if metadata.finished {
+				finished = append(finished, id)
+				finishedIDs[id] = true
+			}
+		}
+	}
+	if status == "current" {
+		query = query.Where("status <> ? OR next_run_at IS NOT NULL", models.FollowStatusCompleted)
+		if len(finished) > 0 {
+			query = query.Where("id NOT IN ?", finished)
+		}
+	} else if status == models.FollowStatusCompleted {
+		query = query.Where("status = ?", models.FollowStatusCompleted)
+		if len(finished) > 0 {
+			query = query.Where("next_run_at IS NULL OR id IN ?", finished)
+		} else {
+			query = query.Where("next_run_at IS NULL")
+		}
+	} else if status != "" {
 		query = query.Where("status = ?", status)
 	}
 	var total int64
@@ -456,6 +486,15 @@ func (s *FollowService) List(actor Actor, page, pageSize int, status string) (Fo
 		}
 		list = append(list, item)
 	}
+	metadata := s.catalogMetadata(actor, rows)
+	if status == "current" || status == models.FollowStatusCompleted {
+		for _, row := range rows {
+			observed := metadata[row.ID]
+			observed.finished = finishedIDs[row.ID]
+			metadata[row.ID] = observed
+		}
+	}
+	projectFollowCatalogMetadata(rows, list, metadata)
 	if err := s.projectOwnerNames(list); err != nil {
 		return FollowPage{}, err
 	}
@@ -475,6 +514,7 @@ func (s *FollowService) Get(actor Actor, id string) (FollowSummary, error) {
 		return item, err
 	}
 	items := []FollowSummary{item}
+	projectFollowCatalogMetadata([]models.FollowSubscription{record}, items, s.catalogMetadata(actor, []models.FollowSubscription{record}))
 	if err = s.projectOwnerNames(items); err != nil {
 		return FollowSummary{}, err
 	}
@@ -654,6 +694,9 @@ func (s *FollowService) Enqueue(ctx context.Context, actor Actor, id, trigger st
 	}
 	if record.Status == models.FollowStatusPaused {
 		return "", appError(CodeConflict, "已暂停的订阅不能立即搜索", nil)
+	}
+	if trigger != "manual" && record.Status == models.FollowStatusCompleted && record.NextRunAt == nil {
+		return "", nil
 	}
 	var snapshot FollowExecutionSnapshot
 	if err := json.Unmarshal([]byte(record.ExecutionSnapshotJSON), &snapshot); err != nil {
@@ -1056,13 +1099,151 @@ func (s *FollowService) projectOwnerNames(items []FollowSummary) error {
 	return nil
 }
 
+type followCatalogMetadata struct {
+	poster   string
+	finished bool
+}
+
+func followPosterRef(current, observed string) string {
+	if current != "" {
+		return current
+	}
+	if len(observed) <= 1024 && strings.HasPrefix(observed, "/api/v1/discovery/images/") {
+		return observed
+	}
+	return ""
+}
+
+// Fill old missing artwork from the same authorized effective Catalog used by
+// browsing. Reads stay local and bounded; a failure keeps the subscription
+// visible for its existing scheduled reconciliation.
+func (s *FollowService) catalogMetadata(actor Actor, records []models.FollowSubscription) map[string]followCatalogMetadata {
+	result := make(map[string]followCatalogMetadata)
+	if s.coverage == nil || len(records) == 0 {
+		return result
+	}
+	libraries, identities := []uint{}, []int64{}
+	snapshots := make(map[string]FollowExecutionSnapshot, len(records))
+	for _, record := range records {
+		var snapshot FollowExecutionSnapshot
+		if json.Unmarshal([]byte(record.ExecutionSnapshotJSON), &snapshot) != nil || snapshot.MediaLibraryID == 0 || !taskLibraryVisible(actor, snapshot.MediaLibraryID) {
+			continue
+		}
+		snapshots[record.ID] = snapshot
+		libraries = append(libraries, snapshot.MediaLibraryID)
+		identities = append(identities, record.TMDBID)
+	}
+	if len(libraries) == 0 {
+		return result
+	}
+	facade := &MediaLibraryService{db: s.db, catalogStore: s.coverage.catalogStore, metadata: s.coverage.metadata}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_ = facade.withCatalogReadTx(ctx, func(tx *gorm.DB) error {
+		var enabled []uint
+		if err := tx.Model(&models.MediaLibrary{}).Select("media_libraries.id").
+			Joins("JOIN storages ON storages.id = media_libraries.storage_id").
+			Where("media_libraries.id IN ? AND media_libraries.enabled = ? AND storages.enabled = ?", libraries, true, true).
+			Pluck("media_libraries.id", &enabled).Error; err != nil {
+			return err
+		}
+		libraries = enabled
+		if len(libraries) == 0 {
+			return nil
+		}
+		reader, err := PinCatalogTx(tx, libraries)
+		if err != nil {
+			return err
+		}
+		var details []struct {
+			LibraryID    uint
+			TMDBID       int64
+			MetadataJSON string
+		}
+		ranked := reader.Recognitions().Select("media_library_recognitions.library_id, media_library_recognitions.tmdb_id, media_library_recognitions.metadata_json, ROW_NUMBER() OVER (PARTITION BY media_library_recognitions.library_id, media_library_recognitions.tmdb_id ORDER BY media_library_recognitions.updated_at DESC, media_library_recognitions.id DESC) AS metadata_rank").
+			Where("media_library_recognitions.media_type = ? AND media_library_recognitions.library_id IN ? AND media_library_recognitions.tmdb_id IN ?", "tv", libraries, identities).
+			Where("EXISTS (?)", reader.VisibleEntries().Select("1").Where("media_library_entries.library_id = media_library_recognitions.library_id AND media_library_entries.recognition_id = media_library_recognitions.id AND media_library_entries.match_status = ?", mediaRecognitionStatusMatched))
+		if err := tx.Table("(?) AS ranked_metadata", ranked).Where("metadata_rank = 1").Limit(1000).Scan(&details).Error; err != nil {
+			return err
+		}
+		var coordinates []struct {
+			LibraryID  uint
+			TMDBID     int64
+			Season     int
+			Present    int
+			MinEpisode int
+			MaxEpisode int
+		}
+		if err := reader.VisibleEntries().Select("library_id, tmdb_id, season, COUNT(DISTINCT episode) AS present, MIN(episode) AS min_episode, MAX(episode) AS max_episode").
+			Where("media_type = ? AND library_id IN ? AND tmdb_id IN ? AND season IS NOT NULL AND episode > 0 AND match_status = ?", "tv", libraries, identities, mediaRecognitionStatusMatched).
+			Group("library_id,tmdb_id,season").Limit(20001).Scan(&coordinates).Error; err != nil {
+			return err
+		}
+		counts := make(map[[3]int64][3]int, len(coordinates))
+		if len(coordinates) <= 20000 {
+			for _, row := range coordinates {
+				counts[[3]int64{int64(row.LibraryID), row.TMDBID, int64(row.Season)}] = [3]int{row.Present, row.MinEpisode, row.MaxEpisode}
+			}
+		}
+		byWork := make(map[[2]int64]tmdb.Snapshot, len(details))
+		for _, row := range details {
+			_, snapshot, err := decodeRecognitionMetadata(row.MetadataJSON)
+			if err == nil && snapshot.MediaType == "tv" && snapshot.TMDBID == row.TMDBID {
+				byWork[[2]int64{int64(row.LibraryID), row.TMDBID}] = snapshot
+			}
+		}
+		imageClient := facade.catalogImageClientTx(tx)
+		for _, record := range records {
+			selected, allowed := snapshots[record.ID]
+			if !allowed {
+				continue
+			}
+			snapshot, found := byWork[[2]int64{int64(selected.MediaLibraryID), record.TMDBID}]
+			if !found {
+				continue
+			}
+			metadata := followCatalogMetadata{poster: catalogImageURLWithClient(imageClient, snapshot.PosterPath, "w500")}
+			metadata.finished = len(selected.Seasons) > 0 && (strings.EqualFold(snapshot.Status, "Ended") || strings.EqualFold(snapshot.Status, "Canceled"))
+			for _, number := range selected.Seasons {
+				declared := 0
+				for _, season := range snapshot.Seasons {
+					if season.SeasonNumber == number {
+						declared = season.EpisodeCount
+						break
+					}
+				}
+				observed := counts[[3]int64{int64(selected.MediaLibraryID), record.TMDBID, int64(number)}]
+				metadata.finished = metadata.finished && declared > 0 && observed == [3]int{declared, 1, declared}
+			}
+			result[record.ID] = metadata
+		}
+		return nil
+	})
+	return result
+}
+
+func projectFollowCatalogMetadata(records []models.FollowSubscription, items []FollowSummary, metadata map[string]followCatalogMetadata) {
+	for index, record := range records {
+		if record.Status == models.FollowStatusCompleted && record.NextRunAt != nil {
+			items[index].Status = models.FollowStatusActive
+			if metadata[record.ID].finished {
+				items[index].Status = models.FollowStatusCompleted
+				items[index].NextRunAt = nil
+			}
+		}
+		if items[index].Snapshot.MediaLibraryID != 0 {
+			items[index].PosterRef = followPosterRef(items[index].PosterRef, metadata[record.ID].poster)
+		}
+	}
+}
+
 func followSummary(record models.FollowSubscription) (FollowSummary, error) {
 	var snapshot FollowExecutionSnapshot
 	if err := json.Unmarshal([]byte(record.ExecutionSnapshotJSON), &snapshot); err != nil {
 		return FollowSummary{}, err
 	}
 	snapshot = normalizeFollowExecutionSnapshot(snapshot)
-	return FollowSummary{ID: record.ID, OwnerID: record.OwnerID, MediaType: record.MediaType, TMDBID: record.TMDBID, Title: record.Title, Year: record.Year, PosterRef: record.PosterRef, Status: record.Status, Revision: record.Revision, Snapshot: snapshot, ProgressTarget: record.ProgressTarget, ProgressPresent: record.ProgressPresent, ProgressMissing: record.ProgressMissing, LastRunID: record.LastRunID, LastRunAt: record.LastRunAt, NextRunAt: record.NextRunAt, LastErrorCode: record.LastErrorCode, LastErrorMessage: record.LastErrorMessage, CreatedAt: record.CreatedAt, UpdatedAt: record.UpdatedAt}, nil
+	return FollowSummary{CaughtUp: record.ProgressTarget > 0 && record.ProgressPresent >= record.ProgressTarget && record.ProgressMissing == 0, ID: record.ID, OwnerID: record.OwnerID, MediaType: record.MediaType, TMDBID: record.TMDBID, Title: record.Title, Year: record.Year, PosterRef: record.PosterRef, Status: record.Status, Revision: record.Revision, Snapshot: snapshot, ProgressTarget: record.ProgressTarget, ProgressPresent: record.ProgressPresent, ProgressMissing: record.ProgressMissing, LastRunID: record.LastRunID, LastRunAt: record.LastRunAt, NextRunAt: record.NextRunAt, LastErrorCode: record.LastErrorCode, LastErrorMessage: record.LastErrorMessage, CreatedAt: record.CreatedAt, UpdatedAt: record.UpdatedAt}, nil
 }
 
 func normalizeFollowExecutionSnapshot(input FollowExecutionSnapshot) FollowExecutionSnapshot {

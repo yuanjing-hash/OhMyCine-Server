@@ -2,10 +2,12 @@ package services
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/authz"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/metadata/tmdb"
 )
 
 func TestDashboardActivityNamesOnlyCurrentWorkAndSeparatesAttention(t *testing.T) {
@@ -74,9 +76,17 @@ func TestDashboardRecentUsesEffectiveCatalogAndPreservesPartitionFailures(t *tes
 	actor.Permissions[authz.PermissionStoragesRead] = struct{}{}
 	admin := NewAdminService(store.writeDB, nil, nil, nil)
 	admin.SetCatalogSnapshotStore(store)
+	metadata := NewMetadataSettingsService(store.writeDB, NewAuditService(store.writeDB), nil, tmdb.Credential{Kind: tmdb.CredentialKindReadAccessToken, Value: "test-token"})
+	if _, err := metadata.record(); err != nil {
+		t.Fatal(err)
+	}
+	admin.SetMetadataSettingsService(metadata)
 	view, err := admin.DashboardActivity(context.Background(), actor)
 	if err != nil || view.Recent.Status != "ok" || len(view.Recent.List) != 1 || view.Recent.List[0].LibraryID != library.ID {
 		t.Fatalf("recent=%+v %v", view.Recent, err)
+	}
+	if !strings.HasPrefix(view.Recent.List[0].PosterURL, "/api/v1/discovery/images/tmdb/") {
+		t.Fatalf("dashboard lost catalog artwork: %+v", view.Recent.List[0])
 	}
 	actor.ResourceRules = []AuthorizationRule{{PermissionCode: authz.PermissionMediaLibrariesRead, Effect: models.AuthorizationEffectDeny, ResourceType: models.AuthorizationResourceMediaLibrary, ResourceID: uintID(library.ID)}}
 	view, err = admin.DashboardActivity(context.Background(), actor)

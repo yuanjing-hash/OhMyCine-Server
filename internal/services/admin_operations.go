@@ -138,7 +138,7 @@ func (s *AdminService) DashboardOperations(ctx context.Context, actor Actor) map
 	}
 	if actor.Can(authz.PermissionDownloadsReadAll) || actor.Can(authz.PermissionDownloadsReadOwn) {
 		put("download-summary", func() ([]DashboardFact, error) {
-			query := db.Model(&models.DownloadTask{}).Joins("JOIN jobs j ON j.id = download_tasks.job_id")
+			query := db.Model(&models.DownloadTask{}).Joins("JOIN jobs j ON j.id = download_tasks.job_id").Where("download_tasks.history_cleared_at IS NULL AND j.history_cleared_at IS NULL")
 			if !actor.Can(authz.PermissionDownloadsReadAll) {
 				query = query.Where("download_tasks.owner_id = ?", actor.User.ID)
 			}

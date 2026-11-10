@@ -114,6 +114,22 @@ func (c *selectionClient) Submit(ctx context.Context, r SubmitRequest) (Task, er
 	}
 	return c.Client.Submit(ctx, r)
 }
+func (c *selectionClient) ReconcileSubmission(ctx context.Context, r SubmitRequest) (Task, error) {
+	if r.Source.ContentSelection == nil || r.Tag != c.binding.Tag {
+		return Task{}, Error("downloader_selection_required", false, nil)
+	}
+	left, err := r.Source.ContentSelection.Digest()
+	right, _ := c.binding.Selection.Digest()
+	if err != nil || left != right {
+		return Task{}, Error("downloader_selection_invalid", false, err)
+	}
+	resolver, ok := c.Client.(SubmissionReconciler)
+	if !ok {
+		return Task{}, Error("downloader_submission_reconcile_unsupported", true, nil)
+	}
+	return resolver.ReconcileSubmission(ctx, r)
+}
+
 func (c *selectionClient) Get(ctx context.Context, id string) (Task, error) {
 	return c.selected.GetSelected(ctx, id, c.binding)
 }

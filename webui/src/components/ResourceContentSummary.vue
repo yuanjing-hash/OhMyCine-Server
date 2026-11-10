@@ -39,7 +39,8 @@ async function more() {
 }
 async function accept() {
   const preview = current.value
-  if (!props.canSelect || !preview?.complete || !selected.value.length || busy.value) return
+  if (!props.canSelect || !preview?.complete || !selected.value.length || busy.value || props.loading) return
+  if (!(Date.parse(preview.expires_at) > Date.now())) { localError.value = '文件清单已过期，请重新读取后选择'; return }
   const owned = ++generation
   const token = props.resultToken
   const controller = new AbortController(); request = controller; busy.value = true; localError.value = ''
@@ -57,16 +58,16 @@ onBeforeUnmount(() => { generation++; request?.abort() })
 
 <template>
   <section class="semantic-inset mt-3 min-w-0 p-3 text-sm" aria-label="实际文件内容">
-    <div class="flex items-center justify-between gap-3"><strong>{{ current?.complete ? '已读取实际文件' : loading ? '正在读取实际文件…' : '实际文件尚未确认' }}</strong><button class="btn-secondary py-1 text-xs" type="button" :disabled="loading || busy" @click="emit('retry')">重新读取文件</button></div>
+    <div class="flex items-center justify-between gap-3"><strong>{{ loading ? current ? '正在更新文件清单…' : '正在读取实际文件…' : current?.complete ? '已读取实际文件' : '实际文件尚未确认' }}</strong><button class="btn-secondary py-1 text-xs" type="button" :disabled="loading || busy" @click="emit('retry')">重新读取文件</button></div>
     <template v-if="current">
       <p class="text-subtle mb-0 mt-2 text-xs">共 {{ current.total_count }} 项 · {{ formatBytes(current.total_size) }}<template v-if="current.analysis"> · {{ current.analysis.video_count }} 个视频</template></p>
       <p v-for="(group, index) in current.analysis?.groups ?? []" :key="index" class="mb-0 mt-2">{{ shareContentGroupLabel(group) }}</p>
       <ul class="m-0 mt-3 list-none space-y-2 p-0" aria-label="实际文件名">
         <li v-for="file in visibleFiles" :key="file.token" class="min-w-0 border-t border-[var(--border)] pt-2">
-          <label class="flex min-w-0 items-start gap-2"><input v-if="canSelect && !file.is_dir" v-model="selected" class="mt-1" type="checkbox" :value="file.token" :disabled="busy" /><span class="min-w-0"><strong class="break-all">{{ file.name }}</strong><small class="text-subtle block break-all">{{ file.path }} · {{ formatBytes(file.size) }} · {{ file.file_kind === 'video' ? '视频' : file.file_kind === 'subtitle' ? '字幕文件' : file.file_kind === 'archive' ? '压缩包' : file.is_dir ? '目录' : '其他文件' }}</small><small v-if="file.episodes.length" class="block">{{ file.season !== undefined ? `第 ${file.season} 季 · ` : '季待确认 · ' }}第 {{ compactEpisodeSet(file.episodes) }} 集<template v-if="file.work_status !== 'matched'"> · 作品待确认</template></small><small v-else-if="file.file_kind === 'video'" class="text-subtle block">集数或作品身份待确认</small><small v-for="(evidence, index) in file.subtitles ?? []" :key="index" class="text-subtle block">{{ evidence.language === 'zh' ? evidence.script === 'Hans' ? '简体中文' : evidence.script === 'Hant' ? '繁体中文' : '中文（文字体系未确认）' : evidence.language }} · {{ evidence.source === 'sidecar_filename' ? '实际字幕文件的名称标注' : '发布名称声明，未核实内嵌字幕' }}</small></span></label>
+          <label class="flex min-w-0 items-start gap-2"><input v-if="canSelect && !file.is_dir" v-model="selected" class="mt-1" type="checkbox" :value="file.token" :disabled="busy || loading" /><span class="min-w-0"><strong class="break-all">{{ file.name }}</strong><small class="text-subtle block break-all">{{ file.path }} · {{ formatBytes(file.size) }} · {{ file.file_kind === 'video' ? '视频' : file.file_kind === 'subtitle' ? '字幕文件' : file.file_kind === 'archive' ? '压缩包' : file.is_dir ? '目录' : '其他文件' }}</small><small v-if="file.episodes.length" class="block">{{ file.season !== undefined ? `第 ${file.season} 季 · ` : '季待确认 · ' }}第 {{ compactEpisodeSet(file.episodes) }} 集<template v-if="file.work_status !== 'matched'"> · 作品待确认</template></small><small v-else-if="file.file_kind === 'video'" class="text-subtle block">集数或作品身份待确认</small><small v-for="(evidence, index) in file.subtitles ?? []" :key="index" class="text-subtle block">{{ evidence.language === 'zh' ? evidence.script === 'Hans' ? '简体中文' : evidence.script === 'Hant' ? '繁体中文' : '中文（文字体系未确认）' : evidence.language }} · {{ evidence.source === 'sidecar_filename' ? '实际字幕文件的名称标注' : '发布名称声明，未核实内嵌字幕' }}</small></span></label>
         </li>
       </ul>
-      <div class="mt-3 flex flex-wrap gap-2"><button v-if="current.files.length > 8" class="btn-secondary py-1 text-xs" type="button" @click="expanded = !expanded">{{ expanded ? '收起文件列表' : `展开已读取的 ${current.files.length} 项` }}</button><button v-if="current.next_offset !== undefined" class="btn-secondary py-1 text-xs" type="button" :disabled="busy" @click="more">{{ busy ? '读取中…' : '读取更多文件' }}</button><button v-if="canSelect" class="btn-secondary py-1 text-xs" type="button" :disabled="busy || !selected.length || !current.complete" @click="accept">{{ busy ? '正在确认选择…' : `选择文件入库（${selected.length} 个 · ${formatBytes(selectedBytes)}）` }}</button></div>
+      <div class="mt-3 flex flex-wrap gap-2"><button v-if="current.files.length > 8" class="btn-secondary py-1 text-xs" type="button" @click="expanded = !expanded">{{ expanded ? '收起文件列表' : `展开已读取的 ${current.files.length} 项` }}</button><button v-if="current.next_offset !== undefined" class="btn-secondary py-1 text-xs" type="button" :disabled="busy || loading" @click="more">{{ busy ? '读取中…' : '读取更多文件' }}</button><button v-if="canSelect" class="btn-secondary py-1 text-xs" type="button" :disabled="busy || loading || !selected.length || !current.complete" @click="accept">{{ busy ? '正在确认选择…' : `选择文件入库（${selected.length} 个 · ${formatBytes(selectedBytes)}）` }}</button></div>
     </template>
     <p v-if="localError || error" class="text-warning mb-0 mt-2 text-xs" role="status">{{ localError || error }}</p>
     <p v-else-if="!current && !loading" class="text-subtle mb-0 mt-2 text-xs">尚未取得实际文件；标题范围不能作为包内集数。可独立重新读取。</p>

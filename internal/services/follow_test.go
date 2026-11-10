@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -366,10 +367,13 @@ func TestFollowOwnAndAllPermissionMatrixDoesNotRequireReadForMutations(t *testin
 
 func TestFollowWorkerUsesCoverageIdentitySearchAndDownloadPipeline(t *testing.T) {
 	current := time.Date(2026, 8, 13, 8, 0, 0, 0, time.UTC)
+	seriesStatus := "Returning Series"
+	var metadataReads atomic.Int64
 	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		metadataReads.Add(1)
 		switch request.URL.Path {
 		case "/tv/100":
-			_, _ = writer.Write([]byte(`{"id":100,"name":"示例剧","original_name":"Fixture Show","original_language":"en","first_air_date":"2026-01-01","genres":[{"id":18,"name":"剧情"}],"origin_country":["US"],"seasons":[{"id":1,"season_number":1,"name":"第 1 季","episode_count":3,"poster_path":"/s1.jpg"}],"alternative_titles":{"results":[]},"translations":{"translations":[]}}`))
+			_, _ = writer.Write([]byte(strings.ReplaceAll(`{"id":100,"name":"示例剧","original_name":"Fixture Show","status":"__STATUS__","poster_path":"/series.jpg","original_language":"en","first_air_date":"2026-01-01","genres":[{"id":18,"name":"剧情"}],"origin_country":["US"],"seasons":[{"id":1,"season_number":1,"name":"第 1 季","episode_count":3,"poster_path":"/s1.jpg"}],"alternative_titles":{"results":[]},"translations":{"translations":[]}}`, "__STATUS__", seriesStatus)))
 		case "/tv/100/season/1":
 			_, _ = writer.Write([]byte(`{"season_number":1,"episodes":[{"id":11,"season_number":1,"episode_number":1,"name":"已入库","air_date":"2026-01-01"},{"id":12,"season_number":1,"episode_number":2,"name":"待下载","air_date":"2026-01-08"},{"id":13,"season_number":1,"episode_number":3,"name":"后续播出","air_date":"2026-08-20"}]}`))
 		default:
@@ -442,6 +446,19 @@ func TestFollowWorkerUsesCoverageIdentitySearchAndDownloadPipeline(t *testing.T)
 	}
 	_, err = downloaders.Create(actor, DownloaderInput{Name: "Follow qBit", Type: models.DownloaderTypeQBittorrent, BaseURL: "http://follow-qbit.example.test", Enabled: true}, RequestContext{})
 	if err != nil {
+		t.Fatal(err)
+	}
+	localSnapshot := tmdb.Snapshot{Version: 1, TMDBID: 100, MediaType: "tv", Title: "示例剧", Status: seriesStatus, PosterPath: "/series.jpg", Seasons: []tmdb.SeasonSnapshot{{SeasonNumber: 1, EpisodeCount: 3}}}
+	localRaw, err := marshalRecognitionMetadata(MediaRecognitionResult{Snapshot: localSnapshot})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recognition := models.MediaLibraryRecognition{LibraryID: library.ID, SourceKey: "follow-fixture", InputFingerprint: "fixture", ProfileID: profile.ID, ProfileRevision: profile.Revision, Status: mediaRecognitionStatusMatched, MediaType: "tv", Title: "示例剧", TMDBID: &tmdbID, MetadataJSON: localRaw, LastGeneration: 1, CreatedAt: current, UpdatedAt: current}
+	if err := queue.db.Create(&recognition).Error; err != nil {
+		t.Fatal(err)
+	}
+	entryOne.RecognitionID = &recognition.ID
+	if err := queue.db.Model(&entryOne).Update("recognition_id", recognition.ID).Error; err != nil {
 		t.Fatal(err)
 	}
 	coverage := NewMediaCoverageService(queue.db, metadata)
@@ -649,8 +666,18 @@ func TestFollowWorkerUsesCoverageIdentitySearchAndDownloadPipeline(t *testing.T)
 		t.Fatalf("completed run=%+v", completedRun)
 	}
 	completed, err := follows.Get(actor, subscription.ID)
-	if err != nil || completed.Status != models.FollowStatusCompleted || completed.ProgressMissing != 0 {
-		t.Fatalf("completed subscription=%+v err=%v", completed, err)
+	if err != nil || completed.Status != models.FollowStatusActive || !completed.CaughtUp || completed.ProgressMissing != 0 || completed.NextRunAt == nil || completed.PosterRef == "" {
+		t.Fatalf("ongoing caught-up subscription=%+v err=%v", completed, err)
+	}
+	// An older completed row with a next check meant only currently caught up.
+	// Local reads keep it watching and recover artwork from its real catalog.
+	if err := queue.db.Model(&models.FollowSubscription{}).Where("id = ?", subscription.ID).Updates(map[string]any{"status": models.FollowStatusCompleted, "poster_ref": ""}).Error; err != nil {
+		t.Fatal(err)
+	}
+	beforeRead := metadataReads.Load()
+	watching, err := follows.List(actor, 1, 30, "current")
+	if err != nil || watching.Total != 1 || len(watching.List) != 1 || watching.List[0].Status != models.FollowStatusActive || !watching.List[0].CaughtUp || watching.List[0].PosterRef == "" || metadataReads.Load() != beforeRead {
+		t.Fatalf("legacy watching/artwork projection=%+v err=%v", watching, err)
 	}
 
 	current = time.Date(2026, 8, 27, 8, 0, 0, 0, time.UTC)
@@ -693,16 +720,82 @@ func TestFollowWorkerUsesCoverageIdentitySearchAndDownloadPipeline(t *testing.T)
 	adapter.downloadErr = sitepkg.ErrUnavailable
 	// The same fixture resource ID evolves; expire its old read facts before
 	// asserting that the later provider failure remains distinguishable.
-	current = current.Add(6 * time.Minute)
+	current = current.Add(40 * time.Minute)
 	if _, err := follows.Enqueue(context.Background(), actor, subscription.ID, "manual", RequestContext{}); err != nil {
 		t.Fatal(err)
 	}
 	failedSubmission := runNext()
-	if failedSubmission.Status != models.FollowRunFailed || failedSubmission.ErrorCode != "follow_submit_failed" || failedSubmission.Candidates != 1 || failedSubmission.Selected != 0 {
-		t.Fatalf("submission failure confused with no matches: %+v", failedSubmission)
+	if failedSubmission.Status != models.FollowRunFailed || failedSubmission.ErrorCode != "follow_content_unavailable" || failedSubmission.Candidates != 1 || failedSubmission.Selected != 0 {
+		t.Fatalf("content-read failure confused with submission or no matches: %+v", failedSubmission)
 	}
 	if err := queue.db.Model(&models.DownloadTask{}).Where("follow_subscription_id = ?", subscription.ID).Count(&downloadCount).Error; err != nil || downloadCount != 1 {
 		t.Fatalf("rejected source created another download: count=%d err=%v", downloadCount, err)
+	}
+	seriesStatus = "Ended"
+	episodeThree := 3
+	entryThree := entryOne
+	entryThree.ID, entryThree.RelativePath, entryThree.ProviderID, entryThree.Episode = 0, "/fixture/s01e03.mkv", "episode-three", &episodeThree
+	if err := queue.db.Create(&entryThree).Error; err != nil {
+		t.Fatal(err)
+	}
+	localSnapshot.Status = seriesStatus
+	localRaw, err = marshalRecognitionMetadata(MediaRecognitionResult{Snapshot: localSnapshot})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := queue.db.Model(&recognition).Update("metadata_json", localRaw).Error; err != nil {
+		t.Fatal(err)
+	}
+	// Complete local ended-season evidence repairs legacy views immediately.
+	if err := queue.db.Model(&models.FollowSubscription{}).Where("id = ?", subscription.ID).Update("status", models.FollowStatusCompleted).Error; err != nil {
+		t.Fatal(err)
+	}
+	beforeRead = metadataReads.Load()
+	watching, err = follows.List(actor, 1, 30, "current")
+	if err != nil || watching.Total != 0 || len(watching.List) != 0 {
+		t.Fatalf("finished subscription remained current: %+v %v", watching, err)
+	}
+	finishedPage, err := follows.List(actor, 1, 30, models.FollowStatusCompleted)
+	if err != nil || finishedPage.Total != 1 || len(finishedPage.List) != 1 || finishedPage.List[0].Status != models.FollowStatusCompleted || finishedPage.List[0].NextRunAt != nil || metadataReads.Load() != beforeRead {
+		t.Fatalf("finished local projection=%+v %v", finishedPage, err)
+	}
+	if _, err := follows.Enqueue(context.Background(), actor, subscription.ID, "manual", RequestContext{}); err != nil {
+		t.Fatal(err)
+	}
+	finishedRun := runNext()
+	finishedSubscription, err := follows.Get(actor, subscription.ID)
+	if err != nil || finishedRun.Status != models.FollowRunCompleted || finishedSubscription.Status != models.FollowStatusCompleted || finishedSubscription.NextRunAt != nil {
+		t.Fatalf("ended fully imported season did not finish: run=%+v subscription=%+v err=%v", finishedRun, finishedSubscription, err)
+	}
+	var schedule models.ScheduleDefinition
+	if err := queue.db.Where("managed_key = ?", managedScheduleKey("follow_search", "follow", subscription.ID)).First(&schedule).Error; err != nil || schedule.Enabled || schedule.NextRunAt != nil {
+		t.Fatalf("completed managed schedule remained enabled: %+v %v", schedule, err)
+	}
+	if scheduled, err := follows.Enqueue(context.Background(), actor, subscription.ID, "schedule", RequestContext{}); err != nil || scheduled != "" {
+		t.Fatalf("completed scheduled search enqueued=%q err=%v", scheduled, err)
+	}
+	if err := queue.db.Model(&schedule).Updates(map[string]any{"cron_expression": "17 * * * *", "timezone": "UTC", "max_retries": 3}).Error; err != nil {
+		t.Fatal(err)
+	}
+	// A manual reconciliation can reopen a completed subscription after a
+	// catalog gap appears. Its original managed schedule must resume as well.
+	if err := queue.db.Delete(&entryThree).Error; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := follows.Enqueue(context.Background(), actor, subscription.ID, "manual", RequestContext{}); err != nil {
+		t.Fatal(err)
+	}
+	runNext()
+	reopened, err := follows.Get(actor, subscription.ID)
+	if err != nil || reopened.Status != models.FollowStatusActive || reopened.NextRunAt == nil {
+		t.Fatalf("manual reconciliation did not reopen subscription: %+v %v", reopened, err)
+	}
+	previousSchedule := schedule
+	if err := queue.db.First(&schedule, "id = ?", schedule.ID).Error; err != nil || !schedule.Enabled || schedule.NextRunAt == nil || !schedule.NextRunAt.Equal(*reopened.NextRunAt) {
+		t.Fatalf("reopened managed schedule did not resume: %+v %v", schedule, err)
+	}
+	if schedule.CronExpression != previousSchedule.CronExpression || schedule.Timezone != previousSchedule.Timezone || schedule.MisfirePolicy != previousSchedule.MisfirePolicy || schedule.OverlapPolicy != previousSchedule.OverlapPolicy || schedule.MaxRetries != previousSchedule.MaxRetries || schedule.RetryDelaySeconds != previousSchedule.RetryDelaySeconds || schedule.MaxRuntimeSeconds != previousSchedule.MaxRuntimeSeconds {
+		t.Fatalf("reopened schedule changed configuration: before=%+v after=%+v", previousSchedule, schedule)
 	}
 	for _, forbidden := range []string{"server-only-secret", "passkey-server-only", "test-token", "https://follow-worker.example.test", root} {
 		if strings.Contains(businessLog.String(), forbidden) {

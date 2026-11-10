@@ -8,13 +8,14 @@ import { Permissions } from '@/auth/generated-permissions'
 import FollowEditorDialog from '@/components/FollowEditorDialog.vue'
 import ClearHistoryButton from '@/components/ClearHistoryButton.vue'
 import ExecutionLogsPanel from '@/components/ExecutionLogsPanel.vue'
+import MediaPoster from '@/components/MediaPoster.vue'
 import { filterReasonRows, followWaitingLabel, type ExecutionSummary } from '@/execution-logs'
 import { deleteFollow, followAction, followPath, followRunStatusLabel, followStatusLabel, type FollowPage, type FollowRunSummary, type FollowSummary } from '@/follows'
 import { useAuthStore } from '@/stores/auth'
 import { notify } from '@/toast'
 import { useFollowWaitClock } from '@/use-follow-wait-clock'
 
-const loading = ref(true); const error = ref(''); const items = ref<FollowSummary[]>([]); const status = ref('')
+const loading = ref(true); const error = ref(''); const items = ref<FollowSummary[]>([]); const status = ref('current')
 const waitClock = useFollowWaitClock()
 const auth = useAuthStore()
 const editing = ref<FollowSummary | null>(null); const expanded = ref(''); const runs = ref<Record<string, FollowRunSummary[]>>({}); const busy = ref('')
@@ -22,12 +23,13 @@ const route = useRoute(), router = useRouter()
 const page = ref(1), total = ref(0), pageSize = 100
 const listRequest = createLatestRequest(), runRequest = createLatestRequest()
 const runLoading = ref(false), runError = ref('')
+const posterRefresh = ref(0)
 const selectedRun = ref<{ followId: string; title: string; run: FollowRunSummary } | null>(null)
 let runTrigger: HTMLElement | null = null
 let alive = true
 async function load(quiet = false) {
   const request = listRequest.begin()
-  if (!quiet) loading.value = true
+  if (!quiet) { loading.value = true; posterRefresh.value++ }
   error.value = ''
   try {
     const query = new URLSearchParams({ page: String(page.value), page_size: String(pageSize) })
@@ -86,14 +88,14 @@ async function refresh() {
 }
 function changePage(value: number) {
   const query: Record<string, string> = { page: String(value) }
-  if (status.value) query.status = status.value
+  query.status = status.value || 'all'
   void router.replace({ query })
 }
 let previousKey = ''
 watch(() => route.fullPath, () => {
   if (route.path !== '/subscriptions/manage') return
   const nextStatus = typeof route.query.status === 'string' ? route.query.status : ''
-  status.value = ['active', 'paused', 'completed', 'blocked'].includes(nextStatus) ? nextStatus : ''
+  status.value = ['current', 'active', 'paused', 'completed', 'blocked'].includes(nextStatus) ? nextStatus : nextStatus === 'all' ? '' : 'current'
   const rawPage = typeof route.query.page === 'string' && /^\d{1,6}$/.test(route.query.page) ? Number(route.query.page) : 1
   page.value = Math.max(1, Math.min(100000, rawPage))
   const key = `${status.value}:${page.value}:${typeof route.query.follow_id === 'string' ? route.query.follow_id : ''}`
@@ -137,12 +139,12 @@ onBeforeUnmount(() => { alive = false; listRequest.cancel(); runRequest.cancel()
 
 <template>
   <section class="space-y-5">
-    <header class="flex flex-wrap items-end justify-between gap-4"><div><h1 class="m-0 text-3xl font-800">订阅管理</h1><p class="page-description mb-0 mt-2">自动对账明确已播的缺集，按每条订阅自己的策略搜索并进入正常下载、整理和入库流水线。</p></div><label><span class="label">状态</span><select v-model="status" class="input min-w-40" @change="changePage(1)"><option value="">全部</option><option value="active">追更中</option><option value="paused">已暂停</option><option value="completed">当前已补齐</option><option value="blocked">需要处理</option></select></label></header>
+    <header class="flex flex-wrap items-end justify-between gap-4"><div><h1 class="m-0 text-3xl font-800">订阅管理</h1><p class="page-description mb-0 mt-2">自动对账明确已播的缺集，按每条订阅自己的策略搜索并进入正常下载、整理和入库流水线。</p></div><div class="flex items-end gap-3"><button class="btn-secondary" :disabled="loading" @click="load()">刷新</button><label><span class="label">状态</span><select v-model="status" class="input min-w-40" @change="changePage(1)"><option value="current">当前订阅</option><option value="">全部</option><option value="active">追更中</option><option value="paused">已暂停</option><option value="completed">已完成</option><option value="blocked">需要处理</option></select></label></div></header>
     <div v-if="loading" class="panel py-12 text-center text-muted">正在读取订阅进度…</div>
     <div v-if="error" class="semantic-error p-4"><strong>订阅暂时不可用</strong><p class="mb-0 mt-1 text-sm">{{ error }}</p><button class="btn-secondary mt-3" @click="refresh">重试</button></div>
     <div v-if="!loading && !error && !items.length" class="panel py-12 text-center"><h2 class="m-0 text-lg">当前筛选下没有订阅</h2><p class="page-description mb-0 mt-2">从推荐或搜索进入电视剧详情，选择一个或多个季并配置执行策略。</p></div>
     <article v-for="item in loading ? [] : items" :key="item.id" class="panel overflow-hidden p-0">
-      <div class="grid gap-4 p-5 md:grid-cols-[5rem_minmax(0,1fr)_auto]"><div class="detail-poster-mini"><img v-if="item.poster_ref" :src="item.poster_ref" :alt="`${item.title} 海报`"><span v-else>无海报</span></div><div class="min-w-0"><div class="flex flex-wrap items-center gap-2"><h2 class="m-0 text-lg">{{ item.title }}</h2><span :class="item.status === 'blocked' ? 'status-chip status-chip--error' : item.status === 'completed' ? 'status-chip status-chip--ready' : item.status === 'paused' ? 'status-chip' : 'status-chip status-chip--warning'">{{ followStatusLabel(item.status) }}</span><span class="status-chip">revision {{ item.revision }}</span></div><p class="mb-0 mt-2 text-sm text-muted">订阅人：{{ item.owner_name || `账号 #${item.owner_id}` }}</p><p class="mb-0 mt-2 text-sm text-muted">季：{{ item.snapshot.seasons.map(value => value === 0 ? '特别篇' : `S${String(value).padStart(2, '0')}`).join('、') }} · 站点 {{ item.snapshot.site_ids.length }} 个 · 每 {{ item.snapshot.schedule.minutes }} 分钟</p><div class="mt-3 grid max-w-xl grid-cols-3 gap-2"><div class="semantic-inset p-2"><small class="text-subtle">已播目标</small><strong class="block">{{ item.progress_target }}</strong></div><div class="semantic-inset p-2"><small class="text-subtle">已入库</small><strong class="block">{{ item.progress_present }}</strong></div><div class="semantic-inset p-2"><small class="text-subtle">仍缺失</small><strong class="block">{{ item.progress_missing }}</strong></div></div><p v-if="item.last_error_message" class="mb-0 mt-3 text-sm" :class="item.status === 'active' && followWaitingLabel({status: 'failed', error_code: item.last_error_code}) ? 'text-muted' : 'semantic-danger-text'">{{ item.last_error_message }} <span class="font-mono text-xs">{{ item.last_error_code }}</span></p><p v-if="item.wait" class="mb-0 mt-2 text-xs text-muted" role="status">本轮记录的冷却截止时间 {{ formatTime(item.wait.not_before) }} · {{ waitClock.remaining(item.wait) }}。这是本轮观察到的本地等待期限；到时仍需重新核实上游状态。</p><p class="mb-0 mt-3 text-xs text-muted">最近运行 {{ formatTime(item.last_run_at) }} · 下次检查 {{ formatTime(item.next_run_at) }}</p></div><div class="flex flex-wrap content-start gap-2 md:max-w-55 md:justify-end"><button v-if="canUpdate(item)" class="btn-secondary" @click="editing = item">编辑策略</button><button v-if="canUpdate(item)" class="btn-secondary" :disabled="busy !== ''" @click="action(item, item.status === 'paused' ? 'resume' : 'pause')">{{ item.status === 'paused' ? '恢复' : '暂停' }}</button><button v-if="canExecute(item)" class="btn-primary" :disabled="busy !== '' || item.status === 'paused'" @click="action(item, 'search')">立即搜索</button><button class="btn-secondary" @click="toggleRuns(item)">运行记录</button><button v-if="canDelete(item)" class="btn-danger" :disabled="busy !== ''" @click="remove(item)">删除</button></div></div>
+      <div class="grid gap-4 p-5 md:grid-cols-[5rem_minmax(0,1fr)_auto]"><div class="detail-poster-mini"><MediaPoster :key="posterRefresh" :src="item.poster_ref" :title="item.title" fallback="无海报" /></div><div class="min-w-0"><div class="flex flex-wrap items-center gap-2"><h2 class="m-0 text-lg">{{ item.title }}</h2><span :class="item.status === 'blocked' ? 'status-chip status-chip--error' : item.status === 'completed' ? 'status-chip status-chip--ready' : item.status === 'paused' ? 'status-chip' : 'status-chip status-chip--warning'">{{ item.status === 'active' && item.caught_up ? '追更中 · 已播补齐' : followStatusLabel(item.status) }}</span><span class="status-chip">revision {{ item.revision }}</span></div><p class="mb-0 mt-2 text-sm text-muted">订阅人：{{ item.owner_name || `账号 #${item.owner_id}` }}</p><p class="mb-0 mt-2 text-sm text-muted">季：{{ item.snapshot.seasons.map(value => value === 0 ? '特别篇' : `S${String(value).padStart(2, '0')}`).join('、') }} · 站点 {{ item.snapshot.site_ids.length }} 个 · 每 {{ item.snapshot.schedule.minutes }} 分钟</p><div class="mt-3 grid max-w-xl grid-cols-3 gap-2"><div class="semantic-inset p-2"><small class="text-subtle">已播目标</small><strong class="block">{{ item.progress_target }}</strong></div><div class="semantic-inset p-2"><small class="text-subtle">已入库</small><strong class="block">{{ item.progress_present }}</strong></div><div class="semantic-inset p-2"><small class="text-subtle">仍缺失</small><strong class="block">{{ item.progress_missing }}</strong></div></div><p v-if="item.last_error_message" class="mb-0 mt-3 text-sm" :class="item.status === 'active' && followWaitingLabel({status: 'failed', error_code: item.last_error_code}) ? 'text-muted' : 'semantic-danger-text'">{{ item.last_error_message }} <span class="font-mono text-xs">{{ item.last_error_code }}</span></p><p v-if="item.wait" class="mb-0 mt-2 text-xs text-muted" role="status">本轮记录的冷却截止时间 {{ formatTime(item.wait.not_before) }} · {{ waitClock.remaining(item.wait) }}。这是本轮观察到的本地等待期限；到时仍需重新核实上游状态。</p><p class="mb-0 mt-3 text-xs text-muted">最近运行 {{ formatTime(item.last_run_at) }}<template v-if="item.status !== 'completed'"> · 下次检查 {{ formatTime(item.next_run_at) }}</template></p></div><div class="flex flex-wrap content-start gap-2 md:max-w-55 md:justify-end"><button v-if="canUpdate(item)" class="btn-secondary" @click="editing = item">编辑策略</button><button v-if="canUpdate(item)" class="btn-secondary" :disabled="busy !== ''" @click="action(item, item.status === 'paused' ? 'resume' : 'pause')">{{ item.status === 'paused' ? '恢复' : '暂停' }}</button><button v-if="canExecute(item)" class="btn-primary" :disabled="busy !== '' || item.status === 'paused'" @click="action(item, 'search')">立即搜索</button><button class="btn-secondary" @click="toggleRuns(item)">运行记录</button><button v-if="canDelete(item)" class="btn-danger" :disabled="busy !== ''" @click="remove(item)">删除</button></div></div>
       <div v-if="expanded === item.id" class="semantic-divider border-t bg-[var(--surface-muted)] p-5">
         <div class="flex flex-wrap items-center justify-between gap-3"><h3 class="m-0 text-base">最近运行</h3><ClearHistoryButton v-if="canExecute(item)" scope="follow_runs" :resource-id="item.id" @cleared="refresh" /></div>
         <p v-if="runLoading" role="status">正在读取运行记录…</p>

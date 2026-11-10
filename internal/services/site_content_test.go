@@ -111,17 +111,24 @@ func TestContentInspectionRejectsAccountChangeDuringRead(t *testing.T) {
 
 func TestContentInspectionParsesTorrentWithoutAnyDownloaderAndFreezesOriginalIndices(t *testing.T) {
 	s, stub, actor, _, downloads, downloaders := siteFixture(t)
+	now := time.Now().UTC()
+	s.now = func() time.Time { return now }
 	raw := inspectionTorrentWithSize(32<<20, "Season 01/01.mkv", "Season 01/Fixture.Show.S01E13.JPN.ENG.mkv", "Season 01/Fixture.Show.S01E13.JPN.ENG.zh-Hans.srt", "Season 01/15.mkv", "Season 01/Fixture.Show.S01E13-E14.2160p.mkv")
 	s.adapters["mikan"] = &stubResolverAdapter{stubSiteAdapter: &stubSiteAdapter{kind: "mikan"}, resolved: sitepkg.Source{Torrent: raw}}
 	created, err := s.Create(context.Background(), actor, SiteInput{Name: "Content fixture", Kind: "mikan", BaseURL: "https://mikanani.me", Enabled: true, Priority: 1, TimeoutSeconds: 15, RateLimitPerMinute: 120}, RequestContext{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	claim := siteResultClaim{ActorID: actor.User.ID, SiteID: created.ID, SiteRevision: created.Revision, TorrentID: "42", Title: "Advertisement 1-99", SearchIdentity: analysisIdentity(), ExpiresAt: s.now().Add(time.Minute)}
+	claim := siteResultClaim{ActorID: actor.User.ID, SiteID: created.ID, SiteRevision: created.Revision, TorrentID: "42", Title: "Advertisement 1-99", SearchIdentity: analysisIdentity(), ExpiresAt: s.now().Add(ptResultTTL)}
 	token := issueAnalysisClaim(t, s, claim)
 	preview, err := s.PreviewContent(context.Background(), actor, ContentPreviewInput{ResultToken: token})
 	if err != nil || !preview.Complete || preview.TotalCount != 5 {
 		t.Fatalf("content=%+v err=%v", preview, err)
+	}
+	// Browsing and file inspection may outlast the old five-minute preview.
+	now = now.Add(16 * time.Minute)
+	if !preview.ExpiresAt.After(now) {
+		t.Fatal("actual-file preview expired before the browsing window")
 	}
 	var selected []string
 	for _, file := range preview.Files {

@@ -189,6 +189,9 @@ func acceptedLibraryJob(db *gorm.DB, libraryID uint, job models.Job) (bool, erro
 // and baseline-building work must remain runnable, otherwise readiness could
 // never become true. Resource keys are private server-created identities.
 func libraryJobBlocked(db *gorm.DB, job models.Job, caches ...map[uint]MediaLibraryReadiness) (bool, error) {
+	if _, pending, err := pendingDownloadControlTask(db, job); err != nil || pending {
+		return false, err
+	}
 	if job.JobType == JobTypeFollowSearch && strings.HasPrefix(job.ResourceKey, "follow:") {
 		return followReadinessBlocked(db, strings.TrimPrefix(job.ResourceKey, "follow:"))
 	}

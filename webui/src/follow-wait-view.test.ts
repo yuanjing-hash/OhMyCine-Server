@@ -21,7 +21,12 @@ async function render(rows: FollowSummary[], canExecute = false) {
   auth.user = { id: 1, username: 'reader', display_name: 'Reader', status: 'active', is_owner: false, roles: [], permissions: [Permissions.FollowsReadOwn, ...(canExecute ? [Permissions.FollowsExecuteOwn] : [])] }
   const router = createRouter({ history: createMemoryHistory(), routes: [{ path: '/:pathMatch(.*)*', component: { template: '<div />' } }] })
   await router.push('/subscriptions/manage'); await router.isReady()
-  request.mockImplementation((url: string) => Promise.resolve(url.endsWith('/runs') ? { list: [{ id: 'old-run', job_id: 'job', status: 'failed', subscription_revision: 1, error_code: 'follow_submit_failed', error_message: '旧记录', filter_summary: {}, wait, searched_names_count: 1, candidates: 1, selected: 0, created_at: '' }] } : { list: rows, total: rows.length }))
+  request.mockImplementation((url: string) => {
+    if (url.endsWith('/runs')) return Promise.resolve({ list: [{ id: 'old-run', job_id: 'job', status: 'failed', subscription_revision: 1, error_code: 'follow_submit_failed', error_message: '旧记录', filter_summary: {}, wait, searched_names_count: 1, candidates: 1, selected: 0, created_at: '' }] })
+    const status = new URL(url, 'https://fixture.invalid').searchParams.get('status')
+    const list = rows.filter(row => status === 'current' ? row.status !== 'completed' : !status || row.status === status)
+    return Promise.resolve({ list, total: list.length })
+  })
   const wrapper = mount(FollowsView, { global: { plugins: [pinia, router], stubs: { ClearHistoryButton: true } } }); wrappers.push(wrapper)
   await flushPromises(); return wrapper
 }
@@ -75,4 +80,28 @@ it('refreshes the current wait and run history together after the child confirms
   expect(paths.filter(path => path.includes('/api/v1/follows?'))).toHaveLength(2)
   expect(paths.filter(path => path.endsWith('/runs'))).toHaveLength(2)
   expect(paths.every(path => path.startsWith('/api/v1/follows'))).toBe(true)
+})
+
+it('separates finished subscriptions from current caught-up shows and refreshes a failed poster', async () => {
+  vi.useFakeTimers()
+  const wrapper = await render([
+    { ...item, title: '仍在播出', caught_up: true, progress_present: 4, progress_missing: 0, poster_ref: '/api/v1/media-artwork/poster/ongoing', wait: undefined },
+    { ...item, id: 'finished', title: '已完结作品', status: 'completed', progress_present: 4, progress_missing: 0, wait: undefined },
+  ])
+  expect(request.mock.calls.some(([url]) => String(url).includes('status=current'))).toBe(true)
+  expect(wrapper.text()).toContain('追更中 · 已播补齐')
+  expect(wrapper.text()).not.toContain('已完结作品')
+  await wrapper.get('img[alt="仍在播出 海报"]').trigger('error')
+  await vi.advanceTimersByTimeAsync(1000)
+  await wrapper.get('img[alt="仍在播出 海报"]').trigger('error')
+  expect(wrapper.text()).toContain('海报暂不可用')
+  await wrapper.findAll('button').find(button => button.text() === '刷新')!.trigger('click'); await flushPromises()
+  expect(wrapper.find('img[alt="仍在播出 海报"]').exists()).toBe(true)
+  await wrapper.get('select').setValue('completed'); await flushPromises()
+  expect(wrapper.text()).toContain('已完结作品')
+  expect(wrapper.text()).not.toContain('仍在播出')
+  expect(wrapper.text()).not.toContain('下次检查')
+  await wrapper.get('select').setValue(''); await flushPromises()
+  expect(wrapper.text()).toContain('仍在播出')
+  expect(wrapper.text()).toContain('已完结作品')
 })

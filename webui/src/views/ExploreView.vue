@@ -110,8 +110,7 @@ function rememberShareValidation(token: string, validation: ShareValidation) {
 function shareValidation(item: TorrentSearchResult) { return shareValidations.value[item.token] ?? item.share_validation }
 const shareSelection = ref<ShareSelection | null>(null)
 const contentSelection = ref<{ resultToken: string; selection: ResourceContentSelection } | null>(null)
-const wholeResourceRequested = ref(false)
-const modernSelectionRequired = computed(() => !!downloadDialog.value?.content_inspection && !contentSelection.value && !shareSelection.value && (!!upgradeID.value || isCloudShareSource(downloadDialog.value?.source_kind) || !wholeResourceRequested.value))
+const modernSelectionRequired = computed(() => !!downloadDialog.value?.content_inspection && !contentSelection.value && !shareSelection.value && (!!upgradeID.value || isCloudShareSource(downloadDialog.value?.source_kind)))
 const downloadForm = ref({ downloaderID: '', mediaLibraryID: 0, priority: 0 })
 const downloadSiteID = ref<number | undefined>()
 const routePreview = ref<DownloadRoutePreview | null>(null)
@@ -400,6 +399,7 @@ async function acceptContentSelection(value: { resultToken: string; selection: R
   await openDownload(item, null, value)
 }
 async function openDownload(item: TorrentSearchResult, selection: ShareSelection | null = null, inspected: { resultToken: string; selection: ResourceContentSelection } | null = null) {
+  if (inspected && inspected.resultToken !== item.token) return
   if (upgradeID.value && (!upgradeContext.value || !isPreparedMediaUpgrade(upgradeContext.value))) { notify(upgradeContextError.value || '洗版目标未就绪或已有执行任务，请返回所选版本查看', 'warning'); return }
   if (resourceUnavailable(item)) return
   const generation = interactionGeneration
@@ -408,8 +408,7 @@ async function openDownload(item: TorrentSearchResult, selection: ShareSelection
   routeRecommendationRequest = null
   routeRecommendationLoading.value = false
   shareSelection.value = selection
-  contentSelection.value = inspected?.resultToken === item.token ? inspected : null
-  wholeResourceRequested.value = false
+  contentSelection.value = inspected
   downloadDialog.value = item
   downloadSiteID.value = groups.value.find(group => group.items.some(candidate => candidate.token === item.token))?.site_id
   downloadForm.value = { downloaderID: selection?.downloaderID ?? '', mediaLibraryID: upgradeContext.value?.library_id ?? 0, priority: 0 }
@@ -496,7 +495,7 @@ async function submitDownload() {
   if (shareSelection.value && (shareSelection.value.downloaderID !== downloadForm.value.downloaderID || Date.parse(shareSelection.value.expiresAt) <= Date.now())) { notify('预览已过期或下载器已变化，请重新预览分享', 'warning'); return }
   if (contentSelection.value && contentSelection.value.resultToken !== item.token) { notify('文件选择与当前结果不一致，请重新读取', 'warning'); return }
   if (upgradeID.value && (!upgradeContext.value || !isPreparedMediaUpgrade(upgradeContext.value) || downloadForm.value.mediaLibraryID !== upgradeContext.value.library_id)) { notify('洗版目标已变化，请返回所选版本重新开始', 'warning'); return }
-  if (modernSelectionRequired.value) { notify('请先选择实际文件；公开资源也可以显式选择获取整个资源', 'warning'); return }
+  if (modernSelectionRequired.value) { notify('请先选择本次需要入库的实际文件', 'warning'); return }
   submitting.value = true
   try {
     if (upgradeID.value && upgradeContext.value) {
@@ -684,7 +683,7 @@ function retireResultInteractions() {
   downloaders.value = []; libraries.value = []; routeChoices.value = []; routeRecommendation.value = null; routePreview.value = null
   downloadForm.value = { downloaderID: '', mediaLibraryID: 0, priority: 0 }; downloadSiteID.value = undefined
   submitting.value = false; routeRecommendationLoading.value = false; routePreviewLoading.value = false
-  shareValidations.value = {}; shareSelection.value = null; contentSelection.value = null; wholeResourceRequested.value = false
+  shareValidations.value = {}; shareSelection.value = null; contentSelection.value = null
   manualRequestGeneration++; manualCandidatesRequest?.abort(); manualSearching.value = false; manualSaving.value = false
   routeRecommendationRequest?.abort(); routePreviewRequest?.abort()
   routeRecommendationRequest = null; routePreviewRequest = null
@@ -901,7 +900,7 @@ onBeforeUnmount(() => {
                 <ResourceContentSummary v-if="entry.item.content_inspection" :result-token="entry.item.token" :read-lane="isCloudShareSource(entry.item.source_kind) ? 'cloud-content' : entry.item.payload_kind === 'magnet' || entry.item.result_type === 'magnet' ? 'magnet-content' : 'torrent-content'" :preview="contentPreviews[entry.item.token]" :loading="inspectingTokens.includes(entry.item.token)" :error="contentErrors[entry.item.token]" :can-select="auth.can(Permissions.DownloadsCreate) && !resourceUnavailable(entry.item)" @retry="resultRecognition.retryContent(entry.item.token)" @select="acceptContentSelection" />
                 <ShareContentSummary v-else-if="isCloudContentResult(entry.item)" :analysis="recognitions[entry.item.token]?.share_analysis" :loading="recognizingTokens.includes(entry.item.token)" :received="!!recognitions[entry.item.token]" :error="recognitionErrors[entry.item.token]" />
                 <p v-else-if="!recognitions[entry.item.token] && !recognitionErrors[entry.item.token]" class="text-subtle mt-3 text-xs" role="status">{{ recognizingTokens.includes(entry.item.token) ? '正在识别 BT 标题…' : '等待识别 BT 标题…' }}</p>
-                <p v-if="libraryStates[entry.item.token]" class="mt-3 text-xs" role="status" :title="libraryStates[entry.item.token].detail"><span class="status-chip" :class="libraryStates[entry.item.token].present ? 'status-chip--ready' : ''">库内：{{ libraryStates[entry.item.token].label }}</span><span class="text-subtle ml-2">当前可见媒体库 · 作品级</span></p>
+                <p v-if="libraryStates[entry.item.token]" class="mt-3 flex flex-wrap items-center gap-2 text-xs" role="status" :title="libraryStates[entry.item.token].detail"><span class="status-chip" :class="libraryStates[entry.item.token].present ? 'status-chip--ready' : ''">库内：{{ libraryStates[entry.item.token].label }}</span><span class="text-subtle">当前可见媒体库 · 作品级</span><button v-if="libraryStates[entry.item.token].retryable" class="btn-secondary py-1 text-xs" type="button" :disabled="resultExpired(entry.item)" @click="resultRecognition.retryCoverage(entry.item.token)">重试库内查询</button></p>
                 <p v-if="recognitionErrors[entry.item.token] && !isCloudContentResult(entry.item)" class="semantic-warning mb-0 mt-3 p-3 text-xs">{{ recognitionErrors[entry.item.token] }}</p>
                 <p v-if="resultExpired(entry.item) && recognitionErrors[entry.item.token] !== '搜索结果已过期，请重新搜索'" class="semantic-warning mb-0 mt-3 p-3 text-xs">搜索结果已过期，请重新搜索</p>
               </div>
@@ -979,7 +978,7 @@ onBeforeUnmount(() => {
         <div v-if="selectedLibrary && selectedRoute" class="semantic-inset mt-4 grid gap-3 p-4 text-sm sm:grid-cols-2"><div><span class="text-subtle block text-xs">最终媒体库</span><strong>{{ selectedLibrary.name }}</strong></div><div><span class="text-subtle block text-xs">分类与入库</span><strong>{{ selectedRoute.route_label }} · {{ selectedLibrary.profile_name }} · {{ selectedLibrary.transfer_mode }}</strong></div></div>
         <p v-if="shareSelection" class="semantic-inset mt-4 p-3 text-sm">本次仅转存所选 {{ shareSelection.fileCount }} 个文件 · {{ formatBytes(shareSelection.totalSize) }}。更换账号或文件范围请重新预览。</p>
         <p v-if="contentSelection" class="semantic-inset mt-4 p-3 text-sm">本次仅获取所选 {{ contentSelection.selection.file_count }} 个实际文件 · {{ formatBytes(contentSelection.selection.selected_bytes) }}。更换下载器只重新核对执行能力，不扩大文件范围。</p>
-        <div v-else-if="downloadDialog.content_inspection && !shareSelection" class="semantic-warning mt-4 p-3 text-sm"><p>{{ upgradeID ? '洗版需要先读取实际文件，并在卡片中选择对应版本。' : isCloudShareSource(downloadDialog.source_kind) ? '请在卡片中选择实际文件后转存，尚未取得清单时不能提交。' : '尚未冻结包内文件选择。可返回卡片选择文件，或明确获取整个资源。' }}</p><label v-if="!upgradeID && !isCloudShareSource(downloadDialog.source_kind)" class="mt-2 flex items-center gap-2"><input v-model="wholeResourceRequested" type="checkbox" data-test="whole-resource-intent">获取整个资源；本次不筛选包内文件</label></div>
+        <div v-else-if="modernSelectionRequired" class="semantic-warning mt-4 p-3 text-sm"><p>{{ upgradeID ? '洗版需要先读取实际文件，并在卡片中选择对应版本。' : '请在卡片中选择实际文件后转存，尚未取得清单时不能提交。' }}</p></div>
         <p class="text-subtle mt-4 text-xs">{{ isCloudShareSource(downloadDialog.source_kind) ? '分享内容将转存到对应网盘的下载器目录，随后自动识别、整理并入库。' : '确认后获取资源，自动识别、整理并入库。' }}</p>
         <div class="mt-5 flex justify-end gap-3"><button class="btn-secondary" type="button" :disabled="submitting" @click="downloadDialog = null">取消</button><button class="btn-primary" :disabled="submitting || routeRecommendationLoading || routePreviewLoading || !downloadForm.downloaderID || !selectedRoute?.enabled || !selectedLibrary || modernSelectionRequired">{{ submitting ? '正在提交…' : isCloudShareSource(downloadDialog.source_kind) ? '确认转存' : '确认并入队' }}</button></div>
       </form>

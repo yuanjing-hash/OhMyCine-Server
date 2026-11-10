@@ -32,7 +32,7 @@ describe('independent title, cloud, torrent, magnet and coverage lanes', () => {
       const token = options?.body ? JSON.parse(String(options.body)).result_token as string : ''
       if (path === torrentRecognitionPath) return Promise.resolve(title(1))
       if (path === resourceContentPreviewPath) return token.startsWith('cloud') ? slow.promise : Promise.resolve(preview(token))
-      return Promise.resolve({ status: 'present', media_type: 'tv', tmdb_id: 1, libraries: [] })
+      return Promise.resolve({ status: 'present', media_type: 'tv', tmdb_id: 1, libraries: [], tv: { counts: { total: 1, present: 1, missing: 0, future: 0, unknown: 0 }, seasons: [] } })
     })
     const { items, queue } = setup()
     items.value = [item('cloud-a', { source_kind: '115_share' }), item('cloud-b', { source_kind: 'quark_share' }), item('torrent', { payload_kind: 'torrent' }), item('magnet', { payload_kind: 'magnet' })]
@@ -45,6 +45,20 @@ describe('independent title, cloud, torrent, magnet and coverage lanes', () => {
     expect(titles).toHaveLength(4)
     expect(titles.every(([, options]) => JSON.parse(String(options?.body)).title_only === true)).toBe(true)
     expect(vi.mocked(api).mock.calls.some(([path]) => path.includes('/downloaders') || path.endsWith('/downloads'))).toBe(false)
+    items.value = [...items.value, item('later', { payload_kind: 'torrent' })]
+    await flushPromises()
+    expect(queue.libraryStates.value.later?.label).toBe('已入库')
+    expect(vi.mocked(api).mock.calls.filter(([path]) => path.endsWith('/coverage'))).toHaveLength(1)
+    const titleReads = vi.mocked(api).mock.calls.filter(([path]) => path === torrentRecognitionPath).length
+    const contentReads = vi.mocked(api).mock.calls.filter(([path]) => path === resourceContentPreviewPath).length
+    expect(queue.retryCoverage('later')).toBe(true)
+    await flushPromises()
+    expect(vi.mocked(api).mock.calls.filter(([path]) => path.endsWith('/coverage'))).toHaveLength(2)
+    expect(vi.mocked(api).mock.calls.filter(([path]) => path === torrentRecognitionPath)).toHaveLength(titleReads)
+    expect(vi.mocked(api).mock.calls.filter(([path]) => path === resourceContentPreviewPath)).toHaveLength(contentReads)
+    queue.acceptManual('later', { ...title(1), manual_override: true })
+    await flushPromises()
+    expect(queue.libraryStates.value.later?.label).toBe('已入库')
     slow.resolve(preview('cloud')); await flushPromises()
   })
 
@@ -63,7 +77,7 @@ describe('independent title, cloud, torrent, magnet and coverage lanes', () => {
 
   it('preserves filename and episode facts when title identification fails, and retries content independently', async () => {
     let contentReads = 0
-    vi.mocked(api).mockImplementation(path => path === torrentRecognitionPath ? Promise.reject(new Error('TMDB unavailable')) : Promise.resolve(preview(`read-${++contentReads}`)))
+    vi.mocked(api).mockImplementation(path => path === torrentRecognitionPath ? Promise.reject(new Error('TMDB unavailable')) : ++contentReads === 1 ? Promise.resolve(preview('first')) : Promise.reject(new Error('读取暂不可用')))
     const { items, queue } = setup()
     items.value = [item('one')]
     await flushPromises()
@@ -73,6 +87,8 @@ describe('independent title, cloud, torrent, magnet and coverage lanes', () => {
     queue.retryContent('one')
     await flushPromises()
     expect(contentReads).toBe(2)
+    expect(queue.contentPreviews.value.one?.token).toBe('content-first')
+    expect(queue.contentErrors.value.one).toBe('读取暂不可用')
     expect(vi.mocked(api).mock.calls.filter(([path]) => path === torrentRecognitionPath)).toHaveLength(1)
   })
 
@@ -104,6 +120,9 @@ describe('independent title, cloud, torrent, magnet and coverage lanes', () => {
     await nextTick(); await Promise.resolve(); await Promise.resolve()
     expect(queue.inspectingTokens.value.sort()).toEqual(['a', 'b'])
     await vi.advanceTimersByTimeAsync(65000)
+    expect(queue.contentErrors.value.a).toBeUndefined()
+    expect(queue.inspectingTokens.value.sort()).toEqual(['a', 'b'])
+    await vi.advanceTimersByTimeAsync(40000)
     expect(queue.contentErrors.value.a).toContain('超时')
     expect(physicalReads).toBe(2)
     for (const token of ['reset-one', 'reset-two']) {

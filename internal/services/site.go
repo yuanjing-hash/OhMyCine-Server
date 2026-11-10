@@ -32,7 +32,7 @@ import (
 )
 
 const (
-	ptResultTTL                     = 15 * time.Minute
+	ptResultTTL                     = 30 * time.Minute
 	maxPTResultClaims               = 5000
 	pluginResourceClaimCleanupBatch = 512
 	defaultSiteSearchConcurrency    = 4

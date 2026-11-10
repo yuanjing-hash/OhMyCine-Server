@@ -36,6 +36,8 @@ func TestPanSouIdentitySnapshotFreezesAliasesAndPages(t *testing.T) {
 	}))
 	defer panSou.Close()
 	s, _, actor, store, _, _ := siteFixture(t)
+	now := time.Now().UTC()
+	s.now = func() time.Time { return now }
 	receiver, _, _ := seedPanSouReceiver(t, s, models.ConnectionProviderQuark)
 	metadata := NewMetadataSettingsService(s.db, s.audit, store, tmdb.Credential{Kind: tmdb.CredentialKindReadAccessToken, Value: "fixture"})
 	metadata.clientFactory = func(tmdb.Credential, string, string) (*tmdb.Client, error) {
@@ -85,6 +87,7 @@ func TestPanSouIdentitySnapshotFreezesAliasesAndPages(t *testing.T) {
 	limiter := rate.NewLimiter(rate.Every(time.Hour), 1)
 	limiter.Allow()
 	s.limits[record.ID] = &siteLimiter{revision: record.Revision, limiter: limiter}
+	now = now.Add(16 * time.Minute)
 	input.Page = 2
 	input.SnapshotID = first.Groups[0].SnapshotID
 	second, err := s.SearchMediaIdentity(context.Background(), actor, input)

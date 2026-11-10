@@ -62,6 +62,7 @@ type MediaCoverageCounts struct {
 
 type MediaCoverageSeason struct {
 	SeasonNumber int                    `json:"season_number"`
+	Finished     bool                   `json:"finished"`
 	Name         string                 `json:"name"`
 	PosterURL    string                 `json:"poster_url,omitempty"`
 	Special      bool                   `json:"special"`
@@ -74,6 +75,7 @@ type MediaCoverageSeason struct {
 type MediaCoverage struct {
 	MediaType string                 `json:"media_type"`
 	TMDBID    int64                  `json:"tmdb_id"`
+	PosterRef string                 `json:"poster_ref,omitempty"`
 	Title     string                 `json:"title"`
 	Status    string                 `json:"status"`
 	Libraries []MediaCoverageLibrary `json:"libraries"`
@@ -120,6 +122,7 @@ func (s *MediaCoverageService) Coverage(ctx context.Context, actor Actor, mediaT
 		return MediaCoverage{}, err
 	}
 	result := MediaCoverage{MediaType: mediaType, TMDBID: tmdbID, Title: verified.Title, Status: "unknown", Libraries: libraries, Freshness: MediaCoverageFreshness{CheckedAt: s.now(), LibraryScanState: scanState, TMDBState: "complete"}}
+	result.PosterRef = catalogImageURLWithClient(client, verified.Snapshot.PosterPath, "w500")
 	if mediaType == "movie" {
 		ids := uniqueEntryLibraries(entries, nil, nil)
 		result.Movie = &struct {
@@ -261,6 +264,7 @@ func (s *MediaCoverageService) Coverage(ctx context.Context, actor Actor, mediaT
 			projection.uncertainty.Metadata += missingFacts
 			result.Freshness.TMDBState = "partial"
 		}
+		projection.Finished = coverageSeasonFinished(verified.Snapshot, season, seasonEpisodes[index], seasonErrors[index], s.now())
 		projection.Status = coverageSeasonStatus(projection.Counts)
 		tv.Seasons = append(tv.Seasons, projection)
 		if !projection.Special {
@@ -271,6 +275,30 @@ func (s *MediaCoverageService) Coverage(ctx context.Context, actor Actor, mediaT
 	result.Status = coverageSeasonStatus(tv.Counts)
 	normalizeMediaCoverageCollections(&result)
 	return result, nil
+}
+
+// A complete current episode list does not establish that an ongoing season
+// has finished. Require ended-series or later-season evidence as well as the
+// provider's complete declared list and known past air dates.
+func coverageSeasonFinished(series tmdb.Snapshot, season tmdb.SeasonSnapshot, episodes []tmdb.EpisodeSnapshot, failed bool, now time.Time) bool {
+	if failed || season.EpisodeCount <= 0 || len(episodes) != season.EpisodeCount {
+		return false
+	}
+	finished := strings.EqualFold(series.Status, "Ended") || strings.EqualFold(series.Status, "Canceled")
+	for _, other := range series.Seasons {
+		finished = finished || (season.SeasonNumber > 0 && other.SeasonNumber > season.SeasonNumber)
+	}
+	if !finished {
+		return false
+	}
+	seen := make(map[int]bool, len(episodes))
+	for _, episode := range episodes {
+		if episode.EpisodeNumber <= 0 || episode.EpisodeNumber > season.EpisodeCount || seen[episode.EpisodeNumber] || coverageAirDateState(episode.AirDate, now) != "aired" {
+			return false
+		}
+		seen[episode.EpisodeNumber] = true
+	}
+	return true
 }
 
 func normalizeMediaCoverageCollections(result *MediaCoverage) {

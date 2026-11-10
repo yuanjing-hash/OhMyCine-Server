@@ -283,7 +283,7 @@ func (a *API) CancelDownloadPipeline(c *gin.Context) {
 		writeError(c, a.log, err)
 		return
 	}
-	success(c, http.StatusOK, gin.H{"cancelled": true, "provider_data_retained": true})
+	success(c, http.StatusOK, gin.H{"cancelled": true, "provider_data_retained": true, "control_pending": a.downloads.ControlPending(id)})
 }
 
 func (a *API) DownloadRecognitionCandidates(c *gin.Context) {

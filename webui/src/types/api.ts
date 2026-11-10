@@ -411,6 +411,7 @@ export interface AIRecognitionSettings {
 export interface AIProviderModel { id: string; display_name: string }
 export interface DownloadTaskSummary {
   wait_reason?: { code: string; message: string }
+  control_pending?: boolean
   id: string; job_id: string; owner_id: number; downloader_id: string | null; downloader_name: string; provider_type: string
   display_name: string; job_status: string; provider_status: string; phase: string; progress: number | null
   bytes_completed: number | null; bytes_total: number | null; download_speed: number | null; upload_speed: number | null

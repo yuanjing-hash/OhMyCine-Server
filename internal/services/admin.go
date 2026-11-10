@@ -13,6 +13,7 @@ import (
 
 type AdminService struct {
 	catalogStore *CatalogSnapshotStore
+	metadata     *MetadataSettingsService
 	db           *gorm.DB
 	authz        *AuthorizationService
 	auth         *AuthService
@@ -21,6 +22,10 @@ type AdminService struct {
 
 func NewAdminService(db *gorm.DB, authorization *AuthorizationService, auth *AuthService, audit *AuditService) *AdminService {
 	return &AdminService{db: db, authz: authorization, auth: auth, audit: audit}
+}
+
+func (s *AdminService) SetMetadataSettingsService(metadata *MetadataSettingsService) {
+	s.metadata = metadata
 }
 
 type RoleSummary struct {

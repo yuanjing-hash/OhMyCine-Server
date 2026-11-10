@@ -106,7 +106,13 @@ Server 同源 Web 管理端使用用户名密码登录，建立可撤销的服�
 
 所有 Cookie 认证的状态变更请求还必须校验 session-bound `X-CSRF-Token`、浏览器同源信息和 `application/json`。浏览器的 `Sec-Fetch-Site: same-origin` 自动建立同源证据，兼容 HTTPS 反代终止 TLS 与后端 Host 改写；`cross-site` 始终拒绝，`same-site` 不整体信任兄弟子域。缺少同源 Fetch Metadata 时，严格解析 `Origin`（缺省时允许 `Referer` fallback），与实际请求 `Host` 的完整主机和端口比较，或匹配显式配置来源；缺失、`null`、畸形和重复来源均不因此获准。实时通知 WebSocket 升级复用同一规则并要求有效 Cookie 会话，不因 GET 而跳过来源检查。反代应保留浏览器来源头及原始 Host，不通过 `Forwarded`/`X-Forwarded-*` 自动扩展信任。CSRF token 只保存在前端内存，不进入 URL、日志或持久化存储。
 
-持久化任务队列的 worker payload/checkpoint 属于私有执行状态，不进入 REST、WebSocket、日志或审计。写入前限制为 64 KiB JSON 对象，并递归拒绝 Authorization、Cookie、password、secret、token、passkey、credential、签名 URL 与本地/绝对路径形态的字段。租约只持久化随机 token 的 SHA-256；所有 heartbeat、checkpoint 和完成操作都必须持有当前未过期 token。运行中暂停/取消先在短事务内持久化中断意图，事务提交后才通知 worker，且在 worker确认或租约过期前继续占用并发槽，避免非协作 worker 造成超卖。下载流水线取消必须二次确认并先调用 provider `Cancel(taskID, false)` 删除任务、保留文件；成功或明确 task-not-found 后才把 DownloadTask 与相关 Job 标记为 cancelled 并释放 Follow claim。终态删除默认也使用 `delete_data=false`，只有用户显式勾选完全删除才传 `true` 删除源/临时文件。provider 不可用、返回不确定错误或 ProviderTaskID 已存在但 Downloader 配置缺失时，必须保留本地记录；Submit 在取消后返回的迟到 provider ID 必须先持久化再用独立有界上下文清理，失败留下可诊断重试事实，不得仅为清空界面而伪造成功。
+持久化任务队列的 worker payload/checkpoint 属于私有执行状态，不进入 REST、WebSocket、日志或审计。写入前限制为 64 KiB JSON 对象，并递归拒绝 Authorization、Cookie、password、secret、token、passkey、credential、签名 URL 与本地/绝对路径形态的字段。租约只持久化随机 token 的 SHA-256。所有 heartbeat、checkpoint 和完成操作都必须持有当前未过期 token。运行中暂停/取消先在短事务内持久化中断意图，事务提交后才通知 worker，且在 worker 确认或租约过期前继续占用并发槽，避免非协作 worker 造成超卖。
+
+已确认 provider 任务身份的流水线取消须经二次确认，先调用原 provider 的 `Cancel(taskID, false)` 删除任务并保留文件。成功或明确 task-not-found 后才把 DownloadTask 与相关 Job 标记为 cancelled 并释放 Follow claim。provider 不可用、结果仍不确定或原 Downloader 配置缺失时保留本地记录和可重试事实。终态删除默认使用 `delete_data=false`。`delete_data=true` 仅在用户显式勾选完全删除、已确认原任务身份并通过既有源/临时文件所有权校验后执行。
+
+Submit 已进入而原 provider 身份尚待核对时，取消接受持久控制意图。私有原 Job payload 中的意图绑定原 DownloadTask、owner 和 Job，DownloadTask 即刻进入 cancelled 历史并停止后续识别、整理与入库，公开摘要以 `control_pending` 表明云端仍在收尾。移除记录通过现有 `HistoryClearedAt` 隐藏 DownloadTask 与原 Job，后台继续保留加密来源、原操作收据及未结算的资源和剧集占用。未知所有权期间的删除数据请求仍需等待确认。
+
+原 Submit 保有物理租约直到返回，迟到的 provider ID 先持久化，再以独立有界上下文执行 `Cancel(false)`。重启后沿原 operation scope、账号、资源摘要和冻结目录，通过可选通用 `SubmissionReconciler` 读取原收据。该只读能力仅核对原操作，确认身份后复用已知 ID 的取消流程。清理失败或证据不足保持每分钟有界等待，保留原占用，结算后释放 Follow claim。最终租约提交重新读取持久意图，延迟事件、列表和仪表盘聚合均遵守隐藏标记。
 
 115 分享链接与提取码具有访问凭据属性，只能进入按 DownloadTask purpose/AAD 隔离的 AES-256-GCM source envelope；`provider_item` 是 Server 内部来源，HTTP 客户端不得提交。分享明文、密文、provider item/directory ID、Cookie、完整 provider 路径和原始上游响应不得进入 Job payload/checkpoint、REST DTO、WebSocket、审计、运行日志或导出。分享与手工转存接管目录必须由绑定 actor、Connection、Storage、Storage 根、用途和过期时间的短期令牌选择，并在保存、提交、sweep、worker 与删除前重新验证 ancestry；下载目录不能与最终媒体库根或同 Connection 其它启用监听目录重叠。生活事件只用于唤醒受限的权威目录枚举，不能直接证明某个文件已经完整落盘。普通取消只删除 provider 任务并保留内容；只有显式完全删除且重新证明 OMC-owned `omc-*`/adopted item 边界后，才能回收对应 provider 子树。
 

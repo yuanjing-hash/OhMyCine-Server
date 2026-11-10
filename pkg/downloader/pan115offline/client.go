@@ -91,6 +91,27 @@ func (c *Client) Submit(ctx context.Context, request downloader.SubmitRequest) (
 	return mapTask(task), nil
 }
 
+// ReconcileSubmission inspects the original task directory and operation only.
+// Missing/unsupported evidence remains pending; it never enters Submit.
+func (c *Client) ReconcileSubmission(ctx context.Context, request downloader.SubmitRequest) (downloader.Task, error) {
+	resolver, ok := c.driver.(cloud.OfflineSubmissionReconciler)
+	if !ok || request.Source.Kind != downloader.SourceURL || request.Source.ContentSelection != nil || !validTaskTag(request.Tag) {
+		return downloader.Task{}, downloader.Error("downloader_submission_reconcile_unsupported", true, nil)
+	}
+	sourceURL := strings.TrimSpace(request.Source.URL)
+	if !strings.HasPrefix(strings.ToLower(sourceURL), "magnet:") {
+		return downloader.Task{}, downloader.Error("downloader_submission_reconcile_unsupported", true, nil)
+	}
+	ctx, err := c.taskOperationContext(ctx, request.Tag)
+	if err != nil {
+		return downloader.Task{}, err
+	}
+	// The original receipt supplies the exact submitted directory. Looking up
+	// today's configured parent could attach cleanup to a different namespace.
+	task, err := resolver.ReconcileOfflineSubmission(ctx, sourceURL, "")
+	return mapTask(task), mapError(err)
+}
+
 const (
 	shareTaskPrefix  = "share:"
 	ingestTaskPrefix = "ingest:"
