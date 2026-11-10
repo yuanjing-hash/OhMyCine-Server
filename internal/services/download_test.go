@@ -21,27 +21,29 @@ import (
 )
 
 type stubDownloadClient struct {
-	mu          sync.Mutex
-	gets        int
-	getCalls    int
-	submits     int
-	source      downloadpkg.Source
-	paused      bool
-	resumed     bool
-	cancelled   bool
-	deleteData  bool
-	cancelErr   error
-	cancelIDs   []string
-	cancelHook  func(string)
-	getErr      error
-	getErrors   []error
-	seedTask    *downloadpkg.Task
-	cleanupErr  error
-	cleanupHook func(string)
-	deletedTags []string
-	submitWait  <-chan struct{}
-	submitSeen  chan<- struct{}
-	submitErr   error
+	mu           sync.Mutex
+	gets         int
+	getCalls     int
+	submits      int
+	source       downloadpkg.Source
+	paused       bool
+	resumed      bool
+	cancelled    bool
+	deleteData   bool
+	cancelErr    error
+	cancelIDs    []string
+	cancelHook   func(string)
+	getErr       error
+	getErrors    []error
+	seedTask     *downloadpkg.Task
+	cleanupErr   error
+	cleanupHook  func(string)
+	deletedTags  []string
+	submitWait   <-chan struct{}
+	submitSeen   chan<- struct{}
+	submitErr    error
+	reconcileErr error
+	reconciles   int
 }
 
 type downloadProviderDiagnosticError struct{}
@@ -154,6 +156,19 @@ func (c *stubDownloadClient) Submit(_ context.Context, request downloadpkg.Submi
 	}
 	return downloadpkg.Task{ID: "provider-hash", Status: "downloading"}, nil
 }
+func (c *stubDownloadClient) ReconcileSubmission(_ context.Context, request downloadpkg.SubmitRequest) (downloadpkg.Task, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.reconciles++
+	if c.reconcileErr != nil {
+		return downloadpkg.Task{}, c.reconcileErr
+	}
+	if request.Source.URL != c.source.URL {
+		return downloadpkg.Task{}, errors.New("reconciliation source changed")
+	}
+	return downloadpkg.Task{ID: "provider-hash", Status: "downloading"}, nil
+}
+
 func (c *stubDownloadClient) Get(context.Context, string) (downloadpkg.Task, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -1125,29 +1140,29 @@ func TestCancelPipelineAfterProviderCompletionRetainsFilesAndReleasesFollowClaim
 
 func TestCancelPipelineCleansUpProviderTaskThatArrivesAfterSubmitRace(t *testing.T) {
 	for _, test := range []struct {
-		name      string
-		cancelErr error
-		submitErr error
+		name                 string
+		cancelErr, submitErr error
 	}{
-		{name: "provider cancel succeeds"},
-		{name: "provider cancel fails", cancelErr: downloadpkg.Error("downloader_unavailable", true, errors.New("offline"))},
-		{name: "submission remains unknown", submitErr: downloadpkg.Error("downloader_submit_unknown", true, cloudpkg.Error(cloudpkg.CodeMutationUnknown, true, nil))},
+		{name: "late accepted identity"},
+		{name: "late cleanup retries", cancelErr: downloadpkg.Error("downloader_unavailable", true, nil)},
+		{name: "unknown submission survives restart and removal", submitErr: downloadpkg.Error("downloader_submit_unknown", true, cloudpkg.Error(cloudpkg.CodeMutationUnknown, true, nil))},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			downloads, downloaders, queue, actor, client := downloadFixture(t)
+			clock := &fakeQueueClock{now: time.Now().UTC()}
+			queue.SetClock(clock)
 			actor.Permissions[authz.PermissionJobsControlOwn] = struct{}{}
 			root := t.TempDir()
-			storage := models.Storage{Name: "Submit race " + test.name, NameNormalized: "submit race " + test.name, Type: models.StorageTypeLocal, RootPath: root, RootPathNormalized: strings.ToLower(root), Enabled: true, Capabilities: `{}`, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()}
+			storage := models.Storage{Name: "Submit race", NameNormalized: "submit race", Type: models.StorageTypeLocal, RootPath: root, RootPathNormalized: strings.ToLower(root), Enabled: true, Capabilities: `{}`, CreatedAt: clock.now, UpdatedAt: clock.now}
 			if err := queue.db.Create(&storage).Error; err != nil {
 				t.Fatal(err)
 			}
 			configureDownloadStaging(t, queue, storage.ID)
-			provider, err := downloaders.Create(actor, DownloaderInput{Name: "Submit race qBit " + test.name, Type: models.DownloaderTypeQBittorrent, BaseURL: "http://qbit.example.test", Enabled: true}, RequestContext{})
+			provider, err := downloaders.Create(actor, DownloaderInput{Name: "Submit race qBit", Type: models.DownloaderTypeQBittorrent, BaseURL: "http://qbit.example.test", Enabled: true}, RequestContext{})
 			if err != nil {
 				t.Fatal(err)
 			}
-			now := time.Now().UTC()
-			subscription := models.FollowSubscription{ID: "pending-submit-follow", OwnerID: actor.User.ID, MediaType: "tv", TMDBID: 1, Title: "Pending submit", Status: models.FollowStatusActive, Revision: 1, LifecycleRevision: 1, ExecutionSnapshotJSON: `{}`, CreatedAt: now, UpdatedAt: now}
+			subscription := models.FollowSubscription{ID: "pending-submit-follow", OwnerID: actor.User.ID, MediaType: "tv", TMDBID: 1, Title: "Pending submit", Status: models.FollowStatusActive, Revision: 1, LifecycleRevision: 1, ExecutionSnapshotJSON: `{}`, CreatedAt: clock.now, UpdatedAt: clock.now}
 			if err := queue.db.Create(&subscription).Error; err != nil {
 				t.Fatal(err)
 			}
@@ -1155,116 +1170,151 @@ func TestCancelPipelineCleansUpProviderTaskThatArrivesAfterSubmitRace(t *testing
 			if err != nil {
 				t.Fatal(err)
 			}
-			episodeClaim := models.FollowEpisodeClaim{SubscriptionID: subscription.ID, SeasonNumber: 1, EpisodeNumber: 2, State: "downloading", DownloadTaskID: &created.ID, ResourceFingerprint: "pending-resource", UpdatedAt: now}
-			if err := queue.db.Create(&episodeClaim).Error; err != nil {
+			claim := models.FollowEpisodeClaim{SubscriptionID: subscription.ID, SeasonNumber: 1, EpisodeNumber: 2, State: "downloading", DownloadTaskID: &created.ID, ResourceFingerprint: "pending-resource", UpdatedAt: clock.now}
+			if err := queue.db.Create(&claim).Error; err != nil {
 				t.Fatal(err)
 			}
 			claimed, err := queue.Claim([]string{"download"})
 			if err != nil || claimed == nil {
 				t.Fatalf("claim=%+v err=%v", claimed, err)
 			}
-			submitSeen := make(chan struct{}, 1)
-			submitWait := make(chan struct{})
-			client.submitSeen = submitSeen
-			client.submitWait = submitWait
-			client.cancelErr = test.cancelErr
-			client.submitErr = test.submitErr
-			var releaseSubmit sync.Once
-			unblock := func() { releaseSubmit.Do(func() { close(submitWait) }) }
+			submitSeen, submitWait := make(chan struct{}, 1), make(chan struct{})
+			client.submitSeen, client.submitWait, client.cancelErr, client.submitErr = submitSeen, submitWait, test.cancelErr, test.submitErr
+			var release sync.Once
+			unblock := func() { release.Do(func() { close(submitWait) }) }
 			defer unblock()
-			workerCtx, cancelWorker := context.WithCancel(context.Background())
-			defer cancelWorker()
-			queue.SetInterrupt(func(string, string) { cancelWorker() })
 			worker := NewDownloadWorker(downloads)
 			resultCh := make(chan WorkerResult, 1)
 			go func() {
-				resultCh <- worker.Run(workerCtx, workerRuntime{queue: queue, job: *claimed}, *claimed)
+				resultCh <- worker.Run(context.Background(), workerRuntime{queue: queue, job: *claimed}, *claimed)
 			}()
 			select {
 			case <-submitSeen:
 			case <-time.After(2 * time.Second):
-				t.Fatal("provider submit did not start")
+				t.Fatal("submit did not start")
 			}
 			assertHeld := func() {
 				t.Helper()
-				var held models.FollowEpisodeClaim
-				var pending models.DownloadTask
-				if err := queue.db.First(&held, "subscription_id = ? AND season_number = ? AND episode_number = ?", subscription.ID, 1, 2).Error; err != nil || held.DownloadTaskID == nil || *held.DownloadTaskID != created.ID || held.State != "downloading" {
-					t.Fatalf("unconfirmed submission released its episode: claim=%+v err=%v", held, err)
+				followWorker := NewFollowSearchWorker(NewFollowService(queue.db, queue.audit, queue, nil, nil), nil)
+				remaining, err := followWorker.excludeClaimedDownloads(context.Background(), subscription.ID, map[[2]int]struct{}{{1, 2}: {}})
+				if err != nil || len(remaining) != 0 {
+					t.Fatalf("Follow made an unresolved original episode eligible again: %+v %v", remaining, err)
 				}
-				if err := queue.db.First(&pending, "id = ?", created.ID).Error; err != nil || pending.Phase == models.DownloadTaskStatusCancelled {
-					t.Fatalf("unconfirmed submission was terminally cancelled: task=%+v err=%v", pending, err)
+				var held models.FollowEpisodeClaim
+				if err := queue.db.First(&held, "subscription_id=? AND season_number=1 AND episode_number=2", subscription.ID).Error; err != nil || held.DownloadTaskID == nil || *held.DownloadTaskID != created.ID || held.State != "downloading" {
+					t.Fatalf("original reservation lost: %+v %v", held, err)
+				}
+				if !downloads.ControlPending(created.ID) {
+					t.Fatal("accepted cancel did not retain pending cleanup")
 				}
 			}
-			for _, control := range []func() error{
-				func() error {
-					return downloads.CancelPipeline(context.Background(), actor, created.ID, RequestContext{})
-				},
-				func() error { return worker.Interrupt(context.Background(), *claimed, "cancel") },
-			} {
-				err := control()
-				if code, retryable := downloadpkg.ErrorInfo(err); ErrorCode(err) != "downloader_submission_unconfirmed" || code != "downloader_submission_unconfirmed" || !retryable {
-					t.Fatalf("unconfirmed control=%v code=%s retryable=%v", err, code, retryable)
+			if err := downloads.CancelPipeline(context.Background(), actor, created.ID, RequestContext{}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := queue.Control(actor, created.JobID, "cancel", RequestContext{}); err != nil {
+				t.Fatal("repeat queue cancellation", err)
+			}
+			assertHeld()
+			history, _, err := downloads.ListScoped(actor, DownloadListScopeHistory, 20)
+			if err != nil || len(history) != 1 || !history[0].ControlPending || history[0].Phase != models.DownloadTaskStatusCancelled {
+				t.Fatalf("cancelled pending history=%+v err=%v", history, err)
+			}
+			restricted := actor
+			restricted.ResourceAccessPolicies = map[string]ResourceAccessPolicy{models.ResourceAccessScopeDownloaderUse: {Mode: models.ResourceAccessModeAllowlist}}
+			history, _, err = downloads.ListScoped(restricted, DownloadListScopeHistory, 20)
+			if err != nil || len(history) != 1 || !history[0].ControlPending || history[0].DownloaderID != nil {
+				t.Fatalf("restricted pending lifecycle was lost or exposed provider details: %+v %v", history, err)
+			}
+			if test.submitErr != nil {
+				if err := downloads.Delete(context.Background(), actor, created.ID, true, RequestContext{}); ErrorCode(err) != "downloader_submission_unconfirmed" {
+					t.Fatal("unknown deletion may delete files", err)
+				}
+				if err := downloads.Delete(context.Background(), actor, created.ID, false, RequestContext{}); err != nil {
+					t.Fatal(err)
+				}
+				if err := downloads.Delete(context.Background(), actor, created.ID, false, RequestContext{}); err != nil {
+					t.Fatal("repeat record removal", err)
+				}
+				rows, total, err := downloads.ListScoped(actor, DownloadListScopeAll, 20)
+				if err != nil || total != 0 || len(rows) != 0 {
+					t.Fatalf("hidden record visible: %+v %v", rows, err)
+				}
+				if _, err := queue.Get(actor, created.JobID); err == nil {
+					t.Fatal("private reconcile job exposed")
 				}
 				assertHeld()
 			}
 			unblock()
-			if test.submitErr != nil {
-				result := <-resultCh
-				if result.ErrorCode != "downloader_submit_unknown" || result.RetryAt == nil {
-					t.Fatalf("unknown submission lost retry recovery: %+v", result)
-				}
-				if err := downloads.CancelPipeline(context.Background(), actor, created.ID, RequestContext{}); ErrorCode(err) != "downloader_submission_unconfirmed" {
-					t.Fatal("unknown submission was treated as not submitted", err)
-				}
-				assertHeld()
-				return
+			result := <-resultCh
+			if result.RetryAt != nil {
+				err = queue.RetryLater(claimed.Job.ID, claimed.LeaseToken, result.ErrorCode, result.ErrorMessage, *result.RetryAt)
+			} else if result.ErrorCode != "" {
+				err = queue.Fail(claimed.Job.ID, claimed.LeaseToken, result.ErrorCode, result.ErrorMessage)
+			} else {
+				err = queue.Complete(claimed.Job.ID, claimed.LeaseToken)
 			}
-			deadline := time.Now().Add(2 * time.Second)
-			var task models.DownloadTask
-			for {
-				if err := queue.db.First(&task, "id = ?", created.ID).Error; err != nil {
-					t.Fatal(err)
-				}
-				if task.ProviderTaskID != "" {
-					break
-				}
-				if time.Now().After(deadline) {
-					t.Fatal("late provider identity did not reach original worker")
-				}
-				time.Sleep(5 * time.Millisecond)
+			if err != nil {
+				t.Fatal(err)
 			}
-			if err := downloads.CancelPipeline(context.Background(), actor, created.ID, RequestContext{}); test.cancelErr != nil {
-				if ErrorCode(err) != CodeDownloaderUnavailable {
-					t.Fatal("provider refusal was not preserved", err)
-				}
+			if test.cancelErr != nil || test.submitErr != nil {
 				assertHeld()
 				client.mu.Lock()
 				client.cancelErr = nil
+				client.reconcileErr = downloadpkg.Error("downloader_submission_unconfirmed", true, nil)
 				client.mu.Unlock()
-				if err := downloads.CancelPipeline(context.Background(), actor, created.ID, RequestContext{}); err != nil {
-					t.Fatal(err)
+				// Restarted workers only query the original source. More than the
+				// ordinary failure budget must neither Submit nor release its claim.
+				rounds := 1
+				if test.submitErr != nil {
+					rounds = 5
 				}
-			} else if err != nil {
-				t.Fatal(err)
-			}
-			if result := <-resultCh; result.ErrorCode != "" {
-				t.Fatalf("cancelled original worker=%+v", result)
+				for n := 0; n < rounds; n++ {
+					clock.now = clock.now.Add(2 * time.Minute)
+					if err := queue.PromoteDueRetries(); err != nil {
+						t.Fatal(err)
+					}
+					next, err := queue.Claim([]string{"download"})
+					if err != nil || next == nil {
+						t.Fatalf("private recovery not scheduled: %+v %v", next, err)
+					}
+					if n == rounds-1 {
+						client.mu.Lock()
+						client.reconcileErr = nil
+						client.mu.Unlock()
+					}
+					restarted := NewDownloadWorker(downloads)
+					recovered := restarted.Run(context.Background(), workerRuntime{queue: queue, job: *next}, *next)
+					if recovered.RetryAt != nil {
+						err = queue.RetryLater(next.Job.ID, next.LeaseToken, recovered.ErrorCode, recovered.ErrorMessage, *recovered.RetryAt)
+					} else if recovered.ErrorCode == "" {
+						err = queue.Complete(next.Job.ID, next.LeaseToken)
+					} else {
+						t.Fatalf("unexpected recovery %+v", recovered)
+					}
+					if err != nil {
+						t.Fatal(err)
+					}
+					if n < rounds-1 {
+						assertHeld()
+					}
+				}
 			}
 			client.mu.Lock()
-			cancelled, deleteData := client.cancelled, client.deleteData
+			cancelled, deleteData, submits := client.cancelled, client.deleteData, client.submits
 			client.mu.Unlock()
-			if !cancelled || deleteData {
-				t.Fatalf("late provider cleanup cancelled=%v deleteData=%v", cancelled, deleteData)
+			if !cancelled || deleteData || submits != 1 {
+				t.Fatalf("cleanup cancelled=%v deleteData=%v submissions=%d", cancelled, deleteData, submits)
 			}
-			if err := queue.db.First(&task, "id = ?", created.ID).Error; err != nil {
-				t.Fatal(err)
+			var task models.DownloadTask
+			if err := queue.db.First(&task, "id=?", created.ID).Error; err != nil || task.Phase != models.DownloadTaskStatusCancelled || task.ProviderTaskID != "provider-hash" || task.LastErrorCode != "" {
+				t.Fatalf("cancelled task=%+v err=%v", task, err)
 			}
-			if task.Phase != models.DownloadTaskStatusCancelled || task.ProviderTaskID != "provider-hash" || task.LastErrorCode != "" {
-				t.Fatalf("task=%+v", task)
+			if err := queue.db.First(&claim, "subscription_id=? AND season_number=1 AND episode_number=2", subscription.ID).Error; err != nil || claim.State != "failed" || claim.DownloadTaskID != nil {
+				t.Fatalf("settled claim=%+v err=%v", claim, err)
 			}
-			if err := queue.db.First(&episodeClaim, "subscription_id = ? AND season_number = ? AND episode_number = ?", subscription.ID, 1, 2).Error; err != nil || episodeClaim.State != "failed" || episodeClaim.DownloadTaskID != nil {
-				t.Fatalf("confirmed cleanup did not release episode: claim=%+v err=%v", episodeClaim, err)
+			var job models.Job
+			if err := queue.db.First(&job, "id=?", created.JobID).Error; err != nil || job.Status != models.JobStatusCancelled || job.FailureRetryCount != 0 {
+				t.Fatalf("cleanup job=%+v err=%v", job, err)
 			}
 		})
 	}

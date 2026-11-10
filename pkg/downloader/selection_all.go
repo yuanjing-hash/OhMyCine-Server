@@ -47,18 +47,38 @@ func (c *verifiedAllClient) Manifest(ctx context.Context, id string) (Manifest, 
 	return Manifest{}, Error("downloader_manifest_unsupported", false, nil)
 }
 
-func (c *verifiedAllClient) Submit(ctx context.Context, r SubmitRequest) (Task, error) {
+func (c *verifiedAllClient) ordinaryRequest(r SubmitRequest) (SubmitRequest, error) {
 	if !VerifiedAllSource(r.Source) {
-		return Task{}, Error("downloader_selection_invalid", false, nil)
+		return SubmitRequest{}, Error("downloader_selection_invalid", false, nil)
 	}
 	a, _ := c.source.ContentSelection.Digest()
 	b, _ := r.Source.ContentSelection.Digest()
 	if a != b || c.source.URL != r.Source.URL {
-		return Task{}, Error("downloader_selection_invalid", false, nil)
+		return SubmitRequest{}, Error("downloader_selection_invalid", false, nil)
 	}
 	r.Source.ContentSelection = nil
 	r.Source.AllFilesVerified = false
 	r.Source.Torrent = nil
 	r.MetadataOnly = false
+	return r, nil
+}
+
+func (c *verifiedAllClient) Submit(ctx context.Context, r SubmitRequest) (Task, error) {
+	r, err := c.ordinaryRequest(r)
+	if err != nil {
+		return Task{}, err
+	}
 	return c.Client.Submit(ctx, r)
+}
+
+func (c *verifiedAllClient) ReconcileSubmission(ctx context.Context, r SubmitRequest) (Task, error) {
+	r, err := c.ordinaryRequest(r)
+	if err != nil {
+		return Task{}, err
+	}
+	resolver, ok := c.Client.(SubmissionReconciler)
+	if !ok {
+		return Task{}, Error("downloader_submission_reconcile_unsupported", true, nil)
+	}
+	return resolver.ReconcileSubmission(ctx, r)
 }

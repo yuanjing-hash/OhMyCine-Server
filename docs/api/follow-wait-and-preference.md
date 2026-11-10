@@ -137,3 +137,36 @@ For explicit `transfer_first`, potential share-producing Sites are queried befor
 The shared authorized route choice adds `can_try_without_seeders`, projected from the local executor registry rather than a provider test or type-name branch in Follow. Only enabled choices with this capability may bypass the public live-swarm minimum. Ineligible live-swarm choices are removed again during preparation, actual-selection route validation and final serial handoff/fallback. This permits an offline attempt; it does not prove provider availability, acceptance or download completion. Actual file selection remains required.
 
 Existing `seeders` remains the compatibility rejection count. Additional safe reasons distinguish `seeders_zero`, `seeders_unknown`, `seeders_zero_offline` and `seeders_unknown_offline`. `share_results` counts returned share observations including aliases, `share_candidates` counts eligible deduplicated share candidates, and `share_checks_started` counts entered share preparations. A zero count does not by itself prove the configured upstream has no shares: current Site type policy, authorized usable receiver association, actual query completion, returned data and deferred inspection are separate facts. Aggregate title samples do not establish whether entries share one resource identity.
+
+## Completion and current subscriptions
+
+The optional list filter `status=current` includes active, paused and blocked
+subscriptions. An omitted filter retains the historical all-status view. The
+summary adds `caught_up`, based on the saved known-aired target and actual
+present counts. Ongoing series remain active when currently caught up.
+
+A subscription becomes `completed` only when every selected season has a
+complete official episode list, finished-season evidence and actual complete
+catalog coverage. Ended/canceled series or a later officially declared season
+can establish that a selected season finished. Future dates, unavailable facts
+and truncated lists keep it active. Completed subscriptions have no
+`next_run_at`, and their managed search schedule is disabled. History remains
+available. A manual check or policy edit uses the existing authorized entrypoint.
+When manual reconciliation returns a completed subscription to active, it
+restores the managed schedule's next check in the same guarded transaction and
+preserves its Cron, timezone and execution policies.
+
+Legacy completed rows with a next check meant currently caught up. List and
+detail reads project these as active unless an authorized enabled target
+catalog proves an ended/canceled selected season is fully present. The legacy
+classification prefix is bounded to 1000 rows and the local metadata lookup to
+two seconds. Unresolved rows remain current until normal worker reconciliation.
+The current/completed filter uses the same captured classification for total,
+paging and row status.
+
+Missing `poster_ref` is filled from the authorized effective catalog using the
+shared discovery image gateway. Normal worker coverage also saves a missing
+poster from its existing verified metadata read. Lists and detail reads do no
+provider calls, preserve a nonempty saved poster and recheck current library
+visibility. Dashboard artwork uses the same configured metadata/image gateway
+as the existing catalog cards.

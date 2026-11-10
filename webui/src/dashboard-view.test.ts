@@ -12,7 +12,7 @@ vi.mock('@/use-job-live-refresh', () => ({ useJobLiveRefresh: () => undefined })
 const reply = (data: unknown) => new Response(JSON.stringify({ code: 0, message: 'success', data }), { headers: { 'Content-Type': 'application/json' } })
 const section = <T,>(list: T[] = []) => ({ status: 'ok', list, has_more: false })
 function task(name: string) { return { id: name, display_name: name, job_type: 'transfer', status: 'running', progress: 0.5, processed_items: 1, total_items: 2 } }
-function activity(name = '') { return { generated_at: '2026-10-26T08:00:00Z', active_tasks: section(name ? [task(name)] : []), waiting_tasks: section(), attention_tasks: section(), recently_added: section([{ library_id: 1, work_id: 'show', title: '最近入库作品', kind: 'series', added_at: '2026-10-25T08:00:00Z', season_count: 1, episode_count: 8 }]), capacities: section([{ id: 1, name: '媒体空间', enabled: true, status: 'not_sampled', free_bytes: null, total_bytes: null, sampled_at: null, checked_at: null }]) } }
+function activity(name = '') { return { generated_at: '2026-10-26T08:00:00Z', active_tasks: section(name ? [task(name)] : []), waiting_tasks: section(), attention_tasks: section(), recently_added: section([{ library_id: 1, work_id: 'show', title: '最近入库作品', kind: 'series', poster_url: '/api/v1/media-artwork/poster/show', added_at: '2026-10-25T08:00:00Z', season_count: 1, episode_count: 8 }]), capacities: section([{ id: 1, name: '媒体空间', enabled: true, status: 'not_sampled', free_bytes: null, total_bytes: null, sampled_at: null, checked_at: null }]) } }
 function calendar() { return { events: [{ id: 'event', subscription_id: 'follow', title: '订阅剧集', season_number: 1, episode_number: 3, air_date: '2026-10-26', library_status: 'present', activity: 'none', schedule_state: 'fresh' }], undated: [], subscriptions: [{ id: 'follow', title: '订阅剧集' }], has_more: false, partial: false, missing_seasons: 0, stale_seasons: 0 } }
 function setup(permissions: PermissionCode[] = Object.values(Permissions)) {
   auth = reactive({ user: { id: 1, display_name: '测试用户', permissions }, can: (code: PermissionCode): boolean => auth.user?.permissions.includes(code) ?? false, canAny: (codes: readonly PermissionCode[]): boolean => codes.some(code => auth.can(code)) })
@@ -36,10 +36,11 @@ function serve(view = activity('入库：测试剧 S01E08'), options: { calendar
   return fetcher
 }
 function render() { return mount(DashboardView, { global: { stubs: { RouterLink: { props: ['to'], template: '<a><slot /></a>' } } } }) }
-afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals() })
+afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.useRealTimers() })
 
 describe('dashboard actual operations and calendar', () => {
   it('shows named running tasks, real recent posters and shared calendar without placeholder cards or history counts', async () => {
+    vi.useFakeTimers()
     setup(); const fetcher = serve(); const wrapper = render(); await flushPromises()
     expect(wrapper.text()).toContain('入库：测试剧 S01E08')
     expect(wrapper.text()).toContain('50%')
@@ -50,6 +51,15 @@ describe('dashboard actual operations and calendar', () => {
     expect(wrapper.text()).not.toContain('待接入')
     expect(wrapper.text()).not.toContain('data owner')
     expect(fetcher.mock.calls.some(([, options]) => (options as RequestInit | undefined)?.method === 'POST')).toBe(false)
+    const poster = wrapper.get('img[alt="最近入库作品 海报"]')
+    expect(poster.attributes('src')).toBe('/api/v1/media-artwork/poster/show')
+    await poster.trigger('error')
+    await vi.advanceTimersByTimeAsync(1000)
+    expect(wrapper.find('img[alt="最近入库作品 海报"]').exists()).toBe(true)
+    await wrapper.get('img[alt="最近入库作品 海报"]').trigger('error')
+    expect(wrapper.text()).toContain('海报暂不可用')
+    await wrapper.findAll('button').find(button => button.text() === '刷新')!.trigger('click'); await flushPromises()
+    expect(wrapper.find('img[alt="最近入库作品 海报"]').exists()).toBe(true)
     wrapper.unmount()
   })
   it('renders calm zero-running state and only samples capacity after an explicit action', async () => {

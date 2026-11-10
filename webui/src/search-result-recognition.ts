@@ -5,7 +5,7 @@ import { torrentRecognitionPath, type TorrentRecognitionResult, type TorrentSear
 import { isCloudContentResult, parseShareContentAnalysis, type ShareContentAnalysis } from '@/share-content'
 import { useResourceContentRecognition } from '@/resource-content-recognition'
 
-type LibraryState = { label: string; detail: string; present: boolean }
+type LibraryState = { label: string; detail: string; present: boolean; retryable?: boolean }
 type Attempt = { controller: AbortController; generation: number; revision: number; cancel: () => void }
 
 const concurrentRecognitions = 2
@@ -58,7 +58,7 @@ export function useSearchResultRecognition(items: Ref<TorrentSearchResult[]>, ca
       const count = value.tv ? `；已入库 ${value.tv.counts.present} 集` : ''
       return { label, detail: `按当前账号可见媒体库判断，依据已扫描内容${count}；作品级状态，不代表该资源版本已存在`, present: value.status === 'present' }
     } catch {
-      return { label: '库内状态暂不可用', detail: '未能读取媒体库状态，请稍后重新检测；不代表未入库', present: false }
+      return { label: '库内状态暂不可用', detail: '未能读取媒体库状态，请稍后重试；不代表未入库', present: false, retryable: true }
     }
   }
 
@@ -112,7 +112,7 @@ export function useSearchResultRecognition(items: Ref<TorrentSearchResult[]>, ca
             ? '库内状态查询超时，请重新检测'
             : isCloudContentResult(item) ? '分享文件读取超时，请重新检测；尚未确认实际集数' : '作品自动识别超时，请重新检测或使用手动检测'
           if (libraryStates.value[item.token]?.label === '正在查询库内状态…') {
-            libraryStates.value[item.token] = { label: '库内状态暂不可用', detail: '查询超时，不代表未入库', present: false }
+            libraryStates.value[item.token] = { label: '库内状态暂不可用', detail: '查询超时，不代表未入库', present: false, retryable: true }
           }
         }
       } finally {
@@ -193,6 +193,20 @@ export function useSearchResultRecognition(items: Ref<TorrentSearchResult[]>, ca
     pump()
   }
 
+  function retryCoverage(token: string) {
+    const item = items.value.find(candidate => candidate.token === token)
+    if (stopped || !item) return false
+    if (item.content_inspection) return modern.retryCoverage(token)
+    const result = recognitions.value[token]
+    const key = coverageKey(result)
+    if (!key || !result || !canReadLibrary()) return false
+    coverage.delete(key)
+    // Reuse the retained identity through the existing bounded owner. No title
+    // or content request is needed to retry only its library coverage.
+    acceptManual(token, result)
+    return true
+  }
+
   function acceptShareAnalysis(token: string, analysis: ShareContentAnalysis) {
     const item = items.value.find(candidate => candidate.token === token)
     const parsed = parseShareContentAnalysis(analysis)
@@ -218,5 +232,5 @@ export function useSearchResultRecognition(items: Ref<TorrentSearchResult[]>, ca
   function dispose() { stopped = true; stopWatch(); modern.dispose(); reset() }
   const titleTokens = computed(() => [...recognizingTokens.value, ...items.value.filter(item => modern.titleTokens.value.some(key => key === `${item.token}:0` || key.startsWith(`${item.token}:`))).map(item => item.token)])
   const inspectingTokens = computed(() => items.value.filter(item => modern.inspectingTokens.value.some(key => key.startsWith(`${item.token}:`))).map(item => item.token))
-  return { recognitions, recognitionErrors, recognizingTokens: titleTokens, libraryStates, contentPreviews: modern.contentPreviews, contentErrors: modern.contentErrors, inspectingTokens, retryContent: modern.retryContent, retry, acceptManual, acceptShareAnalysis, reset, dispose }
+  return { recognitions, recognitionErrors, recognizingTokens: titleTokens, libraryStates, contentPreviews: modern.contentPreviews, contentErrors: modern.contentErrors, inspectingTokens, retryContent: modern.retryContent, retryCoverage, retry, acceptManual, acceptShareAnalysis, reset, dispose }
 }

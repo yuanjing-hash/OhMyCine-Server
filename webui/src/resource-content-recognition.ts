@@ -6,7 +6,7 @@ import { createOwnedReadQueue, type OwnedReadTask } from '@/owned-read-queue'
 import { parseResourceContent, resourceContentPreviewPath, type ResourceContentPreview } from '@/resource-content'
 import { isCloudContentResult } from '@/share-content'
 
-type LibraryState = { label: string; detail: string; present: boolean }
+type LibraryState = { label: string; detail: string; present: boolean; retryable?: boolean }
 interface RecognitionState {
   recognitions: Ref<Record<string, TorrentRecognitionResult>>
   recognitionErrors: Ref<Record<string, string>>
@@ -17,14 +17,15 @@ export function useResourceContentRecognition(items: Ref<TorrentSearchResult[]>,
   const contentPreviews = ref<Record<string, ResourceContentPreview>>({})
   const contentErrors = ref<Record<string, string>>({})
   const titleLane = createOwnedReadQueue<TorrentRecognitionResult>(4, 30000, 'title')
-  const cloudLane = createOwnedReadQueue<ResourceContentPreview>(2, 65000, 'cloud-content')
-  const torrentLane = createOwnedReadQueue<ResourceContentPreview>(2, 65000, 'torrent-content')
-  const magnetLane = createOwnedReadQueue<ResourceContentPreview>(2, 65000, 'magnet-content')
+  const cloudLane = createOwnedReadQueue<ResourceContentPreview>(2, 105000, 'cloud-content')
+  const torrentLane = createOwnedReadQueue<ResourceContentPreview>(2, 105000, 'torrent-content')
+  const magnetLane = createOwnedReadQueue<ResourceContentPreview>(2, 105000, 'magnet-content')
   const contentLanes = [cloudLane, torrentLane, magnetLane]
   const coverageLane = createOwnedReadQueue<MediaCoverage>(4, 30000, 'coverage')
   let titleRevisions = new Map<string, number>()
   let contentRevisions = new Map<string, number>()
   const coverageRevisions = new Map<string, number>()
+  const coverageResults = new Map<string, LibraryState>()
   const priority = new Set<string>()
 
   const currentItems = () => items.value.filter(item => item.content_inspection && Date.parse(item.expires_at) > Date.now())
@@ -39,6 +40,7 @@ export function useResourceContentRecognition(items: Ref<TorrentSearchResult[]>,
   }
   function updateCoverage() {
     const tasks: OwnedReadTask<MediaCoverage>[] = []
+    const currentKeys = new Set<string>()
     for (const item of currentItems()) {
       const result = coverageResult(item)
       const key = identity(result)
@@ -47,17 +49,26 @@ export function useResourceContentRecognition(items: Ref<TorrentSearchResult[]>,
         continue
       }
       if (!canReadLibrary()) { state.libraryStates.value[item.token] = { label: '无权查看库内状态', detail: '需要媒体库读取权限', present: false }; continue }
-      state.libraryStates.value[item.token] ??= { label: '正在查询库内状态…', detail: '', present: false }
-      tasks.push({ key: `${key}:${coverageRevisions.get(key) ?? 0}`,
+      const requestKey = `${key}:${coverageRevisions.get(key) ?? 0}`
+      currentKeys.add(requestKey)
+      const saved = coverageResults.get(requestKey)
+      if (saved) { state.libraryStates.value[item.token] = saved; continue }
+      state.libraryStates.value[item.token] = { label: '正在查询库内状态…', detail: '', present: false }
+      tasks.push({ key: requestKey,
         run: signal => api<unknown>(discoveryCoveragePath(result!.media_type!, result!.tmdb_id!), { signal }).then(normalizeMediaCoverage),
         resolve: value => {
-          for (const owner of currentItems()) if (identity(coverageResult(owner)) === key) state.libraryStates.value[owner.token] = { label: value.status === 'missing' ? '未入库' : coverageStatusLabel(value.status), detail: '依据当前账号可见媒体库的扫描事实；作品级状态', present: value.status === 'present' }
+          const result = { label: value.status === 'missing' ? '未入库' : coverageStatusLabel(value.status), detail: '依据当前账号可见媒体库的扫描事实；作品级状态', present: value.status === 'present' }
+          coverageResults.set(requestKey, result)
+          for (const owner of currentItems()) if (identity(coverageResult(owner)) === key) state.libraryStates.value[owner.token] = result
         },
         reject: () => {
-          for (const owner of currentItems()) if (identity(coverageResult(owner)) === key) state.libraryStates.value[owner.token] = { label: '库内状态暂不可用', detail: '查询失败或超时，不代表未入库', present: false }
+          const result = { label: '库内状态暂不可用', detail: '查询失败或超时，不代表未入库', present: false, retryable: true }
+          coverageResults.set(requestKey, result)
+          for (const owner of currentItems()) if (identity(coverageResult(owner)) === key) state.libraryStates.value[owner.token] = result
         },
       })
     }
+    for (const key of coverageResults.keys()) if (!currentKeys.has(key)) coverageResults.delete(key)
     coverageLane.update(tasks)
   }
   function reconcile() {
@@ -100,8 +111,16 @@ export function useResourceContentRecognition(items: Ref<TorrentSearchResult[]>,
   function retryContent(token: string) {
     if (!currentItems().some(item => item.token === token)) return false
     contentRevisions.set(token, (contentRevisions.get(token) ?? 0) + 1)
-    delete contentPreviews.value[token]; delete contentErrors.value[token]
+    delete contentErrors.value[token]
     priority.add(token); reconcile(); return true
+  }
+  function retryCoverage(token: string) {
+    const item = currentItems().find(item => item.token === token)
+    const work = item && identity(coverageResult(item))
+    if (!work || !canReadLibrary()) return false
+    coverageRevisions.set(work, (coverageRevisions.get(work) ?? 0) + 1)
+    updateCoverage()
+    return true
   }
   function retry(token: string) {
     if (!currentItems().some(item => item.token === token)) return false
@@ -120,10 +139,10 @@ export function useResourceContentRecognition(items: Ref<TorrentSearchResult[]>,
   }
   function reset() {
     titleLane.reset(); contentLanes.forEach(lane => lane.reset()); coverageLane.reset()
-    titleRevisions.clear(); contentRevisions.clear(); coverageRevisions.clear(); priority.clear()
+    titleRevisions.clear(); contentRevisions.clear(); coverageRevisions.clear(); coverageResults.clear(); priority.clear()
     contentPreviews.value = {}; contentErrors.value = {}
   }
   function dispose() { stop(); reset(); titleLane.dispose(); contentLanes.forEach(lane => lane.dispose()); coverageLane.dispose() }
   const inspectingTokens = computed(() => contentLanes.flatMap(lane => lane.activeKeys.value))
-  return { contentPreviews, contentErrors, titleTokens: titleLane.activeKeys, inspectingTokens, retryContent, retry, acceptManual, reset, dispose }
+  return { contentPreviews, contentErrors, titleTokens: titleLane.activeKeys, inspectingTokens, retryContent, retryCoverage, retry, acceptManual, reset, dispose }
 }

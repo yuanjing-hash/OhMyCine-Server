@@ -89,6 +89,9 @@ func (a *API) SetDownloadSettingsService(service *services.DownloadSettingsServi
 }
 func (a *API) SetMetadataSettingsService(service *services.MetadataSettingsService) {
 	a.metadataSettings = service
+	if a.admin != nil {
+		a.admin.SetMetadataSettingsService(service)
+	}
 }
 func (a *API) SetAIRecognitionSettingsService(service *services.AIRecognitionSettingsService) {
 	a.aiRecognitionSettings = service

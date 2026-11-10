@@ -66,15 +66,13 @@ it('shows actual file names directly and submits only the opaque selection with 
   expect(body).not.toHaveProperty('indices')
 })
 
-it('keeps explicit whole-resource intake available after magnet metadata fails', async () => {
+it('submits ordinary whole-resource intake directly after magnet metadata fails', async () => {
   fixture(true)
   const wrapper = await render()
   expect(wrapper.get('[aria-label="实际文件内容"]').text()).toContain('元数据暂不可得')
   await wrapper.get('article footer .btn-primary').trigger('click'); await flushPromises()
   const dialog = wrapper.get('form[role="dialog"]')
-  expect(dialog.text()).toContain('获取整个资源')
-  expect(dialog.find('button.btn-primary').attributes('disabled')).toBeDefined()
-  await dialog.get('input[data-test="whole-resource-intent"]').setValue(true)
+  expect(dialog.find('input[type="checkbox"]').exists()).toBe(false)
   expect(dialog.find('button.btn-primary').attributes('disabled')).toBeUndefined()
   await dialog.trigger('submit'); await flushPromises()
   const call = request.mock.calls.find(([path]) => path === '/api/v1/discovery/downloads')!

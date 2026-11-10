@@ -265,7 +265,7 @@ func (s *SiteService) readCloudContent(ctx context.Context, actor Actor, claim s
 	if err := s.validateInspectionScope(ctx, actor, claim, scope); err != nil {
 		return inspectedContent{}, err
 	}
-	return inspectedContent{Entries: entries, RootName: root.Title, ExpiresAt: s.now().Add(5 * time.Minute)}, nil
+	return inspectedContent{Entries: entries, RootName: root.Title, ExpiresAt: s.now().Add(ptResultTTL)}, nil
 }
 
 func (s *SiteService) readTorrentContent(ctx context.Context, actor Actor, claim siteResultClaim, record models.Site) (inspectedContent, error) {
@@ -355,7 +355,7 @@ func (s *SiteService) readTorrentContent(ctx context.Context, actor Actor, claim
 	if !private && !manifest.Private {
 		originalMagnet = source.Magnet
 	}
-	return inspectedContent{Manifest: &manifest, RootName: manifest.Name, OriginalMagnet: originalMagnet, PluginLifecycle: pluginLifecycle, ExpiresAt: s.now().Add(5 * time.Minute)}, nil
+	return inspectedContent{Manifest: &manifest, RootName: manifest.Name, OriginalMagnet: originalMagnet, PluginLifecycle: pluginLifecycle, ExpiresAt: s.now().Add(ptResultTTL)}, nil
 }
 
 func resourceContentError(err error) error {
@@ -403,7 +403,7 @@ func (s *SiteService) PreviewContent(ctx context.Context, actor Actor, input Con
 	if input.Offset < 0 || input.Offset > 10000 || input.Limit < 0 || input.Limit > 200 {
 		return ContentPreviewSummary{}, appError(CodeInvalidRequest, "文件分页参数无效", nil)
 	}
-	ctx, cancel := context.WithTimeout(ctx, 65*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 90*time.Second)
 	defer cancel()
 	actor, err := s.inspectionActor(ctx, actor)
 	if err != nil {
@@ -521,7 +521,9 @@ func (s *SiteService) PreviewContent(ctx context.Context, actor Actor, input Con
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Path < entries[j].Path })
 	var analyzed []siteShareAnalyzedFile
-	summary.Analysis, analyzed = s.analyzeShareEntries(ctx, actor, claim, entries)
+	analysisCtx, stopAnalysis := context.WithTimeout(ctx, 25*time.Second)
+	summary.Analysis, analyzed = s.analyzeShareEntries(analysisCtx, actor, claim, entries)
+	stopAnalysis()
 	preview.AnalysisFiles = analyzed
 	byToken := map[string]siteShareAnalyzedFile{}
 	for _, file := range analyzed {

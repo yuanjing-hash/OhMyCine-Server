@@ -36,7 +36,7 @@ OhMyCine Server 是一个**以媒体流水线为核心**的自托管后端，负
 
 自动分类入库采用 MoviePilot 的“媒体类型目录 → 类型内分类目录”层级原则，但保持 OhMyCine 自己的 Profile、任务快照和执行器实现：所有新任务先固定进入 `电影` 或 `电视剧`，再进入对应 Profile 分类、作品和季目录。本地、115 同源、跨数据源、插件下载与自动追更共享同一规范化模板；升级不会改写已排队任务的冻结模板或自动搬动已有文件。
 
-电视剧详情现已提供 MoviePilot 风格的多季订阅入口，并在创建前展示站点顺序、下载器、目标媒体库、检查周期、分辨率/编码/来源/发布组、包含与排除词、做种/年龄/大小、单次资源上限和下载优先级。保存后形成版本化、无凭据的执行快照；以后修改全局配置不会漂移旧订阅，编辑通过 revision CAS 生成下一版。到期订阅只创建持久 `follow-search` Job，Worker 重新验证 owner 权限和配置，复用 `MediaCoverageService`、多语言身份搜索、SiteService opaque result claim 与 DownloadService；它不持久化真实 torrent/magnet URL，也不直接调用下载器或移动文件。明确缺集先建立逐集 claim，再由稳定排序与集合覆盖选择单集、多集或整季资源；下载仍沿用 Download → Transfer → Import → STRM/refresh/notify 流水线。`active|paused|completed|blocked` 状态、运行记录和安全错误可在订阅管理页查看，`completed` 仍会按周期低成本复核，发现新已播缺集后重新进入追更。
+电视剧详情现已提供 MoviePilot 风格的多季订阅入口，并在创建前展示站点顺序、下载器、目标媒体库、检查周期、分辨率/编码/来源/发布组、包含与排除词、做种/年龄/大小、单次资源上限和下载优先级。保存后形成版本化、无凭据的执行快照；以后修改全局配置不会漂移旧订阅，编辑通过 revision CAS 生成下一版。到期订阅只创建持久 `follow-search` Job，Worker 重新验证 owner 权限和配置，复用 `MediaCoverageService`、多语言身份搜索、SiteService opaque result claim 与 DownloadService；它不持久化真实 torrent/magnet URL，也不直接调用下载器或移动文件。明确缺集先建立逐集 claim，再由稳定排序与集合覆盖选择单集、多集或整季资源；下载仍沿用 Download → Transfer → Import → STRM/refresh/notify 流水线。`active|paused|completed|blocked` 状态、运行记录和安全错误可在订阅管理页查看，`completed` 只表示所选季已有可信完结依据且实际文件完整入库，终止自动搜索并保留历史；连载剧仅补齐当前已播集时保持 `active`，继续定期检查。旧 `completed` 且仍带下一次检查时间的记录按当前补齐兼容处理，使用本地目录事实和常规执行逐步核对。
 
 下载预分类完成后 Server 不只设置 qBittorrent Category，还必须显式调用 `setLocation(暂存目录/分类)` 后才恢复下载；因为用户关闭 Automatic Torrent Management 时，单独修改 Category 不会改变保存位置。入库源解析仅对旧任务兼容查找暂存根目录，新任务的正常路线始终是分类目录。`copy|symlink` 入库后进入独立做种管理，按任务快照的时长/分享率条件采样；`copy` 达标后删任务与暂存源数据，`symlink` 只删任务并永久保留链接源，`move` 入库后以 `deleteData=false` 清理 qBittorrent 任务。自动清理默认关闭。
 

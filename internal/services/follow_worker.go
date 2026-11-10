@@ -170,7 +170,7 @@ func (w *FollowSearchWorker) Run(ctx context.Context, runtime JobRuntime, job Cl
 		}
 		return tx.Model(&models.FollowSubscription{}).
 			Where("id = ? AND revision = ? AND lifecycle_revision = ? AND status <> ?", subscription.ID, run.SubscriptionRevision, run.LifecycleRevision, models.FollowStatusPaused).
-			Updates(map[string]any{"progress_target": target, "progress_present": present, "progress_missing": target - present, "last_run_id": run.ID, "last_run_at": now, "updated_at": now}).Error
+			Updates(map[string]any{"progress_target": target, "progress_present": present, "progress_missing": target - present, "last_run_id": run.ID, "last_run_at": now, "poster_ref": followPosterRef(subscription.PosterRef, coverage.PosterRef), "updated_at": now}).Error
 	}); err != nil {
 		return followPersistFailure()
 	}
@@ -181,7 +181,15 @@ func (w *FollowSearchWorker) Run(ctx context.Context, runtime JobRuntime, job Cl
 		if unknown > 0 || uncertain.Seasons > 0 {
 			return w.waitForCoverage(run, subscription, snapshot, followCoverageWaitMessage(uncertain), unknown, uncertain)
 		}
-		return w.finish(run, subscription, models.FollowRunCompleted, models.FollowStatusCompleted, "", "", snapshot, 0, 0, map[string]int{})
+		status := models.FollowStatusActive
+		finished := true
+		for _, season := range seenSeasons {
+			finished = finished && season.Finished && season.Counts.Total > 0 && season.Counts.Present == season.Counts.Total
+		}
+		if finished {
+			status = models.FollowStatusCompleted
+		}
+		return w.finish(run, subscription, models.FollowRunCompleted, status, "", "", snapshot, 0, 0, map[string]int{})
 	}
 	if unknown > 0 {
 		w.record(ctx, "follow.coverage_uncertain", "coverage", "skipped", fmt.Sprintf("另有 %d 集的播出或在库状态尚未确认，本轮跳过这些剧集，只搜索 %d 集明确缺集", unknown, len(missing)), map[string]any{"uncertain_count": unknown, "missing_count": len(missing)})
@@ -1059,7 +1067,7 @@ func (w *FollowSearchWorker) excludeClaimedDownloads(ctx context.Context, subscr
 			}
 			continue
 		}
-		if task.Phase != models.DownloadTaskStatusFailed && task.Phase != models.DownloadTaskStatusCancelled {
+		if task.LastErrorCode == downloadCancellationPending || task.Phase != models.DownloadTaskStatusFailed && task.Phase != models.DownloadTaskStatusCancelled {
 			if claim.DownloadTaskID == nil {
 				if err := w.follows.db.Model(&claim).Updates(map[string]any{"state": "downloading", "download_task_id": task.ID, "updated_at": w.follows.now()}).Error; err != nil {
 					return nil, err
@@ -1148,6 +1156,10 @@ func (w *FollowSearchWorker) finish(run models.FollowRun, subscription models.Fo
 			next = now.Add(time.Duration(stored.Schedule.Minutes) * time.Minute)
 		}
 	}
+	var nextRun *time.Time
+	if subscriptionStatus != models.FollowStatusCompleted {
+		nextRun = &next
+	}
 	summaryRaw, _ := json.Marshal(summary)
 	selectedCount := 0
 	if len(selected) > 0 {
@@ -1160,9 +1172,19 @@ func (w *FollowSearchWorker) finish(run models.FollowRun, subscription models.Fo
 		if err := tx.Model(&models.FollowSubscription{}).Where("id = ?", subscription.ID).Updates(map[string]any{"last_run_id": run.ID, "last_run_at": now, "updated_at": now}).Error; err != nil {
 			return err
 		}
-		return tx.Model(&models.FollowSubscription{}).
+		updated := tx.Model(&models.FollowSubscription{}).
 			Where("id = ? AND revision = ? AND lifecycle_revision = ? AND status <> ?", subscription.ID, run.SubscriptionRevision, run.LifecycleRevision, models.FollowStatusPaused).
-			Updates(map[string]any{"status": subscriptionStatus, "next_run_at": next, "last_error_code": code, "last_error_message": message, "updated_at": now}).Error
+			Updates(map[string]any{"status": subscriptionStatus, "next_run_at": nextRun, "last_error_code": code, "last_error_message": message, "updated_at": now})
+		if updated.Error != nil {
+			return updated.Error
+		}
+		reopened := subscription.Status == models.FollowStatusCompleted && subscription.NextRunAt == nil && subscriptionStatus == models.FollowStatusActive
+		if updated.RowsAffected == 1 && (subscriptionStatus == models.FollowStatusCompleted || reopened) {
+			return tx.Model(&models.ScheduleDefinition{}).
+				Where("managed_key = ?", managedScheduleKey("follow_search", "follow", subscription.ID)).
+				Updates(map[string]any{"enabled": reopened, "next_run_at": nextRun, "revision": gorm.Expr("revision + 1"), "updated_at": now}).Error
+		}
+		return nil
 	})
 	if err != nil {
 		return followPersistFailure()

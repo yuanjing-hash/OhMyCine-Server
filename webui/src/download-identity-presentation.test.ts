@@ -14,7 +14,7 @@ vi.mock('@/toast', () => ({ notify: vi.fn() }))
 vi.mock('@/stores/auth', () => ({ useAuthStore: () => ({ user: { id: 7 }, can: (code: string) => [Permissions.DownloadsReadOwn, Permissions.JobsControlOwn].includes(code as typeof Permissions.DownloadsReadOwn), canAny: (codes: string[]) => codes.includes(Permissions.DownloadsReadOwn) }) }))
 
 let wrapper: VueWrapper | undefined
-afterEach(() => { wrapper?.unmount(); wrapper = undefined; vi.useRealTimers(); vi.clearAllMocks() })
+afterEach(() => { wrapper?.unmount(); wrapper = undefined; vi.useRealTimers(); vi.clearAllMocks(); vi.restoreAllMocks() })
 
 it('keeps the original recovery reason visible and never labels a legacy automatic lock as a manual action', async () => {
   vi.useFakeTimers()
@@ -37,4 +37,39 @@ it('keeps the original recovery reason visible and never labels a legacy automat
   await flushPromises()
   expect(vi.mocked(api).mock.calls.filter(([path]) => path === '/api/v1/jobs/original-job/retry')).toHaveLength(1)
   expect(notify).toHaveBeenCalledWith('已请求使用原下载文件重新识别并入库，不会重新提交下载', 'success')
+})
+
+it('accepts cancellation of an unconfirmed submission and removes its history record while retaining cloud files', async () => {
+  vi.useFakeTimers()
+  vi.spyOn(window, 'confirm').mockReturnValue(true)
+  let task: DownloadTaskSummary | undefined = { id: 'pending', job_id: 'pending-job', owner_id: 7, display_name: '原云端任务', downloader_name: '云下载器', job_status: 'retry_wait', phase: 'downloading', lifecycle_scope: 'active', last_error_code: 'downloader_submission_unconfirmed', last_error_message: '正在核对原操作' } as DownloadTaskSummary
+  vi.mocked(api).mockImplementation(async (path, options) => {
+    if (path === '/api/v1/downloads?scope=active&limit=200' || path === '/api/v1/downloads?scope=history&limit=200') {
+      const list = task && path.includes(`scope=${task.lifecycle_scope}`) ? [task] : []
+      return { list, total: list.length }
+    }
+    if (path === '/api/v1/seeding-tasks?limit=100') return { list: [], total: 0 }
+    if (path === '/api/v1/downloads/pending/cancel') {
+      task = { ...task!, phase: 'cancelled', lifecycle_scope: 'history', control_pending: true, last_error_code: 'downloader_cancellation_pending' }
+      return { cancelled: true, control_pending: true, provider_data_retained: true }
+    }
+    if (path === '/api/v1/downloads/pending?delete_data=false' && options?.method === 'DELETE') { task = undefined; return { deleted: true } }
+    throw new Error(`unexpected offline request ${path}`)
+  })
+  wrapper = mount(DownloadsView, { global: { stubs: { DirectoryPickerDialog: true, DownloadRouteTargetPicker: true, MediaReorganizationDialog: true, TransferNodesPanel: true, SecretInput: true, ClearHistoryButton: true } } })
+  await flushPromises()
+  await wrapper.findAll('button').find(button => button.text().startsWith('进行中'))!.trigger('click'); await flushPromises()
+  expect(wrapper.text()).toContain('核对原任务')
+  expect(wrapper.findAll('button').some(button => button.text() === '暂停')).toBe(false)
+  await wrapper.findAll('button').find(button => button.text() === '取消')!.trigger('click'); await flushPromises()
+  expect(wrapper.text()).toContain('已取消 · 云端收尾中')
+  expect(wrapper.findAll('button').some(button => button.text() === '重试下载')).toBe(false)
+  await wrapper.findAll('button').find(button => button.text() === '移除记录')!.trigger('click'); await flushPromises()
+  const dialog = wrapper.get('[role="dialog"]')
+  expect(dialog.text()).toContain('核对与收尾继续进行，文件保留')
+  expect(dialog.find('input[type="checkbox"]').exists()).toBe(false)
+  await dialog.trigger('submit'); await flushPromises()
+  expect(vi.mocked(api).mock.calls.some(([path, options]) => path === '/api/v1/downloads/pending?delete_data=false' && options?.method === 'DELETE')).toBe(true)
+  expect(wrapper.text()).not.toContain('原云端任务')
+  expect(notify).toHaveBeenCalledWith('记录已移除，后续入库已停止。', 'success')
 })

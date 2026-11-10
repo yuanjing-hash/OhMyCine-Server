@@ -48,7 +48,7 @@ func downloadSummaryForActor(actor Actor, record models.DownloadTask, item Downl
 func safeDownloadTaskSummary(item DownloadTaskSummary) DownloadTaskSummary {
 	return DownloadTaskSummary{
 		ID: item.ID, JobID: item.JobID, OwnerID: item.OwnerID, DisplayName: "资源权限受限的下载任务",
-		JobStatus: item.JobStatus, ProviderStatus: item.ProviderStatus, Phase: item.Phase,
+		JobStatus: item.JobStatus, ProviderStatus: item.ProviderStatus, Phase: item.Phase, ControlPending: item.ControlPending,
 		Progress: item.Progress, BytesCompleted: item.BytesCompleted, BytesTotal: item.BytesTotal,
 		DownloadSpeed: item.DownloadSpeed, UploadSpeed: item.UploadSpeed, ETASeconds: item.ETASeconds,
 		LastSampledAt: item.LastSampledAt, LastErrorCode: item.LastErrorCode,

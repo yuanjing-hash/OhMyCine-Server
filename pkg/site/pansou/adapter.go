@@ -21,7 +21,7 @@ import (
 
 const maxSnapshotItems = 1000
 const maxSnapshots = 32
-const snapshotTTL = 10 * time.Minute
+const snapshotTTL = 30 * time.Minute
 
 type snapshot struct {
 	key     string

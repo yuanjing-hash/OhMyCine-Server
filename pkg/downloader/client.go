@@ -72,6 +72,12 @@ type Source struct {
 	ProviderItemID string
 }
 
+// SubmissionReconciler reads only the original submitted operation. It must not
+// create a provider task or a replacement directory when the result is unknown.
+type SubmissionReconciler interface {
+	ReconcileSubmission(context.Context, SubmitRequest) (Task, error)
+}
+
 type SubmitRequest struct {
 	Source       Source
 	SavePath     string

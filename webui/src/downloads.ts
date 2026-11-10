@@ -70,6 +70,8 @@ export function formatETA(value: number | null): string {
 
 export function downloadStatusLabel(task: DownloadTaskSummary, retrying = false): string {
 	if (retrying) return '正在重试…'
+  if (task.control_pending) return '已取消 · 云端收尾中'
+  if (isDownloadSubmissionPending(task)) return task.job_status === 'failed' ? '提交结果待核对' : '核对原任务'
 	if (task.job_status === 'running' && normalizedProviderStatus(task.provider_status) === 'unavailable') return '等待下载器恢复'
 	if (task.job_status === 'running' && normalizedProviderStatus(task.provider_status) === 'stalleddl') return '等待连接/暂无速度'
 	const phases: Record<string, string> = { submitting: '提交下载器', metadata: '获取 metadata', classifying: '轻量刮削', waiting_user_action: '准备自动归入未识别', categorized: '已指派分类', downloading: '正式下载', verifying: '完成后复核' }
@@ -80,6 +82,7 @@ export function downloadStatusLabel(task: DownloadTaskSummary, retrying = false)
 
 export function downloadStatusClass(task: DownloadTaskSummary, retrying = false): string {
   if (retrying) return 'status-chip status-chip--planned'
+  if (isDownloadSubmissionPending(task)) return 'status-chip status-chip--warning'
   if (task.job_status === 'completed') return 'status-chip status-chip--ready'
   if (task.job_status === 'failed' || task.job_status === 'cancelled') return 'status-chip status-chip--error'
   if (task.job_status === 'running' && normalizedProviderStatus(task.provider_status) === 'unavailable') return 'status-chip status-chip--warning'
@@ -88,7 +91,9 @@ export function downloadStatusClass(task: DownloadTaskSummary, retrying = false)
 }
 
 export function downloadErrorMessage(task: DownloadTaskSummary, retrying = false): string {
-  if (retrying || task.job_status === 'cancelled') return ''
+  if (retrying) return ''
+  if (task.control_pending) return '后续入库已取消，正在核对并结束原云端任务。'
+  if (task.job_status === 'cancelled') return ''
   // Preclassification deliberately keeps a safe TMDB warning visible while
   // the provider continues downloading. Only a stale terminal downloader
   // failure should be suppressed by authoritative active telemetry.
@@ -185,7 +190,11 @@ export function isDownloadHistoryTask(task: DownloadTaskSummary): boolean {
 }
 
 export function canCancelDownloadPipeline(task: DownloadTaskSummary): boolean {
-  return task.lifecycle_scope === 'active' && task.job_status !== 'cancelled'
+  return task.lifecycle_scope === 'active' && task.job_status !== 'cancelled' && !task.control_pending && task.phase !== 'cancelled'
+}
+
+export function isDownloadSubmissionPending(task: DownloadTaskSummary): boolean {
+  return task.control_pending === true || ['downloader_submission_unconfirmed', 'downloader_submit_unknown', 'downloader_selection_result_unknown', 'downloader_share_result_unknown'].includes(task.last_error_code)
 }
 
 export function formatSampleTime(value: string | null): string {
