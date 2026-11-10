@@ -213,6 +213,8 @@ func (s *DownloaderService) clientForTask(ctx context.Context, record models.Dow
 		remote, err := s.nodeDownloaderClientWithBinding(record, binding, localRoot, task.ID)
 		if err == nil && task.BTSelectionGroupID != "" {
 			err = remote.SetSelectionGroupWorkspace(task.BTSelectionGroupID)
+		} else if err == nil && task.StagingCategory != "" && task.StagingCategory != "." {
+			err = remote.SetCompletionDirectory(task.StagingCategory)
 		}
 		return remote, err
 	}

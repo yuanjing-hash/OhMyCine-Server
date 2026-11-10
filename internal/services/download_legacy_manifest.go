@@ -13,7 +13,7 @@ func withCompletedManifestRecovery(ctx context.Context) context.Context {
 }
 func legacyCompletedManifestAccess(ctx context.Context, task models.DownloadTask) bool {
 	allowed, _ := ctx.Value(completedManifestRecoveryContext{}).(bool)
-	return allowed && !task.ContentSelectionRequired && task.BTSelectionGroupID == "" && isCompletedRecognitionRecovery(task) && task.ProviderTaskID != ""
+	return allowed && !task.ContentSelectionRequired && task.BTSelectionGroupID == "" && task.ScrapeStatus == "completed_unrecognized" && isCompletedRecognitionRecovery(task) && task.ProviderTaskID != ""
 }
 
 // An unreadable pre-selection source does not grant normal provider access.

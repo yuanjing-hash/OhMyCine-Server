@@ -1050,7 +1050,14 @@ func (w *FollowSearchWorker) upsertImported(subscriptionID string, season, episo
 
 func (w *FollowSearchWorker) excludeClaimedDownloads(ctx context.Context, subscriptionID string, missing map[[2]int]struct{}) (map[[2]int]struct{}, error) {
 	var claims []models.FollowEpisodeClaim
-	if err := w.follows.db.Where("subscription_id = ? AND (download_task_id IS NOT NULL OR state = ?)", subscriptionID, "queued").Find(&claims).Error; err != nil {
+	if err := w.follows.db.Where(`subscription_id = ? AND (download_task_id IS NOT NULL OR state = ? OR EXISTS (
+		SELECT 1 FROM download_tasks pending
+		WHERE pending.follow_subscription_id=follow_episode_claims.subscription_id
+		AND pending.follow_resource_fingerprint=follow_episode_claims.resource_fingerprint
+		AND pending.scrape_status IN ('completed_unverified','completed_unrecognized','completed_verified')
+		AND (pending.provider_task_id<>'' OR pending.completed_manifest_json NOT IN ('','{}'))
+		AND pending.target_library_id IS NOT NULL AND pending.phase NOT IN (?,?)
+	))`, subscriptionID, "queued", models.DownloadTaskStatusCompleted, models.DownloadTaskStatusCancelled).Find(&claims).Error; err != nil {
 		return nil, err
 	}
 	for _, claim := range claims {
@@ -1067,10 +1074,36 @@ func (w *FollowSearchWorker) excludeClaimedDownloads(ctx context.Context, subscr
 			}
 			continue
 		}
-		if task.LastErrorCode == downloadCancellationPending || task.Phase != models.DownloadTaskStatusFailed && task.Phase != models.DownloadTaskStatusCancelled {
+		if task.LastErrorCode == downloadCancellationPending || downloadCompletionPending(task) || task.Phase != models.DownloadTaskStatusFailed && task.Phase != models.DownloadTaskStatusCancelled {
 			if claim.DownloadTaskID == nil {
-				if err := w.follows.db.Model(&claim).Updates(map[string]any{"state": "downloading", "download_task_id": task.ID, "updated_at": w.follows.now()}).Error; err != nil {
+				restored := false
+				err := w.follows.db.Transaction(func(tx *gorm.DB) error {
+					var current models.DownloadTask
+					err := tx.Where("id = ? AND job_id = ? AND owner_id = ? AND follow_subscription_id = ? AND follow_resource_fingerprint = ?", task.ID, task.JobID, task.OwnerID, subscriptionID, claim.ResourceFingerprint).First(&current).Error
+					if errors.Is(err, gorm.ErrRecordNotFound) {
+						return nil
+					}
+					if err != nil {
+						return err
+					}
+					if current.LastErrorCode != downloadCancellationPending && !downloadCompletionPending(current) && (current.Phase == models.DownloadTaskStatusFailed || current.Phase == models.DownloadTaskStatusCancelled) {
+						return nil
+					}
+					updated := tx.Model(&claim).Where("download_task_id IS NULL").
+						Where(map[string]any{"resource_fingerprint": claim.ResourceFingerprint, "state": claim.State, "run_id": claim.RunID, "updated_at": claim.UpdatedAt}).
+						Updates(map[string]any{"state": "downloading", "download_task_id": current.ID, "updated_at": w.follows.now()})
+					if updated.Error != nil {
+						return updated.Error
+					}
+					restored = updated.RowsAffected == 1
+					task = current
+					return nil
+				})
+				if err != nil {
 					return nil, err
+				}
+				if !restored {
+					continue
 				}
 			}
 			if _, needed := missing[[2]int{claim.SeasonNumber, claim.EpisodeNumber}]; needed {

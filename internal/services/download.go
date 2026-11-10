@@ -432,6 +432,9 @@ func (s *DownloadService) submit(ctx context.Context, ownerID uint, input Submit
 	if input.FollowSubscriptionID != "" {
 		var existing models.DownloadTask
 		if err := s.db.Where("follow_subscription_id = ? AND follow_resource_fingerprint = ?", input.FollowSubscriptionID, input.FollowResourceFingerprint).First(&existing).Error; err == nil {
+			if downloadCompletionPending(existing) {
+				return DownloadTaskSummary{}, appError("download_completion_pending", "原下载已完成，正在核对原文件并继续入库", nil)
+			}
 			if existing.LastErrorCode == downloadCancellationPending {
 				return DownloadTaskSummary{}, appError(downloadCancellationPending, downloadCancellationMessage, nil)
 			}
@@ -725,7 +728,7 @@ func (s *DownloadService) submit(ctx context.Context, ownerID uint, input Submit
 			var previous models.DownloadTask
 			err := tx.Where("follow_subscription_id = ? AND follow_resource_fingerprint = ?", input.FollowSubscriptionID, input.FollowResourceFingerprint).First(&previous).Error
 			if err == nil {
-				if replacingFollowTask == nil || previous.ID != replacingFollowTask.ID || previous.OwnerID != ownerID || previous.LastErrorCode == downloadCancellationPending || previous.Phase != models.DownloadTaskStatusFailed && previous.Phase != models.DownloadTaskStatusCancelled {
+				if replacingFollowTask == nil || previous.ID != replacingFollowTask.ID || previous.OwnerID != ownerID || previous.LastErrorCode == downloadCancellationPending || downloadCompletionPending(previous) || previous.Phase != models.DownloadTaskStatusFailed && previous.Phase != models.DownloadTaskStatusCancelled {
 					return appError(CodeConflict, "原追更下载任务状态已变化，请重试", nil)
 				}
 				release := downloadIdentityObservedQuery(tx, *replacingFollowTask).Where("phase = ?", replacingFollowTask.Phase).Updates(map[string]any{"follow_subscription_id": "", "follow_resource_fingerprint": ""})
@@ -2040,6 +2043,14 @@ func (w *DownloadWorker) Run(ctx context.Context, runtime JobRuntime, job Claime
 			return w.telemetryPersistenceFailure(task, task.ProviderTaskID, err)
 		}
 		if providerTask.Completed {
+			active, persistErr := w.updateActiveTask(&task, map[string]any{"phase": models.DownloadTaskStatusVerifying, "scrape_status": "completed_unverified", "updated_at": time.Now().UTC()})
+			if persistErr != nil {
+				return w.telemetryPersistenceFailure(task, task.ProviderTaskID, persistErr)
+			}
+			if !active {
+				return WorkerResult{}
+			}
+			task.Phase, task.ScrapeStatus = models.DownloadTaskStatusVerifying, "completed_unverified"
 			w.recordDownload(ctx, task, "download.provider_completed", "verify", "confirmed", "下载器已报告完成；开始复核真实文件清单及媒体身份，此时尚未确认入库", nil)
 			var completedManifest *downloadpkg.Manifest
 			var completedSourceManifest *downloadpkg.Manifest
@@ -2050,7 +2061,10 @@ func (w *DownloadWorker) Run(ctx context.Context, runtime JobRuntime, job Claime
 					if _, retryable := downloadpkg.ErrorInfo(manifestErr); retryable {
 						return w.failureRetryable(task, manifestErr)
 					}
-					_, _ = w.updateActiveTask(&task, map[string]any{"scrape_status": "completed_unverified", "last_error_code": "downloader_manifest_invalid", "last_error_message": "下载完成，但文件清单复核失败", "updated_at": time.Now().UTC()})
+					if task.TargetLibraryID != nil {
+						return w.failure(task, manifestErr)
+					}
+					_, _ = w.updateActiveTask(&task, map[string]any{"last_error_code": "downloader_manifest_invalid", "last_error_message": "下载完成，但文件清单复核失败", "updated_at": time.Now().UTC()})
 				} else if persistErr := w.persistCompletedManifest(&task, manifest); persistErr != nil {
 					return w.failure(task, persistErr)
 				} else if selectedManifest, verifyErr := w.verifyCompleted(ctx, &task, manifest); verifyErr != nil {
@@ -2174,9 +2188,26 @@ func (w *DownloadWorker) completedRecognitionRecoveryTask(job ClaimedJob) (model
 	return task, isCompletedRecognitionRecovery(task), nil
 }
 
+// Completion evidence is separate from successful metadata recognition. These
+// markers are written only after the provider completion/actual manifest path.
 func isCompletedRecognitionRecovery(task models.DownloadTask) bool {
-	hasSnapshot := strings.TrimSpace(task.CompletedManifestJSON) != "" && strings.TrimSpace(task.CompletedManifestJSON) != "{}"
-	return task.ScrapeStatus == "completed_unrecognized" && (hasSnapshot || task.ProviderTaskID != "") && task.TargetLibraryID != nil
+	switch task.ScrapeStatus {
+	case "completed_unverified", "completed_unrecognized", "completed_verified":
+	default:
+		return false
+	}
+	if task.TargetLibraryID == nil {
+		return false
+	}
+	if task.ProviderTaskID != "" {
+		return true
+	}
+	_, exists, err := completedDownloadManifest(task.CompletedManifestJSON)
+	return exists && err == nil
+}
+
+func downloadCompletionPending(task models.DownloadTask) bool {
+	return task.Phase != models.DownloadTaskStatusCompleted && task.Phase != models.DownloadTaskStatusCancelled && isCompletedRecognitionRecovery(task)
 }
 
 func (w *DownloadWorker) completedRecognitionManifestClient(ctx context.Context, task models.DownloadTask) (downloadpkg.ManifestClient, error) {
@@ -3351,6 +3382,13 @@ func (w *DownloadWorker) transferEnqueueFailure(task models.DownloadTask, err er
 
 func downloadFailureMessage(code string, retryable bool) string {
 	switch code {
+	case nodeprotocol.ErrorPathMappingInvalid:
+		return "原下载文件尚未通过节点目录核对，请检查节点可读挂载与任务分类目录。修复后继续核对原文件并入库"
+	case nodeprotocol.ErrorCompletionUpgradeRequired:
+		return "原下载已完成，当前节点尚不支持本任务所需的分类目录文件导出。请升级该节点后继续核对并入库"
+	case nodeprotocol.ErrorExportPreparing:
+		return "原下载已完成，节点正在校验文件并准备导出，将继续核对原任务"
+
 	case "downloader_share_result_unknown":
 		return "云端转存结果尚未确认，正在核对原任务输出；不会重复提交转存"
 	case quark.CodePending:
@@ -3456,7 +3494,13 @@ func (w *DownloadWorker) markFailure(task models.DownloadTask, code, message str
 			return nil
 		}
 		if finished {
-			return syncFailedFollowClaims(tx, task.ID, now)
+			var current models.DownloadTask
+			if err := tx.First(&current, "id = ?", task.ID).Error; err != nil {
+				return err
+			}
+			if !downloadCompletionPending(current) {
+				return syncFailedFollowClaims(tx, task.ID, now)
+			}
 		}
 		return nil
 	})

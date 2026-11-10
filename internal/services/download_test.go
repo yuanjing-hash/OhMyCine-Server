@@ -57,6 +57,7 @@ type metadataDownloadClient struct {
 	*stubDownloadClient
 	metadataOnly      bool
 	manifestCalls     int
+	manifestErr       error
 	category          string
 	categoryPath      string
 	routedPath        string
@@ -92,7 +93,11 @@ func (c *metadataDownloadClient) Submit(ctx context.Context, request downloadpkg
 func (c *metadataDownloadClient) Manifest(context.Context, string) (downloadpkg.Manifest, error) {
 	c.mu.Lock()
 	c.manifestCalls++
+	err := c.manifestErr
 	c.mu.Unlock()
+	if err != nil {
+		return downloadpkg.Manifest{}, err
+	}
 	return downloadpkg.Manifest{Name: "Example.Show.S01E01", Complete: true, Files: []downloadpkg.File{{RelativePath: "Example.Show.S01E01/Example.Show.S01E01.mkv", Size: 2 * 1024 * 1024 * 1024}}}, nil
 }
 func (c *metadataDownloadClient) Categories(context.Context) ([]downloadpkg.Category, error) {
