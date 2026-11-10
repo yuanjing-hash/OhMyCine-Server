@@ -14,8 +14,16 @@ import (
 
 func TestTaskDownloaderClientMapsCategoryPathsAndBindsRequests(t *testing.T) {
 	requests := make([]nodeprotocol.DownloaderActionRequest, 0, 8)
+	categoryExport := true
+	manifestFailure := ""
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/node/v1/health":
+			capabilities := []string{nodeprotocol.CapabilityQBittorrentControl}
+			if categoryExport {
+				capabilities = append(capabilities, nodeprotocol.CapabilityDownloaderCategoryExportV1)
+			}
+			_ = json.NewEncoder(w).Encode(nodeprotocol.HealthResponse{Capabilities: nodeprotocol.Capabilities{Codes: capabilities}})
 		case r.Method == http.MethodPut && r.URL.Path == "/node/v1/credential-grants/grant-1":
 			w.WriteHeader(http.StatusNoContent)
 		case r.Method == http.MethodPost && r.URL.Path == "/node/v1/downloader/actions":
@@ -35,6 +43,13 @@ func TestTaskDownloaderClientMapsCategoryPathsAndBindsRequests(t *testing.T) {
 				}
 			case nodeprotocol.DownloaderActionGet:
 				response.Task = &nodeprotocol.DownloaderTask{ID: input.ProviderTaskID, Status: "downloading"}
+			case nodeprotocol.DownloaderActionManifest:
+				if manifestFailure != "" {
+					w.WriteHeader(http.StatusBadGateway)
+					_ = json.NewEncoder(w).Encode(nodeprotocol.ErrorResponse{Code: manifestFailure})
+					return
+				}
+				response.Manifest = &nodeprotocol.DownloaderManifest{Name: "Movie", Files: []nodeprotocol.DownloaderFile{{RelativePath: "Movie.mkv", Size: 1}}}
 			}
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(response)
@@ -75,6 +90,29 @@ func TestTaskDownloaderClientMapsCategoryPathsAndBindsRequests(t *testing.T) {
 	}
 	if _, err := client.Get(context.Background(), "provider-task-1"); err != nil {
 		t.Fatal(err)
+	}
+	if _, err := client.Manifest(context.Background(), "provider-task-1"); err != nil {
+		t.Fatal(err)
+	}
+	newRequest := requests[len(requests)-1]
+	if newRequest.CategoryName != "电视剧" || newRequest.SavePath != "/qb-downloads/task-42/电视剧" {
+		t.Fatalf("categorized manifest binding=%+v", newRequest)
+	}
+	categoryExport = false
+	if _, err := client.Manifest(context.Background(), "provider-task-1"); err == nil {
+		t.Fatal("old Node without a verified export was accepted")
+	} else if code, _ := downloadpkg.ErrorInfo(err); code != nodeprotocol.ErrorCompletionUpgradeRequired {
+		t.Fatalf("old Node completion error=%v", err)
+	}
+	oldRequest := requests[len(requests)-1]
+	if oldRequest.CategoryName != "" || oldRequest.SavePath != "" || oldRequest.OperationKey != newRequest.OperationKey {
+		t.Fatalf("old Node request changed original export identity: %+v", oldRequest)
+	}
+	manifestFailure = nodeprotocol.ErrorDownloaderUnreachable
+	if _, err := client.Manifest(context.Background(), "provider-task-1"); err == nil {
+		t.Fatal("unreachable downloader was accepted")
+	} else if code, _ := downloadpkg.ErrorInfo(err); code != nodeprotocol.ErrorDownloaderUnreachable {
+		t.Fatalf("connectivity failure became an upgrade error: %v", err)
 	}
 
 	var ensures []nodeprotocol.DownloaderActionRequest

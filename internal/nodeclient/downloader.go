@@ -21,14 +21,15 @@ type CredentialGrantFactory func(context.Context, string, string, string) (nodep
 // DownloaderClient implements the ordinary provider contract while ensuring
 // every qBittorrent request is executed by the paired Node.
 type DownloaderClient struct {
-	groupID        string
-	selectionScope string
-	node           *Client
-	downloaderID   string
-	saveRoot       string
-	localRoot      string
-	taskID         string
-	grant          CredentialGrantFactory
+	groupID            string
+	completionCategory string
+	selectionScope     string
+	node               *Client
+	downloaderID       string
+	saveRoot           string
+	localRoot          string
+	taskID             string
+	grant              CredentialGrantFactory
 }
 
 func NewDownloaderClient(node *Client, downloaderID, saveRoot, localRoot, taskID string, grant CredentialGrantFactory, selectionScopes ...string) (*DownloaderClient, error) {
@@ -133,7 +134,7 @@ func (c *DownloaderClient) Manifest(ctx context.Context, id string) (downloadpkg
 	input := c.request(nodeprotocol.DownloaderActionManifest, c.boundTaskID(), id, false)
 	input.OperationKey = stableOperationKey("file_export", c.downloaderID, c.boundTaskID(), id)
 	input.RequestID = "qb:manifest:" + uuid.NewString()
-	response, err := c.call(ctx, input)
+	response, err := c.manifestResponse(ctx, input)
 	if err != nil || response.Manifest == nil {
 		return downloadpkg.Manifest{}, remoteDownloaderError(err, "downloader_manifest_invalid")
 	}
@@ -145,6 +146,32 @@ func (c *DownloaderClient) Manifest(ctx context.Context, id string) (downloadpkg
 		files = append(files, downloadpkg.File{RelativePath: file.RelativePath, Size: file.Size, NativeIndex: file.NativeIndex})
 	}
 	return downloadpkg.Manifest{Name: response.Manifest.Name, Files: files, Complete: response.Manifest.Complete}, nil
+}
+
+func (c *DownloaderClient) manifestResponse(ctx context.Context, input nodeprotocol.DownloaderActionRequest) (nodeprotocol.DownloaderActionResponse, error) {
+	categoryUnsupported := false
+	if c.completionCategory != "" {
+		health, err := c.node.Health(ctx)
+		if err != nil {
+			return nodeprotocol.DownloaderActionResponse{}, remoteDownloaderError(err, "")
+		}
+		if health.Capabilities.Has(nodeprotocol.CapabilityDownloaderCategoryExportV1) {
+			input.CategoryName = c.completionCategory
+			input.SavePath = joinRemoteRoot(c.remoteTaskRoot(), c.completionCategory)
+		} else {
+			categoryUnsupported = true
+		}
+	}
+	response, err := c.call(ctx, input)
+	// An existing immutable export remains usable on an older Node. A fresh
+	// categorized export requires explicit capability instead of guessing paths.
+	if categoryUnsupported {
+		code, _ := downloadpkg.ErrorInfo(remoteDownloaderError(err, ""))
+		if err == nil && response.FileExport == nil || code == nodeprotocol.ErrorPathMappingInvalid {
+			return nodeprotocol.DownloaderActionResponse{}, downloadpkg.Error(nodeprotocol.ErrorCompletionUpgradeRequired, false, nil)
+		}
+	}
+	return response, err
 }
 
 func (c *DownloaderClient) fileExportManifest(ctx context.Context, summary nodeprotocol.FileExportSummary, expectedOperationKey string) (downloadpkg.Manifest, error) {
@@ -294,7 +321,33 @@ func (c *DownloaderClient) UpdateCategory(ctx context.Context, name, savePath st
 }
 
 func (c *DownloaderClient) SetCategory(ctx context.Context, id, name, savePath string) error {
-	return c.categoryAction(ctx, nodeprotocol.DownloaderActionSetCategory, id, name, savePath)
+	if err := c.validateCompletionCategory(name); err != nil {
+		return err
+	}
+	if filepath.Clean(savePath) != filepath.Join(filepath.Clean(c.localRoot), name) {
+		return downloadpkg.Error(nodeprotocol.ErrorPathMappingInvalid, false, nil)
+	}
+	if err := c.categoryAction(ctx, nodeprotocol.DownloaderActionSetCategory, id, name, savePath); err != nil {
+		return err
+	}
+	return c.SetCompletionDirectory(name)
+}
+
+func (c *DownloaderClient) validateCompletionCategory(category string) error {
+	if c.groupID != "" || strings.TrimSpace(category) != category || category == "" || category == "." || category == ".." || len([]rune(category)) > 128 || strings.ContainsAny(category, "/\\:\x00\r\n") {
+		return downloadpkg.Error(nodeprotocol.ErrorPathMappingInvalid, false, nil)
+	}
+	return nil
+}
+
+// SetCompletionDirectory binds only the task's already-persisted classification.
+// The Node independently requires its original successful mutation receipt.
+func (c *DownloaderClient) SetCompletionDirectory(category string) error {
+	if err := c.validateCompletionCategory(category); err != nil {
+		return err
+	}
+	c.completionCategory = category
+	return nil
 }
 
 func (c *DownloaderClient) categoryAction(ctx context.Context, action, providerTaskID, name, localPath string) error {
@@ -339,8 +392,7 @@ func (c *DownloaderClient) request(action, taskID, providerTaskID string, mutati
 }
 
 func stableOperationKey(parts ...string) string {
-	digest := sha256.Sum256([]byte(strings.Join(parts, "\x00")))
-	return "qb:" + parts[0] + ":" + hex.EncodeToString(digest[:20])
+	return nodeprotocol.DownloaderOperationKey(parts...)
 }
 
 func joinRemoteRoot(root, child string) string {
@@ -434,6 +486,10 @@ func remoteDownloaderError(err error, fallback string) error {
 			return nil
 		}
 		return downloadpkg.Error(fallback, false, nil)
+	}
+	var provider *downloadpkg.ProviderError
+	if errors.As(err, &provider) {
+		return err
 	}
 	var remote *RemoteError
 	if errors.As(err, &remote) {

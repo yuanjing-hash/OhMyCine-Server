@@ -33,6 +33,8 @@ describe('download presentation', () => {
     expect(formatProgress(45.26)).toBe('45.3%')
     expect(formatETA(3661)).toBe('1 小时 2 分钟')
     expect(downloadStatusLabel(task)).toBe('排队中')
+    expect(downloadStatusLabel({ job_status: 'failed', scrape_status: 'completed_unverified', provider_status: 'stalledUP' } as DownloadTaskSummary)).toBe('文件核对失败')
+    expect(downloadStatusLabel({ job_status: 'retry_wait', scrape_status: 'completed_unverified' } as DownloadTaskSummary)).toBe('核对已下载文件')
     expect(torrentToBase64(new Uint8Array([0, 1, 2]))).toBe('AAEC')
   })
   it('parses newline-delimited download sources without duplicating a task', () => {

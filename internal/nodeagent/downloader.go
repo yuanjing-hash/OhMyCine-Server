@@ -271,12 +271,12 @@ func (a *Agent) executeDownloaderAction(ctx context.Context, serverID string, in
 			return response, err
 		}
 		if task, getErr := client.Get(ctx, input.ProviderTaskID); getErr == nil && task.Completed {
-			if err := a.verifyManagedManifest(ctx, serverID, input.DownloaderID, input.ProviderTaskID, credential.NodeMountRoot, manifest, input.TaskID); err != nil {
+			download, err := a.completionDownloadLocation(ctx, serverID, input, credential)
+			if err != nil {
 				return response, downloadpkg.Error(nodeprotocol.ErrorPathMappingInvalid, false, err)
 			}
-			download, err := a.managedDownloadForTask(ctx, serverID, input.DownloaderID, input.TaskID, input.ProviderTaskID)
-			if err != nil || download.TaskID != input.TaskID {
-				return response, downloadpkg.Error(nodeprotocol.ErrorPlanConflict, false, err)
+			if err := verifyManagedManifest(credential.NodeMountRoot, download, manifest); err != nil {
+				return response, downloadpkg.Error(nodeprotocol.ErrorPathMappingInvalid, false, err)
 			}
 			a.startFileExport(serverID, input.OperationKey, credential.NodeMountRoot, download, manifest)
 			return response, downloadpkg.Error(nodeprotocol.ErrorExportPreparing, true, nil)
@@ -304,7 +304,11 @@ func (a *Agent) executeDownloaderAction(ctx context.Context, serverID string, in
 		}
 		return response, client.UpdateCategory(ctx, input.CategoryName, input.SavePath)
 	case nodeprotocol.DownloaderActionSetCategory:
-		if _, err := mapDownloaderPath(credential.DownloaderSaveRoot, credential.NodeMountRoot, input.SavePath); err != nil {
+		original, err := a.managedDownloadForTask(ctx, serverID, input.DownloaderID, input.TaskID, input.ProviderTaskID)
+		if err != nil {
+			return response, downloadpkg.Error(nodeprotocol.ErrorPathMappingInvalid, false, err)
+		}
+		if _, err := mappedCategoryDownload(original, input, credential); err != nil {
 			return response, downloadpkg.Error(nodeprotocol.ErrorPathMappingInvalid, false, err)
 		}
 		return response, client.SetCategory(ctx, input.ProviderTaskID, input.CategoryName, input.SavePath)
@@ -313,17 +317,93 @@ func (a *Agent) executeDownloaderAction(ctx context.Context, serverID string, in
 	}
 }
 
-func (a *Agent) verifyManagedManifest(ctx context.Context, serverID, downloaderID, providerTaskID, mountRoot string, manifest downloadpkg.Manifest, taskIDs ...string) error {
-	var download ManagedDownload
-	var err error
-	if len(taskIDs) > 0 {
-		download, err = a.managedDownloadForTask(ctx, serverID, downloaderID, taskIDs[0], providerTaskID)
-	} else {
-		download, err = a.store.ManagedDownload(ctx, serverID, downloaderID, providerTaskID)
-	}
+// Classification changes a location inside the immutable task workspace.
+// Keep that original root and require the successful old write receipt on every
+// newly built export. A read must never redispatch SetCategory or setLocation.
+func (a *Agent) completionDownloadLocation(ctx context.Context, server string, input nodeprotocol.DownloaderActionRequest, credential nodeprotocol.DownloaderCredential) (ManagedDownload, error) {
+	original, err := a.managedDownloadForTask(ctx, server, input.DownloaderID, input.TaskID, input.ProviderTaskID)
 	if err != nil {
-		return errors.New("node_managed_download_not_found")
+		return original, err
 	}
+	if input.CategoryName == "" && input.SavePath == "" {
+		return original, nil
+	}
+	mapped, err := mappedCategoryDownload(original, input, credential)
+	if err != nil {
+		return original, err
+	}
+	// Metadata-only submission may initially use a tag before qB returns its
+	// hash. Only provider aliases already persisted for this same task qualify.
+	rows, err := a.store.db.QueryContext(ctx, `SELECT provider_task_id FROM managed_downloads WHERE paired_server_id=? AND downloader_id=? AND task_id=? AND tag=? ORDER BY provider_task_id LIMIT 17`, server, input.DownloaderID, input.TaskID, original.Tag)
+	if err != nil {
+		return original, err
+	}
+	defer rows.Close()
+	aliases := []string{}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return original, err
+		}
+		aliases = append(aliases, id)
+	}
+	if err := rows.Err(); err != nil {
+		return original, err
+	}
+	if len(aliases) > 16 {
+		return original, ErrPlanConflict
+	}
+	// Release the query before receipt reads on Node's single SQLite connection.
+	if err := rows.Close(); err != nil {
+		return original, err
+	}
+	for _, provider := range aliases {
+		key := nodeprotocol.DownloaderOperationKey(nodeprotocol.DownloaderActionSetCategory, input.DownloaderID, input.TaskID, provider, input.CategoryName, input.SavePath)
+		prior := nodeprotocol.DownloaderActionRequest{RequestID: key, TaskID: input.TaskID, OperationKey: key, DownloaderID: input.DownloaderID, Action: nodeprotocol.DownloaderActionSetCategory, ProviderTaskID: provider, CategoryName: input.CategoryName, SavePath: input.SavePath, Selection: input.Selection}
+		digest, err := prior.Digest()
+		if err != nil {
+			return original, err
+		}
+		receipt, err := a.store.ProviderReceipt(ctx, server, key)
+		if errors.Is(err, ErrOperationNotFound) {
+			continue
+		}
+		if err != nil {
+			return original, err
+		}
+		// Ordinary metadata routing had no inline Selection field. The Node
+		// already reloaded and verified this task's stored binding above.
+		prior.Selection = nil
+		ordinaryDigest, digestErr := prior.Digest()
+		if digestErr != nil {
+			return original, digestErr
+		}
+		if receipt.Status == "completed" && receipt.Action == prior.Action && receipt.OperationKey == key && (receipt.RequestDigest == digest || receipt.RequestDigest == ordinaryDigest) {
+			return mapped, nil
+		}
+	}
+	return original, ErrPlanConflict
+}
+
+func mappedCategoryDownload(original ManagedDownload, input nodeprotocol.DownloaderActionRequest, credential nodeprotocol.DownloaderCredential) (ManagedDownload, error) {
+	category := strings.TrimSpace(input.CategoryName)
+	if category == "" || category != input.CategoryName || category == "." || category == ".." || len([]rune(category)) > 128 || strings.ContainsAny(category, "/\\:\x00\r\n") || original.TaskID != input.TaskID || original.DownloaderID != input.DownloaderID || original.Tag != "omc-"+input.TaskID || input.Selection != nil && input.Selection.Group != nil {
+		return original, ErrPlanConflict
+	}
+	taskRemote := strings.TrimRight(credential.DownloaderSaveRoot, "/\\") + "/" + input.TaskID
+	taskRoot, err := mapDownloaderPath(credential.DownloaderSaveRoot, credential.NodeMountRoot, taskRemote)
+	if err != nil || !sameCleanPath(taskRoot, original.NodeLocalRoot) {
+		return original, ErrPlanConflict
+	}
+	location, err := mapDownloaderPath(credential.DownloaderSaveRoot, credential.NodeMountRoot, input.SavePath)
+	if err != nil || !sameCleanPath(location, filepath.Join(taskRoot, category)) {
+		return original, ErrPlanConflict
+	}
+	original.NodeLocalRoot = location
+	return original, nil
+}
+
+func verifyManagedManifest(mountRoot string, download ManagedDownload, manifest downloadpkg.Manifest) error {
 	root, err := secureExportRoot(mountRoot, download.NodeLocalRoot)
 	if err != nil {
 		return err

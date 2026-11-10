@@ -37,6 +37,9 @@ func (c *DownloaderClient) selectedCall(ctx context.Context, action, id string, 
 	if raw, err := json.Marshal(input); err != nil || len(raw) > nodeprotocol.MaxWireBodyBytes {
 		return nodeprotocol.DownloaderActionResponse{}, downloadpkg.Error("downloader_selection_wire_limit", false, err)
 	}
+	if action == nodeprotocol.DownloaderActionManifest {
+		return c.manifestResponse(ctx, input)
+	}
 	return c.call(ctx, input)
 }
 func (c *DownloaderClient) GetSelected(ctx context.Context, id string, b downloadpkg.SelectionContext) (downloadpkg.Task, error) {

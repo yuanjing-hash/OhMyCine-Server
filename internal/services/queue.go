@@ -18,6 +18,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/authz"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/nodeprotocol"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
@@ -1373,7 +1374,7 @@ func (s *QueueService) finishLease(id, token, status, code, message string, next
 // the ordinary bounded failure budget. Empty-code retry_at is scheduled work.
 func retryWaitConsumesFailureBudget(code string) bool {
 	switch strings.TrimSpace(code) {
-	case "", downloadCancellationPending, "downloader_submission_unconfirmed", "downloader_submit_unknown", "downloader_selection_result_unknown", "downloader_share_result_unknown", "pan115_auth_expired", "pan115_cookie_invalid", "credentials_required", "media_library_not_ready", "download_tracking_persist_wait", quarkReorganizationPending, quarkStructurePending, CodeMediaUpgradePending, CodeMediaUpgradeSeedingBusy, "media_upgrade_artifacts_pending":
+	case "", nodeprotocol.ErrorExportPreparing, downloadCancellationPending, "downloader_submission_unconfirmed", "downloader_submit_unknown", "downloader_selection_result_unknown", "downloader_share_result_unknown", "pan115_auth_expired", "pan115_cookie_invalid", "credentials_required", "media_library_not_ready", "download_tracking_persist_wait", quarkReorganizationPending, quarkStructurePending, CodeMediaUpgradePending, CodeMediaUpgradeSeedingBusy, "media_upgrade_artifacts_pending":
 		return false
 	default:
 		return true

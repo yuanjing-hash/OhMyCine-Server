@@ -5,9 +5,10 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"strings"
+
 	downloadpkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/downloader"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/resourcecontent"
-	"strings"
 )
 
 const (
@@ -226,4 +227,14 @@ func (r DownloaderActionRequest) Digest() (string, error) {
 func digestBytes(raw []byte) string {
 	sum := sha256.Sum256(raw)
 	return hex.EncodeToString(sum[:])
+}
+
+// DownloaderOperationKey retains the original v1 receipt identity across
+// clients, Node restart and read-only completion-location reconciliation.
+func DownloaderOperationKey(parts ...string) string {
+	if len(parts) == 0 {
+		return ""
+	}
+	digest := sha256.Sum256([]byte(strings.Join(parts, "\x00")))
+	return "qb:" + parts[0] + ":" + hex.EncodeToString(digest[:20])
 }

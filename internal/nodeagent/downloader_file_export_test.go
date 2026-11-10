@@ -2,6 +2,8 @@ package nodeagent
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -45,6 +47,7 @@ func TestCompletedQBittorrentManifestPublishesPersistentPagedExport(t *testing.T
 	var providerMu sync.Mutex
 	providerAvailable := true
 	providerRequests := 0
+	locationMoves := 0
 	qbit := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		providerMu.Lock()
 		providerRequests++
@@ -60,6 +63,28 @@ func TestCompletedQBittorrentManifestPublishesPersistentPagedExport(t *testing.T
 			_, _ = io.WriteString(w, "Ok.")
 		case "/api/v2/torrents/info":
 			_, _ = io.WriteString(w, `[{"hash":"hash-1","name":"Movie","state":"stalledUP","progress":1,"downloaded":29,"total_size":29}]`)
+		case "/api/v2/torrents/setCategory":
+		case "/api/v2/torrents/setLocation":
+			if err := r.ParseForm(); err != nil {
+				t.Error(err)
+				w.WriteHeader(400)
+				return
+			}
+			target := r.Form.Get("location")
+			if target != filepath.Join(downloadRoot, "电视剧") {
+				t.Error("unexpected category location")
+				w.WriteHeader(400)
+				return
+			}
+			if err := os.MkdirAll(target, 0o700); err != nil {
+				t.Error(err)
+				return
+			}
+			if err := os.Rename(filepath.Join(downloadRoot, "Movie"), filepath.Join(target, "Movie")); err != nil {
+				t.Error(err)
+				return
+			}
+			locationMoves++
 		case "/api/v2/torrents/files":
 			_ = json.NewEncoder(w).Encode([]map[string]any{
 				{"name": "Movie/Movie.mkv", "size": len(files["Movie/Movie.mkv"])},
@@ -74,6 +99,19 @@ func TestCompletedQBittorrentManifestPublishesPersistentPagedExport(t *testing.T
 	store, err := OpenStore(databasePath)
 	if err != nil {
 		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	// Keep the two historical tables in their exact server-v1.1.70 shape.
+	// Completion-location recovery must read the original columns and receipt.
+	for _, statement := range []string{
+		`DROP TABLE managed_downloads`,
+		`DROP TABLE provider_receipts`,
+		`CREATE TABLE provider_receipts (request_id TEXT PRIMARY KEY, paired_server_id TEXT NOT NULL, operation_key TEXT NOT NULL, request_digest TEXT NOT NULL, action TEXT NOT NULL, status TEXT NOT NULL, response_json TEXT NOT NULL DEFAULT '', error_code TEXT NOT NULL DEFAULT '', created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL, UNIQUE(paired_server_id, request_id))`,
+		`CREATE TABLE managed_downloads (id INTEGER PRIMARY KEY AUTOINCREMENT, paired_server_id TEXT NOT NULL, downloader_id TEXT NOT NULL, task_id TEXT NOT NULL, provider_task_id TEXT NOT NULL, tag TEXT NOT NULL DEFAULT '', downloader_save_path TEXT NOT NULL, node_local_root TEXT NOT NULL, created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL, UNIQUE(paired_server_id, downloader_id, provider_task_id))`,
+	} {
+		if _, err := store.db.ExecContext(context.Background(), statement); err != nil {
+			t.Fatal(err)
+		}
 	}
 	now := time.Now().UTC().Truncate(time.Millisecond)
 	if err := store.SaveManagedDownload(context.Background(), ManagedDownload{
@@ -105,9 +143,44 @@ func TestCompletedQBittorrentManifestPublishesPersistentPagedExport(t *testing.T
 	}
 	agent.now = func() time.Time { return now }
 	node := httptest.NewServer(agent.Handler())
+	t.Cleanup(node.Close)
+
+	categoryPath := filepath.Join(downloadRoot, "电视剧")
+	categoryKey := nodeprotocol.DownloaderOperationKey(nodeprotocol.DownloaderActionSetCategory, "downloader-1", "task-1", "hash-1", "电视剧", categoryPath)
+	category := putManifestGrant(t, node.URL, agent, now, qbit.URL, mountRoot, "grant-category", categoryKey, nodeprotocol.DownloaderActionSetCategory)
+	category.Action, category.CategoryName, category.SavePath = nodeprotocol.DownloaderActionSetCategory, "电视剧", categoryPath
+	doNodeJSON(t, node.URL+"/node/v1/downloader/actions", http.MethodPost, category, http.StatusOK)
+	if locationMoves != 1 {
+		t.Fatal("normal category action did not relocate source")
+	}
+	// v1.1.70 canonicalized these ordinary wire fields and cleared GrantID.
+	legacyWire, err := json.Marshal(map[string]any{"request_id": categoryKey, "task_id": "task-1", "operation_key": categoryKey, "downloader_id": "downloader-1", "action": "set_category", "grant_id": "", "provider_task_id": "hash-1", "category_name": "电视剧", "save_path": categoryPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyDigest := sha256.Sum256(legacyWire)
+	receipt, err := store.ProviderReceipt(context.Background(), "server-1", categoryKey)
+	if err != nil || receipt.RequestDigest != hex.EncodeToString(legacyDigest[:]) {
+		t.Fatalf("ordinary category receipt drifted from v1.1.70: %+v %v", receipt, err)
+	}
 
 	const operationKey = "qb:file_export:task-1"
 	action := putManifestGrant(t, node.URL, agent, now, qbit.URL, mountRoot, "grant-export-1", operationKey)
+	legacy := doNodeJSON(t, node.URL+"/node/v1/downloader/actions", http.MethodPost, action, http.StatusBadGateway)
+	var oldFailure nodeprotocol.ErrorResponse
+	if json.Unmarshal(legacy, &oldFailure) != nil || oldFailure.Code != nodeprotocol.ErrorPathMappingInvalid {
+		t.Fatalf("legacy completion failure=%s", legacy)
+	}
+	for _, path := range []string{filepath.Join(downloadRoot, "unrecorded"), filepath.Join(mountRoot, "another-task", "电视剧")} {
+		action.CategoryName, action.SavePath = "unrecorded", path
+		body := doNodeJSON(t, node.URL+"/node/v1/downloader/actions", http.MethodPost, action, http.StatusBadGateway)
+		if json.Unmarshal(body, &oldFailure) != nil || oldFailure.Code != nodeprotocol.ErrorPathMappingInvalid {
+			t.Fatalf("unreceipted path was accepted: %s", body)
+		}
+	}
+	// Retry the same read-only export identity using the successful original
+	// category receipt. No second relocation or submission is permitted.
+	action.CategoryName, action.SavePath = category.CategoryName, category.SavePath
 	body := doNodeJSON(t, node.URL+"/node/v1/downloader/actions", http.MethodPost, action, http.StatusBadGateway)
 	var preparing nodeprotocol.ErrorResponse
 	if err := json.Unmarshal(body, &preparing); err != nil || preparing.Code != nodeprotocol.ErrorExportPreparing {
@@ -233,13 +306,16 @@ func TestFileExportHashFailureCanRetryWithoutPublishingPartialState(t *testing.T
 	}
 }
 
-func putManifestGrant(t *testing.T, nodeURL string, agent *Agent, now time.Time, qbitURL, mountRoot, grantID, operationKey string) nodeprotocol.DownloaderActionRequest {
+func putManifestGrant(t *testing.T, nodeURL string, agent *Agent, now time.Time, qbitURL, mountRoot, grantID, operationKey string, actions ...string) nodeprotocol.DownloaderActionRequest {
 	t.Helper()
 	credential, err := json.Marshal(nodeprotocol.DownloaderCredential{ProviderType: "qbittorrent", BaseURL: qbitURL, DownloaderSaveRoot: mountRoot, NodeMountRoot: mountRoot})
 	if err != nil {
 		t.Fatal(err)
 	}
-	grant := nodeprotocol.CredentialGrant{GrantID: grantID, NodeID: "node-1", TaskID: "task-1", OperationKey: operationKey, ResourceKind: nodeprotocol.ResourceKindDownloader, ResourceID: "downloader-1", CredentialRevision: 1, AllowedActions: []string{nodeprotocol.DownloaderActionManifest}, ExpiresAt: now.Add(5 * time.Minute), Credential: credential}
+	if len(actions) == 0 {
+		actions = []string{nodeprotocol.DownloaderActionManifest}
+	}
+	grant := nodeprotocol.CredentialGrant{GrantID: grantID, NodeID: "node-1", TaskID: "task-1", OperationKey: operationKey, ResourceKind: nodeprotocol.ResourceKindDownloader, ResourceID: "downloader-1", CredentialRevision: 1, AllowedActions: actions, ExpiresAt: now.Add(5 * time.Minute), Credential: credential}
 	envelope, err := nodeprotocol.SealCredentialGrant(agent.sealingPublicKey, grant, now)
 	if err != nil {
 		t.Fatal(err)

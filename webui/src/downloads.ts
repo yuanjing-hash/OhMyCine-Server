@@ -71,6 +71,7 @@ export function formatETA(value: number | null): string {
 export function downloadStatusLabel(task: DownloadTaskSummary, retrying = false): string {
 	if (retrying) return '正在重试…'
   if (task.control_pending) return '已取消 · 云端收尾中'
+  if (task.scrape_status === 'completed_unverified' && task.job_status !== 'cancelled' && task.job_status !== 'completed') return task.job_status === 'failed' ? '文件核对失败' : '核对已下载文件'
   if (isDownloadSubmissionPending(task)) return task.job_status === 'failed' ? '提交结果待核对' : '核对原任务'
 	if (task.job_status === 'running' && normalizedProviderStatus(task.provider_status) === 'unavailable') return '等待下载器恢复'
 	if (task.job_status === 'running' && normalizedProviderStatus(task.provider_status) === 'stalleddl') return '等待连接/暂无速度'

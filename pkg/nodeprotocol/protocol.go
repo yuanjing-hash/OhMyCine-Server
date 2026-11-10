@@ -33,6 +33,8 @@ const (
 	CapabilityContentDigestV2       = "content_digest_v2"
 	CapabilityRangeExport           = "range_export"
 
+	CapabilityDownloaderCategoryExportV1 = "downloader_category_export_v1"
+
 	OperationPending   = "pending"
 	OperationRunning   = "running"
 	OperationPaused    = "paused"
@@ -68,6 +70,8 @@ const (
 	ErrorPlanConflict          = "node_operation_plan_conflict"
 	ErrorLeaseExpired          = "node_lease_expired"
 	ErrorExportPreparing       = "node_file_export_preparing"
+
+	ErrorCompletionUpgradeRequired = "node_completion_export_upgrade_required"
 )
 
 const MaxWireBodyBytes = 1 << 20

@@ -1926,6 +1926,10 @@ Server 本地库。一个下载任务只能绑定一个最终媒体库。远端 
 修改，避免历史任务恢复时漂移；名称、启停和可续签凭据仍可维护。新 Provider
 进入正式下载/存储能力时，必须同时实现 Node 适配，或明确显示不支持 Node。
 
+远端下载器确认完成后，Server 先保存 `completed_unverified`，再读取实际文件清单、校验并进入共享识别和 Transfer。文件核对失败保留原 provider 身份、冻结选集和追更占用，重试从原清单核对继续，页面显示“继续核对并入库”。文件导出准备属于正常等待，不消耗普通失败预算。
+
+Node 的 `downloader_category_export_v1` 能力支持下载任务内部的分类目录导出。原任务根保持固定，Manifest 仅凭同一 Server、下载器、任务、provider 身份以及成功 `set_category` 收据，定位到原任务根的一个分类子目录。导出复用原 operation key，恢复期间只读核对，不重新移动文件。没有该能力的旧 Node 仍可复用已有的完整导出，新的分类目录导出返回明确的节点升级提示。最终导出继续校验路径、普通文件、大小和 SHA-256，并遵守原选集范围。
+
 Node 安装只安装 `ohmycine-node`，不安装 qBittorrent、防火墙或反向代理。正式
 Server 可生成 Linux bash 或 Windows PowerShell 完整命令；命令先校验 RSA-3072
 签名清单和 installer SHA-256，再执行对应平台安装器。开发构建不生成伪官方命令。

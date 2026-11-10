@@ -17,6 +17,7 @@ import (
 	cloudpkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud"
 	downloadpkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/downloader"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/metadata/tmdb"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/nodeprotocol"
 	"gorm.io/gorm"
 )
 
@@ -273,6 +274,179 @@ func TestCompletedRecognitionRecoveryBackfillsLegacyManifestOnlyOnce(t *testing.
 	if manifestCalls != 1 {
 		t.Fatalf("persisted manifest was fetched again: calls=%d", manifestCalls)
 	}
+	if err := queue.Complete(claimed.Job.ID, claimed.LeaseToken); err != nil {
+		t.Fatal(err)
+	}
+	if err := queue.db.Model(&library).Updates(map[string]any{"baseline_generation": 1, "status": models.MediaLibraryStatusListening}).Error; err != nil {
+		t.Fatal(err)
+	}
+	// A completed provider with an unreadable output remains the same original
+	// acquisition. Recover the failed file-read stage without preclassification.
+	accepted, err := downloads.Submit(context.Background(), actor, SubmitDownloadInput{DownloaderID: provider.ID, MediaLibraryID: &library.ID, DisplayName: "Example Show", Source: DownloadSourceInput{Kind: downloadpkg.SourceURL, URL: "magnet:?xt=urn:btih:completion-output"}, RecognitionOverride: &DownloadRecognitionIdentity{TMDBID: 100, MediaType: "tv", Source: mediaIdentitySourceDirectID, Status: mediaIdentityStatusVerified}}, RequestContext{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	subscription := models.FollowSubscription{ID: "completed-original-follow", OwnerID: actor.User.ID, MediaType: "tv", TMDBID: 100, Title: "Example Show", Status: models.FollowStatusActive, Revision: 1, LifecycleRevision: 1, ExecutionSnapshotJSON: `{}`, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()}
+	if err := queue.db.Create(&subscription).Error; err != nil {
+		t.Fatal(err)
+	}
+	fingerprint := strings.Repeat("a", 64)
+	if err := queue.db.Model(&models.DownloadTask{}).Where("id=?", accepted.ID).Updates(map[string]any{"provider_task_id": "provider-hash", "phase": models.DownloadTaskStatusDownloading, "scrape_status": "classified", "scrape_category": "未识别", "staging_category": "未识别", "follow_subscription_id": subscription.ID, "follow_resource_fingerprint": fingerprint}).Error; err != nil {
+		t.Fatal(err)
+	}
+	episode := models.FollowEpisodeClaim{SubscriptionID: subscription.ID, SeasonNumber: 1, EpisodeNumber: 1, State: "downloading", DownloadTaskID: &accepted.ID, ResourceFingerprint: fingerprint, UpdatedAt: time.Now().UTC()}
+	if err := queue.db.Create(&episode).Error; err != nil {
+		t.Fatal(err)
+	}
+	client.manifestErr = downloadpkg.Error(nodeprotocol.ErrorPathMappingInvalid, false, nil)
+	client.seedTask = &downloadpkg.Task{ID: "provider-hash", Status: "stalledUP", Completed: true}
+	original, err := queue.Claim([]string{"download"})
+	if err != nil || original == nil {
+		t.Fatalf("claim=%+v %v", original, err)
+	}
+	worker := NewDownloadWorker(downloads)
+	failed := worker.Run(context.Background(), workerRuntime{queue: queue, job: *original}, *original)
+	if failed.ErrorCode != nodeprotocol.ErrorPathMappingInvalid || !strings.Contains(failed.ErrorMessage, "节点") {
+		t.Fatalf("completion error lost its stage: %+v", failed)
+	}
+	if err := queue.Fail(original.Job.ID, original.LeaseToken, failed.ErrorCode, failed.ErrorMessage); err != nil {
+		t.Fatal(err)
+	}
+	if err := queue.db.First(&episode, "subscription_id=? AND season_number=1 AND episode_number=1", subscription.ID).Error; err != nil || episode.DownloadTaskID == nil || *episode.DownloadTaskID != accepted.ID {
+		t.Fatalf("pending original lost reservation %+v %v", episode, err)
+	}
+	// A released old-build claim can be repaired only by this exact task's
+	// retained fingerprint and durable provider-completed marker.
+	if err := queue.db.Model(&episode).Updates(map[string]any{"state": "failed", "download_task_id": nil}).Error; err != nil {
+		t.Fatal(err)
+	}
+	follows := NewFollowService(queue.db, queue.audit, queue, nil, nil)
+	followWorker := NewFollowSearchWorker(follows, nil)
+	newRun := models.FollowRun{ID: "completion-competing-run", SubscriptionID: subscription.ID, OwnerID: actor.User.ID, SubscriptionRevision: 1, LifecycleRevision: 1, ExecutionSnapshotJSON: `{}`, JobID: accepted.JobID, Trigger: "manual", Status: models.FollowRunRunning}
+	if err := queue.db.Create(&newRun).Error; err != nil {
+		t.Fatal(err)
+	}
+	reservedDuringRead := false
+	const reserveCallback = "completion:concurrent_follow_reservation"
+	if err := queue.db.Callback().Query().After("gorm:after_query").Register(reserveCallback, func(query *gorm.DB) {
+		observed, ok := query.Statement.Dest.(*models.DownloadTask)
+		if reservedDuringRead || !ok || observed.ID != accepted.ID {
+			return
+		}
+		reservedDuringRead = true
+		reserved, _, err := followWorker.reserveEpisodes(newRun, subscription.ID, followCandidate{Season: 1, Fingerprint: fingerprint}, []int{1})
+		if err != nil || !reserved {
+			t.Fatalf("concurrent run did not reserve the episode: %v", err)
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	missing, err := followWorker.excludeClaimedDownloads(context.Background(), subscription.ID, map[[2]int]struct{}{{1, 1}: {}, {1, 2}: {}})
+	_ = queue.db.Callback().Query().Remove(reserveCallback)
+	if err != nil || !reservedDuringRead || len(missing) != 2 {
+		t.Fatalf("stale completion read consumed a newer reservation: missing=%v err=%v", missing, err)
+	}
+	if err := queue.db.First(&episode, "subscription_id=? AND season_number=1 AND episode_number=1", subscription.ID).Error; err != nil || episode.DownloadTaskID != nil || episode.RunID == nil || *episode.RunID != newRun.ID || episode.State != "queued" {
+		t.Fatalf("new run reservation was overwritten: %+v %v", episode, err)
+	}
+	followWorker.releaseEpisodes(subscription.ID, newRun.ID, fingerprint)
+	missing, err = followWorker.excludeClaimedDownloads(context.Background(), subscription.ID, map[[2]int]struct{}{{1, 1}: {}, {1, 2}: {}})
+	if err != nil || len(missing) != 1 {
+		t.Fatalf("pending completion became another download: missing=%v err=%v", missing, err)
+	}
+	if _, exists := missing[[2]int{1, 2}]; !exists {
+		t.Fatal("unrelated missing episode was blocked")
+	}
+	if err := queue.db.First(&episode, "subscription_id=? AND season_number=1 AND episode_number=1", subscription.ID).Error; err != nil || episode.DownloadTaskID == nil || *episode.DownloadTaskID != accepted.ID {
+		t.Fatalf("exact old claim not restored %+v %v", episode, err)
+	}
+	client.mu.Lock()
+	client.manifestErr = nil
+	beforeGet, beforeSubmit, beforeManifest, beforeCategories := client.getCalls, client.submits, client.manifestCalls, len(client.categoryCalls)
+	client.mu.Unlock()
+	if _, err := queue.Control(actor, accepted.JobID, "retry", RequestContext{}); err != nil {
+		t.Fatal(err)
+	}
+	resumed, err := queue.Claim([]string{"download"})
+	if err != nil || resumed == nil {
+		t.Fatalf("recovery claim=%+v %v", resumed, err)
+	}
+	const transferCallback = "completion:transfer_persistence_failure"
+	if err := queue.db.Callback().Create().Before("gorm:create").Register(transferCallback, func(create *gorm.DB) {
+		if create.Statement.Table == "transfer_tasks" {
+			create.AddError(appError("fixture_transfer_persistence_failed", "fixture", nil))
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	transferFailure := NewDownloadWorker(downloads).Run(context.Background(), workerRuntime{queue: queue, job: *resumed}, *resumed)
+	_ = queue.db.Callback().Create().Remove(transferCallback)
+	if transferFailure.ErrorCode == "" {
+		t.Fatal("transfer persistence failure was accepted")
+	}
+	if err := queue.Fail(resumed.Job.ID, resumed.LeaseToken, transferFailure.ErrorCode, transferFailure.ErrorMessage); err != nil {
+		t.Fatal(err)
+	}
+	var verified models.DownloadTask
+	if err := queue.db.First(&verified, "id=?", accepted.ID).Error; err != nil || verified.ScrapeStatus != "completed_verified" || !downloadCompletionPending(verified) {
+		t.Fatalf("verified original lost its pending completion: %+v %v", verified, err)
+	}
+	if err := queue.db.First(&episode, "subscription_id=? AND season_number=1 AND episode_number=1", subscription.ID).Error; err != nil || episode.DownloadTaskID == nil || *episode.DownloadTaskID != accepted.ID {
+		t.Fatalf("failed transfer released completed files: %+v %v", episode, err)
+	}
+	if _, err := queue.Control(actor, accepted.JobID, "retry", RequestContext{}); err != nil {
+		t.Fatal(err)
+	}
+	resumed, err = queue.Claim([]string{"download"})
+	if err != nil || resumed == nil {
+		t.Fatalf("verified recovery claim=%+v %v", resumed, err)
+	}
+	recovered := NewDownloadWorker(downloads).Run(context.Background(), workerRuntime{queue: queue, job: *resumed}, *resumed)
+	if recovered.ErrorCode != "" || recovered.RetryAt != nil {
+		t.Fatalf("recovery=%+v", recovered)
+	}
+	client.mu.Lock()
+	afterGet, afterSubmit, afterManifest, afterCategories := client.getCalls, client.submits, client.manifestCalls, len(client.categoryCalls)
+	client.mu.Unlock()
+	if afterGet != beforeGet || afterSubmit != beforeSubmit || afterManifest != beforeManifest+1 || afterCategories != beforeCategories {
+		t.Fatalf("completion replayed provider workflow: gets %d/%d submits %d/%d manifests %d/%d categories %d/%d", beforeGet, afterGet, beforeSubmit, afterSubmit, beforeManifest, afterManifest, beforeCategories, afterCategories)
+	}
+	var completed models.DownloadTask
+	if err := queue.db.First(&completed, "id=?", accepted.ID).Error; err != nil || completed.ProviderTaskID != "provider-hash" || completed.ScrapeStatus != "completed_verified" || completed.CompletedManifestJSON == "" {
+		t.Fatalf("completed original=%+v %v", completed, err)
+	}
+	var transfer models.TransferTask
+	if err := queue.db.First(&transfer, "download_task_id=?", accepted.ID).Error; err != nil {
+		t.Fatal("normal transfer handoff absent", err)
+	}
+	// A cancellation can settle after the task read but before lost-attachment
+	// recovery. Its completed file snapshot cannot revive the cancelled task.
+	if err := queue.db.Model(&episode).Updates(map[string]any{"state": "queued", "download_task_id": nil}).Error; err != nil {
+		t.Fatal(err)
+	}
+	cancelledDuringRead := false
+	const cancelCallback = "completion:cancel_before_follow_attachment"
+	if err := queue.db.Callback().Query().After("gorm:after_query").Register(cancelCallback, func(query *gorm.DB) {
+		observed, ok := query.Statement.Dest.(*models.DownloadTask)
+		if cancelledDuringRead || !ok || observed.ID != accepted.ID {
+			return
+		}
+		cancelledDuringRead = true
+		if err := downloads.CancelPipeline(context.Background(), actor, accepted.ID, RequestContext{}); err != nil {
+			t.Fatal(err)
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	missing, err = followWorker.excludeClaimedDownloads(context.Background(), subscription.ID, map[[2]int]struct{}{{1, 1}: {}})
+	_ = queue.db.Callback().Query().Remove(cancelCallback)
+	if err != nil || !cancelledDuringRead || len(missing) != 1 {
+		t.Fatalf("cancelled completion was restored from a stale read: missing=%v err=%v", missing, err)
+	}
+	if err := queue.db.First(&episode, "subscription_id=? AND season_number=1 AND episode_number=1", subscription.ID).Error; err != nil || episode.DownloadTaskID != nil {
+		t.Fatalf("cancelled task regained its episode: %+v %v", episode, err)
+	}
+
 }
 
 func TestValidateCompletedManifestEpisodeOverrideRequiresExactlyOneVideo(t *testing.T) {
