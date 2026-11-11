@@ -192,6 +192,9 @@ func (c *Client) StopOperation(ctx context.Context, key string, input nodeprotoc
 	if !health.Capabilities.Has(nodeprotocol.CapabilityOperationStopCASV1) {
 		return nodeprotocol.OperationResponse{}, &RemoteError{Code: "node_execution_control_upgrade_required"}
 	}
+	if input.SealUploadRetry && !health.Capabilities.Has(nodeprotocol.CapabilityStorageUploadRetryV1) {
+		return nodeprotocol.OperationResponse{}, &RemoteError{Code: nodeprotocol.ErrorCapabilityMissing}
+	}
 	var out nodeprotocol.OperationResponse
 	err = c.do(ctx, http.MethodPost, "/node/v1/operations/"+key+"/stop", input, &out)
 	return out, err

@@ -136,7 +136,8 @@ func (w *TransferWorker) stopRemoteUploadExecution(ctx context.Context, raw remo
 				continue
 			}
 			var count int64
-			if !errors.Is(err, ErrCatalogFence) && w.service.db.WithContext(ctx).Model(&models.RemoteOperation{}).Where("operation_key=?", remoteUploadOperationKey(task.ID, batch.index)).Count(&count).Error == nil && count == 0 {
+			key, _, identityErr := remoteUploadBatchIdentityTx(w.service.db.WithContext(ctx), task, batch)
+			if !errors.Is(err, ErrCatalogFence) && identityErr == nil && w.service.db.WithContext(ctx).Model(&models.RemoteOperation{}).Where("operation_key=?", key).Count(&count).Error == nil && count == 0 {
 				continue
 			}
 			return err

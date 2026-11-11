@@ -40,56 +40,59 @@ type TransferFilterOptions struct {
 }
 
 type TransferSummary struct {
-	ID                     string     `json:"id"`
-	OwnerID                uint       `json:"owner_id"`
-	DownloadTaskID         string     `json:"download_task_id"`
-	JobID                  string     `json:"job_id"`
-	DisplayName            string     `json:"display_name"`
-	DownloaderName         string     `json:"downloader_name"`
-	ProviderType           string     `json:"provider_type"`
-	ScrapeStatus           string     `json:"scrape_status"`
-	ScrapeTitle            string     `json:"scrape_title"`
-	ScrapeMediaType        string     `json:"scrape_media_type"`
-	ScrapeCategory         string     `json:"scrape_category"`
-	ScrapeTMDBID           *int64     `json:"scrape_tmdb_id"`
-	ScrapeYear             *int       `json:"scrape_year"`
-	ScrapeConfidence       *float64   `json:"scrape_confidence"`
-	IdentitySource         string     `json:"identity_source"`
-	IdentityStatus         string     `json:"identity_status"`
-	IdentityLocked         bool       `json:"identity_locked"`
-	IdentityRevision       uint64     `json:"identity_revision"`
-	ProfileID              uint       `json:"profile_id"`
-	ProfileRevision        uint64     `json:"profile_revision"`
-	LibraryID              uint       `json:"library_id"`
-	LibraryName            string     `json:"library_name"`
-	ExecutionLocation      string     `json:"execution_location"`
-	NodeID                 *string    `json:"node_id,omitempty"`
-	NodeName               string     `json:"node_name,omitempty"`
-	RemotePhase            string     `json:"remote_phase,omitempty"`
-	RemoteStatus           string     `json:"remote_status,omitempty"`
-	RemoteProgress         *float64   `json:"remote_progress,omitempty"`
-	RemoteTransferredBytes *int64     `json:"remote_transferred_bytes,omitempty"`
-	RemoteTotalBytes       *int64     `json:"remote_total_bytes,omitempty"`
-	RemoteUploadSpeedBPS   *int64     `json:"remote_upload_speed_bps,omitempty"`
-	RemoteSampledAt        *time.Time `json:"remote_sampled_at,omitempty"`
-	RemoteErrorCode        string     `json:"remote_error_code,omitempty"`
-	RecoveryPending        bool       `json:"recovery_pending,omitempty"`
-	RouteKind              string     `json:"route_kind"`
-	TransferMode           string     `json:"transfer_mode"`
-	ConflictPolicy         string     `json:"conflict_policy"`
-	Phase                  string     `json:"phase"`
-	JobStatus              string     `json:"job_status"`
-	RetryAt                *time.Time `json:"retry_at"`
-	ProcessedFiles         int        `json:"processed_files"`
-	TotalFiles             int        `json:"total_files"`
-	LastErrorCode          string     `json:"last_error_code"`
-	LastErrorMessage       string     `json:"last_error_message"`
-	CleanupStatus          string     `json:"cleanup_status"`
-	CleanupRemoved         int        `json:"cleanup_removed"`
-	CleanupErrorCode       string     `json:"cleanup_error_code"`
-	CreatedAt              time.Time  `json:"created_at"`
-	UpdatedAt              time.Time  `json:"updated_at"`
-	FinishedAt             *time.Time `json:"finished_at"`
+	RemoteTargetCheck      *nodeprotocol.StorageTargetCheck `gorm:"-" json:"remote_target_check,omitempty"`
+	UploadRetryAllowed     bool                             `json:"upload_retry_allowed,omitempty"`
+	UploadRetryVersion     uint64                           `json:"upload_retry_version,omitempty"`
+	ID                     string                           `json:"id"`
+	OwnerID                uint                             `json:"owner_id"`
+	DownloadTaskID         string                           `json:"download_task_id"`
+	JobID                  string                           `json:"job_id"`
+	DisplayName            string                           `json:"display_name"`
+	DownloaderName         string                           `json:"downloader_name"`
+	ProviderType           string                           `json:"provider_type"`
+	ScrapeStatus           string                           `json:"scrape_status"`
+	ScrapeTitle            string                           `json:"scrape_title"`
+	ScrapeMediaType        string                           `json:"scrape_media_type"`
+	ScrapeCategory         string                           `json:"scrape_category"`
+	ScrapeTMDBID           *int64                           `json:"scrape_tmdb_id"`
+	ScrapeYear             *int                             `json:"scrape_year"`
+	ScrapeConfidence       *float64                         `json:"scrape_confidence"`
+	IdentitySource         string                           `json:"identity_source"`
+	IdentityStatus         string                           `json:"identity_status"`
+	IdentityLocked         bool                             `json:"identity_locked"`
+	IdentityRevision       uint64                           `json:"identity_revision"`
+	ProfileID              uint                             `json:"profile_id"`
+	ProfileRevision        uint64                           `json:"profile_revision"`
+	LibraryID              uint                             `json:"library_id"`
+	LibraryName            string                           `json:"library_name"`
+	ExecutionLocation      string                           `json:"execution_location"`
+	NodeID                 *string                          `json:"node_id,omitempty"`
+	NodeName               string                           `json:"node_name,omitempty"`
+	RemotePhase            string                           `json:"remote_phase,omitempty"`
+	RemoteStatus           string                           `json:"remote_status,omitempty"`
+	RemoteProgress         *float64                         `json:"remote_progress,omitempty"`
+	RemoteTransferredBytes *int64                           `json:"remote_transferred_bytes,omitempty"`
+	RemoteTotalBytes       *int64                           `json:"remote_total_bytes,omitempty"`
+	RemoteUploadSpeedBPS   *int64                           `json:"remote_upload_speed_bps,omitempty"`
+	RemoteSampledAt        *time.Time                       `json:"remote_sampled_at,omitempty"`
+	RemoteErrorCode        string                           `json:"remote_error_code,omitempty"`
+	RecoveryPending        bool                             `json:"recovery_pending,omitempty"`
+	RouteKind              string                           `json:"route_kind"`
+	TransferMode           string                           `json:"transfer_mode"`
+	ConflictPolicy         string                           `json:"conflict_policy"`
+	Phase                  string                           `json:"phase"`
+	JobStatus              string                           `json:"job_status"`
+	RetryAt                *time.Time                       `json:"retry_at"`
+	ProcessedFiles         int                              `json:"processed_files"`
+	TotalFiles             int                              `json:"total_files"`
+	LastErrorCode          string                           `json:"last_error_code"`
+	LastErrorMessage       string                           `json:"last_error_message"`
+	CleanupStatus          string                           `json:"cleanup_status"`
+	CleanupRemoved         int                              `json:"cleanup_removed"`
+	CleanupErrorCode       string                           `json:"cleanup_error_code"`
+	CreatedAt              time.Time                        `json:"created_at"`
+	UpdatedAt              time.Time                        `json:"updated_at"`
+	FinishedAt             *time.Time                       `json:"finished_at"`
 }
 
 type TransferPage struct {
@@ -145,6 +148,7 @@ func transferUploadUnsettledTx(db *gorm.DB, transferID string) (bool, error) {
 }
 
 const transferProjectionColumns = `
+	COALESCE((SELECT a.version FROM job_action_requests a WHERE a.job_id=jobs.id AND a.action_type='upload_retry' AND a.response='' AND jobs.status='waiting_user_action' ORDER BY a.version DESC LIMIT 1),0) AS upload_retry_version,
 	transfer.id, transfer.owner_id, transfer.download_task_id, transfer.job_id,
 	download.display_name, download.downloader_name, download.provider_type,
 	download.scrape_status, download.scrape_title, download.scrape_media_type,
@@ -229,6 +233,7 @@ func (s *TransferService) List(actor Actor, filter TransferListFilter) (Transfer
 	}
 	for _, row := range rows {
 		finalizeTransferProjection(&row)
+		s.projectUploadRetryAction(actor, &row)
 		if !resources[row.JobID].visible(actor) {
 			row.TransferSummary = safeTransferSummary(row.TransferSummary)
 		}
@@ -250,6 +255,7 @@ func (s *TransferService) Get(actor Actor, id string) (TransferDetail, error) {
 		return TransferDetail{}, appError(CodeNotFound, "媒体整理任务不存在", gorm.ErrRecordNotFound)
 	}
 	finalizeTransferProjection(&row)
+	s.projectUploadRetryAction(actor, &row)
 	plan, err := decodeTransferPlanSummary(row.PlanSummaryJSON)
 	if err != nil {
 		plan = nil
@@ -390,6 +396,19 @@ func (s *TransferService) transferFilterOptions(actor Actor, query *gorm.DB) (Tr
 	return options, nil
 }
 
+func (s *TransferService) projectUploadRetryAction(actor Actor, row *transferProjectionRow) {
+	if row.Phase == models.TransferTaskStatusCompleted || row.UploadRetryVersion == 0 || !actor.Can(authz.PermissionJobsRespond) || !(actor.Can(authz.PermissionJobsReadAll) || row.OwnerID == actor.User.ID && actor.Can(authz.PermissionJobsReadOwn)) {
+		row.UploadRetryVersion = 0
+		return
+	}
+	var job models.Job
+	if s.db.First(&job, "id=?", row.JobID).Error == nil && authorizeJobContinuationTx(s.db, actor, job, "respond") == nil {
+		row.UploadRetryAllowed = true
+		return
+	}
+	row.UploadRetryVersion = 0
+}
+
 func finalizeTransferProjection(row *transferProjectionRow) {
 	row.LastErrorCode = row.JobErrorCode
 	if row.LastErrorCode == "" {
@@ -398,6 +417,16 @@ func finalizeTransferProjection(row *transferProjectionRow) {
 	row.LastErrorMessage = row.JobErrorMessage
 	if row.ExecutionLocation != models.NodeLocationRemote {
 		return
+	}
+	if row.Phase == models.TransferTaskStatusCompleted {
+		row.RemoteErrorCode = ""
+		row.UploadRetryAllowed, row.UploadRetryVersion = false, 0
+	}
+	var observation struct {
+		TargetCheck *nodeprotocol.StorageTargetCheck `json:"target_check"`
+	}
+	if row.Phase != models.TransferTaskStatusCompleted && len(row.UploadProgressJSON) <= 4096 && json.Unmarshal([]byte(row.UploadProgressJSON), &observation) == nil && observation.TargetCheck != nil && observation.TargetCheck.Valid() {
+		row.RemoteTargetCheck = observation.TargetCheck
 	}
 	var progress nodeprotocol.StorageUploadProgress
 	if len(row.UploadProgressJSON) > 4096 || json.Unmarshal([]byte(row.UploadProgressJSON), &progress) != nil || progress.Version != 1 ||

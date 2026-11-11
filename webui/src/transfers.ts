@@ -14,6 +14,15 @@ export interface TransferStats {
   completed_today: number
 }
 
+export interface TransferTargetCheck {
+  version: number
+  reason: string
+  complete: boolean
+  name_matches?: number
+  size_matches?: number
+  identical_matches?: number
+}
+
 export interface TransferSummary {
   id: string
   owner_id: number
@@ -48,6 +57,9 @@ export interface TransferSummary {
   remote_upload_speed_bps?: number | null
   remote_sampled_at?: string | null
   remote_error_code?: string
+  remote_target_check?: TransferTargetCheck | null
+  upload_retry_allowed?: boolean
+  upload_retry_version?: number
   recovery_pending?: boolean
   route_kind: DownloadRouteKind
   transfer_mode: TransferMode
@@ -169,8 +181,44 @@ export function transferExecutionLabel(item: TransferSummary): string {
 
 export function remoteTransferPhaseLabel(item: TransferSummary): string {
   if (item.execution_location !== 'node') return ''
+  if (isTransferTargetCheckPending(item)) return '等待核对旧上传结果'
   if (item.recovery_pending) return '原上传尚未确认完成，若未自动恢复，请管理员核对原任务与节点状态'
   return remotePhaseLabels[item.remote_phase || ''] || (item.remote_phase ? `节点阶段 · ${item.remote_phase}` : '节点等待调度')
+}
+
+function isTransferTargetCheckPending(item: TransferSummary): boolean {
+  const check = item.remote_target_check?.version === 1 ? item.remote_target_check : null
+  if (check?.reason === 'target_verified') return false
+  return item.execution_location === 'node' && item.phase !== 'completed' && !['failed', 'cancelled'].includes(item.job_status)
+    && (Object.hasOwn(targetCheckReasons, check?.reason || '') || item.remote_error_code === 'node_reconciliation_required')
+}
+
+const targetCheckReasons: Record<string, string> = {
+  parent_unresolved: '目标目录尚未确认，无法核对旧上传结果',
+  listing_incomplete: '目标目录读取尚未完成，旧上传结果仍未确认',
+  target_missing: '尚未发现符合原计划的目标文件',
+  digest_missing: '目标文件缺少可用的内容校验，尚不能确认旧上传结果',
+  digest_mismatch: '目标文件的内容校验与原文件不符，旧上传结果仍未确认',
+  multiple_matches: '发现多项可能匹配的目标文件，无法唯一确认旧上传结果',
+}
+
+export function transferTargetCheckSummary(item: TransferSummary) {
+  if (item.execution_location !== 'node') return null
+  const check = item.remote_target_check?.version === 1 ? item.remote_target_check : null
+  const pending = isTransferTargetCheckPending(item)
+  if (!pending && check?.reason !== 'target_verified') return null
+  const counts: string[] = []
+  for (const [value, label] of [[check?.name_matches, '同名'], [check?.size_matches, '大小相符'], [check?.identical_matches, '内容相符']] as const) {
+    if (typeof value === 'number' && Number.isSafeInteger(value) && value >= 0) counts.push(`${label} ${value} 项`)
+  }
+  const retryAt = Date.parse(item.retry_at || '')
+  return {
+    reason: check?.reason === 'target_verified' ? '目标文件核对通过'
+      : Object.hasOwn(targetCheckReasons, check?.reason || '') ? targetCheckReasons[check!.reason] : '旧上传结果尚未确认，正在等待目标核对',
+    complete: check?.complete,
+    counts: counts.join(' · '),
+    retryAt: pending && item.job_status === 'retry_wait' && Number.isFinite(retryAt) ? item.retry_at : null,
+  }
 }
 
 export type TransferDeletionScope = 'record_only' | 'record_and_source' | 'record_and_library' | 'record_source_and_library'
@@ -220,6 +268,7 @@ export function transferIdentityLabel(item: Pick<TransferSummary, 'identity_lock
 }
 
 export function transferStatusClass(item: TransferSummary): string {
+  if (isTransferTargetCheckPending(item)) return 'status-chip status-chip--warning'
   if (item.recovery_pending) return 'status-chip status-chip--warning'
   if (item.job_status === 'failed') return 'status-chip status-chip--error'
   if (item.job_status === 'waiting_user_action' || item.job_status === 'retry_wait' || item.job_status === 'paused' || item.job_status === 'cancelled') return 'status-chip status-chip--warning'
@@ -229,12 +278,14 @@ export function transferStatusClass(item: TransferSummary): string {
 }
 
 export function transferStatusLabel(item: TransferSummary): string {
-  if (item.recovery_pending) return '等待核对原上传'
-  if (item.job_status === 'waiting_user_action') return '等待冲突处理'
-  if (item.job_status === 'retry_wait') return '等待自动重试'
   if (item.job_status === 'paused') return '已暂停'
   if (item.job_status === 'cancelled') return '已取消'
   if (item.job_status === 'failed') return '整理失败'
+  if (item.job_status === 'waiting_user_action' && item.upload_retry_allowed) return '等待重新尝试上传'
+  if (isTransferTargetCheckPending(item)) return '等待核对旧上传结果'
+  if (item.recovery_pending) return '等待核对原上传'
+  if (item.job_status === 'waiting_user_action') return '等待冲突处理'
+  if (item.job_status === 'retry_wait') return '等待自动重试'
   if (item.phase === 'failed' && item.job_status === 'queued') return '等待重试'
   if (item.phase === 'failed' && item.job_status === 'running') return '整理处理中'
   if (item.phase === 'failed') return '整理失败'
@@ -252,7 +303,7 @@ export function transferUploadMetrics(item: TransferSummary, now: number) {
   const sampledAt = Date.parse(item.remote_sampled_at || '')
   const age = now - sampledAt
   const sampleState = !Number.isFinite(age) || age < 0 ? 'unknown' : age > 15_000 ? 'stale' : 'fresh'
-  const uploading = item.remote_phase === 'uploading_target' && !item.recovery_pending && !['paused', 'cancelled', 'failed', 'completed'].includes(item.job_status)
+  const uploading = item.remote_phase === 'uploading_target' && !item.recovery_pending && !isTransferTargetCheckPending(item) && !['paused', 'cancelled', 'failed', 'completed'].includes(item.job_status)
   return {
     transferred,
     total,
@@ -286,7 +337,7 @@ export function canRetargetTransfer(item: TransferSummary): boolean {
 }
 
 export function canDeleteTransferRecord(item: TransferSummary): boolean {
-  if (item.recovery_pending) return false
+  if (item.recovery_pending || isTransferTargetCheckPending(item)) return false
   return item.job_status === 'failed' || item.job_status === 'cancelled' || item.job_status === 'completed'
 }
 

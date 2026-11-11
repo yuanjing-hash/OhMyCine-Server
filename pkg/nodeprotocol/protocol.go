@@ -35,6 +35,7 @@ const (
 
 	CapabilityDownloaderCategoryExportV1 = "downloader_category_export_v1"
 	CapabilityOperationStopCASV1         = "operation_stop_cas_v1"
+	CapabilityStorageUploadRetryV1       = "storage_upload_retry_v1"
 
 	OperationPending   = "pending"
 	OperationRunning   = "running"
@@ -143,9 +144,10 @@ type LeaseRequest struct {
 // OperationStopRequest stops only the exact issued lease. It never adopts a
 // later owner epoch. Older Nodes do not expose this optional control endpoint.
 type OperationStopRequest struct {
-	PlanDigest string `json:"plan_digest"`
-	LeaseEpoch uint64 `json:"lease_epoch"`
-	Cancel     bool   `json:"cancel"`
+	PlanDigest      string `json:"plan_digest"`
+	LeaseEpoch      uint64 `json:"lease_epoch"`
+	Cancel          bool   `json:"cancel"`
+	SealUploadRetry bool   `json:"seal_upload_retry,omitempty"`
 }
 
 type OperationResponse struct {

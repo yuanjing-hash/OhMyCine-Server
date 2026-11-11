@@ -82,11 +82,14 @@ func remoteUploadBatchRecordTx(tx *gorm.DB, task models.TransferTask, download m
 	if task.NodeID == nil || download.NodeID == nil || *task.NodeID == "" || *task.NodeID != *download.NodeID || task.DownloadTaskID != download.ID {
 		return record, conflict
 	}
-	key := remoteUploadOperationKey(task.ID, batch.index)
+	key, payload, err := remoteUploadBatchIdentityTx(tx, task, batch)
+	if err != nil {
+		return record, conflict
+	}
 	if err := tx.First(&record, "operation_key = ?", key).Error; err != nil {
 		return record, conflict
 	}
-	raw, err := json.Marshal(batch.plan)
+	raw, err := json.Marshal(payload)
 	if err != nil {
 		return record, conflict
 	}

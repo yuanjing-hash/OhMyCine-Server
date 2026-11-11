@@ -87,6 +87,7 @@ export function jobActionLabel(value: string): string {
     skip: "跳过",
     rename: "自动改名",
     recheck: "重新核对",
+    retry_upload: "重新尝试上传",
   } as Record<string, string>)[value] ?? value;
 }
 export const listJobs = (query: URLSearchParams, signal?: AbortSignal) =>
@@ -99,7 +100,7 @@ export const controlJob = (
   id: string,
   action: "pause" | "resume" | "cancel" | "retry",
 ) => api<Job>(`/api/v1/jobs/${id}/${action}`, { method: "POST", body: "{}" });
-export const respondAction = (job: Job, response: string) =>
+export const respondAction = (job: Pick<Job, 'id'> & { action_request: Pick<JobAction, 'version'> | null }, response: string) =>
   api<Job>(
     `/api/v1/jobs/${job.id}/actions/${job.action_request?.version}/respond`,
     { method: "POST", body: JSON.stringify({ response }) },

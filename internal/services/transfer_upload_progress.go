@@ -45,6 +45,18 @@ func (w *TransferWorker) persistMeasuredUpload(ctx context.Context, task *models
 			encoded = string(raw)
 		}
 	}
+	if check := response.TargetCheck; check != nil && check.Valid() {
+		observation := map[string]any{}
+		if encoded != "" {
+			_ = json.Unmarshal([]byte(encoded), &observation)
+		}
+		observation["target_check"] = check
+		raw, err := json.Marshal(observation)
+		if err != nil {
+			return err
+		}
+		encoded = string(raw)
+	}
 	if err := fenceRemoteUploadClaim(w.service.db.WithContext(ctx).Model(&models.TransferTask{}).Where("id=? AND job_id=? AND history_cleared_at IS NULL", task.ID, task.JobID), ctx).Update("upload_progress_json", encoded).Error; err != nil {
 		return err
 	}
