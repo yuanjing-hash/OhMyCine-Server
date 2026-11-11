@@ -30,7 +30,7 @@ replace github.com/yuanjing-hash/OhMyCine-Server/webui => ./webui
 require (
 	github.com/aead/ecdh v0.2.0 // indirect
 	github.com/alecthomas/atomic v0.1.0-alpha2 // indirect
-	github.com/aliyun/aliyun-oss-go-sdk v3.0.2+incompatible // indirect
+	github.com/aliyun/aliyun-oss-go-sdk v3.0.2+incompatible
 	github.com/anacrolix/chansync v0.4.1-0.20240627045151-1aa1ac392fe8 // indirect
 	github.com/anacrolix/generics v0.0.3-0.20240902042256-7fb2702ef0ca // indirect
 	github.com/anacrolix/missinggo v1.3.0 // indirect

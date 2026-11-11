@@ -184,6 +184,18 @@ func (c *Client) CancelOperation(ctx context.Context, key string) (nodeprotocol.
 	err := c.do(ctx, http.MethodPost, "/node/v1/operations/"+key+"/cancel", nil, &out)
 	return out, err
 }
+func (c *Client) StopOperation(ctx context.Context, key string, input nodeprotocol.OperationStopRequest) (nodeprotocol.OperationResponse, error) {
+	health, err := c.Health(ctx)
+	if err != nil {
+		return nodeprotocol.OperationResponse{}, err
+	}
+	if !health.Capabilities.Has(nodeprotocol.CapabilityOperationStopCASV1) {
+		return nodeprotocol.OperationResponse{}, &RemoteError{Code: "node_execution_control_upgrade_required"}
+	}
+	var out nodeprotocol.OperationResponse
+	err = c.do(ctx, http.MethodPost, "/node/v1/operations/"+key+"/stop", input, &out)
+	return out, err
+}
 func (c *Client) PutCredentialGrant(ctx context.Context, envelope nodeprotocol.CredentialGrantEnvelope) error {
 	return c.do(ctx, http.MethodPut, "/node/v1/credential-grants/"+envelope.GrantID, envelope, nil)
 }

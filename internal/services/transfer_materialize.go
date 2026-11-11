@@ -483,7 +483,7 @@ func cleanupCrossSourceManagedRoot(task models.TransferTask, download models.Dow
 // files and provider/library data remain untouched, matching pipeline-cancel's
 // conservative keep-data contract.
 func (w *TransferWorker) Interrupt(ctx context.Context, job ClaimedJob, action string) error {
-	if action != "cancel" {
+	if action != "cancel" && action != "pause" {
 		return nil
 	}
 	var payload transferJobPayload
@@ -497,6 +497,14 @@ func (w *TransferWorker) Interrupt(ctx context.Context, job ClaimedJob, action s
 	var download models.DownloadTask
 	if err := w.service.db.First(&download, "id = ?", task.DownloadTaskID).Error; err != nil {
 		return err
+	}
+	if normalizeExecutionLocation(task.ExecutionLocation) == models.NodeLocationRemote && models.IsNativeCloudStorage(download.TargetStorageType) {
+		if err := w.interruptRemoteUpload(ctx, task, download, &job); err != nil {
+			return err
+		}
+	}
+	if action != "cancel" {
+		return nil
 	}
 	return cleanupCrossSourcePartials(ctx, task, download)
 }

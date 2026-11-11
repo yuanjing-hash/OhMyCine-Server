@@ -2083,6 +2083,7 @@ const (
 // TransferTask is the private durable import fact. ManifestJSON contains
 // provider-relative media names and must never be serialized by an API.
 type TransferTask struct {
+	UploadProgressJSON   string     `gorm:"type:text;not null;default:''" json:"-"`
 	CatalogPublishedAt   *time.Time `json:"-"`
 	ID                   string     `gorm:"primaryKey;size:36" json:"id"`
 	ManagedRevision      uint64     `gorm:"not null;default:0" json:"-"`

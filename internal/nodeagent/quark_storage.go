@@ -332,9 +332,11 @@ func (a *Agent) uploadQuarkStorageFile(ctx context.Context, serverID string, inp
 	if _, e = handle.Seek(0, io.SeekStart); e != nil {
 		return out, e
 	}
-	item, e := driver.Upload(ctx, cloud.UploadRequest{ParentID: parent, Name: out.TargetName, Size: f.Size, Reader: handle})
+	item, e := driver.Upload(ctx, cloud.UploadRequest{ParentID: parent, Name: out.TargetName, Size: f.Size, Reader: handle, Progress: storageUploadProgressCallback(ctx)})
 	if e != nil {
-		_ = a.store.UpdateStorageUploadFile(ctx, input.OperationKey, f.SourceFileToken, input.PlanDigest, nodeprotocol.StorageFileReconciling, parent, "", "", a.now())
+		if saveErr := a.checkpointUnknownStorageFile(ctx, input, f.SourceFileToken, nodeprotocol.StorageFileReconciling, parent, "", ""); saveErr != nil {
+			return out, saveErr
+		}
 		return out, e
 	}
 	// Persist exact output identity before expensive verification. A restart

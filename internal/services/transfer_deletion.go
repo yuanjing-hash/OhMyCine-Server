@@ -354,6 +354,11 @@ func (s *TransferService) loadTransferDeletionBoundaryWithDB(ctx context.Context
 	if db.First(&b.transferJob, "id = ?", b.transfer.JobID).Error != nil || !isDeletableTransferJobStatus(b.transferJob.Status) {
 		return b, appError(CodeQueueStateConflict, "媒体整理任务仍在执行，不能删除", nil)
 	}
+	if pending, err := transferUploadUnsettledTx(db, b.transfer.ID); err != nil {
+		return b, err
+	} else if pending {
+		return b, appError(CodeQueueStateConflict, "原上传仍待核对，请先完成或取消原操作", nil)
+	}
 	if jobHasActiveLease(b.transferJob, time.Now().UTC()) {
 		return b, appError(CodeQueueStateConflict, "媒体整理 worker 仍在收口，请稍后重试", nil)
 	}

@@ -5,6 +5,8 @@ import (
 	"errors"
 	"sync"
 	"time"
+
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/nodeprotocol"
 )
 
 // operationAdmission is shared by every Node-owned data/metadata execution
@@ -83,8 +85,8 @@ func (a *Agent) acquireOperation(ctx context.Context) (func(), error) {
 
 // Persistent operation identity remains in Store. This watcher only owns the
 // in-process queue/running context; cancellation never creates another plan.
-func (a *Agent) ownedOperationContext(parent context.Context, serverID, key, digest string, credentialExpiry time.Time) (context.Context, context.CancelFunc) {
-	ctx, cancel := context.WithCancel(parent)
+func (a *Agent) ownedOperationContext(parent context.Context, serverID, key, digest string, credentialExpiry time.Time, liveGuards ...func(context.Context) error) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancelCause(parent)
 	go func() {
 		ticker := time.NewTicker(250 * time.Millisecond)
 		defer ticker.Stop()
@@ -93,16 +95,23 @@ func (a *Agent) ownedOperationContext(parent context.Context, serverID, key, dig
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
+				if len(liveGuards) != 0 {
+					if err := liveGuards[0](ctx); err != nil {
+						cancel(err)
+						return
+					}
+					continue
+				}
 				if !credentialExpiry.After(a.now()) {
-					cancel()
+					cancel(errors.New(nodeprotocol.ErrorCredentialExpired))
 					return
 				}
 				if _, err := a.store.ActiveOperationPlan(ctx, serverID, key, digest, a.now()); err != nil {
-					cancel()
+					cancel(err)
 					return
 				}
 			}
 		}
 	}()
-	return ctx, cancel
+	return ctx, func() { cancel(context.Canceled) }
 }

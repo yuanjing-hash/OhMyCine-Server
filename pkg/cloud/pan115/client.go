@@ -598,7 +598,13 @@ func (c *Client) Upload(ctx context.Context, request cloud.UploadRequest) (cloud
 		<-c.callSlots
 		return cloud.Item{}, err
 	}
-	uploadErr := sdk.UploadFastOrByMultipart(parentID, name, request.Size, file, pan115sdk.UploadMultipartWithThreadsNum(1))
+	request.ParentID, request.Name = parentID, name
+	var uploadErr error
+	if observed, ok := c.sdk.(observedUploadSDK); ok {
+		uploadErr = observed.UploadObserved(ctx, request, file)
+	} else {
+		uploadErr = sdk.UploadFastOrByMultipart(parentID, name, request.Size, file, pan115sdk.UploadMultipartWithThreadsNum(1))
+	}
 	<-c.callSlots
 	c.recordOutcome(uploadErr)
 	if c.onCallResult != nil {

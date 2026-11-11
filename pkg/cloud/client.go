@@ -457,6 +457,17 @@ type UploadRequest struct {
 	Name     string
 	Size     int64
 	Reader   io.ReadSeeker
+	Progress func(UploadProgress)
+}
+
+// UploadProgress separates logical file coverage from body bytes sent during
+// this attempt. Hashing and repeated parts cannot inflate logical coverage.
+type UploadProgress struct {
+	Phase            string
+	TransferredBytes int64
+	NetworkBytes     int64
+	TotalBytes       int64
+	SampledAt        time.Time
 }
 
 // UploadDriver is available only to the Server transfer worker. Plugins never

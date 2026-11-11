@@ -110,6 +110,14 @@ func (s *TransferService) Delete(actor Actor, id string, request RequestContext)
 		if !isDeletableTransferJobStatus(job.Status) {
 			return appError(CodeQueueStateConflict, "仅失败、已取消或已完成的媒体整理记录可以删除", nil)
 		}
+		if pending, err := transferUploadUnsettledTx(tx, task.ID); err != nil {
+			return err
+		} else if pending {
+			return appError(CodeQueueStateConflict, "原上传仍待核对，请先完成或取消原操作", nil)
+		}
+		if err := assertCatalogJobDomainSettledTx(tx, job.ID); err != nil {
+			return err
+		}
 		if err := s.audit.Record(tx, &actor.User.ID, "transfer.delete", "transfer_task", task.ID, "success", map[string]any{
 			"job_status": job.Status,
 			"phase":      task.Phase,
@@ -290,7 +298,12 @@ func (w *TransferWorker) Run(ctx context.Context, runtime JobRuntime, job Claime
 	var download models.DownloadTask
 	ctx = serverlog.WithBusinessFields(ctx, transferBusinessFields(task, download))
 	w.transferEvent(ctx, task, "transfer.start", "start", "started", "开始本次媒体整理，先复核已保存清单、来源与目标边界；尚未移动或入库文件", map[string]any{"total_count": task.TotalFiles})
-	defer func() { w.recordTransferEnd(ctx, task, download, started, result) }()
+	defer func() {
+		if ctx.Err() == nil && result.ErrorCode == "" && result.RetryAt == nil && result.Wait == nil {
+			result = w.completedTransferResult(task)
+		}
+		w.recordTransferEnd(ctx, task, download, started, result)
+	}()
 	if task.Phase == models.TransferTaskStatusCompleted {
 		return w.finishCompletedTransfer(ctx, task)
 	}
@@ -589,6 +602,23 @@ func (w *TransferWorker) Run(ctx context.Context, runtime JobRuntime, job Claime
 	serverlog.OperationMediaTransfer.Event(w.service.log.Info()).Str("task_id", task.ID).Uint("library_id", task.LibraryID).Str("transfer_mode", download.TransferMode).Int("files", len(plan)).Int64("duration_ms", time.Since(started).Milliseconds()).Msg(serverlog.OperationMediaTransfer.Message("完成"))
 	task.Phase = models.TransferTaskStatusCompleted
 	return w.finishCompletedTransfer(ctx, task)
+}
+
+// A successful worker result also requires the durable transfer to be complete.
+// A request can time out while the parent lease and original Node work are live.
+func (w *TransferWorker) completedTransferResult(task models.TransferTask) WorkerResult {
+	var current models.TransferTask
+	if err := w.service.db.First(&current, "id = ? AND job_id = ?", task.ID, task.JobID).Error; err != nil {
+		return WorkerResult{ErrorCode: "transfer_state_persist_failed", ErrorMessage: "整理状态暂时无法核对"}
+	}
+	if current.Phase == models.TransferTaskStatusCompleted {
+		return WorkerResult{}
+	}
+	if errors.Is(ensureDownloadPipelineActive(w.service.db, current.DownloadTaskID), context.Canceled) {
+		return WorkerResult{}
+	}
+	next := time.Now().UTC().Add(15 * time.Second)
+	return WorkerResult{RetryAt: &next, ErrorCode: "transfer_reconciliation_pending", ErrorMessage: "原整理尚未完成，将继续核对原操作"}
 }
 
 func newTransferPlanSummary(plan []transferPlanItem) (TransferPlanSummary, error) {

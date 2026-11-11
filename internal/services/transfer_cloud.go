@@ -1861,7 +1861,11 @@ func taskJobCheckpoint(db *gorm.DB, jobID string) string {
 	return job.CheckpointJSON
 }
 
-func (w *TransferWorker) cloudFailure(task models.TransferTask, err error) WorkerResult {
+func (w *TransferWorker) cloudFailure(task models.TransferTask, err error, uploadContexts ...context.Context) WorkerResult {
+	var uploadContext context.Context
+	if len(uploadContexts) > 0 {
+		uploadContext = uploadContexts[0]
+	}
 	if activeErr := ensureDownloadPipelineActive(w.service.db, task.DownloadTaskID); errors.Is(activeErr, context.Canceled) {
 		return WorkerResult{}
 	}
@@ -1880,12 +1884,12 @@ func (w *TransferWorker) cloudFailure(task models.TransferTask, err error) Worke
 		} else {
 			message = "网盘暂时不可用，云端整理将自动重试"
 		}
-		_ = w.service.db.Model(&task).Updates(map[string]any{"phase": phase, "last_error_code": code, "updated_at": time.Now().UTC()}).Error
+		_ = fenceRemoteUploadClaim(w.service.db.Model(&task), uploadContext).Updates(map[string]any{"phase": phase, "last_error_code": code, "updated_at": time.Now().UTC()}).Error
 		next := time.Now().UTC().Add(15 * time.Second)
 		serverlog.OperationMediaTransfer.Event(w.service.log.Warn()).Str("task_id", task.ID).Uint("library_id", task.LibraryID).Str("error_code", code).Time("retry_at", next).Msg(serverlog.OperationMediaTransfer.Message("暂时失败，已安排自动重试"))
 		return WorkerResult{RetryAt: &next, ErrorCode: code, ErrorMessage: message}
 	}
-	_ = w.service.db.Model(&task).Updates(map[string]any{"phase": models.TransferTaskStatusFailed, "last_error_code": code, "updated_at": time.Now().UTC()}).Error
+	_ = fenceRemoteUploadClaim(w.service.db.Model(&task), uploadContext).Updates(map[string]any{"phase": models.TransferTaskStatusFailed, "last_error_code": code, "updated_at": time.Now().UTC()}).Error
 	serverlog.OperationMediaTransfer.Event(w.service.log.Error()).Str("task_id", task.ID).Uint("library_id", task.LibraryID).Str("error_code", code).Msg(serverlog.OperationMediaTransfer.Message("失败"))
 	return WorkerResult{ErrorCode: code, ErrorMessage: message}
 }

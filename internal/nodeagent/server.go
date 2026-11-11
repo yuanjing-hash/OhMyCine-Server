@@ -84,6 +84,7 @@ func (a *Agent) Handler() http.Handler {
 	mux.HandleFunc("GET /node/v1/operations/{operation_key}", a.requireServer(a.getOperation))
 	mux.HandleFunc("POST /node/v1/operations/{operation_key}/lease", a.requireServer(a.renewLease))
 	mux.HandleFunc("POST /node/v1/operations/{operation_key}/cancel", a.requireServer(a.cancelOperation))
+	mux.HandleFunc("POST /node/v1/operations/{operation_key}/stop", a.requireServer(a.stopOperation))
 	mux.HandleFunc("GET /node/v1/operations/{operation_key}/manifest", a.requireServer(a.fileExportManifest))
 	mux.HandleFunc("GET /node/v1/operations/{operation_key}/chunks/{file_token}", a.requireServer(a.fileExportChunks))
 	mux.HandleFunc("GET /node/v1/operations/{operation_key}/files/{file_token}", a.requireServer(a.fileExportRange))
@@ -382,6 +383,27 @@ func (a *Agent) renewLease(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "node_persistence_failed", "节点无法续期任务")
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (a *Agent) stopOperation(w http.ResponseWriter, r *http.Request) {
+	var input nodeprotocol.OperationStopRequest
+	if err := decodeJSON(w, r, &input); err != nil {
+		return
+	}
+	result, err := a.store.StopLease(r.Context(), r.Header.Get("X-OhMyCine-Verified-Server-ID"), r.PathValue("operation_key"), input, a.now())
+	if errors.Is(err, ErrLeaseConflict) {
+		writeError(w, http.StatusConflict, "node_lease_conflict", "原任务控制租约已变更")
+		return
+	}
+	if errors.Is(err, ErrOperationNotFound) {
+		writeError(w, http.StatusNotFound, err.Error(), "远端任务不存在")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "node_persistence_failed", "节点无法保存任务控制")
 		return
 	}
 	writeJSON(w, http.StatusOK, result)

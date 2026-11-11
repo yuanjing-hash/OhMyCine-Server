@@ -1,12 +1,14 @@
 package nodeprotocol
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"path"
 	"strings"
+	"time"
 )
 
 const (
@@ -91,15 +93,47 @@ type StorageUploadFileResult struct {
 }
 
 type StorageActionResponse struct {
-	RequestID      string                    `json:"request_id"`
-	OperationKey   string                    `json:"operation_key"`
-	PlanDigest     string                    `json:"plan_digest"`
-	Status         string                    `json:"status"`
-	TotalFiles     int                       `json:"total_files"`
-	CompletedFiles int                       `json:"completed_files"`
-	Files          []StorageUploadFileResult `json:"files,omitempty"`
-	ErrorCode      string                    `json:"error_code,omitempty"`
+	ExecutionActive *bool                     `json:"execution_active,omitempty"`
+	Phase           string                    `json:"phase,omitempty"`
+	UploadProgress  *StorageUploadProgress    `json:"upload_progress,omitempty"`
+	RequestID       string                    `json:"request_id"`
+	OperationKey    string                    `json:"operation_key"`
+	PlanDigest      string                    `json:"plan_digest"`
+	Status          string                    `json:"status"`
+	TotalFiles      int                       `json:"total_files"`
+	CompletedFiles  int                       `json:"completed_files"`
+	Files           []StorageUploadFileResult `json:"files,omitempty"`
+	ErrorCode       string                    `json:"error_code,omitempty"`
 }
+
+type StorageUploadProgress struct {
+	invalid          bool
+	Version          int       `json:"version"`
+	TransferredBytes int64     `json:"transferred_bytes"`
+	TotalBytes       int64     `json:"total_bytes"`
+	UploadSpeedBPS   *int64    `json:"upload_speed_bps,omitempty"`
+	SampledAt        time.Time `json:"sampled_at"`
+}
+
+func (progress *StorageUploadProgress) UnmarshalJSON(raw []byte) error {
+	type wire StorageUploadProgress
+	var fields map[string]json.RawMessage
+	var value wire
+	if json.Unmarshal(raw, &fields) != nil || json.Unmarshal(raw, &value) != nil {
+		progress.invalid = true
+		return nil
+	}
+	*progress = StorageUploadProgress(value)
+	for _, required := range []string{"version", "transferred_bytes", "total_bytes", "sampled_at"} {
+		field := bytes.TrimSpace(fields[required])
+		if len(field) == 0 || bytes.Equal(field, []byte("null")) {
+			progress.invalid = true
+		}
+	}
+	return nil
+}
+
+func (progress StorageUploadProgress) HasMeasurements() bool { return !progress.invalid }
 
 func (plan StorageUploadPlan) Validate() error {
 	if plan.ProviderType == StorageProviderQuark {
