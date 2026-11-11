@@ -63,7 +63,8 @@ func safeDownloadTaskSummary(item DownloadTaskSummary) DownloadTaskSummary {
 func safeTransferSummary(item TransferSummary) TransferSummary {
 	return TransferSummary{ID: item.ID, OwnerID: item.OwnerID, DownloadTaskID: item.DownloadTaskID, JobID: item.JobID,
 		DisplayName: "资源权限受限的整理任务", Phase: item.Phase, JobStatus: item.JobStatus, RetryAt: item.RetryAt,
-		ProcessedFiles: item.ProcessedFiles, TotalFiles: item.TotalFiles, LastErrorCode: item.LastErrorCode,
+		RecoveryPending: item.RecoveryPending,
+		ProcessedFiles:  item.ProcessedFiles, TotalFiles: item.TotalFiles, LastErrorCode: item.LastErrorCode,
 		CleanupStatus: item.CleanupStatus, CleanupRemoved: item.CleanupRemoved, CleanupErrorCode: item.CleanupErrorCode,
 		CreatedAt: item.CreatedAt, UpdatedAt: item.UpdatedAt, FinishedAt: item.FinishedAt}
 }

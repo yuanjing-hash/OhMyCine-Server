@@ -43,7 +43,12 @@ export interface TransferSummary {
   remote_phase?: string
   remote_status?: string
   remote_progress?: number | null
+  remote_transferred_bytes?: number | null
+  remote_total_bytes?: number | null
+  remote_upload_speed_bps?: number | null
+  remote_sampled_at?: string | null
   remote_error_code?: string
+  recovery_pending?: boolean
   route_kind: DownloadRouteKind
   transfer_mode: TransferMode
   conflict_policy: 'ask' | 'overwrite' | 'skip' | 'rename'
@@ -150,6 +155,7 @@ const remotePhaseLabels: Record<string, string> = {
   verifying_remote_files: '节点核验下载文件',
   waiting_server_plan: '节点等待 Server 规划',
   pulling_source: '节点拉取来源文件',
+  hashing_source: '节点校验源文件',
   uploading_target: '节点上传目标网盘',
   verifying_target: '节点核验目标文件',
   waiting_node: '等待节点恢复',
@@ -163,6 +169,7 @@ export function transferExecutionLabel(item: TransferSummary): string {
 
 export function remoteTransferPhaseLabel(item: TransferSummary): string {
   if (item.execution_location !== 'node') return ''
+  if (item.recovery_pending) return '原上传尚未确认完成，若未自动恢复，请管理员核对原任务与节点状态'
   return remotePhaseLabels[item.remote_phase || ''] || (item.remote_phase ? `节点阶段 · ${item.remote_phase}` : '节点等待调度')
 }
 
@@ -213,6 +220,7 @@ export function transferIdentityLabel(item: Pick<TransferSummary, 'identity_lock
 }
 
 export function transferStatusClass(item: TransferSummary): string {
+  if (item.recovery_pending) return 'status-chip status-chip--warning'
   if (item.job_status === 'failed') return 'status-chip status-chip--error'
   if (item.job_status === 'waiting_user_action' || item.job_status === 'retry_wait' || item.job_status === 'paused' || item.job_status === 'cancelled') return 'status-chip status-chip--warning'
   if (item.phase === 'failed' && item.job_status !== 'queued' && item.job_status !== 'running') return 'status-chip status-chip--error'
@@ -221,6 +229,7 @@ export function transferStatusClass(item: TransferSummary): string {
 }
 
 export function transferStatusLabel(item: TransferSummary): string {
+  if (item.recovery_pending) return '等待核对原上传'
   if (item.job_status === 'waiting_user_action') return '等待冲突处理'
   if (item.job_status === 'retry_wait') return '等待自动重试'
   if (item.job_status === 'paused') return '已暂停'
@@ -235,6 +244,27 @@ export function transferStatusLabel(item: TransferSummary): string {
 export function formatTransferProgress(item: TransferSummary): string {
   if (item.total_files < 1) return '尚未生成计划'
   return `${item.processed_files} / ${item.total_files}`
+}
+
+export function transferUploadMetrics(item: TransferSummary, now: number) {
+  const transferred = measuredValue(item.remote_transferred_bytes)
+  const total = measuredValue(item.remote_total_bytes)
+  const sampledAt = Date.parse(item.remote_sampled_at || '')
+  const age = now - sampledAt
+  const sampleState = !Number.isFinite(age) || age < 0 ? 'unknown' : age > 15_000 ? 'stale' : 'fresh'
+  const uploading = item.remote_phase === 'uploading_target' && !item.recovery_pending && !['paused', 'cancelled', 'failed', 'completed'].includes(item.job_status)
+  return {
+    transferred,
+    total,
+    percentage: transferred !== null && total !== null && total > 0 && transferred <= total ? transferred / total * 100 : null,
+    speed: uploading && sampleState === 'fresh' ? measuredValue(item.remote_upload_speed_bps) : null,
+    sampledAt: sampleState === 'unknown' ? null : item.remote_sampled_at,
+    sampleState,
+  }
+}
+
+function measuredValue(value: number | null | undefined): number | null {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null
 }
 
 export function transferPhaseDescription(item: TransferSummary): string {
@@ -256,6 +286,7 @@ export function canRetargetTransfer(item: TransferSummary): boolean {
 }
 
 export function canDeleteTransferRecord(item: TransferSummary): boolean {
+  if (item.recovery_pending) return false
   return item.job_status === 'failed' || item.job_status === 'cancelled' || item.job_status === 'completed'
 }
 

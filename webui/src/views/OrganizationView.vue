@@ -6,6 +6,7 @@ import { Permissions } from '@/auth/generated-permissions'
 import ClearHistoryButton from '@/components/ClearHistoryButton.vue'
 import MediaReorganizationDialog from '@/components/MediaReorganizationDialog.vue'
 import TransferDeletionDialog from '@/components/TransferDeletionDialog.vue'
+import TransferProgress from '@/components/TransferProgress.vue'
 import { controlJob, jobActionLabel as actionLabel, respondAction } from '@/jobs'
 import { useAuthStore } from '@/stores/auth'
 import { notify } from '@/toast'
@@ -13,7 +14,6 @@ import {
   canDeleteTransferRecord,
   canRetargetTransfer,
   conflictPolicyLabels,
-  formatTransferProgress,
   getTransfer,
   listTransfers,
   remoteTransferPhaseLabel,
@@ -48,6 +48,7 @@ const filterCategories = ref<string[]>([])
 const mediaLibraries = ref<MediaLibraryDetail[]>([])
 const loading = ref(true)
 const detailLoading = ref(false)
+const detailError = ref('')
 const saving = ref(false)
 const error = ref('')
 const selected = ref<TransferDetail | null>(null)
@@ -64,10 +65,15 @@ const libraryID = ref(readStringQuery('library_id'))
 const category = ref(readStringQuery('category'))
 const transferMode = ref<'' | TransferMode>(readModeQuery())
 const keyword = ref(readStringQuery('keyword'))
+const now = ref(Date.now())
 let drawerTrigger: HTMLElement | null = null
 let refreshTimer: number | undefined
 let debounceTimer: number | undefined
 let socket: WebSocket | undefined
+let listRequest = 0
+let pendingListRequests = 0
+let detailRequest = 0
+let disposed = false
 
 const canRespond = computed(() => {
   if (!selected.value || !auth.can(Permissions.JobsRespond)) return false
@@ -123,26 +129,32 @@ async function syncRoute(taskID = selected.value?.id ?? readStringQuery('task'))
 }
 
 async function load(showLoading = true, quiet = false) {
+  const request = ++listRequest
+  pendingListRequests++
   if (showLoading) loading.value = true
   if (!quiet) error.value = ''
   try {
     const result: TransferPage = await listTransfers(queryParams())
+    if (request !== listRequest) return
     items.value = result.list
     total.value = result.total
     stats.value = result.stats
     filterLibraries.value = result.filter_options.libraries
     filterCategories.value = result.filter_options.categories
+    if (detailLoading.value) return
     const requested = readStringQuery('task')
     let detailLoaded = false
     if (requested && selected.value?.id !== requested) {
       detailLoaded = await openByID(requested, false)
+      if (request !== listRequest) return
       if (!detailLoaded) await syncRoute('')
     }
     if (selected.value && !detailLoaded && !(await refreshDetail(selected.value.id))) await syncRoute('')
   } catch (reason) {
-    if (!quiet) error.value = message(reason)
+    if (request === listRequest && !quiet) error.value = message(reason)
   } finally {
-    if (showLoading) loading.value = false
+    pendingListRequests--
+    if (request === listRequest) loading.value = false
   }
 }
 
@@ -165,33 +177,52 @@ async function open(item: TransferSummary) {
 }
 
 async function openByID(id: string, updateRoute: boolean): Promise<boolean> {
+  const request = ++detailRequest
+  detailError.value = ''
+  if (selected.value?.id !== id) selected.value = null
   detailLoading.value = true
   await nextTick()
   document.querySelector<HTMLElement>('.organization-drawer .icon-button')?.focus()
   try {
-    selected.value = await getTransfer(id)
+    const detail = await getTransfer(id)
+    if (request !== detailRequest) return true
+    selected.value = detail
     if (updateRoute) await syncRoute(id)
     return true
   } catch (reason) {
+    if (request !== detailRequest) return true
     notify(message(reason), 'error')
     if (updateRoute) await closeDrawer()
     return false
   } finally {
-    detailLoading.value = false
+    if (request === detailRequest) detailLoading.value = false
   }
 }
 
 async function refreshDetail(id: string): Promise<boolean> {
+  const request = ++detailRequest
   try {
-    selected.value = await getTransfer(id)
+    const detail = await getTransfer(id)
+    if (request !== detailRequest || selected.value?.id !== id) return true
+    selected.value = detail
+    detailError.value = ''
     return true
-  } catch {
-    selected.value = null
-    return false
+  } catch (reason) {
+    if (request !== detailRequest || selected.value?.id !== id) return true
+    if (reason instanceof APIError && [401, 403, 404].includes(reason.status)) {
+      selected.value = null
+      detailError.value = ''
+      return false
+    }
+    detailError.value = message(reason)
+    return true
   }
 }
 
 async function closeDrawer() {
+  detailRequest++
+  detailLoading.value = false
+  detailError.value = ''
   selected.value = null
   await syncRoute('')
   window.setTimeout(() => drawerTrigger?.focus())
@@ -285,11 +316,19 @@ async function respond(response: string) {
 
 function scheduleRefresh() {
   if (debounceTimer !== undefined) window.clearTimeout(debounceTimer)
-  debounceTimer = window.setTimeout(() => { void load(false, true) }, 400)
+  debounceTimer = window.setTimeout(() => { if (!pendingListRequests) void load(false, true) }, 400)
 }
 
 function startLiveUpdates() {
-  refreshTimer = window.setInterval(() => { void load(false, true) }, 15_000)
+  if (disposed) return
+  let refreshedAt = Date.now()
+  refreshTimer = window.setInterval(() => {
+    now.value = Date.now()
+    if (now.value - refreshedAt >= (scope.value === 'active' ? 5_000 : 15_000)) {
+      refreshedAt = now.value
+      if (!pendingListRequests) void load(false, true)
+    }
+  }, 1_000)
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
   socket = new WebSocket(`${protocol}//${window.location.host}/api/v1/jobs/events/ws`)
   socket.onmessage = event => {
@@ -348,6 +387,9 @@ onMounted(async () => {
 })
 
 onBeforeUnmount(() => {
+  disposed = true
+  listRequest++
+  detailRequest++
   if (refreshTimer !== undefined) window.clearInterval(refreshTimer)
   if (debounceTimer !== undefined) window.clearTimeout(debounceTimer)
   socket?.close()
@@ -388,19 +430,19 @@ onBeforeUnmount(() => {
       <p v-if="loading" class="p-6 text-muted">正在读取媒体整理记录…</p>
       <p v-else-if="items.length === 0" class="p-6 text-muted">{{ scope === 'history' ? '当前没有媒体整理历史记录。' : '当前没有进行中的自动整理任务。' }}</p>
       <table v-else class="semantic-table organization-table w-full">
-        <thead><tr><th>媒体</th><th>识别 / 分类</th><th>目标</th><th>阶段</th><th>文件</th><th>更新时间</th><th>操作</th></tr></thead>
+        <thead><tr><th>媒体</th><th>识别 / 分类</th><th>目标</th><th>阶段</th><th>执行进度</th><th>更新时间</th><th>操作</th></tr></thead>
         <tbody><tr v-for="item in items" :key="item.id" :class="{ 'task-action-required': item.job_status === 'waiting_user_action' }">
           <td><button class="semantic-link text-left" type="button" @click="open(item)"><strong class="block">{{ item.display_name }}</strong><small class="text-subtle mt-1 block">{{ item.downloader_name }} · {{ item.provider_type }}</small></button></td>
           <td><strong class="block">{{ item.scrape_title || '未识别标题' }}</strong><small class="text-subtle mt-1 block">{{ item.scrape_media_type || '未知类型' }} · {{ item.scrape_category || '未分类' }}<template v-if="item.scrape_tmdb_id"> · TMDB {{ item.scrape_tmdb_id }}</template></small></td>
           <td><strong class="block">{{ item.library_name }}</strong><small class="text-subtle mt-1 block">{{ transferRouteLabel(item.route_kind) }} · {{ transferModeLabels[item.transfer_mode] }} · {{ conflictPolicyLabels[item.conflict_policy] }}</small><small class="text-subtle mt-1 block">{{ transferExecutionLabel(item) }}</small></td>
           <td><span :class="transferStatusClass(item)">{{ transferStatusLabel(item) }}</span><small v-if="item.execution_location === 'node'" class="text-subtle mt-1 block">{{ remoteTransferPhaseLabel(item) }}</small><small v-if="item.phase === 'risk_backoff'" class="semantic-warning-text mt-1 block">{{ transferPhaseDescription(item) }}</small><small v-if="item.remote_error_code" class="semantic-warning-text mt-1 block">{{ item.remote_error_code }}</small><small v-if="item.last_error_message" class="semantic-danger-text mt-1 block">{{ item.last_error_message }}</small></td>
-          <td>{{ formatTransferProgress(item) }}</td>
+          <td><TransferProgress :item="item" :now="now" /></td>
           <td>{{ formatDate(item.updated_at) }}</td>
           <td><div class="flex flex-wrap gap-2"><button class="btn-secondary" type="button" @click="open(item)">查看详情</button><button v-if="canReorganize(item)" class="btn-secondary" type="button" :disabled="saving" @click="openReorganization(item)">修正识别并重新整理</button><button v-if="canControl(item) && canRetargetTransfer(item)" class="btn-secondary" type="button" :disabled="saving" @click="openRetarget(item)">修改入库目标</button><button v-if="canControl(item) && item.job_status === 'failed'" class="btn-secondary" type="button" :disabled="saving" @click="retry(item)">重试入库</button><button v-if="canDelete(item)" class="btn-danger" type="button" :disabled="saving" @click="remove(item)">删除记录</button></div></td>
         </tr></tbody>
       </table>
       <div v-if="!loading && items.length" class="organization-mobile-list p-3">
-        <article v-for="item in items" :key="item.id" class="semantic-inset p-3"><div class="flex items-start justify-between gap-3"><div><strong>{{ item.scrape_title || item.display_name }}</strong><small class="text-subtle mt-1 block">{{ item.library_name }} · {{ transferRouteLabel(item.route_kind) }} · {{ transferModeLabels[item.transfer_mode] }}</small><small class="text-subtle mt-1 block">{{ transferExecutionLabel(item) }}<template v-if="item.execution_location === 'node'"> · {{ remoteTransferPhaseLabel(item) }}</template></small></div><span :class="transferStatusClass(item)">{{ transferStatusLabel(item) }}</span></div><p class="text-subtle mb-0 mt-3 text-xs">{{ item.scrape_category || '未分类' }} · {{ formatTransferProgress(item) }} · {{ formatDate(item.updated_at) }}</p><div class="mt-3 flex flex-wrap gap-2"><button class="btn-secondary" type="button" @click="open(item)">查看详情</button><button v-if="canReorganize(item)" class="btn-secondary" type="button" :disabled="saving" @click="openReorganization(item)">修正识别并重新整理</button><button v-if="canControl(item) && canRetargetTransfer(item)" class="btn-secondary" type="button" :disabled="saving" @click="openRetarget(item)">修改入库目标</button><button v-if="canControl(item) && item.job_status === 'failed'" class="btn-secondary" type="button" :disabled="saving" @click="retry(item)">重试入库</button><button v-if="canDelete(item)" class="btn-danger" type="button" :disabled="saving" @click="remove(item)">删除记录</button></div></article>
+        <article v-for="item in items" :key="item.id" class="semantic-inset p-3"><div class="flex items-start justify-between gap-3"><div><strong>{{ item.scrape_title || item.display_name }}</strong><small class="text-subtle mt-1 block">{{ item.library_name }} · {{ transferRouteLabel(item.route_kind) }} · {{ transferModeLabels[item.transfer_mode] }}</small><small class="text-subtle mt-1 block">{{ transferExecutionLabel(item) }}<template v-if="item.execution_location === 'node'"> · {{ remoteTransferPhaseLabel(item) }}</template></small></div><span :class="transferStatusClass(item)">{{ transferStatusLabel(item) }}</span></div><p class="text-subtle mb-0 mt-3 text-xs">{{ item.scrape_category || '未分类' }} · {{ formatDate(item.updated_at) }}</p><TransferProgress class="mt-3 text-sm" :item="item" :now="now" /><div class="mt-3 flex flex-wrap gap-2"><button class="btn-secondary" type="button" @click="open(item)">查看详情</button><button v-if="canReorganize(item)" class="btn-secondary" type="button" :disabled="saving" @click="openReorganization(item)">修正识别并重新整理</button><button v-if="canControl(item) && canRetargetTransfer(item)" class="btn-secondary" type="button" :disabled="saving" @click="openRetarget(item)">修改入库目标</button><button v-if="canControl(item) && item.job_status === 'failed'" class="btn-secondary" type="button" :disabled="saving" @click="retry(item)">重试入库</button><button v-if="canDelete(item)" class="btn-danger" type="button" :disabled="saving" @click="remove(item)">删除记录</button></div></article>
       </div>
       <footer v-if="!loading && items.length" class="border-t border-[var(--border)] p-3 text-sm text-muted">显示 {{ items.length }} / {{ total }} 条 <span class="ml-4 inline-flex items-center gap-2"><button class="btn-secondary" type="button" :disabled="page === 1" @click="changePage(page - 1)">上一页</button><span>第 {{ page }} 页</span><button class="btn-secondary" type="button" :disabled="page * pageSize >= total" @click="changePage(page + 1)">下一页</button></span></footer>
     </div>
@@ -414,8 +456,9 @@ onBeforeUnmount(() => {
         <header><div><small>自动整理任务</small><h2>{{ selected?.scrape_title || selected?.display_name || '正在加载' }}</h2></div><button class="icon-button" type="button" aria-label="关闭详情" @click="closeDrawer()">×</button></header>
         <p v-if="detailLoading && !selected" class="p-5 text-muted">正在读取任务详情…</p>
         <template v-else-if="selected">
+          <p v-if="detailError" class="semantic-warning m-4 p-3 text-sm" role="status">详情暂未刷新 · {{ detailError }}</p>
           <section v-if="selected.job.action_request" class="semantic-warning m-4 p-4"><strong>{{ selected.job.action_request.prompt }}</strong><dl class="mt-3 grid gap-2 text-sm"><div v-for="(value, key) in selected.job.action_request.preview" :key="key"><dt class="text-subtle">{{ key }}</dt><dd class="m-0">{{ value }}</dd></div></dl><div class="mt-3 flex flex-wrap gap-2"><button v-for="option in selected.job.action_request.options" :key="option" class="btn-primary" type="button" :disabled="saving || !canRespond" @click="respond(option)">{{ actionLabel(option) }}</button></div></section>
-          <section class="organization-detail-section"><div class="flex items-start justify-between gap-3"><div><h3>任务概览</h3><p class="text-subtle mt-1 text-sm">{{ selected.display_name }} · {{ selected.downloader_name }}</p></div><span :class="transferStatusClass(selected)">{{ transferStatusLabel(selected) }}</span></div><p v-if="selected.phase === 'risk_backoff'" class="semantic-warning mt-4 p-3 text-sm">{{ transferPhaseDescription(selected) }}</p><p v-if="selected.execution_location === 'node'" class="semantic-inset mt-4 p-3 text-sm"><strong>{{ transferExecutionLabel(selected) }}</strong><span class="text-subtle mt-1 block">{{ remoteTransferPhaseLabel(selected) }}<template v-if="selected.remote_progress != null"> · {{ Math.round(selected.remote_progress * 100) }}%</template><template v-if="selected.remote_error_code"> · {{ selected.remote_error_code }}</template></span></p><dl class="organization-facts"><div><dt>目标媒体库</dt><dd>{{ selected.library_name }}</dd></div><div><dt>执行位置</dt><dd>{{ transferExecutionLabel(selected) }}</dd></div><div><dt>入库路线</dt><dd>{{ transferRouteLabel(selected.route_kind) }}</dd></div><div><dt>入库方式</dt><dd>{{ transferModeLabels[selected.transfer_mode] }}</dd></div><div><dt>冲突策略</dt><dd>{{ conflictPolicyLabels[selected.conflict_policy] }}</dd></div><div><dt>文件进度</dt><dd>{{ formatTransferProgress(selected) }}</dd></div><div><dt>暂存清理</dt><dd>{{ selected.cleanup_status === 'deferred' ? '等待做种结束' : selected.cleanup_status === 'completed' ? `已清理 ${selected.cleanup_removed} 项` : selected.cleanup_status === 'failed' ? `清理失败 · ${selected.cleanup_error_code}` : selected.cleanup_status === 'skipped' ? '旧任务不自动清理' : '待处理' }}</dd></div><div><dt>分类规则快照</dt><dd>Profile {{ selected.profile_id }} · r{{ selected.profile_revision }}</dd></div><div><dt>创建时间</dt><dd>{{ formatDate(selected.created_at) }}</dd></div></dl><p v-if="selected.last_error_message" class="semantic-error mt-4 p-3"><strong>{{ selected.last_error_code || '整理失败' }}</strong><span class="mt-1 block">{{ selected.last_error_message }}</span></p><div class="mt-4 flex flex-wrap gap-2"><button v-if="canReorganize(selected)" class="btn-primary" type="button" :disabled="saving" @click="openReorganization(selected)">修正识别并重新整理</button><button v-if="canControl(selected) && selected.job_status === 'failed'" class="btn-primary" type="button" :disabled="saving" @click="retry(selected)">仅重试入库阶段</button><button v-if="canDelete(selected)" class="btn-danger" type="button" :disabled="saving" @click="remove(selected)">删除记录</button></div></section>
+          <section class="organization-detail-section"><div class="flex items-start justify-between gap-3"><div><h3>任务概览</h3><p class="text-subtle mt-1 text-sm">{{ selected.display_name }} · {{ selected.downloader_name }}</p></div><span :class="transferStatusClass(selected)">{{ transferStatusLabel(selected) }}</span></div><p v-if="selected.phase === 'risk_backoff'" class="semantic-warning mt-4 p-3 text-sm">{{ transferPhaseDescription(selected) }}</p><p v-if="selected.execution_location === 'node'" class="semantic-inset mt-4 p-3 text-sm"><strong>{{ transferExecutionLabel(selected) }}</strong><span class="text-subtle mt-1 block">{{ remoteTransferPhaseLabel(selected) }}<template v-if="selected.remote_error_code"> · {{ selected.remote_error_code }}</template></span></p><dl class="organization-facts"><div><dt>目标媒体库</dt><dd>{{ selected.library_name }}</dd></div><div><dt>执行位置</dt><dd>{{ transferExecutionLabel(selected) }}</dd></div><div><dt>入库路线</dt><dd>{{ transferRouteLabel(selected.route_kind) }}</dd></div><div><dt>入库方式</dt><dd>{{ transferModeLabels[selected.transfer_mode] }}</dd></div><div><dt>冲突策略</dt><dd>{{ conflictPolicyLabels[selected.conflict_policy] }}</dd></div><div><dt>执行进度</dt><dd><TransferProgress :item="selected" :now="now" /></dd></div><div><dt>暂存清理</dt><dd>{{ selected.cleanup_status === 'deferred' ? '等待做种结束' : selected.cleanup_status === 'completed' ? `已清理 ${selected.cleanup_removed} 项` : selected.cleanup_status === 'failed' ? `清理失败 · ${selected.cleanup_error_code}` : selected.cleanup_status === 'skipped' ? '旧任务不自动清理' : '待处理' }}</dd></div><div><dt>分类规则快照</dt><dd>Profile {{ selected.profile_id }} · r{{ selected.profile_revision }}</dd></div><div><dt>创建时间</dt><dd>{{ formatDate(selected.created_at) }}</dd></div></dl><p v-if="selected.last_error_message" class="semantic-error mt-4 p-3"><strong>{{ selected.last_error_code || '整理失败' }}</strong><span class="mt-1 block">{{ selected.last_error_message }}</span></p><div class="mt-4 flex flex-wrap gap-2"><button v-if="canReorganize(selected)" class="btn-primary" type="button" :disabled="saving" @click="openReorganization(selected)">修正识别并重新整理</button><button v-if="canControl(selected) && selected.job_status === 'failed'" class="btn-primary" type="button" :disabled="saving" @click="retry(selected)">仅重试入库阶段</button><button v-if="canDelete(selected)" class="btn-danger" type="button" :disabled="saving" @click="remove(selected)">删除记录</button></div></section>
           <section class="organization-detail-section"><h3>识别与命名</h3><dl class="organization-facts"><div><dt>身份状态</dt><dd>{{ transferIdentityLabel(selected) }}</dd></div><div><dt>识别标题</dt><dd>{{ selected.scrape_title || '未识别' }}</dd></div><div><dt>媒体类型</dt><dd>{{ selected.scrape_media_type || '未知' }}</dd></div><div><dt>分类</dt><dd>{{ selected.scrape_category || '未分类' }}</dd></div><div><dt>TMDB</dt><dd>{{ selected.scrape_tmdb_id ?? '未匹配' }}</dd></div><div><dt>年份</dt><dd>{{ selected.scrape_year ?? '未知' }}</dd></div><div><dt>置信度</dt><dd>{{ selected.scrape_confidence == null ? '未知' : selected.scrape_confidence.toFixed(2) }}</dd></div></dl><div v-if="selected.plan_summary?.items.length" class="mt-4"><h4>目标相对路径</h4><p v-if="selected.plan_summary.truncated" class="semantic-warning p-2 text-xs">文件较多，仅显示前 {{ selected.plan_summary.items.length }} / {{ selected.plan_summary.total_files }} 项。</p><ul class="organization-plan"><li v-for="item in selected.plan_summary.items" :key="`${item.relative_path}-${item.kind}`"><code>{{ item.relative_path }}</code><span>{{ item.kind === 'video' ? '视频' : '伴随文件' }} · {{ formatSize(item.size) }} · {{ resultLabel(item.result) }}</span></li></ul></div><p v-else class="text-subtle text-sm">历史任务或尚未进入规划阶段，暂无安全命名摘要。</p></section>
           <section class="organization-detail-section"><h3>执行记录</h3><h4>状态时间线</h4><ol class="task-timeline"><li v-for="event in selected.timeline" :key="event.id"><strong>{{ event.event_type }}</strong><span>{{ event.from_status || '开始' }} → {{ event.to_status || '—' }}</span><time>{{ formatDate(event.created_at) }}</time></li></ol><h4 class="mt-6">执行尝试</h4><ol class="task-timeline"><li v-for="attempt in selected.attempts" :key="attempt.id"><strong>第 {{ attempt.attempt_number }} 次 · {{ attempt.status }}</strong><span>{{ attempt.error_message || '无错误' }}</span><time>{{ formatDate(attempt.started_at) }}</time></li></ol></section>
         </template>

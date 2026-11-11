@@ -104,7 +104,7 @@ func (s *TransferNodeService) sealStorageGrant(ctx context.Context, node models.
 	resourceID := strconv.FormatUint(uint64(storage.ID), 10)
 	grantID := uuid.NewString()
 	var existing models.NodeCredentialGrant
-	lookup := s.db.WithContext(ctx).Where("node_id = ? AND task_id = ? AND operation_key = ? AND storage_id = ? AND credential_revision = ? AND revoked_at IS NULL AND expires_at > ?", node.ID, taskID, operationKey, storage.ID, connection.Revision, now.Add(time.Minute)).Order("expires_at DESC").First(&existing).Error
+	lookup := s.db.WithContext(ctx).Where("node_id = ? AND task_id = ? AND operation_key = ? AND storage_id = ? AND credential_revision = ? AND revoked_at IS NULL AND expires_at > ?", node.ID, taskID, operationKey, storage.ID, connection.Revision, now.Add(3*time.Minute)).Order("expires_at DESC").First(&existing).Error
 	if lookup == nil {
 		grantID = existing.ID
 	} else if !errors.Is(lookup, gorm.ErrRecordNotFound) {

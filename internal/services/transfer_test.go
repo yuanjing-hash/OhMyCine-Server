@@ -161,6 +161,125 @@ func TestTransferOrganizationProjectsLatestRemoteNodeStage(t *testing.T) {
 	if item.ExecutionLocation != models.NodeLocationRemote || item.NodeID == nil || *item.NodeID != nodeID || item.NodeName != "异地节点" || item.RemotePhase != nodeprotocol.PhaseUploadingTarget || item.RemoteStatus != nodeprotocol.OperationRunning || item.RemoteProgress == nil || *item.RemoteProgress != 0.5 || item.RemoteErrorCode != nodeprotocol.ErrorTargetRateLimited {
 		t.Fatalf("remote projection=%+v", item)
 	}
+	if item.RemoteTransferredBytes != nil || item.RemoteTotalBytes != nil || item.RemoteUploadSpeedBPS != nil || item.RemoteSampledAt != nil {
+		t.Fatal("an older Node response invented byte measurements")
+	}
+	progressJSON, err := json.Marshal(map[string]any{"version": 1, "transferred_bytes": 512, "total_bytes": 1024, "upload_speed_bps": 64, "sampled_at": now, "private_operation": "must-stay-private"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := queue.db.Model(&transfer).Updates(map[string]any{"phase": models.TransferTaskStatusTransferring, "upload_progress_json": string(progressJSON)}).Error; err != nil {
+		t.Fatal(err)
+	}
+	detail, err := service.Get(actor, transfer.ID)
+	if err != nil || detail.RemoteTransferredBytes == nil || *detail.RemoteTransferredBytes != 512 || detail.RemoteTotalBytes == nil || *detail.RemoteTotalBytes != 1024 || detail.RemoteUploadSpeedBPS == nil || *detail.RemoteUploadSpeedBPS != 64 || detail.RemoteSampledAt == nil {
+		t.Fatalf("measured progress=%+v err=%v", detail.TransferSummary, err)
+	}
+	public, err := json.Marshal(detail)
+	if err != nil || strings.Contains(string(public), "must-stay-private") || strings.Contains(string(public), "upload_progress_json") || strings.Contains(string(public), "projection-new") {
+		t.Fatalf("private progress or operation leaked: %s err=%v", public, err)
+	}
+	for _, incomplete := range []map[string]any{
+		{"version": 1, "total_bytes": 1024, "sampled_at": now},
+		{"version": 1, "transferred_bytes": 0, "total_bytes": nil, "sampled_at": now},
+	} {
+		encoded, err := json.Marshal(incomplete)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := queue.db.Model(&transfer).Update("upload_progress_json", string(encoded)).Error; err != nil {
+			t.Fatal(err)
+		}
+		unknown, err := service.Get(actor, transfer.ID)
+		if err != nil || unknown.RemoteTransferredBytes != nil || unknown.RemoteTotalBytes != nil || unknown.RemoteUploadSpeedBPS != nil || unknown.RemoteSampledAt != nil {
+			t.Fatalf("incomplete progress invented measurements: %+v err=%v", unknown.TransferSummary, err)
+		}
+	}
+	zero, err := json.Marshal(nodeprotocol.StorageUploadProgress{Version: 1, TotalBytes: 1024, SampledAt: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := queue.db.Model(&transfer).Update("upload_progress_json", string(zero)).Error; err != nil {
+		t.Fatal(err)
+	}
+	measuredZero, err := service.Get(actor, transfer.ID)
+	if err != nil || measuredZero.RemoteTransferredBytes == nil || *measuredZero.RemoteTransferredBytes != 0 || measuredZero.RemoteTotalBytes == nil || *measuredZero.RemoteTotalBytes != 1024 {
+		t.Fatalf("explicit zero progress became unknown: %+v err=%v", measuredZero.TransferSummary, err)
+	}
+	if err := queue.db.Model(&transfer).Update("upload_progress_json", string(progressJSON)).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := queue.db.Model(&models.DownloadTask{}).Where("id = ?", download.ID).Updates(map[string]any{"execution_location": models.NodeLocationRemote, "node_id": nodeID}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := queue.db.Model(&transfer).Updates(map[string]any{"route_version": 0, "source_data_source_json": "{}", "target_data_source_json": "{}"}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := queue.db.Model(&models.Job{}).Where("id = ?", transfer.JobID).Update("status", models.JobStatusCompleted).Error; err != nil {
+		t.Fatal(err)
+	}
+	legacy, err := service.List(actor, TransferListFilter{Scope: "active", Status: "processing", Page: 1, PageSize: 20})
+	if err != nil || legacy.Total != 1 || len(legacy.List) != 1 || !legacy.List[0].RecoveryPending || legacy.Stats.Processing != 1 || legacy.Stats.CompletedToday != 0 {
+		t.Fatalf("unfinished legacy upload without recovery proof was hidden: %+v err=%v", legacy, err)
+	}
+	legacyHistory, err := service.List(actor, TransferListFilter{Scope: "history", Page: 1, PageSize: 20})
+	if err != nil || legacyHistory.Total != 0 {
+		t.Fatalf("unfinished legacy upload was shown as history: %+v err=%v", legacyHistory, err)
+	}
+	eligible, err := transferUploadRecoveryPendingTx(queue.db, transfer.ID)
+	if err != nil || eligible {
+		t.Fatalf("read visibility authorized recovery without proof: eligible=%v err=%v", eligible, err)
+	}
+	if err := queue.db.Model(&models.Job{}).Where("id = ?", transfer.JobID).Update("status", models.JobStatusQueued).Error; err != nil {
+		t.Fatal(err)
+	}
+	identity, err := marshalDataSourceIdentity(localDataSourceIdentity())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := queue.db.Model(&models.DownloadTask{}).Where("id = ?", download.ID).Updates(map[string]any{"transfer_route_version": models.TransferRouteVersionCurrent, "transfer_route_kind": models.TransferRouteSameSourceLocal, "source_data_source_json": identity, "target_data_source_json": identity}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := queue.db.Model(&transfer).Updates(map[string]any{"route_version": models.TransferRouteVersionCurrent, "route_kind": models.TransferRouteSameSourceLocal, "source_data_source_json": identity, "target_data_source_json": identity}).Error; err != nil {
+		t.Fatal(err)
+	}
+	checkpoint := models.RemoteUploadFile{TransferTaskID: transfer.ID, DownloadTaskID: download.ID, Ordinal: 0, SourceFileToken: "private-file-token", SourceRelative: "Movie.2024.mkv", TargetRelative: "Movie (2024).mkv", Size: 1024, SHA256: strings.Repeat("c", 64), ConflictAction: nodeprotocol.StorageConflictFailIfExists, Status: nodeprotocol.StorageFilePending, CreatedAt: now, UpdatedAt: now}
+	if err := queue.db.Create(&checkpoint).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := queue.db.Model(&models.Job{}).Where("id = ?", transfer.JobID).Update("status", models.JobStatusCompleted).Error; err != nil {
+		t.Fatal(err)
+	}
+	active, err := service.List(actor, TransferListFilter{Scope: "active", Status: "processing", Category: "华语电影", Page: 1, PageSize: 20})
+	if err != nil || active.Total != 1 || len(active.List) != 1 || !active.List[0].RecoveryPending || active.List[0].JobStatus != models.JobStatusCompleted || active.Stats.Processing != 1 || active.Stats.CompletedToday != 0 {
+		t.Fatalf("unfinished original upload=%+v err=%v", active, err)
+	}
+	history, err := service.List(actor, TransferListFilter{Scope: "history", Page: 1, PageSize: 20})
+	if err != nil || history.Total != 0 {
+		t.Fatalf("unfinished original was placed in history: %+v err=%v", history, err)
+	}
+	detail, err = service.Get(actor, transfer.ID)
+	if err != nil || !detail.RecoveryPending || detail.Job.Status != models.JobStatusCompleted || detail.RemoteUploadSpeedBPS != nil {
+		t.Fatalf("original Job or unknown speed was rewritten: %+v err=%v", detail, err)
+	}
+	other := Actor{User: models.User{ID: actor.User.ID + 99}, Permissions: map[string]struct{}{authz.PermissionTransfersReadOwn: {}}}
+	otherPage, err := service.List(other, TransferListFilter{Scope: "active", Status: "processing", Page: 1, PageSize: 20})
+	if err != nil || otherPage.Total != 0 || otherPage.Stats != (TransferStats{}) {
+		t.Fatalf("recovery predicate escaped owner scope: %+v err=%v", otherPage, err)
+	}
+	denied := actor
+	denied.ResourceRules = []AuthorizationRule{{PermissionCode: authz.PermissionMediaLibrariesRead, Effect: models.AuthorizationEffectDeny, ResourceType: models.AuthorizationResourceMediaLibrary, ResourceID: uintID(transfer.LibraryID)}}
+	redacted, err := service.Get(denied, transfer.ID)
+	if err != nil || !redacted.RecoveryPending || redacted.RemoteTransferredBytes != nil || redacted.RemoteTotalBytes != nil || redacted.RemoteUploadSpeedBPS != nil || redacted.RemoteSampledAt != nil || redacted.NodeID != nil {
+		t.Fatalf("resource redaction lost recovery or exposed progress: %+v err=%v", redacted.TransferSummary, err)
+	}
+	if err := queue.db.Model(&transfer).Updates(map[string]any{"phase": models.TransferTaskStatusCompleted, "finished_at": now, "upload_progress_json": `{"version":2,"transferred_bytes":512,"total_bytes":1024,"sampled_at":"2026-11-11T00:00:00Z"}`}).Error; err != nil {
+		t.Fatal(err)
+	}
+	history, err = service.List(actor, TransferListFilter{Scope: "history", Status: "completed", Page: 1, PageSize: 20})
+	if err != nil || history.Total != 1 || len(history.List) != 1 || history.List[0].RecoveryPending || history.Stats.Processing != 0 || history.Stats.CompletedToday != 1 || history.List[0].RemoteTransferredBytes != nil {
+		t.Fatalf("settled history or unknown progress version=%+v err=%v", history, err)
+	}
 }
 
 func float64Pointer(value float64) *float64 { return &value }

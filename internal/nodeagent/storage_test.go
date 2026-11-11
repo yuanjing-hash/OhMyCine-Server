@@ -1,18 +1,26 @@
 package nodeagent
 
 import (
+	"bytes"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/sha1"
+	"crypto/sha256"
+	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"io"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -27,6 +35,7 @@ type fakeStorageDriver struct {
 	items       map[string]cloud.Item
 	children    map[string][]string
 	next        int
+	uploadGate  func(context.Context) error
 	uploadCalls int
 }
 
@@ -95,6 +104,11 @@ func (driver *fakeStorageDriver) CreateDirectory(ctx context.Context, parentID, 
 func (driver *fakeStorageDriver) Upload(ctx context.Context, request cloud.UploadRequest) (cloud.Item, error) {
 	if err := driver.check(ctx); err != nil {
 		return cloud.Item{}, err
+	}
+	if driver.uploadGate != nil {
+		if err := driver.uploadGate(ctx); err != nil {
+			return cloud.Item{}, err
+		}
 	}
 	body, err := io.ReadAll(request.Reader)
 	if err != nil {
@@ -187,8 +201,84 @@ func TestStorageUploadRunsInBackgroundPersistsCheckpointAndReusesReceipt(t *test
 	}
 	testServer := httptest.NewServer(agent.Handler())
 	defer testServer.Close()
+	// Use the production signed-HTTP path, including durable replay nonces and
+	// the Node Store's one-connection pool while the upload watcher is active.
+	public, key, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert := &x509.Certificate{SerialNumber: big.NewInt(1), NotBefore: now.Add(-time.Minute), NotAfter: now.Add(time.Hour)}
+	der, err := x509.CreateCertificate(rand.Reader, cert, cert, public, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyDER, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certPath, keyPath := filepath.Join(root, "node.crt"), filepath.Join(root, "node.key")
+	if err := os.WriteFile(certPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keyPath, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER}), 0600); err != nil {
+		t.Fatal(err)
+	}
+	fingerprintRaw := sha256.Sum256(der)
+	fingerprint := hex.EncodeToString(fingerprintRaw[:])
+	if err := store.SaveChallenge(context.Background(), "fixture-enrollment", "server-1", now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CompleteEnrollment(context.Background(), "fixture-enrollment", "server-1", fingerprint, fingerprint, now); err != nil {
+		t.Fatal(err)
+	}
+	agent.config.AllowInsecureDevelopment = false
+	agent.config.Transport = "http"
+	agent.config.TLSCertificateFile = certPath
+	agent.config.TLSPrivateKeyFile = keyPath
+	do := func(target, method string, input any, status int) []byte {
+		t.Helper()
+		body, _ := json.Marshal(input)
+		request, err := http.NewRequest(method, target, bytes.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("X-OhMyCine-Server-ID", "server-1")
+		if err := nodeprotocol.SignHTTPRequest(request, der, key, fingerprint, agent.now()); err != nil {
+			t.Fatal(err)
+		}
+		client := &http.Client{Timeout: 2 * time.Second}
+		response, err := client.Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer response.Body.Close()
+		raw, err := io.ReadAll(response.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if response.StatusCode != status {
+			t.Fatalf("%s got %d expected %d: %s", method, response.StatusCode, status, raw)
+		}
+		if err := nodeprotocol.VerifyHTTPResponse(request, response, raw, fingerprint); err != nil {
+			t.Fatal(err)
+		}
+		return raw
+	}
 	action := nodeprotocol.StorageActionRequest{RequestID: "request-1", TaskID: "task-1", OperationKey: "upload-1", PlanDigest: planDigest, StorageID: "storage-1", Action: nodeprotocol.StorageActionUpload, GrantID: "grant-1"}
-	doNodeJSON(t, testServer.URL+"/node/v1/storage/actions", http.MethodPost, action, http.StatusAccepted)
+	// Fail only the final durable ACK after the file checkpoint was saved.
+	if _, err := store.db.Exec(`CREATE TRIGGER reject_upload_completion BEFORE UPDATE OF status ON provider_receipts WHEN NEW.status='completed' BEGIN SELECT RAISE(ABORT,'fixture persistence failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	do(testServer.URL+"/node/v1/storage/actions", http.MethodPost, action, http.StatusAccepted)
+	failed := waitStorageReceiptCode(t, agent, store, "request-1", "node_persistence_failed")
+	if failed.CompletedFiles != 1 || fake.uploadCalls != 1 {
+		t.Fatalf("completed file checkpoint lost: %+v", failed)
+	}
+	if _, err := store.db.Exec(`DROP TRIGGER reject_upload_completion`); err != nil {
+		t.Fatal(err)
+	}
+	do(testServer.URL+"/node/v1/storage/actions", http.MethodPost, action, http.StatusAccepted)
 	response := waitStorageReceipt(t, store, "request-1")
 	if response.Status != nodeprotocol.StorageActionCompleted || response.CompletedFiles != 1 || len(response.Files) != 1 || response.Files[0].TargetParentID == "" || response.Files[0].TargetName != "Episode 01.mkv" || response.Files[0].TargetItemID == "" {
 		t.Fatalf("response=%+v", response)
@@ -211,6 +301,9 @@ func TestStorageUploadRunsInBackgroundPersistsCheckpointAndReusesReceipt(t *test
 	resultRequest.Header.Set("X-OhMyCine-Server-ID", "server-1")
 	resultRequest.Header.Set(storageTaskHeader, "task-1")
 	resultRequest.Header.Set(storageOperationHeader, "upload-1")
+	if err := nodeprotocol.SignHTTPRequest(resultRequest, der, key, fingerprint, agent.now()); err != nil {
+		t.Fatal(err)
+	}
 	resultHTTP, err := http.DefaultClient.Do(resultRequest)
 	if err != nil {
 		t.Fatal(err)
@@ -219,11 +312,113 @@ func TestStorageUploadRunsInBackgroundPersistsCheckpointAndReusesReceipt(t *test
 	if resultHTTP.StatusCode != http.StatusOK {
 		t.Fatalf("result query status=%d", resultHTTP.StatusCode)
 	}
-	repeated := doNodeJSON(t, testServer.URL+"/node/v1/storage/actions", http.MethodPost, action, http.StatusOK)
+	repeated := do(testServer.URL+"/node/v1/storage/actions", http.MethodPost, action, http.StatusOK)
 	var repeatedResponse nodeprotocol.StorageActionResponse
 	if err := json.Unmarshal(repeated, &repeatedResponse); err != nil || repeatedResponse.Status != nodeprotocol.StorageActionCompleted || fake.uploadCalls != 1 {
 		t.Fatalf("repeat=%s calls=%d err=%v", repeated, fake.uploadCalls, err)
 	}
+	// The same Node process remains alive beyond the initial grant. A renewed
+	// same-account grant advances its guard, then exact-epoch stop joins it.
+	var clock atomic.Int64
+	clock.Store(now.UnixNano())
+	agent.now = func() time.Time { return time.Unix(0, clock.Load()).UTC() }
+	uploadPlan.Files[0].TargetRelativePath = "TV/Season 01/Episode 02.mkv"
+	payload, _ = json.Marshal(uploadPlan)
+	operation.OperationKey = "upload-2"
+	operation.Payload = payload
+	planDigest, _ = operation.Digest()
+	if _, _, err := store.Put(context.Background(), "server-1", planDigest, operation, now); err != nil {
+		t.Fatal(err)
+	}
+	grant.GrantID = "grant-2"
+	grant.OperationKey = "upload-2"
+	grant.ExpiresAt = now.Add(time.Second)
+	envelope, err = nodeprotocol.SealCredentialGrant(agent.sealingPublicKey, grant, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveCredentialGrant(context.Background(), "server-1", envelope, now); err != nil {
+		t.Fatal(err)
+	}
+	action.RequestID = "request-2"
+	action.OperationKey = "upload-2"
+	action.PlanDigest = planDigest
+	action.GrantID = grant.GrantID
+	entered := make(chan struct{})
+	exited := make(chan struct{})
+	fake.uploadGate = func(ctx context.Context) error { close(entered); <-ctx.Done(); close(exited); return ctx.Err() }
+	do(testServer.URL+"/node/v1/storage/actions", http.MethodPost, action, http.StatusAccepted)
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("upload never entered")
+	}
+	grant.GrantID = "grant-2-renewed"
+	grant.ExpiresAt = now.Add(5 * time.Minute)
+	envelope, err = nodeprotocol.SealCredentialGrant(agent.sealingPublicKey, grant, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveCredentialGrant(context.Background(), "server-1", envelope, now); err != nil {
+		t.Fatal(err)
+	}
+	clock.Store(now.Add(2 * time.Second).UnixNano())
+	select {
+	case <-exited:
+		t.Fatal("initial expired grant cancelled renewed operation")
+	case <-time.After(350 * time.Millisecond):
+	}
+	stop := nodeprotocol.OperationStopRequest{PlanDigest: planDigest, LeaseEpoch: 1}
+	do(testServer.URL+"/node/v1/operations/upload-2/stop", http.MethodPost, stop, http.StatusOK)
+	paused := waitStorageReceiptCode(t, agent, store, "request-2", nodeprotocol.ErrorLeaseExpired)
+	if paused.ExecutionActive == nil || *paused.ExecutionActive {
+		t.Fatal("stop ACK did not join storage worker")
+	}
+	renewed := nodeprotocol.LeaseRequest{PlanDigest: planDigest, LeaseEpoch: 2, LeaseExpiresAt: now.Add(5 * time.Minute)}
+	do(testServer.URL+"/node/v1/operations/upload-2/lease", http.MethodPost, renewed, http.StatusOK)
+	stop.Cancel = true
+	do(testServer.URL+"/node/v1/operations/upload-2/stop", http.MethodPost, stop, http.StatusConflict)
+	fake.uploadGate = nil
+	action.GrantID = grant.GrantID
+	do(testServer.URL+"/node/v1/storage/actions", http.MethodPost, action, http.StatusAccepted)
+	unknown := waitStorageReceiptCode(t, agent, store, "request-2", nodeprotocol.ErrorReconciliationNeeded)
+	if fake.uploadCalls != 1 {
+		t.Fatal("uncertain upload was blindly resubmitted")
+	}
+	// The original provider result becomes visible later. Only the matching
+	// original file is reconciled; another upload is forbidden.
+	if len(unknown.Files) != 1 || unknown.Files[0].TargetParentID == "" {
+		t.Fatal("lost original target scope")
+	}
+	parent := unknown.Files[0].TargetParentID
+	digestBody := sha1.Sum(sourceBody)
+	fake.mu.Lock()
+	fake.items["late-original-output"] = cloud.Item{ID: "late-original-output", ParentID: parent, Name: "Episode 02.mkv", Size: int64(len(sourceBody)), SHA1: strings.ToUpper(hex.EncodeToString(digestBody[:]))}
+	fake.children[parent] = append(fake.children[parent], "late-original-output")
+	fake.mu.Unlock()
+	do(testServer.URL+"/node/v1/storage/actions", http.MethodPost, action, http.StatusAccepted)
+	resumed := waitStorageReceipt(t, store, "request-2")
+	if resumed.Status != nodeprotocol.StorageActionCompleted || fake.uploadCalls != 1 {
+		t.Fatalf("same request did not resume exactly once: %+v calls=%d", resumed, fake.uploadCalls)
+	}
+}
+
+func waitStorageReceiptCode(t *testing.T, a *Agent, store *Store, id, code string) nodeprotocol.StorageActionResponse {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		receipt, err := store.ProviderReceipt(context.Background(), "server-1", id)
+		var response nodeprotocol.StorageActionResponse
+		if err == nil && json.Unmarshal([]byte(receipt.ResponseJSON), &response) == nil {
+			response = a.storageExecutionResponse(response)
+			if response.ErrorCode == code && response.ExecutionActive != nil && !*response.ExecutionActive {
+				return response
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("storage receipt did not persist exited state %s", code)
+	return nodeprotocol.StorageActionResponse{}
 }
 
 func waitStorageReceipt(t *testing.T, store *Store, requestID string) nodeprotocol.StorageActionResponse {

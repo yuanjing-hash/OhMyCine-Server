@@ -1,11 +1,13 @@
 package services
 
 import (
+	"encoding/json"
 	"strings"
 	"time"
 
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/authz"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/nodeprotocol"
 	"gorm.io/gorm"
 )
 
@@ -38,51 +40,56 @@ type TransferFilterOptions struct {
 }
 
 type TransferSummary struct {
-	ID                string     `json:"id"`
-	OwnerID           uint       `json:"owner_id"`
-	DownloadTaskID    string     `json:"download_task_id"`
-	JobID             string     `json:"job_id"`
-	DisplayName       string     `json:"display_name"`
-	DownloaderName    string     `json:"downloader_name"`
-	ProviderType      string     `json:"provider_type"`
-	ScrapeStatus      string     `json:"scrape_status"`
-	ScrapeTitle       string     `json:"scrape_title"`
-	ScrapeMediaType   string     `json:"scrape_media_type"`
-	ScrapeCategory    string     `json:"scrape_category"`
-	ScrapeTMDBID      *int64     `json:"scrape_tmdb_id"`
-	ScrapeYear        *int       `json:"scrape_year"`
-	ScrapeConfidence  *float64   `json:"scrape_confidence"`
-	IdentitySource    string     `json:"identity_source"`
-	IdentityStatus    string     `json:"identity_status"`
-	IdentityLocked    bool       `json:"identity_locked"`
-	IdentityRevision  uint64     `json:"identity_revision"`
-	ProfileID         uint       `json:"profile_id"`
-	ProfileRevision   uint64     `json:"profile_revision"`
-	LibraryID         uint       `json:"library_id"`
-	LibraryName       string     `json:"library_name"`
-	ExecutionLocation string     `json:"execution_location"`
-	NodeID            *string    `json:"node_id,omitempty"`
-	NodeName          string     `json:"node_name,omitempty"`
-	RemotePhase       string     `json:"remote_phase,omitempty"`
-	RemoteStatus      string     `json:"remote_status,omitempty"`
-	RemoteProgress    *float64   `json:"remote_progress,omitempty"`
-	RemoteErrorCode   string     `json:"remote_error_code,omitempty"`
-	RouteKind         string     `json:"route_kind"`
-	TransferMode      string     `json:"transfer_mode"`
-	ConflictPolicy    string     `json:"conflict_policy"`
-	Phase             string     `json:"phase"`
-	JobStatus         string     `json:"job_status"`
-	RetryAt           *time.Time `json:"retry_at"`
-	ProcessedFiles    int        `json:"processed_files"`
-	TotalFiles        int        `json:"total_files"`
-	LastErrorCode     string     `json:"last_error_code"`
-	LastErrorMessage  string     `json:"last_error_message"`
-	CleanupStatus     string     `json:"cleanup_status"`
-	CleanupRemoved    int        `json:"cleanup_removed"`
-	CleanupErrorCode  string     `json:"cleanup_error_code"`
-	CreatedAt         time.Time  `json:"created_at"`
-	UpdatedAt         time.Time  `json:"updated_at"`
-	FinishedAt        *time.Time `json:"finished_at"`
+	ID                     string     `json:"id"`
+	OwnerID                uint       `json:"owner_id"`
+	DownloadTaskID         string     `json:"download_task_id"`
+	JobID                  string     `json:"job_id"`
+	DisplayName            string     `json:"display_name"`
+	DownloaderName         string     `json:"downloader_name"`
+	ProviderType           string     `json:"provider_type"`
+	ScrapeStatus           string     `json:"scrape_status"`
+	ScrapeTitle            string     `json:"scrape_title"`
+	ScrapeMediaType        string     `json:"scrape_media_type"`
+	ScrapeCategory         string     `json:"scrape_category"`
+	ScrapeTMDBID           *int64     `json:"scrape_tmdb_id"`
+	ScrapeYear             *int       `json:"scrape_year"`
+	ScrapeConfidence       *float64   `json:"scrape_confidence"`
+	IdentitySource         string     `json:"identity_source"`
+	IdentityStatus         string     `json:"identity_status"`
+	IdentityLocked         bool       `json:"identity_locked"`
+	IdentityRevision       uint64     `json:"identity_revision"`
+	ProfileID              uint       `json:"profile_id"`
+	ProfileRevision        uint64     `json:"profile_revision"`
+	LibraryID              uint       `json:"library_id"`
+	LibraryName            string     `json:"library_name"`
+	ExecutionLocation      string     `json:"execution_location"`
+	NodeID                 *string    `json:"node_id,omitempty"`
+	NodeName               string     `json:"node_name,omitempty"`
+	RemotePhase            string     `json:"remote_phase,omitempty"`
+	RemoteStatus           string     `json:"remote_status,omitempty"`
+	RemoteProgress         *float64   `json:"remote_progress,omitempty"`
+	RemoteTransferredBytes *int64     `json:"remote_transferred_bytes,omitempty"`
+	RemoteTotalBytes       *int64     `json:"remote_total_bytes,omitempty"`
+	RemoteUploadSpeedBPS   *int64     `json:"remote_upload_speed_bps,omitempty"`
+	RemoteSampledAt        *time.Time `json:"remote_sampled_at,omitempty"`
+	RemoteErrorCode        string     `json:"remote_error_code,omitempty"`
+	RecoveryPending        bool       `json:"recovery_pending,omitempty"`
+	RouteKind              string     `json:"route_kind"`
+	TransferMode           string     `json:"transfer_mode"`
+	ConflictPolicy         string     `json:"conflict_policy"`
+	Phase                  string     `json:"phase"`
+	JobStatus              string     `json:"job_status"`
+	RetryAt                *time.Time `json:"retry_at"`
+	ProcessedFiles         int        `json:"processed_files"`
+	TotalFiles             int        `json:"total_files"`
+	LastErrorCode          string     `json:"last_error_code"`
+	LastErrorMessage       string     `json:"last_error_message"`
+	CleanupStatus          string     `json:"cleanup_status"`
+	CleanupRemoved         int        `json:"cleanup_removed"`
+	CleanupErrorCode       string     `json:"cleanup_error_code"`
+	CreatedAt              time.Time  `json:"created_at"`
+	UpdatedAt              time.Time  `json:"updated_at"`
+	FinishedAt             *time.Time `json:"finished_at"`
 }
 
 type TransferPage struct {
@@ -108,6 +115,7 @@ type TransferDetail struct {
 
 type transferProjectionRow struct {
 	TransferSummary
+	UploadProgressJSON     string `gorm:"column:upload_progress_json"`
 	PlanSummaryJSON        string `gorm:"column:plan_summary_json"`
 	MovieDirectoryTemplate string `gorm:"column:movie_directory_template"`
 	MovieFilenameTemplate  string `gorm:"column:movie_filename_template"`
@@ -116,6 +124,24 @@ type transferProjectionRow struct {
 	TransferErrorCode      string `gorm:"column:transfer_error_code"`
 	JobErrorCode           string `gorm:"column:job_error_code"`
 	JobErrorMessage        string `gorm:"column:job_error_message"`
+}
+
+// Business completion is independent of whether the retained upload evidence
+// suffices for automatic recovery. This read predicate grants no write authority.
+const transferUploadUnsettledSQL = `(
+	jobs.status='completed' AND jobs.job_type='transfer'
+	AND transfer.execution_location='node'
+	AND COALESCE(transfer.phase,'') NOT IN ('completed','failed')
+	AND transfer.finished_at IS NULL AND transfer.catalog_published_at IS NULL
+)`
+
+const transferRecoveryPendingSQL = "COALESCE(" + transferUploadUnsettledSQL + ", 0)"
+
+func transferUploadUnsettledTx(db *gorm.DB, transferID string) (bool, error) {
+	var count int64
+	err := db.Table("transfer_tasks AS transfer").Joins("JOIN jobs ON jobs.id=transfer.job_id").
+		Where("transfer.id=? AND "+transferRecoveryPendingSQL, transferID).Count(&count).Error
+	return count == 1, err
 }
 
 const transferProjectionColumns = `
@@ -130,6 +156,7 @@ const transferProjectionColumns = `
 	COALESCE((SELECT remote.status FROM remote_operations AS remote WHERE remote.task_id = download.id AND remote.node_id = transfer.node_id ORDER BY remote.updated_at DESC, remote.id DESC LIMIT 1), '') AS remote_status,
 	(SELECT remote.progress FROM remote_operations AS remote WHERE remote.task_id = download.id AND remote.node_id = transfer.node_id ORDER BY remote.updated_at DESC, remote.id DESC LIMIT 1) AS remote_progress,
 	COALESCE((SELECT remote.error_code FROM remote_operations AS remote WHERE remote.task_id = download.id AND remote.node_id = transfer.node_id ORDER BY remote.updated_at DESC, remote.id DESC LIMIT 1), '') AS remote_error_code,
+	` + transferRecoveryPendingSQL + ` AS recovery_pending, transfer.upload_progress_json,
 	download.transfer_route_kind AS route_kind, download.transfer_mode,
 	download.conflict_policy, transfer.phase, jobs.status AS job_status, jobs.next_attempt_at AS retry_at,
 	transfer.processed_files, transfer.total_files,
@@ -260,9 +287,9 @@ func (s *TransferService) Get(actor Actor, id string) (TransferDetail, error) {
 func applyTransferFilters(query *gorm.DB, filter TransferListFilter) *gorm.DB {
 	switch filter.Scope {
 	case "active":
-		query = query.Where("jobs.status IN ?", []string{models.JobStatusQueued, models.JobStatusRunning, models.JobStatusRetryWait, models.JobStatusWaitingUserAction, models.JobStatusPaused})
+		query = query.Where("(jobs.status IN ? OR "+transferRecoveryPendingSQL+")", []string{models.JobStatusQueued, models.JobStatusRunning, models.JobStatusRetryWait, models.JobStatusWaitingUserAction, models.JobStatusPaused})
 	case "history":
-		query = query.Where("jobs.status IN ?", []string{models.JobStatusFailed, models.JobStatusCancelled, models.JobStatusCompleted})
+		query = query.Where("jobs.status IN ? AND NOT "+transferRecoveryPendingSQL, []string{models.JobStatusFailed, models.JobStatusCancelled, models.JobStatusCompleted})
 	}
 	if filter.LibraryID != nil {
 		query = query.Where("transfer.library_id = ?", *filter.LibraryID)
@@ -275,7 +302,7 @@ func applyTransferFilters(query *gorm.DB, filter TransferListFilter) *gorm.DB {
 	}
 	switch filter.Status {
 	case "processing":
-		query = query.Where("jobs.status IN ?", []string{models.JobStatusQueued, models.JobStatusRunning, models.JobStatusRetryWait})
+		query = query.Where("(jobs.status IN ? OR "+transferRecoveryPendingSQL+")", []string{models.JobStatusQueued, models.JobStatusRunning, models.JobStatusRetryWait})
 	case "waiting_action":
 		query = query.Where("jobs.status = ?", models.JobStatusWaitingUserAction)
 	case "paused":
@@ -301,7 +328,7 @@ func (s *TransferService) transferStats(query *gorm.DB) (TransferStats, error) {
 		where  string
 		args   []any
 	}{
-		{&stats.Processing, "jobs.status IN ?", []any{[]string{models.JobStatusQueued, models.JobStatusRunning, models.JobStatusRetryWait}}},
+		{&stats.Processing, "(jobs.status IN ? OR " + transferRecoveryPendingSQL + ")", []any{[]string{models.JobStatusQueued, models.JobStatusRunning, models.JobStatusRetryWait}}},
 		{&stats.WaitingAction, "jobs.status = ?", []any{models.JobStatusWaitingUserAction}},
 		{&stats.Failed, "jobs.status = ?", []any{models.JobStatusFailed}},
 	}
@@ -369,6 +396,22 @@ func finalizeTransferProjection(row *transferProjectionRow) {
 		row.LastErrorCode = row.TransferErrorCode
 	}
 	row.LastErrorMessage = row.JobErrorMessage
+	if row.ExecutionLocation != models.NodeLocationRemote {
+		return
+	}
+	var progress nodeprotocol.StorageUploadProgress
+	if len(row.UploadProgressJSON) > 4096 || json.Unmarshal([]byte(row.UploadProgressJSON), &progress) != nil || progress.Version != 1 ||
+		!progress.HasMeasurements() || progress.TransferredBytes < 0 || progress.TotalBytes < 0 || progress.TransferredBytes > progress.TotalBytes ||
+		progress.SampledAt.IsZero() || progress.UploadSpeedBPS != nil && *progress.UploadSpeedBPS < 0 {
+		return
+	}
+	row.RemoteTransferredBytes = &progress.TransferredBytes
+	row.RemoteTotalBytes = &progress.TotalBytes
+	row.RemoteSampledAt = &progress.SampledAt
+	age := time.Since(progress.SampledAt)
+	if row.RemotePhase == nodeprotocol.PhaseUploadingTarget && !row.RecoveryPending && age >= 0 && age <= 15*time.Second && (row.JobStatus == models.JobStatusRunning || row.JobStatus == models.JobStatusQueued || row.JobStatus == models.JobStatusRetryWait) {
+		row.RemoteUploadSpeedBPS = progress.UploadSpeedBPS
+	}
 }
 
 func escapeSQLiteLike(value string) string {

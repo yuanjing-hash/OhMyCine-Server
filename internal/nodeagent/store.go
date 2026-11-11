@@ -252,7 +252,7 @@ func (s *Store) UpdateActionReceipt(ctx context.Context, serverID, requestID str
 	if err != nil {
 		return err
 	}
-	result, err := s.db.ExecContext(ctx, `UPDATE provider_receipts SET status='started',response_json=?,error_code='',updated_at=? WHERE request_id=? AND paired_server_id=?`, string(raw), now.UTC(), requestID, serverID)
+	result, err := s.db.ExecContext(ctx, `UPDATE provider_receipts SET status='started',response_json=?,error_code='',updated_at=? WHERE request_id=? AND paired_server_id=? AND status<>'completed'`, string(raw), now.UTC(), requestID, serverID)
 	if err != nil {
 		return err
 	}
@@ -548,6 +548,36 @@ func (s *Store) RenewLease(ctx context.Context, serverID, key, digest string, ep
 		return nodeprotocol.OperationResponse{}, ErrLeaseConflict
 	}
 	return s.Get(ctx, serverID, key)
+}
+
+// StopLease shortens the original lease without increasing its epoch. A late
+// old stop cannot cancel or expire a renewed execution's authority.
+func (s *Store) StopLease(ctx context.Context, serverID, key string, input nodeprotocol.OperationStopRequest, now time.Time) (nodeprotocol.OperationResponse, error) {
+	if input.LeaseEpoch == 0 || !nodeprotocol.ValidDigest(input.PlanDigest) {
+		return nodeprotocol.OperationResponse{}, ErrLeaseConflict
+	}
+	query := `UPDATE operations SET lease_expires_at=?,revision=revision+1,updated_at=? WHERE operation_key=? AND paired_server_id=? AND plan_digest=? AND lease_epoch=? AND status NOT IN (?,?,?)`
+	args := []any{now.UTC(), now.UTC(), key, serverID, input.PlanDigest, input.LeaseEpoch, nodeprotocol.OperationCompleted, nodeprotocol.OperationFailed, nodeprotocol.OperationCancelled}
+	if input.Cancel {
+		query = `UPDATE operations SET status=?,phase=?,lease_expires_at=?,revision=revision+1,updated_at=? WHERE operation_key=? AND paired_server_id=? AND plan_digest=? AND lease_epoch=? AND status NOT IN (?,?,?)`
+		args = append([]any{nodeprotocol.OperationCancelled, nodeprotocol.OperationCancelled}, args...)
+	}
+	result, err := s.db.ExecContext(ctx, query, args...)
+	if err != nil {
+		return nodeprotocol.OperationResponse{}, err
+	}
+	affected, _ := result.RowsAffected()
+	current, err := s.Get(ctx, serverID, key)
+	if err != nil {
+		return nodeprotocol.OperationResponse{}, err
+	}
+	if current.PlanDigest != input.PlanDigest || current.LeaseEpoch != input.LeaseEpoch {
+		return nodeprotocol.OperationResponse{}, ErrLeaseConflict
+	}
+	if affected != 1 && current.Status != nodeprotocol.OperationCompleted && current.Status != nodeprotocol.OperationFailed && current.Status != nodeprotocol.OperationCancelled {
+		return nodeprotocol.OperationResponse{}, ErrLeaseConflict
+	}
+	return current, nil
 }
 
 func (s *Store) Cancel(ctx context.Context, serverID, key string, now time.Time) (nodeprotocol.OperationResponse, error) {

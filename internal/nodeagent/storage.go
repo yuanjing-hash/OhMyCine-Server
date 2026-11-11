@@ -13,6 +13,9 @@ import (
 	"net/http"
 	"path"
 	"strings"
+	"time"
+
+	"github.com/rs/zerolog/log"
 
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud/pan115"
@@ -74,7 +77,7 @@ func (a *Agent) storageAction(w http.ResponseWriter, r *http.Request) {
 		if receipt.Status == "completed" {
 			var response nodeprotocol.StorageActionResponse
 			if json.Unmarshal([]byte(receipt.ResponseJSON), &response) == nil {
-				writeJSON(w, http.StatusOK, response)
+				writeJSON(w, http.StatusOK, a.storageExecutionResponse(response))
 				return
 			}
 		}
@@ -99,7 +102,7 @@ func (a *Agent) storageAction(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "node_persistence_failed", "节点无法保存存储操作")
 		return
 	}
-	response := nodeprotocol.StorageActionResponse{RequestID: input.RequestID, OperationKey: input.OperationKey, PlanDigest: input.PlanDigest, Status: nodeprotocol.StorageActionAccepted, TotalFiles: len(uploadPlan.Files)}
+	response := nodeprotocol.StorageActionResponse{RequestID: input.RequestID, OperationKey: input.OperationKey, PlanDigest: input.PlanDigest, Status: nodeprotocol.StorageActionAccepted, Phase: nodeprotocol.PhaseWaitingNode, TotalFiles: len(uploadPlan.Files)}
 	if receipt.ResponseJSON != "" {
 		_ = json.Unmarshal([]byte(receipt.ResponseJSON), &response)
 	}
@@ -113,7 +116,7 @@ func (a *Agent) storageAction(w http.ResponseWriter, r *http.Request) {
 	if started && response.Status == nodeprotocol.StorageActionAccepted {
 		response.Status = nodeprotocol.StorageActionRunning
 	}
-	writeJSON(w, http.StatusAccepted, response)
+	writeJSON(w, http.StatusAccepted, a.storageExecutionResponse(response))
 }
 
 func (a *Agent) storageActionResult(w http.ResponseWriter, r *http.Request) {
@@ -142,7 +145,7 @@ func (a *Agent) storageActionResult(w http.ResponseWriter, r *http.Request) {
 	if receipt.ResponseJSON == "" || json.Unmarshal([]byte(receipt.ResponseJSON), &response) != nil {
 		response = nodeprotocol.StorageActionResponse{RequestID: requestID, OperationKey: operationKey, Status: nodeprotocol.StorageActionAccepted}
 	}
-	writeJSON(w, http.StatusOK, response)
+	writeJSON(w, http.StatusOK, a.storageExecutionResponse(response))
 }
 
 func (a *Agent) storagePlan(ctx context.Context, serverID string, input nodeprotocol.StorageActionRequest) (nodeprotocol.OperationPlan, nodeprotocol.StorageUploadPlan, error) {
@@ -213,38 +216,40 @@ func (a *Agent) startStorageUpload(serverID string, input nodeprotocol.StorageAc
 			delete(a.storageRuns, input.OperationKey)
 			a.storageMu.Unlock()
 		}()
+		defer a.finishStorageExecution(serverID, input)
 		a.runStorageUpload(context.Background(), serverID, input, plan, grant, credential)
 	}()
 	return true
 }
 
 func (a *Agent) runStorageUpload(ctx context.Context, serverID string, input nodeprotocol.StorageActionRequest, plan nodeprotocol.StorageUploadPlan, grant nodeprotocol.CredentialGrant, credential nodeprotocol.StorageCredential) {
-	ctx, cancel := a.ownedOperationContext(ctx, serverID, input.OperationKey, input.PlanDigest, grant.ExpiresAt)
+	guard := a.storageUploadGuard(serverID, input, grant, credential)
+	var quarkState *quarkGrantState
+	if plan.ProviderType == nodeprotocol.StorageProviderQuark {
+		quarkState = a.newQuarkGrantState(serverID, input.PlanDigest, grant, credential)
+		guard = quarkState.check
+	}
+	ctx, cancel := a.ownedOperationContext(ctx, serverID, input.OperationKey, input.PlanDigest, grant.ExpiresAt, guard)
 	defer cancel()
+	response := nodeprotocol.StorageActionResponse{RequestID: input.RequestID, OperationKey: input.OperationKey, PlanDigest: input.PlanDigest, Status: nodeprotocol.StorageActionRunning, Phase: nodeprotocol.PhaseWaitingNode, TotalFiles: len(plan.Files), Files: make([]nodeprotocol.StorageUploadFileResult, 0, len(plan.Files))}
 	release, admissionErr := a.acquireOperation(ctx)
 	if admissionErr != nil {
+		a.pauseStorageUpload(ctx, serverID, input, response, admissionErr)
 		return
 	}
 	defer release()
-	response := nodeprotocol.StorageActionResponse{RequestID: input.RequestID, OperationKey: input.OperationKey, PlanDigest: input.PlanDigest, Status: nodeprotocol.StorageActionRunning, TotalFiles: len(plan.Files), Files: make([]nodeprotocol.StorageUploadFileResult, 0, len(plan.Files))}
-	_ = a.store.UpdateActionReceipt(ctx, serverID, input.RequestID, response, a.now())
-	_ = a.store.UpdateOperationExecution(ctx, serverID, input.OperationKey, input.PlanDigest, nodeprotocol.OperationRunning, nodeprotocol.PhaseUploadingTarget, "", nil, a.now())
-	guard := func(callCtx context.Context) error {
-		if !grant.ExpiresAt.After(a.now()) {
-			return cloud.Error(cloud.CodeAuthExpired, false, errors.New(nodeprotocol.ErrorCredentialExpired))
-		}
-		_, err := a.store.ActiveOperationPlan(callCtx, serverID, input.OperationKey, input.PlanDigest, a.now())
-		if errors.Is(err, ErrLeaseConflict) {
-			return cloud.Error(cloud.CodeUnavailable, true, errors.New(nodeprotocol.ErrorLeaseExpired))
-		}
-		return err
+	if err := a.store.UpdateActionReceipt(ctx, serverID, input.RequestID, response, a.now()); err != nil {
+		a.pauseStorageUpload(ctx, serverID, input, response, errors.New("node_persistence_failed"))
+		return
+	}
+	if err := a.store.UpdateOperationExecution(ctx, serverID, input.OperationKey, input.PlanDigest, nodeprotocol.OperationRunning, nodeprotocol.PhaseWaitingNode, "", nil, a.now()); err != nil {
+		a.pauseStorageUpload(ctx, serverID, input, response, err)
+		return
 	}
 	var driver storageUploadDriver
 	var err error
 	if plan.ProviderType == nodeprotocol.StorageProviderQuark {
-		state := a.newQuarkGrantState(serverID, input.PlanDigest, grant, credential)
-		guard = state.check
-		driver, err = a.newQuarkUploadDriver(ctx, serverID, input, credential, state)
+		driver, err = a.newQuarkUploadDriver(ctx, serverID, input, credential, quarkState)
 		if err == nil {
 			err = configureQuarkDirectoryLocator(driver.(*nodeQuarkUploadDriver).Client, credential, plan.TargetRootRelativePath, plan.TargetRootID)
 		}
@@ -257,6 +262,11 @@ func (a *Agent) runStorageUpload(ctx context.Context, serverID string, input nod
 	}
 	if driver.Provider() != plan.ProviderType {
 		a.pauseStorageUpload(ctx, serverID, input, response, errors.New(nodeprotocol.ErrorCapabilityMissing))
+		return
+	}
+	response.Phase = nodeprotocol.PhaseVerifyingTarget
+	if err := a.store.UpdateActionReceipt(ctx, serverID, input.RequestID, response, a.now()); err != nil {
+		a.pauseStorageUpload(ctx, serverID, input, response, errors.New("node_persistence_failed"))
 		return
 	}
 	root, err := driver.Stat(ctx, plan.TargetRootID)
@@ -272,7 +282,9 @@ func (a *Agent) runStorageUpload(ctx context.Context, serverID string, input nod
 			a.pauseStorageUpload(ctx, serverID, input, response, err)
 			return
 		}
-		result, err := a.uploadStorageFile(ctx, serverID, input, plan, filePlan, driver, guard)
+		observe := a.storageUploadObserver(ctx, serverID, input, plan, &response)
+		fileCtx := context.WithValue(ctx, storageUploadProgressKey{}, observe)
+		result, err := a.uploadStorageFile(fileCtx, serverID, input, plan, filePlan, driver, guard)
 		if err != nil {
 			response.Files = append(response.Files, result)
 			a.pauseStorageUpload(ctx, serverID, input, response, err)
@@ -280,17 +292,36 @@ func (a *Agent) runStorageUpload(ctx context.Context, serverID string, input nod
 		}
 		response.Files = append(response.Files, result)
 		response.CompletedFiles = index + 1
+		var delivered, total int64
+		for _, file := range response.Files {
+			if file.Status == nodeprotocol.StorageFileCompleted || file.Status == nodeprotocol.StorageFileReused {
+				delivered += file.Size
+			}
+		}
+		for _, file := range plan.Files {
+			total += file.Size
+		}
+		response.UploadProgress = &nodeprotocol.StorageUploadProgress{Version: 1, TransferredBytes: delivered, TotalBytes: total, SampledAt: a.now()}
 		progress := float64(response.CompletedFiles) / float64(response.TotalFiles)
-		_ = a.store.UpdateActionReceipt(ctx, serverID, input.RequestID, response, a.now())
-		_ = a.store.UpdateOperationExecution(ctx, serverID, input.OperationKey, input.PlanDigest, nodeprotocol.OperationRunning, nodeprotocol.PhaseUploadingTarget, "", &progress, a.now())
+		if err := a.store.UpdateActionReceipt(ctx, serverID, input.RequestID, response, a.now()); err != nil {
+			a.pauseStorageUpload(ctx, serverID, input, response, errors.New("node_persistence_failed"))
+			return
+		}
+		if err := a.store.UpdateOperationExecution(ctx, serverID, input.OperationKey, input.PlanDigest, nodeprotocol.OperationRunning, response.Phase, "", &progress, a.now()); err != nil {
+			a.pauseStorageUpload(ctx, serverID, input, response, err)
+			return
+		}
 	}
 	if err := guard(ctx); err != nil {
 		a.pauseStorageUpload(ctx, serverID, input, response, err)
 		return
 	}
 	response.Status = nodeprotocol.StorageActionCompleted
+	response.Phase = nodeprotocol.PhaseCompleted
 	response.ErrorCode = ""
-	_ = a.store.CompleteStorageAction(ctx, serverID, input.RequestID, input.OperationKey, input.PlanDigest, response, a.now())
+	if err := a.store.CompleteStorageAction(ctx, serverID, input.RequestID, input.OperationKey, input.PlanDigest, response, a.now()); err != nil {
+		a.pauseStorageUpload(ctx, serverID, input, response, errors.New("node_persistence_failed"))
+	}
 }
 
 func (a *Agent) uploadStorageFile(ctx context.Context, serverID string, input nodeprotocol.StorageActionRequest, plan nodeprotocol.StorageUploadPlan, filePlan nodeprotocol.StorageUploadFile, driver storageUploadDriver, guard func(context.Context) error) (nodeprotocol.StorageUploadFileResult, error) {
@@ -326,11 +357,13 @@ func (a *Agent) uploadStorageFile(ctx context.Context, serverID string, input no
 		return result, errors.New(nodeprotocol.ErrorChecksumMismatch)
 	}
 	defer func() { _ = handle.Close() }()
+	reportStorageUploadPhase(ctx, "hashing_source")
 	sha1Digest, err := hashStorageSource(ctx, handle, filePlan.Size, filePlan.SHA256)
 	if err != nil {
 		return result, err
 	}
 
+	reportStorageUploadPhase(ctx, nodeprotocol.PhaseVerifyingTarget)
 	parentID, err := ensureStorageParent(ctx, driver, plan.TargetRootID, path.Dir(filePlan.TargetRelativePath), guard)
 	if err != nil {
 		return result, err
@@ -387,19 +420,25 @@ func (a *Agent) uploadStorageFile(ctx context.Context, serverID string, input no
 	if _, err := handle.Seek(0, io.SeekStart); err != nil {
 		return result, errors.New(nodeprotocol.ErrorChecksumMismatch)
 	}
-	uploaded, err := driver.Upload(ctx, cloud.UploadRequest{ParentID: parentID, Name: result.TargetName, Size: filePlan.Size, Reader: handle})
+	reportStorageUploadPhase(ctx, nodeprotocol.PhaseUploadingTarget)
+	uploaded, err := driver.Upload(ctx, cloud.UploadRequest{ParentID: parentID, Name: result.TargetName, Size: filePlan.Size, Reader: handle, Progress: storageUploadProgressCallback(ctx)})
 	if err != nil {
 		code := storageErrorCode(err)
 		status := nodeprotocol.StorageFileReconciling
 		if code == nodeprotocol.ErrorCredentialExpired || code == nodeprotocol.ErrorTargetRateLimited {
 			status = nodeprotocol.StorageFilePending
 		}
-		_ = a.store.UpdateStorageUploadFile(ctx, input.OperationKey, filePlan.SourceFileToken, input.PlanDigest, status, parentID, "", sha1Digest, a.now())
+		if saveErr := a.checkpointUnknownStorageFile(ctx, input, filePlan.SourceFileToken, status, parentID, "", sha1Digest); saveErr != nil {
+			return result, saveErr
+		}
 		return result, err
 	}
+	reportStorageUploadPhase(ctx, nodeprotocol.PhaseVerifyingTarget)
 	verified, err := verifyUploadedTarget(ctx, driver, uploaded, parentID, result.TargetName, filePlan.Size, sha1Digest)
 	if err != nil {
-		_ = a.store.UpdateStorageUploadFile(ctx, input.OperationKey, filePlan.SourceFileToken, input.PlanDigest, nodeprotocol.StorageFileReconciling, parentID, uploaded.ID, sha1Digest, a.now())
+		if saveErr := a.checkpointUnknownStorageFile(ctx, input, filePlan.SourceFileToken, nodeprotocol.StorageFileReconciling, parentID, uploaded.ID, sha1Digest); saveErr != nil {
+			return result, saveErr
+		}
 		return result, errors.New(nodeprotocol.ErrorReconciliationNeeded)
 	}
 	return a.finishStorageFile(ctx, input, filePlan, verified, parentID, sha1Digest, nodeprotocol.StorageFileCompleted)
@@ -413,6 +452,11 @@ func (a *Agent) finishStorageFile(ctx context.Context, input nodeprotocol.Storag
 }
 
 func (a *Agent) pauseStorageUpload(ctx context.Context, serverID string, input nodeprotocol.StorageActionRequest, response nodeprotocol.StorageActionResponse, err error) {
+	if ctx.Err() != nil && context.Cause(ctx) != nil {
+		err = context.Cause(ctx)
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
 	code := storageErrorCode(err)
 	response.ErrorCode = code
 	switch code {
@@ -423,7 +467,6 @@ func (a *Agent) pauseStorageUpload(ctx context.Context, serverID string, input n
 	default:
 		response.Status = nodeprotocol.StorageActionRunning
 	}
-	_ = a.store.UpdateActionReceipt(ctx, serverID, input.RequestID, response, a.now())
 	phase := nodeprotocol.PhaseUploadingTarget
 	switch code {
 	case nodeprotocol.ErrorCredentialExpired:
@@ -431,7 +474,15 @@ func (a *Agent) pauseStorageUpload(ctx context.Context, serverID string, input n
 	case nodeprotocol.ErrorReconciliationNeeded:
 		phase = nodeprotocol.PhaseVerifyingTarget
 	}
-	_ = a.store.UpdateOperationExecution(ctx, serverID, input.OperationKey, input.PlanDigest, nodeprotocol.OperationRunning, phase, code, nil, a.now())
+	response.Phase = phase
+	log.Info().Str("operation", "node_storage_upload").Str("task_id", input.TaskID).Str("status", response.Status).Str("phase", phase).Str("error_code", code).Msg("节点上传保留原结果核对")
+	if err := a.store.UpdateActionReceipt(ctx, serverID, input.RequestID, response, a.now()); err != nil {
+		log.Warn().Str("operation", "node_storage_upload").Str("task_id", input.TaskID).Str("error_code", "node_persistence_failed").Msg("节点上传回执暂未保存")
+	}
+	if err := a.store.UpdateOperationExecution(ctx, serverID, input.OperationKey, input.PlanDigest, nodeprotocol.OperationRunning, phase, code, nil, a.now()); err != nil {
+		log.Warn().Str("operation", "node_storage_upload").Str("task_id", input.TaskID).Str("error_code", "node_persistence_failed").Msg("节点上传阶段暂未保存，保留原操作")
+	}
+
 }
 
 func ensureStorageParent(ctx context.Context, driver storageUploadDriver, rootID, directory string, guard func(context.Context) error) (string, error) {
@@ -546,7 +597,10 @@ func hashStorageSource(ctx context.Context, file io.ReadSeeker, expectedSize int
 	}
 	sha256Hash, sha1Hash := sha256.New(), sha1.New()
 	written, err := io.Copy(io.MultiWriter(sha256Hash, sha1Hash), &contextReader{ctx: ctx, reader: io.LimitReader(file, expectedSize+1)})
-	if err != nil || written != expectedSize || hex.EncodeToString(sha256Hash.Sum(nil)) != expectedSHA256 {
+	if err != nil {
+		return "", err
+	}
+	if written != expectedSize || hex.EncodeToString(sha256Hash.Sum(nil)) != expectedSHA256 {
 		return "", errors.New(nodeprotocol.ErrorChecksumMismatch)
 	}
 	return strings.ToUpper(hex.EncodeToString(sha1Hash.Sum(nil))), nil
@@ -574,7 +628,7 @@ func storageErrorCode(err error) string {
 	if errors.Is(err, ErrPlanConflict) || strings.Contains(err.Error(), nodeprotocol.ErrorPlanConflict) {
 		return nodeprotocol.ErrorPlanConflict
 	}
-	for _, code := range []string{nodeprotocol.ErrorCredentialExpired, nodeprotocol.ErrorReconciliationNeeded, nodeprotocol.ErrorChecksumMismatch, nodeprotocol.ErrorCapabilityMissing} {
+	for _, code := range []string{nodeprotocol.ErrorCredentialExpired, nodeprotocol.ErrorReconciliationNeeded, nodeprotocol.ErrorChecksumMismatch, nodeprotocol.ErrorCapabilityMissing, "node_persistence_failed"} {
 		if strings.Contains(err.Error(), code) {
 			return code
 		}
@@ -620,3 +674,12 @@ func storageSafeMessage(code string) string {
 }
 
 var _ storageUploadDriver = (*pan115.Client)(nil)
+
+func (a *Agent) checkpointUnknownStorageFile(parent context.Context, input nodeprotocol.StorageActionRequest, token, status, parentID, itemID, sha1 string) error {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), 5*time.Second)
+	defer cancel()
+	if err := a.store.UpdateStorageUploadFile(ctx, input.OperationKey, token, input.PlanDigest, status, parentID, itemID, sha1, a.now()); err != nil {
+		return errors.New("node_persistence_failed")
+	}
+	return nil
+}

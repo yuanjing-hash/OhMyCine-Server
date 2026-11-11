@@ -1,5 +1,26 @@
-import { describe, expect, it } from 'vitest'
-import { canDeleteTransferRecord, formatTransferProgress, remoteTransferPhaseLabel, shouldRefreshTransferEvent, transferDeletionLabels, transferExecutionLabel, transferIdentityLabel, transferPhaseDescription, transferRouteLabel, transferStatusClass, transferStatusLabel, type TransferSummary } from '@/transfers'
+// @vitest-environment happy-dom
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { flushPromises, mount, type VueWrapper } from '@vue/test-utils'
+import { APIError, api } from '@/api/client'
+import { Permissions } from '@/auth/generated-permissions'
+import OrganizationView from '@/views/OrganizationView.vue'
+import { canDeleteTransferRecord, formatTransferProgress, remoteTransferPhaseLabel, shouldRefreshTransferEvent, transferDeletionLabels, transferExecutionLabel, transferIdentityLabel, transferPhaseDescription, transferRouteLabel, transferStatusClass, transferStatusLabel, transferUploadMetrics, type TransferSummary } from '@/transfers'
+
+const route = vi.hoisted(() => ({ query: {} as Record<string, string> }))
+vi.mock('@/api/client', async original => ({ ...await original<typeof import('@/api/client')>(), api: vi.fn() }))
+vi.mock('vue-router', () => ({ useRoute: () => route, useRouter: () => ({ replace: async ({ query }: { query: Record<string, string> }) => { route.query = query } }) }))
+vi.mock('@/toast', () => ({ notify: vi.fn() }))
+vi.mock('@/stores/auth', () => ({ useAuthStore: () => ({ user: { id: 7 }, can: (code: string) => [Permissions.TransfersReadOwn, Permissions.JobsReadOwn, Permissions.JobsControlOwn].includes(code as typeof Permissions.TransfersReadOwn), canAny: () => true }) }))
+
+let wrapper: VueWrapper | undefined
+afterEach(() => {
+  wrapper?.unmount()
+  wrapper = undefined
+  route.query = {}
+  vi.useRealTimers()
+  vi.clearAllMocks()
+  vi.unstubAllGlobals()
+})
 
 const summary = { phase: 'planning', job_status: 'running', processed_files: 0, total_files: 2 } as TransferSummary
 
@@ -65,11 +86,106 @@ describe('media organization presentation', () => {
     for (const job_status of ['queued', 'running', 'waiting_user_action', 'retry_wait', 'paused'] as const) {
       expect(canDeleteTransferRecord({ ...summary, job_status })).toBe(false)
     }
+    const recovering = { ...summary, job_status: 'completed', recovery_pending: true } as TransferSummary
+    expect(canDeleteTransferRecord(recovering)).toBe(false)
+    expect(transferStatusLabel(recovering)).toBe('等待核对原上传')
+    expect(remoteTransferPhaseLabel({ ...recovering, execution_location: 'node', remote_phase: 'uploading_target' })).toContain('请管理员核对原任务与节点状态')
   })
 
   it('exposes four explicit deletion scopes without collapsing destructive choices', () => {
     expect(Object.keys(transferDeletionLabels)).toEqual(['record_only', 'record_and_source', 'record_and_library', 'record_source_and_library'])
     expect(transferDeletionLabels.record_only).toBe('仅删除转移记录')
     expect(transferDeletionLabels.record_source_and_library).toContain('源文件和媒体库文件')
+  })
+
+  it('keeps measured single-file upload, old-operation recovery and Server history consistent across table and detail', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-11-11T02:00:00Z'))
+    vi.stubGlobal('WebSocket', class { close() {} })
+    const upload = {
+      ...summary, id: 'upload', job_id: 'upload-job', owner_id: 7, display_name: '正在上传的一集',
+      library_name: '媒体库', phase: 'transferring', execution_location: 'node', node_name: '传输节点',
+      remote_phase: 'uploading_target', remote_progress: 0, processed_files: 0, total_files: 1,
+      remote_transferred_bytes: 512 * 1024 * 1024, remote_total_bytes: 1024 * 1024 * 1024,
+      remote_upload_speed_bps: 1024 * 1024, remote_sampled_at: '2026-11-11T02:00:00Z',
+    } as TransferSummary
+    const recovering = { ...upload, id: 'recovering', display_name: '原上传等待恢复', job_id: 'original-job', job_status: 'completed', recovery_pending: true } as TransferSummary
+    const completed = { ...summary, id: 'finished', display_name: '真正完成的入库', phase: 'completed', job_status: 'completed', execution_location: 'server', total_files: 1, processed_files: 1 } as TransferSummary
+    let pendingRead: Promise<void> | undefined
+    let pendingDetail: Promise<void> | undefined
+    let detailUnavailable = false
+    vi.mocked(api).mockImplementation(async path => {
+      if (path.startsWith('/api/v1/transfers?')) {
+        await pendingRead
+        const list = path.includes('scope=history') ? [completed] : [upload, recovering]
+        return { list, total: list.length, stats: { processing: 2, waiting_action: 0, failed: 0, completed_today: 1 }, filter_options: { libraries: [], categories: [] } }
+      }
+      if (path === '/api/v1/transfers/upload') return { ...upload, job: { status: upload.job_status, action_request: null }, plan_summary: null, timeline: [], attempts: [] }
+      if (path === '/api/v1/transfers/recovering') {
+        await pendingDetail
+        if (detailUnavailable) throw new APIError(503, 'TEMPORARILY_UNAVAILABLE', '详情读取暂时不可用')
+        return { ...recovering, job: { status: recovering.job_status, action_request: null }, plan_summary: null, timeline: [], attempts: [] }
+      }
+      throw new Error(`unexpected offline request ${path}`)
+    })
+    wrapper = mount(OrganizationView, { global: { stubs: { RouterLink: true, MediaReorganizationDialog: true, TransferDeletionDialog: true, ClearHistoryButton: true } } })
+    await flushPromises()
+    const table = wrapper.get('.organization-table')
+    expect(table.text()).toContain('512.0 MiB / 1.0 GiB · 50.0%')
+    expect(table.text()).toContain('上传速度 1.0 MiB/s')
+    expect(table.text()).toContain('等待核对原上传')
+    expect(table.findAll('button').some(button => button.text() === '删除记录')).toBe(false)
+    expect(wrapper.get('.organization-mobile-list').text()).toContain('50.0%')
+    await table.findAll('button').find(button => button.text() === '查看详情')!.trigger('click')
+    await flushPromises()
+    expect(wrapper.get('.organization-drawer').text()).toContain('50.0%')
+    expect(wrapper.get('.organization-drawer').text()).toContain('文件 0 / 1')
+
+    await vi.advanceTimersByTimeAsync(16_000)
+    expect(wrapper.get('.organization-table').text()).toContain('速度采样已过期')
+    expect(wrapper.get('.organization-drawer').text()).toContain('上传速度 未知')
+    upload.remote_phase = 'hashing_source'
+    upload.remote_sampled_at = new Date().toISOString()
+    await wrapper.findAll('button').find(button => button.text() === '刷新')!.trigger('click')
+    await flushPromises()
+    expect(wrapper.get('.organization-drawer').text()).toContain('节点校验源文件')
+    expect(wrapper.get('.organization-drawer').text()).toContain('上传速度 未知')
+    expect(transferUploadMetrics({ ...upload, remote_phase: 'uploading_target', remote_sampled_at: new Date(Date.now() + 1_000).toISOString() }, Date.now()).speed).toBeNull()
+    expect(transferUploadMetrics({ ...upload, remote_transferred_bytes: undefined, remote_total_bytes: undefined, remote_sampled_at: undefined }, Date.now()).percentage).toBeNull()
+
+    let finishRead!: () => void
+    pendingRead = new Promise(resolve => { finishRead = resolve })
+    const beforePoll = vi.mocked(api).mock.calls.filter(([path]) => path.startsWith('/api/v1/transfers?')).length
+    await vi.advanceTimersByTimeAsync(14_000)
+    expect(vi.mocked(api).mock.calls.filter(([path]) => path.startsWith('/api/v1/transfers?'))).toHaveLength(beforePoll + 1)
+    let finishDetail!: () => void
+    pendingDetail = new Promise(resolve => { finishDetail = resolve })
+    await wrapper.get('.organization-table').findAll('button').filter(button => button.text() === '查看详情')[1]!.trigger('click')
+    await flushPromises()
+    finishRead()
+    pendingRead = undefined
+    await flushPromises()
+    finishDetail()
+    pendingDetail = undefined
+    await flushPromises()
+    expect(wrapper.get('.organization-drawer h2').text()).toBe('原上传等待恢复')
+    expect(route.query.task).toBe('recovering')
+    detailUnavailable = true
+    await wrapper.findAll('button').find(button => button.text() === '刷新')!.trigger('click')
+    await flushPromises()
+    expect(wrapper.get('.organization-drawer h2').text()).toBe('原上传等待恢复')
+    expect(wrapper.get('.organization-drawer').text()).toContain('详情读取暂时不可用')
+    expect(route.query.task).toBe('recovering')
+
+    await wrapper.get('[aria-label="关闭详情"]').trigger('click')
+    await wrapper.get('#organization-tab-history').trigger('click')
+    await flushPromises()
+    expect(wrapper.get('.organization-table').text()).toContain('真正完成的入库')
+    expect(wrapper.get('.organization-table').text()).not.toContain('正在上传的一集')
+    expect(vi.mocked(api).mock.calls.some(([path]) => path.startsWith('/api/v1/transfers?scope=history'))).toBe(true)
+    await vi.advanceTimersByTimeAsync(0)
+    wrapper.unmount()
+    wrapper = undefined
+    expect(vi.getTimerCount()).toBe(0)
   })
 })

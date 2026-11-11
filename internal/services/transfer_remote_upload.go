@@ -44,35 +44,43 @@ type remoteUploadBatch struct {
 // freezes naming and conflict decisions once, then dispatches deterministic,
 // bounded batches while retaining one ordinary TransferTask for the user.
 func (w *TransferWorker) runRemoteNodeUpload(ctx context.Context, runtime JobRuntime, job ClaimedJob, task models.TransferTask, download models.DownloadTask, manifest downloadpkg.Manifest, started time.Time) WorkerResult {
+	ctx = context.WithValue(ctx, remoteUploadClaimKey{}, job)
+
 	if w.service == nil || w.service.downloader == nil || w.service.downloader.transferNodes == nil || normalizeExecutionLocation(download.ExecutionLocation) != models.NodeLocationRemote || download.NodeID == nil || task.NodeID == nil || *download.NodeID != *task.NodeID {
-		return w.cloudFailure(task, cloudTransferError("node_transfer_snapshot_invalid", false, nil))
+		return w.cloudFailure(task, cloudTransferError("node_transfer_snapshot_invalid", false, nil), ctx)
 	}
 	if (download.ProviderType != models.DownloaderTypeQBittorrent && download.ProviderType != models.DownloaderTypePan115Offline && download.ProviderType != models.DownloaderTypeQuarkShare) || !models.IsNativeCloudStorage(download.TargetStorageType) || download.TargetStorageID == nil || download.TargetConnectionID == nil || strings.TrimSpace(download.TargetProviderRootID) == "" {
-		return w.cloudFailure(task, cloudTransferError(CodeTransferRouteUnsupported, false, nil))
+		return w.cloudFailure(task, cloudTransferError(CodeTransferRouteUnsupported, false, nil), ctx)
 	}
 	if download.TransferMode != models.MediaLibraryTransferCopy && download.TransferMode != models.MediaLibraryTransferMove {
-		return w.cloudFailure(task, cloudTransferError("cloud_transfer_mode_invalid", false, nil))
+		return w.cloudFailure(task, cloudTransferError("cloud_transfer_mode_invalid", false, nil), ctx)
 	}
 	if manifest.RemoteExportOperationKey == "" || !nodeprotocol.ValidDigest(manifest.RemoteExportDigest) || manifest.RemoteExportExpiresAt == nil {
-		return w.cloudFailure(task, cloudTransferError("node_file_export_invalid", false, nil))
+		return w.cloudFailure(task, cloudTransferError("node_file_export_invalid", false, nil), ctx)
 	}
 
 	client, node, err := w.service.downloader.transferNodes.nodeClient(*download.NodeID)
 	if err != nil {
-		return w.cloudFailure(task, remoteUploadClientError(err))
+		return w.cloudFailure(task, remoteUploadClientError(err), ctx)
 	}
 	var capabilities nodeprotocol.Capabilities
 	if json.Unmarshal([]byte(node.CapabilitiesJSON), &capabilities) != nil || !remoteUploadCapabilities(capabilities, download.TargetStorageType) {
-		return w.cloudFailure(task, cloudTransferError(nodeprotocol.ErrorCapabilityMissing, false, nil))
+		return w.cloudFailure(task, cloudTransferError(nodeprotocol.ErrorCapabilityMissing, false, nil), ctx)
 	}
 	var storage models.Storage
 	if err := w.service.db.WithContext(ctx).First(&storage, *download.TargetStorageID).Error; err != nil || storage.Type != download.TargetStorageType || storage.ConnectionID == nil || *storage.ConnectionID != *download.TargetConnectionID {
-		return w.cloudFailure(task, cloudTransferError("cloud_transfer_boundary_invalid", false, err))
+		return w.cloudFailure(task, cloudTransferError("cloud_transfer_boundary_invalid", false, err), ctx)
 	}
 
+	if err := assertRemoteUploadClaimTx(w.service.db.WithContext(ctx), ctx); err != nil {
+		return WorkerResult{ErrorCode: CodeQueueLeaseInvalid, ErrorMessage: "原上传执行租约已变更"}
+	}
+	if err := fenceRemoteUploadClaim(w.service.db.WithContext(ctx).Model(&models.Job{}).Where("id=?", task.JobID), ctx).Update("speed", nil).Error; err != nil {
+		return WorkerResult{ErrorCode: "transfer_state_persist_failed", ErrorMessage: "原上传进度暂时无法保存"}
+	}
 	rows, exists, err := w.loadRemoteUploadFiles(ctx, task, download, manifest)
 	if err != nil {
-		return w.cloudFailure(task, cloudTransferError("node_operation_plan_conflict", false, err))
+		return w.cloudFailure(task, cloudTransferError("node_operation_plan_conflict", false, err), ctx)
 	}
 	if !exists {
 		policy := download.ConflictPolicy
@@ -81,7 +89,7 @@ func (w *TransferWorker) runRemoteNodeUpload(ctx context.Context, runtime JobRun
 		}
 		planned, conflicts, planErr := w.planRemoteNodeUpload(ctx, download, manifest, policy)
 		if planErr != nil {
-			return w.cloudFailure(task, planErr)
+			return w.cloudFailure(task, planErr, ctx)
 		}
 		if conflicts > 0 && policy == models.MediaLibraryConflictAsk {
 			options := []string{models.MediaLibraryConflictOverwrite, models.MediaLibraryConflictSkip, models.MediaLibraryConflictRename}
@@ -98,26 +106,48 @@ func (w *TransferWorker) runRemoteNodeUpload(ctx context.Context, runtime JobRun
 			}
 		}
 		if err != nil {
-			return w.cloudFailure(task, cloudTransferError("transfer_state_persist_failed", true, err))
+			return w.cloudFailure(task, cloudTransferError("transfer_state_persist_failed", true, err), ctx)
 		}
 	}
 	if len(rows) == 0 {
-		return w.cloudFailure(task, cloudTransferError("transfer_plan_invalid", false, nil))
+		return w.cloudFailure(task, cloudTransferError("transfer_plan_invalid", false, nil), ctx)
 	}
 	if err := w.persistRemoteUploadProgress(ctx, &task, rows, models.TransferTaskStatusPlanning); err != nil {
-		return w.cloudFailure(task, cloudTransferError("transfer_state_persist_failed", true, err))
+		return w.cloudFailure(task, cloudTransferError("transfer_state_persist_failed", true, err), ctx)
 	}
-
-	permit, err := enterCatalogPhysicalWrite(ctx, w.service.db, CatalogPhysicalWriteInput{LibraryID: task.LibraryID, OwnerKind: CatalogPhysicalTransfer, OwnerID: task.ID, Job: &job})
-	if err != nil {
-		return w.cloudFailure(task, cloudTransferError("transfer_write_admission_failed", true, err))
-	}
-	defer quiesceCatalogPhysicalWrite(w.service.db, permit, w.service.log)
 
 	batches, err := buildRemoteUploadBatches(rows, storage, download, manifest)
 	if err != nil {
-		return w.cloudFailure(task, cloudTransferError("transfer_plan_invalid", false, err))
+		return w.cloudFailure(task, cloudTransferError("transfer_plan_invalid", false, err), ctx)
 	}
+	if err := w.recoverRemoteUploadPermit(ctx, client, task, download, batches); err != nil {
+		code, message := "node_execution_stop_pending", "原节点执行的退出尚未确认，15 秒后继续核对原操作"
+		var remote *nodeclient.RemoteError
+		if errors.As(err, &remote) && remote.Code == "node_execution_control_upgrade_required" {
+			code = remote.Code
+			message = "请升级传输节点以核对原上传的退出；保留原文件和操作，15 秒后重新检查节点能力"
+		}
+		next := time.Now().UTC().Add(15 * time.Second)
+		_ = w.service.db.Model(&models.TransferTask{}).Where("id=? AND job_id=?", task.ID, task.JobID).Updates(map[string]any{"last_error_code": code, "updated_at": time.Now().UTC()}).Error
+		return WorkerResult{RetryAt: &next, ErrorCode: code, ErrorMessage: message}
+	}
+	permit, err := enterCatalogPhysicalWrite(ctx, w.service.db, CatalogPhysicalWriteInput{LibraryID: task.LibraryID, OwnerKind: CatalogPhysicalTransfer, OwnerID: task.ID, Job: &job})
+	if err != nil {
+		return w.cloudFailure(task, cloudTransferError("transfer_write_admission_failed", true, err), ctx)
+	}
+
+	defer func() {
+		if task.Phase == models.TransferTaskStatusCompleted {
+			return
+		} // final domain/physical commit already joined every Node receipt
+		stopCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		defer cancel()
+		if err := w.stopRemoteUploadExecution(stopCtx, client, task, download, batches, remoteUploadStopProof{physical: permit.evidence}); err == nil {
+			quiesceCatalogPhysicalWrite(w.service.db, permit, w.service.log)
+		} else {
+			w.transferEvent(stopCtx, task, "node.upload.stop_pending", "upload", "waiting", "原节点操作的退出尚未确认，保留媒体库写入保护继续核对", map[string]any{"error_code": "node_execution_stop_pending"})
+		}
+	}()
 	ctx = withFileDisplayNames(ctx, firstNonEmpty(node.Name, "传输节点"), task.LibraryName)
 	w.transferEvent(ctx, task, "node.upload.plan", "planning", "planned", "节点直传计划已冻结，将按原批次发送并读取节点回执；主 Server 不伪装节点内部文件操作过程", map[string]any{"total_count": len(rows), "batch_count": len(batches)})
 	for _, batch := range batches {
@@ -126,24 +156,35 @@ func (w *TransferWorker) runRemoteNodeUpload(ctx context.Context, runtime JobRun
 		}
 		if remoteUploadRowsTerminal(batch.rows) {
 			if err := w.recoverTerminalRemoteUploadBatch(ctx, client, &task, download, rows, batch); err != nil {
-				return w.cloudFailure(task, err)
+				return w.cloudFailure(task, err, ctx)
 			}
 			continue
 		}
-		if err := w.refreshRemoteUploadExport(ctx, &task, download, &manifest); err != nil {
-			return w.cloudFailure(task, err)
-		}
-		batch.plan.SourceExportOperationKey = manifest.RemoteExportOperationKey
-		batch.plan.SourceManifestDigest = manifest.RemoteExportDigest
-		if err := w.executeRemoteUploadBatch(ctx, runtime, client, node, storage, &task, download, rows, batch); err != nil {
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		for {
+			err := w.executeRemoteUploadBatch(ctx, runtime, client, node, storage, &task, download, rows, batch, &manifest)
+			if err == nil {
+				break
+			}
+			if ctx.Err() != nil {
 				return WorkerResult{}
 			}
-			return w.cloudFailure(task, err)
+			var failure *cloudTransferFailure
+			if !errors.As(err, &failure) || !failure.retryable {
+				return w.cloudFailure(task, err, ctx)
+			}
+			w.transferEvent(ctx, task, "node.upload.request_wait", "upload", "waiting", "节点控制请求暂未完成，继续核对原批次并保留写入归属", map[string]any{"error_code": safeLabel(failure.code, 96), "retry_after_seconds": 15})
+			if err := uploadHeartbeat(runtime, task, int64(remoteUploadTerminalCount(rows)), int64(len(rows))); err != nil {
+				return w.cloudFailure(task, cloudTransferError(CodeQueueLeaseInvalid, true, err), ctx)
+			}
+			select {
+			case <-ctx.Done():
+				return WorkerResult{}
+			case <-time.After(15 * time.Second):
+			}
 		}
 	}
 	if !remoteUploadRowsTerminal(rows) {
-		return w.cloudFailure(task, cloudTransferError(nodeprotocol.ErrorReconciliationNeeded, true, nil))
+		return w.cloudFailure(task, cloudTransferError(nodeprotocol.ErrorReconciliationNeeded, true, nil), ctx)
 	}
 
 	now := time.Now().UTC()
@@ -177,7 +218,7 @@ func (w *TransferWorker) runRemoteNodeUpload(ctx context.Context, runtime JobRun
 		return WorkerResult{}
 	}
 	if err != nil {
-		return w.cloudFailure(task, cloudTransferError("transfer_state_persist_failed", true, err))
+		return w.cloudFailure(task, cloudTransferError("transfer_state_persist_failed", true, err), ctx)
 	}
 	serverlog.OperationCloudTransfer.Event(w.service.log.Info()).Str("task_id", task.ID).Uint("library_id", task.LibraryID).Str("node_id", node.ID).Str("provider", storage.Type).Int("files", len(rows)).Int64("duration_ms", time.Since(started).Milliseconds()).Msg(serverlog.OperationCloudTransfer.Message("传输节点直传完成"))
 	task.Phase = models.TransferTaskStatusCompleted
@@ -235,8 +276,11 @@ func buildRemoteUploadBatches(rows []models.RemoteUploadFile, storage models.Sto
 	return batches, nil
 }
 
-func (w *TransferWorker) executeRemoteUploadBatch(ctx context.Context, runtime JobRuntime, client remoteUploadNodeClient, node models.TransferNode, storage models.Storage, task *models.TransferTask, download models.DownloadTask, allRows []models.RemoteUploadFile, batch remoteUploadBatch) error {
+func (w *TransferWorker) executeRemoteUploadBatch(ctx context.Context, runtime JobRuntime, client remoteUploadNodeClient, node models.TransferNode, storage models.Storage, task *models.TransferTask, download models.DownloadTask, allRows []models.RemoteUploadFile, batch remoteUploadBatch, manifest *downloadpkg.Manifest) error {
 	w.transferEvent(ctx, *task, "node.upload.dispatch", "upload", "started", "开始处理节点直传批次，发送或核对既有冻结计划；不重复创建已完成的操作", map[string]any{"batch_count": batch.index + 1, "total_count": len(batch.rows)})
+	if err := assertRemoteUploadClaimTx(w.service.db.WithContext(ctx), ctx); err != nil {
+		return err
+	}
 	operationKey := remoteUploadOperationKey(task.ID, batch.index)
 	plan, record, completed, err := w.prepareRemoteUploadOperation(ctx, node.ID, download.ID, operationKey, batch.plan)
 	if err != nil {
@@ -252,8 +296,11 @@ func (w *TransferWorker) executeRemoteUploadBatch(ctx context.Context, runtime J
 		if putErr != nil {
 			return remoteUploadClientError(putErr)
 		}
-		if err := validateRemoteOperationResponse(remote, record); err != nil {
+		if err := validateRemoteOperationIdentity(remote, record); err != nil {
 			return err
+		}
+		if remote.Status != nodeprotocol.OperationCompleted && remote.LeaseEpoch > plan.LeaseEpoch {
+			return cloudTransferError(nodeprotocol.ErrorPlanConflict, false, nil)
 		}
 		if remote.Status == nodeprotocol.OperationFailed || remote.Status == nodeprotocol.OperationCancelled {
 			return cloudTransferError(firstNonEmpty(remote.ErrorCode, nodeprotocol.ErrorPlanConflict), false, nil)
@@ -267,6 +314,7 @@ func (w *TransferWorker) executeRemoteUploadBatch(ctx context.Context, runtime J
 			if err := validateRemoteOperationResponse(remote, record); err != nil {
 				return err
 			}
+			nodeCompleted = remote.Status == nodeprotocol.OperationCompleted
 		}
 		if err := w.persistRemoteOperationResponse(ctx, record, remote); err != nil {
 			return err
@@ -274,6 +322,14 @@ func (w *TransferWorker) executeRemoteUploadBatch(ctx context.Context, runtime J
 		if nodeCompleted {
 			response, err = client.StorageActionResult(ctx, requestID, download.ID, operationKey)
 		} else {
+			// Source authority is needed only for unfinished execution. A completed
+			// original Node result must remain readable after source/export cleanup.
+			if manifest == nil {
+				return cloudTransferError("node_file_export_invalid", false, nil)
+			}
+			if err := w.refreshRemoteUploadExport(ctx, task, download, manifest); err != nil {
+				return err
+			}
 			request, err = w.authorizeRemoteUpload(ctx, client, node, storage, request, batch.rows)
 			if err != nil {
 				return err
@@ -286,17 +342,20 @@ func (w *TransferWorker) executeRemoteUploadBatch(ctx context.Context, runtime J
 	}
 
 	credentialRefreshes := 0
-	lastQuarkGrant := time.Now()
+	lastGrantPublication := time.Now()
 	leaseExpiresAt := plan.LeaseExpiresAt
 	lastObserved := ""
 	for {
-		if storage.Type == models.StorageTypeQuark && time.Since(lastQuarkGrant) > 5*time.Minute && response.Status != nodeprotocol.StorageActionCompleted {
+		if err := w.remoteUploadJobActive(ctx, task.JobID); err != nil {
+			return err
+		}
+		if time.Since(lastGrantPublication) > 2*time.Minute && response.Status != nodeprotocol.StorageActionCompleted {
 			var renewErr error
 			request, renewErr = w.authorizeRemoteUpload(ctx, client, node, storage, request, batch.rows)
 			if renewErr != nil {
 				return renewErr
 			}
-			lastQuarkGrant = time.Now()
+			lastGrantPublication = time.Now()
 		}
 		if err := validateStorageActionResponse(response, request, len(batch.rows)); err != nil {
 			return err
@@ -304,7 +363,10 @@ func (w *TransferWorker) executeRemoteUploadBatch(ctx context.Context, runtime J
 		if err := w.applyRemoteUploadResponse(ctx, task, allRows, batch.rows, response, batch.plan.ProviderType); err != nil {
 			return err
 		}
-		observed := response.Status + ":" + response.ErrorCode
+		if err := w.persistMeasuredUpload(ctx, task, allRows, batch.rows, response); err != nil {
+			return err
+		}
+		observed := response.Status + ":" + response.Phase + ":" + response.ErrorCode
 		if observed != lastObserved {
 			lastObserved = observed
 			outcome, message := "accepted", "主 Server 已取得节点批次回执，继续等待节点返回可核对的最终文件结果"
@@ -314,9 +376,9 @@ func (w *TransferWorker) executeRemoteUploadBatch(ctx context.Context, runtime J
 			if response.Status == nodeprotocol.StorageActionWaitingCredentials || response.Status == nodeprotocol.StorageActionReconciliation {
 				outcome, message = "waiting", "节点批次正在等待凭据或结果核对，原任务保持恢复流程，不能视为媒体已入库"
 			}
-			w.transferEvent(ctx, *task, "node.upload.receipt", "upload", outcome, message, map[string]any{"completed_count": response.CompletedFiles, "total_count": len(batch.rows)})
+			w.transferEvent(ctx, *task, "node.upload.receipt", "upload", outcome, message, map[string]any{"completed_count": response.CompletedFiles, "total_count": len(batch.rows), "status": safeLabel(response.Status, 64), "phase": safeLabel(response.Phase, 64), "error_code": safeLabel(response.ErrorCode, 96)})
 		}
-		phase := nodeprotocol.PhaseUploadingTarget
+		phase := firstNonEmpty(safeLabel(response.Phase, 64), nodeprotocol.PhaseUploadingTarget)
 		switch response.Status {
 		case nodeprotocol.StorageActionWaitingCredentials:
 			phase = nodeprotocol.PhaseWaitingCredentials
@@ -382,8 +444,7 @@ func (w *TransferWorker) executeRemoteUploadBatch(ctx context.Context, runtime J
 		}
 
 		processed, total := int64(remoteUploadTerminalCount(allRows)), int64(len(allRows))
-		progress = float64(processed) * 100 / float64(total)
-		if err := runtime.Heartbeat(&progress, &processed, &total, nil, nil); err != nil {
+		if err := uploadHeartbeat(runtime, *task, processed, total); err != nil {
 			return cloudTransferError(CodeQueueLeaseInvalid, true, err)
 		}
 		if time.Until(leaseExpiresAt) < 2*time.Minute {
@@ -405,6 +466,9 @@ func (w *TransferWorker) executeRemoteUploadBatch(ctx context.Context, runtime J
 }
 
 func (w *TransferWorker) authorizeRemoteUpload(ctx context.Context, client remoteUploadNodeClient, node models.TransferNode, storage models.Storage, request nodeprotocol.StorageActionRequest, rows []models.RemoteUploadFile) (nodeprotocol.StorageActionRequest, error) {
+	if err := assertRemoteUploadClaimTx(w.service.db.WithContext(ctx), ctx); err != nil {
+		return request, err
+	}
 	actions := []string{nodeprotocol.StorageActionUpload}
 	for _, row := range rows {
 		if row.ConflictAction == nodeprotocol.StorageConflictReplace {
@@ -440,6 +504,9 @@ func (w *TransferWorker) prepareRemoteUploadOperation(ctx context.Context, nodeI
 	var record models.RemoteOperation
 	completed := false
 	err = w.service.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := assertRemoteUploadClaimTx(tx, ctx); err != nil {
+			return err
+		}
 		err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("operation_key = ?", operationKey).First(&record).Error
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			record = models.RemoteOperation{OperationKey: operationKey, TaskID: taskID, NodeID: nodeID, PlanDigest: digest, PlanRevision: plan.PlanRevision, LeaseEpoch: plan.LeaseEpoch, Phase: nodeprotocol.PhaseAccepted, Status: nodeprotocol.OperationPending, CreatedAt: now, UpdatedAt: now}
@@ -459,11 +526,19 @@ func (w *TransferWorker) prepareRemoteUploadOperation(ctx context.Context, nodeI
 		if record.Status == nodeprotocol.OperationFailed || record.Status == nodeprotocol.OperationCancelled {
 			return cloudTransferError(nodeprotocol.ErrorPlanConflict, false, nil)
 		}
+		previousEpoch := record.LeaseEpoch
 		plan.LeaseEpoch = record.LeaseEpoch + 1
 		plan.LeaseExpiresAt = now.Add(remoteUploadLeaseDuration)
 		record.LeaseEpoch = plan.LeaseEpoch
 		record.UpdatedAt = now
-		return tx.Model(&models.RemoteOperation{}).Where("id = ? AND plan_digest = ?", record.ID, digest).Updates(map[string]any{"lease_epoch": record.LeaseEpoch, "updated_at": now}).Error
+		result := fenceRemoteUploadClaim(tx.Model(&models.RemoteOperation{}).Where("id=? AND plan_digest=? AND lease_epoch=?", record.ID, digest, previousEpoch), ctx).Updates(map[string]any{"lease_epoch": record.LeaseEpoch, "updated_at": now})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return ErrCatalogFence
+		}
+		return nil
 	})
 	return plan, record, completed, err
 }
@@ -472,23 +547,26 @@ func (w *TransferWorker) renewRemoteUploadOperation(ctx context.Context, client 
 	if record == nil {
 		return time.Time{}, cloudTransferError(nodeprotocol.ErrorPlanConflict, false, nil)
 	}
+	if err := assertRemoteUploadClaimTx(w.service.db.WithContext(ctx), ctx); err != nil {
+		return time.Time{}, err
+	}
 	now := time.Now().UTC()
 	epoch := record.LeaseEpoch + 1
 	expiresAt := now.Add(remoteUploadLeaseDuration)
-	remote, err := client.RenewOperationLease(ctx, record.OperationKey, nodeprotocol.LeaseRequest{PlanDigest: record.PlanDigest, LeaseEpoch: epoch, LeaseExpiresAt: expiresAt})
-	if err != nil {
-		return time.Time{}, remoteUploadClientError(err)
-	}
-	expected := *record
-	expected.LeaseEpoch = epoch
-	if err := validateRemoteOperationResponse(remote, expected); err != nil {
-		return time.Time{}, err
-	}
-	result := w.service.db.WithContext(ctx).Model(&models.RemoteOperation{}).Where("id = ? AND plan_digest = ? AND lease_epoch = ? AND status NOT IN ?", record.ID, record.PlanDigest, record.LeaseEpoch, []string{nodeprotocol.OperationCompleted, nodeprotocol.OperationFailed, nodeprotocol.OperationCancelled}).Updates(map[string]any{"lease_epoch": epoch, "updated_at": now})
+	// Reserve before issuing the RPC. An unknown ACK never rolls the issued
+	// high-water mark back where a successor could reuse this epoch.
+	result := fenceRemoteUploadClaim(w.service.db.WithContext(ctx).Model(&models.RemoteOperation{}).Where("id = ? AND plan_digest = ? AND lease_epoch = ? AND status NOT IN ?", record.ID, record.PlanDigest, record.LeaseEpoch, []string{nodeprotocol.OperationCompleted, nodeprotocol.OperationFailed, nodeprotocol.OperationCancelled}), ctx).Updates(map[string]any{"lease_epoch": epoch, "updated_at": now})
 	if result.Error != nil || result.RowsAffected != 1 {
 		return time.Time{}, cloudTransferError(nodeprotocol.ErrorPlanConflict, false, firstNonNil(result.Error, gorm.ErrRecordNotFound))
 	}
 	record.LeaseEpoch = epoch
+	remote, err := client.RenewOperationLease(ctx, record.OperationKey, nodeprotocol.LeaseRequest{PlanDigest: record.PlanDigest, LeaseEpoch: epoch, LeaseExpiresAt: expiresAt})
+	if err != nil {
+		return time.Time{}, remoteUploadClientError(err)
+	}
+	if err := validateRemoteOperationResponse(remote, *record); err != nil {
+		return time.Time{}, err
+	}
 	if err := w.persistRemoteOperationResponse(ctx, *record, remote); err != nil {
 		return time.Time{}, err
 	}
@@ -496,7 +574,17 @@ func (w *TransferWorker) renewRemoteUploadOperation(ctx context.Context, client 
 }
 
 func validateRemoteOperationResponse(response nodeprotocol.OperationResponse, record models.RemoteOperation) error {
-	if response.OperationKey != record.OperationKey || response.PlanDigest != record.PlanDigest || response.LeaseEpoch == 0 || response.Revision == 0 || response.Status != nodeprotocol.OperationCompleted && response.LeaseEpoch < record.LeaseEpoch {
+	if err := validateRemoteOperationIdentity(response, record); err != nil {
+		return err
+	}
+	if response.Status != nodeprotocol.OperationCompleted && response.LeaseEpoch != record.LeaseEpoch {
+		return cloudTransferError(nodeprotocol.ErrorPlanConflict, false, nil)
+	}
+	return nil
+}
+
+func validateRemoteOperationIdentity(response nodeprotocol.OperationResponse, record models.RemoteOperation) error {
+	if response.OperationKey != record.OperationKey || response.PlanDigest != record.PlanDigest || response.LeaseEpoch == 0 || response.Revision == 0 {
 		return cloudTransferError(nodeprotocol.ErrorPlanConflict, false, nil)
 	}
 	return nil
@@ -508,7 +596,7 @@ func (w *TransferWorker) persistRemoteOperationResponse(ctx context.Context, rec
 
 func (w *TransferWorker) persistRemoteOperationState(ctx context.Context, record models.RemoteOperation, status, phase, errorCode string, progress *float64) error {
 	updates := map[string]any{"status": status, "phase": phase, "progress": progress, "error_code": safeLabel(errorCode, 96), "updated_at": time.Now().UTC()}
-	result := w.service.db.WithContext(ctx).Model(&models.RemoteOperation{}).Where("id = ? AND operation_key = ? AND plan_digest = ?", record.ID, record.OperationKey, record.PlanDigest).Updates(updates)
+	result := fenceRemoteUploadClaim(w.service.db.WithContext(ctx).Model(&models.RemoteOperation{}).Where("id=? AND operation_key=? AND plan_digest=? AND lease_epoch=? AND (status<>? OR ?=?)", record.ID, record.OperationKey, record.PlanDigest, record.LeaseEpoch, nodeprotocol.OperationCompleted, status, nodeprotocol.OperationCompleted), ctx).Updates(updates)
 	if result.Error != nil || result.RowsAffected != 1 {
 		return cloudTransferError("transfer_state_persist_failed", true, firstNonNil(result.Error, gorm.ErrRecordNotFound))
 	}
@@ -569,7 +657,7 @@ func (w *TransferWorker) applyRemoteUploadResponse(ctx context.Context, task *mo
 			continue
 		}
 		now := time.Now().UTC()
-		result := w.service.db.WithContext(ctx).Model(&models.RemoteUploadFile{}).Where("id = ? AND transfer_task_id = ? AND source_file_token = ? AND status NOT IN ?", row.ID, task.ID, row.SourceFileToken, []string{nodeprotocol.StorageFileCompleted, nodeprotocol.StorageFileReused, nodeprotocol.StorageFileSkipped}).Updates(map[string]any{"status": file.Status, "target_parent_id": file.TargetParentID, "target_item_id": file.TargetItemID, "target_sha1": strings.ToUpper(file.SHA1), "target_digest_json": digestJSON, "updated_at": now})
+		result := fenceRemoteUploadClaim(w.service.db.WithContext(ctx).Model(&models.RemoteUploadFile{}).Where("id = ? AND transfer_task_id = ? AND source_file_token = ? AND status NOT IN ?", row.ID, task.ID, row.SourceFileToken, []string{nodeprotocol.StorageFileCompleted, nodeprotocol.StorageFileReused, nodeprotocol.StorageFileSkipped}), ctx).Updates(map[string]any{"status": file.Status, "target_parent_id": file.TargetParentID, "target_item_id": file.TargetItemID, "target_sha1": strings.ToUpper(file.SHA1), "target_digest_json": digestJSON, "updated_at": now})
 		if result.Error != nil || result.RowsAffected != 1 {
 			return cloudTransferError("transfer_state_persist_failed", true, firstNonNil(result.Error, gorm.ErrRecordNotFound))
 		}
@@ -595,6 +683,10 @@ func (w *TransferWorker) applyRemoteUploadResponse(ctx context.Context, task *mo
 }
 
 func (w *TransferWorker) persistRemoteUploadProgress(ctx context.Context, task *models.TransferTask, rows []models.RemoteUploadFile, phase string) error {
+	// Build from durable monotonic file facts, not an earlier poll's copy.
+	if err := w.service.db.WithContext(ctx).Where("transfer_task_id=?", task.ID).Order("ordinal").Find(&rows).Error; err != nil {
+		return err
+	}
 	summary, err := remoteUploadPlanSummary(rows)
 	if err != nil {
 		return err
@@ -604,11 +696,15 @@ func (w *TransferWorker) persistRemoteUploadProgress(ctx context.Context, task *
 		return err
 	}
 	processed := remoteUploadTerminalCount(rows)
-	result := w.service.db.WithContext(ctx).Model(&models.TransferTask{}).Where("id = ?", task.ID).Updates(map[string]any{"phase": phase, "processed_files": processed, "total_files": len(rows), "plan_summary_json": encoded, "updated_at": time.Now().UTC()})
+	result := fenceRemoteUploadClaim(w.service.db.WithContext(ctx).Model(&models.TransferTask{}).Where("id=? AND job_id=? AND history_cleared_at IS NULL", task.ID, task.JobID), ctx).Updates(map[string]any{"phase": gorm.Expr("CASE WHEN phase=? THEN phase ELSE ? END", models.TransferTaskStatusCompleted, phase), "processed_files": gorm.Expr("MAX(processed_files,?)", processed), "total_files": len(rows), "plan_summary_json": encoded, "updated_at": time.Now().UTC()})
 	if result.Error != nil || result.RowsAffected != 1 {
 		return firstNonNil(result.Error, gorm.ErrRecordNotFound)
 	}
-	task.Phase, task.ProcessedFiles, task.TotalFiles, task.PlanSummaryJSON = phase, processed, len(rows), encoded
+	var current models.TransferTask
+	if err := w.service.db.WithContext(ctx).Select("phase", "processed_files").First(&current, "id=?", task.ID).Error; err != nil {
+		return err
+	}
+	task.Phase, task.ProcessedFiles, task.TotalFiles, task.PlanSummaryJSON = current.Phase, current.ProcessedFiles, len(rows), encoded
 	return nil
 }
 
@@ -703,6 +799,9 @@ func (w *TransferWorker) refreshRemoteUploadExport(ctx context.Context, task *mo
 	if manifest.RemoteExportExpiresAt != nil && manifest.RemoteExportExpiresAt.After(time.Now().UTC().Add(2*time.Minute)) {
 		return nil
 	}
+	if err := assertRemoteUploadClaimTx(w.service.db.WithContext(ctx), ctx); err != nil {
+		return err
+	}
 	refreshed, err := w.service.downloader.refreshRemoteFileExport(ctx, download)
 	if err != nil {
 		return err
@@ -715,7 +814,7 @@ func (w *TransferWorker) refreshRemoteUploadExport(ctx context.Context, task *mo
 	if err != nil || len(encoded) > nodeprotocol.MaxWireBodyBytes {
 		return cloudTransferError("node_file_export_invalid", false, err)
 	}
-	if result := w.service.db.WithContext(ctx).Model(&models.TransferTask{}).Where("id = ?", task.ID).Updates(map[string]any{"manifest_json": string(encoded), "updated_at": time.Now().UTC()}); result.Error != nil || result.RowsAffected != 1 {
+	if result := fenceRemoteUploadClaim(w.service.db.WithContext(ctx).Model(&models.TransferTask{}).Where("id = ?", task.ID), ctx).Updates(map[string]any{"manifest_json": string(encoded), "updated_at": time.Now().UTC()}); result.Error != nil || result.RowsAffected != 1 {
 		return cloudTransferError("transfer_state_persist_failed", true, firstNonNil(result.Error, gorm.ErrRecordNotFound))
 	}
 	task.ManifestJSON = string(encoded)
