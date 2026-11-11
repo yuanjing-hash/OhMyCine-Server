@@ -199,7 +199,11 @@ func TestRemoteUploadLeaseRenewalCanRetryAfterNetworkFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	execution := &retryRenewRemoteUploadClient{fail: true, operation: &nodeprotocol.OperationResponse{OperationKey: existing.OperationKey, PlanDigest: existing.PlanDigest, LeaseEpoch: existing.LeaseEpoch, Revision: 1, Status: nodeprotocol.OperationRunning}}
-	err = worker.executeRemoteUploadBatch(context.Background(), nil, execution, models.TransferNode{ID: nodeID}, models.Storage{}, &models.TransferTask{ID: transferID}, models.DownloadTask{ID: downloadID}, nil, remoteUploadBatch{plan: payload}, nil)
+	retainedJob, err := queue.Enqueue(EnqueueJobInput{OwnerID: actor.User.ID, JobType: "transfer", DisplayName: "retained upload", Payload: map[string]any{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = worker.executeRemoteUploadBatch(context.Background(), nil, execution, models.TransferNode{ID: nodeID}, models.Storage{}, &models.TransferTask{ID: transferID, JobID: retainedJob.ID}, models.DownloadTask{ID: downloadID}, nil, remoteUploadBatch{plan: payload}, nil)
 	if err == nil || len(execution.renewals) != 1 || execution.renewals[0].LeaseEpoch != existing.LeaseEpoch+1 {
 		t.Fatalf("reserved successor rejected the existing Node epoch before renewal: renewals=%+v err=%v", execution.renewals, err)
 	}

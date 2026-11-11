@@ -107,6 +107,9 @@ func (s *Store) migrate(ctx context.Context) error {
 			`CREATE UNIQUE INDEX idx_managed_group_provider ON managed_download_groups(paired_server_id,downloader_id,provider_task_id) WHERE provider_task_id<>'' AND cleanup_state<>'completed'`,
 			`CREATE TABLE managed_download_group_refs(paired_server_id TEXT NOT NULL,downloader_id TEXT NOT NULL,task_id TEXT NOT NULL,group_id TEXT NOT NULL,binding_json TEXT NOT NULL,node_local_root TEXT NOT NULL,PRIMARY KEY(paired_server_id,downloader_id,task_id))`,
 		}},
+		{11, []string{
+			`ALTER TABLE operations ADD COLUMN superseded_by TEXT NOT NULL DEFAULT ''`,
+		}},
 	}
 	for _, migration := range migrations {
 		var applied int
@@ -454,9 +457,9 @@ func (s *Store) OperationTaskMatches(ctx context.Context, serverID, key, taskID 
 // persisted lease is valid. Callers use it immediately before starting each
 // privileged provider mutation instead of trusting a previously decoded plan.
 func (s *Store) ActiveOperationPlan(ctx context.Context, serverID, key, digest string, now time.Time) (nodeprotocol.OperationPlan, error) {
-	var raw, storedDigest, storedServer, status string
+	var raw, storedDigest, storedServer, status, superseded string
 	var leaseExpiresAt time.Time
-	err := s.db.QueryRowContext(ctx, `SELECT paired_server_id,plan_digest,plan_json,status,lease_expires_at FROM operations WHERE operation_key=?`, key).Scan(&storedServer, &storedDigest, &raw, &status, &leaseExpiresAt)
+	err := s.db.QueryRowContext(ctx, `SELECT paired_server_id,plan_digest,plan_json,status,lease_expires_at,superseded_by FROM operations WHERE operation_key=?`, key).Scan(&storedServer, &storedDigest, &raw, &status, &leaseExpiresAt, &superseded)
 	if errors.Is(err, sql.ErrNoRows) || err == nil && storedServer != serverID {
 		return nodeprotocol.OperationPlan{}, ErrOperationNotFound
 	}
@@ -466,7 +469,7 @@ func (s *Store) ActiveOperationPlan(ctx context.Context, serverID, key, digest s
 	if storedDigest != digest {
 		return nodeprotocol.OperationPlan{}, ErrPlanConflict
 	}
-	if !leaseExpiresAt.After(now) || status == nodeprotocol.OperationCompleted || status == nodeprotocol.OperationFailed || status == nodeprotocol.OperationCancelled {
+	if superseded != "" || !leaseExpiresAt.After(now) || status == nodeprotocol.OperationCompleted || status == nodeprotocol.OperationFailed || status == nodeprotocol.OperationCancelled {
 		return nodeprotocol.OperationPlan{}, ErrLeaseConflict
 	}
 	var plan nodeprotocol.OperationPlan
@@ -539,7 +542,7 @@ func (s *Store) RenewLease(ctx context.Context, serverID, key, digest string, ep
 	if epoch == 0 || expiresAt.IsZero() || expiresAt.After(now.Add(15*time.Minute)) {
 		return nodeprotocol.OperationResponse{}, ErrLeaseConflict
 	}
-	result, err := s.db.ExecContext(ctx, `UPDATE operations SET lease_epoch=?,lease_expires_at=?,revision=revision+1,updated_at=? WHERE operation_key=? AND paired_server_id=? AND plan_digest=? AND lease_epoch<=? AND status NOT IN (?,?,?)`, epoch, expiresAt.UTC(), now.UTC(), key, serverID, digest, epoch, nodeprotocol.OperationCompleted, nodeprotocol.OperationFailed, nodeprotocol.OperationCancelled)
+	result, err := s.db.ExecContext(ctx, `UPDATE operations SET lease_epoch=?,lease_expires_at=?,revision=revision+1,updated_at=? WHERE operation_key=? AND paired_server_id=? AND plan_digest=? AND lease_epoch<=? AND superseded_by='' AND status NOT IN (?,?,?)`, epoch, expiresAt.UTC(), now.UTC(), key, serverID, digest, epoch, nodeprotocol.OperationCompleted, nodeprotocol.OperationFailed, nodeprotocol.OperationCancelled)
 	if err != nil {
 		return nodeprotocol.OperationResponse{}, err
 	}
@@ -561,6 +564,13 @@ func (s *Store) StopLease(ctx context.Context, serverID, key string, input nodep
 	if input.Cancel {
 		query = `UPDATE operations SET status=?,phase=?,lease_expires_at=?,revision=revision+1,updated_at=? WHERE operation_key=? AND paired_server_id=? AND plan_digest=? AND lease_epoch=? AND status NOT IN (?,?,?)`
 		args = append([]any{nodeprotocol.OperationCancelled, nodeprotocol.OperationCancelled}, args...)
+	}
+	if input.SealUploadRetry {
+		if input.Cancel {
+			return nodeprotocol.OperationResponse{}, ErrLeaseConflict
+		}
+		query = `UPDATE operations SET superseded_by=?,lease_expires_at=?,revision=revision+1,updated_at=? WHERE operation_key=? AND paired_server_id=? AND plan_digest=? AND lease_epoch=? AND kind=? AND superseded_by IN ('',?) AND status NOT IN (?,?,?)`
+		args = []any{storageUploadRetrySealed, now.UTC(), now.UTC(), key, serverID, input.PlanDigest, input.LeaseEpoch, nodeprotocol.OperationKindStorageUpload, storageUploadRetrySealed, nodeprotocol.OperationCompleted, nodeprotocol.OperationFailed, nodeprotocol.OperationCancelled}
 	}
 	result, err := s.db.ExecContext(ctx, query, args...)
 	if err != nil {

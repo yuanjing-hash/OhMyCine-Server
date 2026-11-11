@@ -53,6 +53,7 @@ type StorageCredential struct {
 // StorageUploadPlan is immutable operation payload. All names and conflict
 // decisions are made by the Server; the Node only executes these exact paths.
 type StorageUploadPlan struct {
+	RetryOf                  *StorageUploadRetry `json:"retry_of,omitempty"`
 	DigestVersion            int                 `json:"digest_version,omitempty"`
 	StorageID                string              `json:"storage_id"`
 	ProviderType             string              `json:"provider_type"`
@@ -61,6 +62,20 @@ type StorageUploadPlan struct {
 	TargetRootID             string              `json:"target_root_id"`
 	TargetRootRelativePath   string              `json:"target_root_relative_path,omitempty"`
 	Files                    []StorageUploadFile `json:"files"`
+}
+
+// A new write attempt exists only after a durable, explicit Server job action.
+// The old operation and all its receipts remain independently addressable.
+type StorageUploadRetry struct {
+	OperationKey  string `json:"operation_key"`
+	PlanDigest    string `json:"plan_digest"`
+	ActionVersion uint64 `json:"action_version"`
+}
+
+func StorageUploadRetryKey(previous string, version uint64) string {
+	raw, _ := json.Marshal([]any{"storage-upload-retry-v1", previous, version})
+	digest := sha256.Sum256(raw)
+	return "storage:retry:" + hex.EncodeToString(digest[:20])
 }
 
 type StorageUploadFile struct {
@@ -82,17 +97,19 @@ type StorageActionRequest struct {
 }
 
 type StorageUploadFileResult struct {
-	SourceFileToken string         `json:"source_file_token"`
-	TargetParentID  string         `json:"target_parent_id,omitempty"`
-	TargetName      string         `json:"target_name,omitempty"`
-	TargetItemID    string         `json:"target_item_id,omitempty"`
-	Status          string         `json:"status"`
-	Size            int64          `json:"size"`
-	SHA1            string         `json:"sha1,omitempty"`
-	ContentDigest   *ContentDigest `json:"content_digest,omitempty"`
+	TargetCheck     *StorageTargetCheck `json:"-"`
+	SourceFileToken string              `json:"source_file_token"`
+	TargetParentID  string              `json:"target_parent_id,omitempty"`
+	TargetName      string              `json:"target_name,omitempty"`
+	TargetItemID    string              `json:"target_item_id,omitempty"`
+	Status          string              `json:"status"`
+	Size            int64               `json:"size"`
+	SHA1            string              `json:"sha1,omitempty"`
+	ContentDigest   *ContentDigest      `json:"content_digest,omitempty"`
 }
 
 type StorageActionResponse struct {
+	TargetCheck     *StorageTargetCheck       `json:"target_check,omitempty"`
 	ExecutionActive *bool                     `json:"execution_active,omitempty"`
 	Phase           string                    `json:"phase,omitempty"`
 	UploadProgress  *StorageUploadProgress    `json:"upload_progress,omitempty"`
@@ -104,6 +121,34 @@ type StorageActionResponse struct {
 	CompletedFiles  int                       `json:"completed_files"`
 	Files           []StorageUploadFileResult `json:"files,omitempty"`
 	ErrorCode       string                    `json:"error_code,omitempty"`
+}
+
+// StorageTargetCheck contains only bounded read facts, never provider IDs,
+// names, paths or credentials. It is evidence, not permission to submit again.
+type StorageTargetCheck struct {
+	Version          int    `json:"version"`
+	Reason           string `json:"reason"`
+	Complete         bool   `json:"complete"`
+	NameMatches      *int   `json:"name_matches,omitempty"`
+	SizeMatches      *int   `json:"size_matches,omitempty"`
+	IdenticalMatches *int   `json:"identical_matches,omitempty"`
+}
+
+func (check StorageTargetCheck) Valid() bool {
+	if check.Version != 1 {
+		return false
+	}
+	switch check.Reason {
+	case "parent_unresolved", "listing_incomplete", "target_missing", "digest_missing", "digest_mismatch", "multiple_matches", "target_verified":
+	default:
+		return false
+	}
+	for _, count := range []*int{check.NameMatches, check.SizeMatches, check.IdenticalMatches} {
+		if count != nil && (*count < 0 || *count > 10000) {
+			return false
+		}
+	}
+	return true
 }
 
 type StorageUploadProgress struct {
@@ -136,6 +181,9 @@ func (progress *StorageUploadProgress) UnmarshalJSON(raw []byte) error {
 func (progress StorageUploadProgress) HasMeasurements() bool { return !progress.invalid }
 
 func (plan StorageUploadPlan) Validate() error {
+	if plan.RetryOf != nil && (!validID(plan.RetryOf.OperationKey) || !ValidDigest(plan.RetryOf.PlanDigest) || plan.RetryOf.ActionVersion == 0) {
+		return errors.New("node_storage_retry_invalid")
+	}
 	if plan.ProviderType == StorageProviderQuark {
 		if plan.DigestVersion != 2 || plan.TargetRootRelativePath != "" && !ValidStorageDirectoryRelativePath(plan.TargetRootRelativePath) {
 			return errors.New("node_storage_digest_version_invalid")

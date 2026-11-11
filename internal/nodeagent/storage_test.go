@@ -30,13 +30,15 @@ import (
 )
 
 type fakeStorageDriver struct {
-	mu          sync.Mutex
-	before      func(context.Context) error
-	items       map[string]cloud.Item
-	children    map[string][]string
-	next        int
-	uploadGate  func(context.Context) error
-	uploadCalls int
+	mu                sync.Mutex
+	before            func(context.Context) error
+	items             map[string]cloud.Item
+	children          map[string][]string
+	next              int
+	uploadGate        func(context.Context) error
+	uploadCalls       int
+	omitListSHA1      bool
+	invalidPageParent string
 }
 
 func newFakeStorageDriver(before func(context.Context) error) *fakeStorageDriver {
@@ -85,9 +87,17 @@ func (driver *fakeStorageDriver) List(ctx context.Context, parentID string, page
 	end := min(len(ids), start+int(page.Limit))
 	items := make([]cloud.Item, 0, end-start)
 	for _, id := range ids[start:end] {
-		items = append(items, driver.items[id])
+		item := driver.items[id]
+		if driver.omitListSHA1 {
+			item.SHA1 = ""
+		}
+		items = append(items, item)
 	}
-	return cloud.Page{Items: items, Offset: page.Offset, HasMore: end < len(ids)}, nil
+	offset := page.Offset
+	if parentID == driver.invalidPageParent {
+		offset++
+	}
+	return cloud.Page{Items: items, Offset: offset, HasMore: end < len(ids)}, nil
 }
 func (driver *fakeStorageDriver) CreateDirectory(ctx context.Context, parentID, name string) (cloud.Item, error) {
 	if err := driver.check(ctx); err != nil {
@@ -380,9 +390,12 @@ func TestStorageUploadRunsInBackgroundPersistsCheckpointAndReusesReceipt(t *test
 	do(testServer.URL+"/node/v1/operations/upload-2/stop", http.MethodPost, stop, http.StatusConflict)
 	fake.uploadGate = nil
 	action.GrantID = grant.GrantID
+	if err := os.Rename(sourcePath, sourcePath+".held"); err != nil {
+		t.Fatal(err)
+	}
 	do(testServer.URL+"/node/v1/storage/actions", http.MethodPost, action, http.StatusAccepted)
 	unknown := waitStorageReceiptCode(t, agent, store, "request-2", nodeprotocol.ErrorReconciliationNeeded)
-	if fake.uploadCalls != 1 {
+	if fake.uploadCalls != 1 || unknown.TargetCheck == nil || unknown.TargetCheck.Reason != "target_missing" || !unknown.TargetCheck.Complete {
 		t.Fatal("uncertain upload was blindly resubmitted")
 	}
 	// The original provider result becomes visible later. Only the matching
@@ -391,15 +404,94 @@ func TestStorageUploadRunsInBackgroundPersistsCheckpointAndReusesReceipt(t *test
 		t.Fatal("lost original target scope")
 	}
 	parent := unknown.Files[0].TargetParentID
+	fake.invalidPageParent = parent
+	do(testServer.URL+"/node/v1/storage/actions", http.MethodPost, action, http.StatusAccepted)
+	partial := waitStorageReceiptCode(t, agent, store, "request-2", nodeprotocol.ErrorReconciliationNeeded)
+	if partial.TargetCheck == nil || partial.TargetCheck.Complete || partial.TargetCheck.Reason != "listing_incomplete" || fake.uploadCalls != 1 {
+		t.Fatal("invalid pagination became a complete absence proof")
+	}
+	fake.invalidPageParent = ""
 	digestBody := sha1.Sum(sourceBody)
 	fake.mu.Lock()
 	fake.items["late-original-output"] = cloud.Item{ID: "late-original-output", ParentID: parent, Name: "Episode 02.mkv", Size: int64(len(sourceBody)), SHA1: strings.ToUpper(hex.EncodeToString(digestBody[:]))}
 	fake.children[parent] = append(fake.children[parent], "late-original-output")
+	fake.omitListSHA1 = true // production lists may omit it; Stat supplies the fact
 	fake.mu.Unlock()
 	do(testServer.URL+"/node/v1/storage/actions", http.MethodPost, action, http.StatusAccepted)
 	resumed := waitStorageReceipt(t, store, "request-2")
-	if resumed.Status != nodeprotocol.StorageActionCompleted || fake.uploadCalls != 1 {
+	if resumed.Status != nodeprotocol.StorageActionCompleted || fake.uploadCalls != 1 || resumed.TargetCheck == nil || resumed.TargetCheck.Reason != "target_verified" || resumed.TargetCheck.IdenticalMatches == nil || *resumed.TargetCheck.IdenticalMatches != 1 {
 		t.Fatalf("same request did not resume exactly once: %+v calls=%d", resumed, fake.uploadCalls)
+	}
+	if err := os.Rename(sourcePath+".held", sourcePath); err != nil {
+		t.Fatal(err)
+	}
+	// A genuinely unresolved third output requires an explicit linked attempt.
+	// Retained same-operation reads cannot turn an empty list into a new upload.
+	uploadPlan.Files[0].TargetRelativePath = "TV/Season 01/Episode 03.mkv"
+	payload, _ = json.Marshal(uploadPlan)
+	operation.OperationKey, operation.Payload = "upload-3", payload
+	planDigest, _ = operation.Digest()
+	if _, _, err := store.Put(context.Background(), "server-1", planDigest, operation, agent.now()); err != nil {
+		t.Fatal(err)
+	}
+	grant.GrantID, grant.OperationKey = "grant-3", "upload-3"
+	envelope, err = nodeprotocol.SealCredentialGrant(agent.sealingPublicKey, grant, agent.now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveCredentialGrant(context.Background(), "server-1", envelope, agent.now()); err != nil {
+		t.Fatal(err)
+	}
+	action.RequestID, action.OperationKey, action.PlanDigest, action.GrantID = "request-3", "upload-3", planDigest, grant.GrantID
+	fake.uploadGate = func(context.Context) error { return errors.New(nodeprotocol.ErrorReconciliationNeeded) }
+	do(testServer.URL+"/node/v1/storage/actions", http.MethodPost, action, http.StatusAccepted)
+	waitStorageReceiptCode(t, agent, store, "request-3", nodeprotocol.ErrorReconciliationNeeded)
+	seal := nodeprotocol.OperationStopRequest{PlanDigest: planDigest, LeaseEpoch: 1, SealUploadRetry: true}
+	do(testServer.URL+"/node/v1/operations/upload-3/stop", http.MethodPost, seal, http.StatusOK)
+	do(testServer.URL+"/node/v1/operations/upload-3/lease", http.MethodPost, nodeprotocol.LeaseRequest{PlanDigest: planDigest, LeaseEpoch: 2, LeaseExpiresAt: now.Add(5 * time.Minute)}, http.StatusConflict)
+	do(testServer.URL+"/node/v1/storage/actions", http.MethodPost, action, http.StatusConflict)
+	previous := nodeprotocol.StorageUploadRetry{OperationKey: operation.OperationKey, PlanDigest: planDigest, ActionVersion: 7}
+	uploadPlan.RetryOf = &previous
+	payload, _ = json.Marshal(uploadPlan)
+	operation.OperationKey, operation.Payload = nodeprotocol.StorageUploadRetryKey(previous.OperationKey, previous.ActionVersion), payload
+	childDigest, _ := operation.Digest()
+	if _, _, err := store.Put(context.Background(), "server-1", childDigest, operation, agent.now()); err != nil {
+		t.Fatal(err)
+	}
+	grant.GrantID, grant.OperationKey = "grant-child", operation.OperationKey
+	envelope, err = nodeprotocol.SealCredentialGrant(agent.sealingPublicKey, grant, agent.now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveCredentialGrant(context.Background(), "server-1", envelope, agent.now()); err != nil {
+		t.Fatal(err)
+	}
+	child := action
+	child.RequestID, child.OperationKey, child.PlanDigest, child.GrantID = operation.OperationKey, operation.OperationKey, childDigest, grant.GrantID
+	fake.uploadGate = nil
+	corrupt := append([]byte(nil), sourceBody...)
+	corrupt[0] ^= 1
+	if err := os.WriteFile(sourcePath, corrupt, 0600); err != nil {
+		t.Fatal(err)
+	}
+	do(testServer.URL+"/node/v1/storage/actions", http.MethodPost, child, http.StatusAccepted)
+	waitStorageReceiptCode(t, agent, store, child.RequestID, nodeprotocol.ErrorChecksumMismatch)
+	if fake.uploadCalls != 1 {
+		t.Fatal("new body accepted an unverified changed source")
+	}
+	if err := os.WriteFile(sourcePath, sourceBody, 0600); err != nil {
+		t.Fatal(err)
+	}
+	do(testServer.URL+"/node/v1/storage/actions", http.MethodPost, child, http.StatusAccepted)
+	finished := waitStorageReceipt(t, store, child.RequestID)
+	if finished.Status != nodeprotocol.StorageActionCompleted || fake.uploadCalls != 2 {
+		t.Fatalf("linked attempt did not complete once: %+v calls=%d", finished, fake.uploadCalls)
+	}
+	do(testServer.URL+"/node/v1/storage/actions", http.MethodPost, child, http.StatusOK)
+	prior, err := store.StorageUploadCheckpoint(context.Background(), "upload-3", file.FileToken)
+	var successor string
+	if err != nil || prior.Status != nodeprotocol.StorageFileReconciling || store.db.QueryRow(`SELECT superseded_by FROM operations WHERE operation_key='upload-3'`).Scan(&successor) != nil || successor != child.OperationKey || fake.uploadCalls != 2 {
+		t.Fatal("explicit retry lost predecessor or submitted twice")
 	}
 }
 

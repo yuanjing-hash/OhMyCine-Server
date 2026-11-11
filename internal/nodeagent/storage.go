@@ -112,7 +112,11 @@ func (a *Agent) storageAction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	started := a.startStorageUpload(serverID, input, uploadPlan, grant, credential)
+	started, err := a.startStorageUpload(serverID, input, uploadPlan, grant, credential)
+	if err != nil {
+		writeStorageError(w, err)
+		return
+	}
 	if started && response.Status == nodeprotocol.StorageActionAccepted {
 		response.Status = nodeprotocol.StorageActionRunning
 	}
@@ -202,14 +206,24 @@ func (a *Agent) storageCredential(ctx context.Context, serverID string, input no
 	return grant, credential, nil
 }
 
-func (a *Agent) startStorageUpload(serverID string, input nodeprotocol.StorageActionRequest, plan nodeprotocol.StorageUploadPlan, grant nodeprotocol.CredentialGrant, credential nodeprotocol.StorageCredential) bool {
+func (a *Agent) startStorageUpload(serverID string, input nodeprotocol.StorageActionRequest, plan nodeprotocol.StorageUploadPlan, grant nodeprotocol.CredentialGrant, credential nodeprotocol.StorageCredential) (bool, error) {
 	a.storageMu.Lock()
+	defer a.storageMu.Unlock()
 	if _, running := a.storageRuns[input.OperationKey]; running {
-		a.storageMu.Unlock()
-		return false
+		return false, nil
+	}
+	if _, err := a.store.ActiveOperationPlan(context.Background(), serverID, input.OperationKey, input.PlanDigest, a.now()); err != nil {
+		return false, err
+	}
+	if plan.RetryOf != nil {
+		if _, running := a.storageRuns[plan.RetryOf.OperationKey]; running {
+			return false, ErrLeaseConflict
+		}
+		if err := a.store.AcceptStorageUploadRetry(context.Background(), serverID, input, plan, a.now()); err != nil {
+			return false, err
+		}
 	}
 	a.storageRuns[input.OperationKey] = struct{}{}
-	a.storageMu.Unlock()
 	go func() {
 		defer func() {
 			a.storageMu.Lock()
@@ -219,7 +233,7 @@ func (a *Agent) startStorageUpload(serverID string, input nodeprotocol.StorageAc
 		defer a.finishStorageExecution(serverID, input)
 		a.runStorageUpload(context.Background(), serverID, input, plan, grant, credential)
 	}()
-	return true
+	return true, nil
 }
 
 func (a *Agent) runStorageUpload(ctx context.Context, serverID string, input nodeprotocol.StorageActionRequest, plan nodeprotocol.StorageUploadPlan, grant nodeprotocol.CredentialGrant, credential nodeprotocol.StorageCredential) {
@@ -285,6 +299,7 @@ func (a *Agent) runStorageUpload(ctx context.Context, serverID string, input nod
 		observe := a.storageUploadObserver(ctx, serverID, input, plan, &response)
 		fileCtx := context.WithValue(ctx, storageUploadProgressKey{}, observe)
 		result, err := a.uploadStorageFile(fileCtx, serverID, input, plan, filePlan, driver, guard)
+		response.TargetCheck = result.TargetCheck
 		if err != nil {
 			response.Files = append(response.Files, result)
 			a.pauseStorageUpload(ctx, serverID, input, response, err)
@@ -347,6 +362,51 @@ func (a *Agent) uploadStorageFile(ctx context.Context, serverID string, input no
 		result.TargetParentID = checkpoint.TargetParentID
 		return result, nil
 	}
+	if checkpoint.Status == nodeprotocol.StorageFileUploading || checkpoint.Status == nodeprotocol.StorageFileReconciling {
+		// This SHA1 was recorded only after the original source SHA256 matched
+		// this immutable plan/token/size. Target-only queries do not read source
+		// bytes again and never turn absence into another upload.
+		parentID, identical, check, inspectErr := inspectStorageCheckpoint(ctx, driver, plan, filePlan, checkpoint)
+		result.TargetParentID, result.TargetCheck = parentID, check
+		if inspectErr != nil {
+			return result, inspectErr
+		}
+		if check.Reason == "target_verified" {
+			confirmed, err := a.finishStorageFile(ctx, input, filePlan, identical[0], parentID, checkpoint.TargetSHA1, nodeprotocol.StorageFileCompleted)
+			if err != nil {
+				return result, err
+			}
+			confirmed.TargetCheck = check
+			return confirmed, nil
+		}
+		return result, errors.New(nodeprotocol.ErrorReconciliationNeeded)
+	}
+	if plan.RetryOf != nil {
+		previous, readErr := a.store.StorageUploadCheckpoint(ctx, plan.RetryOf.OperationKey, filePlan.SourceFileToken)
+		if readErr != nil && !errors.Is(readErr, ErrOperationNotFound) {
+			return result, readErr
+		}
+		if readErr == nil && (previous.PlanDigest != plan.RetryOf.PlanDigest || previous.Size != filePlan.Size) {
+			return result, ErrPlanConflict
+		}
+		if readErr == nil && (previous.Status == nodeprotocol.StorageFileUploading || previous.Status == nodeprotocol.StorageFileReconciling || previous.Status == nodeprotocol.StorageFileCompleted || previous.Status == nodeprotocol.StorageFileReused) {
+			parent, identical, check, err := inspectStorageCheckpoint(ctx, driver, plan, filePlan, previous)
+			result.TargetParentID, result.TargetCheck = parent, check
+			if err != nil || !check.Complete || check.Reason == "multiple_matches" {
+				return result, errors.New(nodeprotocol.ErrorReconciliationNeeded)
+			}
+			if check.Reason == "target_verified" {
+				confirmed, err := a.finishStorageFile(ctx, input, filePlan, identical[0], parent, previous.TargetSHA1, nodeprotocol.StorageFileReused)
+				if err != nil {
+					return result, err
+				}
+				confirmed.TargetCheck = check
+				return confirmed, nil
+			}
+			// Only this explicitly linked new attempt may continue to source
+			// verification. The old checkpoint remains permanently unchanged.
+		}
+	}
 
 	source, err := a.store.FileExportRangeFile(ctx, serverID, plan.SourceExportOperationKey, input.TaskID, filePlan.SourceFileToken, a.now())
 	if err != nil || source.Size != filePlan.Size || source.SHA256 != filePlan.SHA256 {
@@ -364,22 +424,16 @@ func (a *Agent) uploadStorageFile(ctx context.Context, serverID string, input no
 	}
 
 	reportStorageUploadPhase(ctx, nodeprotocol.PhaseVerifyingTarget)
+	result.TargetCheck = &nodeprotocol.StorageTargetCheck{Version: 1, Reason: "parent_unresolved"}
 	parentID, err := ensureStorageParent(ctx, driver, plan.TargetRootID, path.Dir(filePlan.TargetRelativePath), guard)
 	if err != nil {
 		return result, err
 	}
 	result.TargetParentID = parentID
-	existing, err := listStorageName(ctx, driver, parentID, result.TargetName)
+	existing, identical, check, err := inspectStorageTarget(ctx, driver, parentID, result.TargetName, filePlan.Size, sha1Digest)
+	result.TargetCheck = check
 	if err != nil {
 		return result, err
-	}
-	identical := identicalStorageItems(existing, filePlan.Size, sha1Digest)
-	if checkpoint.Status == nodeprotocol.StorageFileUploading || checkpoint.Status == nodeprotocol.StorageFileReconciling {
-		if len(identical) == 1 {
-			return a.finishStorageFile(ctx, input, filePlan, identical[0], parentID, sha1Digest, nodeprotocol.StorageFileCompleted)
-		}
-		_ = a.store.UpdateStorageUploadFile(ctx, input.OperationKey, filePlan.SourceFileToken, input.PlanDigest, nodeprotocol.StorageFileReconciling, parentID, "", sha1Digest, a.now())
-		return result, errors.New(nodeprotocol.ErrorReconciliationNeeded)
 	}
 	if len(existing) > 0 {
 		switch filePlan.ConflictAction {
@@ -535,15 +589,100 @@ func ensureStorageParent(ctx context.Context, driver storageUploadDriver, rootID
 	return parentID, nil
 }
 
+// Read-only counterpart of ensureStorageParent. Reconciliation never creates a
+// replacement directory or discards its retained physical parent identity.
+func findStorageParent(ctx context.Context, driver storageUploadDriver, rootID, directory string) (string, error) {
+	parent := rootID
+	if directory == "." {
+		return parent, nil
+	}
+	for _, segment := range strings.Split(directory, "/") {
+		items, err := listStorageName(ctx, driver, parent, segment)
+		if err != nil || len(items) != 1 || !items[0].IsDir || items[0].ID == "" {
+			return "", errors.New(nodeprotocol.ErrorReconciliationNeeded)
+		}
+		parent = items[0].ID
+	}
+	return parent, nil
+}
+
+func inspectStorageTarget(ctx context.Context, driver storageUploadDriver, parent, name string, size int64, sha1Digest string) ([]cloud.Item, []cloud.Item, *nodeprotocol.StorageTargetCheck, error) {
+	check := &nodeprotocol.StorageTargetCheck{Version: 1, Reason: "listing_incomplete"}
+	items, err := listStorageName(ctx, driver, parent, name)
+	if err != nil {
+		return nil, nil, check, err
+	}
+	names, sizes, missing, detailCalls := len(items), 0, 0, 0
+	for index, item := range items {
+		if item.IsDir || item.Size != size {
+			continue
+		}
+		sizes++
+		if !validSHA1(item.SHA1) {
+			missing++
+			if detailCalls < 16 {
+				detailCalls++
+				detail, detailErr := driver.Stat(ctx, item.ID)
+				if detailErr == nil && detail.ID == item.ID && detail.ParentID == parent && detail.Name == name && !detail.IsDir && detail.Size == size && validSHA1(detail.SHA1) {
+					items[index] = detail
+					missing--
+				}
+			}
+		}
+	}
+	identical := identicalStorageItems(items, size, sha1Digest)
+	matches := len(identical)
+	check.Complete, check.NameMatches, check.SizeMatches, check.IdenticalMatches = true, &names, &sizes, &matches
+	switch {
+	case names > 1:
+		check.Reason = "multiple_matches"
+	case matches == 1:
+		check.Reason = "target_verified"
+	case names == 0:
+		check.Reason = "target_missing"
+	case missing > 0:
+		check.Reason = "digest_missing"
+	default:
+		check.Reason = "digest_mismatch"
+	}
+	return items, identical, check, nil
+}
+
+func inspectStorageCheckpoint(ctx context.Context, driver storageUploadDriver, plan nodeprotocol.StorageUploadPlan, file nodeprotocol.StorageUploadFile, checkpoint StorageUploadCheckpoint) (string, []cloud.Item, *nodeprotocol.StorageTargetCheck, error) {
+	check := &nodeprotocol.StorageTargetCheck{Version: 1, Reason: "digest_missing"}
+	if !validSHA1(checkpoint.TargetSHA1) {
+		return "", nil, check, errors.New(nodeprotocol.ErrorReconciliationNeeded)
+	}
+	reportStorageUploadPhase(ctx, nodeprotocol.PhaseVerifyingTarget)
+	check.Reason = "parent_unresolved"
+	parent, err := findStorageParent(ctx, driver, plan.TargetRootID, path.Dir(file.TargetRelativePath))
+	if err != nil || parent == "" || parent != checkpoint.TargetParentID {
+		return "", nil, check, errors.New(nodeprotocol.ErrorReconciliationNeeded)
+	}
+	_, identical, check, err := inspectStorageTarget(ctx, driver, parent, path.Base(file.TargetRelativePath), file.Size, checkpoint.TargetSHA1)
+	return parent, identical, check, err
+}
+
 func listStorageName(ctx context.Context, driver storageUploadDriver, parentID, name string) ([]cloud.Item, error) {
 	matches := make([]cloud.Item, 0, 1)
+	seen := make(map[string]struct{})
 	for offset := int64(0); offset < storageListMaximum; offset += storageListLimit {
 		page, err := driver.List(ctx, parentID, cloud.PageRequest{Offset: offset, Limit: storageListLimit})
 		if err != nil {
 			return nil, err
 		}
+		if page.Offset != offset || int64(len(page.Items)) > storageListLimit || page.HasMore && int64(len(page.Items)) != storageListLimit {
+			return nil, errors.New(nodeprotocol.ErrorReconciliationNeeded)
+		}
 		for _, item := range page.Items {
-			if item.ParentID == parentID && item.Name == name {
+			if item.ID == "" || item.ParentID != parentID || item.ID == parentID {
+				return nil, errors.New(nodeprotocol.ErrorReconciliationNeeded)
+			}
+			if _, duplicate := seen[item.ID]; duplicate {
+				return nil, errors.New(nodeprotocol.ErrorReconciliationNeeded)
+			}
+			seen[item.ID] = struct{}{}
+			if item.Name == name {
 				matches = append(matches, item)
 			}
 		}
@@ -572,12 +711,11 @@ func verifyUploadedTarget(ctx context.Context, driver storageUploadDriver, item 
 	if err != nil || stat.ID != item.ID || stat.ParentID != parentID || stat.Name != name || stat.IsDir || stat.Size != size || !strings.EqualFold(strings.TrimSpace(stat.SHA1), sha1Digest) {
 		return cloud.Item{}, errors.New("target stat mismatch")
 	}
-	matches, err := listStorageName(ctx, driver, parentID, name)
+	_, identical, check, err := inspectStorageTarget(ctx, driver, parentID, name, size, sha1Digest)
 	if err != nil {
 		return cloud.Item{}, err
 	}
-	identical := identicalStorageItems(matches, size, sha1Digest)
-	if len(identical) != 1 || identical[0].ID != stat.ID {
+	if check.Reason != "target_verified" || len(identical) != 1 || identical[0].ID != stat.ID {
 		return cloud.Item{}, errors.New("target listing mismatch")
 	}
 	return stat, nil

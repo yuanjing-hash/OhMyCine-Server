@@ -131,6 +131,9 @@ func (w *TransferWorker) runRemoteNodeUpload(ctx context.Context, runtime JobRun
 		_ = w.service.db.Model(&models.TransferTask{}).Where("id=? AND job_id=?", task.ID, task.JobID).Updates(map[string]any{"last_error_code": code, "updated_at": time.Now().UTC()}).Error
 		return WorkerResult{RetryAt: &next, ErrorCode: code, ErrorMessage: message}
 	}
+	if err := w.activateRemoteUploadRetry(ctx, client, task, download, batches); err != nil {
+		return w.cloudFailure(task, err, ctx)
+	}
 	permit, err := enterCatalogPhysicalWrite(ctx, w.service.db, CatalogPhysicalWriteInput{LibraryID: task.LibraryID, OwnerKind: CatalogPhysicalTransfer, OwnerID: task.ID, Job: &job})
 	if err != nil {
 		return w.cloudFailure(task, cloudTransferError("transfer_write_admission_failed", true, err), ctx)
@@ -161,6 +164,15 @@ func (w *TransferWorker) runRemoteNodeUpload(ctx context.Context, runtime JobRun
 			continue
 		}
 		for {
+			if w.pendingRemoteUploadRetry(ctx, task, batch.index) {
+				wait, err := w.waitForRemoteUploadRetry(ctx, client, task, download, batches, batch, remoteUploadStopProof{physical: permit.evidence})
+				if err != nil {
+					return w.cloudFailure(task, err, ctx)
+				}
+				if wait != nil {
+					return WorkerResult{Wait: wait}
+				}
+			}
 			err := w.executeRemoteUploadBatch(ctx, runtime, client, node, storage, &task, download, rows, batch, &manifest)
 			if err == nil {
 				break
@@ -171,6 +183,15 @@ func (w *TransferWorker) runRemoteNodeUpload(ctx context.Context, runtime JobRun
 			var failure *cloudTransferFailure
 			if !errors.As(err, &failure) || !failure.retryable {
 				return w.cloudFailure(task, err, ctx)
+			}
+			if failure.code == nodeprotocol.ErrorReconciliationNeeded {
+				wait, waitErr := w.waitForRemoteUploadRetry(ctx, client, task, download, batches, batch, remoteUploadStopProof{physical: permit.evidence})
+				if waitErr != nil {
+					return w.cloudFailure(task, waitErr, ctx)
+				}
+				if wait != nil {
+					return WorkerResult{Wait: wait}
+				}
 			}
 			w.transferEvent(ctx, task, "node.upload.request_wait", "upload", "waiting", "节点控制请求暂未完成，继续核对原批次并保留写入归属", map[string]any{"error_code": safeLabel(failure.code, 96), "retry_after_seconds": 15})
 			if err := uploadHeartbeat(runtime, task, int64(remoteUploadTerminalCount(rows)), int64(len(rows))); err != nil {
@@ -281,7 +302,16 @@ func (w *TransferWorker) executeRemoteUploadBatch(ctx context.Context, runtime J
 	if err := assertRemoteUploadClaimTx(w.service.db.WithContext(ctx), ctx); err != nil {
 		return err
 	}
-	operationKey := remoteUploadOperationKey(task.ID, batch.index)
+	operationKey, payload, err := remoteUploadBatchIdentityTx(w.service.db.WithContext(ctx), *task, batch)
+	if err != nil {
+		return err
+	}
+	batch.plan = payload
+	if payload.RetryOf != nil {
+		if err := requireUploadRetryCapability(ctx, client, node.ID); err != nil {
+			return err
+		}
+	}
 	plan, record, completed, err := w.prepareRemoteUploadOperation(ctx, node.ID, download.ID, operationKey, batch.plan)
 	if err != nil {
 		return err

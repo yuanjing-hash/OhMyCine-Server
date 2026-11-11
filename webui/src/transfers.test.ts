@@ -4,20 +4,23 @@ import { flushPromises, mount, type VueWrapper } from '@vue/test-utils'
 import { APIError, api } from '@/api/client'
 import { Permissions } from '@/auth/generated-permissions'
 import OrganizationView from '@/views/OrganizationView.vue'
-import { canDeleteTransferRecord, formatTransferProgress, remoteTransferPhaseLabel, shouldRefreshTransferEvent, transferDeletionLabels, transferExecutionLabel, transferIdentityLabel, transferPhaseDescription, transferRouteLabel, transferStatusClass, transferStatusLabel, transferUploadMetrics, type TransferSummary } from '@/transfers'
+import { canDeleteTransferRecord, formatTransferProgress, remoteTransferPhaseLabel, shouldRefreshTransferEvent, transferDeletionLabels, transferExecutionLabel, transferIdentityLabel, transferPhaseDescription, transferRouteLabel, transferStatusClass, transferStatusLabel, transferTargetCheckSummary, transferUploadMetrics, type TransferSummary } from '@/transfers'
 
 const route = vi.hoisted(() => ({ query: {} as Record<string, string> }))
+const actor = vi.hoisted(() => ({ canRespond: true }))
 vi.mock('@/api/client', async original => ({ ...await original<typeof import('@/api/client')>(), api: vi.fn() }))
 vi.mock('vue-router', () => ({ useRoute: () => route, useRouter: () => ({ replace: async ({ query }: { query: Record<string, string> }) => { route.query = query } }) }))
 vi.mock('@/toast', () => ({ notify: vi.fn() }))
-vi.mock('@/stores/auth', () => ({ useAuthStore: () => ({ user: { id: 7 }, can: (code: string) => [Permissions.TransfersReadOwn, Permissions.JobsReadOwn, Permissions.JobsControlOwn].includes(code as typeof Permissions.TransfersReadOwn), canAny: () => true }) }))
+vi.mock('@/stores/auth', () => ({ useAuthStore: () => ({ user: { id: 7 }, can: (code: string) => (code === Permissions.JobsRespond && actor.canRespond) || [Permissions.TransfersReadOwn, Permissions.JobsReadOwn, Permissions.JobsControlOwn].includes(code as typeof Permissions.TransfersReadOwn), canAny: () => true }) }))
 
 let wrapper: VueWrapper | undefined
 afterEach(() => {
   wrapper?.unmount()
   wrapper = undefined
   route.query = {}
+  actor.canRespond = true
   vi.useRealTimers()
+  vi.restoreAllMocks()
   vi.clearAllMocks()
   vi.unstubAllGlobals()
 })
@@ -67,6 +70,11 @@ describe('media organization presentation', () => {
     const remote = { ...summary, execution_location: 'node', node_name: '香港节点', remote_phase: 'uploading_target' } as TransferSummary
     expect(transferExecutionLabel(remote)).toBe('传输节点 · 香港节点')
     expect(remoteTransferPhaseLabel(remote)).toBe('节点上传目标网盘')
+    expect(remoteTransferPhaseLabel({ ...remote, remote_phase: 'verifying_target' })).toBe('节点核验目标文件')
+    const verified = { ...remote, remote_phase: 'verifying_target', remote_target_check: { version: 1, reason: 'target_verified', complete: true } }
+    expect(remoteTransferPhaseLabel(verified)).toBe('节点核验目标文件')
+    expect(transferTargetCheckSummary(verified)?.reason).toBe('目标文件核对通过')
+    expect(transferTargetCheckSummary({ ...remote, remote_target_check: { version: 2, reason: 'target_missing', complete: true } })).toBeNull()
     expect(remoteTransferPhaseLabel({ ...remote, remote_phase: '' })).toBe('节点等待调度')
     expect(transferExecutionLabel({ ...summary, execution_location: 'server' } as TransferSummary)).toBe('主 Server')
   })
@@ -109,10 +117,19 @@ describe('media organization presentation', () => {
       remote_transferred_bytes: 512 * 1024 * 1024, remote_total_bytes: 1024 * 1024 * 1024,
       remote_upload_speed_bps: 1024 * 1024, remote_sampled_at: '2026-11-11T02:00:00Z',
     } as TransferSummary
-    const recovering = { ...upload, id: 'recovering', display_name: '原上传等待恢复', job_id: 'original-job', job_status: 'completed', recovery_pending: true } as TransferSummary
+    const recovering = {
+      ...upload, id: 'recovering', display_name: '原上传等待恢复', job_id: 'original-job', job_status: 'retry_wait',
+      remote_phase: 'verifying_target', remote_error_code: 'node_reconciliation_required',
+      remote_target_check: { version: 1, reason: 'target_missing', complete: true, name_matches: 0, size_matches: 0, identical_matches: 0 },
+      retry_at: '2026-11-11T02:01:00Z', remote_transferred_bytes: undefined, remote_total_bytes: undefined,
+      remote_upload_speed_bps: undefined, remote_sampled_at: undefined,
+    } as TransferSummary
     const completed = { ...summary, id: 'finished', display_name: '真正完成的入库', phase: 'completed', job_status: 'completed', execution_location: 'server', total_files: 1, processed_files: 1 } as TransferSummary
     let pendingRead: Promise<void> | undefined
     let pendingDetail: Promise<void> | undefined
+    let pendingRetry: Promise<void> | undefined
+    let retryConflict = false
+    let retryAction: { version: number; action_type: string; prompt: string; options: string[]; preview: Record<string, string> } | null = null
     let detailUnavailable = false
     vi.mocked(api).mockImplementation(async path => {
       if (path.startsWith('/api/v1/transfers?')) {
@@ -124,7 +141,20 @@ describe('media organization presentation', () => {
       if (path === '/api/v1/transfers/recovering') {
         await pendingDetail
         if (detailUnavailable) throw new APIError(503, 'TEMPORARILY_UNAVAILABLE', '详情读取暂时不可用')
-        return { ...recovering, job: { status: recovering.job_status, action_request: null }, plan_summary: null, timeline: [], attempts: [] }
+        return { ...recovering, job: { status: recovering.job_status, action_request: retryAction }, plan_summary: null, timeline: [], attempts: [] }
+      }
+      if (path.startsWith('/api/v1/jobs/original-job/actions/') && path.endsWith('/respond')) {
+        await pendingRetry
+        if (retryConflict) {
+          retryConflict = false
+          recovering.upload_retry_version = 5
+          retryAction = { ...retryAction!, version: 5 }
+          throw new APIError(409, 'queue_action_stale', '操作已变化')
+        }
+        recovering.job_status = 'queued'
+        recovering.upload_retry_allowed = false
+        retryAction = null
+        return { status: 'queued' }
       }
       throw new Error(`unexpected offline request ${path}`)
     })
@@ -133,7 +163,13 @@ describe('media organization presentation', () => {
     const table = wrapper.get('.organization-table')
     expect(table.text()).toContain('512.0 MiB / 1.0 GiB · 50.0%')
     expect(table.text()).toContain('上传速度 1.0 MiB/s')
-    expect(table.text()).toContain('等待核对原上传')
+    expect(table.text()).toContain('等待核对旧上传结果')
+    const recoveryRow = table.findAll('tbody tr')[1]!
+    expect(recoveryRow.text()).toContain('尚未发现符合原计划的目标文件')
+    expect(recoveryRow.text()).toContain('同名 0 项')
+    expect(recoveryRow.text()).toContain('下次检查')
+    expect(recoveryRow.text()).toContain('上传数据 未知 / 未知')
+    expect(recoveryRow.find('progress').exists()).toBe(false)
     expect(table.findAll('button').some(button => button.text() === '删除记录')).toBe(false)
     expect(wrapper.get('.organization-mobile-list').text()).toContain('50.0%')
     await table.findAll('button').find(button => button.text() === '查看详情')!.trigger('click')
@@ -176,6 +212,46 @@ describe('media organization presentation', () => {
     expect(wrapper.get('.organization-drawer h2').text()).toBe('原上传等待恢复')
     expect(wrapper.get('.organization-drawer').text()).toContain('详情读取暂时不可用')
     expect(route.query.task).toBe('recovering')
+
+    detailUnavailable = false
+    recovering.job_status = 'waiting_user_action'
+    recovering.upload_retry_allowed = true
+    recovering.upload_retry_version = 4
+    retryAction = { version: 4, action_type: 'upload_retry', prompt: '旧上传尚未确认，可按原计划重新尝试', options: ['retry_upload'], preview: {} }
+    actor.canRespond = false
+    await wrapper.findAll('button').find(button => button.text() === '刷新')!.trigger('click')
+    await flushPromises()
+    expect(wrapper.get('.organization-table').findAll('button').some(button => button.text() === '重新尝试上传')).toBe(false)
+    expect(wrapper.get('.organization-drawer').findAll('button').find(button => button.text() === '重新尝试上传')!.attributes('disabled')).toBeDefined()
+    actor.canRespond = true
+    await wrapper.findAll('button').find(button => button.text() === '刷新')!.trigger('click')
+    await flushPromises()
+    expect(wrapper.get('.organization-mobile-list').findAll('button').some(button => button.text() === '重新尝试上传')).toBe(true)
+    const confirmation = vi.spyOn(window, 'confirm').mockReturnValue(true)
+    let finishRetry!: () => void
+    pendingRetry = new Promise(resolve => { finishRetry = resolve })
+    retryConflict = true
+    const retryButton = wrapper.get('.organization-drawer').findAll('button').find(button => button.text() === '重新尝试上传')!
+    await retryButton.trigger('click')
+    await retryButton.trigger('click')
+    await flushPromises()
+    const retryCalls = () => vi.mocked(api).mock.calls.filter(([path]) => path.endsWith('/respond'))
+    expect(retryCalls()).toHaveLength(1)
+    expect(retryCalls()[0]).toEqual(['/api/v1/jobs/original-job/actions/4/respond', { method: 'POST', body: JSON.stringify({ response: 'retry_upload' }) }])
+    expect(retryButton.attributes('disabled')).toBeDefined()
+    expect(confirmation).not.toHaveBeenCalled()
+    finishRetry()
+    pendingRetry = undefined
+    await flushPromises()
+    expect(retryCalls()).toHaveLength(1)
+    expect(wrapper.get('.organization-drawer h2').text()).toBe('原上传等待恢复')
+    await wrapper.get('.organization-table').findAll('button').find(button => button.text() === '重新尝试上传')!.trigger('click')
+    await flushPromises()
+    expect(retryCalls()).toHaveLength(2)
+    expect(retryCalls()[1]![0]).toBe('/api/v1/jobs/original-job/actions/5/respond')
+    expect(wrapper.get('.organization-drawer h2').text()).toBe('原上传等待恢复')
+    expect(wrapper.get('.organization-drawer').text()).not.toContain('整理完成')
+    expect(wrapper.get('.organization-table').findAll('button').some(button => button.text() === '重新尝试上传')).toBe(false)
 
     await wrapper.get('[aria-label="关闭详情"]').trigger('click')
     await wrapper.get('#organization-tab-history').trigger('click')

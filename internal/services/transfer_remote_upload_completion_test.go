@@ -42,6 +42,12 @@ type fencedRemoteResultClient struct {
 	operation  nodeprotocol.OperationResponse
 	beforeStop func()
 	stops      int
+	nodeID     string
+	seals      int
+}
+
+func (c *fencedRemoteResultClient) Health(context.Context) (nodeprotocol.HealthResponse, error) {
+	return nodeprotocol.HealthResponse{NodeID: c.nodeID, ProtocolMin: 1, ProtocolMax: 1, Capabilities: nodeprotocol.Capabilities{Codes: []string{nodeprotocol.CapabilityStorageUploadRetryV1}}}, nil
 }
 
 func (c *fencedRemoteResultClient) Operation(context.Context, string) (nodeprotocol.OperationResponse, error) {
@@ -61,6 +67,9 @@ func (c *fencedRemoteResultClient) RenewOperationLease(_ context.Context, key st
 }
 func (c *fencedRemoteResultClient) StopOperation(_ context.Context, key string, input nodeprotocol.OperationStopRequest) (nodeprotocol.OperationResponse, error) {
 	c.stops++
+	if input.SealUploadRetry {
+		c.seals++
+	}
 	if c.beforeStop != nil {
 		c.beforeStop()
 	}
@@ -71,6 +80,151 @@ func (c *fencedRemoteResultClient) StopOperation(_ context.Context, key string, 
 }
 
 func TestRemoteUploadTerminalRowsRecoverOriginalResultAfterRestart(t *testing.T) {
+	t.Run("explicit_linked_retry_preserves_original", func(t *testing.T) {
+		f := newRemoteBatchFixture(t, cloud.ProviderPan115)
+		f.queue = NewQueueService(f.queue.db, f.queue.audit)
+		f.service.queue = f.queue
+		worker := NewTransferWorker(f.service)
+		var user models.User
+		if err := f.queue.db.First(&user, f.download.OwnerID).Error; err != nil {
+			t.Fatal(err)
+		}
+		actor := Actor{User: user, Permissions: map[string]struct{}{authz.PermissionJobsRespond: {}, authz.PermissionJobsReadAll: {}, authz.PermissionJobsControlAll: {}, authz.PermissionTransfersReadAll: {}, authz.PermissionDownloadsCreate: {}, authz.PermissionMediaLibrariesRead: {}, authz.PermissionDiscoveryRead: {}}}
+		persistFixtureAuthority(t, f.queue.db, actor)
+		task := f.task
+		task.Phase = models.TransferTaskStatusTransferring
+		task.FinishedAt = nil
+		if err := f.queue.db.Model(&task).Updates(map[string]any{"phase": task.Phase, "finished_at": nil}).Error; err != nil {
+			t.Fatal(err)
+		}
+		var storage models.Storage
+		if err := f.queue.db.First(&storage, f.library.StorageID).Error; err != nil {
+			t.Fatal(err)
+		}
+		batches, err := buildRemoteUploadBatches(f.rows, storage, f.download, f.manifest)
+		if err != nil {
+			t.Fatal(err)
+		}
+		record, err := remoteUploadBatchRecordTx(f.queue.db, task, f.download, batches[0])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := f.queue.db.Model(&record).Updates(map[string]any{"status": nodeprotocol.OperationRunning, "phase": nodeprotocol.PhaseVerifyingTarget}).Error; err != nil {
+			t.Fatal(err)
+		}
+		claimed, err := f.queue.Claim([]string{"transfer"})
+		if err != nil || claimed == nil {
+			t.Fatalf("claim=%+v err=%v", claimed, err)
+		}
+		ctx := context.WithValue(context.Background(), remoteUploadClaimKey{}, *claimed)
+		var proof models.CatalogPhysicalWrite
+		if err := f.queue.db.First(&proof, "owner_kind=? AND owner_id=?", CatalogPhysicalTransfer, task.ID).Error; err != nil {
+			t.Fatal(err)
+		}
+		proof.JobLeaseHash, proof.State = leaseHash(claimed.LeaseToken), "entered"
+		if err := f.queue.db.Save(&proof).Error; err != nil {
+			t.Fatal(err)
+		}
+		zero := 0
+		inactive := false
+		check := &nodeprotocol.StorageTargetCheck{Version: 1, Reason: "target_missing", Complete: true, NameMatches: &zero, SizeMatches: &zero, IdenticalMatches: &zero}
+		response := nodeprotocol.StorageActionResponse{RequestID: record.OperationKey, OperationKey: record.OperationKey, PlanDigest: record.PlanDigest, Status: nodeprotocol.StorageActionReconciliation, Phase: nodeprotocol.PhaseVerifyingTarget, TotalFiles: len(f.rows), ExecutionActive: &inactive, ErrorCode: nodeprotocol.ErrorReconciliationNeeded, TargetCheck: check}
+		client := &fencedRemoteResultClient{nodeID: *task.NodeID, operation: nodeprotocol.OperationResponse{OperationKey: record.OperationKey, PlanDigest: record.PlanDigest, LeaseEpoch: record.LeaseEpoch, Status: nodeprotocol.OperationRunning}, terminalRemoteResultClient: terminalRemoteResultClient{key: record.OperationKey, task: f.download.ID, response: response}}
+		if err := worker.persistMeasuredUpload(ctx, &task, f.rows, f.rows, response); err != nil {
+			t.Fatal(err)
+		}
+		// A completed Node receipt may have an older epoch than a reserved,
+		// unacknowledged renewal. It needs a read, never a higher-epoch seal.
+		if err := f.queue.db.Model(&record).Update("lease_epoch", record.LeaseEpoch+1).Error; err != nil {
+			t.Fatal(err)
+		}
+		client.operation.Status = nodeprotocol.OperationCompleted
+		client.response.Status = nodeprotocol.StorageActionCompleted
+		client.response.CompletedFiles = len(f.rows)
+		if wait, err := worker.waitForRemoteUploadRetry(ctx, client, task, f.download, batches, batches[0], remoteUploadStopProof{physical: proof}); err != nil || wait != nil || client.seals != 0 {
+			t.Fatal("late completion required a higher-epoch seal", err)
+		}
+		if err := f.queue.db.Model(&record).Update("lease_epoch", client.operation.LeaseEpoch).Error; err != nil {
+			t.Fatal(err)
+		}
+		client.operation.Status = nodeprotocol.OperationRunning
+		client.response = response
+		check.Complete = false
+		if err := worker.persistMeasuredUpload(ctx, &task, f.rows, f.rows, response); err != nil {
+			t.Fatal(err)
+		}
+		if wait, err := worker.waitForRemoteUploadRetry(ctx, client, task, f.download, batches, batches[0], remoteUploadStopProof{physical: proof}); err != nil || wait != nil || client.stops != 0 {
+			t.Fatal("partial listing authorized a retry")
+		}
+		check.Complete = true
+		if err := worker.persistMeasuredUpload(ctx, &task, f.rows, f.rows, response); err != nil {
+			t.Fatal(err)
+		}
+		wait, err := worker.waitForRemoteUploadRetry(ctx, client, task, f.download, batches, batches[0], remoteUploadStopProof{physical: proof})
+		if err != nil || wait == nil || wait.ActionType != "upload_retry" || client.seals != 1 {
+			t.Fatalf("wait=%+v err=%v seals=%d", wait, err, client.seals)
+		}
+		if err := f.queue.Wait(task.JobID, claimed.LeaseToken, *wait); err != nil {
+			t.Fatal(err)
+		}
+		page, err := f.service.List(actor, TransferListFilter{Scope: "active"})
+		if err != nil || len(page.List) != 1 || !page.List[0].UploadRetryAllowed || page.List[0].UploadRetryVersion == 0 || page.List[0].RemoteTargetCheck == nil || page.List[0].RemoteTransferredBytes != nil {
+			t.Fatalf("action projection=%+v err=%v", page, err)
+		}
+		version := page.List[0].UploadRetryVersion
+		denied := actor
+		denied.Permissions = map[string]struct{}{authz.PermissionTransfersReadAll: {}, authz.PermissionMediaLibrariesRead: {}, authz.PermissionJobsReadAll: {}}
+		readOnly, err := f.service.List(denied, TransferListFilter{Scope: "active"})
+		if err != nil || len(readOnly.List) != 1 || readOnly.List[0].UploadRetryAllowed || readOnly.List[0].UploadRetryVersion != 0 {
+			t.Fatal("read-only actor obtained retry authority")
+		}
+		if _, err := f.queue.Respond(denied, task.JobID, version, "retry_upload", RequestContext{}); err == nil {
+			t.Fatal("read-only actor responded")
+		}
+		if _, err := f.queue.Respond(actor, task.JobID, version, "retry_upload", RequestContext{}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.queue.Respond(actor, task.JobID, version, "retry_upload", RequestContext{}); err == nil {
+			t.Fatal("duplicate response accepted")
+		}
+		claimed, err = f.queue.Claim([]string{"transfer"})
+		if err != nil || claimed == nil {
+			t.Fatalf("resume=%+v err=%v", claimed, err)
+		}
+		ctx = context.WithValue(context.Background(), remoteUploadClaimKey{}, *claimed)
+		if err := worker.activateRemoteUploadRetry(ctx, client, task, f.download, batches); err != nil {
+			t.Fatal(err)
+		}
+		if err := worker.activateRemoteUploadRetry(ctx, client, task, f.download, batches); err != nil {
+			t.Fatal(err)
+		}
+		childKey, payload, err := remoteUploadBatchIdentityTx(f.queue.db, task, batches[0])
+		if err != nil || payload.RetryOf == nil || payload.RetryOf.OperationKey != record.OperationKey || payload.RetryOf.ActionVersion != version || childKey == record.OperationKey {
+			t.Fatalf("child=%s payload=%+v err=%v", childKey, payload, err)
+		}
+		_, child, _, err := worker.prepareRemoteUploadOperation(ctx, *task.NodeID, f.download.ID, childKey, payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		retained, err := remoteUploadBatchRecordTx(f.queue.db, task, f.download, batches[0])
+		if err != nil || retained.ID != child.ID {
+			t.Fatal("publication resolved a different retry generation")
+		}
+		var count int64
+		if err := f.queue.db.Model(&models.RemoteOperation{}).Where("operation_key IN ?", []string{record.OperationKey, childKey}).Count(&count).Error; err != nil || count != 2 {
+			t.Fatal("original operation was removed")
+		}
+		if err := worker.persistMeasuredUpload(ctx, &task, f.rows, f.rows, nodeprotocol.StorageActionResponse{Status: nodeprotocol.StorageActionCompleted}); err != nil {
+			t.Fatal(err)
+		}
+		var projected transferProjectionRow
+		projected.ExecutionLocation, projected.Phase, projected.RemoteErrorCode = models.NodeLocationRemote, models.TransferTaskStatusCompleted, nodeprotocol.ErrorReconciliationNeeded
+		projected.UploadProgressJSON = task.UploadProgressJSON
+		finalizeTransferProjection(&projected)
+		if projected.RemoteTargetCheck != nil || projected.RemoteErrorCode != "" {
+			t.Fatal("old reconciliation obscured completed output")
+		}
+	})
 	for _, provider := range []string{cloud.ProviderQuark, cloud.ProviderPan115} {
 		t.Run(provider, func(t *testing.T) {
 			f := newRemoteBatchFixture(t, provider)
