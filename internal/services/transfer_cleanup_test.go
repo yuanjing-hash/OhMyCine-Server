@@ -14,6 +14,7 @@ import (
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
 	cloudpkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud"
 	downloadpkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/downloader"
+	"gorm.io/gorm"
 )
 
 func configurePan115CleanupPackage(t *testing.T, fixture *cloudTransferFixture, withListener bool) {
@@ -484,6 +485,15 @@ func TestTransferCleanupPan115RetriesRecycleAndReconcileFailures(t *testing.T) {
 func TestTransferCleanupDefersQBittorrentCopyUntilSeedingCleanup(t *testing.T) {
 	queue, actor, download, selectedPath, _ := transferFixture(t, models.MediaLibraryTransferCopy, models.MediaLibraryConflictOverwrite, false)
 	service := NewTransferService(queue.db, queue.audit, queue, zerolog.Nop())
+	// A post-import source owner is a capability-backed lifecycle record,
+	// rather than a provider-name special case in the transfer executor.
+	seed := models.SeedingTask{ID: "copy-source-owner", OwnerID: actor.User.ID, DownloadTaskID: download.ID, TransferMode: download.TransferMode, Phase: models.SeedingTaskStatusQueued}
+	if _, err := queue.EnqueueWith(EnqueueJobInput{OwnerID: actor.User.ID, JobType: "seeding", DisplayName: "copy source owner", Payload: seedingJobPayload{SeedingTaskID: seed.ID}}, func(tx *gorm.DB, job models.Job) error {
+		seed.JobID = job.ID
+		return tx.Create(&seed).Error
+	}); err != nil {
+		t.Fatal(err)
+	}
 	extraPath := filepath.Join(download.StagingAbsolutePath, download.ScrapeCategory, "promo.txt")
 	if err := os.WriteFile(extraPath, []byte("spam"), 0o600); err != nil {
 		t.Fatal(err)
@@ -530,6 +540,52 @@ func TestTransferCleanupDefersQBittorrentCopyUntilSeedingCleanup(t *testing.T) {
 	}
 	if err := queue.db.First(&task, "id = ?", task.ID).Error; err != nil || task.CleanupStatus != models.TransferCleanupCompleted || task.CleanupRemoved != 1 {
 		t.Fatalf("completed task=%+v err=%v", task, err)
+	}
+	// Cloud-upload Copy ends its torrent but retains its source even if the
+	// legacy callback still carries a whole-package DeleteData flag.
+	if err := queue.db.Model(&models.DownloadTask{}).Where("id = ?", download.ID).Update("target_storage_type", "fixture-cloud").Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := service.CleanupAfterSeeding(context.Background(), download.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := queue.db.First(&task, "id = ?", task.ID).Error; err != nil || task.CleanupStatus != models.TransferCleanupSkipped || task.CleanupErrorCode != "copy_source_retained" {
+		t.Fatalf("cloud Copy retention=%+v err=%v", task, err)
+	}
+	for _, path := range []string{selectedPath, extraPath} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("cloud Copy source was deleted: %s: %v", path, err)
+		}
+	}
+	if err := queue.db.Model(&models.DownloadTask{}).Where("id = ?", download.ID).Update("transfer_mode", models.MediaLibraryTransferMove).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := service.CleanupAfterSeeding(context.Background(), download.ID, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := queue.db.First(&task, "id = ?", task.ID).Error; err != nil || task.CleanupStatus != models.TransferCleanupSkipped || task.CleanupErrorCode != "protected_source_retained" {
+		t.Fatalf("main Server upload Move falsely claimed full source cleanup: %+v err=%v", task, err)
+	}
+	if _, err := os.Stat(selectedPath); err != nil {
+		t.Fatalf("main Server upload source retention was not protected: %v", err)
+	}
+	missingCtx := context.WithValue(context.Background(), sourceNativeTaskMissingKey{}, true)
+	if err := service.CleanupAfterSeeding(missingCtx, download.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := queue.db.First(&task, "id = ?", task.ID).Error; err != nil || task.CleanupErrorCode != "native_task_missing" {
+		t.Fatalf("main Server native absence was treated as deleted bytes: %+v err=%v", task, err)
+	}
+	// A real source completion and its private confirmation are atomic. A late
+	// Stop/Get-missing result must not replace that new completion with skipped.
+	if err := service.CleanupAfterSeeding(context.Background(), download.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.CleanupAfterSeeding(missingCtx, download.ID, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := queue.db.First(&task, "id = ?", task.ID).Error; err != nil || task.CleanupStatus != models.TransferCleanupCompleted || task.CleanupErrorCode != "" {
+		t.Fatalf("late observation downgraded confirmed source cleanup: %+v err=%v", task, err)
 	}
 }
 

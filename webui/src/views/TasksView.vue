@@ -15,6 +15,7 @@ import {
   getJob,
   getTimeline,
   jobActionLabel,
+  jobTypeLabel,
   listJobs,
   reorderLane,
   respondAction,
@@ -371,7 +372,7 @@ onBeforeUnmount(() => { alive = false; listRequest.cancel(); detailRequest.cance
             </td>
             <td>
               <button class="semantic-link text-left" @click="open(job)">
-                <strong>{{ job.display_name }}</strong><small class="block text-subtle">{{ job.job_type }} · P{{ job.priority }} ·
+                <strong>{{ job.display_name }}</strong><small class="block text-subtle">{{ jobTypeLabel(job) }} · P{{ job.priority }} ·
                   {{ job.provider || job.resource_key || "无资源标签" }}</small>
               </button>
             </td>
@@ -466,7 +467,7 @@ onBeforeUnmount(() => { alive = false; listRequest.cancel(); detailRequest.cance
       >
         <header>
           <div>
-            <small>{{ selected?.job_type }}</small>
+            <small>{{ selected ? jobTypeLabel(selected) : '' }}</small>
             <h2>{{ selected?.display_name || '任务详情' }}</h2>
             <span v-if="selected" class="status-chip">{{ statusLabels[selected.status] }}</span>
           </div>

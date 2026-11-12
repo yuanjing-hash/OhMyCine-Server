@@ -187,7 +187,7 @@ const actions: Record<string, string> = {
   poster: '海报图片', fanart: '背景图片', thumb: '缩略图', image: '图片', source_poster: '来源海报', source_fanart: '来源背景', subtitle: '字幕',
   login: '网页登录', player_login: 'Player 登录', clear_recycle_bin: '永久清空回收站', beta: 'Beta 通道', stable: '稳定通道',
   symlink: '创建软链接', hardlink: '创建硬链接', skip: '跳过', overwrite: '覆盖', ask: '等待用户决定', recycle: '移入回收站',
-  browser_login: '网页登录', 'auth.login': '网页登录', remove_task_and_data: '移除下载器任务并请求清理数据', remove_task_keep_data: '移除下载器任务并保留数据',
+  browser_login: '网页登录', 'auth.login': '网页登录', inspect_task: '核对原下载器任务', prepare_remove_task_and_data: '计划移除下载器任务并请求清理数据', prepare_remove_task_keep_data: '计划移除下载器任务并保留数据', remove_task_and_data: '已提交任务移除和源数据清理请求', remove_task_keep_data: '已提交任务移除请求并保留数据',
   prepare_install: '准备安装包', install: '安装插件', update: '更新插件', enable: '启用插件', disable: '停用插件', rollback: '回滚插件', uninstall: '卸载插件',
   media_library_scan: '全量核对媒体库', media_library_structure_diagnose: '诊断媒体目录', media_library_structure_repair: '修复媒体目录',
   strm_reconcile: '核对 STRM', follow_search: '执行追更', cookiecloud_sync: '同步 CookieCloud', pan115_recycle_cleanup: '清空 115 回收站', empty_directory: '清理空目录',

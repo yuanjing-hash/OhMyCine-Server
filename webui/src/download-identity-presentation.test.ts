@@ -6,7 +6,7 @@ import { api } from '@/api/client'
 import { Permissions } from '@/auth/generated-permissions'
 import { downloadErrorMessage } from '@/downloads'
 import { notify } from '@/toast'
-import type { DownloadTaskSummary } from '@/types/api'
+import type { DownloadTaskSummary, SeedingTaskSummary } from '@/types/api'
 
 vi.mock('@/api/client', async original => ({ ...await original<typeof import('@/api/client')>(), api: vi.fn() }))
 vi.mock('vue-router', () => ({ RouterLink: { template: '<a><slot /></a>' }, useRoute: () => ({ query: { section: 'history' } }), useRouter: () => ({ replace: vi.fn() }) }))
@@ -15,6 +15,36 @@ vi.mock('@/stores/auth', () => ({ useAuthStore: () => ({ user: { id: 7 }, can: (
 
 let wrapper: VueWrapper | undefined
 afterEach(() => { wrapper?.unmount(); wrapper = undefined; vi.useRealTimers(); vi.clearAllMocks(); vi.restoreAllMocks() })
+
+it('separates source cleanup from local seeding and retries only the original cleanup Job', async () => {
+  vi.useFakeTimers()
+  const cleanup = { id: 'cleanup', job_id: 'cleanup-job', owner_id: 7, display_name: '原移动任务', downloader_name: '原下载器', transfer_mode: 'move', purpose: 'source_cleanup', delete_data: true, phase: 'failed', job_status: 'failed', last_error_code: 'downloader_auth_failed' } as SeedingTaskSummary
+  const copy = { ...cleanup, id: 'cloud-copy', job_id: 'cloud-copy-job', display_name: '网盘复制任务', transfer_mode: 'copy', delete_data: false, phase: 'cleanup', job_status: 'retry_wait', last_error_code: 'shared_source_retained' } as SeedingTaskSummary
+  const local = { ...cleanup, id: 'local-copy', job_id: 'local-copy-job', display_name: '本地复制任务', transfer_mode: 'copy', purpose: 'seeding', phase: 'retained', job_status: 'retry_wait', last_error_code: '', seeded_seconds: 300, minimum_seed_minutes: 60 } as SeedingTaskSummary
+  vi.mocked(api).mockImplementation(async path => {
+    if (path === '/api/v1/downloads?scope=history&limit=200' || path === '/api/v1/downloads?scope=active&limit=200') return { list: [], total: 0 }
+    if (path === '/api/v1/seeding-tasks?limit=100') return { list: [cleanup, copy, local], total: 3 }
+    if (path === '/api/v1/jobs/cleanup-job/retry') return { id: 'cleanup-job', status: 'queued' }
+    throw new Error(`unexpected offline request ${path}`)
+  })
+  wrapper = mount(DownloadsView, { global: { stubs: { DirectoryPickerDialog: true, DownloadRouteTargetPicker: true, MediaReorganizationDialog: true, TransferNodesPanel: true, SecretInput: true, ClearHistoryButton: true } } })
+  await flushPromises()
+  await wrapper.findAll('button').find(button => button.text().startsWith('源清理 / 做种'))!.trigger('click')
+  await flushPromises()
+  expect(wrapper.text()).toContain('源文件清理 · 2 项未结束')
+  expect(wrapper.text()).toContain('做种任务 · 1 项未结束')
+  const original = wrapper.findAll('article').find(card => card.text().includes('原移动任务'))!
+  expect(original.text()).toContain('移动入库 · 本任务不保种')
+  expect(original.text()).toContain('清理受阻')
+  expect(original.text()).not.toContain('做种时长')
+  const cloudCopy = wrapper.findAll('article').find(card => card.text().includes('网盘复制任务'))!
+  expect(cloudCopy.text()).toContain('共享清理延期')
+  expect(cloudCopy.text()).toContain('移除原任务，保留源文件')
+  await original.findAll('button').find(button => button.text() === '重试源清理')!.trigger('click')
+  await flushPromises()
+  expect(vi.mocked(api).mock.calls.filter(([path]) => path === '/api/v1/jobs/cleanup-job/retry')).toHaveLength(1)
+  expect(vi.mocked(api).mock.calls.some(([path]) => path === '/api/v1/downloads')).toBe(false)
+})
 
 it('keeps the original recovery reason visible and never labels a legacy automatic lock as a manual action', async () => {
   vi.useFakeTimers()

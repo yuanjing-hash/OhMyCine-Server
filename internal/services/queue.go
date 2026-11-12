@@ -305,6 +305,7 @@ type JobDTO struct {
 	OwnerID               *uint             `json:"owner_id"`
 	CreatedByKind         string            `json:"created_by_kind"`
 	JobType               string            `json:"job_type"`
+	Purpose               string            `json:"purpose,omitempty"`
 	Priority              int               `json:"priority"`
 	LanePosition          int64             `json:"lane_position"`
 	LaneRank              *int              `json:"lane_rank"`

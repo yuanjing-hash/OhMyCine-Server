@@ -61,6 +61,10 @@ func (c *selectionGroupClient) retireAndCleanup(ctx context.Context) (done bool,
 				if err := tx.First(&task, "id = ? AND owner_id = ? AND bt_selection_group_id = ?", ref.TaskID, group.OwnerID, group.ID).Error; err != nil {
 					return err
 				}
+				disposition, err := downloadSourceDisposition(task)
+				if err != nil {
+					return err
+				}
 				plain, err := c.service.credentials.Decrypt(downloadSourcePurpose(task.ID), task.SourceCiphertext)
 				if err != nil {
 					return err
@@ -80,7 +84,7 @@ func (c *selectionGroupClient) retireAndCleanup(ctx context.Context) (done bool,
 					if task.TargetLibraryID == nil || transfer.LibraryID != *task.TargetLibraryID {
 						return nil
 					}
-					if task.SeedingCleanupEnabled {
+					if !disposition.immediate() && task.SeedingCleanupEnabled {
 						var seed models.SeedingTask
 						if err := tx.First(&seed, "download_task_id = ?", task.ID).Error; err != nil {
 							return err
@@ -90,7 +94,7 @@ func (c *selectionGroupClient) retireAndCleanup(ctx context.Context) (done bool,
 						}
 					}
 				}
-				retain := ref.State == "released" || task.TransferMode == models.MediaLibraryTransferSymlink || task.TransferMode != models.MediaLibraryTransferMove && !task.SeedingCleanupEnabled
+				retain := ref.State == "released" || disposition.RetainSource || !disposition.immediate() && !task.SeedingCleanupEnabled
 				for _, file := range source.ContentSelection.Files {
 					if retain {
 						protected[file.Index] = true
@@ -189,6 +193,8 @@ func (c *selectionGroupClient) retireAndCleanup(ctx context.Context) (done bool,
 					status, code = models.TransferCleanupCompleted, ""
 				} else if task.TransferMode == models.MediaLibraryTransferSymlink {
 					status, code = models.TransferCleanupSkipped, "symlink_source_retained"
+				} else if disposition, err := downloadSourceDisposition(task); err == nil && disposition.RetainSource {
+					status, code = models.TransferCleanupSkipped, "copy_source_retained"
 				}
 				if err := tx.Model(&models.TransferTask{}).Where("download_task_id = ?", task.ID).Updates(map[string]any{"cleanup_status": status, "cleanup_error_code": code, "updated_at": time.Now().UTC()}).Error; err != nil {
 					return err
@@ -197,6 +203,6 @@ func (c *selectionGroupClient) retireAndCleanup(ctx context.Context) (done bool,
 			done = true
 			return nil
 		})
-	})
+	}, true)
 	return
 }

@@ -14,6 +14,8 @@ type jobResourceAccess struct {
 	SiteIDs      []uint
 	UnknownSite  bool
 	Bound        bool
+	Purpose      string
+	DisplayName  string
 	invalid      bool
 }
 
@@ -28,12 +30,19 @@ func jobResourceAccessRows(db *gorm.DB, jobs []models.Job) (map[string]jobResour
 		byType[job.JobType] = append(byType[job.JobType], job.ID)
 	}
 	type binding struct {
-		JobID               string
-		LibraryID           uint
-		DownloaderID        *string
-		SourceOrigin        string
-		DownloadPayloadJSON string
-		SiteID              uint
+		JobID                string
+		LibraryID            uint
+		DownloaderID         *string
+		SourceOrigin         string
+		DownloadPayloadJSON  string
+		SiteID               uint
+		DisplayName          string
+		TransferMode         string
+		TargetStorageType    string
+		TransferRouteKind    string
+		TransferRouteVersion int
+		SourceDataSourceJSON string
+		TargetDataSourceJSON string
 	}
 	for jobType, table := range map[string]string{"download": "download_tasks", "transfer": "transfer_tasks", "seeding": "seeding_tasks"} {
 		ids := byType[jobType]
@@ -51,6 +60,9 @@ func jobResourceAccessRows(db *gorm.DB, jobs []models.Job) (map[string]jobResour
 		}
 		query = query.Joins("JOIN jobs AS source_job ON source_job.id = download.job_id").Joins("LEFT JOIN plugin_resource_claims AS claim ON claim.id = download.plugin_resource_claim_id")
 		columns += ", download.downloader_id, download.source_origin, source_job.payload_json AS download_payload_json, COALESCE(claim.site_id,0) AS site_id"
+		if jobType == "seeding" {
+			columns += ", download.display_name, download.transfer_mode, download.target_storage_type, download.transfer_route_kind, download.transfer_route_version, download.source_data_source_json, download.target_data_source_json"
+		}
 		jobColumn := "download.job_id"
 		if jobType != "download" {
 			jobColumn = "phase.job_id"
@@ -61,6 +73,15 @@ func jobResourceAccessRows(db *gorm.DB, jobs []models.Job) (map[string]jobResour
 		}
 		for _, row := range rows {
 			access := jobResourceAccess{LibraryID: row.LibraryID, DownloaderID: row.DownloaderID, Bound: true}
+			if jobType == "seeding" {
+				disposition, err := downloadSourceDisposition(models.DownloadTask{TransferMode: row.TransferMode, TargetStorageType: row.TargetStorageType, TransferRouteKind: row.TransferRouteKind, TransferRouteVersion: row.TransferRouteVersion, SourceDataSourceJSON: row.SourceDataSourceJSON, TargetDataSourceJSON: row.TargetDataSourceJSON})
+				if err == nil {
+					access.Purpose = disposition.Purpose
+					if disposition.immediate() {
+						access.DisplayName = "源文件清理：" + row.DisplayName
+					}
+				}
+			}
 			var payload downloadJobPayload
 			if err := json.Unmarshal([]byte(row.DownloadPayloadJSON), &payload); err != nil {
 				access.invalid = true
@@ -138,6 +159,7 @@ func redactJobResources(dto *JobDTO) {
 	dto.DisplayName = "资源权限受限的任务"
 	dto.ResourceKey, dto.Provider, dto.LastErrorMessage = "", "", ""
 	dto.Action, dto.WaitReason = nil, nil
+	dto.Purpose = ""
 }
 
 func (s *QueueService) projectJobResourceAccess(actor Actor, jobs []models.Job, dtos []JobDTO) error {
@@ -146,6 +168,10 @@ func (s *QueueService) projectJobResourceAccess(actor Actor, jobs []models.Job, 
 		return err
 	}
 	for i, job := range jobs {
+		dtos[i].Purpose = rows[job.ID].Purpose
+		if rows[job.ID].DisplayName != "" {
+			dtos[i].DisplayName = rows[job.ID].DisplayName
+		}
 		if !rows[job.ID].visible(actor) {
 			redactJobResources(&dtos[i])
 		}

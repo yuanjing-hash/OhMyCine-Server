@@ -23,8 +23,23 @@ func TestSelectionGroupCleanupUnknownDeleteOnlyProbesAndIgnoresNewLifecycle(t *t
 	}
 	binding.Group = &g
 	cleanup := downloader.GroupCleanup{Key: strings.Repeat("c", 64), Group: g, Files: binding.Selection, DeleteFiles: true}
+	state.mu.Lock()
+	state.state = "stalledUP"
+	// Cleanup does not need to reapply a desired union merely because its
+	// priorities differ. All source consumers were retired by the authority.
+	state.priorities = [2]int{0, 1}
+	beforeWrites := state.writes
+	state.mu.Unlock()
+	cleanup.ProbeOnly = true
+	if gone, err := client.CleanupSelectionGroup(ctx, source, binding, cleanup); err == nil || gone || state.writes != beforeWrites || state.adds != 1 {
+		t.Fatal("a probe sent pause/delete or recreated acquisition", gone, err, state.writes, state.adds)
+	}
+	cleanup.ProbeOnly = false
 	if gone, err := client.CleanupSelectionGroup(ctx, source, binding, cleanup); err == nil || gone || state.deletes != 1 {
 		t.Fatal("unknown delete not retained", gone, err, state.deletes)
+	}
+	if state.adds != 1 || !stopped(state.state) {
+		t.Fatal("cleanup reapplied acquisition or failed to stop the original native task", state.adds, state.state)
 	}
 	cleanup.ProbeOnly = true
 	if gone, err := client.CleanupSelectionGroup(ctx, source, binding, cleanup); err != nil || !gone || state.deletes != 1 {

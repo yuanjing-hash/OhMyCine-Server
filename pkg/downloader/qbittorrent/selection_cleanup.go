@@ -20,7 +20,10 @@ func (c *Client) CleanupSelectionGroup(ctx context.Context, source downloader.So
 		return false, err
 	}
 	defer release()
-	info, _, err := c.selectedState(ctx, selectionHash(manifest.Identity), binding, true)
+	// Retired references may have a newer logical union than the last wanted
+	// update. Cleanup needs the owned hash/tags/workspace and immutable file
+	// identities, never proof that a new download union was applied.
+	info, _, err := c.selectedState(ctx, selectionHash(manifest.Identity), binding, false)
 	if err != nil {
 		code, _ := downloader.ErrorInfo(err)
 		if code == "downloader_task_not_found" {
@@ -33,11 +36,29 @@ func (c *Client) CleanupSelectionGroup(ctx context.Context, source downloader.So
 		}
 		return false, err
 	}
-	if !sameWorkspace(info.SavePath, cleanup.Group.Workspace) || !stopped(info.State) {
+	if !sameWorkspace(info.SavePath, cleanup.Group.Workspace) {
 		return false, downloader.Error("downloader_selection_cleanup_invalid", false, nil)
 	}
 	if cleanup.ProbeOnly {
 		return false, downloader.Error("downloader_selection_cleanup_unconfirmed", true, nil)
+	}
+	if !stopped(info.State) {
+		// The authority has retired every consumer and persisted its receipt.
+		// Stop this verified native task directly; applying a union here could
+		// recreate a torrent that disappeared between inspection and cleanup.
+		if err = c.pauseHash(ctx, info.Hash); err != nil {
+			return false, err
+		}
+		info, _, err = c.selectedState(ctx, info.Hash, binding, false)
+		if code, _ := downloader.ErrorInfo(err); code == "downloader_task_not_found" {
+			return true, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		if !sameWorkspace(info.SavePath, cleanup.Group.Workspace) || !stopped(info.State) {
+			return false, downloader.Error("downloader_selection_stop_unconfirmed", true, nil)
+		}
 	}
 	if err = c.cancelHash(ctx, info.Hash, false); err != nil {
 		return false, downloader.Error("downloader_selection_cleanup_unconfirmed", true, err)
