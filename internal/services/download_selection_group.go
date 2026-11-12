@@ -192,7 +192,8 @@ func (s *DownloaderService) bindBTSelectionGroup(client downloadpkg.Client, reco
 	return bound, nil
 }
 
-func (c *selectionGroupClient) with(ctx context.Context, intent string, fn func(context.Context, downloadpkg.SelectionContext, downloadpkg.Task) error) error {
+func (c *selectionGroupClient) with(ctx context.Context, intent string, fn func(context.Context, downloadpkg.SelectionContext, downloadpkg.Task) error, cleanupOnly ...bool) error {
+	noAcquisition := len(cleanupOnly) > 0 && cleanupOnly[0]
 	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 	lease := uuid.NewString()
@@ -307,7 +308,11 @@ func (c *selectionGroupClient) with(ctx context.Context, intent string, fn func(
 		digest, _ = union.Digest()
 		known := []string{}
 		_ = json.Unmarshal([]byte(group.KnownDigestsJSON), &known)
-		for _, d := range []string{group.AppliedDigest, group.PendingDigest, digest} {
+		digests := []string{group.AppliedDigest, group.PendingDigest}
+		if !noAcquisition {
+			digests = append(digests, digest)
+		}
+		for _, d := range digests {
 			if d != "" {
 				found := false
 				for _, old := range known {
@@ -322,8 +327,10 @@ func (c *selectionGroupClient) with(ctx context.Context, intent string, fn func(
 			return downloadpkg.Error("downloader_selection_group_reconcile_required", true, nil)
 		}
 		raw, _ := json.Marshal(known)
-		if err := tx.Model(&models.BTSelectionGroup{}).Where("id = ? AND lease_owner = ?", group.ID, lease).Updates(map[string]any{"pending_digest": digest, "known_digests_json": string(raw)}).Error; err != nil {
-			return err
+		if !noAcquisition {
+			if err := tx.Model(&models.BTSelectionGroup{}).Where("id = ? AND lease_owner = ?", group.ID, lease).Updates(map[string]any{"pending_digest": digest, "known_digests_json": string(raw)}).Error; err != nil {
+				return err
+			}
 		}
 		snapshot = downloadpkg.SelectionGroup{Version: 1, ID: group.ID, Tag: "omc-group-" + group.ID[:32], Workspace: group.Workspace, Revision: group.Revision, Epoch: group.LeaseEpoch, PreviousDigests: known, Union: union, Resume: resume, Empty: empty}
 		return nil
@@ -360,7 +367,7 @@ func (c *selectionGroupClient) with(ctx context.Context, intent string, fn func(
 	}
 	ctx = downloadpkg.WithSelectionFence(ctx, check)
 	provider := downloadpkg.Task{ID: group.ProviderTaskID}
-	if group.CleanupState == "" {
+	if group.CleanupState == "" && !noAcquisition {
 		provider, err = c.groups.ApplySelectionGroup(ctx, downloadpkg.SubmitRequest{Source: c.source, SavePath: group.Workspace, Tag: c.task.ProviderTag}, snapshot)
 	}
 	if err != nil {
@@ -372,14 +379,16 @@ func (c *selectionGroupClient) with(ctx context.Context, intent string, fn func(
 	if err = check(); err != nil {
 		return err
 	}
-	digest, _ := snapshot.Union.Digest()
-	raw, _ := json.Marshal([]string{digest})
-	r := c.service.db.WithContext(ctx).Model(&models.BTSelectionGroup{}).Where("id = ? AND lease_owner = ? AND lease_epoch = ? AND revision = ?", group.ID, lease, snapshot.Epoch, snapshot.Revision).Updates(map[string]any{"provider_task_id": provider.ID, "applied_revision": snapshot.Revision, "applied_digest": digest, "pending_digest": "", "known_digests_json": string(raw), "updated_at": time.Now().UTC()})
-	if r.Error != nil {
-		return r.Error
-	}
-	if r.RowsAffected != 1 {
-		return downloadpkg.Error("downloader_selection_group_busy", true, nil)
+	if !noAcquisition {
+		digest, _ := snapshot.Union.Digest()
+		raw, _ := json.Marshal([]string{digest})
+		r := c.service.db.WithContext(ctx).Model(&models.BTSelectionGroup{}).Where("id = ? AND lease_owner = ? AND lease_epoch = ? AND revision = ?", group.ID, lease, snapshot.Epoch, snapshot.Revision).Updates(map[string]any{"provider_task_id": provider.ID, "applied_revision": snapshot.Revision, "applied_digest": digest, "pending_digest": "", "known_digests_json": string(raw), "updated_at": time.Now().UTC()})
+		if r.Error != nil {
+			return r.Error
+		}
+		if r.RowsAffected != 1 {
+			return downloadpkg.Error("downloader_selection_group_busy", true, nil)
+		}
 	}
 	binding := downloadpkg.SelectionContext{Tag: c.task.ProviderTag, Selection: *c.source.ContentSelection, RootName: manifest.Name, MultiFile: manifest.MultiFile, Group: &snapshot}
 	if fn != nil {
@@ -401,13 +410,24 @@ func (c *selectionGroupClient) Submit(ctx context.Context, r downloadpkg.SubmitR
 	return
 }
 func (c *selectionGroupClient) Get(ctx context.Context, id string) (out downloadpkg.Task, err error) {
+	return c.inspect(ctx, id, false)
+}
+
+// inspectForCleanup reads only the already-owned native selection. Unlike a
+// download reconciliation, it never reapplies a union or recreates a missing
+// native torrent, and it never manufactures applied revision/digest evidence.
+func (c *selectionGroupClient) inspectForCleanup(ctx context.Context, id string) (downloadpkg.Task, error) {
+	return c.inspect(ctx, id, true)
+}
+
+func (c *selectionGroupClient) inspect(ctx context.Context, id string, cleanupOnly bool) (out downloadpkg.Task, err error) {
 	err = c.with(ctx, "", func(ctx context.Context, b downloadpkg.SelectionContext, t downloadpkg.Task) error {
 		if id != "" && id != t.ID {
 			return downloadpkg.Error("downloader_selection_identity_mismatch", false, nil)
 		}
 		out, err = c.selective.GetSelected(ctx, t.ID, b)
 		return err
-	})
+	}, cleanupOnly)
 	return
 }
 func (c *selectionGroupClient) Manifest(ctx context.Context, id string) (out downloadpkg.Manifest, err error) {

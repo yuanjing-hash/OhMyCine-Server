@@ -10,7 +10,7 @@ import MediaReorganizationDialog from '@/components/MediaReorganizationDialog.vu
 import SecretInput from '@/components/SecretInput.vue'
 import TransferNodesPanel from '@/components/TransferNodesPanel.vue'
 import { credentialLoader } from '@/credentials'
-import { beginDownloadRetry, isCloudDownloader, isDownloadSubmissionPending, downloadSourceKind, canCancelDownloadPipeline, downloadErrorMessage, downloadProviderStatusLabel, downloadStatusClass, downloadStatusLabel, formatBytes, formatETA, formatProgress, formatSampleTime, isDownloadHistoryTask, nodeSupportsDownloader, nodePan115UnsupportedSource, parseDownloadSourceLines, reconcileDownloadRetries, summarizeDownloaderTasks, torrentToBase64, type DownloadManagementSection, type DownloadRetryPresentations, type DownloadSourceMode } from '@/downloads'
+import { beginDownloadRetry, isSourceCleanupTask, isCloudDownloader, isDownloadSubmissionPending, downloadSourceKind, canCancelDownloadPipeline, downloadErrorMessage, downloadProviderStatusLabel, downloadStatusClass, downloadStatusLabel, formatBytes, formatETA, formatProgress, formatSampleTime, isDownloadHistoryTask, nodeSupportsDownloader, nodePan115UnsupportedSource, parseDownloadSourceLines, reconcileDownloadRetries, summarizeDownloaderTasks, torrentToBase64, type DownloadManagementSection, type DownloadRetryPresentations, type DownloadSourceMode } from '@/downloads'
 import { previewDownloadRoutes, routeTargetByID, type DownloadRoutePreview } from '@/download-routes'
 import { useAuthStore } from '@/stores/auth'
 import { notify } from '@/toast'
@@ -23,6 +23,10 @@ const router = useRouter()
 const downloaders = ref<DownloaderSummary[]>([])
 const tasks = ref<DownloadTaskSummary[]>([])
 const seedingTasks = ref<SeedingTaskSummary[]>([])
+const postImportGroups = computed(() => [
+  { title: '源文件清理', tasks: seedingTasks.value.filter(isSourceCleanupTask) },
+  { title: '做种任务', tasks: seedingTasks.value.filter(task => !isSourceCleanupTask(task)) },
+])
 const downloadSettings = ref<DownloadSettings | null>(null)
 const mediaLibraries = ref<MediaLibraryDetail[]>([])
 const storages = ref<StorageSummary[]>([])
@@ -88,7 +92,7 @@ const visibleSections = computed(() => ([
   { id: 'active', label: '进行中', count: activeTotal.value, visible: canReadDownloads.value },
   { id: 'history', label: '历史记录', count: historyTotal.value, visible: canReadDownloads.value },
   { id: 'create', label: '新建下载', visible: auth.can(Permissions.DownloadsCreate) },
-  { id: 'seeding', label: '做种管理', count: seedingTasks.value.filter(item => item.phase !== 'completed').length, visible: canReadDownloads.value },
+  { id: 'seeding', label: '源清理 / 做种', count: seedingTasks.value.filter(item => item.phase !== 'completed').length, visible: canReadDownloads.value },
   { id: 'downloaders', label: '下载器管理', count: downloaders.value.length, visible: canReadDownloaders.value },
   { id: 'nodes', label: '传输节点', visible: canReadTransferNodes.value },
 ] as Array<{ id: DownloadManagementSection; label: string; count?: number; visible: boolean }>).filter(item => item.visible))
@@ -486,12 +490,13 @@ async function confirmDeleteDownload() {
 }
 
 async function stopSeeding(task: SeedingTaskSummary) {
-  const consequence = task.delete_data ? '删除 qBittorrent 任务以及统一暂存目录中的源文件' : '只删除 qBittorrent 任务并保留源文件，保证媒体库软链接继续有效'
-  if (!window.confirm(`确认立即停止做种？将${consequence}。`)) return
+  const consequence = task.delete_data ? '移除原下载器任务并清理本任务受管源文件' : '只移除原下载器任务，保留源文件'
+  const purpose = isSourceCleanupTask(task) ? '执行源文件清理' : '立即停止做种'
+  if (!window.confirm(`确认${purpose}？将${consequence}；其他共享引用仍受保护。`)) return
   saving.value = true
   try {
     await api(`/api/v1/seeding-tasks/${task.id}/stop`, { method: 'POST', body: '{}' })
-    notify('做种清理已完成', 'success')
+    notify(isSourceCleanupTask(task) ? '源文件收尾已完成' : '做种清理已完成', 'success')
   } catch (reason) { notify(message(reason), 'error') } finally { saving.value = false; await load(false, true) }
 }
 
@@ -516,7 +521,13 @@ function seededTime(seconds: number | null) {
   const hours = Math.floor(seconds / 3600), minutes = Math.floor((seconds % 3600) / 60)
   return hours > 0 ? `${hours} 小时 ${minutes} 分钟` : `${minutes} 分钟`
 }
-function seedingPhaseLabel(phase: SeedingTaskSummary['phase']) { return ({ queued: '等待采样', seeding: '正在做种', cleanup: '正在清理', retained: '保留做种', completed: '已停止', failed: '异常' } as const)[phase] }
+function seedingPhaseLabel(task: SeedingTaskSummary) {
+  if (isSourceCleanupTask(task)) {
+    if (task.last_error_code === 'shared_source_retained' && task.phase !== 'completed') return '共享清理延期'
+    return ({ queued: '等待源清理', seeding: '核对原任务', cleanup: '正在清理', retained: '等待源清理', completed: '收尾完成', failed: '清理受阻' } as const)[task.phase]
+  }
+  return ({ queued: '等待采样', seeding: '正在做种', cleanup: '正在清理', retained: '保留做种', completed: '已停止', failed: '异常' } as const)[task.phase]
+}
 function canStopSeeding(task: SeedingTaskSummary) { return task.phase !== 'completed' && (auth.can(Permissions.DownloadsManageAll) || (task.owner_id === auth.user?.id && auth.can(Permissions.JobsControlOwn))) }
 
 function stats(item: DownloaderSummary) { return summarizeDownloaderTasks(tasks.value, item.id) }
@@ -584,9 +595,38 @@ onBeforeUnmount(() => { if (refreshTimer !== undefined) window.clearInterval(ref
       </div>
     </section>
 
-    <section v-if="activeSection === 'seeding'" id="download-panel-seeding" class="mt-6" role="tabpanel" aria-labelledby="download-tab-seeding"><div class="flex flex-wrap items-end justify-between gap-3"><div><h2 class="m-0 text-xl">做种管理</h2><p class="text-subtle mb-0 mt-1 text-xs">复制和软链接入库任务在这里跟踪。复制清理源文件；软链接永远保留源文件。</p></div><ClearHistoryButton v-if="canClearSeedingHistory" scope="seeding" label="清除已结束记录" @cleared="load(false, true)" /></div>
-      <div v-if="seedingTasks.length === 0" class="panel mt-5">还没有做种任务。</div>
-      <div v-else class="downloader-grid mt-5"><article v-for="task in seedingTasks" :key="task.id" class="panel"><div class="flex items-start justify-between gap-3"><div><h3 class="m-0 text-base">{{ task.display_name || '未命名下载' }}</h3><p class="text-subtle mb-0 mt-1 text-xs">{{ task.downloader_name }} · {{ task.transfer_mode === 'copy' ? '复制入库' : '软链接入库' }} · {{ task.cleanup_enabled ? '自动清理' : '保留做种' }}</p></div><span :class="task.phase === 'failed' ? 'status-chip status-chip--error' : task.phase === 'completed' ? 'status-chip' : 'status-chip status-chip--ready'">{{ seedingPhaseLabel(task.phase) }}</span></div><dl class="mt-5 grid grid-cols-2 gap-3 text-sm"><div><dt class="text-subtle text-xs">分享率</dt><dd class="m-0 mt-1 font-700">{{ task.ratio == null ? '未知' : task.ratio.toFixed(2) }} / {{ task.minimum_ratio || '关闭' }}</dd></div><div><dt class="text-subtle text-xs">做种时长</dt><dd class="m-0 mt-1 font-700">{{ seededTime(task.seeded_seconds) }} / {{ task.minimum_seed_minutes ? `${task.minimum_seed_minutes} 分钟` : '关闭' }}</dd></div><div><dt class="text-subtle text-xs">已上传</dt><dd class="m-0 mt-1 font-700">{{ formatBytes(task.uploaded_bytes) }}</dd></div><div><dt class="text-subtle text-xs">清理动作</dt><dd class="m-0 mt-1 font-700">{{ task.delete_data ? '删任务和源文件' : '只删任务' }}</dd></div></dl><div v-if="canStopSeeding(task)" class="mt-5 flex flex-wrap gap-2"><button v-if="task.job_status === 'failed'" class="btn-secondary" type="button" :disabled="saving" @click="retryStage(task.job_id, '做种任务')">重试做种</button><button class="btn-danger" type="button" :disabled="saving" @click="stopSeeding(task)">立即停止做种</button></div></article></div>
+    <section v-if="activeSection === 'seeding'" id="download-panel-seeding" class="mt-6" role="tabpanel" aria-labelledby="download-tab-seeding">
+      <div class="flex flex-wrap items-end justify-between gap-3">
+        <div><h2 class="m-0 text-xl">下载收尾与做种</h2><p class="text-subtle mb-0 mt-1 text-xs">移动入库、上传网盘不保种，确认入库后处理源文件；上传网盘的复制保留源文件。其他本地复制按原做种策略执行，软链接始终保留源文件。</p></div>
+        <ClearHistoryButton v-if="canClearSeedingHistory" scope="seeding" label="清除已结束记录" @cleared="load(false, true)" />
+      </div>
+      <p v-if="seedingTasks.length === 0" class="panel mt-5">还没有下载收尾或做种任务。</p>
+      <section v-for="group in postImportGroups" v-else :key="group.title" class="mt-5">
+        <h3 class="text-base">{{ group.title }} · {{ group.tasks.filter(task => task.phase !== 'completed').length }} 项未结束</h3>
+        <p v-if="!group.tasks.length" class="text-subtle text-sm">暂无任务。</p>
+        <div v-else class="downloader-grid">
+          <article v-for="task in group.tasks" :key="task.id" class="panel">
+            <div class="flex items-start justify-between gap-3">
+              <div><h4 class="m-0 text-base">{{ task.display_name || '未命名下载' }}</h4><p class="text-subtle mb-0 mt-1 text-xs">{{ task.downloader_name }} · {{ task.transfer_mode === 'move' ? '移动入库' : task.transfer_mode === 'copy' ? '复制入库' : '软链接入库' }} · {{ isSourceCleanupTask(task) ? '本任务不保种' : task.cleanup_enabled ? '达到条件后清理' : '保留做种' }}</p></div>
+              <span :class="task.phase === 'failed' ? 'status-chip status-chip--error' : task.phase === 'completed' ? 'status-chip' : 'status-chip status-chip--ready'">{{ seedingPhaseLabel(task) }}</span>
+            </div>
+            <dl class="mt-5 grid grid-cols-2 gap-3 text-sm">
+              <template v-if="!isSourceCleanupTask(task)">
+                <div><dt class="text-subtle text-xs">分享率</dt><dd class="m-0 mt-1 font-700">{{ task.ratio == null ? '未知' : task.ratio.toFixed(2) }} / {{ task.minimum_ratio || '关闭' }}</dd></div>
+                <div><dt class="text-subtle text-xs">做种时长</dt><dd class="m-0 mt-1 font-700">{{ seededTime(task.seeded_seconds) }} / {{ task.minimum_seed_minutes ? `${task.minimum_seed_minutes} 分钟` : '关闭' }}</dd></div>
+                <div><dt class="text-subtle text-xs">已上传</dt><dd class="m-0 mt-1 font-700">{{ formatBytes(task.uploaded_bytes) }}</dd></div>
+              </template>
+              <div><dt class="text-subtle text-xs">源文件策略</dt><dd class="m-0 mt-1 font-700">{{ task.delete_data ? '移除原任务并清理受管源' : '移除原任务，保留源文件' }}</dd></div>
+            </dl>
+            <p v-if="task.last_error_code === 'shared_source_retained' && task.phase !== 'completed'" class="text-subtle text-sm">本任务引用已结束，其他任务仍使用共享源；物理清理延期，本任务不继续做种。</p>
+            <p v-else-if="isSourceCleanupTask(task) && task.last_error_code" class="semantic-error text-sm">源文件清理受阻（{{ task.last_error_code }}），已入库文件保留。连接可用后可重试本清理任务。</p>
+            <div v-if="canStopSeeding(task)" class="mt-5 flex flex-wrap gap-2">
+              <button v-if="task.job_status === 'failed'" class="btn-secondary" type="button" :disabled="saving" @click="retryStage(task.job_id, isSourceCleanupTask(task) ? '源文件清理' : '做种任务')">{{ isSourceCleanupTask(task) ? '重试源清理' : '重试做种' }}</button>
+              <button v-if="task.job_status !== 'failed' || !isSourceCleanupTask(task)" class="btn-danger" type="button" :disabled="saving" @click="stopSeeding(task)">{{ isSourceCleanupTask(task) ? '执行源清理' : '立即停止做种' }}</button>
+            </div>
+          </article>
+        </div>
+      </section>
     </section>
 
     <section v-if="activeSection === 'downloaders'" id="download-panel-downloaders" class="mt-6" role="tabpanel" aria-labelledby="download-tab-downloaders"><div class="flex flex-wrap items-end justify-between gap-4"><div><h2 class="m-0 text-xl">下载器管理</h2><p class="text-subtle mb-0 mt-1 text-xs">优先顺序从上到下；PT 固定首个已启用 qB，故障时不自动换下一个；公开 BT 按兼容顺序选择。BT 下载器使用系统暂存目录，115 下载器绑定数据源和下载目录。</p></div><button v-if="auth.can(Permissions.DownloadersCreate)" class="btn-primary" @click="createOpen = !createOpen">{{ createOpen ? '取消添加' : '添加下载器' }}</button></div>

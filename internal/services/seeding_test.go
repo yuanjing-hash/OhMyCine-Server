@@ -19,6 +19,9 @@ func seedingFixture(t *testing.T, mode string, cleanup bool) (*SeedingService, *
 	t.Helper()
 	_, downloaders, queue, actor, client := downloadFixture(t)
 	actor.Permissions[authz.PermissionJobsControlOwn] = struct{}{}
+	actor.Permissions[authz.PermissionDiscoveryRead] = struct{}{}
+	actor.Permissions[authz.PermissionDownloadsCreate] = struct{}{}
+	persistFixtureAuthority(t, queue.db, actor)
 	provider, err := downloaders.Create(actor, DownloaderInput{Name: "qBit seeding", Type: models.DownloaderTypeQBittorrent, BaseURL: "http://127.0.0.1:8080", Enabled: true}, RequestContext{})
 	if err != nil {
 		t.Fatal(err)
@@ -51,7 +54,7 @@ func seedingFixture(t *testing.T, mode string, cleanup bool) (*SeedingService, *
 	if err := queue.db.Create(&library).Error; err != nil {
 		t.Fatal(err)
 	}
-	transfer := models.TransferTask{ID: "transfer-" + mode, OwnerID: actor.User.ID, JobID: download.JobID, DownloadTaskID: download.ID, LibraryID: library.ID, LibraryName: library.Name, ManifestJSON: string(rawManifest), SourceManifestJSON: string(rawManifest), Phase: models.TransferTaskStatusCompleted, CleanupStatus: models.TransferCleanupDeferred, CreatedAt: now, UpdatedAt: now}
+	transfer := models.TransferTask{ID: "transfer-" + mode, OwnerID: actor.User.ID, JobID: download.JobID, DownloadTaskID: download.ID, LibraryID: library.ID, LibraryName: library.Name, ManifestJSON: string(rawManifest), SourceManifestJSON: string(rawManifest), Phase: models.TransferTaskStatusCompleted, CatalogPublishedAt: &now, CleanupStatus: models.TransferCleanupDeferred, CreatedAt: now, UpdatedAt: now}
 	if err := queue.db.Create(&transfer).Error; err != nil {
 		t.Fatal(err)
 	}
@@ -60,11 +63,33 @@ func seedingFixture(t *testing.T, mode string, cleanup bool) (*SeedingService, *
 
 func TestSeedingWorkerUsesModeSpecificCleanup(t *testing.T) {
 	for _, test := range []struct {
+		name       string
 		mode       string
 		deleteData bool
-	}{{models.MediaLibraryTransferCopy, true}, {models.MediaLibraryTransferSymlink, false}} {
-		t.Run(test.mode, func(t *testing.T) {
-			service, queue, _, client, download := seedingFixture(t, test.mode, true)
+		cloud      bool
+		cleanup    bool
+	}{
+		{name: "local-copy", mode: models.MediaLibraryTransferCopy, deleteData: true, cleanup: true},
+		{name: "symlink", mode: models.MediaLibraryTransferSymlink, cleanup: true},
+		{name: "move-disabled", mode: models.MediaLibraryTransferMove},
+		{name: "move-enabled", mode: models.MediaLibraryTransferMove, cleanup: true},
+		{name: "cloud-move", mode: models.MediaLibraryTransferMove, cloud: true, cleanup: true, deleteData: true},
+		{name: "cloud-copy", mode: models.MediaLibraryTransferCopy, cloud: true, cleanup: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			service, queue, actor, client, download := seedingFixture(t, test.mode, test.cleanup)
+			if test.cloud {
+				download.SourceDataSourceJSON, _ = marshalDataSourceIdentity(models.DataSourceIdentity{Kind: models.DataSourceKindLocal, ProviderType: models.StorageTypeLocal, ConnectionIdentity: models.DataSourceLocalConnectionIdentity})
+				download.TargetDataSourceJSON, _ = marshalDataSourceIdentity(models.DataSourceIdentity{Kind: models.DataSourceKindProvider, ProviderType: "fixture-cloud", ConnectionIdentity: "1", StorageScope: "2"})
+				download.TransferRouteKind, download.TransferRouteVersion = models.TransferRouteCrossSource, models.TransferRouteVersionCurrent
+				download.TargetStorageType = "fixture-cloud"
+				if err := queue.db.Save(&download).Error; err != nil {
+					t.Fatal(err)
+				}
+				if err := queue.db.Model(&models.TransferTask{}).Where("download_task_id = ?", download.ID).Updates(map[string]any{"source_data_source_json": download.SourceDataSourceJSON, "target_data_source_json": download.TargetDataSourceJSON, "route_kind": download.TransferRouteKind, "route_version": download.TransferRouteVersion}).Error; err != nil {
+					t.Fatal(err)
+				}
+			}
 			logManager, logger := captureRemainingBusiness(t, "seeding")
 			service.log = logger
 			cleanupCalls := 0
@@ -76,9 +101,25 @@ func TestSeedingWorkerUsesModeSpecificCleanup(t *testing.T) {
 				return nil
 			})
 			ratio, seeded, uploaded := 1.5, int64(7200), int64(1024)
+			immediate := test.mode == models.MediaLibraryTransferMove || test.cloud
+			remote := download
+			remote.ExecutionLocation = models.NodeLocationRemote
+			disposition, err := downloadSourceDisposition(remote)
+			if err != nil || disposition.immediate() != immediate || disposition.allowsWholePackageDelete(remote) != (test.mode == models.MediaLibraryTransferMove || test.mode == models.MediaLibraryTransferCopy && !test.cloud) {
+				t.Fatalf("Node placement changed logical policy: %+v err=%v", disposition, err)
+			}
+			if immediate {
+				ratio, seeded = 0, 0 // Even explicit global thresholds do not apply.
+			}
 			client.seedTask = &downloadpkg.Task{ID: "provider-hash", Status: "uploading", Ratio: &ratio, SeededSeconds: &seeded, UploadedBytes: &uploaded, Seeding: true}
 			if err := service.Enqueue(download); err != nil {
 				t.Fatal(err)
+			}
+			if test.cloud && test.mode == models.MediaLibraryTransferCopy {
+				// A legacy remote Copy row used to permit whole-package deletion.
+				if err := queue.db.Model(&models.SeedingTask{}).Where("download_task_id = ?", download.ID).Update("delete_data", true).Error; err != nil {
+					t.Fatal(err)
+				}
 			}
 			claimed, err := queue.Claim([]string{"seeding"})
 			if err != nil || claimed == nil {
@@ -88,7 +129,7 @@ func TestSeedingWorkerUsesModeSpecificCleanup(t *testing.T) {
 			if result.ErrorCode != "" || result.RetryAt != nil {
 				t.Fatalf("result=%+v", result)
 			}
-			if !client.cancelled || client.deleteData != test.deleteData {
+			if !client.cancelled || client.deleteData != test.deleteData || client.getCalls == 0 {
 				t.Fatalf("cancelled=%v deleteData=%v", client.cancelled, client.deleteData)
 			}
 			if cleanupCalls != 1 {
@@ -101,8 +142,20 @@ func TestSeedingWorkerUsesModeSpecificCleanup(t *testing.T) {
 			if task.Phase != models.SeedingTaskStatusCompleted || task.Ratio == nil || *task.Ratio != ratio {
 				t.Fatalf("task=%+v", task)
 			}
+			items, err := service.List(actor, 10)
+			if err != nil || len(items) != 1 || (items[0].Purpose == sourcePurposeCleanup) != immediate {
+				t.Fatalf("purpose projection=%+v err=%v", items, err)
+			}
+			job, err := queue.Get(actor, task.JobID)
+			if err != nil || (job.Purpose == sourcePurposeCleanup) != immediate || immediate && !strings.HasPrefix(job.DisplayName, "源文件清理：") {
+				t.Fatalf("job projection=%+v err=%v", job, err)
+			}
 			entries := remainingBusinessEntries(t, logManager)
-			requireRemainingBusinessEvent(t, entries, "seeding.provider.accepted", "accepted")
+			planned := requireRemainingBusinessEvent(t, entries, "seeding.cleanup.start", "started")
+			accepted := requireRemainingBusinessEvent(t, entries, "seeding.provider.accepted", "accepted")
+			if !strings.HasPrefix(planned.Fields["action"].(string), "prepare_") || strings.HasPrefix(accepted.Fields["action"].(string), "prepare_") {
+				t.Fatal("planned deletion was presented as an accepted action", planned, accepted)
+			}
 			finished := requireRemainingBusinessEvent(t, entries, "seeding.finish", "finished")
 			if finished.Fields["mode"] != test.mode || finished.Fields["downloader_name"] != task.DownloaderName {
 				t.Fatalf("cleanup narrative lost actual mode/downloader: %+v", finished)
@@ -196,15 +249,69 @@ func TestSeedingDisabledRetainsProviderAndMoveRemovesOnlyTask(t *testing.T) {
 		t.Fatalf("delete active seeding downloader err=%v", err)
 	}
 
-	moveService, moveQueue, _, moveClient, moved := seedingFixture(t, models.MediaLibraryTransferMove, true)
+	moveService, moveQueue, moveActor, moveClient, moved := seedingFixture(t, models.MediaLibraryTransferMove, true)
+	moveClient.getErr = downloadpkg.Error("downloader_auth_failed", false, nil)
+	logManager, logger := captureRemainingBusiness(t, "source-cleanup-retry")
+	moveService.log = logger
 	if err := moveService.AfterTransfer(context.Background(), moved); err != nil {
 		t.Fatal(err)
 	}
-	if !moveClient.cancelled || moveClient.deleteData {
-		t.Fatalf("move cleanup cancelled=%v deleteData=%v", moveClient.cancelled, moveClient.deleteData)
+	var moveTask models.SeedingTask
+	if err := moveQueue.db.First(&moveTask, "download_task_id = ?", moved.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	// Exercise an old failed Job through normal retry. It remains the original
+	// cleanup identity, and its original acquisition is never replayed.
+	if err := moveQueue.db.Model(&models.Job{}).Where("id = ?", moveTask.JobID).Updates(map[string]any{"display_name": "做种：" + moved.DisplayName, "status": models.JobStatusFailed}).Error; err != nil {
+		t.Fatal(err)
+	}
+	projected, err := moveQueue.Get(moveActor, moveTask.JobID)
+	if err != nil || projected.Purpose != sourcePurposeCleanup || projected.DisplayName != "源文件清理："+moved.DisplayName {
+		t.Fatalf("legacy job=%+v err=%v", projected, err)
+	}
+	if _, err := moveQueue.Control(moveActor, moveTask.JobID, "retry", RequestContext{}); err != nil {
+		t.Fatal(err)
+	}
+	moveJob, err := moveQueue.Claim([]string{"seeding"})
+	if err != nil || moveJob == nil {
+		t.Fatalf("claim=%+v err=%v", moveJob, err)
+	}
+	worker := NewSeedingWorker(moveService)
+	if err := moveQueue.db.Model(&models.TransferTask{}).Where("download_task_id = ?", moved.ID).Update("catalog_published_at", nil).Error; err != nil {
+		t.Fatal(err)
+	}
+	blocked := worker.Run(context.Background(), workerRuntime{queue: moveQueue, job: *moveJob}, *moveJob)
+	if blocked.ErrorCode != "source_cleanup_import_pending" || blocked.RetryAt == nil || moveClient.getCalls != 0 || moveClient.cancelled {
+		t.Fatalf("unpublished import authorized native cleanup: %+v", blocked)
+	}
+	if err := moveQueue.db.Model(&models.TransferTask{}).Where("download_task_id = ?", moved.ID).Update("catalog_published_at", time.Now().UTC()).Error; err != nil {
+		t.Fatal(err)
+	}
+	failed := worker.Run(context.Background(), workerRuntime{queue: moveQueue, job: *moveJob}, *moveJob)
+	if failed.ErrorCode != "downloader_auth_failed" || failed.RetryAt != nil || moveClient.cancelled || moveClient.submits != 0 {
+		t.Fatalf("auth failure sent cleanup or replayed acquisition: %+v client=%+v", failed, moveClient)
+	}
+	failureLog := requireRemainingBusinessEvent(t, remainingBusinessEntries(t, logManager), "seeding.failed", "failed")
+	if failureLog.Fields["action"] != "inspect_task" || failureLog.Fields["stage"] != "cleanup" {
+		t.Fatalf("failed read claimed source deletion: %+v", failureLog)
+	}
+	if err := moveQueue.Fail(moveJob.Job.ID, moveJob.LeaseToken, failed.ErrorCode, failed.ErrorMessage); err != nil {
+		t.Fatal(err)
+	}
+	moveClient.getErr = nil
+	if _, err := moveQueue.Control(moveActor, moveTask.JobID, "retry", RequestContext{}); err != nil {
+		t.Fatal(err)
+	}
+	moveJob, err = moveQueue.Claim([]string{"seeding"})
+	if err != nil || moveJob == nil {
+		t.Fatal(err)
+	}
+	result = worker.Run(context.Background(), workerRuntime{queue: moveQueue, job: *moveJob}, *moveJob)
+	if result.ErrorCode != "" || result.RetryAt != nil || !moveClient.cancelled || moveClient.deleteData || moveClient.submits != 0 {
+		t.Fatalf("move retry=%+v cancelled=%v deleteData=%v submits=%d", result, moveClient.cancelled, moveClient.deleteData, moveClient.submits)
 	}
 	var count int64
-	if err := moveQueue.db.Model(&models.SeedingTask{}).Count(&count).Error; err != nil || count != 0 {
+	if err := moveQueue.db.Model(&models.SeedingTask{}).Count(&count).Error; err != nil || count != 1 {
 		t.Fatalf("count=%d err=%v", count, err)
 	}
 	missingDownloader := "removed-downloader"
@@ -234,6 +341,43 @@ func TestSeedingProviderTaskNotFoundCompletesIdempotently(t *testing.T) {
 	}
 	if task.Phase != models.SeedingTaskStatusCompleted {
 		t.Fatalf("phase=%s", task.Phase)
+	}
+	for _, action := range []string{"stop", "interrupt"} {
+		t.Run(action, func(t *testing.T) {
+			service, queue, actor, client, download := seedingFixture(t, models.MediaLibraryTransferMove, true)
+			client.getErr = downloadpkg.Error("downloader_task_not_found", false, nil)
+			cleanupCalls := 0
+			service.SetStagingCleanup(func(ctx context.Context, _ string, _ bool) error {
+				cleanupCalls++
+				if missing, _ := ctx.Value(sourceNativeTaskMissingKey{}).(bool); !missing {
+					t.Fatal("native task absence was not passed to source cleanup")
+				}
+				return nil
+			})
+			if err := service.Enqueue(download); err != nil {
+				t.Fatal(err)
+			}
+			var task models.SeedingTask
+			if err := queue.db.First(&task, "download_task_id = ?", download.ID).Error; err != nil {
+				t.Fatal(err)
+			}
+			if action == "stop" {
+				if _, err := service.Stop(context.Background(), actor, task.ID, RequestContext{}); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				claimed, err := queue.Claim([]string{"seeding"})
+				if err != nil || claimed == nil {
+					t.Fatal(err)
+				}
+				if err := NewSeedingWorker(service).Interrupt(context.Background(), *claimed, "cancel"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if client.cancelled || cleanupCalls != 1 {
+				t.Fatalf("missing native task sent a delete request: cancelled=%v cleanup=%d", client.cancelled, cleanupCalls)
+			}
+		})
 	}
 }
 

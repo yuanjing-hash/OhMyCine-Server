@@ -71,7 +71,7 @@ func safeTransferSummary(item TransferSummary) TransferSummary {
 
 func safeSeedingSummary(item SeedingTaskSummary) SeedingTaskSummary {
 	return SeedingTaskSummary{ID: item.ID, JobID: item.JobID, JobStatus: item.JobStatus, DownloadTaskID: item.DownloadTaskID, OwnerID: item.OwnerID,
-		DisplayName: "资源权限受限的做种任务", Phase: item.Phase, Ratio: item.Ratio, SeededSeconds: item.SeededSeconds, UploadedBytes: item.UploadedBytes,
+		DisplayName: "资源权限受限的下载收尾任务", Phase: item.Phase, Ratio: item.Ratio, SeededSeconds: item.SeededSeconds, UploadedBytes: item.UploadedBytes,
 		LastSampledAt: item.LastSampledAt, LastErrorCode: item.LastErrorCode, CreatedAt: item.CreatedAt, UpdatedAt: item.UpdatedAt, FinishedAt: item.FinishedAt}
 }
 

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/authz"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
 	downloadpkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/downloader"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/resourcecontent"
@@ -254,7 +255,9 @@ func TestDownloadSelectionGroupDurableUnionLateRestoreCancelAndAckRecovery(t *te
 	b.TransferMode = models.MediaLibraryTransferMove
 	b.ProviderTaskID = "shared-native"
 	b.TargetLibraryID = &library.ID
-	if err = queue.db.Model(&models.DownloadTask{}).Where("id = ?", b.ID).Update("provider_task_id", b.ProviderTaskID).Error; err != nil {
+	b.Phase = models.DownloadTaskStatusCompleted
+	b.SeedingCleanupEnabled, b.SeedingMinimumMinutes, b.SeedingMinimumRatio = true, 1440, 100
+	if err = queue.db.Model(&models.DownloadTask{}).Where("id = ?", b.ID).Updates(map[string]any{"provider_task_id": b.ProviderTaskID, "phase": b.Phase, "seeding_cleanup_enabled": true, "seeding_minimum_minutes": 1440, "seeding_minimum_ratio": 100}).Error; err != nil {
 		t.Fatal(err)
 	}
 	seeding := NewSeedingService(queue.db, queue.audit, queue, service, zerolog.Nop())
@@ -265,9 +268,33 @@ func TestDownloadSelectionGroupDurableUnionLateRestoreCancelAndAckRecovery(t *te
 	if err != nil || claimed == nil {
 		t.Fatal("group did not use existing cleanup job", err)
 	}
+	var beforeCleanup models.BTSelectionGroup
+	if err = queue.db.First(&beforeCleanup, "id = ?", b.BTSelectionGroupID).Error; err != nil {
+		t.Fatal(err)
+	}
+	beforeApplies := provider.applies
 	result := NewSeedingWorker(seeding).Run(context.Background(), workerRuntime{queue: queue, job: *claimed}, *claimed)
 	if result.RetryAt == nil || provider.cleanupRequests != 0 {
 		t.Fatal("cleanup job did not defer active consumer", result)
+	}
+	var waiting models.SeedingTask
+	if err = queue.db.First(&waiting, "download_task_id = ?", b.ID).Error; err != nil || waiting.Phase != models.SeedingTaskStatusCleanup || waiting.LastErrorCode != "shared_source_retained" {
+		t.Fatal("move reference was incorrectly kept seeding", waiting, err)
+	}
+	actor.Permissions[authz.PermissionDownloadsManageAll] = struct{}{}
+	if _, e := seeding.Stop(context.Background(), actor, waiting.ID, RequestContext{}); ErrorCode(e) != CodeConflict {
+		t.Fatal("manual cleanup finished while another shared consumer was active", e)
+	}
+	if e := NewSeedingWorker(seeding).Interrupt(context.Background(), *claimed, "cancel"); ErrorCode(e) != CodeConflict {
+		t.Fatal("task-center control finished while another shared consumer was active", e)
+	}
+	var retired models.BTSelectionRef
+	if e := queue.db.First(&retired, "task_id = ?", b.ID).Error; e != nil || retired.State != "retired" || provider.cleanupRequests != 0 {
+		t.Fatal("source cleanup used download cancellation/released semantics", retired, e)
+	}
+	var afterCleanup models.BTSelectionGroup
+	if e := queue.db.First(&afterCleanup, "id = ?", b.BTSelectionGroupID).Error; e != nil || provider.applies != beforeApplies || afterCleanup.AppliedRevision != beforeCleanup.AppliedRevision || afterCleanup.AppliedDigest != beforeCleanup.AppliedDigest || afterCleanup.PendingDigest != beforeCleanup.PendingDigest || afterCleanup.KnownDigestsJSON != beforeCleanup.KnownDigestsJSON {
+		t.Fatal("cleanup acquired content or manufactured applied union facts", afterCleanup, e)
 	}
 	cleanupB := boundB.(interface {
 		retireAndCleanup(context.Context) (bool, error)
@@ -301,10 +328,11 @@ func TestDownloadSelectionGroupDurableUnionLateRestoreCancelAndAckRecovery(t *te
 	if len(original.ContentSelection.Files) != 1 || original.ContentSelection.Files[0].Path != "a.mkv" {
 		t.Fatal("union overwrote own source")
 	}
-	// A copy/retain reference in the same group keeps the move ref explicitly
-	// deferred. Nothing claims source cleanup completion while it still holds.
+	// A cloud-upload Copy reference in the same group keeps its copied bytes
+	// even when global seeding cleanup is enabled. Its active claim defers the
+	// group's cleanup, not the already retired Move reference's seeding.
 	c, sourceC, _ := makeTask(0, 10, "a.mkv")
-	if err = queue.db.Model(&models.DownloadTask{}).Where("id = ?", c.ID).Update("transfer_mode", models.MediaLibraryTransferCopy).Error; err != nil {
+	if err = queue.db.Model(&models.DownloadTask{}).Where("id = ?", c.ID).Updates(map[string]any{"transfer_mode": models.MediaLibraryTransferCopy, "target_storage_type": "fixture-cloud", "target_library_id": library.ID, "seeding_cleanup_enabled": true, "phase": models.DownloadTaskStatusCompleted}).Error; err != nil {
 		t.Fatal(err)
 	}
 	boundC, e := service.bindBTSelectionGroup(provider, config, c, sourceC)
@@ -321,11 +349,19 @@ func TestDownloadSelectionGroupDurableUnionLateRestoreCancelAndAckRecovery(t *te
 	if _, e = os.Stat(fileB); e != nil {
 		t.Fatal("move source vanished during retained ref", e)
 	}
-	if e = boundC.Cancel(context.Background(), "shared-native", false); e != nil {
+	cJob := models.Job{ID: uuid.NewString(), OwnerID: &c.OwnerID, JobType: "transfer", Status: models.JobStatusCompleted, PayloadJSON: "{}"}
+	if e = queue.db.Create(&cJob).Error; e != nil {
+		t.Fatal(e)
+	}
+	cTransfer := models.TransferTask{ID: uuid.NewString(), JobID: cJob.ID, OwnerID: c.OwnerID, DownloadTaskID: c.ID, LibraryID: library.ID, LibraryName: library.Name, ManifestJSON: "{}", Phase: models.TransferTaskStatusCompleted, CatalogPublishedAt: &now}
+	if e = queue.db.Create(&cTransfer).Error; e != nil {
 		t.Fatal(e)
 	}
 	provider.cleanupAckLost = true
-	if done, e := cleanupB.retireAndCleanup(context.Background()); e == nil || done || provider.cleanupRequests != 1 {
+	cleanupC := boundC.(interface {
+		retireAndCleanup(context.Context) (bool, error)
+	})
+	if done, e := cleanupC.retireAndCleanup(context.Background()); e == nil || done || provider.cleanupRequests != 1 {
 		t.Fatal("unknown native cleanup not retained", done, e)
 	}
 	if _, e := downloads.prepareBTSelectionGroup(actor.User.ID, config, downloadSourceEnvelope{Kind: sourceB.Kind, Torrent: sourceB.Torrent, ContentSelection: sourceB.ContentSelection, SelectionMode: "files"}, root, SubmitDownloadInput{SourceSiteID: 7}); e == nil {
@@ -352,6 +388,20 @@ func TestDownloadSelectionGroupDurableUnionLateRestoreCancelAndAckRecovery(t *te
 		if _, e = os.Stat(file); e != nil {
 			t.Fatal("cleanup removed protected source", file, e)
 		}
+	}
+	if e = queue.db.First(&cTransfer, "id = ?", cTransfer.ID).Error; e != nil || cTransfer.CleanupStatus != models.TransferCleanupSkipped || cTransfer.CleanupErrorCode != "copy_source_retained" {
+		t.Fatal("cloud Copy falsely claimed source deletion", cTransfer, e)
+	}
+	if e = queue.db.First(&transfer, "id = ?", transfer.ID).Error; e != nil {
+		t.Fatal(e)
+	}
+	transfers := NewTransferService(queue.db, queue.audit, queue, zerolog.Nop())
+	transfers.seeding = seeding
+	if result := NewTransferWorker(transfers).finishCompletedTransfer(context.Background(), transfer); result.ErrorCode != "" || result.RetryAt != nil {
+		t.Fatal("completed transfer repeat failed", result)
+	}
+	if e = queue.db.First(&transfer, "id = ?", transfer.ID).Error; e != nil || transfer.CleanupStatus != models.TransferCleanupCompleted {
+		t.Fatal("late transfer finish overwrote completed shared cleanup", transfer, e)
 	}
 	next, e := downloads.prepareBTSelectionGroup(actor.User.ID, config, downloadSourceEnvelope{Kind: sourceB.Kind, Torrent: sourceB.Torrent, ContentSelection: sourceB.ContentSelection, SelectionMode: "files"}, root, SubmitDownloadInput{SourceSiteID: 7})
 	if e != nil || next.Generation != groupB.Generation+1 || next.Workspace == groupB.Workspace {

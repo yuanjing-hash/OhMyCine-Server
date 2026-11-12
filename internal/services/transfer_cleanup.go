@@ -63,16 +63,15 @@ func (w *TransferWorker) finishCompletedTransfer(ctx context.Context, task model
 				return WorkerResult{RetryAt: &next, ErrorCode: "shared_source_cleanup_schedule_failed", ErrorMessage: "共享源策略检查将自动重试"}
 			}
 		}
-		// A reference never owns the physical package. Source data stays in its
-		// stable managed workspace for other references and seeding. Cleanup
-		// requires a separate fenced group-wide policy, not a task's move flag.
+		// A reference never owns the physical package. Its logical disposition
+		// is handled by the shared executor; other consumers keep their source.
 		if normalizeExecutionLocation(download.ExecutionLocation) == models.NodeLocationRemote {
 			if err := cleanupCrossSourceManagedRoot(task, download); err != nil {
 				next := time.Now().UTC().Add(time.Minute)
 				return WorkerResult{RetryAt: &next, ErrorCode: "node_staging_cleanup_failed", ErrorMessage: "本任务接收暂存清理将自动重试"}
 			}
 		}
-		_ = w.service.db.Model(&models.TransferTask{}).Where("id = ?", task.ID).Updates(map[string]any{"cleanup_status": models.TransferCleanupDeferred, "cleanup_error_code": "shared_source_retained", "updated_at": time.Now().UTC()}).Error
+		_ = w.service.db.Model(&models.TransferTask{}).Where("id = ? AND cleanup_status NOT IN ?", task.ID, []string{models.TransferCleanupCompleted, models.TransferCleanupSkipped}).Updates(map[string]any{"cleanup_status": models.TransferCleanupDeferred, "cleanup_error_code": "shared_source_retained", "updated_at": time.Now().UTC()}).Error
 		return WorkerResult{}
 	}
 	if download.ProviderType != models.DownloaderTypePan115Offline && download.ProviderType != models.DownloaderTypeQuarkShare && w.service.seeding != nil {
@@ -118,7 +117,10 @@ func (w *TransferWorker) finishCompletedTransfer(ctx context.Context, task model
 			next := time.Now().UTC().Add(time.Minute)
 			return WorkerResult{RetryAt: &next, ErrorCode: "node_staging_checkpoint_cleanup_failed", ErrorMessage: "入库已完成，断点记录清理将自动重试"}
 		}
-		_ = w.service.db.Model(&models.TransferTask{}).Where("id = ?", task.ID).Updates(map[string]any{"cleanup_status": models.TransferCleanupCompleted, "cleanup_error_code": "", "updated_at": time.Now().UTC()}).Error
+		// The receiver workspace is gone, but the original Node source still
+		// belongs to the durable post-import executor. Do not report its source
+		// cleanup as completed merely because transfer/upload has completed.
+		_ = w.service.db.Model(&models.TransferTask{}).Where("id = ? AND cleanup_status NOT IN ?", task.ID, []string{models.TransferCleanupCompleted, models.TransferCleanupSkipped}).Updates(map[string]any{"cleanup_status": models.TransferCleanupDeferred, "cleanup_error_code": "source_cleanup_pending", "updated_at": time.Now().UTC()}).Error
 		return WorkerResult{}
 	}
 	if download.ProviderType == models.DownloaderTypePluginHTTP {
@@ -135,11 +137,16 @@ func (w *TransferWorker) finishCompletedTransfer(ctx context.Context, task model
 		serverlog.OperationDownloadStagingCleanup.Event(w.service.log.Info()).Str("task_id", task.ID).Int("removed", removed).Str("source_cleanup", "plugin_managed_output").Msg(serverlog.OperationDownloadStagingCleanup.Message("已清理站点下载暂存产物"))
 		return WorkerResult{}
 	}
-	if download.ProviderType == models.DownloaderTypeQBittorrent && (download.TransferMode == models.MediaLibraryTransferCopy || download.TransferMode == models.MediaLibraryTransferSymlink) {
+	var sourceTaskCount int64
+	if err := w.service.db.Model(&models.SeedingTask{}).Where("download_task_id = ?", download.ID).Count(&sourceTaskCount).Error; err != nil {
+		next := time.Now().UTC().Add(time.Minute)
+		return WorkerResult{RetryAt: &next, ErrorCode: "source_cleanup_state_unavailable", ErrorMessage: "入库已完成，源文件收尾状态将自动重试"}
+	}
+	if sourceTaskCount > 0 {
 		if task.CleanupStatus != models.TransferCleanupCompleted {
-			_ = w.service.db.Model(&models.TransferTask{}).Where("id = ?", task.ID).Updates(map[string]any{"cleanup_status": models.TransferCleanupDeferred, "cleanup_error_code": "", "updated_at": time.Now().UTC()}).Error
+			_ = w.service.db.Model(&models.TransferTask{}).Where("id = ? AND cleanup_status NOT IN ?", task.ID, []string{models.TransferCleanupCompleted, models.TransferCleanupSkipped}).Updates(map[string]any{"cleanup_status": models.TransferCleanupDeferred, "cleanup_error_code": "source_cleanup_pending", "updated_at": time.Now().UTC()}).Error
 		}
-		w.transferEvent(ctx, task, "transfer.cleanup.deferred", "cleanup", "waiting", "来源文件仍用于做种或软链接，暂存清理已延后；不会提前删除下载源", map[string]any{"transfer_mode": download.TransferMode})
+		w.transferEvent(ctx, task, "transfer.cleanup.deferred", "cleanup", "waiting", "已交给原下载器收尾任务处理源文件策略；文件入库不重复执行，源清理结果单独记录", map[string]any{"transfer_mode": download.TransferMode})
 		return WorkerResult{}
 	}
 	if task.CleanupStatus == models.TransferCleanupCompleted || task.CleanupStatus == models.TransferCleanupSkipped {
@@ -165,17 +172,14 @@ func (w *TransferWorker) finishCompletedTransfer(ctx context.Context, task model
 	return WorkerResult{}
 }
 
-// CleanupAfterSeeding is called only after qBittorrent has acknowledged its
-// seeding cleanup. deleteData means the provider already removed the entire
-// source package; symlink mode keeps selected media and removes only the
-// unselected, manifest-owned files.
+// CleanupAfterSeeding retains its existing callback contract for post-import
+// source retirement and eligible seeding. deleteData is a native cleanup
+// acknowledgement, not authorization to delete an uploaded target. Missing
+// native-task facts and protected source retention are recorded separately.
 func (s *TransferService) CleanupAfterSeeding(ctx context.Context, downloadTaskID string, deleteData bool) error {
 	var task models.TransferTask
 	if err := s.db.First(&task, "download_task_id = ?", downloadTaskID).Error; err != nil {
 		return err
-	}
-	if task.CleanupStatus == models.TransferCleanupCompleted || task.CleanupStatus == models.TransferCleanupSkipped {
-		return nil
 	}
 	var download models.DownloadTask
 	if err := s.db.First(&download, "id = ?", downloadTaskID).Error; err != nil {
@@ -184,19 +188,44 @@ func (s *TransferService) CleanupAfterSeeding(ctx context.Context, downloadTaskI
 	if download.BTSelectionGroupID != "" {
 		return nil
 	}
+	disposition, err := downloadSourceDisposition(download)
+	if err != nil {
+		return err
+	}
+	if disposition.RetainSource && disposition.immediate() {
+		// Ending a cloud-upload Copy torrent is not authorization to delete its
+		// copied source, even if an older row persisted DeleteData=true.
+		return s.recordSourceCleanup(task, download, false, map[string]any{"cleanup_status": models.TransferCleanupSkipped, "cleanup_error_code": "copy_source_retained", "updated_at": time.Now().UTC()})
+	}
+	if missing, _ := ctx.Value(sourceNativeTaskMissingKey{}).(bool); missing && disposition.immediate() && (disposition.CloudUpload || normalizeExecutionLocation(download.ExecutionLocation) == models.NodeLocationRemote) {
+		// A missing native task is not proof of how its files were removed.
+		// Never manufacture a successful delete-data receipt from that read.
+		return s.recordSourceCleanup(task, download, false, map[string]any{"cleanup_status": models.TransferCleanupSkipped, "cleanup_error_code": "native_task_missing", "updated_at": time.Now().UTC()})
+	}
+	if !disposition.immediate() && (task.CleanupStatus == models.TransferCleanupCompleted || task.CleanupStatus == models.TransferCleanupSkipped) {
+		return nil
+	}
 	if deleteData {
 		extras, err := transferCleanupDifference(task)
 		if err != nil {
 			return s.persistTransferCleanupFailure(task.ID, "download_staging_manifest_invalid", err)
 		}
 		now := time.Now().UTC()
-		if err := s.db.Model(&models.TransferTask{}).Where("id = ?", task.ID).Updates(map[string]any{"cleanup_status": models.TransferCleanupCompleted, "cleanup_removed": len(extras), "cleanup_error_code": "", "updated_at": now}).Error; err != nil {
+		updates := map[string]any{"cleanup_status": models.TransferCleanupCompleted, "cleanup_removed": len(extras), "cleanup_error_code": "", "updated_at": now}
+		if err := s.recordSourceCleanup(task, download, disposition.immediate(), updates); err != nil {
 			return err
 		}
-		serverlog.OperationDownloadStagingCleanup.Event(s.log.Info()).Str("task_id", task.ID).Int("removed", len(extras)).Str("source_cleanup", "provider_delete_data").Msg(serverlog.OperationDownloadStagingCleanup.Message("做种结束后已由下载器清理暂存数据"))
+		serverlog.OperationDownloadStagingCleanup.Event(s.log.Info()).Str("task_id", task.ID).Int("removed", len(extras)).Str("source_cleanup", "provider_delete_data").Msg(serverlog.OperationDownloadStagingCleanup.Message("下载器源数据清理请求已确认，受管暂存收尾已记录"))
 		return nil
 	}
-	_, err := s.cleanupTransferStaging(ctx, task, download)
+	if disposition.immediate() && download.TransferMode == models.MediaLibraryTransferMove && (disposition.CloudUpload || normalizeExecutionLocation(download.ExecutionLocation) == models.NodeLocationRemote) {
+		// The ordinary Node protocol has only whole-package deletion. If its
+		// manifest contains protected leftovers, do not turn an inability to
+		// delete selected bytes exactly into a recursive/whole-package delete.
+		// The native task has ended; this is explicit source retention, not seed.
+		return s.recordSourceCleanup(task, download, false, map[string]any{"cleanup_status": models.TransferCleanupSkipped, "cleanup_error_code": "protected_source_retained", "updated_at": time.Now().UTC()})
+	}
+	_, err = s.cleanupTransferStaging(ctx, task, download)
 	return err
 }
 

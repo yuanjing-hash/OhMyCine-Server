@@ -1,4 +1,8 @@
-import type { DownloaderSummary, DownloadTaskSummary, TransferNodeSummary } from '@/types/api'
+import type { DownloaderSummary, DownloadTaskSummary, SeedingTaskSummary, TransferNodeSummary } from '@/types/api'
+
+export function isSourceCleanupTask(task: Pick<SeedingTaskSummary, 'purpose' | 'transfer_mode'>): boolean {
+  return task.purpose === 'source_cleanup' || task.transfer_mode === 'move'
+}
 
 export type DownloadSourceMode = 'url' | 'torrent' | 'share'
 export function isCloudShareSource(kind?: string): kind is '115_share' | 'quark_share' { return kind === '115_share' || kind === 'quark_share' }

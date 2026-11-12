@@ -435,7 +435,8 @@ export interface SeedingSettings {
 }
 export interface SeedingTaskSummary {
   id: string; job_id: string; job_status: string; download_task_id: string; owner_id: number
-  downloader_name: string; display_name: string; provider_type: string; transfer_mode: 'copy' | 'symlink'; delete_data: boolean
+  downloader_name: string; display_name: string; provider_type: string; transfer_mode: 'move' | 'copy' | 'symlink'; delete_data: boolean
+  purpose?: 'source_cleanup' | 'seeding'
   cleanup_enabled: boolean; minimum_seed_minutes: number; minimum_ratio: number; completion_mode: 'all' | 'any'
   phase: 'queued' | 'seeding' | 'cleanup' | 'retained' | 'completed' | 'failed'
   ratio: number | null; seeded_seconds: number | null; uploaded_bytes: number | null; last_sampled_at: string | null

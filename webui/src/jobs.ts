@@ -21,6 +21,7 @@ export interface Job {
   owner_id: number | null;
   created_by_kind: "user" | "system";
   job_type: string;
+  purpose?: 'source_cleanup' | 'seeding';
   priority: number;
   lane_position: number;
   lane_rank: number | null;
@@ -81,6 +82,19 @@ export const statusLabels: Record<JobStatus, string> = {
   failed: "失败",
   cancelled: "已取消",
 };
+const jobTypeLabels: Record<string, string> = {
+  download: '下载', transfer: '整理入库', 'follow-search': '订阅搜索',
+  unified_schedule: '计划任务', media_library_recognition: '识别媒体',
+  media_library_structure_diagnosis: '检查媒体库', media_library_repair: '整理媒体库',
+  media_library_retirement: '移除媒体库', media_reorganization: '整理媒体',
+  media_artifact: '生成媒体文件', strm_reconcile: '同步 STRM',
+  media_server_refresh: '刷新媒体服务器', seeding: '做种管理',
+  subscription_calendar_refresh: '更新播出计划',
+};
+export function jobTypeLabel(job: Pick<Job, 'job_type' | 'purpose'>): string {
+  if (job.job_type === 'seeding' && job.purpose === 'source_cleanup') return '源文件清理';
+  return jobTypeLabels[job.job_type] ?? job.job_type;
+}
 export function jobActionLabel(value: string): string {
   return ({
     overwrite: "覆盖",

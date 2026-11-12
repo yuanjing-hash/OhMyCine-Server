@@ -119,6 +119,7 @@ type SeedingTaskSummary struct {
 	DisplayName        string     `json:"display_name"`
 	ProviderType       string     `json:"provider_type"`
 	TransferMode       string     `json:"transfer_mode"`
+	Purpose            string     `json:"purpose,omitempty"`
 	DeleteData         bool       `json:"delete_data"`
 	CleanupEnabled     bool       `json:"cleanup_enabled"`
 	MinimumSeedMinutes int        `json:"minimum_seed_minutes"`
@@ -152,48 +153,11 @@ func (s *SeedingService) SetStagingCleanup(cleanup func(context.Context, string,
 	s.stagingCleanup = cleanup
 }
 
-// AfterTransfer applies the mode-specific provider lifecycle. Moving has
-// already removed the data from qBittorrent's save path, so its stale task is
-// removed without asking the provider to delete data. Copy/symlink continue
-// through durable seeding management.
+// AfterTransfer uses the existing durable post-import executor for both source
+// cleanup and eligible local seeding. Native cleanup failure must not turn an
+// already successful import into another transfer/upload attempt.
 func (s *SeedingService) AfterTransfer(ctx context.Context, download models.DownloadTask) error {
-	if download.BTSelectionGroupID != "" {
-		return s.Enqueue(download)
-	}
-	if normalizeExecutionLocation(download.ExecutionLocation) == models.NodeLocationRemote {
-		// Node downloads are copied over the data plane even when the final local
-		// organization mode is move. The original bytes still back qB seeding and
-		// must remain on the Node until the ordinary seeding policy finishes.
-		return s.Enqueue(download)
-	}
-	if download.TransferMode != models.MediaLibraryTransferMove {
-		return s.Enqueue(download)
-	}
-	if download.DownloaderID == nil || download.ProviderTaskID == "" {
-		return nil
-	}
-	_, supported, err := s.seedingDownloader(*download.DownloaderID)
-	if err != nil {
-		// Import has already completed and the provider configuration may have
-		// been removed concurrently. There is no credential left with which to
-		// clean the stale task, so do not turn a successful move into a stuck
-		// transfer retry loop.
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil
-		}
-		return err
-	}
-	if !supported {
-		return nil
-	}
-	client, err := s.downloaders.clientForDownloadTask(ctx, download)
-	if err != nil {
-		return err
-	}
-	if err := client.Cancel(ctx, download.ProviderTaskID, false); err != nil && !providerTaskMissing(err) {
-		return err
-	}
-	return nil
+	return s.Enqueue(download)
 }
 
 // Enqueue is restart-safe and deliberately stores no source path. Whole-package
@@ -201,7 +165,7 @@ func (s *SeedingService) AfterTransfer(ctx context.Context, download models.Down
 // that no unselected video or unmatched subtitle needs conservative retention.
 func (s *SeedingService) Enqueue(download models.DownloadTask) error {
 	remote := normalizeExecutionLocation(download.ExecutionLocation) == models.NodeLocationRemote
-	if download.BTSelectionGroupID == "" && !remote && download.TransferMode != models.MediaLibraryTransferCopy && download.TransferMode != models.MediaLibraryTransferSymlink {
+	if download.BTSelectionGroupID == "" && !remote && download.TransferMode != models.MediaLibraryTransferCopy && download.TransferMode != models.MediaLibraryTransferSymlink && download.TransferMode != models.MediaLibraryTransferMove {
 		return nil
 	}
 	if download.DownloaderID == nil || download.ProviderTaskID == "" {
@@ -216,6 +180,10 @@ func (s *SeedingService) Enqueue(download models.DownloadTask) error {
 	}
 	if !supported {
 		return nil
+	}
+	disposition, err := downloadSourceDisposition(download)
+	if err != nil {
+		return err
 	}
 	var existing models.SeedingTask
 	if err := s.db.Where("download_task_id = ?", download.ID).First(&existing).Error; err == nil {
@@ -224,12 +192,16 @@ func (s *SeedingService) Enqueue(download models.DownloadTask) error {
 		return err
 	}
 	now, id := time.Now().UTC(), uuid.NewString()
-	deleteData := (remote || download.TransferMode == models.MediaLibraryTransferCopy) && s.transferAllowsWholePackageCleanup(download.ID)
+	deleteData := disposition.allowsWholePackageDelete(download) && s.transferAllowsWholePackageCleanup(download.ID)
 	if download.BTSelectionGroupID != "" {
 		deleteData = false
 	}
 	record := models.SeedingTask{ID: id, OwnerID: download.OwnerID, DownloadTaskID: download.ID, ExecutionLocation: normalizeExecutionLocation(download.ExecutionLocation), NodeID: download.NodeID, NodeName: download.NodeName, DownloaderID: download.DownloaderID, DownloaderName: download.DownloaderName, ProviderType: download.ProviderType, ProviderTaskID: download.ProviderTaskID, TransferMode: download.TransferMode, DeleteData: deleteData, CleanupEnabled: download.SeedingCleanupEnabled, MinimumSeedMinutes: download.SeedingMinimumMinutes, MinimumRatio: download.SeedingMinimumRatio, CompletionMode: download.SeedingCompletionMode, Phase: models.SeedingTaskStatusQueued, CreatedAt: now, UpdatedAt: now}
-	_, err = s.queue.EnqueueWith(EnqueueJobInput{OwnerID: download.OwnerID, JobType: "seeding", DisplayName: "做种：" + download.DisplayName, Provider: download.ProviderType, ResourceKey: "downloader:" + *download.DownloaderID, Payload: seedingJobPayload{SeedingTaskID: id}}, func(tx *gorm.DB, job models.Job) error {
+	displayName := "做种：" + download.DisplayName
+	if disposition.immediate() {
+		displayName = "源文件清理：" + download.DisplayName
+	}
+	_, err = s.queue.EnqueueWith(EnqueueJobInput{OwnerID: download.OwnerID, JobType: "seeding", DisplayName: displayName, Provider: download.ProviderType, ResourceKey: "downloader:" + *download.DownloaderID, Payload: seedingJobPayload{SeedingTaskID: id}}, func(tx *gorm.DB, job models.Job) error {
 		record.JobID = job.ID
 		return tx.Create(&record).Error
 	})
@@ -286,7 +258,7 @@ func (s *SeedingService) List(actor Actor, limit int) ([]SeedingTaskSummary, err
 		jobIDs = append(jobIDs, record.JobID)
 	}
 	statuses := map[string]string{}
-	displayNames := map[string]string{}
+	downloadsByID := map[string]models.DownloadTask{}
 	resources := map[string]jobResourceAccess{}
 	if len(jobIDs) > 0 {
 		var jobs []models.Job
@@ -308,16 +280,16 @@ func (s *SeedingService) List(actor Actor, limit int) ([]SeedingTaskSummary, err
 			downloadIDs = append(downloadIDs, record.DownloadTaskID)
 		}
 		var downloads []models.DownloadTask
-		if err := s.db.Select("id", "display_name").Where("id IN ?", downloadIDs).Find(&downloads).Error; err != nil {
+		if err := s.db.Select("id", "display_name", "transfer_mode", "target_storage_type", "transfer_route_version", "transfer_route_kind", "source_data_source_json", "target_data_source_json").Where("id IN ?", downloadIDs).Find(&downloads).Error; err != nil {
 			return nil, err
 		}
 		for _, download := range downloads {
-			displayNames[download.ID] = download.DisplayName
+			downloadsByID[download.ID] = download
 		}
 	}
 	result := make([]SeedingTaskSummary, 0, len(records))
 	for _, record := range records {
-		item := seedingTaskSummary(record, statuses[record.JobID], displayNames[record.DownloadTaskID])
+		item := seedingTaskSummary(record, statuses[record.JobID], downloadsByID[record.DownloadTaskID])
 		if !resources[record.JobID].visible(actor) {
 			item = safeSeedingSummary(item)
 		}
@@ -341,14 +313,18 @@ func (s *SeedingService) Stop(ctx context.Context, actor Actor, id string, reque
 	defer func() {
 		fields := seedingBusinessFields(task)
 		fields["user_id"], fields["request_id"] = actor.User.ID, request.RequestID
-		remainingBusinessResult(ctx, s.log, serverlog.OperationSeedingManagement, "seeding.manual.finish", "cleanup", "手动结束做种流程已返回，管理记录已结束；任务移除和数据保留策略见本次处理记录", "手动结束做种流程未完成", started, fields, resultErr)
+		remainingBusinessResult(ctx, s.log, serverlog.OperationSeedingManagement, "seeding.manual.finish", "cleanup", "下载器收尾流程已返回，管理记录已结束；任务移除和源文件策略见本次处理记录", "下载器收尾流程尚未完成", started, fields, resultErr)
 	}()
 	if task.Phase != models.SeedingTaskStatusCompleted {
-		if err := s.cleanupProvider(ctx, &task); err != nil && !providerTaskMissing(err) {
-			return SeedingTaskSummary{}, appError(CodeDownloaderUnavailable, "下载器未能停止做种，请稍后重试", nil)
+		outcome, err := s.cleanupProvider(ctx, &task)
+		if err != nil {
+			return SeedingTaskSummary{}, appError(CodeDownloaderUnavailable, "下载器收尾尚未完成，请稍后重试原任务", err)
+		}
+		if outcome.sharedDeferred {
+			return SeedingTaskSummary{}, appError(CodeConflict, "本任务引用已结束，共享源仍被其他任务使用，物理清理延期；将继续核对原清理任务", nil)
 		}
 		if s.stagingCleanup != nil {
-			if err := s.stagingCleanup(ctx, task.DownloadTaskID, task.DeleteData); err != nil {
+			if err := s.stagingCleanup(outcome.context(ctx), task.DownloadTaskID, task.DeleteData); err != nil {
 				return SeedingTaskSummary{}, appError(CodeDownloaderUnavailable, "下载器任务已停止，但暂存清理将继续重试", err)
 			}
 		}
@@ -359,11 +335,11 @@ func (s *SeedingService) Stop(ctx context.Context, actor Actor, id string, reque
 	var job models.Job
 	_ = s.db.First(&job, "id = ?", task.JobID).Error
 	var download models.DownloadTask
-	_ = s.db.Select("display_name").First(&download, "id = ?", task.DownloadTaskID).Error
+	_ = s.db.First(&download, "id = ?", task.DownloadTaskID).Error
 	if err := s.db.First(&task, "id = ?", task.ID).Error; err != nil {
 		return SeedingTaskSummary{}, err
 	}
-	item := seedingTaskSummary(task, job.Status, download.DisplayName)
+	item := seedingTaskSummary(task, job.Status, download)
 	resources, err := jobResourceAccessRows(s.db, []models.Job{job})
 	if err != nil {
 		return SeedingTaskSummary{}, err
@@ -374,18 +350,58 @@ func (s *SeedingService) Stop(ctx context.Context, actor Actor, id string, reque
 	return item, nil
 }
 
-func (s *SeedingService) cleanupProvider(ctx context.Context, task *models.SeedingTask) error {
-	s.enforceSafeDeleteData(task)
+func (s *SeedingService) cleanupProvider(ctx context.Context, task *models.SeedingTask) (outcome sourceCleanupOutcome, resultErr error) {
+	if err := s.enforceSafeDeleteData(task); err != nil {
+		return outcome, err
+	}
 	if task.DownloaderID == nil {
-		return appError(CodeDownloaderUnavailable, "原下载器配置已不存在", nil)
+		return outcome, appError(CodeDownloaderUnavailable, "原下载器配置已不存在", nil)
 	}
 	var download models.DownloadTask
 	if err := s.db.First(&download, "id = ?", task.DownloadTaskID).Error; err != nil {
-		return err
+		return outcome, err
+	}
+	disposition, err := downloadSourceDisposition(download)
+	if err != nil {
+		return outcome, err
+	}
+	if disposition.immediate() && !s.sourceCleanupReady(download) {
+		return outcome, appError(CodeConflict, "目标文件和本批目录发布尚未确认，保留源文件", nil)
 	}
 	client, err := s.downloaders.clientForDownloadTask(ctx, download)
 	if err != nil {
-		return err
+		return outcome, err
+	}
+	if disposition.immediate() && download.BTSelectionGroupID != "" {
+		var group models.BTSelectionGroup
+		if err := s.db.First(&group, "id = ?", download.BTSelectionGroupID).Error; err != nil {
+			return outcome, err
+		}
+		if group.CleanupState == "completed" {
+			return outcome, nil
+		}
+		// retireAndCleanup performs its own ownership-scoped native read only
+		// after all consumers have retired and its original receipt is durable.
+		// Never run acquisition-capable group.Get as a cleanup preflight.
+		done, err := retireSourceSelectionGroup(ctx, client)
+		if err != nil {
+			return outcome, err
+		}
+		if !done {
+			outcome.sharedDeferred = true
+			err = s.db.Model(task).Updates(map[string]any{"phase": models.SeedingTaskStatusCleanup, "last_error_code": "shared_source_retained", "updated_at": time.Now().UTC()}).Error
+			return outcome, err
+		}
+		return outcome, nil
+	}
+	if disposition.immediate() {
+		if _, err := inspectPostImportSource(ctx, client, task.ProviderTaskID); err != nil {
+			if providerTaskMissing(err) {
+				outcome.nativeMissing = true
+				return outcome, nil
+			}
+			return outcome, err
+		}
 	}
 	policy := "仅移除下载器任务，保留下载数据"
 	if task.DeleteData {
@@ -393,12 +409,18 @@ func (s *SeedingService) cleanupProvider(ctx context.Context, task *models.Seedi
 	}
 	fields := seedingBusinessFields(*task)
 	fields["resource_name"] = download.DisplayName
+	fields["action"] = seedingCleanupAction(*task, true)
 	serverlog.RecordBusiness(ctx, s.log, serverlog.OperationSeedingManagement, serverlog.BusinessEvent{Code: "seeding.cleanup.start", Stage: "cleanup", Outcome: "started", Message: "开始处理“" + serverlog.BusinessDisplayName(download.DisplayName) + "”：" + policy, Fields: fields})
 	err = client.Cancel(ctx, task.ProviderTaskID, task.DeleteData)
-	if err == nil || providerTaskMissing(err) {
+	if providerTaskMissing(err) {
+		outcome.nativeMissing = true
+		return outcome, nil
+	}
+	if err == nil {
+		fields["action"] = seedingCleanupAction(*task, false)
 		serverlog.RecordBusiness(ctx, s.log, serverlog.OperationSeedingManagement, serverlog.BusinessEvent{Code: "seeding.provider.accepted", Stage: "cleanup", Outcome: "accepted", Message: "下载器“" + serverlog.BusinessDisplayName(task.DownloaderName) + "”已接受任务移除或确认任务已不存在；策略：" + policy + "，后续还需处理暂存清理和管理记录", Fields: fields})
 	}
-	return err
+	return outcome, err
 }
 
 func seedingBusinessFields(task models.SeedingTask) map[string]any {
@@ -406,12 +428,19 @@ func seedingBusinessFields(task models.SeedingTask) map[string]any {
 	if task.DownloaderID != nil {
 		fields["downloader_id"] = *task.DownloaderID
 	}
-	if task.DeleteData {
-		fields["action"] = "remove_task_and_data"
-	} else {
-		fields["action"] = "remove_task_keep_data"
-	}
+	fields["action"] = "inspect_task"
 	return fields
+}
+
+func seedingCleanupAction(task models.SeedingTask, planned bool) string {
+	action := "remove_task_keep_data"
+	if task.DeleteData {
+		action = "remove_task_and_data"
+	}
+	if planned {
+		return "prepare_" + action
+	}
+	return action
 }
 
 func seedingProgressMessage(task models.SeedingTask) string {
@@ -425,22 +454,50 @@ func seedingProgressMessage(task models.SeedingTask) string {
 	return "当前做种时长 " + timeText + "，分享率 " + ratioText
 }
 
-func (s *SeedingService) enforceSafeDeleteData(task *models.SeedingTask) {
-	if task != nil && task.DeleteData {
-		var download models.DownloadTask
-		if s.db.Select("bt_selection_group_id").First(&download, "id = ?", task.DownloadTaskID).Error == nil && download.BTSelectionGroupID != "" {
-			task.DeleteData = false
-			_ = s.db.Model(&models.SeedingTask{}).Where("id = ?", task.ID).Update("delete_data", false).Error
-			return
-		}
+func (s *SeedingService) enforceSafeDeleteData(task *models.SeedingTask) error {
+	if task == nil || !task.DeleteData {
+		return nil
 	}
-	if task == nil || !task.DeleteData || s.transferAllowsWholePackageCleanup(task.DownloadTaskID) {
-		return
+	var download models.DownloadTask
+	if err := s.db.First(&download, "id = ?", task.DownloadTaskID).Error; err != nil {
+		return err
+	}
+	disposition, err := downloadSourceDisposition(download)
+	if err != nil {
+		return err
+	}
+	if download.BTSelectionGroupID == "" && disposition.allowsWholePackageDelete(download) && s.transferAllowsWholePackageCleanup(task.DownloadTaskID) {
+		return nil
 	}
 	// Re-evaluate persisted tasks at the destructive boundary so jobs created by
 	// an older Server version cannot bypass the protected-leftover policy.
 	task.DeleteData = false
-	_ = s.db.Model(&models.SeedingTask{}).Where("id = ?", task.ID).Update("delete_data", false).Error
+	return s.db.Model(&models.SeedingTask{}).Where("id = ?", task.ID).Update("delete_data", false).Error
+}
+
+// This is the same persisted publication fence used by shared cleanup. Merely
+// accepting an upload or completing a downloader is not sufficient authority.
+func (s *SeedingService) sourceCleanupReady(download models.DownloadTask) bool {
+	var transfer models.TransferTask
+	if download.Phase != models.DownloadTaskStatusCompleted || s.db.First(&transfer, "download_task_id = ?", download.ID).Error != nil || transfer.Phase != models.TransferTaskStatusCompleted || transfer.CatalogPublishedAt == nil {
+		return false
+	}
+	if download.TargetLibraryID != nil && transfer.LibraryID != *download.TargetLibraryID {
+		return false
+	}
+	return transfer.RouteVersion == download.TransferRouteVersion && transfer.RouteKind == download.TransferRouteKind && transfer.SourceDataSourceJSON == download.SourceDataSourceJSON && transfer.TargetDataSourceJSON == download.TargetDataSourceJSON
+}
+
+func (s *SeedingService) isSourceCleanup(task models.SeedingTask) bool {
+	if task.TransferMode == models.MediaLibraryTransferMove {
+		return true
+	}
+	var download models.DownloadTask
+	if s.db.First(&download, "id = ?", task.DownloadTaskID).Error != nil {
+		return false
+	}
+	disposition, err := downloadSourceDisposition(download)
+	return err == nil && disposition.immediate()
 }
 
 func (s *SeedingService) finish(task models.SeedingTask, actorID *uint, reason string, request RequestContext) error {
@@ -456,8 +513,10 @@ func (s *SeedingService) finish(task models.SeedingTask, actorID *uint, reason s
 	})
 }
 
-func seedingTaskSummary(record models.SeedingTask, jobStatus, displayName string) SeedingTaskSummary {
-	return SeedingTaskSummary{ID: record.ID, JobID: record.JobID, JobStatus: jobStatus, DownloadTaskID: record.DownloadTaskID, OwnerID: record.OwnerID, DownloaderName: record.DownloaderName, DisplayName: displayName, ProviderType: record.ProviderType, TransferMode: record.TransferMode, DeleteData: record.DeleteData, CleanupEnabled: record.CleanupEnabled, MinimumSeedMinutes: record.MinimumSeedMinutes, MinimumRatio: record.MinimumRatio, CompletionMode: record.CompletionMode, Phase: record.Phase, Ratio: record.Ratio, SeededSeconds: record.SeededSeconds, UploadedBytes: record.UploadedBytes, LastSampledAt: record.LastSampledAt, LastErrorCode: record.LastErrorCode, CreatedAt: record.CreatedAt, UpdatedAt: record.UpdatedAt, FinishedAt: record.FinishedAt}
+func seedingTaskSummary(record models.SeedingTask, jobStatus string, download models.DownloadTask) SeedingTaskSummary {
+	disposition, err := downloadSourceDisposition(download)
+	deleteData := err == nil && record.DeleteData && !disposition.RetainSource
+	return SeedingTaskSummary{ID: record.ID, JobID: record.JobID, JobStatus: jobStatus, DownloadTaskID: record.DownloadTaskID, OwnerID: record.OwnerID, DownloaderName: record.DownloaderName, DisplayName: download.DisplayName, ProviderType: record.ProviderType, TransferMode: record.TransferMode, Purpose: disposition.Purpose, DeleteData: deleteData, CleanupEnabled: record.CleanupEnabled, MinimumSeedMinutes: record.MinimumSeedMinutes, MinimumRatio: record.MinimumRatio, CompletionMode: record.CompletionMode, Phase: record.Phase, Ratio: record.Ratio, SeededSeconds: record.SeededSeconds, UploadedBytes: record.UploadedBytes, LastSampledAt: record.LastSampledAt, LastErrorCode: record.LastErrorCode, CreatedAt: record.CreatedAt, UpdatedAt: record.UpdatedAt, FinishedAt: record.FinishedAt}
 }
 
 type SeedingWorker struct{ service *SeedingService }
@@ -471,7 +530,7 @@ func NewSeedingWorker(service *SeedingService) *SeedingWorker {
 // DeleteData flag before the queue acknowledges cancellation.
 func (w *SeedingWorker) Interrupt(ctx context.Context, job ClaimedJob, action string) error {
 	if action == "pause" {
-		serverlog.RecordBusiness(ctx, w.service.log, serverlog.OperationSeedingManagement, serverlog.BusinessEvent{Code: "seeding.monitor.paused", Stage: "monitor", Outcome: "confirmed", Message: "本次做种监测已停止，下载器中的做种任务和数据保持原状，恢复监测后继续采样", Fields: map[string]any{"job_id": job.Job.ID, "resource_name": job.Job.DisplayName}})
+		serverlog.RecordBusiness(ctx, w.service.log, serverlog.OperationSeedingManagement, serverlog.BusinessEvent{Code: "seeding.monitor.paused", Stage: "monitor", Outcome: "confirmed", Message: "本次下载收尾检查已暂停，原下载器任务和数据保持不变，恢复后继续原操作", Fields: map[string]any{"job_id": job.Job.ID, "resource_name": job.Job.DisplayName}})
 		return nil
 	}
 	if action != "cancel" {
@@ -485,22 +544,28 @@ func (w *SeedingWorker) Interrupt(ctx context.Context, job ClaimedJob, action st
 	if err := w.service.db.First(&task, "id = ?", payload.SeedingTaskID).Error; err != nil {
 		return err
 	}
-	w.service.enforceSafeDeleteData(&task)
+	if err := w.service.enforceSafeDeleteData(&task); err != nil {
+		return err
+	}
 	if task.Phase == models.SeedingTaskStatusCompleted {
 		return nil
 	}
-	if err := w.service.cleanupProvider(ctx, &task); err != nil && !providerTaskMissing(err) {
+	outcome, err := w.service.cleanupProvider(ctx, &task)
+	if err != nil {
 		return err
 	}
+	if outcome.sharedDeferred {
+		return appError(CodeConflict, "本任务引用已结束，共享源清理延期，原清理任务将继续核对", nil)
+	}
 	if w.service.stagingCleanup != nil {
-		if err := w.service.stagingCleanup(ctx, task.DownloadTaskID, task.DeleteData); err != nil {
+		if err := w.service.stagingCleanup(outcome.context(ctx), task.DownloadTaskID, task.DeleteData); err != nil {
 			return err
 		}
 	}
 	if err := w.service.finish(task, nil, "task_center", RequestContext{}); err != nil {
 		return err
 	}
-	serverlog.RecordBusiness(ctx, w.service.log, serverlog.OperationSeedingManagement, serverlog.BusinessEvent{Code: "seeding.control.finish", Stage: "cleanup", Outcome: "finished", Message: "任务中心请求的做种清理流程已返回，做种管理记录已结束", Fields: seedingBusinessFields(task)})
+	serverlog.RecordBusiness(ctx, w.service.log, serverlog.OperationSeedingManagement, serverlog.BusinessEvent{Code: "seeding.control.finish", Stage: "cleanup", Outcome: "finished", Message: "任务中心请求的下载收尾流程已返回，管理记录已结束；源文件保留和清理另行记录", Fields: seedingBusinessFields(task)})
 	return nil
 }
 
@@ -513,11 +578,13 @@ func (w *SeedingWorker) Run(ctx context.Context, _ JobRuntime, job ClaimedJob) W
 	if err := w.service.db.First(&task, "id = ?", payload.SeedingTaskID).Error; err != nil {
 		return WorkerResult{ErrorCode: "seeding_task_missing", ErrorMessage: "做种任务不存在"}
 	}
-	w.service.enforceSafeDeleteData(&task)
+	if err := w.service.enforceSafeDeleteData(&task); err != nil {
+		return w.fail(task, "source_cleanup_policy_invalid", "源文件清理策略无法确认，未提交删除", ctx)
+	}
 	ctx = serverlog.WithBusinessFields(ctx, seedingBusinessFields(task))
-	serverlog.OperationSeedingManagement.Event(w.service.log.Debug()).Str("task_id", task.ID).Msg(serverlog.OperationSeedingManagement.Message("检查做种状态"))
+	serverlog.OperationSeedingManagement.Event(w.service.log.Debug()).Str("task_id", task.ID).Msg(serverlog.OperationSeedingManagement.Message("检查下载收尾状态"))
 	if task.Phase == models.SeedingTaskStatusCompleted {
-		serverlog.RecordBusiness(ctx, w.service.log, serverlog.OperationSeedingManagement, serverlog.BusinessEvent{Code: "seeding.skip", Stage: "monitor", Outcome: "skipped", Message: "做种管理记录已经结束，本次不重复清理"})
+		serverlog.RecordBusiness(ctx, w.service.log, serverlog.OperationSeedingManagement, serverlog.BusinessEvent{Code: "seeding.skip", Stage: "monitor", Outcome: "skipped", Message: "下载收尾记录已经结束，本次不重复清理"})
 		return WorkerResult{}
 	}
 	if task.DownloaderID == nil {
@@ -528,35 +595,58 @@ func (w *SeedingWorker) Run(ctx context.Context, _ JobRuntime, job ClaimedJob) W
 		return w.fail(task, "seeding_download_missing", "原下载任务不存在", ctx)
 	}
 	ctx = serverlog.WithBusinessFields(ctx, map[string]any{"resource_name": download.DisplayName})
+	disposition, err := downloadSourceDisposition(download)
+	if err != nil {
+		return w.fail(task, "source_cleanup_policy_invalid", "源文件清理策略无法确认，未提交删除", ctx)
+	}
+	if disposition.immediate() {
+		ctx = serverlog.WithBusinessFields(ctx, map[string]any{"reason": sourcePurposeCleanup})
+		if !w.service.sourceCleanupReady(download) {
+			return w.retry(task, "source_cleanup_import_pending", "等待目标文件确认和本批目录发布；未提交源清理", ctx)
+		}
+	}
 	if download.BTSelectionGroupID != "" {
-		return w.runSelectionGroupSeeding(ctx, task, download)
+		return w.runSelectionGroupSeeding(ctx, task, download, disposition)
 	}
 	if task.LastSampledAt == nil {
-		serverlog.RecordBusiness(ctx, w.service.log, serverlog.OperationSeedingManagement, serverlog.BusinessEvent{Code: "seeding.start", Stage: "monitor", Outcome: "started", Message: "开始检查“" + serverlog.BusinessDisplayName(download.DisplayName) + "”在下载器“" + serverlog.BusinessDisplayName(task.DownloaderName) + "”的做种状态"})
+		stage, message := "monitor", "开始检查做种状态"
+		if disposition.immediate() {
+			stage, message = "cleanup", "目标文件和目录发布已确认，开始核对原下载器任务并清理受管源；不等待做种条件"
+		}
+		serverlog.RecordBusiness(ctx, w.service.log, serverlog.OperationSeedingManagement, serverlog.BusinessEvent{Code: "seeding.start", Stage: stage, Outcome: "started", Message: message})
 	}
 	client, err := w.service.downloaders.clientForDownloadTask(ctx, download)
 	if err != nil {
 		return w.retry(task, "seeding_downloader_unavailable", "暂时无法连接下载器", ctx)
 	}
-	provider, err := client.Get(ctx, task.ProviderTaskID)
+	provider, err := inspectPostImportSource(ctx, client, task.ProviderTaskID)
 	if err != nil {
 		if providerTaskMissing(err) {
 			if w.service.stagingCleanup != nil {
-				if cleanupErr := w.service.stagingCleanup(ctx, task.DownloadTaskID, task.DeleteData); cleanupErr != nil {
+				cleanupCtx := context.WithValue(ctx, sourceNativeTaskMissingKey{}, true)
+				if cleanupErr := w.service.stagingCleanup(cleanupCtx, task.DownloadTaskID, task.DeleteData); cleanupErr != nil {
 					return w.retry(task, "download_staging_cleanup_failed", "下载暂存清理失败", ctx)
 				}
 			}
 			if err := w.service.finish(task, nil, "provider_missing", RequestContext{}); err != nil {
 				return WorkerResult{ErrorCode: "seeding_state_persist_failed", ErrorMessage: "做种清理结果保存失败"}
 			}
-			serverlog.RecordBusiness(ctx, w.service.log, serverlog.OperationSeedingManagement, serverlog.BusinessEvent{Code: "seeding.finish", Stage: "cleanup", Outcome: "finished", Message: "下载器已无此任务，暂存清理已返回，做种管理记录已结束", Fields: map[string]any{"reason": "provider_missing"}})
+			serverlog.RecordBusiness(ctx, w.service.log, serverlog.OperationSeedingManagement, serverlog.BusinessEvent{Code: "seeding.finish", Stage: "cleanup", Outcome: "finished", Message: "下载器已无此任务，受管源收尾已返回；此记录不单独证明所有源文件已删除", Fields: map[string]any{"reason": "provider_missing"}})
 			return WorkerResult{}
 		}
 		code, retryable := downloadpkg.ErrorInfo(err)
 		if retryable {
-			return w.retry(task, code, "暂时无法读取做种状态", ctx)
+			message := "暂时无法读取做种状态"
+			if disposition.immediate() {
+				message = "暂时无法读取原下载器任务，尚未提交源清理"
+			}
+			return w.retry(task, code, message, ctx)
 		}
-		return w.fail(task, code, "下载器拒绝读取做种状态", ctx)
+		message := "下载器拒绝读取做种状态"
+		if disposition.immediate() {
+			message = "源文件清理受阻：下载器拒绝读取原任务；入库结果保留，修复连接后可重试本清理任务"
+		}
+		return w.fail(task, code, message, ctx)
 	}
 	now := time.Now().UTC()
 	previousPhase := task.Phase
@@ -564,12 +654,15 @@ func (w *SeedingWorker) Run(ctx context.Context, _ JobRuntime, job ClaimedJob) W
 	if !task.CleanupEnabled {
 		phase = models.SeedingTaskStatusRetained
 	}
+	if disposition.immediate() {
+		phase = models.SeedingTaskStatusCleanup
+	}
 	updates := map[string]any{"phase": phase, "ratio": provider.Ratio, "seeded_seconds": provider.SeededSeconds, "uploaded_bytes": provider.UploadedBytes, "last_sampled_at": now, "last_error_code": "", "updated_at": now}
 	if err := w.service.db.Model(&task).Updates(updates).Error; err != nil {
 		return WorkerResult{ErrorCode: "seeding_state_persist_failed", ErrorMessage: "做种状态保存失败"}
 	}
 	task.Ratio, task.SeededSeconds, task.UploadedBytes = provider.Ratio, provider.SeededSeconds, provider.UploadedBytes
-	if !task.CleanupEnabled {
+	if !disposition.immediate() && !task.CleanupEnabled {
 		next := now.Add(seedingSampleInterval)
 		if previousPhase != phase {
 			serverlog.RecordBusiness(ctx, w.service.log, serverlog.OperationSeedingManagement, serverlog.BusinessEvent{Code: "seeding.retained", Stage: "monitor", Outcome: "skipped", Message: "“" + serverlog.BusinessDisplayName(download.DisplayName) + "”未启用自动做种清理，保留下载器任务和数据，后续仅定期采样", Fields: map[string]any{"reason": "cleanup_disabled"}})
@@ -577,7 +670,7 @@ func (w *SeedingWorker) Run(ctx context.Context, _ JobRuntime, job ClaimedJob) W
 		serverlog.OperationSeedingManagement.Event(w.service.log.Debug()).Str("task_id", task.ID).Str("phase", phase).Time("next_sample_at", next).Msg(serverlog.OperationSeedingManagement.Message("保留任务，等待下次采样"))
 		return WorkerResult{RetryAt: &next}
 	}
-	if !seedingThresholdReached(task) {
+	if !disposition.immediate() && !seedingThresholdReached(task) {
 		next := now.Add(seedingSampleInterval)
 		if previousPhase != phase {
 			serverlog.RecordBusiness(ctx, w.service.log, serverlog.OperationSeedingManagement, serverlog.BusinessEvent{Code: "seeding.wait", Stage: "monitor", Outcome: "waiting", Message: fmt.Sprintf("“%s”尚未达到做种清理条件，将继续采样；%s；目标时间 %d 分钟、目标分享率 %.2f，组合规则 %s", serverlog.BusinessDisplayName(download.DisplayName), seedingProgressMessage(task), task.MinimumSeedMinutes, task.MinimumRatio, map[string]string{models.SeedingCompletionAll: "全部满足", models.SeedingCompletionAny: "满足任一"}[task.CompletionMode]), Fields: map[string]any{"reason": "threshold_not_reached"}})
@@ -589,22 +682,30 @@ func (w *SeedingWorker) Run(ctx context.Context, _ JobRuntime, job ClaimedJob) W
 	if task.DeleteData {
 		cleanupPolicy = "移除下载器任务并请求删除下载数据"
 	}
-	serverlog.RecordBusiness(ctx, w.service.log, serverlog.OperationSeedingManagement, serverlog.BusinessEvent{Code: "seeding.cleanup.start", Stage: "cleanup", Outcome: "started", Message: "“" + serverlog.BusinessDisplayName(download.DisplayName) + "”已达到做种条件，" + seedingProgressMessage(task) + "；本次策略：" + cleanupPolicy})
+	cleanupMessage := "已达到做种条件，" + seedingProgressMessage(task) + "；本次策略：" + cleanupPolicy
+	if disposition.immediate() {
+		cleanupMessage = "目标文件和目录发布已确认，本任务不保种；本次策略：" + cleanupPolicy
+	}
+	serverlog.RecordBusiness(ctx, w.service.log, serverlog.OperationSeedingManagement, serverlog.BusinessEvent{Code: "seeding.cleanup.start", Stage: "cleanup", Outcome: "started", Message: cleanupMessage, Fields: map[string]any{"action": seedingCleanupAction(task, true)}})
 	_ = w.service.db.Model(&task).Updates(map[string]any{"phase": models.SeedingTaskStatusCleanup, "updated_at": now}).Error
 	if err := client.Cancel(ctx, task.ProviderTaskID, task.DeleteData); err != nil && !providerTaskMissing(err) {
 		code, _ := downloadpkg.ErrorInfo(err)
 		return w.retry(task, code, "下载器暂时无法完成做种清理", ctx)
 	}
-	serverlog.RecordBusiness(ctx, w.service.log, serverlog.OperationSeedingManagement, serverlog.BusinessEvent{Code: "seeding.provider.accepted", Stage: "cleanup", Outcome: "accepted", Message: "下载器已接受任务移除或确认任务已不存在，继续处理受管暂存清理；此记录不证明所有下载数据已删除"})
+	serverlog.RecordBusiness(ctx, w.service.log, serverlog.OperationSeedingManagement, serverlog.BusinessEvent{Code: "seeding.provider.accepted", Stage: "cleanup", Outcome: "accepted", Message: "下载器已接受任务移除或确认任务已不存在，继续处理受管暂存清理；此记录不证明所有下载数据已删除", Fields: map[string]any{"action": seedingCleanupAction(task, false)}})
 	if w.service.stagingCleanup != nil {
 		if err := w.service.stagingCleanup(ctx, task.DownloadTaskID, task.DeleteData); err != nil {
 			return w.retry(task, "download_staging_cleanup_failed", "下载暂存清理失败", ctx)
 		}
 	}
-	if err := w.service.finish(task, nil, "threshold", RequestContext{}); err != nil {
+	reason := "threshold"
+	if disposition.immediate() {
+		reason = sourcePurposeCleanup
+	}
+	if err := w.service.finish(task, nil, reason, RequestContext{}); err != nil {
 		return WorkerResult{ErrorCode: "seeding_state_persist_failed", ErrorMessage: "做种清理结果保存失败"}
 	}
-	serverlog.RecordBusiness(ctx, w.service.log, serverlog.OperationSeedingManagement, serverlog.BusinessEvent{Code: "seeding.finish", Stage: "cleanup", Outcome: "finished", Message: "“" + serverlog.BusinessDisplayName(download.DisplayName) + "”的任务移除请求与暂存清理流程已返回，做种管理记录已结束"})
+	serverlog.RecordBusiness(ctx, w.service.log, serverlog.OperationSeedingManagement, serverlog.BusinessEvent{Code: "seeding.finish", Stage: "cleanup", Outcome: "finished", Message: "原下载器任务移除与受管源收尾流程已返回；新入库文件和播放记录保持有效"})
 	return WorkerResult{}
 }
 
@@ -625,6 +726,10 @@ func (w *SeedingWorker) retry(task models.SeedingTask, code, message string, con
 	if !task.CleanupEnabled {
 		phase = models.SeedingTaskStatusRetained
 	}
+	sourceCleanup := w.service.isSourceCleanup(task)
+	if sourceCleanup {
+		phase = models.SeedingTaskStatusCleanup
+	}
 	_ = w.service.db.Model(&task).Updates(map[string]any{"phase": phase, "last_error_code": safeLabel(code, 96), "updated_at": now}).Error
 	fields := seedingBusinessFields(task)
 	fields["error_code"] = code
@@ -632,7 +737,11 @@ func (w *SeedingWorker) retry(task models.SeedingTask, code, message string, con
 	if len(contexts) > 0 {
 		ctx = contexts[0]
 	}
-	serverlog.RecordBusiness(ctx, w.service.log, serverlog.OperationSeedingManagement, serverlog.BusinessEvent{Code: "seeding.retry", Stage: "monitor", Outcome: "retry", Message: "下载器“" + serverlog.BusinessDisplayName(task.DownloaderName) + "”的做种状态读取或清理未完成：" + message + "，将按原采样策略重试", Fields: fields})
+	stage, narrative := "monitor", "下载器做种状态读取或清理未完成："+message+"，将按原采样策略重试"
+	if sourceCleanup {
+		stage, narrative = "cleanup", "源文件清理暂未完成："+message+"；保留已入库结果，仅核对原清理操作，不重新下载或上传"
+	}
+	serverlog.RecordBusiness(ctx, w.service.log, serverlog.OperationSeedingManagement, serverlog.BusinessEvent{Code: "seeding.retry", Stage: stage, Outcome: "retry", Message: narrative, Fields: fields})
 	return WorkerResult{RetryAt: &next, ErrorCode: safeLabel(code, 96), ErrorMessage: message}
 }
 
@@ -644,6 +753,10 @@ func (w *SeedingWorker) fail(task models.SeedingTask, code, message string, cont
 	if len(contexts) > 0 {
 		ctx = contexts[0]
 	}
-	serverlog.RecordBusiness(ctx, w.service.log, serverlog.OperationSeedingManagement, serverlog.BusinessEvent{Code: "seeding.failed", Stage: "monitor", Outcome: "failed", Message: "下载器“" + serverlog.BusinessDisplayName(task.DownloaderName) + "”的做种管理未能完成：" + message, Fields: fields})
+	stage, narrative := "monitor", "下载器做种管理未能完成："+message
+	if w.service.isSourceCleanup(task) {
+		stage, narrative = "cleanup", "源文件清理受阻："+message+"；已入库结果保留，可重试原清理任务"
+	}
+	serverlog.RecordBusiness(ctx, w.service.log, serverlog.OperationSeedingManagement, serverlog.BusinessEvent{Code: "seeding.failed", Stage: stage, Outcome: "failed", Message: narrative, Fields: fields})
 	return WorkerResult{ErrorCode: safeLabel(code, 96), ErrorMessage: message}
 }
