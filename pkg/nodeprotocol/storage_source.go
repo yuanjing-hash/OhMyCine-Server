@@ -82,6 +82,7 @@ type StorageSourceActionRequest struct {
 
 // StorageSourceActionResponse is summary-only. Provider files are exposed
 // only through the existing paginated FileExport protocol after verification.
+// Progress is a 0..1 ratio on this wire, not downloader percent.
 type StorageSourceActionResponse struct {
 	CredentialExpiresAt *time.Time         `json:"credential_expires_at,omitempty"`
 	OutputRootID        string             `json:"output_root_id,omitempty"`

@@ -493,7 +493,7 @@ describe('detailed incremental single-site search', () => {
     const libraries = deferred<{ list: unknown[] }>()
     apiMock.mockImplementation((path: string) => {
       if (path === '/api/v1/sites') return Promise.resolve({ list: [] })
-      if (path === '/api/v1/downloaders') return downloaders.promise
+      if (path === '/api/v1/downloaders/options') return downloaders.promise
       if (path === '/api/v1/media-libraries') return libraries.promise
       throw new Error(`unexpected request ${path}`)
     })
@@ -512,7 +512,7 @@ describe('detailed incremental single-site search', () => {
     await button(wrapper, label).trigger('click')
     auth.user = { ...auth.user, id: 2, username: 'new-actor', display_name: '新账号' }
     await flushPromises()
-    for (const [path, options] of apiMock.mock.calls.filter(([path]) => path === '/api/v1/downloaders' || path === '/api/v1/media-libraries')) expect((options.signal as AbortSignal).aborted, `${path} option request must retire with its actor`).toBe(true)
+    for (const [path, options] of apiMock.mock.calls.filter(([path]) => path === '/api/v1/downloaders/options' || path === '/api/v1/media-libraries')) expect((options.signal as AbortSignal).aborted, `${path} option request must retire with its actor`).toBe(true)
     expect(wrapper.findAll('article')).toHaveLength(0)
     expect(wrapper.find('[aria-labelledby="pt-download-title"]').exists()).toBe(false)
     downloaders.resolve({ list: [{ id: 'old-private-downloader', name: '旧账号下载器', enabled: true }] })
@@ -629,7 +629,7 @@ describe('detailed incremental single-site search', () => {
     const choices = [11, 22].flatMap(library => ['d1', 'd2'].map(downloader => ({ downloader_id: downloader, media_library_id: library, downloader_name: downloader, downloader_type: 'qbittorrent', library_name: `库${library}`, enabled: true, route_kind: 'same_source_local', route_label: '本地整理' })))
     apiMock.mockImplementation(async (path: string, options?: RequestInit) => {
       if (path === '/api/v1/sites') return { list: [] }
-      if (path === '/api/v1/downloaders') return { list: ['d1', 'd2'].map(id => ({ id, name: id, type: 'qbittorrent', enabled: true })) }
+      if (path === '/api/v1/downloaders/options') return { list: ['d1', 'd2'].map(id => ({ id, name: id, type: 'qbittorrent', enabled: true })) }
       if (path === '/api/v1/media-libraries') return { list: [11, 22].map(id => ({ id, name: `库${id}`, profile_name: '自动分类', transfer_mode: 'move' })) }
       if (path === '/api/v1/sites/routes/recommend') {
         const input = JSON.parse(String(options?.body))

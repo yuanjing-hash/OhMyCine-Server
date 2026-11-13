@@ -374,7 +374,7 @@ func acquisitionTransferPublished(tx *gorm.DB, reader *CatalogReader, download m
 }
 
 func projectDownloadProgress(status *AcquisitionStatus, task models.DownloadTask) {
-	status.Progress = cloneFloat64(task.Progress)
+	status.Progress = downloadProgressPercent(task)
 	status.BytesCompleted = cloneInt64(task.BytesCompleted)
 	status.BytesTotal = cloneInt64(task.BytesTotal)
 	status.DownloadSpeed = cloneInt64(task.DownloadSpeed)

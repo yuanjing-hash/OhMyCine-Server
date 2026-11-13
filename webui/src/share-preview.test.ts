@@ -3,13 +3,13 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { flushPromises, mount } from '@vue/test-utils'
 import SharePreviewDialog from '@/components/SharePreviewDialog.vue'
 import { api, APIError } from '@/api/client'
-import type { DownloaderSummary } from '@/types/api'
+import type { DownloaderOption } from '@/types/api'
 import { shareValidationLabel, type ShareValidation, type SharePreview } from '@/share-preview'
 vi.mock('@/api/client', async importOriginal => ({ ...await importOriginal<typeof import('@/api/client')>(), api: vi.fn() }))
 beforeEach(() => { vi.mocked(api).mockReset() })
 
-function receiver(id = 'quark', type: DownloaderSummary['type'] = 'quark_share'): DownloaderSummary {
- return { id, name: id, type, enabled: true, storage_id: 1, updated_at: '2026-10-23T00:00:00Z', capabilities: { share_receive: true } } as DownloaderSummary
+function receiver(id = 'quark', type: DownloaderOption['type'] = 'quark_share'): DownloaderOption {
+ return { id, name: id, type, execution_location: 'server', capabilities: { share_receive: true } } as DownloaderOption
 }
 function previewResponse(token: string, video = false): SharePreview {
  return { token, total_size: 100, file_count: 1, expires_at: new Date(Date.now() + 300000).toISOString(), entries: [{ token: 'file', name: `${token}.${video ? 'mkv' : 'txt'}`, path: `${token}.${video ? 'mkv' : 'txt'}`, is_dir: false, size: 100 }] }
@@ -19,9 +19,9 @@ describe('share preview selection', () => {
   vi.mocked(api).mockClear()
   vi.mocked(api).mockResolvedValue({ token: 'quark-preview', total_size: 0, file_count: 0, expires_at: new Date(Date.now() + 300000).toISOString(), entries: [] })
   const receivers = [
-   { id: '115', name: '115 first', type: 'pan115_offline', enabled: true, capabilities: { share_receive: true } },
-   { id: 'quark', name: 'Quark', type: 'quark_share', enabled: true, capabilities: { share_receive: true } },
-  ] as DownloaderSummary[]
+   { id: '115', name: '115 first', type: 'pan115_offline', execution_location: 'server', capabilities: { share_receive: true } },
+   { id: 'quark', name: 'Quark', type: 'quark_share', execution_location: 'server', capabilities: { share_receive: true } },
+  ] as DownloaderOption[]
   const wrapper = mount(SharePreviewDialog, { props: { title: 'Show', resultToken: 'quark-claim', sourceKind: 'quark_share', downloaders: receivers } })
   await flushPromises()
   expect(wrapper.find('select').findAll('option').map(option => option.element.value)).toEqual(['', 'quark'])
@@ -40,7 +40,7 @@ describe('share preview selection', () => {
    if (url.endsWith('/recognize')) { recognitionSignal = options?.signal as AbortSignal; return new Promise(() => {}) }
    return response
   })
-  const downloader = { id: 'd', name: '115', type: 'pan115_offline', enabled: true, capabilities: { share_receive: true } } as DownloaderSummary
+  const downloader = { id: 'd', name: '115', type: 'pan115_offline', execution_location: 'server', capabilities: { share_receive: true } } as DownloaderOption
   const wrapper = mount(SharePreviewDialog, { props: { title: 'Collection', resultToken: 'claim', downloaders: [downloader] } })
   await flushPromises()
   expect(wrapper.findAll('input[type="checkbox"]')).toHaveLength(3)
@@ -62,7 +62,7 @@ it('reports exact validation states, retries, and ignores closed requests', asyn
  const invalid: ShareValidation = { status: 'expired', message: '分享已失效或已被取消', error_code: 'pan115_share_expired', downloader_id: 'd', checked_at: new Date(now).toISOString(), expires_at: new Date(now + 120000).toISOString() }
  const valid: ShareValidation = { ...invalid, status: 'valid', message: '已验证可读取', error_code: undefined }
  vi.mocked(api).mockRejectedValueOnce(new APIError(410, invalid.error_code!, invalid.message, invalid)).mockResolvedValueOnce({ token: 'preview', entries: [], file_count: 0, total_size: 0, expires_at: valid.expires_at, share_validation: valid })
- const downloader = { id: 'd', name: '115', type: 'pan115_offline', enabled: true, capabilities: { share_receive: true } } as DownloaderSummary
+ const downloader = { id: 'd', name: '115', type: 'pan115_offline', execution_location: 'server', capabilities: { share_receive: true } } as DownloaderOption
  const wrapper = mount(SharePreviewDialog, { props: { title: 'Movie', resultToken: 'claim', downloaders: [downloader] } })
  await flushPromises()
  expect(wrapper.text()).toContain(invalid.message)
@@ -107,7 +107,7 @@ it.each(['resolve', 'reject'])('changes result ownership on the same receiver an
  } finally { wrapper.unmount() }
 })
 
-it('clears selected files when the same receiver changes provider or storage ownership', async () => {
+it('preserves stable receiver refreshes and clears selected files on a source change', async () => {
  vi.mocked(api).mockResolvedValue(previewResponse('original'))
  const wrapper = mount(SharePreviewDialog, { props: { title: 'Share', resultToken: 'claim', sourceKind: 'quark_share', downloaders: [receiver('same')] } })
  try {
@@ -115,17 +115,15 @@ it('clears selected files when the same receiver changes provider or storage own
   await wrapper.get('input[type="checkbox"]').setValue(true)
   const pending: { resolve: (value: unknown) => void; signal: AbortSignal; body: unknown }[] = []
   vi.mocked(api).mockImplementation((_path, options) => new Promise(resolve => { pending.push({ resolve, signal: options!.signal as AbortSignal, body: JSON.parse(String(options!.body)) }) }))
-  await wrapper.setProps({ downloaders: [{ ...receiver('same'), storage_id: 2 }] })
+  await wrapper.setProps({ downloaders: [{ ...receiver('same') }] })
   await flushPromises()
-  expect(wrapper.findAll('input[type="checkbox"]')).toHaveLength(0)
-  expect(wrapper.findAll('button').some(button => button.text().includes('仅将所选'))).toBe(false)
-  expect(pending).toHaveLength(1)
+  expect(wrapper.get('input[type="checkbox"]').element).toHaveProperty('checked', true)
+  expect(pending).toHaveLength(0)
   await wrapper.setProps({ sourceKind: '115_share', downloaders: [receiver('same', 'pan115_offline')] })
   await flushPromises()
-  expect(pending).toHaveLength(2)
-  expect(pending[0]!.signal.aborted).toBe(true)
-  pending[0]!.resolve(previewResponse('old-quark'))
-  pending[1]!.resolve(previewResponse('new-115'))
+  expect(wrapper.findAll('input[type="checkbox"]')).toHaveLength(0)
+  expect(pending).toHaveLength(1)
+  pending[0]!.resolve(previewResponse('new-115'))
   await flushPromises()
   expect(wrapper.text()).not.toContain('old-quark')
   expect(wrapper.text()).toContain('new-115.txt')

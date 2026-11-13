@@ -111,7 +111,12 @@ func (c *Client) Get(ctx context.Context, id string) (downloader.Task, error) {
 	return task(id, r), nil
 }
 func task(id string, r quark.SelectionResult) downloader.Task {
-	return downloader.Task{ID: id, Name: r.Root.Name, Status: "completed", Completed: r.Complete, OutputItemID: r.Root.ID}
+	var progress *float64
+	if r.Complete {
+		value := 100.0
+		progress = &value
+	}
+	return downloader.Task{ID: id, Name: r.Root.Name, Status: "completed", Progress: progress, Completed: r.Complete, OutputItemID: r.Root.ID}
 }
 func (c *Client) Manifest(ctx context.Context, id string) (downloader.Manifest, error) {
 	r, e := c.driver.GetSelection(ctx, id)

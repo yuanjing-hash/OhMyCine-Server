@@ -311,8 +311,13 @@ func TestNativeOfflineMapsProviderStorageTask(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if driver.directoryID != "offline-task-root" || task.ID != "hash" || task.OutputItemID != "file-id" || task.BytesCompleted == nil || *task.BytesCompleted != 100 {
+	if driver.directoryID != "offline-task-root" || task.ID != "hash" || task.OutputItemID != "file-id" || task.Progress == nil || *task.Progress != 25 || task.BytesCompleted == nil || *task.BytesCompleted != 100 {
 		t.Fatalf("unexpected task mapping: %#v", task)
+	}
+	progress, driver.task.Status, driver.task.Completed = 1, "completed", true
+	finished, err := client.Get(context.Background(), task.ID)
+	if err != nil || !finished.Completed || finished.Progress == nil || *finished.Progress != 100 || progress != 1 {
+		t.Fatalf("completed task=%+v provider ratio=%v err=%v", finished, progress, err)
 	}
 	if err := client.Cancel(context.Background(), task.ID, true); err != nil || !driver.cancelFiles {
 		t.Fatalf("cancel delete_data was not forwarded: %v", err)
@@ -334,7 +339,7 @@ func TestShareSubmissionUsesStableTaskDirectoryAndReconcilesRetry(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if first.ID != "share:share-task-root" || !first.Completed || driver.receiveCalls != 1 || driver.receivedRoot != "share-task-root" || driver.shareURL != request.Source.URL {
+	if first.ID != "share:share-task-root" || !first.Completed || first.Progress == nil || *first.Progress != 100 || driver.receiveCalls != 1 || driver.receivedRoot != "share-task-root" || driver.shareURL != request.Source.URL {
 		t.Fatalf("task=%+v receive_calls=%d root=%q url=%q", first, driver.receiveCalls, driver.receivedRoot, driver.shareURL)
 	}
 	manifest, err := client.(downloader.ManifestClient).Manifest(context.Background(), first.ID)

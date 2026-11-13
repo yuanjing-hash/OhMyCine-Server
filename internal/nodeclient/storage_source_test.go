@@ -113,7 +113,7 @@ func TestStorageSourceClientReissuesCredentialAfterExpiry(t *testing.T) {
 
 func TestStorageSourceClientRenewsLeaseBeforeAction(t *testing.T) {
 	operation := testStorageSourceOperation(t, time.Now().UTC().Add(30*time.Second))
-	leaseCalls := 0
+	leaseCalls, statusCalls := 0, 0
 	var renewed nodeprotocol.LeaseRequest
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
@@ -126,15 +126,26 @@ func TestStorageSourceClientRenewsLeaseBeforeAction(t *testing.T) {
 		case r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/node/v1/operations/"):
 			writeStorageSourceOperation(t, w, r, nodeprotocol.OperationRunning)
 		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/node/v1/storage-source/actions/"):
-			_ = json.NewEncoder(w).Encode(testStorageSourceResponse(operation, nodeprotocol.StorageSourceAccepted))
+			statusCalls++
+			response := testStorageSourceResponse(operation, nodeprotocol.StorageSourceDownloading)
+			response.TotalBytes, response.DownloadedBytes = 100, 25
+			if statusCalls == 1 {
+				progress := .01
+				response.Progress = &progress
+				response.DownloadedBytes = 1
+			}
+			_ = json.NewEncoder(w).Encode(response)
 		default:
 			http.NotFound(w, r)
 		}
 	}))
 	defer server.Close()
 	client := testStorageSourceClient(t, server, operation, nil)
-	if _, err := client.Get(context.Background(), operation.Plan.OperationKey); err != nil {
-		t.Fatal(err)
+	for _, want := range []float64{1, 25} {
+		task, err := client.Get(context.Background(), operation.Plan.OperationKey)
+		if err != nil || task.Progress == nil || *task.Progress != want || task.Completed {
+			t.Fatalf("storage-source task=%+v want percent=%v err=%v", task, want, err)
+		}
 	}
 	if leaseCalls != 1 || renewed.LeaseEpoch != operation.Plan.LeaseEpoch+1 || !renewed.LeaseExpiresAt.After(operation.Plan.LeaseExpiresAt) {
 		t.Fatalf("lease was not renewed: calls=%d lease=%+v", leaseCalls, renewed)
@@ -167,6 +178,10 @@ func TestStorageSourceClientReadsCompletedFileExport(t *testing.T) {
 	}))
 	defer server.Close()
 	client := testStorageSourceClient(t, server, operation, nil)
+	task, err := client.Get(context.Background(), operation.Plan.OperationKey)
+	if err != nil || !task.Completed || task.Progress == nil || *task.Progress != 100 {
+		t.Fatalf("completed storage-source task=%+v err=%v", task, err)
+	}
 	manifest, err := client.Manifest(context.Background(), operation.Plan.OperationKey)
 	if err != nil {
 		t.Fatal(err)

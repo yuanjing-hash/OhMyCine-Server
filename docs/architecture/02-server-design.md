@@ -1328,7 +1328,8 @@ POST   /api/v1/sites/{id}/test               # 测试站点连接
 GET    /api/v1/sites/{id}/categories         # 获取站点分类
 
 # ====== 下载器管理 ======
-GET    /api/v1/downloaders                   # 下载器列表（脱敏）
+GET    /api/v1/downloaders/options           # 当前用户可使用的启用下载器（安全选项）
+GET    /api/v1/downloaders                   # 下载器配置管理列表（downloaders.read）
 POST   /api/v1/downloaders                   # 添加下载器
 PATCH  /api/v1/downloaders/{id}             # 更新下载器/凭据
 DELETE /api/v1/downloaders/{id}             # 删除无活跃任务引用的配置

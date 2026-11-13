@@ -58,7 +58,7 @@ type DownloadRoutePreview struct {
 // Disabled targets remain in the response with a stable reason so clients do
 // not need to duplicate provider/storage compatibility rules.
 func (s *DownloadService) PreviewRoutes(ctx context.Context, actor Actor, input DownloadRoutePreviewInput) (DownloadRoutePreview, error) {
-	if !actor.Can(authz.PermissionDownloadsCreate) {
+	if !actor.HasPermission(authz.PermissionDownloadsCreate) {
 		return DownloadRoutePreview{}, appError(CodePermissionDenied, "无权创建下载任务", nil)
 	}
 	input.DownloaderID = strings.TrimSpace(input.DownloaderID)

@@ -15,12 +15,15 @@ import { previewDownloadRoutes, routeTargetByID, type DownloadRoutePreview } fro
 import { useAuthStore } from '@/stores/auth'
 import { notify } from '@/toast'
 import { retargetCompletedImport, transferIdentityLabel, transferRouteLabel } from '@/transfers'
-import type { DownloaderSummary, DownloadSettings, DownloadTaskSummary, ListResponse, MediaLibraryDetail, SeedingTaskSummary, StorageSummary, TMDBCandidate, TransferNodeSummary } from '@/types/api'
+import type { DownloaderOption, DownloaderSummary, DownloadSettings, DownloadTaskSummary, ListResponse, MediaLibraryDetail, SeedingTaskSummary, StorageSummary, TMDBCandidate, TransferNodeSummary } from '@/types/api'
 
 const auth = useAuthStore()
+const actorAccessKey = computed(() => JSON.stringify([auth.user?.id, [...(auth.user?.permissions ?? [])].sort()]))
 const route = useRoute()
 const router = useRouter()
 const downloaders = ref<DownloaderSummary[]>([])
+const downloaderOptions = ref<DownloaderOption[]>([])
+let downloaderOptionsRequest: AbortController | null = null
 const tasks = ref<DownloadTaskSummary[]>([])
 const seedingTasks = ref<SeedingTaskSummary[]>([])
 const postImportGroups = computed(() => [
@@ -62,7 +65,7 @@ const deletingTask = ref<DownloadTaskSummary | null>(null)
 const deleteSourceData = ref(false)
 const retargetLibraryID = ref(0)
 const editing = computed(() => downloaders.value.find(item => item.id === editingID.value) ?? null)
-const enabledDownloaders = computed(() => downloaders.value.filter(item => item.enabled))
+const enabledDownloaders = computed(() => downloaderOptions.value)
 const selectedDownloader = computed(() => enabledDownloaders.value.find(item => item.id === submitForm.value.downloaderID) ?? null)
 const unsupportedNodePan115Source = computed(() => selectedDownloader.value?.type === 'pan115_offline' && selectedDownloader.value.execution_location === 'node' && sourceMode.value === 'url' ? nodePan115UnsupportedSource(submitForm.value.sourceURL) : '')
 const selectedRoute = computed(() => routeTargetByID(routePreview.value, submitForm.value.mediaLibraryID))
@@ -130,30 +133,54 @@ watch(() => recognitionForm.value.mediaType, mediaType => {
   }
 })
 
+async function loadDownloaderOptions() {
+  downloaderOptionsRequest?.abort()
+  const controller = new AbortController()
+  downloaderOptionsRequest = controller
+  if (!auth.can(Permissions.DownloadsCreate)) { downloaderOptions.value = []; downloaderOptionsRequest = null; return }
+  try {
+    const data = await api<ListResponse<DownloaderOption>>('/api/v1/downloaders/options', { signal: controller.signal })
+    if (!controller.signal.aborted && downloaderOptionsRequest === controller) downloaderOptions.value = data.list
+  } catch (reason) { if (!controller.signal.aborted && downloaderOptionsRequest === controller) throw reason }
+  finally { if (downloaderOptionsRequest === controller) downloaderOptionsRequest = null }
+}
+
+watch([actorAccessKey, () => auth.can(Permissions.DownloadsCreate)], () => {
+  downloaderOptionsRequest?.abort(); routePreviewRequest?.abort()
+  downloaderOptions.value = []; routePreview.value = null; routePreviewKey.value = ''; routePreviewLoading.value = false
+  submitForm.value.downloaderID = ''; submitForm.value.mediaLibraryID = 0
+  editingID.value = null; createOpen.value = false; downloaderPickerOpen.value = false
+  downloaders.value = []; tasks.value = []; seedingTasks.value = []; mediaLibraries.value = []; storages.value = []; transferNodes.value = []; downloadSettings.value = null
+  void load(false, true)
+}, { flush: 'sync' })
+
 async function load(showLoading = true, quiet = false) {
+  const loadActor = actorAccessKey.value
   if (showLoading) loading.value = true
   try {
-    const requests: Promise<void>[] = []
-    if (canReadDownloaders.value && !reorderingDownloaders.value) requests.push(api<ListResponse<DownloaderSummary>>('/api/v1/downloaders').then(data => { if (!reorderingDownloaders.value) downloaders.value = data.list }))
+    const requests: Promise<void>[] = [loadDownloaderOptions()]
+    if (canReadDownloaders.value && !reorderingDownloaders.value) requests.push(api<ListResponse<DownloaderSummary>>('/api/v1/downloaders').then(data => { if (loadActor === actorAccessKey.value && !reorderingDownloaders.value) downloaders.value = data.list }))
     if (canReadDownloads.value) requests.push(Promise.all([
       api<ListResponse<DownloadTaskSummary>>('/api/v1/downloads?scope=active&limit=200'),
       api<ListResponse<DownloadTaskSummary>>('/api/v1/downloads?scope=history&limit=200'),
     ]).then(([active, history]) => {
+      if (loadActor !== actorAccessKey.value) return
       const nextTasks = [...active.list, ...history.list]
       reconcileRetryingTasks(nextTasks)
       tasks.value = nextTasks
       activeTotal.value = active.total
       historyTotal.value = history.total
     }))
-    if (canReadDownloads.value) requests.push(api<ListResponse<SeedingTaskSummary>>('/api/v1/seeding-tasks?limit=100').then(data => { seedingTasks.value = data.list }))
-    if (auth.can(Permissions.SettingsRead)) requests.push(api<DownloadSettings>('/api/v1/settings/downloads').then(data => { downloadSettings.value = data }))
-    if (auth.can(Permissions.StoragesRead)) requests.push(api<ListResponse<StorageSummary>>('/api/v1/storages').then(data => { storages.value = data.list }))
-    if (canReadTransferNodes.value) requests.push(api<ListResponse<TransferNodeSummary>>('/api/v1/transfer-nodes').then(data => { transferNodes.value = data.list }))
-    if (auth.can(Permissions.MediaLibrariesRead)) requests.push(api<ListResponse<MediaLibraryDetail>>('/api/v1/media-libraries').then(data => { mediaLibraries.value = data.list; if (submitForm.value.mediaLibraryID !== 0 && !mediaLibraries.value.some(item => item.id === submitForm.value.mediaLibraryID)) submitForm.value.mediaLibraryID = 0 }))
+    if (canReadDownloads.value) requests.push(api<ListResponse<SeedingTaskSummary>>('/api/v1/seeding-tasks?limit=100').then(data => { if (loadActor !== actorAccessKey.value) return; seedingTasks.value = data.list }))
+    if (auth.can(Permissions.SettingsRead)) requests.push(api<DownloadSettings>('/api/v1/settings/downloads').then(data => { if (loadActor !== actorAccessKey.value) return; downloadSettings.value = data }))
+    if (auth.can(Permissions.StoragesRead)) requests.push(api<ListResponse<StorageSummary>>('/api/v1/storages').then(data => { if (loadActor !== actorAccessKey.value) return; storages.value = data.list }))
+    if (canReadTransferNodes.value) requests.push(api<ListResponse<TransferNodeSummary>>('/api/v1/transfer-nodes').then(data => { if (loadActor !== actorAccessKey.value) return; transferNodes.value = data.list }))
+    if (auth.can(Permissions.MediaLibrariesRead)) requests.push(api<ListResponse<MediaLibraryDetail>>('/api/v1/media-libraries').then(data => { if (loadActor !== actorAccessKey.value) return; mediaLibraries.value = data.list; if (submitForm.value.mediaLibraryID !== 0 && !mediaLibraries.value.some(item => item.id === submitForm.value.mediaLibraryID)) submitForm.value.mediaLibraryID = 0 }))
     await Promise.all(requests)
+    if (loadActor !== actorAccessKey.value) return
     await loadRoutePreview()
     if (editingID.value && !downloaders.value.some(item => item.id === editingID.value)) editingID.value = null
-  } catch (reason) { if (!quiet) notify(message(reason), 'error') } finally { if (showLoading) loading.value = false }
+  } catch (reason) { if (loadActor === actorAccessKey.value && !quiet) notify(message(reason), 'error') } finally { if (loadActor === actorAccessKey.value && showLoading) loading.value = false }
 }
 
 async function moveDownloader(index: number, direction: -1 | 1) {
@@ -532,8 +559,8 @@ function canStopSeeding(task: SeedingTaskSummary) { return task.phase !== 'compl
 
 function stats(item: DownloaderSummary) { return summarizeDownloaderTasks(tasks.value, item.id) }
 function message(reason: unknown) { return reason instanceof Error ? reason.message : '操作失败' }
-function downloaderLocation(item: DownloaderSummary) { return item.execution_location === 'node' ? `传输节点 · ${item.node_name || '节点不可用'}` : '主 Server' }
-function downloaderOption(item: DownloaderSummary) { return `${item.name} · ${item.type === 'pan115_offline' ? '115 离线' : item.type === 'quark_share' ? '夸克分享转存' : item.type} · ${downloaderLocation(item)}` }
+function downloaderLocation(item: Pick<DownloaderOption, 'execution_location'> & { node_name?: string }) { return item.execution_location === 'node' ? `传输节点${item.node_name ? ` · ${item.node_name}` : ''}` : '主 Server' }
+function downloaderOption(item: DownloaderOption) { return `${item.name} · ${item.type === 'pan115_offline' ? '115 离线' : item.type === 'quark_share' ? '夸克分享转存' : item.type} · ${downloaderLocation(item)}` }
 function healthClass(item: DownloaderSummary) { return item.health.status === 'online' ? 'status-chip status-chip--ready' : item.health.status === 'offline' ? 'status-chip status-chip--error' : 'status-chip' }
 function healthLabel(item: DownloaderSummary) { return item.health.status === 'online' ? '在线' : item.health.status === 'offline' ? '离线' : '未测试' }
 function healthDetail(item: DownloaderSummary) {
@@ -547,7 +574,7 @@ function transferPhaseLabel(phase: string) {
 
 let refreshTimer: number | undefined
 onMounted(async () => { await load(); refreshTimer = window.setInterval(() => { void load(false, true) }, 3000) })
-onBeforeUnmount(() => { if (refreshTimer !== undefined) window.clearInterval(refreshTimer); routePreviewRequest?.abort() })
+onBeforeUnmount(() => { if (refreshTimer !== undefined) window.clearInterval(refreshTimer); routePreviewRequest?.abort(); downloaderOptionsRequest?.abort() })
 </script>
 
 <template>
@@ -561,7 +588,7 @@ onBeforeUnmount(() => { if (refreshTimer !== undefined) window.clearInterval(ref
 
     <form v-if="activeSection === 'create' && auth.can(Permissions.DownloadsCreate)" id="download-panel-create" class="panel mt-6" role="tabpanel" aria-labelledby="download-tab-create" @submit.prevent="submitDownload">
       <div class="flex flex-wrap items-start justify-between gap-3"><div><h2 class="m-0 text-lg">新建下载任务</h2><p class="text-subtle mb-0 mt-1 text-xs">115 支持离线下载与分享转存，夸克支持分享转存。任务写入独立目录，核实输出后自动整理入库。</p></div><div class="flex flex-wrap gap-2" role="radiogroup" aria-label="下载来源"><label v-if="selectedDownloader?.type !== 'quark_share'" class="btn-secondary" :class="{ 'semantic-list-item--selected': sourceMode === 'url' }"><input v-model="sourceMode" class="sr-only" type="radio" value="url" />{{ selectedDownloader?.type === 'pan115_offline' ? '离线下载' : '磁力 / URL' }}</label><label v-if="!isCloudDownloader(selectedDownloader?.type)" class="btn-secondary" :class="{ 'semantic-list-item--selected': sourceMode === 'torrent' }"><input v-model="sourceMode" class="sr-only" type="radio" value="torrent" />上传种子</label><label v-if="isCloudDownloader(selectedDownloader?.type) && selectedDownloader?.capabilities.share_receive" class="btn-secondary" :class="{ 'semantic-list-item--selected': sourceMode === 'share' }"><input v-model="sourceMode" class="sr-only" type="radio" value="share" />分享转存</label></div></div>
-      <div class="mt-5 grid gap-4 md:grid-cols-2"><div><label class="label">下载器</label><select v-model="submitForm.downloaderID" class="input" required><option value="" disabled>请选择</option><option v-for="item in enabledDownloaders" :key="item.id" :value="item.id">{{ downloaderOption(item) }}</option></select><p v-if="selectedDownloader" class="text-subtle mb-0 mt-2 text-xs">实际执行位置：{{ downloaderLocation(selectedDownloader) }}。任务创建后不会自动换节点或回退主 Server。</p></div><DownloadRouteTargetPicker v-model="submitForm.mediaLibraryID" :preview="routePreview" :loading="routePreviewLoading" /><div v-if="isCloudDownloader(selectedDownloader?.type)" class="semantic-inset p-3 text-sm md:col-span-2"><span class="text-subtle block text-xs">网盘下载目录</span><strong>{{ selectedDownloader?.storage_name }} · {{ selectedDownloader?.provider_directory_path || '/' }}</strong><span class="text-subtle mt-1 block text-xs">{{ sourceMode === 'share' ? '分享内容会转存到独立 omc-* 任务子目录，完成后自动识别整理。' : '离线任务会写入独立 omc-* 任务子目录，完成后按媒体库规则自动整理。' }}</span></div><div><label class="label">任务名称（可选）</label><input v-model="submitForm.displayName" class="input" maxlength="256" placeholder="留空时使用安全的通用名称" /></div><div><label class="label">队列优先级</label><input v-model.number="submitForm.priority" class="input" type="number" min="-100" max="100" /></div><div v-if="sourceMode === 'url' || sourceMode === 'share'" class="md:col-span-2"><label class="label">{{ sourceMode === 'share' ? '网盘分享链接（每行一个，按需包含提取码）' : '磁力链接或 HTTP(S) URL（每行一个）' }}</label><textarea v-model="submitForm.sourceURL" class="input min-h-24 font-mono text-xs" required autocomplete="off" spellcheck="false" :placeholder="sourceMode === 'share' ? (selectedDownloader?.type === 'quark_share' ? 'https://pan.quark.cn/s/...?pwd=...' : 'https://115.com/s/...?password=...') : '每行一个，最多 50 个：\nmagnet:?xt=...\nhttps://...'" /><p class="text-subtle mb-0 mt-2 text-xs">空行会忽略，完全相同的链接只提交一次；部分失败时仅保留失败行。</p><p v-if="unsupportedNodePan115Source" class="semantic-warning mb-0 mt-2 p-3 text-xs">传输节点首版只支持 115 磁力离线和 115 分享；当前内容包含普通 HTTP(S) 离线链接，请改用运行在主 Server 的 115 下载器。</p></div><div v-else class="md:col-span-2"><label class="label">种子文件</label><input ref="fileInput" class="input" type="file" accept=".torrent,application/x-bittorrent" required @change="selectTorrent" /></div></div>
+      <div class="mt-5 grid gap-4 md:grid-cols-2"><div><label class="label">下载器</label><select v-model="submitForm.downloaderID" class="input" required><option value="" disabled>请选择</option><option v-for="item in enabledDownloaders" :key="item.id" :value="item.id">{{ downloaderOption(item) }}</option></select><p v-if="selectedDownloader" class="text-subtle mb-0 mt-2 text-xs">实际执行位置：{{ downloaderLocation(selectedDownloader) }}。任务创建后不会自动换节点或回退主 Server。</p></div><DownloadRouteTargetPicker v-model="submitForm.mediaLibraryID" :preview="routePreview" :loading="routePreviewLoading" /><div v-if="isCloudDownloader(selectedDownloader?.type)" class="semantic-inset p-3 text-sm md:col-span-2"><span class="text-subtle block text-xs">网盘下载目录</span><strong>使用下载器已配置的网盘目录</strong><span class="text-subtle mt-1 block text-xs">{{ sourceMode === 'share' ? '分享内容会转存到独立 omc-* 任务子目录，完成后自动识别整理。' : '离线任务会写入独立 omc-* 任务子目录，完成后按媒体库规则自动整理。' }}</span></div><div><label class="label">任务名称（可选）</label><input v-model="submitForm.displayName" class="input" maxlength="256" placeholder="留空时使用安全的通用名称" /></div><div><label class="label">队列优先级</label><input v-model.number="submitForm.priority" class="input" type="number" min="-100" max="100" /></div><div v-if="sourceMode === 'url' || sourceMode === 'share'" class="md:col-span-2"><label class="label">{{ sourceMode === 'share' ? '网盘分享链接（每行一个，按需包含提取码）' : '磁力链接或 HTTP(S) URL（每行一个）' }}</label><textarea v-model="submitForm.sourceURL" class="input min-h-24 font-mono text-xs" required autocomplete="off" spellcheck="false" :placeholder="sourceMode === 'share' ? (selectedDownloader?.type === 'quark_share' ? 'https://pan.quark.cn/s/...?pwd=...' : 'https://115.com/s/...?password=...') : '每行一个，最多 50 个：\nmagnet:?xt=...\nhttps://...'" /><p class="text-subtle mb-0 mt-2 text-xs">空行会忽略，完全相同的链接只提交一次；部分失败时仅保留失败行。</p><p v-if="unsupportedNodePan115Source" class="semantic-warning mb-0 mt-2 p-3 text-xs">传输节点首版只支持 115 磁力离线和 115 分享；当前内容包含普通 HTTP(S) 离线链接，请改用运行在主 Server 的 115 下载器。</p></div><div v-else class="md:col-span-2"><label class="label">种子文件</label><input ref="fileInput" class="input" type="file" accept=".torrent,application/x-bittorrent" required @change="selectTorrent" /></div></div>
       <div v-if="selectedTarget" class="semantic-inset mt-4 grid gap-3 p-4 text-sm sm:grid-cols-2 lg:grid-cols-4">
         <div><span class="text-subtle block text-xs">最终媒体库</span><strong>{{ selectedTarget.name }}</strong></div>
         <div><span class="text-subtle block text-xs">分类规则</span><strong>{{ selectedTarget.profile_name }} · r{{ selectedTarget.profile_revision }}</strong></div>

@@ -109,6 +109,69 @@ func TestResourceRestrictedTaskViewsRetryAndFrozenExecution(t *testing.T) {
 	if _, err := queue.Control(actor, task.JobID, "cancel", RequestContext{}); err != nil {
 		t.Fatalf("revoked task cannot cancel: %v", err)
 	}
+	// An administrator controls the existing Job but never replaces its owner's authority.
+	adminUser := models.User{Username: "retry-admin", UsernameNormalized: "retry-admin", DisplayName: "Retry Admin", PasswordHash: "unused", Status: models.UserStatusActive}
+	if err := queue.db.Create(&adminUser).Error; err != nil {
+		t.Fatal(err)
+	}
+	admin := actor
+	admin.User = adminUser
+	admin.Permissions[authz.PermissionDiscoveryRead] = struct{}{}
+	persistFixtureAuthority(t, queue.db, admin)
+	persistFixtureAuthority(t, queue.db, actor)
+	assertRetry := func(requester Actor, deniedCategory string) {
+		t.Helper()
+		if err := queue.db.Model(&models.Job{}).Where("id = ?", task.JobID).Update("status", models.JobStatusFailed).Error; err != nil {
+			t.Fatal(err)
+		}
+		_, err := queue.Control(requester, task.JobID, "retry", RequestContext{})
+		if deniedCategory == "" {
+			if err != nil {
+				t.Fatalf("authorized retry=%v", err)
+			}
+			return
+		}
+		if ErrorCode(err) != CodePermissionDenied || !strings.Contains(err.Error(), deniedCategory) {
+			t.Fatalf("retry category %q: %v", deniedCategory, err)
+		}
+		var retained models.Job
+		if err := queue.db.First(&retained, "id = ?", task.JobID).Error; err != nil || retained.Status != models.JobStatusFailed || retained.OwnerID == nil || *retained.OwnerID != actor.User.ID {
+			t.Fatalf("denial changed owner/job=%+v err=%v", retained, err)
+		}
+	}
+	for _, requester := range []Actor{actor, admin} {
+		assertRetry(requester, "目标媒体库")
+	}
+	if err := queue.db.Where("user_id = ?", actor.User.ID).Delete(&models.UserResourceAccessPolicy{}).Error; err != nil {
+		t.Fatal(err)
+	}
+	sourcePayload, _ := json.Marshal(downloadJobPayload{DownloadTaskID: download.ID, ResourceAccessVersion: 1, SourceSiteID: 7})
+	if err := queue.db.Model(&models.Job{}).Where("id = ?", download.JobID).Update("payload_json", string(sourcePayload)).Error; err != nil {
+		t.Fatal(err)
+	}
+	sitePolicy := models.UserResourceAccessPolicy{UserID: actor.User.ID, Scope: models.ResourceAccessScopeSiteSearch, Mode: models.ResourceAccessModeAllowlist, ResourceIDsJSON: `["7"]`}
+	if err := queue.db.Create(&sitePolicy).Error; err != nil {
+		t.Fatal(err)
+	}
+	for _, requester := range []Actor{actor, admin} {
+		assertRetry(requester, "")
+	}
+	if err := queue.db.Model(&sitePolicy).Update("resource_ids_json", `["1","2","3"]`).Error; err != nil {
+		t.Fatal(err)
+	}
+	for _, requester := range []Actor{actor, admin} {
+		assertRetry(requester, "来源站点搜索权限")
+	}
+	if err := queue.db.Model(&models.Job{}).Where("id = ?", download.JobID).Update("payload_json", string(legacyPayload)).Error; err != nil {
+		t.Fatal(err)
+	}
+	for _, requester := range []Actor{actor, admin} {
+		assertRetry(requester, "旧任务来源站点无法核验")
+	}
+	if err := queue.db.Model(&models.User{}).Where("id = ?", actor.User.ID).Update("status", models.UserStatusDisabled).Error; err != nil {
+		t.Fatal(err)
+	}
+	assertRetry(admin, "任务所属用户当前不可用")
 }
 
 func TestResourceRestrictedPlayerCatalogUsesCurrentLibraryAuthority(t *testing.T) {

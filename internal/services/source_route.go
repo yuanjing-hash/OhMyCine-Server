@@ -246,7 +246,7 @@ func (s *DownloadService) recommendSourceRoute(ctx context.Context, actor Actor,
 	}
 	visibleDownloaders := make([]models.Downloader, 0, len(downloaders))
 	for _, downloader := range downloaders {
-		if actor.CanResource(authz.PermissionDownloadsCreate, models.AuthorizationResourceDownloader, downloader.ID) {
+		if canUseDownloader(actor, downloader) {
 			visibleDownloaders = append(visibleDownloaders, downloader)
 		}
 	}

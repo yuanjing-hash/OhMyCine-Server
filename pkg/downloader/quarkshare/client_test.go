@@ -62,7 +62,7 @@ func TestReceiverRejectsOtherSourcesAndOutsideFrozenRoot(t *testing.T) {
 		t.Fatal("rejected request mutated provider")
 	}
 	task, e := c.Submit(ctx, downloader.SubmitRequest{Tag: "omc-task", Source: downloader.Source{Kind: downloader.SourceQuarkShare, URL: "https://pan.quark.cn/s/example"}})
-	if e != nil || !task.Completed || d.received != 1 {
+	if e != nil || !task.Completed || task.Progress == nil || *task.Progress != 100 || d.received != 1 {
 		t.Fatal("share receive failed", e)
 	}
 	task, e = c.Submit(ctx, downloader.SubmitRequest{Tag: "omc-adopt", Source: downloader.Source{Kind: downloader.SourceProviderItem, ProviderItemID: "existing"}})
@@ -72,6 +72,11 @@ func TestReceiverRejectsOtherSourcesAndOutsideFrozenRoot(t *testing.T) {
 	manifest, e := c.Manifest(ctx, "omc-task")
 	if e != nil || len(manifest.Files) != 1 || manifest.Files[0].ProviderItemID != "canonical-tv" || !manifest.Complete {
 		t.Fatal("manifest identity lost")
+	}
+	d.result.Complete = false
+	pending, e := c.Get(ctx, "omc-task")
+	if e != nil || pending.Completed || pending.Progress != nil {
+		t.Fatal("unconfirmed receive invented completion progress", pending, e)
 	}
 	if Capabilities.NativeOffline || Capabilities.Seeding || Capabilities.DeleteData || !Capabilities.ShareReceive {
 		t.Fatal("unsupported capabilities advertised")

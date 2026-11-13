@@ -9,7 +9,13 @@ import type { DownloaderSummary, TransferNodeSummary } from '@/types/api'
 
 vi.mock('@/api/client', async importOriginal => ({ ...await importOriginal<typeof import('@/api/client')>(), api: vi.fn() }))
 vi.mock('vue-router', () => ({ RouterLink: { template: '<a><slot /></a>' }, useRoute: () => ({ query: { section: 'downloaders' } }), useRouter: () => ({ replace: vi.fn() }) }))
-vi.mock('@/stores/auth', () => ({ useAuthStore: () => ({ can: (code: string) => [Permissions.DownloadersRead, Permissions.DownloadersCreate, Permissions.DownloadersUpdate, Permissions.TransferNodesRead].includes(code as typeof Permissions.DownloadersRead), canAny: () => false }) }))
+const access = vi.hoisted(() => ({ current: null as null | { user: { id: number; permissions: string[] } } }))
+vi.mock('@/stores/auth', async () => {
+  const { reactive } = await import('vue')
+  const auth = reactive({ user: { id: 1, permissions: ['downloaders.read', 'downloaders.create', 'downloaders.update', 'transfer_nodes.read'] } })
+  access.current = auth
+  return { useAuthStore: () => ({ get user() { return auth.user }, can: (code: string) => auth.user.permissions.includes(code), canAny: (codes: string[]) => codes.some(code => auth.user.permissions.includes(code)) }) }
+})
 
 const sourceCodes = ['quark_tv_read_v2', 'quark_share_receive_v2', 'content_digest_v2', 'range_export']
 function node(id: string, codes: string[], status: TransferNodeSummary['status'] = 'online'): TransferNodeSummary {
@@ -64,5 +70,32 @@ describe('Node downloader capability admission', () => {
     await save.element.closest('form')!.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }))
     await flushPromises()
     expect(vi.mocked(api).mock.calls.some(([, init]) => init?.method === 'PATCH')).toBe(false)
+    const optionRequests: { signal: AbortSignal; finish: (value: unknown) => void }[] = []
+    vi.mocked(api).mockImplementation(async (path, options) => {
+      if (path === '/api/v1/downloaders/options') return new Promise(finish => optionRequests.push({ signal: options!.signal as AbortSignal, finish }))
+      if (path === '/api/v1/media-libraries') return { list: [], total: 0 }
+      if (path === '/api/v1/download-routes/preview') return { options: [] }
+      throw new Error(`unexpected ordinary request ${path}`)
+    })
+    access.current!.user = { id: 2, permissions: [Permissions.DownloadsCreate, Permissions.MediaLibrariesRead] }
+    await flushPromises()
+    expect(optionRequests).toHaveLength(1)
+    access.current!.user = { id: 3, permissions: [Permissions.DownloadsCreate, Permissions.MediaLibrariesRead] }
+    await flushPromises()
+    expect(optionRequests[0]!.signal.aborted).toBe(true)
+    optionRequests[1]!.finish({ list: [{ id: 'current', name: 'Current receiver', type: 'qbittorrent', capabilities: {}, execution_location: 'server' }] })
+    await flushPromises()
+    optionRequests[0]!.finish({ list: [{ id: 'retired', name: 'Private old receiver', type: 'qbittorrent', capabilities: {}, execution_location: 'server' }] })
+    await flushPromises()
+    expect(wrapper.get('select').findAll('option').map(option => option.element.value)).toEqual(['', 'current'])
+    expect(wrapper.text()).not.toContain('Private old receiver')
+    expect(wrapper.text()).not.toContain('下载器管理')
+    access.current!.user = { ...access.current!.user, permissions: [...access.current!.user.permissions].reverse() }
+    await flushPromises()
+    expect(optionRequests).toHaveLength(2)
+    expect(wrapper.get('select').element).toHaveProperty('value', 'current')
+    access.current!.user = { ...access.current!.user, permissions: [] }
+    await flushPromises()
+    expect(wrapper.findAll('option[value="current"]')).toHaveLength(0)
   })
 })

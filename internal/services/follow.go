@@ -274,7 +274,7 @@ func (s *FollowService) Defaults(ctx context.Context, actor Actor, tmdbID int64)
 	}
 	authorizedDownloaders := make([]models.Downloader, 0, len(downloaders))
 	for _, item := range downloaders {
-		if !actor.CanResource(authz.PermissionDownloadsCreate, models.AuthorizationResourceDownloader, item.ID) {
+		if !canUseDownloader(actor, item) {
 			continue
 		}
 		var connectionID *uint

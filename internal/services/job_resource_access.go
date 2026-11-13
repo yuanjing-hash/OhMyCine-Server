@@ -179,33 +179,52 @@ func (s *QueueService) projectJobResourceAccess(actor Actor, jobs []models.Job, 
 	return nil
 }
 
+type jobContinuationDenial uint8
+
+const (
+	jobContinuationAllowed jobContinuationDenial = iota
+	jobContinuationInvalid
+	jobContinuationUnknownOrigin
+	jobContinuationDownloadCreate
+	jobContinuationDownloader
+	jobContinuationLibrary
+	jobContinuationSite
+	jobContinuationFunction
+)
+
 func (access jobResourceAccess) canContinue(actor Actor, jobType string) bool {
+	return access.continuationDenial(actor, jobType) == jobContinuationAllowed
+}
+
+// Keep the original acceptance rules and their order. Exact resource allows
+// remain sufficient where CanResource/HasPermission admitted them before.
+func (access jobResourceAccess) continuationDenial(actor Actor, jobType string) jobContinuationDenial {
 	if access.invalid {
-		return false
+		return jobContinuationInvalid
 	}
 	if access.UnknownSite && restrictedSiteAccess(actor) {
-		return false
+		return jobContinuationUnknownOrigin
 	}
 	if access.DownloaderID != nil && !actor.CanResource(authz.PermissionDownloadsCreate, models.AuthorizationResourceDownloader, *access.DownloaderID) {
-		return false
+		return jobContinuationDownloader
 	}
 	switch jobType {
 	case "download", "transfer", "seeding", JobTypeFollowSearch:
 		if !actor.HasPermission(authz.PermissionDownloadsCreate) {
-			return false
+			return jobContinuationDownloadCreate
 		}
 		if access.LibraryID != 0 && !actor.CanIngestLibrary(uintID(access.LibraryID)) {
-			return false
+			return jobContinuationLibrary
 		}
 	case JobTypeMediaReorganization:
 		if !actor.Can(authz.PermissionJobsControlOwn) && !actor.Can(authz.PermissionJobsControlAll) {
-			return false
+			return jobContinuationFunction
 		}
 		if !actor.Can(authz.PermissionTransfersReadOwn) && !actor.Can(authz.PermissionTransfersReadAll) {
-			return false
+			return jobContinuationFunction
 		}
 		if !taskLibraryVisible(actor, access.LibraryID) || !actor.ResourceAccessAllows(models.ResourceAccessScopeLibraryIngest, uintID(access.LibraryID)) {
-			return false
+			return jobContinuationLibrary
 		}
 	default:
 		permission := authz.PermissionMediaLibrariesScan
@@ -213,7 +232,7 @@ func (access jobResourceAccess) canContinue(actor Actor, jobType string) bool {
 			permission = authz.PermissionSTRMRunsCreate
 		}
 		if access.LibraryID != 0 && !actor.CanResource(permission, models.AuthorizationResourceMediaLibrary, uintID(access.LibraryID)) {
-			return false
+			return jobContinuationLibrary
 		}
 	}
 	allowedSites := 0
@@ -223,9 +242,36 @@ func (access jobResourceAccess) canContinue(actor Actor, jobType string) bool {
 		}
 	}
 	if jobType == JobTypeFollowSearch {
-		return len(access.SiteIDs) > 0 && allowedSites > 0
+		if len(access.SiteIDs) == 0 || allowedSites == 0 {
+			return jobContinuationSite
+		}
+	} else if allowedSites != len(access.SiteIDs) {
+		return jobContinuationSite
 	}
-	return allowedSites == len(access.SiteIDs)
+	return jobContinuationAllowed
+}
+
+func (reason jobContinuationDenial) message(owner bool) string {
+	prefix := "当前权限不允许继续这个任务："
+	if owner {
+		prefix = "任务所属用户当前无权继续这个任务："
+	}
+	switch reason {
+	case jobContinuationInvalid:
+		return prefix + "任务资源记录无法核验，请重新搜索后提交"
+	case jobContinuationUnknownOrigin:
+		return prefix + "旧任务来源站点无法核验，当前站点范围已受限，请重新搜索后提交"
+	case jobContinuationDownloadCreate:
+		return prefix + "缺少创建下载任务的权限"
+	case jobContinuationDownloader:
+		return prefix + "下载器使用权限不足"
+	case jobContinuationLibrary:
+		return prefix + "目标媒体库访问或入库权限不足"
+	case jobContinuationSite:
+		return prefix + "来源站点搜索权限不足"
+	default:
+		return prefix + "执行所需功能权限不足"
+	}
 }
 
 // Only explicit continuation crosses this gate. Cancel/pause and already
@@ -250,13 +296,19 @@ func authorizeJobContinuationTx(tx *gorm.DB, requester Actor, job models.Job, pu
 	if !control {
 		return appError(CodePermissionDenied, "当前权限不允许继续这个任务", nil)
 	}
-	if !access.canContinue(current, job.JobType) {
-		return appError(CodePermissionDenied, "当前权限不允许继续这个任务，请调整权限或重新搜索后提交", nil)
+	if reason := access.continuationDenial(current, job.JobType); reason != jobContinuationAllowed {
+		return appError(CodePermissionDenied, reason.message(false), nil)
 	}
 	if job.OwnerID != nil && *job.OwnerID != requester.User.ID {
 		owner, err := NewAuthorizationService(tx).Resolve(*job.OwnerID)
-		if err != nil || !access.canContinue(owner, job.JobType) {
-			return appError(CodePermissionDenied, "任务所属用户当前无权继续这个任务", nil)
+		if err != nil {
+			if ErrorCode(err) == CodeNotAuthenticated {
+				return appError(CodePermissionDenied, "任务所属用户当前不可用，无法继续这个任务", nil)
+			}
+			return err
+		}
+		if reason := access.continuationDenial(owner, job.JobType); reason != jobContinuationAllowed {
+			return appError(CodePermissionDenied, reason.message(true), nil)
 		}
 	}
 	return nil

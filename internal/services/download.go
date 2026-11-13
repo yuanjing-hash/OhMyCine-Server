@@ -409,7 +409,7 @@ func (s *DownloadService) Submit(ctx context.Context, actor Actor, input SubmitD
 		}
 		serverlog.RecordBusiness(ctx, s.log, serverlog.OperationDownloadTask, serverlog.BusinessEvent{Code: "download.request.failed", Stage: "enqueue", Outcome: "failed", Message: "下载请求未获接受，未确认新任务创建；请结合当前权限、下载器与目标路线错误码检查", Fields: fields})
 	}()
-	if !actor.Can(authz.PermissionDownloadsCreate) {
+	if !actor.HasPermission(authz.PermissionDownloadsCreate) {
 		return DownloadTaskSummary{}, appError(CodePermissionDenied, "无权创建下载任务", nil)
 	}
 	downloaderID := strings.TrimSpace(input.DownloaderID)
@@ -1785,8 +1785,18 @@ func normalizeDownloadDisplayName(requestedName, fallback string) (string, error
 
 func downloadSourcePurpose(id string) string { return "download-task:" + id + ":source" }
 
+// downloadProgressPercent projects the download stage only. Historical samples
+// may predate the adapter unit fix; the durable completed phase is authoritative.
+func downloadProgressPercent(record models.DownloadTask) *float64 {
+	if record.Phase == models.DownloadTaskStatusCompleted {
+		value := 100.0
+		return &value
+	}
+	return cloneFloat64(record.Progress)
+}
+
 func downloadTaskSummary(record models.DownloadTask, jobStatus string) DownloadTaskSummary {
-	return DownloadTaskSummary{ID: record.ID, JobID: record.JobID, OwnerID: record.OwnerID, DownloaderID: record.DownloaderID, DownloaderName: record.DownloaderName, ProviderType: record.ProviderType, DisplayName: record.DisplayName, JobStatus: jobStatus, ProviderStatus: record.ProviderStatus, Phase: record.Phase, ControlPending: record.Phase == models.DownloadTaskStatusCancelled && record.LastErrorCode == downloadCancellationPending, Progress: record.Progress, BytesCompleted: record.BytesCompleted, BytesTotal: record.BytesTotal, DownloadSpeed: record.DownloadSpeed, UploadSpeed: record.UploadSpeed, ETASeconds: record.ETASeconds, LastSampledAt: record.LastSampledAt, LastErrorCode: record.LastErrorCode, LastErrorMessage: record.LastErrorMessage, CreatedAt: record.CreatedAt, UpdatedAt: record.UpdatedAt, FinishedAt: record.FinishedAt, ProfileID: record.ProfileID, ProfileRevision: record.ProfileRevision, ScrapeStatus: record.ScrapeStatus, ScrapeTitle: record.ScrapeTitle, ScrapeMediaType: record.ScrapeMediaType, ScrapeCategory: record.ScrapeCategory, ScrapeTMDBID: record.ScrapeTMDBID, ScrapeConfidence: record.ScrapeConfidence, ScrapeSeason: cloneInt(record.ScrapeSeason), ScrapeEpisode: cloneInt(record.ScrapeEpisode), IdentitySource: record.IdentitySource, IdentityStatus: record.IdentityStatus, IdentityLocked: record.IdentityLocked, IdentityRevision: record.IdentityRevision, ManifestFiles: record.ManifestFileCount, TargetLibraryID: record.TargetLibraryID, TargetLibraryName: record.TargetLibraryName, TransferMode: record.TransferMode, ConflictPolicy: record.ConflictPolicy, RouteKind: record.TransferRouteKind, ExecutionLocation: normalizeExecutionLocation(record.ExecutionLocation), NodeID: record.NodeID, NodeName: record.NodeName}
+	return DownloadTaskSummary{ID: record.ID, JobID: record.JobID, OwnerID: record.OwnerID, DownloaderID: record.DownloaderID, DownloaderName: record.DownloaderName, ProviderType: record.ProviderType, DisplayName: record.DisplayName, JobStatus: jobStatus, ProviderStatus: record.ProviderStatus, Phase: record.Phase, ControlPending: record.Phase == models.DownloadTaskStatusCancelled && record.LastErrorCode == downloadCancellationPending, Progress: downloadProgressPercent(record), BytesCompleted: record.BytesCompleted, BytesTotal: record.BytesTotal, DownloadSpeed: record.DownloadSpeed, UploadSpeed: record.UploadSpeed, ETASeconds: record.ETASeconds, LastSampledAt: record.LastSampledAt, LastErrorCode: record.LastErrorCode, LastErrorMessage: record.LastErrorMessage, CreatedAt: record.CreatedAt, UpdatedAt: record.UpdatedAt, FinishedAt: record.FinishedAt, ProfileID: record.ProfileID, ProfileRevision: record.ProfileRevision, ScrapeStatus: record.ScrapeStatus, ScrapeTitle: record.ScrapeTitle, ScrapeMediaType: record.ScrapeMediaType, ScrapeCategory: record.ScrapeCategory, ScrapeTMDBID: record.ScrapeTMDBID, ScrapeConfidence: record.ScrapeConfidence, ScrapeSeason: cloneInt(record.ScrapeSeason), ScrapeEpisode: cloneInt(record.ScrapeEpisode), IdentitySource: record.IdentitySource, IdentityStatus: record.IdentityStatus, IdentityLocked: record.IdentityLocked, IdentityRevision: record.IdentityRevision, ManifestFiles: record.ManifestFileCount, TargetLibraryID: record.TargetLibraryID, TargetLibraryName: record.TargetLibraryName, TransferMode: record.TransferMode, ConflictPolicy: record.ConflictPolicy, RouteKind: record.TransferRouteKind, ExecutionLocation: normalizeExecutionLocation(record.ExecutionLocation), NodeID: record.NodeID, NodeName: record.NodeName}
 }
 
 func requestedTargetID(value *uint) uint {
