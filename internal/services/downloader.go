@@ -106,6 +106,38 @@ type DownloaderSummary struct {
 	NodeMountRoot               string                   `json:"node_mount_root,omitempty"`
 }
 
+// DownloaderOption is an enabled receiver usable by the current actor. It does
+// not include connection configuration, provider paths or management health.
+type DownloaderOption struct {
+	ID                string                   `json:"id"`
+	Name              string                   `json:"name"`
+	Type              string                   `json:"type"`
+	Capabilities      downloadpkg.Capabilities `json:"capabilities"`
+	ExecutionLocation string                   `json:"execution_location"`
+}
+
+func canUseDownloader(actor Actor, record models.Downloader) bool {
+	return record.Enabled && actor.CanResource(authz.PermissionDownloadsCreate, models.AuthorizationResourceDownloader, record.ID)
+}
+
+func (s *DownloaderService) Options(ctx context.Context, actor Actor) ([]DownloaderOption, error) {
+	if !actor.HasPermission(authz.PermissionDownloadsCreate) {
+		return nil, appError(CodePermissionDenied, "无权创建下载任务", nil)
+	}
+	var records []models.Downloader
+	if err := s.db.WithContext(ctx).Where("enabled = ?", true).Order("sort_order, id").Find(&records).Error; err != nil {
+		return nil, err
+	}
+	items := make([]DownloaderOption, 0, len(records))
+	for _, record := range records {
+		if !canUseDownloader(actor, record) {
+			continue
+		}
+		items = append(items, DownloaderOption{ID: record.ID, Name: record.Name, Type: record.Type, Capabilities: s.receiverCapabilities(ctx, actor, record), ExecutionLocation: normalizeExecutionLocation(record.ExecutionLocation)})
+	}
+	return items, nil
+}
+
 func (s *DownloaderService) List(actor Actor) ([]DownloaderSummary, error) {
 	if !actor.HasPermission(authz.PermissionDownloadersRead) {
 		return nil, appError(CodePermissionDenied, "无权查看下载器", nil)
@@ -662,13 +694,18 @@ func normalizeDownloaderName(input string) (string, string, error) {
 
 func downloaderPurpose(id, field string) string { return "downloader:" + id + ":" + field }
 
-func (s *DownloaderService) summary(actor Actor, record models.Downloader) DownloaderSummary {
+func (s *DownloaderService) receiverCapabilities(ctx context.Context, actor Actor, record models.Downloader) downloadpkg.Capabilities {
 	var capabilities downloadpkg.Capabilities
 	_ = json.Unmarshal([]byte(record.CapabilitiesJSON), &capabilities)
 	if isCloudShareDownloader(record.Type) {
-		_, err := s.configuredShareReceiver(context.Background(), record)
+		_, err := s.configuredShareReceiver(ctx, record)
 		capabilities.ShareReceive = err == nil && actor.CanResource(authz.PermissionDownloadsCreate, models.AuthorizationResourceDownloader, record.ID)
 	}
+	return capabilities
+}
+
+func (s *DownloaderService) summary(actor Actor, record models.Downloader) DownloaderSummary {
+	capabilities := s.receiverCapabilities(context.Background(), actor, record)
 	name := ""
 	var defaultLibraryID *uint
 	defaultLibraryName := ""

@@ -324,9 +324,15 @@ func (c *StorageSourceClient) matchesSource(source downloadpkg.Source) bool {
 }
 
 func (c *StorageSourceClient) storageSourceTask(response nodeprotocol.StorageSourceActionResponse) downloadpkg.Task {
-	progress := response.Progress
-	if progress == nil && response.TotalBytes > 0 {
-		value := float64(response.DownloadedBytes) / float64(response.TotalBytes)
+	var progress *float64
+	// Storage-source wire progress remains a 0..1 ratio, including on old Nodes.
+	if response.Progress != nil {
+		if *response.Progress >= 0 && *response.Progress <= 1 {
+			value := *response.Progress * 100
+			progress = &value
+		}
+	} else if response.TotalBytes > 0 {
+		value := float64(response.DownloadedBytes) / float64(response.TotalBytes) * 100
 		progress = &value
 	}
 	task := downloadpkg.Task{ID: response.OperationKey, Name: response.OperationKey, Status: response.ProviderStatus, Progress: progress, BytesCompleted: &response.DownloadedBytes, BytesTotal: &response.TotalBytes, ErrorCode: response.ErrorCode, OutputItemID: c.basePlan.OfflineDestinationID}
@@ -334,6 +340,8 @@ func (c *StorageSourceClient) storageSourceTask(response nodeprotocol.StorageSou
 		task.OutputItemID = response.OutputRootID
 	}
 	if response.Status == nodeprotocol.StorageSourceCompleted {
+		value := 100.0
+		task.Progress = &value
 		task.Completed = true
 		task.Status = "completed"
 	}

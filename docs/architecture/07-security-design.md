@@ -83,6 +83,8 @@ Server 的角色只提供权限模板；用户有效权限由角色允许、用�
 
 保存名单在事务内重新授权，保护 Owner、禁止自改授权，使用 `authz_version` 检测并发修改并记录审计。非 Owner 管理员只能扩大到自己有权授予的范围，包括将来新建资源；已经更宽的用户可以被收紧。策略改变从下一次请求生效，长连接也重新校验版本；旧搜索令牌、图片/播放入口与缓存命中均不得绕过当前权限。
 
+下载创建使用 `GET /api/v1/downloaders/options` 获取启用且通过 `downloads.create` 精确下载器授权的安全选项，按既有优先顺序返回；它不要求 `downloaders.read`，也不返回连接地址、凭据配置、网盘目录、节点身份或健康信息。精确资源允许与全局拒绝继续遵守既有规则；预览、最终提交与显式重试各自重新授权。管理配置列表仍要求独立的 `downloaders.read`。
+
 已提交的下载与入库继续执行冻结计划。新提交、手动重试和后续订阅运行重新检查当前资源权限；历史可保留阶段摘要，但隐藏已禁止资源的标识和内容。机器签名 STRM 使用既有独立协议，Player 的独立直连数据源仍由其自身授权管理。部署与接口说明见 [用户资源权限](../deployment/user-resource-access.md)。
 
 Player device token 继承签发用户的当前授权。`/api/v1/player/bootstrap` 动态投影目录浏览、发现搜索、创建入库、订阅等 capability；Player 缓存的 capability 仅用于交互提示，Server 每次 mutation 仍重新授权。Acquisition、SSE 和错误 DTO 不返回站点凭据、claim 内部值、torrent URL、上游正文、本地绝对路径、provider 文件身份或临时播放地址。

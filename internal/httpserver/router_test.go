@@ -1872,6 +1872,52 @@ func TestDownloaderAndDownloadAPIRedactSensitiveSources(t *testing.T) {
 	if status != http.StatusNotFound || !bytes.Contains(envelope.Data, []byte(services.CodeNotFound)) {
 		t.Fatalf("retarget route status=%d body=%s", status, envelope.Data)
 	}
+	hash, err := bcrypt.GenerateFromPassword([]byte("Ordinary123"), bcrypt.MinCost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	user := models.User{Username: "receiver-user", UsernameNormalized: "receiver-user", PasswordHash: string(hash), Status: models.UserStatusActive, AuthzVersion: 1}
+	if err := client.db.Create(&user).Error; err != nil {
+		t.Fatal(err)
+	}
+	var role models.Role
+	if err := client.db.Where("code = ?", authz.RoleUser).First(&role).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := client.db.Create(&models.UserRole{UserID: user.ID, RoleID: role.ID}).Error; err != nil {
+		t.Fatal(err)
+	}
+	ordinary := &testClient{router: client.router}
+	ordinary.login(t, user.Username, "Ordinary123")
+	status, _ = ordinary.request(t, http.MethodGet, "/api/v1/downloaders", nil, false)
+	if status != http.StatusForbidden {
+		t.Fatalf("ordinary management list status=%d", status)
+	}
+	status, envelope = ordinary.request(t, http.MethodGet, "/api/v1/downloaders/options", nil, false)
+	var options struct {
+		List []map[string]json.RawMessage `json:"list"`
+	}
+	if err := json.Unmarshal(envelope.Data, &options); err != nil {
+		t.Fatal(err)
+	}
+	if status != http.StatusOK || len(options.List) != 1 || len(options.List[0]) != 5 || options.List[0]["base_url"] != nil || ordinary.lastHeader.Get("Cache-Control") != "no-store" {
+		t.Fatalf("ordinary safe options status=%d body=%s", status, envelope.Data)
+	}
+	policy := models.UserResourceAccessPolicy{UserID: user.ID, Scope: models.ResourceAccessScopeDownloaderUse, Mode: models.ResourceAccessModeAllowlist, ResourceIDsJSON: `[]`}
+	if err := client.db.Create(&policy).Error; err != nil {
+		t.Fatal(err)
+	}
+	status, envelope = ordinary.request(t, http.MethodGet, "/api/v1/downloaders/options", nil, false)
+	if status != http.StatusOK || !bytes.Contains(envelope.Data, []byte(`"list":[]`)) {
+		t.Fatalf("revoked options status=%d body=%s", status, envelope.Data)
+	}
+	if err := client.db.Where("user_id = ?", user.ID).Delete(&models.UserRole{}).Error; err != nil {
+		t.Fatal(err)
+	}
+	status, _ = ordinary.request(t, http.MethodGet, "/api/v1/downloaders/options", nil, false)
+	if status != http.StatusForbidden {
+		t.Fatalf("missing create permission status=%d", status)
+	}
 }
 
 func TestTerminalDownloadCanBeDeletedAndActiveDownloadIsRetained(t *testing.T) {

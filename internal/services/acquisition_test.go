@@ -27,7 +27,7 @@ func TestAcquisitionRecordDownloadUsesTrustedFrozenIdentityBeforeScrape(t *testi
 	queue, actor, clock := queueFixture(t)
 	actor.Permissions[authz.PermissionDiscoveryRead] = struct{}{}
 	tmdbID := int64(65733)
-	progress := 21.5
+	progress := 1.0
 	job := enqueueFake(t, queue, actor, "Doraemon", "acquisition-direct-create")
 	task := models.DownloadTask{
 		ID:                   uuid.NewString(),
@@ -201,7 +201,7 @@ func TestAcquisitionReprojectsTransferProgressAndHidesDeniedLibrary(t *testing.T
 	}
 	downloadJob := enqueueFake(t, queue, actor, "Acquisition download", "acquisition-download")
 	tmdbID := int64(100)
-	progress := 73.5
+	progress := 1.0 // Historical adapter samples used a ratio despite completed phase.
 	bytesCompleted, bytesTotal, downloadSpeed, etaSeconds := int64(735), int64(1000), int64(100), int64(3)
 	download := models.DownloadTask{ID: uuid.NewString(), OwnerID: actor.User.ID, JobID: downloadJob.ID, DownloaderName: "Test", ProviderType: models.DownloaderTypeFake, SourceCiphertext: "encrypted", DisplayName: "Test", Phase: models.DownloadTaskStatusCompleted, Progress: &progress, BytesCompleted: &bytesCompleted, BytesTotal: &bytesTotal, DownloadSpeed: &downloadSpeed, ETASeconds: &etaSeconds, TargetLibraryID: &library.ID, TargetStorageID: &storage.ID, TargetStorageType: storage.Type, TargetStorageRoot: storage.RootPath, TargetRelativeRoot: library.RelativeRoot, ScrapeTMDBID: &tmdbID, ScrapeMediaType: "tv", CreatedAt: now, UpdatedAt: now}
 	if err := queue.db.Create(&download).Error; err != nil {
@@ -253,11 +253,22 @@ func TestAcquisitionReprojectsTransferProgressAndHidesDeniedLibrary(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	if status.Stage != "library" || status.Status != models.TransferTaskStatusCompleted || status.TransferTaskID != transfer.ID || status.Progress == nil || *status.Progress != progress || status.BytesCompleted == nil || *status.BytesCompleted != bytesCompleted || status.DownloadSpeed == nil || *status.DownloadSpeed != downloadSpeed || status.ProcessedFiles != 4 || status.TotalFiles != 4 || status.UpdatedAt == nil || !status.UpdatedAt.Equal(finished) || status.TargetLibraryID == nil {
+	if status.Stage != "library" || status.Status != models.TransferTaskStatusCompleted || status.TransferTaskID != transfer.ID || status.Progress == nil || *status.Progress != 100 || status.BytesCompleted == nil || *status.BytesCompleted != bytesCompleted || status.DownloadSpeed == nil || *status.DownloadSpeed != downloadSpeed || status.ProcessedFiles != 4 || status.TotalFiles != 4 || status.UpdatedAt == nil || !status.UpdatedAt.Equal(finished) || status.TargetLibraryID == nil {
 		t.Fatalf("status=%+v", status)
 	}
 	if status.CatalogTarget == nil || status.CatalogTarget.LibraryID != library.ID || status.CatalogTarget.WorkToken != encodeCatalogToken("series:tmdb:100") {
 		t.Fatalf("missing authoritative navigation: %+v", status)
+	}
+
+	// Both public projections use the durable download completion fact without
+	// rewriting a historical sample or inventing byte/speed telemetry.
+	summary := downloadTaskSummary(download, models.JobStatusCompleted)
+	if summary.Progress == nil || *summary.Progress != 100 || summary.BytesCompleted == nil || *summary.BytesCompleted != bytesCompleted || summary.DownloadSpeed == nil || *summary.DownloadSpeed != downloadSpeed {
+		t.Fatalf("historical download summary=%+v", summary)
+	}
+	var savedDownload models.DownloadTask
+	if err := queue.db.First(&savedDownload, "id = ?", download.ID).Error; err != nil || savedDownload.Progress == nil || *savedDownload.Progress != progress {
+		t.Fatalf("read projection rewrote historical telemetry: %+v %v", savedDownload, err)
 	}
 
 	// Excluding and restoring a different work is not a source-lifetime change.

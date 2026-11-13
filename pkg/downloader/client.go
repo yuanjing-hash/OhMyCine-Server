@@ -166,6 +166,8 @@ type ManifestClient interface {
 	Manifest(context.Context, string) (Manifest, error)
 }
 
+// Task.Progress is a percentage in [0, 100], not a fractional ratio. Nil means
+// no progress observation; provider status text is not completion proof.
 type Task struct {
 	ID             string
 	Name           string

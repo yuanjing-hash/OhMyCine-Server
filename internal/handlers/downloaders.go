@@ -30,6 +30,16 @@ type downloaderPayload struct {
 	NodeMountRoot          *string `json:"node_mount_root"`
 }
 
+func (a *API) DownloaderOptions(c *gin.Context) {
+	actor, _ := middleware.ActorFrom(c)
+	items, err := a.downloaders.Options(c.Request.Context(), actor)
+	if err != nil {
+		writeError(c, a.log, err)
+		return
+	}
+	success(c, http.StatusOK, gin.H{"list": items, "total": len(items)})
+}
+
 func (a *API) Downloaders(c *gin.Context) {
 	actor, _ := middleware.ActorFrom(c)
 	items, err := a.downloaders.List(actor)

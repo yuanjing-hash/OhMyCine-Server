@@ -40,7 +40,7 @@ function fixture(searchReply: (path: string, options?: RequestInit) => unknown =
     if (path === '/api/v1/sites') return Promise.resolve({ list: [] })
     if (path === '/api/v1/discovery/search-options') return Promise.resolve({ list: [{ id: 7, name: '混合来源', site_type: 'cloud_share', searchable: true, health_status: 'online' }] })
     if (path.includes('/torrent-search?')) return Promise.resolve(searchReply(path, options))
-    if (path === '/api/v1/downloaders') return Promise.resolve({ list: [{ id: 'receiver', name: '执行器', type: 'pan115_offline', enabled: true }] })
+    if (path === '/api/v1/downloaders/options') return Promise.resolve({ list: [{ id: 'receiver', name: '执行器', type: 'pan115_offline', enabled: true }] })
     if (path === '/api/v1/media-libraries') return Promise.resolve({ list: [{ id: 1, name: '媒体库', enabled: true }] })
     if (path === '/api/v1/sites/routes/recommend') return Promise.resolve(recommendation())
     if (path === '/api/v1/download-routes/preview') {

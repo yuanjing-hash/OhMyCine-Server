@@ -257,7 +257,7 @@ it.each(['115_share', 'quark_share'])('keeps legacy %s results usable and opens 
   fixture(page => ({ ...group(page), items: [{ token: 'legacy', title: 'Legacy share', source_kind: source, expires_at: new Date(Date.now() + 60_000).toISOString() }] }))
   const implementation = request.getMockImplementation()!
   request.mockImplementation((path: string, options?: RequestInit) => {
-    if (path === '/api/v1/downloaders') return Promise.resolve({ list: [
+    if (path === '/api/v1/downloaders/options') return Promise.resolve({ list: [
       { id: '115', name: '115 receiver', type: 'pan115_offline', enabled: true, capabilities: { share_receive: true } },
       { id: 'quark', name: 'Quark unfinished', type: 'quark_share', enabled: true, capabilities: { share_receive: false } },
     ] })

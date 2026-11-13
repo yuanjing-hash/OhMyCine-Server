@@ -362,6 +362,11 @@ export interface DownloaderCapabilities {
   output_constraint: 'none' | 'local_staging' | 'provider_storage'
   share_receive: boolean
 }
+export interface DownloaderOption {
+  id: string; name: string; type: 'fake' | 'qbittorrent' | 'pan115_offline' | 'quark_share'
+  capabilities: DownloaderCapabilities
+  execution_location: 'server' | 'node'
+}
 export interface DownloaderSummary {
   id: string; name: string; type: 'fake' | 'qbittorrent' | 'pan115_offline' | 'quark_share'; base_url: string; enabled: boolean
   sort_order: number

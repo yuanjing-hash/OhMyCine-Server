@@ -4,17 +4,17 @@ import { api, APIError } from '@/api/client'
 import { formatBytes, cloudShareDownloaderType, isCloudShareSource } from '@/downloads'
 import { isShareVideo, shareEntryFiles, toggleShareEntry, type SharePreview, type SharePreviewEntry, type ShareSelection, type ShareValidation } from '@/share-preview'
 import type { TorrentRecognitionResult } from '@/sites'
-import type { DownloaderSummary } from '@/types/api'
+import type { DownloaderOption } from '@/types/api'
 import { parseShareContentAnalysis, type ShareContentAnalysis } from '@/share-content'
 
-const props = defineProps<{ resultToken: string; title: string; sourceKind?: string; downloaders: DownloaderSummary[] }>()
+const props = defineProps<{ resultToken: string; title: string; sourceKind?: string; downloaders: DownloaderOption[] }>()
 const emit = defineEmits<{ close: []; select: [selection: ShareSelection]; validation: [resultToken: string, validation: ShareValidation]; analysis: [resultToken: string, analysis: ShareContentAnalysis] }>()
 // Omitted source kind is the legacy 115 dialog contract; an explicit other source
 // must never inherit that fallback. Readiness comes from the current Server DTO.
 const sourceKind = computed(() => props.sourceKind ?? '115_share')
 const providerLabel = computed(() => sourceKind.value === 'quark_share' ? '夸克' : sourceKind.value === '115_share' ? '115' : '此来源')
 const available = computed(() => isCloudShareSource(sourceKind.value)
- ? props.downloaders.filter(item => item.enabled && item.type === cloudShareDownloaderType(sourceKind.value) && item.capabilities.share_receive)
+ ? props.downloaders.filter(item => item.type === cloudShareDownloaderType(sourceKind.value) && item.capabilities.share_receive)
  : [])
 const dialog = ref<HTMLElement | null>(null)
 const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null
@@ -22,7 +22,7 @@ const downloaderID = ref('')
 const selectedDownloader = computed(() => available.value.find(item => item.id === downloaderID.value))
 const previewContext = computed(() => {
  const item = selectedDownloader.value
- return JSON.stringify([props.resultToken, sourceKind.value, item && [item.id, item.type, item.storage_id, item.execution_location, item.node_id, item.updated_at]])
+ return JSON.stringify([props.resultToken, sourceKind.value, item && [item.id, item.type, item.execution_location, item.capabilities.share_receive]])
 })
 const preview = ref<SharePreview | null>(null)
 const selected = ref<string[]>([])

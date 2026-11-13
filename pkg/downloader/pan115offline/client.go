@@ -202,7 +202,7 @@ func (c *Client) adoptProviderItem(ctx context.Context, request downloader.Submi
 }
 
 func completedDirectoryTask(prefix string, item cloud.Item) downloader.Task {
-	progress := 1.0
+	progress := 100.0
 	return downloader.Task{ID: prefix + item.ID, Name: item.Name, Status: "completed", Progress: &progress, Completed: true, OutputItemID: item.ID}
 }
 
@@ -514,12 +514,22 @@ func providerDirectoryTask(id string) (string, string, bool) {
 }
 
 func mapTask(task cloud.OfflineTask) downloader.Task {
+	var progress *float64
 	var completed *int64
-	if task.BytesTotal != nil && task.Progress != nil {
-		value := int64(float64(*task.BytesTotal) * *task.Progress)
-		completed = &value
+	// The cloud driver reports a 0..1 ratio; the downloader contract uses percent.
+	if task.Progress != nil && *task.Progress >= 0 && *task.Progress <= 1 {
+		value := *task.Progress * 100
+		progress = &value
+		if task.BytesTotal != nil {
+			value := int64(float64(*task.BytesTotal) * *task.Progress)
+			completed = &value
+		}
 	}
-	return downloader.Task{ID: task.ID, Name: task.Name, Status: task.Status, Progress: task.Progress, BytesCompleted: completed, BytesTotal: task.BytesTotal, ETASeconds: task.ETASeconds, Completed: task.Completed, Failed: task.Failed, OutputItemID: task.OutputItemID}
+	if task.Completed && !task.Failed {
+		value := 100.0
+		progress = &value
+	}
+	return downloader.Task{ID: task.ID, Name: task.Name, Status: task.Status, Progress: progress, BytesCompleted: completed, BytesTotal: task.BytesTotal, ETASeconds: task.ETASeconds, Completed: task.Completed, Failed: task.Failed, OutputItemID: task.OutputItemID}
 }
 
 func mapError(err error) error {

@@ -6,6 +6,107 @@
     "description": "Scoped additive API contract. Existing API authentication, current resource permissions and standard envelopes apply. No endpoint accepts native provider IDs or raw torrent indexes as browser authority. Publication/deployment and real provider acceptance are separate."
   },
   "paths": {
+    "/api/v1/downloaders/options": {
+      "get": {
+        "operationId": "sessionDownloaderUseOptions",
+        "summary": "List enabled downloaders usable for download creation in configured priority order.",
+        "description": "Requires downloads.create (including an exact resource allow), then checks current exact downloader-use scope before projecting each row. Does not require or grant downloaders.read. Management GET /api/v1/downloaders remains protected. Only safe selection fields are returned; preview and Submit independently reauthorize current exact downloader, source site and target library.",
+        "security": [
+          {
+            "sessionCookie": []
+          },
+          {
+            "secureSessionCookie": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Standard envelope containing data.list and data.total. Response uses Cache-Control: no-store.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "code",
+                    "message",
+                    "data"
+                  ],
+                  "properties": {
+                    "code": {
+                      "type": "integer"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "data": {
+                      "type": "object",
+                      "required": [
+                        "list",
+                        "total"
+                      ],
+                      "properties": {
+                        "list": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": [
+                              "id",
+                              "name",
+                              "type",
+                              "capabilities",
+                              "execution_location"
+                            ],
+                            "properties": {
+                              "id": {
+                                "type": "string"
+                              },
+                              "name": {
+                                "type": "string"
+                              },
+                              "type": {
+                                "type": "string",
+                                "enum": [
+                                  "fake",
+                                  "qbittorrent",
+                                  "pan115_offline",
+                                  "quark_share"
+                                ]
+                              },
+                              "capabilities": {
+                                "type": "object",
+                                "description": "Safe receiver capability flags; share_receive reflects current saved receiver configuration, without provider probes."
+                              },
+                              "execution_location": {
+                                "type": "string",
+                                "enum": [
+                                  "server",
+                                  "node"
+                                ]
+                              }
+                            }
+                          }
+                        },
+                        "total": {
+                          "type": "integer",
+                          "minimum": 0
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required."
+          },
+          "403": {
+            "description": "No download-creation authority."
+          }
+        }
+      }
+    },
     "/api/v1/discovery/content-preview": {
       "post": {
         "operationId": "sessionContentPreview",

@@ -7,7 +7,7 @@ import type { PTSearchGroup, PTSearchResult } from './sites'
 
 const { request, notify } = vi.hoisted(() => ({ request: vi.fn(), notify: vi.fn() }))
 vi.mock('@/api/client', async original => ({ ...await original<object>(), api: request }))
-vi.mock('@/stores/auth', () => ({ useAuthStore: () => ({ can: () => true }) }))
+vi.mock('@/stores/auth', () => ({ useAuthStore: () => ({ can: (code: string) => code !== 'downloaders.read' }) }))
 vi.mock('@/toast', () => ({ notify }))
 vi.mock('@/search-result-recognition', async () => {
   const { ref } = await import('vue')
@@ -40,7 +40,7 @@ function fixture(searchReply: (path: string, options?: RequestInit) => unknown =
     if (path === '/api/v1/sites') return Promise.resolve({ list: [] })
     if (path === '/api/v1/discovery/search-options') return Promise.resolve({ list: [{ id: 7, name: '混合来源', site_type: 'cloud_share', searchable: true, health_status: 'online' }] })
     if (path.includes('/torrent-search?')) return Promise.resolve(searchReply(path, options))
-    if (path === '/api/v1/downloaders') return Promise.resolve({ list: [{ id: 'receiver', name: '执行器', type: 'pan115_offline', enabled: true }] })
+    if (path === '/api/v1/downloaders/options') return Promise.resolve({ list: [{ id: 'receiver', name: '执行器', type: 'pan115_offline', enabled: true }] })
     if (path === '/api/v1/media-libraries') return Promise.resolve({ list: [{ id: 1, name: '媒体库', enabled: true }] })
     if (path === '/api/v1/sites/routes/recommend') return Promise.resolve(recommendation())
     if (path === '/api/v1/download-routes/preview') {
@@ -121,6 +121,8 @@ it('uses the same canonical preview kind for a magnet recommendation and final s
   await flushPromises()
   const calls = request.mock.calls.filter(([path]) => path === '/api/v1/download-routes/preview')
   expect(calls).toHaveLength(1)
+  expect(wrapper.get('form[role="dialog"] select').findAll('option').map(option => option.element.value)).toEqual(['', 'receiver'])
+  expect(request.mock.calls.some(([path]) => path === '/api/v1/downloaders')).toBe(false)
   expect(JSON.parse(String(calls[0]![1]!.body)).source_kind).toBe('url')
   expect(notify).not.toHaveBeenCalledWith('盘搜资源类型不支持入库', 'error')
   const confirmation = button(wrapper, '确认并入队')
@@ -173,7 +175,7 @@ it('does not reopen an old share preview after its delayed option reads finish',
   const old = deferred<unknown>()
   fixture(() => ({ groups: [group({ ...result('share-a'), source_kind: '115_share', result_type: '115' })] }))
   const implementation = request.getMockImplementation()!
-  request.mockImplementation((path: string, options?: RequestInit) => path === '/api/v1/downloaders' ? old.promise : implementation(path, options))
+  request.mockImplementation((path: string, options?: RequestInit) => path === '/api/v1/downloaders/options' ? old.promise : implementation(path, options))
   const { wrapper } = await render({ mode: 'resources', site_id: '7', title: 'A' })
   void button(wrapper, '预览分享链接内部内容').trigger('click')
   await flushPromises()

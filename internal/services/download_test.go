@@ -607,6 +607,49 @@ func TestDownloaderCredentialsAndDownloadSourceStayEncrypted(t *testing.T) {
 		t.Fatal("credentials persisted in plaintext")
 	}
 
+	other, err := downloaders.Create(actor, DownloaderInput{Name: "Other receiver", Type: models.DownloaderTypeQBittorrent, BaseURL: "http://other.example.test", Enabled: true}, RequestContext{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	disabled, err := downloaders.Create(actor, DownloaderInput{Name: "Disabled receiver", Type: models.DownloaderTypeQBittorrent, BaseURL: "http://disabled.example.test", Enabled: true}, RequestContext{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := queue.db.Model(&models.Downloader{}).Where("id = ?", disabled.ID).Update("enabled", false).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := queue.db.Model(&models.Downloader{}).Where("id = ?", created.ID).Update("sort_order", 20).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := queue.db.Model(&models.Downloader{}).Where("id = ?", other.ID).Update("sort_order", 10).Error; err != nil {
+		t.Fatal(err)
+	}
+	ordinary := rolePermissionActor([]string{authz.PermissionDownloadsCreate})
+	ordinary.User = actor.User
+	if _, err := downloaders.List(ordinary); ErrorCode(err) != CodePermissionDenied {
+		t.Fatalf("use account read management: %v", err)
+	}
+	options, err := downloaders.Options(context.Background(), ordinary)
+	if err != nil || len(options) != 2 || options[0].ID != other.ID || options[1].ID != created.ID {
+		t.Fatalf("ordered enabled use options=%+v err=%v", options, err)
+	}
+	encoded, err := json.Marshal(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var safeOptions []map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &safeOptions); err != nil {
+		t.Fatal(err)
+	}
+	for _, option := range safeOptions {
+		if len(option) != 5 || option["id"] == nil || option["name"] == nil || option["type"] == nil || option["capabilities"] == nil || option["execution_location"] == nil {
+			t.Fatalf("unsafe use option fields: %s", encoded)
+		}
+	}
+	if strings.Contains(string(encoded), "example.test") || strings.Contains(string(encoded), "super-secret") || strings.Contains(string(encoded), root) {
+		t.Fatal("use options leaked connection/source configuration")
+	}
+
 	item, err := downloads.Submit(context.Background(), actor, SubmitDownloadInput{DownloaderID: created.ID, DisplayName: "安全测试", Priority: 10, Source: DownloadSourceInput{Kind: downloadpkg.SourceURL, URL: "https://tracker.example.test/file?id=1&passkey=pt-secret"}}, RequestContext{})
 	if err != nil {
 		t.Fatal(err)
@@ -650,6 +693,43 @@ func TestDownloaderCredentialsAndDownloadSourceStayEncrypted(t *testing.T) {
 	}
 	if task.StagingAbsolutePath != root || task.StagingStorageID != nil {
 		t.Fatalf("new task did not snapshot independent staging path: %+v", task)
+	}
+	if err := queue.db.Where("user_id = ? AND permission_code = ?", actor.User.ID, authz.PermissionDownloadsCreate).Delete(&models.UserAuthorizationRule{}).Error; err != nil {
+		t.Fatal(err)
+	}
+	exactRule := models.UserAuthorizationRule{UserID: actor.User.ID, PermissionCode: authz.PermissionDownloadsCreate, Effect: models.AuthorizationEffectAllow, ResourceType: models.AuthorizationResourceDownloader, ResourceID: created.ID, CreatedBy: actor.User.ID}
+	if err := queue.db.Create(&exactRule).Error; err != nil {
+		t.Fatal(err)
+	}
+	exact, err := NewAuthorizationService(queue.db).Resolve(actor.User.ID)
+	if err != nil || exact.Can(authz.PermissionDownloadsCreate) {
+		t.Fatalf("exact-only authority=%+v err=%v", exact, err)
+	}
+	options, err = downloaders.Options(context.Background(), exact)
+	if err != nil || len(options) != 1 || options[0].ID != created.ID {
+		t.Fatalf("exact-only options=%+v err=%v", options, err)
+	}
+	if _, err := downloads.PreviewRoutes(context.Background(), exact, DownloadRoutePreviewInput{DownloaderID: created.ID, SourceKind: "url"}); err != nil {
+		t.Fatalf("exact-only preview=%v", err)
+	}
+	input := SubmitDownloadInput{DownloaderID: created.ID, Source: DownloadSourceInput{Kind: downloadpkg.SourceURL, URL: "https://source.example.test/exact"}}
+	if _, err := downloads.Submit(context.Background(), exact, input, RequestContext{}); err != nil {
+		t.Fatalf("exact-only submission=%v", err)
+	}
+	input.DownloaderID = other.ID
+	if _, err := downloads.Submit(context.Background(), exact, input, RequestContext{}); ErrorCode(err) != CodePermissionDenied {
+		t.Fatalf("exact grant admitted another downloader: %v", err)
+	}
+	if _, err := downloads.PreviewRoutes(context.Background(), exact, DownloadRoutePreviewInput{DownloaderID: other.ID, SourceKind: "url"}); ErrorCode(err) != CodePermissionDenied {
+		t.Fatalf("exact grant previewed another downloader: %v", err)
+	}
+	exact.ResourceRules = append(exact.ResourceRules, AuthorizationRule{PermissionCode: authz.PermissionDownloadsCreate, Effect: models.AuthorizationEffectDeny, ResourceType: models.AuthorizationResourceDownloader, ResourceID: created.ID})
+	if options, err := downloaders.Options(context.Background(), exact); err != nil || len(options) != 0 {
+		t.Fatalf("resource deny options=%+v err=%v", options, err)
+	}
+	exact.DeniedPermissions = map[string]struct{}{authz.PermissionDownloadsCreate: {}}
+	if _, err := downloaders.Options(context.Background(), exact); ErrorCode(err) != CodePermissionDenied {
+		t.Fatalf("global deny options=%v", err)
 	}
 }
 

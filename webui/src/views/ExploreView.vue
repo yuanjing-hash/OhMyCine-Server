@@ -20,7 +20,7 @@ import { useAuthStore } from '@/stores/auth'
 import { notify } from '@/toast'
 import { buildDiscoveryMediaSearchPath, discoveryDetailRoute, mediaIdentitySearchURL, type DiscoveryMediaSearch, type DiscoveryMediaSearchFilter, type DiscoveryMediaType, type DiscoverySearchName, type DiscoveryWork } from '@/discovery'
 import { discoveryDownloadsPath, discoverySearchOptionsPath, filterAndSortTorrentResults, ptRecognitionEpisodeLabel, ptRecognitionErrorLabel, ptRecognitionSpecLabels, readTorrentSearchSession, readTorrentSearchSiteSelection, saveTorrentSearchSession, saveTorrentSearchSiteSelection, sitesPath, torrentRecognitionCandidatesPath, torrentRecognitionOverridePath, torrentSearchPath, torrentSearchStreamPath, torrentSearchURL, torrentSearchSessionKey, type PTRecognitionCandidate, type SearchSiteOption, type SiteSummary, type TorrentRecognitionResult, type TorrentResultDirection, type TorrentSearchGroup, type TorrentSearchProgress, type TorrentSearchResult, type TorrentSearchSession } from '@/sites'
-import type { DownloaderSummary, ListResponse, MediaLibraryDetail } from '@/types/api'
+import type { DownloaderOption, ListResponse, MediaLibraryDetail } from '@/types/api'
 import { discoveryOrigins, discoveryResultLinkPath, discoveryTypeOptions, resultPayloadKind, resultPreviewSourceKind, resultSiteType, resultTypeLabel, safeDiscoveryLink, torrentResourceTypeOptions, type DiscoveryTypePolicy } from '@/sites'
 
 const route = useRoute()
@@ -95,7 +95,7 @@ let availabilityRequest: AbortController | null = null
 let copyRequest: AbortController | null = null
 const selectedSiteIDs = ref<number[]>([])
 const activeSearchSiteIDs = ref<number[]>([])
-const downloaders = ref<DownloaderSummary[]>([])
+const downloaders = ref<DownloaderOption[]>([])
 const libraries = ref<MediaLibraryDetail[]>([])
 const downloadDialog = ref<TorrentSearchResult | null>(null)
 const sharePreviewDialog = ref<TorrentSearchResult | null>(null)
@@ -137,7 +137,7 @@ let mediaSearchRequest: AbortController | null = null
 
 const enabledDownloaders = computed(() => {
   const compatible = new Set(routeChoices.value.filter(choice => choice.media_library_id === downloadForm.value.mediaLibraryID && choice.enabled).map(choice => choice.downloader_id))
-  return downloaders.value.filter(item => item.enabled && compatible.has(item.id))
+  return downloaders.value.filter(item => compatible.has(item.id))
 })
 function choiceAppliesToSource(choice: DownloadRouteChoice) {
   const source = routeRecommendation.value?.source_kind
@@ -370,7 +370,7 @@ async function loadDownloadOptions() {
   const controller = new AbortController()
   downloadOptionRequests.add(controller)
   const requests: Promise<void>[] = []
-  if (auth.can(Permissions.DownloadersRead)) requests.push(api<ListResponse<DownloaderSummary>>('/api/v1/downloaders', { signal: controller.signal }).then(response => { if (!controller.signal.aborted && generation === interactionGeneration) downloaders.value = response.list }))
+  if (auth.can(Permissions.DownloadsCreate)) requests.push(api<ListResponse<DownloaderOption>>('/api/v1/downloaders/options', { signal: controller.signal }).then(response => { if (!controller.signal.aborted && generation === interactionGeneration) downloaders.value = response.list }))
   if (auth.can(Permissions.MediaLibrariesRead)) requests.push(api<ListResponse<MediaLibraryDetail>>('/api/v1/media-libraries', { signal: controller.signal }).then(response => { if (!controller.signal.aborted && generation === interactionGeneration) libraries.value = response.list }))
   try { await Promise.all(requests) } finally { downloadOptionRequests.delete(controller) }
 }
@@ -701,6 +701,8 @@ function clearSearchForActorChange() {
 }
 watch(() => auth.user?.id, (current, previous) => { if (current !== previous) clearSearchForActorChange() })
 watch(() => auth.can(Permissions.DiscoveryRead), (allowed, previous) => { if (previous && !allowed) clearSearchForActorChange() })
+watch(() => JSON.stringify([...(auth.user?.permissions ?? [])].sort()), (current, previous) => { if (current !== previous) retireResultInteractions() })
+watch(() => auth.can(Permissions.DownloadsCreate), (allowed, previous) => { if (previous && !allowed) retireResultInteractions() })
 
 watch(() => resourceSearchRouteKey(route.query), () => {
   const resourceMode = route.query.mode === 'resources' || typeof route.query.site_id === 'string'

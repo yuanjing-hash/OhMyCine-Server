@@ -387,6 +387,7 @@ func New(cfg config.Config, api *handlers.API, auth *services.AuthService, log z
 
 	downloadAPI := v1.Group("")
 	downloadAPI.Use(middleware.NoStore(), middleware.Auth(auth, api.CookieName()), middleware.CSRF(auth))
+	downloadAPI.GET("/downloaders/options", middleware.RequirePermission(authz.PermissionDownloadsCreate), api.DownloaderOptions)
 	downloadAPI.GET("/downloaders", middleware.RequirePermission(authz.PermissionDownloadersRead), api.Downloaders)
 	downloadAPI.POST("/downloaders", middleware.RequirePermission(authz.PermissionDownloadersCreate), api.CreateDownloader)
 	downloadAPI.PUT("/downloaders/order", middleware.RequirePermission(authz.PermissionDownloadersUpdate), api.ReorderDownloaders)
