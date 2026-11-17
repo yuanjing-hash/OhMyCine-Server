@@ -2,6 +2,7 @@
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import { flushPromises, mount, type VueWrapper } from '@vue/test-utils'
 import { createMemoryHistory, createRouter } from 'vue-router'
+import { APIError } from '@/api/client'
 import ExploreView from '@/views/ExploreView.vue'
 import ResourceContentSummary from '@/components/ResourceContentSummary.vue'
 import { resourceContentPreviewPath, resourceContentSelectionPath, type ResourceContentPreview } from '@/resource-content'
@@ -105,4 +106,50 @@ it('discards a late selected-file receipt after the card changes', async () => {
   resolve({ selection_token: 'old-selection', selected_bytes: 100 })
   await flushPromises()
   expect(wrapper.emitted('select')).toBeUndefined()
+})
+
+it.each([false, true])('confirms only the frozen selected request, supports lost-ACK replay and choose-other (washing=%s)', async upgrade => {
+  const base = request.getMockImplementation()!
+  const submits: Record<string, unknown>[] = []
+  let finish!: (value: unknown) => void
+  let attempts = 0
+  request.mockImplementation((path: string, options?: RequestInit) => {
+    if (path === '/api/v1/discovery/downloads' || path.endsWith('/submit')) {
+      submits.push(JSON.parse(String(options?.body)))
+      if (++attempts === 1) return Promise.reject(new APIError(409, 'offline_resource_confirmation_required', '需要确认', undefined, { version: 1, reason: 'offline_deadline_exceeded', timeout_minutes: 30, confirmation_token: 'a'.repeat(64) }))
+      if (attempts === 2) return Promise.reject(new Error('reply lost'))
+      return new Promise(resolve => { finish = resolve })
+    }
+    return base(path, options)
+  })
+  const wrapper = await render(upgrade)
+  const select = async () => {
+    const content = wrapper.get('[aria-label="实际文件内容"]')
+    await content.findAll('input[type="checkbox"]')[0]!.setValue(true)
+    await content.findAll('button').find(button => button.text().startsWith('选择文件入库'))!.trigger('click')
+    await flushPromises()
+    await wrapper.get('form[role="dialog"]').trigger('submit'); await flushPromises()
+  }
+  await select()
+  expect(wrapper.get('[aria-label="历史离线超时提示"]').findAll('button').map(button => button.text())).toEqual(['选择其他资源', '继续下载'])
+  const first = { ...submits[0] }
+  expect(first).not.toHaveProperty('offline_failure_override_token')
+  expect(first).toMatchObject({ content_selection_token: 'selection-current', result_token: 'result', downloader_id: 'executor' })
+  await wrapper.get('[aria-label="历史离线超时提示"] .btn-primary').trigger('click'); await flushPromises()
+  expect(submits[1]).toEqual({ ...first, offline_failure_override_token: 'a'.repeat(64) })
+  expect(wrapper.find('[aria-label="历史离线超时提示"]').exists()).toBe(true)
+  const continueButton = wrapper.get('[aria-label="历史离线超时提示"] .btn-primary')
+  await continueButton.trigger('click'); await continueButton.trigger('click'); await flushPromises()
+  expect(submits).toHaveLength(3)
+  expect(submits[2]).toEqual(submits[1])
+  finish(upgrade ? { id: 'upgrade', state: 'queued', revision: 2 } : { id: 'accepted' }); await flushPromises()
+  expect(wrapper.find('form[role="dialog"]').exists()).toBe(false)
+  if (upgrade) return
+  attempts = 0
+  await select()
+  const before = submits.length
+  await wrapper.get('[aria-label="历史离线超时提示"] .btn-secondary').trigger('click')
+  expect(submits).toHaveLength(before)
+  expect(wrapper.find('form[role="dialog"]').exists()).toBe(false)
+  expect(wrapper.find('article').exists()).toBe(true)
 })

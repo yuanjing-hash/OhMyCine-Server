@@ -56,6 +56,9 @@ func savePendingDownloadControlTx(tx *gorm.DB, task *models.DownloadTask, job *m
 		return err
 	}
 	taskUpdates := map[string]any{"phase": models.DownloadTaskStatusCancelled, "last_error_code": downloadCancellationPending, "last_error_message": downloadCancellationMessage, "finished_at": now, "updated_at": now}
+	if task.LastErrorCode == CodeOfflineDeadlineExceeded {
+		taskUpdates["last_error_code"], taskUpdates["last_error_message"] = CodeOfflineDeadlineExceeded, offlineTimeoutMessage
+	}
 	jobUpdates := map[string]any{"payload_json": string(encoded), "last_error_code": downloadCancellationPending, "last_error_message": downloadCancellationMessage, "revision": job.Revision + 1, "updated_at": now}
 	// An entered Submit retains its lease until it returns. Its late identity
 	// meets the cancelled phase barrier and is handed to the same cleanup.
@@ -99,7 +102,7 @@ func (s *DownloadService) requestPendingDownloadControl(actor Actor, taskID stri
 		if !actor.Can(authz.PermissionDownloadsManageAll) && !actor.Can(authz.PermissionJobsControlAll) && (task.OwnerID != actor.User.ID || !actor.Can(authz.PermissionJobsControlOwn)) {
 			return appError(CodePermissionDenied, "无权控制该下载任务", nil)
 		}
-		if !downloadSubmissionUnconfirmed(task) && task.LastErrorCode != downloadCancellationPending {
+		if !downloadSubmissionUnconfirmed(task) && task.LastErrorCode != downloadCancellationPending && !task.OfflineStopPending {
 			return errDownloadProviderIdentityChanged
 		}
 		if err := savePendingDownloadControlTx(tx, &task, &job, remove, actor.User.ID, time.Now().UTC()); err != nil {
@@ -120,7 +123,7 @@ func (s *DownloadService) requestPendingDownloadControl(actor Actor, taskID stri
 
 func (s *DownloadService) ControlPending(taskID string) bool {
 	var task models.DownloadTask
-	return s.db.Select("phase", "last_error_code").First(&task, "id = ?", taskID).Error == nil && task.Phase == models.DownloadTaskStatusCancelled && task.LastErrorCode == downloadCancellationPending
+	return s.db.Select("phase", "last_error_code", "offline_stop_pending").First(&task, "id = ?", taskID).Error == nil && (task.OfflineStopPending || task.Phase == models.DownloadTaskStatusCancelled && task.LastErrorCode == downloadCancellationPending)
 }
 
 func (w *DownloadWorker) controlPendingResult() WorkerResult {
@@ -207,15 +210,23 @@ func (s *DownloadService) settlePendingDownloadControl(original models.DownloadT
 			return err
 		}
 		now := time.Now().UTC()
-		if err := tx.Model(&task).Updates(map[string]any{"last_error_code": "", "last_error_message": "", "updated_at": now}).Error; err != nil {
+		code, message := "", ""
+		if task.LastErrorCode == CodeOfflineDeadlineExceeded {
+			code, message = CodeOfflineDeadlineExceeded, offlineTimeoutMessage
+		}
+		if err := tx.Model(&task).Updates(map[string]any{"last_error_code": code, "last_error_message": message, "offline_stop_pending": false, "updated_at": now}).Error; err != nil {
 			return err
 		}
-		updates := map[string]any{"payload_json": string(encoded), "last_error_code": "", "last_error_message": "", "updated_at": now, "revision": job.Revision + 1}
+		updates := map[string]any{"payload_json": string(encoded), "last_error_code": code, "last_error_message": message, "updated_at": now, "revision": job.Revision + 1}
 		if job.Status != models.JobStatusRunning {
 			updates["status"], updates["finished_at"], updates["next_attempt_at"] = models.JobStatusCancelled, now, nil
 			releaseLease(updates)
 		}
 		if err := tx.Model(&job).Updates(updates).Error; err != nil {
+			return err
+		}
+		task.OfflineStopPending = false
+		if err := releaseDownloadAdmissionTx(tx, task, now); err != nil {
 			return err
 		}
 		return syncFailedFollowClaims(tx, task.ID, now)

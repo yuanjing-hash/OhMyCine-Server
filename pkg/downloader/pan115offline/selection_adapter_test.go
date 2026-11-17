@@ -34,6 +34,12 @@ func (f *selectedCloudFixture) ObserveSelectedOffline(_ context.Context, id stri
 	}
 	return f.result, nil
 }
+func (f *selectedCloudFixture) ReconcileSelectedOffline(ctx context.Context, r cloud.SelectiveOfflineRequest) (cloud.SelectiveOfflineSnapshot, error) {
+	if r.ParentID != f.request.ParentID || string(r.Torrent) != string(f.request.Torrent) {
+		return cloud.SelectiveOfflineSnapshot{}, cloud.Error(cloud.CodeResponseInvalid, false, nil)
+	}
+	return f.ObserveSelectedOffline(ctx, f.result.Task.ID, r.Authority)
+}
 func (f *selectedCloudFixture) CancelSelectedOffline(ctx context.Context, id string, a cloud.SelectiveOfflineAuthority, remove bool) error {
 	if remove {
 		return cloud.Error(cloud.CodeUnavailable, false, nil)
@@ -101,6 +107,11 @@ func TestSelectedAdapterUsesOptionalDriverAndOwnManifestThroughoutBinding(t *tes
 	}
 	if until, _, ok := cloud.RetryTiming(err); !ok || !until.Equal(deadline) {
 		t.Fatal("selected failure lost provider cooldown")
+	}
+	submissions := driver.submissions
+	recovered, err := bound.(downloader.SubmissionReconciler).ReconcileSubmission(context.Background(), downloader.SubmitRequest{Source: source, Tag: "omc-plan", ProviderDirectoryID: "intake"})
+	if err != nil || recovered.ID != task.ID || driver.submissions != submissions || driver.submittedURI != "" {
+		t.Fatal("selected lost acknowledgement did not recover through its read-only original plan", err)
 	}
 }
 func TestSelectedAdapterRejectsMissingLedgerAndGroupBeforeProviderWrite(t *testing.T) {

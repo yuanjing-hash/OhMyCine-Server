@@ -77,6 +77,10 @@ export function downloadStatusLabel(task: DownloadTaskSummary, retrying = false)
   if (task.control_pending) return '已取消 · 云端收尾中'
   if (task.scrape_status === 'completed_unverified' && task.job_status !== 'cancelled' && task.job_status !== 'completed') return task.job_status === 'failed' ? '文件核对失败' : '核对已下载文件'
   if (isDownloadSubmissionPending(task)) return task.job_status === 'failed' ? '提交结果待核对' : '核对原任务'
+  if (!['failed', 'cancelled', 'paused', 'completed', 'waiting_user_action'].includes(task.job_status)) {
+    const acquisitionLabel = acquisitionStateLabel(task.acquisition_state)
+    if (acquisitionLabel) return acquisitionLabel
+  }
 	if (task.job_status === 'running' && normalizedProviderStatus(task.provider_status) === 'unavailable') return '等待下载器恢复'
 	if (task.job_status === 'running' && normalizedProviderStatus(task.provider_status) === 'stalleddl') return '等待连接/暂无速度'
 	const phases: Record<string, string> = { submitting: '提交下载器', metadata: '获取 metadata', classifying: '轻量刮削', waiting_user_action: '准备自动归入未识别', categorized: '已指派分类', downloading: '正式下载', verifying: '完成后复核' }
@@ -87,6 +91,13 @@ export function downloadStatusLabel(task: DownloadTaskSummary, retrying = false)
 
 export function downloadStatusClass(task: DownloadTaskSummary, retrying = false): string {
   if (retrying) return 'status-chip status-chip--planned'
+  if (task.acquisition_state === 'cancelled_stop_pending') return 'status-chip status-chip--error'
+  if (task.job_status === 'failed' || task.job_status === 'cancelled') return isDownloadSubmissionPending(task) ? 'status-chip status-chip--warning' : 'status-chip status-chip--error'
+  if (task.job_status === 'paused' || task.job_status === 'waiting_user_action') return 'status-chip status-chip--warning'
+  if (task.job_status === 'completed') return 'status-chip status-chip--ready'
+  if (['waiting_capacity', 'reconnecting', 'clock_unknown'].includes(task.acquisition_state ?? '')) return 'status-chip status-chip--warning'
+  if (task.acquisition_state === 'cloud_ready') return 'status-chip status-chip--ready'
+  if (task.acquisition_state === 'active' || task.acquisition_state === 'observing') return 'status-chip status-chip--planned'
   if (isDownloadSubmissionPending(task)) return 'status-chip status-chip--warning'
   if (task.job_status === 'completed') return 'status-chip status-chip--ready'
   if (task.job_status === 'failed' || task.job_status === 'cancelled') return 'status-chip status-chip--error'
@@ -97,12 +108,15 @@ export function downloadStatusClass(task: DownloadTaskSummary, retrying = false)
 
 export function downloadErrorMessage(task: DownloadTaskSummary, retrying = false): string {
   if (retrying) return ''
+  if (task.last_error_code === 'offline_deadline_exceeded') return task.control_pending ? '云端离线超过 30 分钟，已取消本次获取；正在结束原云端任务，已完成文件保留。' : '云端离线超过 30 分钟，已取消本次获取，已完成文件保留。'
   if (task.control_pending) return '后续入库已取消，正在核对并结束原云端任务。'
   if (task.job_status === 'cancelled') return ''
   // Preclassification deliberately keeps a safe TMDB warning visible while
   // the provider continues downloading. Only a stale terminal downloader
   // failure should be suppressed by authoritative active telemetry.
   if (task.scrape_status === 'fallback_unrecognized' && task.last_error_code.startsWith('tmdb_')) return task.last_error_message
+  if (task.job_status === 'failed' || task.job_status === 'paused' || task.job_status === 'waiting_user_action') return task.last_error_message
+  if (task.acquisition_state && ['active', 'observing', 'waiting_capacity', 'cloud_ready'].includes(task.acquisition_state) && (!task.last_error_code || task.last_error_code === 'download_observation_pending' || task.last_error_code === 'downloader_capacity')) return ''
   if ((task.job_status === 'queued' || task.job_status === 'running') && isActiveProviderStatus(task.provider_status)) return ''
   return task.last_error_message
 }
@@ -125,7 +139,7 @@ export function downloadProviderStatusLabel(value: string): string {
     metadl: '正在获取元数据',
     queueddl: '等待下载队列',
     stalleddl: '等待连接/暂无速度',
-    unavailable: '等待 qBittorrent 恢复',
+    unavailable: '等待下载器恢复',
   }
   const normalized = normalizedProviderStatus(value)
   return labels[normalized] ?? (value || '尚未采样')
@@ -177,7 +191,11 @@ export function torrentToBase64(bytes: Uint8Array): string {
 
 export function summarizeDownloaderTasks(tasks: DownloadTaskSummary[], downloaderID: string): DownloaderTaskStats {
   const own = tasks.filter(task => task.downloader_id === downloaderID)
-  const active = own.filter(task => task.job_status === 'running')
+  const active = own.filter(task => {
+    if (task.acquisition_state === 'cancelled_stop_pending') return true
+    if (isDownloadHistoryTask(task) || ['failed', 'cancelled', 'paused', 'waiting_user_action'].includes(task.job_status)) return false
+    return task.acquisition_state ? ['active', 'observing', 'reconnecting', 'cloud_ready', 'clock_unknown'].includes(task.acquisition_state) : task.job_status === 'running'
+  })
   const knownProgress = active.flatMap(task => task.progress === null ? [] : [task.progress])
   const knownDownload = active.flatMap(task => task.download_speed === null ? [] : [task.download_speed])
   const knownUpload = active.flatMap(task => task.upload_speed === null ? [] : [task.upload_speed])
@@ -206,4 +224,16 @@ export function formatSampleTime(value: string | null): string {
   if (!value) return '尚未检查'
   const time = new Date(value)
   return Number.isNaN(time.getTime()) ? '时间未知' : time.toLocaleString('zh-CN', { hour12: false })
+}
+
+// These are persisted Server facts, never a timer derived from row creation or progress.
+export function acquisitionStateLabel(state?: DownloadTaskSummary['acquisition_state']): string {
+  return state ? ({ waiting_capacity: '等待下载器空位', active: '正在获取资源', observing: '正在获取 · 定期核对', reconnecting: '等待下载器恢复', cloud_ready: '云端所需文件已就绪', cancelled_stop_pending: '已取消 · 云端收尾中', clock_unknown: '等待核实云端起始时间' })[state] ?? '' : ''
+}
+
+export function offlineTimingLabel(task: Pick<DownloadTaskSummary, 'offline_started_at' | 'offline_deadline_at' | 'offline_ready_at' | 'offline_start_provenance'>): string {
+  if (task.offline_ready_at && Number.isFinite(Date.parse(task.offline_ready_at))) return `云端就绪：${formatSampleTime(task.offline_ready_at)}；后续传输与入库继续处理。`
+  if (!task.offline_started_at || !task.offline_deadline_at || !Number.isFinite(Date.parse(task.offline_started_at)) || !Number.isFinite(Date.parse(task.offline_deadline_at))) return ''
+  const provenance = { dispatch: '云端提交', accepted: '云端受理', provider_added: '云端添加' }
+  return `${task.offline_start_provenance ? provenance[task.offline_start_provenance] ?? '云端起始' : '云端起始'}：${formatSampleTime(task.offline_started_at)} · 离线截止：${formatSampleTime(task.offline_deadline_at)}`
 }

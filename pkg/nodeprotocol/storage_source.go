@@ -8,6 +8,7 @@ import (
 	"errors"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud/quark"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/downloader"
 	"net/url"
 	"regexp"
 	"strings"
@@ -28,13 +29,16 @@ const (
 	StorageSourceTargetPan115         = "pan115"
 	StorageSourceTargetQuark          = "quark"
 
-	StorageSourceActionMaterialize  = "materialize"
-	StorageSourceGrantOfflineSubmit = "offline_submit"
-	StorageSourceGrantOfflineStatus = "offline_status"
-	StorageSourceGrantShareInspect  = "share_inspect"
-	StorageSourceGrantShareReceive  = "share_receive"
-	StorageSourceGrantRead          = "read"
-	StorageSourceActionCleanup      = "cleanup_managed_source"
+	StorageSourceActionOfflineStatus = "cloud_offline_status"
+	StorageSourceActionOfflineStop   = "cloud_offline_stop_keep_output"
+	StorageSourceGrantOfflineStop    = "offline_cancel_keep_output"
+	StorageSourceActionMaterialize   = "materialize"
+	StorageSourceGrantOfflineSubmit  = "offline_submit"
+	StorageSourceGrantOfflineStatus  = "offline_status"
+	StorageSourceGrantShareInspect   = "share_inspect"
+	StorageSourceGrantShareReceive   = "share_receive"
+	StorageSourceGrantRead           = "read"
+	StorageSourceActionCleanup       = "cleanup_managed_source"
 
 	StorageSourceAccepted           = "accepted"
 	StorageSourceSubmitting         = "submitting_offline"
@@ -49,55 +53,62 @@ const (
 // StorageSourcePlan contains only immutable routing facts. The source URI and
 // Cookie are deliberately absent and travel only in a sealed credential grant.
 type StorageSourcePlan struct {
-	DigestVersion           int    `json:"digest_version,omitempty"`
-	TaskDirectoryName       string `json:"task_directory_name,omitempty"`
-	StorageID               string `json:"storage_id"`
-	ProviderType            string `json:"provider_type"`
-	SourceKind              string `json:"source_kind"`
-	TargetKind              string `json:"target_kind"`
-	SourceIdentityDigest    string `json:"source_identity_digest"`
-	TargetIdentityDigest    string `json:"target_identity_digest"`
-	SourceContentDigest     string `json:"source_content_digest"`
-	OfflineDestinationID    string `json:"offline_destination_id"`
-	DestinationRelativePath string `json:"destination_relative_path,omitempty"`
+	CloudOfflineLifecycleVersion int    `json:"cloud_offline_lifecycle_version,omitempty"`
+	OfflineAccountNamespace      string `json:"offline_account_namespace,omitempty"`
+	OfflineRequiredDigest        string `json:"offline_required_digest,omitempty"`
+	DigestVersion                int    `json:"digest_version,omitempty"`
+	TaskDirectoryName            string `json:"task_directory_name,omitempty"`
+	StorageID                    string `json:"storage_id"`
+	ProviderType                 string `json:"provider_type"`
+	SourceKind                   string `json:"source_kind"`
+	TargetKind                   string `json:"target_kind"`
+	SourceIdentityDigest         string `json:"source_identity_digest"`
+	TargetIdentityDigest         string `json:"target_identity_digest"`
+	SourceContentDigest          string `json:"source_content_digest"`
+	OfflineDestinationID         string `json:"offline_destination_id"`
+	DestinationRelativePath      string `json:"destination_relative_path,omitempty"`
 }
 
 type StorageSourceCredential struct {
-	ProviderType string          `json:"provider_type"`
-	Cookie       string          `json:"cookie"`
-	SourceURI    string          `json:"source_uri,omitempty"`
-	Quark        json.RawMessage `json:"quark,omitempty"`
-	RootID       string          `json:"root_id,omitempty"`
+	OfflineRequired *downloader.OfflineRequiredPlan `json:"offline_required,omitempty"`
+	ProviderType    string                          `json:"provider_type"`
+	Cookie          string                          `json:"cookie"`
+	SourceURI       string                          `json:"source_uri,omitempty"`
+	Quark           json.RawMessage                 `json:"quark,omitempty"`
+	RootID          string                          `json:"root_id,omitempty"`
 }
 
 type StorageSourceActionRequest struct {
-	RequestID    string `json:"request_id"`
-	TaskID       string `json:"task_id"`
-	OperationKey string `json:"operation_key"`
-	PlanDigest   string `json:"plan_digest"`
-	StorageID    string `json:"storage_id"`
-	Action       string `json:"action"`
-	GrantID      string `json:"grant_id"`
+	KeepMaterialization bool   `json:"keep_materialization,omitempty"`
+	RequestID           string `json:"request_id"`
+	TaskID              string `json:"task_id"`
+	OperationKey        string `json:"operation_key"`
+	PlanDigest          string `json:"plan_digest"`
+	StorageID           string `json:"storage_id"`
+	Action              string `json:"action"`
+	GrantID             string `json:"grant_id"`
 }
 
 // StorageSourceActionResponse is summary-only. Provider files are exposed
 // only through the existing paginated FileExport protocol after verification.
 // Progress is a 0..1 ratio on this wire, not downloader percent.
 type StorageSourceActionResponse struct {
-	CredentialExpiresAt *time.Time         `json:"credential_expires_at,omitempty"`
-	OutputRootID        string             `json:"output_root_id,omitempty"`
-	RequestID           string             `json:"request_id"`
-	OperationKey        string             `json:"operation_key"`
-	PlanDigest          string             `json:"plan_digest"`
-	Status              string             `json:"status"`
-	ProviderStatus      string             `json:"provider_status,omitempty"`
-	Progress            *float64           `json:"progress,omitempty"`
-	TotalFiles          int64              `json:"total_files"`
-	DownloadedFiles     int64              `json:"downloaded_files"`
-	TotalBytes          int64              `json:"total_bytes"`
-	DownloadedBytes     int64              `json:"downloaded_bytes"`
-	FileExport          *FileExportSummary `json:"file_export,omitempty"`
-	ErrorCode           string             `json:"error_code,omitempty"`
+	Offline             *downloader.OfflineObservation `json:"offline,omitempty"`
+	OfflineStopState    string                         `json:"offline_stop_state,omitempty"`
+	CredentialExpiresAt *time.Time                     `json:"credential_expires_at,omitempty"`
+	OutputRootID        string                         `json:"output_root_id,omitempty"`
+	RequestID           string                         `json:"request_id"`
+	OperationKey        string                         `json:"operation_key"`
+	PlanDigest          string                         `json:"plan_digest"`
+	Status              string                         `json:"status"`
+	ProviderStatus      string                         `json:"provider_status,omitempty"`
+	Progress            *float64                       `json:"progress,omitempty"`
+	TotalFiles          int64                          `json:"total_files"`
+	DownloadedFiles     int64                          `json:"downloaded_files"`
+	TotalBytes          int64                          `json:"total_bytes"`
+	DownloadedBytes     int64                          `json:"downloaded_bytes"`
+	FileExport          *FileExportSummary             `json:"file_export,omitempty"`
+	ErrorCode           string                         `json:"error_code,omitempty"`
 }
 
 type StorageSourceCleanupRequest struct {
@@ -116,6 +127,13 @@ type StorageSourceCleanupResponse struct {
 }
 
 func (plan StorageSourcePlan) Validate() error {
+	if plan.CloudOfflineLifecycleVersion != 0 {
+		if plan.CloudOfflineLifecycleVersion != 1 || plan.SourceKind != StorageSourceKindPan115OfflineMagnet || !ValidDigest(plan.OfflineAccountNamespace) || plan.OfflineRequiredDigest != "" && !ValidDigest(plan.OfflineRequiredDigest) {
+			return errors.New("node_storage_source_plan_invalid")
+		}
+	} else if plan.OfflineAccountNamespace != "" || plan.OfflineRequiredDigest != "" {
+		return errors.New("node_storage_source_plan_invalid")
+	}
 	if plan.ProviderType == StorageProviderQuark {
 		if plan.SourceKind != StorageSourceKindQuarkShareSelected || plan.DigestVersion != 2 || !strings.HasPrefix(plan.TaskDirectoryName, "omc-") || !validID(plan.TaskDirectoryName) || len(plan.TaskDirectoryName) > 64 || plan.DestinationRelativePath != "" && !ValidStorageDirectoryRelativePath(plan.DestinationRelativePath) {
 			return errors.New("node_storage_source_plan_invalid")
@@ -263,7 +281,10 @@ func StorageIdentityDigest(providerType, stableIdentity string) (string, error) 
 }
 
 func (request StorageSourceActionRequest) Validate() error {
-	if !validID(request.RequestID) || !validID(request.TaskID) || !validID(request.OperationKey) || !ValidDigest(request.PlanDigest) || !validID(request.StorageID) || request.Action != StorageSourceActionMaterialize || !validID(request.GrantID) {
+	if request.KeepMaterialization && request.Action != StorageSourceActionOfflineStop {
+		return errors.New("node_storage_source_request_invalid")
+	}
+	if !validID(request.RequestID) || !validID(request.TaskID) || !validID(request.OperationKey) || !ValidDigest(request.PlanDigest) || !validID(request.StorageID) || (request.Action != StorageSourceActionMaterialize && request.Action != StorageSourceActionOfflineStatus && request.Action != StorageSourceActionOfflineStop) || !validID(request.GrantID) {
 		return errors.New("node_storage_source_request_invalid")
 	}
 	return nil
@@ -304,6 +325,14 @@ func (request StorageSourceCleanupRequest) Digest() (string, error) {
 }
 
 func ValidateStorageSourceCredential(credential StorageSourceCredential, requireURI bool) error {
+	if credential.OfflineRequired != nil {
+		if credential.ProviderType != StorageProviderPan115 {
+			return errors.New("node_storage_source_credential_invalid")
+		}
+		if _, err := credential.OfflineRequired.Digest(); err != nil {
+			return errors.New("node_storage_source_credential_invalid")
+		}
+	}
 	if credential.ProviderType == StorageProviderQuark {
 		if credential.Cookie != "" || len(credential.Quark) == 0 || len(credential.Quark) > MaxCredentialGrantBytes || !json.Valid(credential.Quark) || !validProviderItemID(credential.RootID) {
 			return errors.New("node_storage_source_credential_invalid")

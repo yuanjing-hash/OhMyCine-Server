@@ -20,6 +20,7 @@ type ordinaryOfflineInput struct {
 	DeleteFiles, Remote                         bool
 }
 type ordinaryOfflineCheckpoint struct {
+	DispatchedAt      *time.Time `json:"dispatched_at,omitempty"`
 	Input             ordinaryOfflineInput
 	Ack               bool
 	DefiniteRejection bool
@@ -199,6 +200,7 @@ func (c *Client) reconcileOrdinarySubmit(ctx context.Context, g *ordinaryOffline
 		if err != nil {
 			return cloud.OfflineTask{}, cloud.Error(cloud.CodeMutationUnknown, true, err)
 		}
+		applyOrdinaryStart(&task, g)
 		g.Checkpoint.Task = &task
 		if err = c.releaseOrdinary(ctx, g); err != nil {
 			return cloud.OfflineTask{}, err
@@ -288,19 +290,29 @@ func (c *Client) submitOrdinaryOfflineOwned(ctx context.Context, uri, directory,
 	}
 	dispatched := false
 	var hashes []string
+	callCtx := cloud.WithOfflineDispatchRecorder(ctx, func(at time.Time) error {
+		if err := cloud.RecordOfflineDispatch(ctx, at); err != nil {
+			return err
+		}
+		if g.Checkpoint.DispatchedAt == nil {
+			g.Checkpoint.DispatchedAt = &at
+		}
+		if err := g.save(ctx, "submitting"); err != nil {
+			return err
+		}
+		dispatched = true
+		return nil
+	})
 	err = c.waitAndCallOwned(ctx, c.offlineRate, func() error {
 		if e := c.checkOrdinaryOwner(ctx, hash, g.Receipt.ID); e != nil {
 			return e
 		}
 		g.Checkpoint.Ack, g.Checkpoint.DefiniteRejection, g.Checkpoint.Task = false, false, nil
-		if e := g.save(ctx, "submitting"); e != nil {
-			return e
-		}
-		dispatched = true
 		var e error
-		hashes, e = c.sdk.AddOfflineTaskURIs([]string{uri}, directory)
+		hashes, e = c.addOfflineURIs(callCtx, []string{uri}, directory)
 		return e
 	})
+
 	if !dispatched {
 		c.failUndispatchedOrdinary(ctx, g)
 		return cloud.OfflineTask{}, mapError(err)
@@ -309,7 +321,7 @@ func (c *Client) submitOrdinaryOfflineOwned(ctx context.Context, uri, directory,
 		if releaseErr := c.rejectOrdinary(ctx, g); releaseErr != nil {
 			return cloud.OfflineTask{}, releaseErr
 		}
-		return cloud.OfflineTask{}, mapError(err)
+		return cloud.OfflineTask{}, cloud.WithDefiniteSubmissionNonAcceptance(mapError(err))
 	}
 	checkpointCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
@@ -511,3 +523,68 @@ func (c *Client) lockOrdinaryResource(ctx context.Context, hash string) (func(),
 		return nil, cloud.Error(cloud.CodeUnavailable, true, ctx.Err())
 	}
 }
+
+func applyOrdinaryStart(task *cloud.OfflineTask, g *ordinaryOfflineGuard) {
+	if g.Checkpoint.DispatchedAt != nil {
+		task.StartedAt = g.Checkpoint.DispatchedAt
+		task.StartProvenance = "dispatch"
+	}
+}
+
+func (c *Client) SettleStoppedOfflineAccess(ctx context.Context, access cloud.OfflineAccess) error {
+	input, err := c.remoteOrdinaryInput(access)
+	if err != nil {
+		return err
+	}
+	release, err := c.lockOrdinaryResource(ctx, input.Hash)
+	if err != nil {
+		return err
+	}
+	defer release()
+	store := c.ordinaryStore()
+	if store == nil {
+		return selectedError(cloud.CodeUnavailable)
+	}
+	id := "omc-offline-" + selectedDigest([]string{input.Scope, input.Action})
+	receipt, err := store.Load(ctx, id)
+	if err != nil {
+		return selectedUnknown()
+	}
+	var saved ordinaryOfflineCheckpoint
+	if receipt.Provider != cloud.ProviderPan115 || receipt.AccountID != c.selective.account || receipt.Route != "cookie" || receipt.Kind != cloud.OfflineResourceGuardKind || json.Unmarshal(receipt.Payload, &saved) != nil || saved.Input.Version != 1 || saved.Input.Scope != input.Scope || saved.Input.Action != input.Action || saved.Input.Hash != input.Hash || saved.Input.URIDigest != input.URIDigest || !saved.Input.Remote || saved.Input.DirectoryID != "" && input.DirectoryID != "" && saved.Input.DirectoryID != input.DirectoryID {
+		return selectedError(cloud.CodeResponseInvalid)
+	}
+	if receipt.State == "confirmed" {
+		return nil
+	}
+	current, err := store.ResourceClaim(ctx, offlineResourceKey(input.Hash))
+	if err != nil || current.ID != receipt.ID || current.Revision != receipt.Revision {
+		return selectedUnknown()
+	}
+	var task cloud.OfflineTask
+	if c.selective.facts != nil {
+		task, err = c.selective.facts.OfflineFacts(ctx, input.Hash)
+	} else if c.sdk != nil {
+		task, err = c.getOfflineNative(ctx, input.Hash)
+	} else {
+		return selectedError(cloud.CodeUnavailable)
+	}
+	code, _ := cloud.ErrorInfo(err)
+	if code != cloud.CodeNotFound {
+		if err != nil {
+			return err
+		}
+		directory := saved.Input.DirectoryID
+		if directory == "" {
+			directory = input.DirectoryID
+		}
+		if !strings.EqualFold(task.ID, input.Hash) || !task.Completed || directory != "" && task.DirectoryID != directory {
+			return selectedUnknown()
+		}
+	}
+	saved.Ack = true
+	g := &ordinaryOfflineGuard{store, receipt, saved, offlineResourceKey(input.Hash)}
+	return c.releaseOrdinary(ctx, g)
+}
+
+var _ cloud.OfflineStoppedAccessGuard = (*Client)(nil)

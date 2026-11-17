@@ -62,6 +62,9 @@ func (c *StorageSourceClient) Test(ctx context.Context) (downloadpkg.Health, err
 	if c.basePlan.ProviderType == nodeprotocol.StorageProviderQuark {
 		valid = nodeprotocol.QuarkShareSupported(health.Capabilities)
 	}
+	if c.basePlan.CloudOfflineLifecycleVersion == 1 {
+		valid = valid && health.Capabilities.Has(nodeprotocol.CapabilityCloudOfflineLifecycleV1)
+	}
 	if !valid {
 		return downloadpkg.Health{}, downloadpkg.Error(nodeprotocol.ErrorCapabilityMissing, false, nil)
 	}
@@ -69,6 +72,11 @@ func (c *StorageSourceClient) Test(ctx context.Context) (downloadpkg.Health, err
 }
 
 func (c *StorageSourceClient) Submit(ctx context.Context, request downloadpkg.SubmitRequest) (downloadpkg.Task, error) {
+	if c.sourceKind == nodeprotocol.StorageSourceKindPan115OfflineMagnet && c.basePlan.CloudOfflineLifecycleVersion == 1 {
+		if _, err := c.Test(ctx); err != nil {
+			return downloadpkg.Task{}, err
+		}
+	}
 	if request.MetadataOnly || !c.matchesSource(request.Source) {
 		return downloadpkg.Task{}, downloadpkg.Error("downloader_source_unsupported", false, nil)
 	}
@@ -94,7 +102,18 @@ func (c *StorageSourceClient) Get(ctx context.Context, id string) (downloadpkg.T
 	return c.storageSourceTask(response), nil
 }
 
-func (c *StorageSourceClient) Cancel(ctx context.Context, id string, _ bool) error {
+func (c *StorageSourceClient) Cancel(ctx context.Context, id string, deleteData bool) error {
+	if deleteData {
+		return downloadpkg.Error("downloader_action_unsupported", false, nil)
+	}
+	if c.sourceKind == nodeprotocol.StorageSourceKindPan115OfflineMagnet {
+		if c.basePlan.CloudOfflineLifecycleVersion != 1 {
+			return downloadpkg.Error(nodeprotocol.ErrorCapabilityMissing, false, nil)
+		}
+		if err := c.cloudOfflineControl(ctx, id, false); err != nil {
+			return err
+		}
+	}
 	operation, err := c.ensureOperation(ctx)
 	if err != nil {
 		return err
@@ -190,9 +209,16 @@ func (c *StorageSourceClient) execute(ctx context.Context, forceAction bool) (no
 	}
 	requestID := operation.Plan.OperationKey
 	response, resultErr := c.node.StorageSourceActionResult(ctx, requestID, c.taskID, operation.Plan.OperationKey)
+	if resultErr == nil && !forceAction && c.basePlan.CloudOfflineLifecycleVersion == 1 && response.Offline != nil && !response.Offline.Ready {
+		fresh, freshErr := c.refreshCloudOfflineStatus(ctx, operation)
+		if freshErr != nil {
+			return nodeprotocol.StorageSourceActionResponse{}, freshErr
+		}
+		response = fresh
+	}
 	staleExport := response.Status == nodeprotocol.StorageSourceCompleted && (response.FileExport == nil || !response.FileExport.ExpiresAt.After(time.Now().UTC().Add(2*time.Minute)))
 	renewQuark := c.basePlan.ProviderType == nodeprotocol.StorageProviderQuark && response.Status != nodeprotocol.StorageSourceCompleted && (response.CredentialExpiresAt == nil || response.CredentialExpiresAt.Before(time.Now().UTC().Add(2*time.Minute)))
-	if resultErr == nil && !forceAction && response.Status != nodeprotocol.StorageSourceWaitingCredentials && !staleExport && !renewQuark && strings.TrimSpace(response.ErrorCode) == "" {
+	if resultErr == nil && !forceAction && response.Status != nodeprotocol.StorageSourceWaitingCredentials && response.Status != nodeprotocol.StorageSourceWaiting && response.Status != nodeprotocol.StorageSourceAccepted && response.Status != nodeprotocol.StorageSourceSubmitting && !staleExport && !renewQuark && strings.TrimSpace(response.ErrorCode) == "" {
 		if err := c.validateResponse(operation, response); err != nil {
 			return nodeprotocol.StorageSourceActionResponse{}, err
 		}
@@ -206,6 +232,9 @@ func (c *StorageSourceClient) execute(ctx context.Context, forceAction bool) (no
 	actions := []string{nodeprotocol.StorageSourceGrantRead}
 	if c.sourceKind == nodeprotocol.StorageSourceKindPan115OfflineMagnet {
 		actions = append(actions, nodeprotocol.StorageSourceGrantOfflineSubmit, nodeprotocol.StorageSourceGrantOfflineStatus)
+		if c.basePlan.CloudOfflineLifecycleVersion == 1 {
+			actions = append(actions, nodeprotocol.StorageSourceGrantOfflineStop)
+		}
 	} else {
 		actions = append(actions, nodeprotocol.StorageSourceGrantShareInspect, nodeprotocol.StorageSourceGrantShareReceive)
 	}
@@ -286,6 +315,14 @@ func (c *StorageSourceClient) ensureOperation(ctx context.Context) (StorageSourc
 }
 
 func (c *StorageSourceClient) validateResponse(operation StorageSourceOperation, response nodeprotocol.StorageSourceActionResponse) error {
+	if o := response.Offline; o != nil {
+		if c.basePlan.CloudOfflineLifecycleVersion != 1 || o.Version != 1 || o.Kind != downloadpkg.OfflineOperationCloud || o.OperationID != operation.Plan.OperationKey || o.AccountNamespace != c.basePlan.OfflineAccountNamespace || o.RequiredDigest != c.basePlan.OfflineRequiredDigest || !o.KeepOutputStop || o.ReadyManifest != nil {
+			return downloadpkg.Error(nodeprotocol.ErrorPlanConflict, false, nil)
+		}
+		if o.Ready && (o.StartedAt == nil || o.ReadyAt == nil || o.CompletionMode != downloadpkg.OfflineCompletionAggregate && o.CompletionMode != downloadpkg.OfflineCompletionRequiredFiles) {
+			return downloadpkg.Error(nodeprotocol.ErrorPlanConflict, false, nil)
+		}
+	}
 	if c.basePlan.ProviderType == nodeprotocol.StorageProviderQuark && response.Status == nodeprotocol.StorageSourceCompleted && (response.OutputRootID == "" || response.OutputRootID == c.basePlan.OfflineDestinationID) {
 		return downloadpkg.Error(nodeprotocol.ErrorPlanConflict, false, nil)
 	}
@@ -302,7 +339,7 @@ func (c *StorageSourceClient) validateResponse(operation StorageSourceOperation,
 
 func (c *StorageSourceClient) matchesSource(source downloadpkg.Source) bool {
 	if c.sourceKind == nodeprotocol.StorageSourceKindPan115OfflineMagnet {
-		return source.Kind == downloadpkg.SourceURL && strings.TrimSpace(source.URL) == c.sourceURI
+		return source.ContentSelection == nil && !source.AllFilesVerified && source.Kind == downloadpkg.SourceURL && strings.TrimSpace(source.URL) == c.sourceURI
 	}
 	if c.sourceKind == nodeprotocol.StorageSourceKindPan115ShareSelected || c.sourceKind == nodeprotocol.StorageSourceKindQuarkShareSelected {
 		expected := downloadpkg.SourcePan115Share
@@ -335,9 +372,17 @@ func (c *StorageSourceClient) storageSourceTask(response nodeprotocol.StorageSou
 		value := float64(response.DownloadedBytes) / float64(response.TotalBytes) * 100
 		progress = &value
 	}
-	task := downloadpkg.Task{ID: response.OperationKey, Name: response.OperationKey, Status: response.ProviderStatus, Progress: progress, BytesCompleted: &response.DownloadedBytes, BytesTotal: &response.TotalBytes, ErrorCode: response.ErrorCode, OutputItemID: c.basePlan.OfflineDestinationID}
+	task := downloadpkg.Task{Offline: response.Offline, ID: response.OperationKey, Name: response.OperationKey, Status: response.ProviderStatus, Progress: progress, BytesCompleted: &response.DownloadedBytes, BytesTotal: &response.TotalBytes, ErrorCode: response.ErrorCode, OutputItemID: c.basePlan.OfflineDestinationID}
 	if c.basePlan.ProviderType == nodeprotocol.StorageProviderQuark {
 		task.OutputItemID = response.OutputRootID
+	}
+	// An accepted v1 Node operation may still be queued behind data/native
+	// admission. Only its durable native dispatch starts the cloud budget.
+	if c.basePlan.CloudOfflineLifecycleVersion == 1 && (response.Offline == nil || response.Offline.StartedAt == nil) && task.Status == "" {
+		switch response.Status {
+		case nodeprotocol.StorageSourceAccepted, nodeprotocol.StorageSourceSubmitting, nodeprotocol.StorageSourceWaiting:
+			task.Status = "queued"
+		}
 	}
 	if response.Status == nodeprotocol.StorageSourceCompleted {
 		value := 100.0
@@ -360,6 +405,12 @@ func firstStorageSourceError(code string) string {
 }
 
 func storageSourceResponseError(response nodeprotocol.StorageSourceActionResponse) error {
+	if response.Offline != nil && response.Offline.TerminalFailure {
+		return downloadpkg.WithOfflineTerminalFailure(downloadpkg.Error("node_source_offline_failed", false, nil))
+	}
+	if response.Offline != nil && response.Offline.DefiniteNonAcceptance {
+		return downloadpkg.WithDefiniteSubmissionNonAcceptance(downloadpkg.Error(firstStorageSourceError(response.ErrorCode), false, nil))
+	}
 	code := strings.TrimSpace(response.ErrorCode)
 	if code == "" || code == nodeprotocol.ErrorCredentialExpired && response.Status == nodeprotocol.StorageSourceWaitingCredentials {
 		return nil

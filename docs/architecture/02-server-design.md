@@ -1993,3 +1993,7 @@ Player 的入库查询、分页列表在同一只读事务中核对任务所有�
 Node通过`selective_files_v1`及`selective_files_union_v1`协商，旧Node在提交前排除。私有种子来源加密，临时密钥只经封装授权传送；刷新授权不改变原操作身份。Node的总并发限制实际提供方／上传／校验／导出工作，保留取消控制通路；它不代表外部qB进程的带宽限制。
 
 新订阅默认优先简体中文、其次繁体中文；未确认字幕仍允许下载并提示。全局默认和逐订阅均可改为忽略／优先／必须，语言顺序保存在各自快照；没有字幕字段的旧订阅保留原忽略行为。默认值编辑采用revision比较更新，不回写已存在的订阅。
+
+## 统一离线生命周期与下载器准入
+
+云端离线采用 source-aware capability、原始持久 dispatch/accepted clock、30 分钟绝对期限、精确 required-goal 完成和 keep-output 控制。下载器 admission 与 Job lease 分开，独立对象并发默认 2；正常进度/metadata/重连使用有界观察，旧历史占用通过原任务只读核对收敛。失败历史与显示行分离，手动单次确认与 Follow 路线跳过共享同一 Submit 守卫。Node 使用 cloud_offline_lifecycle_v1，旧 accepted plan0 保持原授权自然结算；详细合同见 [云端离线获取](../api/offline-acquisition.md)。

@@ -13,10 +13,12 @@ import (
 	"github.com/google/uuid"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/authz"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/nodeclient"
 	cloudpkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud"
 	downloadpkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/downloader"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/downloader/pan115offline"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/nodeprotocol"
+	"gorm.io/gorm"
 )
 
 func TestNodeStorageSourcePlansFreezeLocalAndCrossAccountRoutes(t *testing.T) {
@@ -179,6 +181,11 @@ func TestNodeStorageDownloaderRouteCannotChangeAfterAnyTask(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	limit := 5
+	changed, err := service.UpdateContext(context.Background(), actor, created.ID, UpdateDownloaderInput{MaxConcurrentDownloads: &limit}, RequestContext{})
+	if err != nil || changed.MaxConcurrentDownloads != limit {
+		t.Fatalf("Node early update lost concurrency: %+v %v", changed, err)
+	}
 	newName := "Remote 115 renamed"
 	if _, err := service.UpdateContext(context.Background(), actor, created.ID, UpdateDownloaderInput{Name: &newName}, RequestContext{}); err != nil {
 		t.Fatalf("safe name update: %v", err)
@@ -229,7 +236,14 @@ func TestStorageSourceGrantPersistsOnlyCredentialMetadata(t *testing.T) {
 	}
 	nodes := NewTransferNodeService(db, NewAuditService(db), connections.credentials)
 	magnet := "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567"
-	operationKey := "storage:source:grant-test"
+	operationKey := nodeclient.StorageSourceOperationKey("task-grant")
+	queue := NewQueueService(db, NewAuditService(db))
+	_, err = queue.EnqueueWith(EnqueueJobInput{OwnerID: actor.User.ID, JobType: "download", DisplayName: "grant"}, func(tx *gorm.DB, job models.Job) error {
+		return tx.Create(&models.DownloadTask{ID: "task-grant", OwnerID: actor.User.ID, JobID: job.ID, StagingStorageID: &storage.ID, NodeID: &node.ID, DownloaderName: "grant", ProviderType: models.DownloaderTypePan115Offline, Phase: models.DownloadTaskStatusDownloading, SourceCiphertext: "encrypted-fixture", DisplayName: "grant"}).Error
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	envelope, err := nodes.sealStorageSourceGrant(context.Background(), node, storage, "task-grant", operationKey, []string{nodeprotocol.StorageSourceGrantRead, nodeprotocol.StorageSourceGrantOfflineSubmit, nodeprotocol.StorageSourceGrantOfflineStatus}, magnet)
 	if err != nil {
 		t.Fatal(err)

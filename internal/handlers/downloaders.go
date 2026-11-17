@@ -13,6 +13,7 @@ import (
 )
 
 type downloaderPayload struct {
+	MaxConcurrentDownloads *int    `json:"max_concurrent_downloads"`
 	Name                   string  `json:"name"`
 	Type                   string  `json:"type"`
 	BaseURL                string  `json:"base_url"`
@@ -105,7 +106,7 @@ func (a *API) CreateDownloader(c *gin.Context) {
 	if payload.NodeMountRoot != nil {
 		nodeMountRoot = *payload.NodeMountRoot
 	}
-	item, err := a.downloaders.CreateContext(c.Request.Context(), actor, services.DownloaderInput{Name: payload.Name, Type: payload.Type, BaseURL: payload.BaseURL, Username: username, Password: password, Enabled: enabled, StorageID: payload.StorageID, ProviderDirectoryToken: token, AutoListenLifeEvents: autoListen, ExecutionLocation: executionLocation, NodeID: nodeID, DownloaderSaveRoot: downloaderSaveRoot, NodeMountRoot: nodeMountRoot}, middleware.RequestContextFrom(c))
+	item, err := a.downloaders.CreateContext(c.Request.Context(), actor, services.DownloaderInput{MaxConcurrentDownloads: payload.MaxConcurrentDownloads, Name: payload.Name, Type: payload.Type, BaseURL: payload.BaseURL, Username: username, Password: password, Enabled: enabled, StorageID: payload.StorageID, ProviderDirectoryToken: token, AutoListenLifeEvents: autoListen, ExecutionLocation: executionLocation, NodeID: nodeID, DownloaderSaveRoot: downloaderSaveRoot, NodeMountRoot: nodeMountRoot}, middleware.RequestContextFrom(c))
 	if err != nil {
 		writeError(c, a.log, err)
 		return
@@ -132,7 +133,7 @@ func (a *API) UpdateDownloader(c *gin.Context) {
 	if payload.BaseURL != "" {
 		baseURL = &payload.BaseURL
 	}
-	item, err := a.downloaders.UpdateContext(c.Request.Context(), actor, id, services.UpdateDownloaderInput{Name: name, BaseURL: baseURL, Username: payload.Username, Password: payload.Password, ClearUsername: payload.ClearUsername, ClearPassword: payload.ClearPassword, Enabled: payload.Enabled, StorageID: payload.StorageID, ProviderDirectoryToken: payload.ProviderDirectoryToken, AutoListenLifeEvents: payload.AutoListenLifeEvents, ExecutionLocation: payload.ExecutionLocation, NodeID: payload.NodeID, DownloaderSaveRoot: payload.DownloaderSaveRoot, NodeMountRoot: payload.NodeMountRoot}, middleware.RequestContextFrom(c))
+	item, err := a.downloaders.UpdateContext(c.Request.Context(), actor, id, services.UpdateDownloaderInput{MaxConcurrentDownloads: payload.MaxConcurrentDownloads, Name: name, BaseURL: baseURL, Username: payload.Username, Password: payload.Password, ClearUsername: payload.ClearUsername, ClearPassword: payload.ClearPassword, Enabled: payload.Enabled, StorageID: payload.StorageID, ProviderDirectoryToken: payload.ProviderDirectoryToken, AutoListenLifeEvents: payload.AutoListenLifeEvents, ExecutionLocation: payload.ExecutionLocation, NodeID: payload.NodeID, DownloaderSaveRoot: payload.DownloaderSaveRoot, NodeMountRoot: payload.NodeMountRoot}, middleware.RequestContextFrom(c))
 	if err != nil {
 		writeError(c, a.log, err)
 		return
@@ -203,15 +204,16 @@ func (a *API) CreateDownload(c *gin.Context) {
 	actor, _ := middleware.ActorFrom(c)
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 6<<20)
 	var payload struct {
-		DownloaderID   string `json:"downloader_id"`
-		MediaLibraryID *uint  `json:"media_library_id"`
-		ProfileID      uint   `json:"profile_id"`
-		DisplayName    string `json:"display_name"`
-		Priority       int    `json:"priority"`
-		SourceKind     string `json:"source_kind"`
-		SourceURL      string `json:"source_url"`
-		TorrentBase64  string `json:"torrent_base64"`
-		TorrentName    string `json:"torrent_filename"`
+		OfflineFailureOverrideToken string `json:"offline_failure_override_token,omitempty"`
+		DownloaderID                string `json:"downloader_id"`
+		MediaLibraryID              *uint  `json:"media_library_id"`
+		ProfileID                   uint   `json:"profile_id"`
+		DisplayName                 string `json:"display_name"`
+		Priority                    int    `json:"priority"`
+		SourceKind                  string `json:"source_kind"`
+		SourceURL                   string `json:"source_url"`
+		TorrentBase64               string `json:"torrent_base64"`
+		TorrentName                 string `json:"torrent_filename"`
 	}
 	if err := strictJSON(c, &payload); err != nil {
 		writeError(c, a.log, invalid("下载任务信息无效", err))
@@ -229,7 +231,7 @@ func (a *API) CreateDownload(c *gin.Context) {
 			return
 		}
 	}
-	item, err := a.downloads.Submit(c.Request.Context(), actor, services.SubmitDownloadInput{DownloaderID: payload.DownloaderID, MediaLibraryID: payload.MediaLibraryID, ProfileID: payload.ProfileID, DisplayName: payload.DisplayName, Priority: payload.Priority, Source: services.DownloadSourceInput{Kind: payload.SourceKind, URL: payload.SourceURL, Torrent: torrent, Filename: payload.TorrentName}}, middleware.RequestContextFrom(c))
+	item, err := a.downloads.Submit(c.Request.Context(), actor, services.SubmitDownloadInput{OfflineFailureOverrideToken: payload.OfflineFailureOverrideToken, DownloaderID: payload.DownloaderID, MediaLibraryID: payload.MediaLibraryID, ProfileID: payload.ProfileID, DisplayName: payload.DisplayName, Priority: payload.Priority, Source: services.DownloadSourceInput{Kind: payload.SourceKind, URL: payload.SourceURL, Torrent: torrent, Filename: payload.TorrentName}}, middleware.RequestContextFrom(c))
 	if err != nil {
 		writeError(c, a.log, err)
 		return
@@ -241,19 +243,20 @@ func (a *API) CreateDownloadBatch(c *gin.Context) {
 	actor, _ := middleware.ActorFrom(c)
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 256<<10)
 	var payload struct {
-		DownloaderID   string   `json:"downloader_id"`
-		MediaLibraryID *uint    `json:"media_library_id"`
-		ProfileID      uint     `json:"profile_id"`
-		DisplayName    string   `json:"display_name"`
-		Priority       int      `json:"priority"`
-		SourceKind     string   `json:"source_kind"`
-		Sources        []string `json:"sources"`
+		DownloaderID            string                            `json:"downloader_id"`
+		MediaLibraryID          *uint                             `json:"media_library_id"`
+		ProfileID               uint                              `json:"profile_id"`
+		DisplayName             string                            `json:"display_name"`
+		Priority                int                               `json:"priority"`
+		SourceKind              string                            `json:"source_kind"`
+		Sources                 []string                          `json:"sources"`
+		OfflineFailureOverrides []services.OfflineFailureOverride `json:"offline_failure_overrides,omitempty"`
 	}
 	if err := strictJSON(c, &payload); err != nil {
 		writeError(c, a.log, invalid("批量下载任务信息无效", err))
 		return
 	}
-	result, err := a.downloads.SubmitBatch(c.Request.Context(), actor, services.SubmitDownloadBatchInput{DownloaderID: payload.DownloaderID, MediaLibraryID: payload.MediaLibraryID, ProfileID: payload.ProfileID, DisplayName: payload.DisplayName, Priority: payload.Priority, SourceKind: payload.SourceKind, Sources: payload.Sources}, middleware.RequestContextFrom(c))
+	result, err := a.downloads.SubmitBatch(c.Request.Context(), actor, services.SubmitDownloadBatchInput{OfflineFailureOverrides: payload.OfflineFailureOverrides, DownloaderID: payload.DownloaderID, MediaLibraryID: payload.MediaLibraryID, ProfileID: payload.ProfileID, DisplayName: payload.DisplayName, Priority: payload.Priority, SourceKind: payload.SourceKind, Sources: payload.Sources}, middleware.RequestContextFrom(c))
 	if err != nil {
 		writeError(c, a.log, err)
 		return

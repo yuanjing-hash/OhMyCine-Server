@@ -89,7 +89,7 @@ func (c *Client) submitSelected(ctx context.Context, request downloader.SubmitRe
 	if err = selectedSnapshot(snapshot, snapshot.Task.ID, downloader.SelectionContext{Tag: request.Tag, Selection: *request.Source.ContentSelection, RootName: manifest.Name, MultiFile: manifest.MultiFile}); err != nil {
 		return downloader.Task{}, downloader.WithFailureStage(err, downloader.FailureSelectionSubmission)
 	}
-	return mapTask(snapshot.Task), nil
+	return c.observeOffline(ctx, snapshot.Task), nil
 }
 func (c *Client) GetSelected(ctx context.Context, id string, binding downloader.SelectionContext) (downloader.Task, error) {
 	if !c.SupportsSelectiveFiles() || binding.Group != nil {
@@ -102,7 +102,7 @@ func (c *Client) GetSelected(ctx context.Context, id string, binding downloader.
 	if err = selectedSnapshot(snapshot, id, binding); err != nil {
 		return downloader.Task{}, err
 	}
-	return mapTask(snapshot.Task), nil
+	return c.observeOffline(ctx, snapshot.Task), nil
 }
 func (c *Client) ManifestSelected(ctx context.Context, id string, binding downloader.SelectionContext) (downloader.Manifest, error) {
 	if !c.SupportsSelectiveFiles() || binding.Group != nil {

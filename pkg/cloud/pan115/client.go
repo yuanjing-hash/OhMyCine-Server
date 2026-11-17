@@ -85,7 +85,10 @@ type directoryPathSDK interface {
 	DirName2CID(string) (*pan115sdk.APIGetDirIDResp, error)
 }
 
-type sdkAdapter struct{ *pan115sdk.Pan115Client }
+type sdkAdapter struct {
+	*pan115sdk.Pan115Client
+	nativeUIDMu sync.Mutex
+}
 
 var _ directoryPathSDK = (*sdkAdapter)(nil)
 
@@ -254,7 +257,7 @@ func New(config cloud.Config) (cloud.Driver, error) {
 	return &Client{
 		selective:  &selectiveOfflineState{store: config.Operations, account: resourceAccount},
 		beforeCall: config.BeforeCall, onCallResult: config.OnCallResult,
-		sdk: &sdkAdapter{sdk}, downloadHTTP: newDownloadHTTPClient(), listRate: rate.NewLimiter(rate.Every(2*time.Second), 1),
+		sdk: &sdkAdapter{Pan115Client: sdk}, downloadHTTP: newDownloadHTTPClient(), listRate: rate.NewLimiter(rate.Every(2*time.Second), 1),
 		interactiveRate: rate.NewLimiter(rate.Every(250*time.Millisecond), 1), pipelineRate: rate.NewLimiter(rate.Every(250*time.Millisecond), 1),
 		bulkRate: rate.NewLimiter(rate.Every(bulkRequestSpacing), 1), directRate: rate.NewLimiter(rate.Every(time.Second), 1),
 		offlineRate: rate.NewLimiter(rate.Every(2*time.Second), 1), eventRate: rate.NewLimiter(rate.Every(5*time.Second), 1),
@@ -828,12 +831,21 @@ func (c *Client) SubmitOffline(ctx context.Context, uri, directoryID string) (cl
 		}
 	}
 	var hashes []string
-	err := c.waitAndCall(ctx, c.offlineRate, func() error {
+	err := c.waitAndCallOwned(ctx, c.offlineRate, func() error {
 		var err error
-		hashes, err = c.sdk.AddOfflineTaskURIs([]string{uri}, directoryID)
+		hashes, err = c.addOfflineURIs(ctx, []string{uri}, directoryID)
 		return err
 	})
 	if err != nil {
+		if definiteOfflineRejection(err) {
+			recorded, recordErr := cloud.RecordOfflineNonAcceptance(ctx)
+			if recordErr != nil {
+				return cloud.OfflineTask{}, cloud.Error(cloud.CodeMutationUnknown, true, recordErr)
+			}
+			if recorded {
+				return cloud.OfflineTask{}, cloud.WithDefiniteSubmissionNonAcceptance(mapError(err))
+			}
+		}
 		if recovered, ok := c.recoverSubmittedOffline(ctx, uri); ok {
 			return recovered, nil
 		}
@@ -850,7 +862,7 @@ func (c *Client) SubmitOffline(ctx context.Context, uri, directoryID string) (cl
 		return cloud.OfflineTask{}, err
 	}
 	c.offlinePages.Store(taskID, int64(1))
-	return cloud.OfflineTask{ID: taskID, Status: "queued", ProviderStatus: 0}, nil
+	return cloud.OfflineTask{DirectoryID: directoryID, ID: taskID, Status: "queued", ProviderStatus: 0}, nil
 }
 
 func (c *Client) recoverSubmittedOffline(ctx context.Context, uri string) (cloud.OfflineTask, bool) {
@@ -1021,7 +1033,12 @@ func mapOfflineTask(task *pan115sdk.OfflineTask) cloud.OfflineTask {
 	if outputID == "" {
 		outputID = strings.TrimSpace(task.FileId)
 	}
-	return cloud.OfflineTask{ID: strings.TrimSpace(task.InfoHash), Name: strings.TrimSpace(task.Name), Status: status, Progress: &progress, BytesTotal: &total, ETASeconds: &eta, OutputItemID: outputID, Completed: completed, Failed: failed, ProviderStatus: task.Status}
+	var added *time.Time
+	if task.AddTime > 0 {
+		value := time.Unix(task.AddTime, 0).UTC()
+		added = &value
+	}
+	return cloud.OfflineTask{DirectoryID: strings.TrimSpace(task.DirId), StartedAt: added, StartProvenance: "provider_added", ID: strings.TrimSpace(task.InfoHash), Name: strings.TrimSpace(task.Name), Status: status, Progress: &progress, BytesTotal: &total, ETASeconds: &eta, OutputItemID: outputID, Completed: completed, Failed: failed, ProviderStatus: task.Status}
 }
 
 func (c *Client) Probe(ctx context.Context) (cloud.Account, error) {
@@ -1898,4 +1915,39 @@ func mapError(err error) error {
 		return cloud.Error(cloud.CodeNotFound, false, err)
 	}
 	return cloud.Error(cloud.CodeUnavailable, true, err)
+}
+
+// The pinned SDK performs GetUser when UserID is empty. Finish that read before
+// recording the original native Add boundary; never place a mutable recorder on
+// the cached SDK/HTTP client shared by concurrent operations.
+func (s *sdkAdapter) AddOfflineTaskURIsContext(ctx context.Context, uris []string, directory string) ([]string, error) {
+	s.nativeUIDMu.Lock()
+	if s.UserID <= 0 {
+		user, err := s.GetUser()
+		if err != nil {
+			s.nativeUIDMu.Unlock()
+			return nil, err
+		}
+		if user == nil || user.UserID <= 0 {
+			s.nativeUIDMu.Unlock()
+			return nil, cloud.Error(cloud.CodeResponseInvalid, false, nil)
+		}
+		s.UserID = user.UserID
+	}
+	s.nativeUIDMu.Unlock()
+	if err := cloud.RecordOfflineDispatch(ctx, time.Now().UTC()); err != nil {
+		return nil, err
+	}
+	return s.Pan115Client.AddOfflineTaskURIs(uris, directory)
+}
+func (c *Client) addOfflineURIs(ctx context.Context, uris []string, directory string) ([]string, error) {
+	if sdk, ok := c.sdk.(interface {
+		AddOfflineTaskURIsContext(context.Context, []string, string) ([]string, error)
+	}); ok {
+		return sdk.AddOfflineTaskURIsContext(ctx, uris, directory)
+	}
+	if err := cloud.RecordOfflineDispatch(ctx, c.now()); err != nil {
+		return nil, err
+	}
+	return c.sdk.AddOfflineTaskURIs(uris, directory)
 }

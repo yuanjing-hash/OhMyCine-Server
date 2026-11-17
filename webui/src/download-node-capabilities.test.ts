@@ -99,3 +99,71 @@ describe('Node downloader capability admission', () => {
     expect(wrapper.findAll('option[value="current"]')).toHaveLength(0)
   })
 })
+
+it('round-trips the independent acquisition limit in create and an existing Node edit', async () => {
+  access.current!.user = { id: 1, permissions: [Permissions.DownloadersRead, Permissions.DownloadersCreate, Permissions.DownloadersUpdate, Permissions.TransferNodesRead] }
+  const downloader = { id: 'qbit', name: 'Node qB', type: 'qbittorrent', execution_location: 'node', node_id: 'ready', base_url: 'http://qbit.example.test', downloader_save_root: '/downloads', node_mount_root: '/downloads', max_concurrent_downloads: 4, health: { status: 'online' }, capabilities: {} } as DownloaderSummary
+  vi.mocked(api).mockImplementation(async (path, options) => {
+    if (path === '/api/v1/transfer-nodes') return { list: [node('ready', ['qbittorrent_control', 'range_export'])] }
+    if (path === '/api/v1/downloaders' && options?.method === 'POST' || path === '/api/v1/downloaders/qbit') return downloader
+    if (path === '/api/v1/downloaders') return { list: [downloader] }
+    throw new Error(`unexpected request ${path}`)
+  })
+  wrapper = mount(DownloadsView, { global: { stubs: { DirectoryPickerDialog: true, TransferNodesPanel: true, SecretInput: true, ClearHistoryButton: true } } })
+  await flushPromises()
+  await wrapper.findAll('button').find(button => button.text() === '添加下载器')!.trigger('click')
+  expect(wrapper.get('#createForm-concurrency').element).toHaveProperty('value', '2')
+  await wrapper.get('#createForm-concurrency').setValue(3)
+  await wrapper.get('#createForm-concurrency').element.closest('form')!.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true })); await flushPromises()
+  const create = vi.mocked(api).mock.calls.find(([path, options]) => path === '/api/v1/downloaders' && options?.method === 'POST')!
+  expect(JSON.parse(String(create[1]!.body))).toMatchObject({ max_concurrent_downloads: 3 })
+  await wrapper.findAll('button').find(button => button.text() === '编辑')!.trigger('click')
+  expect(wrapper.get('#editForm-concurrency').element).toHaveProperty('value', '4')
+  await wrapper.get('#editForm-concurrency').setValue(1)
+  expect(wrapper.text()).toContain('调低上限会保留正在获取的任务')
+  await wrapper.get('#editForm-concurrency').element.closest('form')!.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true })); await flushPromises()
+  const edit = vi.mocked(api).mock.calls.find(([path, options]) => path === '/api/v1/downloaders/qbit' && options?.method === 'PATCH')!
+  expect(JSON.parse(String(edit[1]!.body))).toMatchObject({ max_concurrent_downloads: 1, execution_location: 'node', node_id: 'ready' })
+})
+
+it('lets a use-only actor confirm exact warned batch items without replaying accepted sources', async () => {
+  access.current!.user = { id: 2, permissions: [Permissions.DownloadsCreate, Permissions.MediaLibrariesRead] }
+  const submitted: Record<string, unknown>[] = []
+  const token = 'a'.repeat(64)
+  let finish!: (value: unknown) => void
+  let continued = 0
+  vi.mocked(api).mockImplementation(async (path, options) => {
+    if (path === '/api/v1/downloaders/options') return { list: [{ id: 'receiver', name: 'Allowed receiver', type: 'qbittorrent', execution_location: 'server', capabilities: {} }] }
+    if (path === '/api/v1/media-libraries') return { list: [{ id: 1, name: 'Allowed library', enabled: true }] }
+    if (path === '/api/v1/download-routes/preview') return { options: [{ media_library_id: 1, library_name: 'Allowed library', enabled: true }] }
+    if (path === '/api/v1/downloads/batch') {
+      const body = JSON.parse(String(options?.body)); submitted.push(body)
+      if (body.offline_failure_overrides) {
+        if (++continued === 1) throw new Error('reply lost')
+        return new Promise(resolve => { finish = resolve })
+      }
+      return { submitted: body.sources.includes('magnet:accepted') ? 1 : 0, failed: body.sources.length - (body.sources.includes('magnet:accepted') ? 1 : 0), results: body.sources.map((source: string, index: number) => source === 'magnet:accepted' ? { index, task: { id: 'accepted' } } : source === 'magnet:warned' ? { index, error_code: 'offline_resource_confirmation_required', offline_failure_warning: { version: 1, reason: 'offline_deadline_exceeded', timeout_minutes: 30, confirmation_token: token } } : { index, error_code: 'invalid_source' }) }
+    }
+    throw new Error(`management request forbidden ${path}`)
+  })
+  wrapper = mount(DownloadsView, { global: { stubs: { DirectoryPickerDialog: true, TransferNodesPanel: true, SecretInput: true, ClearHistoryButton: true } } })
+  await flushPromises()
+  await wrapper.get('input[name="download-route-target"][value="1"]').setValue(true)
+  await wrapper.get('textarea').setValue('magnet:accepted\nmagnet:warned\nmagnet:invalid')
+  await wrapper.get('#download-panel-create').trigger('submit'); await flushPromises()
+  expect(wrapper.get('textarea').element).toHaveProperty('value', 'magnet:warned\nmagnet:invalid')
+  await wrapper.get('[aria-label="历史离线超时提示"] .btn-secondary').trigger('click')
+  expect(submitted).toHaveLength(1)
+  expect(wrapper.find('[aria-label="历史离线超时提示"]').exists()).toBe(false)
+  await wrapper.get('#download-panel-create').trigger('submit'); await flushPromises()
+  await wrapper.get('[aria-label="历史离线超时提示"] .btn-primary').trigger('click'); await flushPromises()
+  const expected = { ...submitted[1], sources: ['magnet:warned'], offline_failure_overrides: [{ index: 0, confirmation_token: token }] }
+  expect(submitted[2]).toEqual(expected)
+  const button = wrapper.get('[aria-label="历史离线超时提示"] .btn-primary')
+  await button.trigger('click'); await button.trigger('click'); await flushPromises()
+  expect(submitted).toHaveLength(4)
+  expect(submitted[3]).toEqual(expected)
+  finish({ submitted: 1, failed: 0, results: [{ index: 0, task: { id: 'same-accepted' } }] }); await flushPromises()
+  expect(wrapper.find('[aria-label="历史离线超时提示"]').exists()).toBe(false)
+  expect(vi.mocked(api).mock.calls.some(([path]) => path === '/api/v1/downloaders')).toBe(false)
+})

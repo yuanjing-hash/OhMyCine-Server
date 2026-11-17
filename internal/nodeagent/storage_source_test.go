@@ -18,23 +18,32 @@ import (
 	"time"
 
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/downloader"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/nodeprotocol"
 )
 
 type fakeStorageSourceDriver struct {
-	mu           sync.Mutex
-	before       func(context.Context) error
-	taskID       string
-	complete     bool
-	submitCalls  int
-	receiveCalls int
-	readOffsets  []int64
-	failReads    map[int64]int
-	share        cloud.ShareSnapshot
-	shareItems   []cloud.Item
-	receiveErr   error
-	body         []byte
-	sha1         string
+	mu            sync.Mutex
+	before        func(context.Context) error
+	taskID        string
+	complete      bool
+	requiredReady bool
+	submitCalls   int
+	cancelCalls   int
+	cancelFiles   bool
+	loseCancel    bool
+	cancelApplied bool
+	extras        bool
+	rejectSubmit  bool
+	failed        bool
+	receiveCalls  int
+	readOffsets   []int64
+	failReads     map[int64]int
+	share         cloud.ShareSnapshot
+	shareItems    []cloud.Item
+	receiveErr    error
+	body          []byte
+	sha1          string
 }
 
 func (driver *fakeStorageSourceDriver) check(ctx context.Context) error {
@@ -56,15 +65,22 @@ func (driver *fakeStorageSourceDriver) List(ctx context.Context, parentID string
 	}
 	driver.mu.Lock()
 	defer driver.mu.Unlock()
-	if parentID != "share-root" {
+	items := driver.shareItems
+	switch parentID {
+	case "share-root":
+	case "output-1":
+		items = []cloud.Item{{ID: "season-1", ParentID: parentID, Name: "Season 01", IsDir: true}}
+	case "season-1":
+		items = []cloud.Item{{ID: "provider-file-1", ParentID: parentID, Name: "Episode 01.mkv", Size: int64(len(driver.body)), SHA1: driver.sha1}}
+	default:
 		return cloud.Page{}, nil
 	}
 	start := int(request.Offset)
-	if start >= len(driver.shareItems) {
+	if start >= len(items) {
 		return cloud.Page{Offset: request.Offset}, nil
 	}
-	end := min(len(driver.shareItems), start+int(request.Limit))
-	return cloud.Page{Items: append([]cloud.Item(nil), driver.shareItems[start:end]...), Offset: request.Offset, HasMore: end < len(driver.shareItems)}, nil
+	end := min(len(items), start+int(request.Limit))
+	return cloud.Page{Items: append([]cloud.Item(nil), items[start:end]...), Offset: request.Offset, HasMore: end < len(items)}, nil
 }
 func (driver *fakeStorageSourceDriver) DirectURL(context.Context, cloud.DirectURLRequest) (cloud.TemporaryURL, error) {
 	return cloud.TemporaryURL{}, errors.New("not implemented")
@@ -79,7 +95,31 @@ func (driver *fakeStorageSourceDriver) Stat(ctx context.Context, id string) (clo
 	if id == "share-root" {
 		return cloud.Item{ID: id, ParentID: "0", Name: "Share Root", IsDir: true, PickCode: "share-pick"}, nil
 	}
+	if id == "season-1" {
+		return cloud.Item{ID: id, ParentID: "output-1", Name: "Season 01", IsDir: true}, nil
+	}
+	if id == "provider-file-1" {
+		return cloud.Item{ID: id, ParentID: "season-1", Name: "Episode 01.mkv", Size: int64(len(driver.body)), SHA1: driver.sha1}, nil
+	}
 	return cloud.Item{}, cloud.Error(cloud.CodeNotFound, false, nil)
+}
+func (driver *fakeStorageSourceDriver) FinalizedFiles(ctx context.Context, leaves []cloud.Item) ([]cloud.FinalizedFile, error) {
+	if err := driver.check(ctx); err != nil {
+		return nil, err
+	}
+	driver.mu.Lock()
+	defer driver.mu.Unlock()
+	if !driver.requiredReady {
+		return nil, nil
+	}
+	var facts []cloud.FinalizedFile
+	for _, leaf := range leaves {
+		if leaf.ID != "provider-file-1" || leaf.ParentID != "season-1" || leaf.Name != "Episode 01.mkv" || leaf.Size != int64(len(driver.body)) {
+			return nil, errors.New("unowned finalized leaf")
+		}
+		facts = append(facts, cloud.FinalizedFile{Item: leaf, State: cloud.OfflineFinalizationComplete})
+	}
+	return facts, nil
 }
 func (driver *fakeStorageSourceDriver) SubmitOffline(ctx context.Context, uri, directoryID string) (cloud.OfflineTask, error) {
 	if err := driver.check(ctx); err != nil {
@@ -90,7 +130,16 @@ func (driver *fakeStorageSourceDriver) SubmitOffline(ctx context.Context, uri, d
 	}
 	driver.mu.Lock()
 	defer driver.mu.Unlock()
+	if err := cloud.RecordOfflineDispatch(ctx, time.Now().UTC()); err != nil {
+		return cloud.OfflineTask{}, err
+	}
 	driver.submitCalls++
+	if driver.rejectSubmit {
+		if _, err := cloud.RecordOfflineNonAcceptance(ctx); err != nil {
+			return cloud.OfflineTask{}, err
+		}
+		return cloud.OfflineTask{}, cloud.WithDefiniteSubmissionNonAcceptance(cloud.Error(cloud.CodeOfflineBadLink, false, nil))
+	}
 	driver.taskID = strings.Repeat("a", 40)
 	return driver.offlineTaskLocked(), nil
 }
@@ -107,14 +156,39 @@ func (driver *fakeStorageSourceDriver) GetOffline(ctx context.Context, taskID st
 }
 func (driver *fakeStorageSourceDriver) offlineTaskLocked() cloud.OfflineTask {
 	progress := float64(0.5)
-	task := cloud.OfflineTask{ID: driver.taskID, Status: "downloading", Progress: &progress}
+	task := cloud.OfflineTask{DirectoryID: "0", ID: driver.taskID, Status: "downloading", Progress: &progress}
+	if driver.requiredReady {
+		task.OutputItemID = "output-1"
+	}
 	if driver.complete {
 		progress = 1
 		task.Status, task.Progress, task.Completed, task.OutputItemID = "completed", &progress, true, "output-1"
 	}
+	if driver.failed {
+		task.Failed = true
+		task.Status = "failed"
+	}
 	return task
 }
-func (driver *fakeStorageSourceDriver) CancelOffline(context.Context, string, bool) error { return nil }
+func (driver *fakeStorageSourceDriver) CancelOffline(ctx context.Context, id string, deleteFiles bool) error {
+	if err := driver.check(ctx); err != nil {
+		return err
+	}
+	driver.mu.Lock()
+	defer driver.mu.Unlock()
+	if id != driver.taskID {
+		return errors.New("wrong original task")
+	}
+	driver.cancelCalls++
+	driver.cancelFiles = deleteFiles
+	if driver.cancelApplied {
+		driver.taskID = ""
+	}
+	if driver.loseCancel {
+		return errors.New("lost cancel acknowledgement")
+	}
+	return nil
+}
 func (driver *fakeStorageSourceDriver) InspectShare(ctx context.Context, _ string) (cloud.ShareSnapshot, error) {
 	if err := driver.check(ctx); err != nil {
 		return cloud.ShareSnapshot{}, err
@@ -146,7 +220,11 @@ func (driver *fakeStorageSourceDriver) StreamTree(ctx context.Context, rootID st
 	if rootID != "output-1" {
 		return errors.New("unexpected root")
 	}
-	return emit(cloud.TreeBatch{Offset: 0, Total: 1, Entries: []cloud.TreeEntry{{Item: cloud.Item{ID: "provider-file-1", ParentID: rootID, Name: "Episode 01.mkv", Size: int64(len(driver.body)), SHA1: driver.sha1}, RelativePath: "/Season 01/Episode 01.mkv"}}})
+	entries := []cloud.TreeEntry{{Item: cloud.Item{ID: "provider-file-1", ParentID: rootID, Name: "Episode 01.mkv", Size: int64(len(driver.body)), SHA1: driver.sha1}, RelativePath: "/Season 01/Episode 01.mkv"}}
+	if driver.extras {
+		entries = append(entries, cloud.TreeEntry{Item: cloud.Item{ID: "extra", ParentID: rootID, Name: "bonus.bin", Size: 123, SHA1: strings.Repeat("F", 40)}, RelativePath: "/bonus.bin"})
+	}
+	return emit(cloud.TreeBatch{Offset: 0, Total: int64(len(entries)), Entries: entries})
 }
 func (driver *fakeStorageSourceDriver) OpenRead(ctx context.Context, request cloud.ReadRequest) (cloud.ReadResult, error) {
 	if err := driver.check(ctx); err != nil {
@@ -175,7 +253,7 @@ func TestStorageSourceRestartDoesNotResubmitAndResumesVerifiedChunks(t *testing.
 	}
 	body := bytes.Repeat([]byte("m"), int(nodeprotocol.FileChunkSize)+257)
 	digest := sha1.Sum(body)
-	fake := &fakeStorageSourceDriver{body: body, sha1: strings.ToUpper(hex.EncodeToString(digest[:]))}
+	fake := &fakeStorageSourceDriver{extras: true, body: body, sha1: strings.ToUpper(hex.EncodeToString(digest[:]))}
 	store, err := OpenStore(filepath.Join(root, "node.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -199,15 +277,17 @@ func TestStorageSourceRestartDoesNotResubmitAndResumesVerifiedChunks(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	plan := nodeprotocol.StorageSourcePlan{StorageID: "storage-a", ProviderType: nodeprotocol.StorageProviderPan115, SourceKind: nodeprotocol.StorageSourceKindPan115OfflineMagnet, TargetKind: nodeprotocol.StorageSourceTargetPan115, SourceIdentityDigest: strings.Repeat("1", 64), TargetIdentityDigest: strings.Repeat("2", 64), SourceContentDigest: contentDigest, OfflineDestinationID: "0"}
+	required := &downloader.OfflineRequiredPlan{Version: 1, RootName: "Show", MultiFile: true, Files: []downloader.OfflineRequiredFile{{RelativePath: "Season 01/Episode 01.mkv", Size: int64(len(body))}}}
+	requiredDigest, _ := required.Digest()
+	plan := nodeprotocol.StorageSourcePlan{OfflineRequiredDigest: requiredDigest, CloudOfflineLifecycleVersion: 1, OfflineAccountNamespace: offlineAccountNamespace(nodeprotocol.StorageProviderPan115, "1"), StorageID: "storage-a", ProviderType: nodeprotocol.StorageProviderPan115, SourceKind: nodeprotocol.StorageSourceKindPan115OfflineMagnet, TargetKind: nodeprotocol.StorageSourceTargetPan115, SourceIdentityDigest: strings.Repeat("1", 64), TargetIdentityDigest: strings.Repeat("2", 64), SourceContentDigest: contentDigest, OfflineDestinationID: "0"}
 	payload, _ := json.Marshal(plan)
 	operation := nodeprotocol.OperationPlan{ProtocolVersion: nodeprotocol.VersionV1, OperationKey: "source-1", TaskID: "task-1", NodeID: "node-1", Kind: nodeprotocol.OperationKindStorageSourceMaterialize, PlanRevision: 1, LeaseEpoch: 1, LeaseExpiresAt: now.Add(10 * time.Minute), Payload: payload}
 	planDigest, _ := operation.Digest()
 	if _, _, err := store.Put(context.Background(), "server-1", planDigest, operation, now); err != nil {
 		t.Fatal(err)
 	}
-	credential, _ := json.Marshal(nodeprotocol.StorageSourceCredential{ProviderType: nodeprotocol.StorageProviderPan115, Cookie: "UID=secret; CID=secret; SEID=secret", SourceURI: magnet})
-	grant := nodeprotocol.CredentialGrant{GrantID: "grant-1", NodeID: "node-1", TaskID: "task-1", OperationKey: "source-1", ResourceKind: nodeprotocol.ResourceKindStorage, ResourceID: "storage-a", CredentialRevision: 1, AllowedActions: []string{nodeprotocol.StorageSourceGrantOfflineSubmit, nodeprotocol.StorageSourceGrantOfflineStatus, nodeprotocol.StorageSourceGrantRead}, ExpiresAt: now.Add(10 * time.Minute), Credential: credential}
+	credential, _ := json.Marshal(nodeprotocol.StorageSourceCredential{OfflineRequired: required, ProviderType: nodeprotocol.StorageProviderPan115, Cookie: "UID=1_A1; CID=secret; SEID=secret", SourceURI: magnet})
+	grant := nodeprotocol.CredentialGrant{GrantID: "grant-1", NodeID: "node-1", TaskID: "task-1", OperationKey: "source-1", ResourceKind: nodeprotocol.ResourceKindStorage, ResourceID: "storage-a", CredentialRevision: 1, AllowedActions: []string{nodeprotocol.StorageSourceGrantOfflineStop, nodeprotocol.StorageSourceGrantOfflineSubmit, nodeprotocol.StorageSourceGrantOfflineStatus, nodeprotocol.StorageSourceGrantRead}, ExpiresAt: now.Add(10 * time.Minute), Credential: credential}
 	envelope, err := nodeprotocol.SealCredentialGrant(agent.sealingPublicKey, grant, now)
 	if err != nil {
 		t.Fatal(err)
@@ -218,8 +298,20 @@ func TestStorageSourceRestartDoesNotResubmitAndResumesVerifiedChunks(t *testing.
 	action := nodeprotocol.StorageSourceActionRequest{RequestID: "source-request-1", TaskID: "task-1", OperationKey: "source-1", PlanDigest: planDigest, StorageID: "storage-a", Action: nodeprotocol.StorageSourceActionMaterialize, GrantID: "grant-1"}
 	firstServer := httptest.NewServer(agent.Handler())
 	doNodeJSON(t, firstServer.URL+"/node/v1/storage-source/actions", http.MethodPost, action, http.StatusAccepted)
-	waitStorageSourceStatus(t, store, action.RequestID, nodeprotocol.StorageSourceWaiting)
+	waiting := waitStorageSourceStatus(t, store, action.RequestID, nodeprotocol.StorageSourceWaiting)
+	if waiting.Offline == nil || waiting.Offline.StartedAt == nil || waiting.Offline.Ready {
+		t.Fatal("missing original native dispatch clock")
+	}
+	started := *waiting.Offline.StartedAt
+	waitStorageSourceIdle(t, agent, action.OperationKey)
 	firstServer.Close()
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = OpenStore(filepath.Join(root, "node.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
 	if fake.submitCalls != 1 {
 		t.Fatalf("submit calls=%d", fake.submitCalls)
 	}
@@ -228,7 +320,8 @@ func TestStorageSourceRestartDoesNotResubmitAndResumesVerifiedChunks(t *testing.
 	// persisted. The next wake uses the stored provider task ID and must not
 	// submit the same offline task again.
 	fake.mu.Lock()
-	fake.complete = true
+	fake.requiredReady = true
+	fake.cancelApplied = true
 	fake.failReads = map[int64]int{nodeprotocol.FileChunkSize: 1}
 	fake.mu.Unlock()
 	restarted, err := New(config, store)
@@ -237,6 +330,20 @@ func TestStorageSourceRestartDoesNotResubmitAndResumesVerifiedChunks(t *testing.
 	}
 	restarted.sourceFactory = agent.sourceFactory
 	secondServer := httptest.NewServer(restarted.Handler())
+	release, err := restarted.acquireOperation(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	statusInput := action
+	statusInput.RequestID = "cloud-status"
+	statusInput.Action = nodeprotocol.StorageSourceActionOfflineStatus
+	rawStatus := doNodeJSON(t, secondServer.URL+"/node/v1/storage-source/actions", http.MethodPost, statusInput, http.StatusOK)
+	var cloudStatus nodeprotocol.StorageSourceActionResponse
+	if json.Unmarshal(rawStatus, &cloudStatus) != nil || cloudStatus.Offline == nil || !cloudStatus.Offline.Ready || cloudStatus.Offline.StartedAt == nil || !cloudStatus.Offline.StartedAt.Equal(started) || len(fake.readOffsets) != 0 {
+		release()
+		t.Fatal("cloud status waited for data capacity or conflated readiness with materialization")
+	}
+	release()
 	doNodeJSON(t, secondServer.URL+"/node/v1/storage-source/actions", http.MethodPost, action, http.StatusAccepted)
 	waitStorageSourceError(t, store, action.RequestID, nodeprotocol.StorageSourceDownloading, "node_source_unavailable")
 	secondServer.Close()
@@ -258,6 +365,9 @@ func TestStorageSourceRestartDoesNotResubmitAndResumesVerifiedChunks(t *testing.
 	defer thirdServer.Close()
 	doNodeJSON(t, thirdServer.URL+"/node/v1/storage-source/actions", http.MethodPost, action, http.StatusAccepted)
 	completed := waitStorageSourceStatus(t, store, action.RequestID, nodeprotocol.StorageSourceCompleted)
+	if completed.Offline == nil || !completed.Offline.Ready || completed.Offline.StartedAt == nil || !completed.Offline.StartedAt.Equal(started) || completed.Offline.CompletionMode != downloader.OfflineCompletionRequiredFiles || !completed.Offline.UpstreamStopped || fake.cancelCalls != 1 || fake.taskID != "" {
+		t.Fatal("required-ready stop/transport did not preserve output after original native task removal")
+	}
 	if completed.FileExport == nil || completed.FileExport.TotalFiles != 1 || completed.DownloadedFiles != 1 || completed.DownloadedBytes != int64(len(body)) {
 		t.Fatalf("response=%+v", completed)
 	}
@@ -547,5 +657,218 @@ func TestShareFailuresPreserveSafeNodeClassification(t *testing.T) {
 		if got != expected || strings.Contains(storageSourceSafeMessage(got), "private") {
 			t.Fatalf("code=%s", got)
 		}
+	}
+}
+
+func TestStorageSourceCloudDeadlineControlsPreserveOriginalReceiptsAndPermissions(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	store, err := OpenStore(filepath.Join(dir, "node.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	config := Config{NodeID: "node-1", ListenAddress: "127.0.0.1:0", DataDirectory: dir, ManagedRoot: filepath.Join(dir, "managed"), SealingPrivateKeyFile: filepath.Join(dir, "seal.key"), MaxConcurrentOperations: 1, AllowInsecureDevelopment: true}
+	if err := EnsureSealingIdentity(config); err != nil {
+		t.Fatal(err)
+	}
+	agent, err := New(config, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	agent.now = func() time.Time { return now }
+	fake := &fakeStorageSourceDriver{taskID: strings.Repeat("a", 40), loseCancel: true}
+	agent.sourceFactory = func(_ nodeprotocol.StorageSourceCredential, guard func(context.Context) error) (storageSourceDriver, error) {
+		fake.before = guard
+		return fake, nil
+	}
+	uri := "magnet:?xt=urn:btih:" + strings.Repeat("a", 40)
+	contentDigest, _ := nodeprotocol.StorageSourceContentDigest(nodeprotocol.StorageSourceKindPan115OfflineMagnet, uri)
+	makeOperation := func(key string, legacy bool) (nodeprotocol.StorageSourceActionRequest, nodeprotocol.StorageSourcePlan, nodeprotocol.StorageSourceCredential) {
+		t.Helper()
+		plan := nodeprotocol.StorageSourcePlan{CloudOfflineLifecycleVersion: 1, OfflineAccountNamespace: offlineAccountNamespace(nodeprotocol.StorageProviderPan115, "1"), StorageID: "storage", ProviderType: nodeprotocol.StorageProviderPan115, SourceKind: nodeprotocol.StorageSourceKindPan115OfflineMagnet, TargetKind: nodeprotocol.StorageSourceTargetLocal, SourceIdentityDigest: strings.Repeat("1", 64), SourceContentDigest: contentDigest, OfflineDestinationID: "0"}
+		if legacy {
+			plan.CloudOfflineLifecycleVersion = 0
+			plan.OfflineAccountNamespace = ""
+		}
+		raw, _ := json.Marshal(plan)
+		operation := nodeprotocol.OperationPlan{ProtocolVersion: 1, OperationKey: key, TaskID: "task-" + key, NodeID: "node-1", Kind: nodeprotocol.OperationKindStorageSourceMaterialize, PlanRevision: 1, LeaseEpoch: 1, LeaseExpiresAt: now.Add(10 * time.Minute), Payload: raw}
+		digest, _ := operation.Digest()
+		if _, _, err := store.Put(ctx, "server-1", digest, operation, now); err != nil {
+			t.Fatal(err)
+		}
+		input := nodeprotocol.StorageSourceActionRequest{RequestID: key, TaskID: operation.TaskID, OperationKey: key, PlanDigest: digest, StorageID: "storage", Action: nodeprotocol.StorageSourceActionMaterialize}
+		if _, err := store.PrepareStorageSourceRun(ctx, "server-1", input, now); err != nil {
+			t.Fatal(err)
+		}
+		credential := nodeprotocol.StorageSourceCredential{ProviderType: nodeprotocol.StorageProviderPan115, Cookie: "UID=1_A1; CID=private; SEID=private", SourceURI: uri}
+		return input, plan, credential
+	}
+	saveGrant := func(input nodeprotocol.StorageSourceActionRequest, credential nodeprotocol.StorageSourceCredential, id string, actions []string) {
+		t.Helper()
+		raw, _ := json.Marshal(credential)
+		grant := nodeprotocol.CredentialGrant{GrantID: id, NodeID: "node-1", TaskID: input.TaskID, OperationKey: input.OperationKey, ResourceKind: nodeprotocol.ResourceKindStorage, ResourceID: "storage", CredentialRevision: 1, AllowedActions: actions, ExpiresAt: now.Add(10 * time.Minute), Credential: raw}
+		envelope, err := nodeprotocol.SealCredentialGrant(agent.sealingPublicKey, grant, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.SaveCredentialGrant(ctx, "server-1", envelope, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	input, plan, credential := makeOperation("original", false)
+	hold, err := agent.offlineLock(ctx, "server-1", input.OperationKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancelled, cancelLockWait := context.WithCancel(ctx)
+	cancelLockWait()
+	if release, err := agent.offlineLock(cancelled, "server-1", input.OperationKey); !errors.Is(err, context.Canceled) || release != nil {
+		t.Fatal("cancelled deadline observation was blocked behind native control", err)
+	}
+	hold()
+	ledger, err := agent.loadOfflineLedger(ctx, "server-1", input, plan, credential, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := now.Add(-31 * time.Minute)
+	ledger.state.DispatchedAt = &started
+	ledger.state.AcceptedAt = &started
+	if err := ledger.save(ctx, "accepted", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := agent.publishOfflineLifecycle(ctx, "server-1", input, plan, ledger); err != nil {
+		t.Fatal(err)
+	}
+	allActions := []string{nodeprotocol.StorageSourceGrantRead, nodeprotocol.StorageSourceGrantOfflineStatus, nodeprotocol.StorageSourceGrantOfflineStop}
+	saveGrant(input, credential, "current", allActions)
+	saveGrant(input, credential, "old-no-stop", []string{nodeprotocol.StorageSourceGrantRead, nodeprotocol.StorageSourceGrantOfflineStatus})
+	server := httptest.NewServer(agent.Handler())
+	defer server.Close()
+	control := input
+	control.Action = nodeprotocol.StorageSourceActionOfflineStop
+	control.GrantID = "old-no-stop"
+	doNodeJSON(t, server.URL+"/node/v1/storage-source/actions", http.MethodPost, control, http.StatusForbidden)
+	if fake.cancelCalls != 0 {
+		t.Fatal("legacy grant widened stop permission")
+	}
+	wrong := credential
+	wrong.Cookie = "UID=2_A1; CID=private; SEID=private"
+	saveGrant(input, wrong, "wrong-account", allActions)
+	control.GrantID = "wrong-account"
+	doNodeJSON(t, server.URL+"/node/v1/storage-source/actions", http.MethodPost, control, http.StatusConflict)
+	if fake.cancelCalls != 0 {
+		t.Fatal("different account canceled original task")
+	}
+	release, err := agent.acquireOperation(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	if err := agent.ReconcileCloudOfflineDeadlines(ctx); err != nil {
+		t.Fatal(err)
+	}
+	agent.offlineStopWG.Wait()
+	run, err := store.StorageSourceRun(ctx, "server-1", input.OperationKey)
+	if err != nil || run.Offline == nil || !run.Offline.DeadlineExceeded || !run.Offline.StopPending || run.Offline.UpstreamStopped || fake.cancelCalls != 1 || fake.cancelFiles {
+		t.Fatal("deadline did not persist local cancel with truthful keep-output pending stop", err, run)
+	}
+	control.GrantID = "current"
+	doNodeJSON(t, server.URL+"/node/v1/storage-source/actions", http.MethodPost, control, http.StatusOK)
+	if fake.cancelCalls != 1 {
+		t.Fatal("lost stop ACK replayed native cancel")
+	}
+	fake.mu.Lock()
+	fake.taskID = ""
+	fake.mu.Unlock()
+	control.Action = nodeprotocol.StorageSourceActionOfflineStatus
+	raw := doNodeJSON(t, server.URL+"/node/v1/storage-source/actions", http.MethodPost, control, http.StatusOK)
+	var response nodeprotocol.StorageSourceActionResponse
+	if json.Unmarshal(raw, &response) != nil || response.Offline == nil || !response.Offline.UpstreamStopped || response.Offline.StopPending || !response.Offline.DeadlineExceeded || !response.Offline.StartedAt.Equal(started) || fake.cancelCalls != 1 {
+		t.Fatal("read-only reconciliation lost original cancellation/start proof")
+	}
+	legacy, _, legacyCredential := makeOperation("legacy", true)
+	saveGrant(legacy, legacyCredential, "legacy-expanded", allActions)
+	legacy.Action = nodeprotocol.StorageSourceActionOfflineStop
+	legacy.GrantID = "legacy-expanded"
+	doNodeJSON(t, server.URL+"/node/v1/storage-source/actions", http.MethodPost, legacy, http.StatusConflict)
+	disconnected, disconnectedPlan, disconnectedCredential := makeOperation("disconnected", false)
+	lostLedger, err := agent.loadOfflineLedger(ctx, "server-1", disconnected, disconnectedPlan, disconnectedCredential, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lostLedger.state.DispatchedAt = &started
+	if err := lostLedger.save(ctx, "entered", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := agent.publishOfflineLifecycle(ctx, "server-1", disconnected, disconnectedPlan, lostLedger); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(20 * time.Minute)
+	if err := agent.ReconcileCloudOfflineDeadlines(ctx); err != nil {
+		t.Fatal(err)
+	}
+	pending, _ := store.StorageSourceRun(ctx, "server-1", disconnected.OperationKey)
+	if pending.Offline == nil || !pending.Offline.DeadlineExceeded || !pending.Offline.StopPending || fake.cancelCalls != 1 {
+		t.Fatal("expired lease/grant either lost local timeout or invented upstream cancellation")
+	}
+	rejected, rejectedPlan, rejectedCredential := makeOperation("rejected", false)
+	fake.taskID = ""
+	fake.rejectSubmit = true
+	rejectedGrant := nodeprotocol.CredentialGrant{AllowedActions: append(append([]string(nil), allActions...), nodeprotocol.StorageSourceGrantOfflineSubmit), ExpiresAt: now.Add(10 * time.Minute)}
+	fake.before = nil
+	if _, err := agent.progressCloudOffline(ctx, "server-1", rejected, rejectedPlan, rejectedGrant, rejectedCredential, fake, true); !downloader.DefiniteSubmissionNonAcceptance(err) {
+		t.Fatal("explicit native rejection lost durable Node no-task proof", err)
+	}
+	rejectedRun, _ := store.StorageSourceRun(ctx, "server-1", rejected.OperationKey)
+	if rejectedRun.Offline == nil || !rejectedRun.Offline.DefiniteNonAcceptance || rejectedRun.Offline.StopPending {
+		t.Fatal("rejected native submission remained physically admitted")
+	}
+	now = now.Add(40 * time.Minute)
+	if err := agent.ReconcileCloudOfflineDeadlines(ctx); err != nil {
+		t.Fatal(err)
+	}
+	rejectedRun, _ = store.StorageSourceRun(ctx, "server-1", rejected.OperationKey)
+	if rejectedRun.Offline.DeadlineExceeded || fake.cancelCalls != 1 {
+		t.Fatal("no-task rejection was blacklisted as a timed-out acquisition")
+	}
+
+	terminal, terminalPlan, terminalCredential := makeOperation("terminal", false)
+	fake.taskID = strings.Repeat("a", 40)
+	fake.rejectSubmit = false
+	fake.failed = true
+	terminalLedger, err := agent.loadOfflineLedger(ctx, "server-1", terminal, terminalPlan, terminalCredential, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminalStart := now.Add(-31 * time.Minute)
+	terminalLedger.state.DispatchedAt = &terminalStart
+	terminalLedger.state.AcceptedAt = &terminalStart
+	if err := terminalLedger.save(ctx, "accepted", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := agent.publishOfflineLifecycle(ctx, "server-1", terminal, terminalPlan, terminalLedger); err != nil {
+		t.Fatal(err)
+	}
+	fake.before = nil
+	if _, err := agent.progressCloudOffline(ctx, "server-1", terminal, terminalPlan, rejectedGrant, terminalCredential, fake, false); err != nil {
+		t.Fatal(err)
+	}
+	terminalRun, _ := store.StorageSourceRun(ctx, "server-1", terminal.OperationKey)
+	if terminalRun.Offline == nil || !terminalRun.Offline.TerminalFailure || terminalRun.Status != nodeprotocol.StorageSourceFailed {
+		t.Fatal("original native terminal failure was reduced to transient transport failure")
+	}
+	if err := agent.ReconcileCloudOfflineDeadlines(ctx); err != nil {
+		t.Fatal(err)
+	}
+	terminalRun, _ = store.StorageSourceRun(ctx, "server-1", terminal.OperationKey)
+	if terminalRun.Offline.DeadlineExceeded {
+		t.Fatal("original native terminal failure became deadline history")
+	}
+
+	var ciphertext []byte
+	if err := store.db.QueryRow(`SELECT ciphertext FROM cloud_operation_receipts WHERE operation_key='original' AND receipt_id='cloud-offline-lifecycle'`).Scan(&ciphertext); err != nil || bytes.Contains(ciphertext, []byte("account_id")) || bytes.Contains(ciphertext, []byte("dispatched_at")) {
+		t.Fatal("native lifecycle receipt was not private encrypted state")
 	}
 }

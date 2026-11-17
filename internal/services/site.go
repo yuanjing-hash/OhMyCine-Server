@@ -24,6 +24,7 @@ import (
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
 	downloadpkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/downloader"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/metadata/tmdb"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/resourcecontent"
 	sitepkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/site"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/site/builtin"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/site/pansou"
@@ -293,8 +294,12 @@ type SiteSearchDetail struct {
 	Revision         uint64 `json:"revision"`
 }
 type SiteDownloadInput struct {
-	ContentSelectionToken string
-	ContentMode           string
+	ExpectedTMDBID              *int64
+	ExpectedMediaType           string
+	offlineIntakeContext        string
+	OfflineFailureOverrideToken string
+	ContentSelectionToken       string
+	ContentMode                 string
 	// Internal-only replacement intent. Public handlers never deserialize these.
 	PreserveExistingVersions  bool
 	ReplacementIdentity       *DownloadRecognitionIdentity
@@ -1726,6 +1731,23 @@ func (s *SiteService) Download(ctx context.Context, actor Actor, input SiteDownl
 	if err := validateSiteContentMode(input, ""); err != nil {
 		return DownloadTaskSummary{}, err
 	}
+	input.ExpectedMediaType = strings.ToLower(strings.TrimSpace(input.ExpectedMediaType))
+	if (input.ExpectedTMDBID == nil) != (input.ExpectedMediaType == "") || input.ExpectedTMDBID != nil && (*input.ExpectedTMDBID <= 0 || input.ExpectedMediaType != "movie" && input.ExpectedMediaType != "tv") {
+		return DownloadTaskSummary{}, appError(CodeInvalidRequest, "期望媒体身份参数无效", nil)
+	}
+	intakeDigest := offlineSiteIntakeDigest(input)
+	if input.OfflineFailureOverrideToken != "" && s.downloads != nil {
+		if replay, ok, err := s.downloads.replayOfflineIntake(ctx, actor, input.OfflineFailureOverrideToken, intakeDigest); err != nil {
+			return DownloadTaskSummary{}, err
+		} else if ok {
+			return replay, nil
+		}
+	}
+	if input.ExpectedTMDBID != nil {
+		if err := s.BindExpectedIdentity(ctx, actor, input.ResultToken, input.ExpectedMediaType, *input.ExpectedTMDBID, input); err != nil {
+			return DownloadTaskSummary{}, err
+		}
+	}
 	token := strings.TrimSpace(input.ResultToken)
 	claim, err := s.reserveClaim(token, actor.User.ID)
 	if err != nil {
@@ -2010,7 +2032,7 @@ func (s *SiteService) Download(ctx context.Context, actor Actor, input SiteDownl
 			return nil
 		}
 	}
-	submitInput := SubmitDownloadInput{SourceSiteID: claimedSite.ID, DownloaderID: input.DownloaderID, MediaLibraryID: input.MediaLibraryID, ProfileID: input.ProfileID, DisplayName: claim.Title, Priority: input.Priority, Source: source, PluginID: pluginID, PluginVersion: pluginVersion, PluginConnectionID: pluginConnectionID, PluginResourceClaimID: resourceClaimID, RecognitionOverride: recognitionOverride, FollowSubscriptionID: input.FollowSubscriptionID, FollowResourceFingerprint: input.FollowResourceFingerprint, ForceRecognitionOverride: input.FollowSubscriptionID != "" || input.ReplacementIdentity != nil, BeforePersist: beforePersist, AfterPersist: input.AfterPersist, PreserveExistingVersions: input.PreserveExistingVersions}
+	submitInput := SubmitDownloadInput{offlineIntakeDigest: intakeDigest, OfflineFailureOverrideToken: input.OfflineFailureOverrideToken, SourceSiteID: claimedSite.ID, DownloaderID: input.DownloaderID, MediaLibraryID: input.MediaLibraryID, ProfileID: input.ProfileID, DisplayName: claim.Title, Priority: input.Priority, Source: source, PluginID: pluginID, PluginVersion: pluginVersion, PluginConnectionID: pluginConnectionID, PluginResourceClaimID: resourceClaimID, RecognitionOverride: recognitionOverride, FollowSubscriptionID: input.FollowSubscriptionID, FollowResourceFingerprint: input.FollowResourceFingerprint, ForceRecognitionOverride: input.FollowSubscriptionID != "" || input.ReplacementIdentity != nil, BeforePersist: beforePersist, AfterPersist: input.AfterPersist, PreserveExistingVersions: input.PreserveExistingVersions}
 	stage = "enqueue"
 	if source.ShareSelection != nil {
 		previewToken := input.PreviewToken
@@ -2050,7 +2072,11 @@ func siteTorrentDownloadSource(definition builtin.Definition, definitionFound bo
 	if err != nil {
 		return DownloadSourceInput{}, appError(CodeSiteResponseInvalid, "公开 BT 站点返回的种子文件无效", err)
 	}
-	return DownloadSourceInput{Kind: downloadpkg.SourceURL, URL: magnet}, nil
+	manifest, manifestErr := resourcecontent.ParseTorrent(torrent, resourcecontent.Limits{MaxMetainfoBytes: downloadpkg.MaxTorrentBytes})
+	if manifestErr != nil {
+		return DownloadSourceInput{}, appError(CodeSiteResponseInvalid, "公开 BT 站点返回的内容清单无效", manifestErr)
+	}
+	return DownloadSourceInput{Kind: downloadpkg.SourceURL, URL: magnet, offlineRequired: requiredWholeMediaPlan(manifest)}, nil
 }
 
 func (s *SiteService) runtimeConfig(id uint) (models.Site, sitepkg.Config, sitepkg.Adapter, error) {

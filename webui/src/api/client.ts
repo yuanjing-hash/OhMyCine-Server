@@ -1,9 +1,10 @@
 import { parseShareValidation, type ShareValidation } from '@/share-preview'
+import { offlineConfirmationCode, parseOfflineFailureWarning, type OfflineFailureWarning } from '@/offline-failure'
 
 interface Envelope<T> { code: number; message: string; data: T }
 
 export class APIError extends Error {
-  constructor(public status: number, public errorCode: string, message: string, public shareValidation?: ShareValidation) { super(message) }
+  constructor(public status: number, public errorCode: string, message: string, public shareValidation?: ShareValidation, public offlineFailureWarning?: OfflineFailureWarning) { super(message) }
 }
 
 let csrfToken = ''
@@ -48,7 +49,8 @@ export async function api<T>(path: string, options: RequestInit = {}, config: { 
     if (response.status === 401 && errorCode === 'NOT_AUTHENTICATED') { clearCSRFToken(); window.dispatchEvent(new CustomEvent('omc:unauthorized')) }
     if (response.status === 403) window.dispatchEvent(new CustomEvent('omc:forbidden'))
     const validation = typeof data === 'object' && data !== null ? parseShareValidation(Reflect.get(data, 'share_validation')) : undefined
-    throw new APIError(response.status, errorCode, payload.message, validation)
+    const warning = errorCode === offlineConfirmationCode && typeof data === 'object' && data !== null ? parseOfflineFailureWarning(Reflect.get(data, 'offline_failure_warning')) : undefined
+    throw new APIError(response.status, errorCode, payload.message, validation, warning)
   }
   return payload.data as T
 }

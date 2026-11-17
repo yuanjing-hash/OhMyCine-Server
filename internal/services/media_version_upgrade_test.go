@@ -183,6 +183,32 @@ func TestMediaVersionUpgradeFenceAllowsNewHeadButRejectsOldEntryDrift(t *testing
 	if err := f.service.db.Transaction(func(tx *gorm.DB) error { return f.service.validateSnapshotTx(tx, row, snapshot) }); err != nil {
 		t.Fatalf("legitimate replacement publication blocked: %v", err)
 	}
+	// A proven no-task retry moves the existing upgrade intent with its parent
+	// worker, while preserving the original download history and catalog fence.
+	original := f.createDownload(t, "upgrade-rejected-original")
+	replacement := f.createDownload(t, "upgrade-rejected-replacement")
+	parent, err := f.service.queue.Enqueue(EnqueueJobInput{OwnerID: f.actor.User.ID, JobType: JobTypeMediaVersionUpgrade, DisplayName: "retry replacement", Payload: map[string]string{"upgrade_id": row.ID}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.service.db.Model(&models.Job{}).Where("id = ?", parent.ID).Update("status", models.JobStatusFailed).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := f.service.db.Model(&row).Updates(map[string]any{"state": "failed", "error_code": "media_upgrade_replacement_failed", "download_task_id": original.ID, "job_id": parent.ID}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := f.service.db.Transaction(func(tx *gorm.DB) error {
+		return moveRejectedOfflineIntentsTx(tx, original, replacement, time.Now().UTC())
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.service.db.First(&row, "id = ?", row.ID).Error; err != nil || row.DownloadTaskID != replacement.ID || row.State != "submitted" || row.ErrorCode != "" {
+		t.Fatalf("no-task retry lost upgrade intent: %+v %v", row, err)
+	}
+	var resumed models.Job
+	if err := f.service.db.First(&resumed, "id = ?", parent.ID).Error; err != nil || resumed.Status != models.JobStatusQueued {
+		t.Fatalf("no-task retry left parent failed: %+v %v", resumed, err)
+	}
 	if err := f.service.db.Model(&f.old).Update("provider_id", "different-file").Error; err != nil {
 		t.Fatal(err)
 	}

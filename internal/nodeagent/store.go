@@ -110,6 +110,10 @@ func (s *Store) migrate(ctx context.Context) error {
 		{11, []string{
 			`ALTER TABLE operations ADD COLUMN superseded_by TEXT NOT NULL DEFAULT ''`,
 		}},
+		{12, []string{
+			`ALTER TABLE storage_source_runs ADD COLUMN cloud_offline_json TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE storage_source_runs ADD COLUMN offline_stop_state TEXT NOT NULL DEFAULT ''`,
+		}},
 	}
 	for _, migration := range migrations {
 		var applied int

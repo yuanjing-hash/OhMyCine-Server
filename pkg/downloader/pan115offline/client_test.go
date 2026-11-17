@@ -376,3 +376,77 @@ func TestProviderItemAdoptionRevalidatesIdentityAndDestructiveCancel(t *testing.
 		t.Fatalf("identity mismatch code=%q retryable=%t err=%v", code, retryable, err)
 	}
 }
+
+type finalizedFixtureDriver struct {
+	*fakeShareDriver
+	states map[string]cloud.OfflineFinalization
+}
+
+func (f *finalizedFixtureDriver) FinalizedFiles(_ context.Context, files []cloud.Item) ([]cloud.FinalizedFile, error) {
+	var result []cloud.FinalizedFile
+	for _, file := range files {
+		state := f.states[file.ID]
+		if state == "" {
+			state = cloud.OfflineFinalizationUnknown
+		}
+		result = append(result, cloud.FinalizedFile{Item: file, State: state})
+	}
+	return result, nil
+}
+func TestNativeOfflineRequiredGoalUsesExactFinalizedLeavesAndSourceAwareScope(t *testing.T) {
+	base := newFakeShareDriver()
+	driver := &finalizedFixtureDriver{fakeShareDriver: base, states: map[string]cloud.OfflineFinalization{"video": cloud.OfflineFinalizationComplete, "subtitle": cloud.OfflineFinalizationComplete, "extra": cloud.OfflineFinalizationPending}}
+	root := cloud.Item{ID: "owned-task", ParentID: "intake", Name: "omc-task", IsDir: true}
+	pack := cloud.Item{ID: "pack", ParentID: root.ID, Name: "Pack", IsDir: true}
+	video := cloud.Item{ID: "video", ParentID: pack.ID, Name: "a.mkv", Size: 10}
+	subtitle := cloud.Item{ID: "subtitle", ParentID: pack.ID, Name: "a.zh.ass", Size: 2}
+	extra := cloud.Item{ID: "extra", ParentID: pack.ID, Name: "sample.txt", Size: 20}
+	for _, item := range []cloud.Item{root, pack, video, subtitle, extra} {
+		base.items[item.ID] = item
+	}
+	base.children["intake"] = []cloud.Item{root}
+	base.children[root.ID] = []cloud.Item{pack}
+	base.children[pack.ID] = []cloud.Item{video, subtitle, extra}
+	base.task = cloud.OfflineTask{ID: "native", DirectoryID: root.ID, OutputItemID: pack.ID, Status: "downloading"}
+	client, err := New(downloader.Config{CloudDriver: driver, ProviderStorageRootID: "root", ProviderDirectoryID: "intake", OfflineAccountNamespace: strings.Repeat("a", 64)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter := client.(*Client)
+	if err := adapter.BindTaskOperation("task"); err != nil {
+		t.Fatal(err)
+	}
+	plan := downloader.OfflineRequiredPlan{Version: 1, RootName: "Pack", MultiFile: true, Files: []downloader.OfflineRequiredFile{{RelativePath: "a.mkv", Size: 10}, {RelativePath: "a.zh.ass", Size: 2}}}
+	if err := adapter.BindOfflineRequired(plan); err != nil {
+		t.Fatal(err)
+	}
+	for _, kind := range []string{downloader.SourcePan115Share, downloader.SourceProviderItem, downloader.SourceQuarkShare} {
+		if operation := downloader.ResolveOfflineOperation(client, downloader.Source{Kind: kind}); operation.Kind != "" {
+			t.Fatal("share/adoption acquired offline deadline")
+		}
+	}
+	if operation := downloader.ResolveOfflineOperation(client, downloader.Source{Kind: downloader.SourceURL}); operation.Kind != downloader.OfflineOperationCloud || !operation.KeepOutputStop || operation.AccountNamespace == "" {
+		t.Fatal("native source lost common capability")
+	}
+	task, err := downloader.ObserveOffline(context.Background(), client, "native")
+	if err != nil || task.Completed || task.Offline == nil || !task.Offline.Ready || task.Offline.CompletionMode != downloader.OfflineCompletionRequiredFiles || task.Offline.ReadyManifest == nil || len(task.Offline.ReadyManifest.Files) != 2 {
+		t.Fatal("required finalized media did not finish goal independently of extras", task, err)
+	}
+	for _, state := range []cloud.OfflineFinalization{cloud.OfflineFinalizationUnknown, cloud.OfflineFinalizationPending} {
+		driver.states["subtitle"] = state
+		task, err = adapter.Get(context.Background(), "native")
+		if err != nil || task.Offline.Ready || task.Completed {
+			t.Fatal("enumeration, size or file existence fabricated completion", err)
+		}
+	}
+	driver.states["subtitle"] = cloud.OfflineFinalizationComplete
+	base.items[pack.ID] = cloud.Item{ID: pack.ID, ParentID: "outside", Name: "Pack", IsDir: true}
+	task, err = adapter.Get(context.Background(), "native")
+	if err != nil || task.Offline.Ready {
+		t.Fatal("outside-root leaf proof accepted", err)
+	}
+	base.items[pack.ID] = pack
+	if err := adapter.StopOfflineKeepOutput(context.Background(), "native"); err != nil || base.cancelFiles {
+		t.Fatal("keep-output stop deleted cloud media", err)
+	}
+}

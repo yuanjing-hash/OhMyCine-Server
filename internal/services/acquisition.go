@@ -27,27 +27,32 @@ type acquisitionDownloadCandidate struct {
 }
 
 type AcquisitionStatus struct {
-	ID                   string                    `json:"id,omitempty"`
-	Title                string                    `json:"title,omitempty"`
-	MediaType            string                    `json:"media_type"`
-	TMDBID               int64                     `json:"tmdb_id"`
-	Stage                string                    `json:"stage"`
-	Status               string                    `json:"status"`
-	DownloadTaskID       string                    `json:"download_task_id,omitempty"`
-	FollowSubscriptionID string                    `json:"follow_subscription_id,omitempty"`
-	TargetLibraryID      *uint                     `json:"target_library_id,omitempty"`
-	CatalogTarget        *AcquisitionCatalogTarget `json:"catalog_target,omitempty"`
-	TransferTaskID       string                    `json:"transfer_task_id,omitempty"`
-	Progress             *float64                  `json:"progress,omitempty"`
-	BytesCompleted       *int64                    `json:"bytes_completed,omitempty"`
-	BytesTotal           *int64                    `json:"bytes_total,omitempty"`
-	DownloadSpeed        *int64                    `json:"download_speed,omitempty"`
-	ETASeconds           *int64                    `json:"eta_seconds,omitempty"`
-	ProcessedFiles       int                       `json:"processed_files,omitempty"`
-	TotalFiles           int                       `json:"total_files,omitempty"`
-	LastErrorCode        string                    `json:"last_error_code"`
-	Revision             uint64                    `json:"revision"`
-	UpdatedAt            *time.Time                `json:"updated_at,omitempty"`
+	AcquisitionState       string                    `json:"acquisition_state,omitempty"`
+	OfflineStartedAt       *time.Time                `json:"offline_started_at,omitempty"`
+	OfflineDeadlineAt      *time.Time                `json:"offline_deadline_at,omitempty"`
+	OfflineReadyAt         *time.Time                `json:"offline_ready_at,omitempty"`
+	OfflineStartProvenance string                    `json:"offline_start_provenance,omitempty"`
+	ID                     string                    `json:"id,omitempty"`
+	Title                  string                    `json:"title,omitempty"`
+	MediaType              string                    `json:"media_type"`
+	TMDBID                 int64                     `json:"tmdb_id"`
+	Stage                  string                    `json:"stage"`
+	Status                 string                    `json:"status"`
+	DownloadTaskID         string                    `json:"download_task_id,omitempty"`
+	FollowSubscriptionID   string                    `json:"follow_subscription_id,omitempty"`
+	TargetLibraryID        *uint                     `json:"target_library_id,omitempty"`
+	CatalogTarget          *AcquisitionCatalogTarget `json:"catalog_target,omitempty"`
+	TransferTaskID         string                    `json:"transfer_task_id,omitempty"`
+	Progress               *float64                  `json:"progress,omitempty"`
+	BytesCompleted         *int64                    `json:"bytes_completed,omitempty"`
+	BytesTotal             *int64                    `json:"bytes_total,omitempty"`
+	DownloadSpeed          *int64                    `json:"download_speed,omitempty"`
+	ETASeconds             *int64                    `json:"eta_seconds,omitempty"`
+	ProcessedFiles         int                       `json:"processed_files,omitempty"`
+	TotalFiles             int                       `json:"total_files,omitempty"`
+	LastErrorCode          string                    `json:"last_error_code"`
+	Revision               uint64                    `json:"revision"`
+	UpdatedAt              *time.Time                `json:"updated_at,omitempty"`
 }
 
 // AcquisitionCatalogTarget is navigation evidence, independent of the latest
@@ -187,6 +192,11 @@ func (p *acquisitionProjection) project(row models.MediaAcquisition) (Acquisitio
 				status.Status = "publishing"
 			}
 			projectDownloadProgress(&status, task)
+			if blocked, err := downloadCapacityBlocked(p.tx, task); err != nil {
+				return AcquisitionStatus{}, err
+			} else if blocked {
+				status.AcquisitionState = "waiting_capacity"
+			}
 			var linked models.TransferTask
 			err = p.tx.Where("download_task_id = ? AND owner_id = ?", task.ID, row.OwnerID).First(&linked).Error
 			if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
@@ -374,6 +384,8 @@ func acquisitionTransferPublished(tx *gorm.DB, reader *CatalogReader, download m
 }
 
 func projectDownloadProgress(status *AcquisitionStatus, task models.DownloadTask) {
+	status.AcquisitionState = downloadAcquisitionState(task, models.JobStatusRetryWait)
+	status.OfflineStartedAt, status.OfflineDeadlineAt, status.OfflineReadyAt, status.OfflineStartProvenance = task.OfflineStartedAt, task.OfflineDeadlineAt, task.OfflineReadyAt, task.OfflineStartProvenance
 	status.Progress = downloadProgressPercent(task)
 	status.BytesCompleted = cloneInt64(task.BytesCompleted)
 	status.BytesTotal = cloneInt64(task.BytesTotal)

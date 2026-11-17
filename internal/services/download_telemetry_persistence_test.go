@@ -96,7 +96,7 @@ func TestDownloadTelemetryPersistenceRecovery(t *testing.T) {
 
 			result := worker.Run(context.Background(), workerRuntime{queue: queue, job: *claim}, *claim)
 			if mode == "temporary" {
-				if result.ErrorCode != "" || result.RetryAt != nil || writes < 3 {
+				if result.ErrorCode != "" || result.RetryAt == nil || writes < 3 {
 					t.Fatalf("recovery result=%+v writes=%d", result, writes)
 				}
 			} else {

@@ -371,7 +371,7 @@ func TestObservedUploadTransfersBodiesAndReconcilesCompletion(t *testing.T) {
 		sdk.Client.Header.Set("X-Account-Scope", "local-scope")
 		sdk.SetCookies(&http.Cookie{Name: "UID", Value: "local-user"})
 		sdk.UserID, sdk.Userkey, sdk.UploadMetaInfo = 42, "local-key", &pan115sdk.UploadMetaInfo{SizeLimit: 1024}
-		adapter := &sdkAdapter{sdk}
+		adapter := &sdkAdapter{Pan115Client: sdk}
 		firstCtx, stopFirst := context.WithCancel(context.WithValue(context.Background(), attemptKey{}, "first"))
 		defer stopFirst()
 		secondCtx, stopSecond := context.WithTimeout(context.WithValue(context.Background(), attemptKey{}, "second"), 2*time.Second)

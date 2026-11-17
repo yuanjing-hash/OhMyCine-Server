@@ -20,6 +20,7 @@ import {
   reorderLane,
   respondAction,
   statusLabels,
+  jobStatusLabel,
   unknown,
   progressPercent,
   type Job,
@@ -387,7 +388,7 @@ onBeforeUnmount(() => { alive = false; listRequest.cancel(); detailRequest.cance
                   'status-chip--error': job.status === 'failed',
                   'status-chip--ready': job.status === 'completed',
                 }"
-              >{{ statusLabels[job.status] }}</span><small
+              >{{ jobStatusLabel(job) }}</span><small
                 v-if="job.interrupt_pending"
                 class="block mt-1 semantic-warning-text"
               >控制请求处理中</small>
@@ -469,7 +470,7 @@ onBeforeUnmount(() => { alive = false; listRequest.cancel(); detailRequest.cance
           <div>
             <small>{{ selected ? jobTypeLabel(selected) : '' }}</small>
             <h2>{{ selected?.display_name || '任务详情' }}</h2>
-            <span v-if="selected" class="status-chip">{{ statusLabels[selected.status] }}</span>
+            <span v-if="selected" class="status-chip">{{ jobStatusLabel(selected) }}</span>
           </div>
           <button
             class="icon-button"

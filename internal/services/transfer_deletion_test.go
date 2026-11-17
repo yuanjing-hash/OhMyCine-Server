@@ -48,10 +48,12 @@ func attachPan115DeletionDownloader(t *testing.T, fixture *cloudTransferFixture,
 		t.Fatal(err)
 	}
 	registry := downloadpkg.NewRegistry()
-	if err := registry.Register(models.DownloaderTypePan115Offline, downloadpkg.Capabilities{Cancel: true, NativeOffline: true}, func(downloadpkg.Config) (downloadpkg.Client, error) { return client, nil }); err != nil {
+	if err := registry.Register(models.DownloaderTypePan115Offline, downloadpkg.Capabilities{Cancel: true, NativeOffline: true}, func(config downloadpkg.Config) (downloadpkg.Client, error) {
+		return &sourceAwareNativeStub{client, config.OfflineAccountNamespace}, nil
+	}); err != nil {
 		t.Fatal(err)
 	}
-	downloader := NewDownloaderService(fixture.queue.db, fixture.queue.audit, nil, registry)
+	downloader := NewDownloaderService(fixture.queue.db, fixture.queue.audit, fixture.service.connections.credentials, registry)
 	downloader.SetConnectionService(fixture.service.connections)
 	fixture.service.SetDownloaderService(downloader)
 	fixture.download.DownloaderID = &record.ID

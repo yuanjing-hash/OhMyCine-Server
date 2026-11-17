@@ -1649,30 +1649,31 @@ const (
 // Downloader stores only encrypted credentials. Public APIs must use an
 // allowlisted DTO and never serialize this model directly.
 type Downloader struct {
-	ID                    string     `gorm:"primaryKey;size:36" json:"id"`
-	OwnerID               uint       `gorm:"not null;default:0;index" json:"-"`
-	Name                  string     `gorm:"size:128;not null" json:"name"`
-	NameNormalized        string     `gorm:"size:128;not null;uniqueIndex" json:"-"`
-	Type                  string     `gorm:"size:32;not null;index" json:"type"`
-	SortOrder             int        `gorm:"not null;default:0;index" json:"sort_order"`
-	ExecutionLocation     string     `gorm:"size:16;not null;default:'server';index" json:"execution_location"`
-	NodeID                *string    `gorm:"size:36;index" json:"node_id,omitempty"`
-	NodeName              string     `gorm:"size:128;not null;default:''" json:"node_name,omitempty"`
-	BaseURL               string     `gorm:"size:2048;not null;default:''" json:"base_url"`
-	UsernameCiphertext    string     `gorm:"type:text;not null;default:''" json:"-"`
-	PasswordCiphertext    string     `gorm:"type:text;not null;default:''" json:"-"`
-	StorageID             *uint      `gorm:"index" json:"storage_id"`
-	ProviderDirectoryID   string     `gorm:"size:128;not null;default:''" json:"-"`
-	ProviderDirectoryPath string     `gorm:"size:2048;not null;default:''" json:"-"`
-	AutoListenLifeEvents  bool       `gorm:"not null;default:false" json:"auto_listen_life_events"`
-	Enabled               bool       `gorm:"not null;default:true" json:"enabled"`
-	CapabilitiesJSON      string     `gorm:"type:text;not null" json:"-"`
-	LastHealthStatus      string     `gorm:"size:24;not null;default:'unknown'" json:"-"`
-	LastHealthVersion     string     `gorm:"size:64;not null;default:''" json:"-"`
-	LastHealthErrorCode   string     `gorm:"size:96;not null;default:''" json:"-"`
-	LastHealthCheckedAt   *time.Time `json:"-"`
-	CreatedAt             time.Time  `json:"created_at"`
-	UpdatedAt             time.Time  `json:"updated_at"`
+	MaxConcurrentDownloads int        `gorm:"not null;default:2" json:"max_concurrent_downloads"`
+	ID                     string     `gorm:"primaryKey;size:36" json:"id"`
+	OwnerID                uint       `gorm:"not null;default:0;index" json:"-"`
+	Name                   string     `gorm:"size:128;not null" json:"name"`
+	NameNormalized         string     `gorm:"size:128;not null;uniqueIndex" json:"-"`
+	Type                   string     `gorm:"size:32;not null;index" json:"type"`
+	SortOrder              int        `gorm:"not null;default:0;index" json:"sort_order"`
+	ExecutionLocation      string     `gorm:"size:16;not null;default:'server';index" json:"execution_location"`
+	NodeID                 *string    `gorm:"size:36;index" json:"node_id,omitempty"`
+	NodeName               string     `gorm:"size:128;not null;default:''" json:"node_name,omitempty"`
+	BaseURL                string     `gorm:"size:2048;not null;default:''" json:"base_url"`
+	UsernameCiphertext     string     `gorm:"type:text;not null;default:''" json:"-"`
+	PasswordCiphertext     string     `gorm:"type:text;not null;default:''" json:"-"`
+	StorageID              *uint      `gorm:"index" json:"storage_id"`
+	ProviderDirectoryID    string     `gorm:"size:128;not null;default:''" json:"-"`
+	ProviderDirectoryPath  string     `gorm:"size:2048;not null;default:''" json:"-"`
+	AutoListenLifeEvents   bool       `gorm:"not null;default:false" json:"auto_listen_life_events"`
+	Enabled                bool       `gorm:"not null;default:true" json:"enabled"`
+	CapabilitiesJSON       string     `gorm:"type:text;not null" json:"-"`
+	LastHealthStatus       string     `gorm:"size:24;not null;default:'unknown'" json:"-"`
+	LastHealthVersion      string     `gorm:"size:64;not null;default:''" json:"-"`
+	LastHealthErrorCode    string     `gorm:"size:96;not null;default:''" json:"-"`
+	LastHealthCheckedAt    *time.Time `json:"-"`
+	CreatedAt              time.Time  `json:"created_at"`
+	UpdatedAt              time.Time  `json:"updated_at"`
 }
 
 // DownloadSettings is the singleton Server-wide local staging boundary. It is
@@ -1810,6 +1811,20 @@ type CookieCloudPayload struct {
 // DownloadTask is the durable provider fact linked one-to-one to a queue Job.
 // SourceCiphertext may contain PT passkeys and is never exposed or logged.
 type DownloadTask struct {
+	OfflineSettledAt                   *time.Time `json:"-"`
+	OfflineClockState                  string     `gorm:"size:24;not null;default:''" json:"-"`
+	OfflineKind                        string     `gorm:"size:32;not null;default:''" json:"-"`
+	OfflineAccountNamespace            string     `gorm:"size:128;not null;default:''" json:"-"`
+	OfflineResourceDigest              string     `gorm:"size:64;not null;default:''" json:"-"`
+	OfflineRequiredDigest              string     `gorm:"size:64;not null;default:''" json:"-"`
+	OfflineRequiredIntentJSON          string     `gorm:"type:text;not null;default:'{}'" json:"-"`
+	OfflineHistoryRevision             uint64     `gorm:"not null;default:0" json:"-"`
+	OfflineStartedAt                   *time.Time `json:"-"`
+	OfflineStartProvenance             string     `gorm:"size:24;not null;default:''" json:"-"`
+	OfflineDeadlineAt                  *time.Time `gorm:"index" json:"-"`
+	OfflineReadyAt                     *time.Time `json:"-"`
+	OfflineCompletionMode              string     `gorm:"size:24;not null;default:''" json:"-"`
+	OfflineStopPending                 bool       `gorm:"not null;default:false" json:"-"`
 	ContentSelectionRequired           bool       `gorm:"<-:create;not null;default:false" json:"-"`
 	BTSelectionGroupID                 string     `gorm:"size:64;not null;default:'';index" json:"-"`
 	ID                                 string     `gorm:"primaryKey;size:36" json:"id"`

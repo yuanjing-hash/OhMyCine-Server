@@ -45,10 +45,12 @@ type Capabilities struct {
 }
 
 type Config struct {
-	BaseURL     string
-	Username    string
-	Password    string
-	CloudDriver cloud.NativeOfflineDriver
+	// Supplied only after the factory verifies its frozen account binding.
+	OfflineAccountNamespace string
+	BaseURL                 string
+	Username                string
+	Password                string
+	CloudDriver             cloud.NativeOfflineDriver
 	// ShareDriver supports native share receivers without requiring offline download.
 	ShareDriver           cloud.ShareBrowseDriver
 	ProviderStorageRootID string
@@ -59,6 +61,7 @@ type Config struct {
 }
 
 type Source struct {
+	OfflineRequired  *OfflineRequiredPlan       `json:"-"`
 	AllFilesVerified bool                       `json:"-"`
 	ContentSelection *resourcecontent.Selection `json:"-"`
 	// ShareSelection is internal-only and persisted encrypted by Server.
@@ -169,6 +172,7 @@ type ManifestClient interface {
 // Task.Progress is a percentage in [0, 100], not a fractional ratio. Nil means
 // no progress observation; provider status text is not completion proof.
 type Task struct {
+	Offline        *OfflineObservation
 	ID             string
 	Name           string
 	Status         string
@@ -252,7 +256,22 @@ func (r *Registry) Build(providerType string, config Config) (Client, error) {
 	if !ok {
 		return nil, errors.New("downloader provider is unavailable")
 	}
-	return entry.builder(config)
+	client, err := entry.builder(config)
+	if err != nil {
+		return nil, err
+	}
+	// NativeOffline is a declared execution contract, not a best-effort hint.
+	// Each such adapter must explicitly classify its actual source; silently
+	// treating a missing optional method as non-offline would bypass policy.
+	if entry.capabilities.NativeOffline {
+		if _, ok := client.(OfflineLifecycleClient); !ok {
+			return nil, Error("downloader_offline_lifecycle_unsupported", false, nil)
+		}
+		if _, ok := client.(OfflineObserver); !ok {
+			return nil, Error("downloader_offline_lifecycle_unsupported", false, nil)
+		}
+	}
+	return client, nil
 }
 
 func (r *Registry) Capabilities(providerType string) (Capabilities, bool) {

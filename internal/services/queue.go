@@ -47,6 +47,7 @@ type QueueService struct {
 	interrupt             func(string, string)
 	interruptAcknowledged func(string, string) error
 	retryAccepted         func(*gorm.DB, models.Job, time.Time) error
+	retryReplacement      func(*gorm.DB, models.Job, time.Time) (*models.Job, error)
 	events                *QueueEventHub
 	writeAdmission        *CatalogWriteAdmission
 }
@@ -61,6 +62,9 @@ func (s *QueueService) SetInterruptAcknowledged(fn func(string, string) error) {
 }
 func (s *QueueService) SetRetryAccepted(fn func(*gorm.DB, models.Job, time.Time) error) {
 	s.retryAccepted = fn
+}
+func (s *QueueService) SetRetryReplacement(fn func(*gorm.DB, models.Job, time.Time) (*models.Job, error)) {
+	s.retryReplacement = fn
 }
 func (s *QueueService) SetEventHub(hub *QueueEventHub) { s.events = hub }
 func (s *QueueService) publish(job models.Job, eventType string) {
@@ -618,6 +622,7 @@ func (s *QueueService) Lane(actor Actor, jobType string, priority int) ([]JobDTO
 func (s *QueueService) Control(actor Actor, id, action string, request RequestContext) (JobDTO, error) {
 	now := s.clock.Now()
 	var job models.Job
+	var replacementJob *models.Job
 	interruptAfterCommit := false
 	err := s.db.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&job, "id = ? AND history_cleared_at IS NULL", id).Error; err != nil {
@@ -702,6 +707,24 @@ func (s *QueueService) Control(actor Actor, id, action string, request RequestCo
 			if err := authorizeJobContinuationTx(tx, actor, job); err != nil {
 				return err
 			}
+			if s.retryReplacement != nil {
+				replacement, err := s.retryReplacement(tx, job, now)
+				if err != nil {
+					return err
+				}
+				if replacement != nil {
+					// A proven non-acceptance is a new acquisition. Keep the
+					// historical operation and its immutable receipt untouched.
+					if err := recordJobEvent(tx, job.ID, "control.retry_replacement", from, from, &actor.User.ID, "", now); err != nil {
+						return err
+					}
+					if err := s.audit.Record(tx, &actor.User.ID, "jobs.retry", "job", job.ID, "success", map[string]any{"from": from, "to": from, "replacement_job_id": replacement.ID}, request); err != nil {
+						return err
+					}
+					replacementJob = replacement
+					return nil
+				}
+			}
 			updates["status"] = models.JobStatusQueued
 			updates["next_attempt_at"] = nil
 			updates["finished_at"] = nil
@@ -771,6 +794,10 @@ func (s *QueueService) Control(actor Actor, id, action string, request RequestCo
 		s.interrupt(job.ID, action)
 	}
 	s.wake()
+	if replacementJob != nil {
+		s.publish(*replacementJob, "job.created")
+		return s.Get(actor, replacementJob.ID)
+	}
 	s.publish(job, "job.status_changed")
 	return s.Get(actor, id)
 }
@@ -1023,9 +1050,10 @@ func (s *QueueService) UpdatePolicy(actor Actor, jobType string, revision uint64
 }
 
 type ClaimedJob struct {
-	Job        models.Job
-	Attempt    models.JobAttempt
-	LeaseToken string
+	Job                     models.Job
+	Attempt                 models.JobAttempt
+	LeaseToken              string
+	ObservationContinuation bool
 }
 
 func (s *QueueService) Claim(jobTypes []string) (*ClaimedJob, error) {
@@ -1041,6 +1069,7 @@ func (s *QueueService) Claim(jobTypes []string) (*ClaimedJob, error) {
 			return err
 		}
 		readinessCache := make(map[uint]MediaLibraryReadiness)
+		capacityCache := make(downloadClaimAdmissionCache)
 		for _, policy := range policies {
 			var active int64
 			if err := tx.Model(&models.Job{}).Where("job_type = ? AND status = ? AND lease_expires_at > ?", policy.JobType, models.JobStatusRunning, now).Count(&active).Error; err != nil {
@@ -1070,33 +1099,60 @@ func (s *QueueService) Claim(jobTypes []string) (*ClaimedJob, error) {
 						continue
 					}
 				}
+				admitted, admissionErr := admitDownloadJobTx(tx, candidate, now, capacityCache)
+				if admissionErr != nil {
+					return admissionErr
+				}
+				if !admitted {
+					continue
+				}
 				token, hash, err := newLeaseToken()
 				if err != nil {
 					return err
 				}
+				attempt, continuation, err := downloadObservationAttemptTx(tx, candidate)
+				if err != nil {
+					return err
+				}
+				nextAttempt := candidate.AttemptCount + 1
+				if continuation {
+					nextAttempt = candidate.AttemptCount
+				}
 				expires := now.Add(time.Duration(policy.LeaseSeconds) * time.Second)
-				result := tx.Model(&models.Job{}).Where("id = ? AND status = ? AND revision = ?", candidate.ID, models.JobStatusQueued, candidate.Revision).Updates(map[string]any{"status": models.JobStatusRunning, "revision": candidate.Revision + 1, "lease_token_hash": hash, "lease_expires_at": expires, "heartbeat_at": now, "started_at": gorm.Expr("COALESCE(started_at, ?)", now), "started_generation": candidate.Generation, "attempt_count": candidate.AttemptCount + 1, "updated_at": now})
+				result := tx.Model(&models.Job{}).Where("id = ? AND status = ? AND revision = ?", candidate.ID, models.JobStatusQueued, candidate.Revision).Updates(map[string]any{"status": models.JobStatusRunning, "revision": candidate.Revision + 1, "lease_token_hash": hash, "lease_expires_at": expires, "heartbeat_at": now, "started_at": gorm.Expr("COALESCE(started_at, ?)", now), "started_generation": candidate.Generation, "attempt_count": nextAttempt, "updated_at": now})
 				if result.Error != nil {
 					return result.Error
 				}
 				if result.RowsAffected != 1 {
 					continue
 				}
-				attempt := models.JobAttempt{JobID: candidate.ID, AttemptNumber: candidate.AttemptCount + 1, LeaseTokenHash: hash, Status: models.JobStatusRunning, StartedAt: now}
-				if err := tx.Create(&attempt).Error; err != nil {
-					return err
-				}
-				if err := recordJobEvent(tx, candidate.ID, "claimed", models.JobStatusQueued, models.JobStatusRunning, nil, "", now); err != nil {
-					return err
+				if continuation {
+					resumed := tx.Model(&models.JobAttempt{}).Where("id = ? AND job_id = ? AND attempt_number = ? AND lease_token_hash = ? AND status = ? AND safe_error_code = '' AND safe_error_message = '' AND finished_at IS NOT NULL", attempt.ID, candidate.ID, nextAttempt, attempt.LeaseTokenHash, models.JobStatusRetryWait).Updates(map[string]any{"lease_token_hash": hash, "status": models.JobStatusRunning, "finished_at": nil, "safe_error_code": "", "safe_error_message": ""})
+					if resumed.Error != nil {
+						return resumed.Error
+					}
+					if resumed.RowsAffected != 1 {
+						return appError(CodeQueueStateConflict, "状态核对的原执行记录已变化", nil)
+					}
+					attempt.LeaseTokenHash, attempt.Status, attempt.FinishedAt = hash, models.JobStatusRunning, nil
+					attempt.SafeErrorCode, attempt.SafeErrorMessage = "", ""
+				} else {
+					attempt = models.JobAttempt{JobID: candidate.ID, AttemptNumber: nextAttempt, LeaseTokenHash: hash, Status: models.JobStatusRunning, StartedAt: now}
+					if err := tx.Create(&attempt).Error; err != nil {
+						return err
+					}
+					if err := recordJobEvent(tx, candidate.ID, "claimed", models.JobStatusQueued, models.JobStatusRunning, nil, "", now); err != nil {
+						return err
+					}
 				}
 				candidate.Status = models.JobStatusRunning
 				candidate.Revision++
 				candidate.LeaseTokenHash = hash
 				candidate.LeaseExpiresAt = &expires
 				candidate.HeartbeatAt = &now
-				candidate.AttemptCount++
+				candidate.AttemptCount = nextAttempt
 				candidate.StartedGeneration = candidate.Generation
-				claimed = &ClaimedJob{Job: candidate, Attempt: attempt, LeaseToken: token}
+				claimed = &ClaimedJob{Job: candidate, Attempt: attempt, LeaseToken: token, ObservationContinuation: continuation}
 				return nil
 			}
 		}
@@ -1106,6 +1162,25 @@ func (s *QueueService) Claim(jobTypes []string) (*ClaimedJob, error) {
 		s.publish(claimed.Job, "job.status_changed")
 	}
 	return claimed, err
+}
+
+// A normal download observation yields its short lease, not its logical
+// acquisition attempt. Reopen only the exact same-generation, error-free wait;
+// failures, controls and expired leases always retain ordinary new-attempt rules.
+// Both Job and Attempt receive a fresh lease hash in Claim's writer transaction.
+func downloadObservationAttemptTx(tx *gorm.DB, job models.Job) (models.JobAttempt, bool, error) {
+	var attempt models.JobAttempt
+	if job.JobType != "download" || job.Status != models.JobStatusQueued || job.LastErrorCode != "" || job.LastErrorMessage != "" || job.InterruptStatus != "" || job.CancellationAsked || job.AttemptCount < 1 || job.StartedGeneration == 0 || job.StartedGeneration != job.Generation {
+		return attempt, false, nil
+	}
+	err := tx.Where("job_id = ? AND attempt_number = ?", job.ID, job.AttemptCount).Order("id DESC").First(&attempt).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return models.JobAttempt{}, false, nil
+	}
+	if err != nil {
+		return models.JobAttempt{}, false, err
+	}
+	return attempt, attempt.Status == models.JobStatusRetryWait && attempt.SafeErrorCode == "" && attempt.SafeErrorMessage == "" && attempt.FinishedAt != nil, nil
 }
 
 func newLeaseToken() (string, string, error) {
@@ -1344,7 +1419,16 @@ func (s *QueueService) finishLease(id, token, status, code, message string, next
 			finished = nil
 			failureRetryCount = 0
 		}
+		var observationPosition int64
+		if job.JobType == "download" && finalStatus == models.JobStatusRetryWait && code == "" {
+			if err := tx.Model(&models.Job{}).Where("job_type = ? AND priority = ?", job.JobType, job.Priority).Select("COALESCE(MAX(lane_position),0)").Scan(&observationPosition).Error; err != nil {
+				return err
+			}
+		}
 		updates := map[string]any{"status": finalStatus, "revision": job.Revision + 1, "failure_retry_count": failureRetryCount, "last_error_code": code, "last_error_message": message, "next_attempt_at": next, "finished_at": finished, "updated_at": now}
+		if observationPosition > 0 {
+			updates["lane_position"] = observationPosition + 1000
+		}
 		if finalStatus == models.JobStatusQueued {
 			updates["history_cleared_at"] = nil
 		}
@@ -1355,8 +1439,10 @@ func (s *QueueService) finishLease(id, token, status, code, message string, next
 		if err := finalizeTerminalNoIOCatalogJobTx(tx, job.ID); err != nil {
 			return err
 		}
-		if err := recordJobEvent(tx, id, "worker.finished", models.JobStatusRunning, finalStatus, nil, code, now); err != nil {
-			return err
+		if !(job.JobType == "download" && finalStatus == models.JobStatusRetryWait && code == "" && message == "") {
+			if err := recordJobEvent(tx, id, "worker.finished", models.JobStatusRunning, finalStatus, nil, code, now); err != nil {
+				return err
+			}
 		}
 		return closeAttempt(tx, job, finalStatus, code, message, now)
 	})
@@ -1375,7 +1461,7 @@ func (s *QueueService) finishLease(id, token, status, code, message string, next
 // the ordinary bounded failure budget. Empty-code retry_at is scheduled work.
 func retryWaitConsumesFailureBudget(code string) bool {
 	switch strings.TrimSpace(code) {
-	case "", "transfer_reconciliation_pending", "node_execution_stop_pending", "node_execution_exit_unknown", "node_execution_control_upgrade_required", nodeprotocol.ErrorReconciliationNeeded, nodeprotocol.ErrorExportPreparing, downloadCancellationPending, "downloader_submission_unconfirmed", "downloader_submit_unknown", "downloader_selection_result_unknown", "downloader_share_result_unknown", "pan115_auth_expired", "pan115_cookie_invalid", "credentials_required", "media_library_not_ready", "download_tracking_persist_wait", quarkReorganizationPending, quarkStructurePending, CodeMediaUpgradePending, CodeMediaUpgradeSeedingBusy, "media_upgrade_artifacts_pending":
+	case "", "offline_clock_unknown", "transfer_reconciliation_pending", "node_execution_stop_pending", "node_execution_exit_unknown", "node_execution_control_upgrade_required", nodeprotocol.ErrorReconciliationNeeded, nodeprotocol.ErrorExportPreparing, downloadCancellationPending, "downloader_submission_unconfirmed", "downloader_submit_unknown", "downloader_selection_result_unknown", "downloader_share_result_unknown", "pan115_auth_expired", "pan115_cookie_invalid", "credentials_required", "media_library_not_ready", "download_tracking_persist_wait", quarkReorganizationPending, quarkStructurePending, CodeMediaUpgradePending, CodeMediaUpgradeSeedingBusy, "media_upgrade_artifacts_pending":
 		return false
 	default:
 		return true

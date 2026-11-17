@@ -13,6 +13,8 @@ import (
 
 	crypto "github.com/SheltonZhu/115driver/pkg/crypto/m115"
 	sdk "github.com/SheltonZhu/115driver/pkg/driver"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud"
+	"time"
 )
 
 // Cookie protocol, separate from /open/offline OAuth APIs. The author's
@@ -102,7 +104,9 @@ func (s *sdkAdapter) AddOfflineWanted(ctx context.Context, input selectedWantedR
 	if len(input.InfoHash) != 40 || input.DirectoryID == "" || input.SavePath == "" || len(input.Wanted) == 0 || len(input.Wanted) > 10000 || s.Client.RetryCount != 0 {
 		return errors.New("115 wanted request or single-dispatch policy invalid")
 	}
+	s.nativeUIDMu.Lock()
 	uid := s.UserID
+	s.nativeUIDMu.Unlock()
 	if uid <= 0 {
 		user, err := s.GetUser()
 		if err != nil {
@@ -127,6 +131,9 @@ func (s *sdkAdapter) AddOfflineWanted(ctx context.Context, input selectedWantedR
 	}
 	key := crypto.GenerateKey()
 	payload := crypto.Encode(raw, key)
+	if err := cloud.RecordOfflineDispatch(ctx, time.Now().UTC()); err != nil {
+		return err
+	}
 	response, err := s.NewRequest().SetContext(ctx).SetFormData(map[string]string{"data": payload}).SetDoNotParseResponse(true).Post(selectiveSubmitEndpoint)
 	if err != nil {
 		return err

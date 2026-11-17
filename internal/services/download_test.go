@@ -14,11 +14,52 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/authz"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/credential"
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/database"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
 	cloudpkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud"
 	downloadpkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/downloader"
 	"gorm.io/gorm"
 )
+
+// Drive the actual nonfailure RetryLater/Claim boundary without a wall clock
+// sleep. This is a new execution lease, never a second provider submission.
+func finishScheduledDownload(t *testing.T, worker *DownloadWorker, queue *QueueService, claim *ClaimedJob) WorkerResult {
+	t.Helper()
+	for samples := 0; samples < 16; samples++ {
+		result := worker.Run(context.Background(), workerRuntime{queue: queue, job: *claim}, *claim)
+		if result.RetryAt == nil || result.ErrorCode != "" {
+			return result
+		}
+		if err := queue.RetryLater(claim.Job.ID, claim.LeaseToken, "", "", *result.RetryAt); err != nil {
+			t.Fatal(err)
+		}
+		clock, ok := queue.clock.(*fakeQueueClock)
+		if !ok {
+			t.Fatal("fixture needs an injected clock")
+		}
+		clock.now = *result.RetryAt
+		if err := queue.PromoteDueRetries(); err != nil {
+			t.Fatal(err)
+		}
+		next, err := queue.Claim([]string{"download"})
+		if err != nil || next == nil || next.Job.ID != claim.Job.ID {
+			t.Fatalf("observation claim=%+v err=%v", next, err)
+		}
+		old := *claim
+		if next.Attempt.ID != old.Attempt.ID || next.Job.AttemptCount != old.Job.AttemptCount || next.LeaseToken == old.LeaseToken {
+			t.Fatal("ordinary observation did not retain logical attempt with a fresh lease")
+		}
+		if err := queue.Heartbeat(old.Job.ID, old.LeaseToken, nil, nil, nil, nil, nil); ErrorCode(err) != CodeQueueLeaseInvalid {
+			t.Fatalf("old observation heartbeat=%v", err)
+		}
+		if err := queue.Complete(old.Job.ID, old.LeaseToken); ErrorCode(err) != CodeQueueLeaseInvalid {
+			t.Fatalf("old observation completed new lease=%v", err)
+		}
+		*claim = *next
+	}
+	t.Fatal("download did not settle within bounded observations")
+	return WorkerResult{}
+}
 
 type stubDownloadClient struct {
 	mu           sync.Mutex
@@ -44,6 +85,23 @@ type stubDownloadClient struct {
 	submitErr    error
 	reconcileErr error
 	reconciles   int
+}
+
+// Only native-route fixtures declare this contract. Ordinary qB fixtures keep
+// their existing BT-only client, while mixed shares/adoption remain nonoffline.
+type sourceAwareNativeStub struct {
+	*stubDownloadClient
+	namespace string
+}
+
+func (c *sourceAwareNativeStub) OfflineOperation(source downloadpkg.Source) downloadpkg.OfflineOperation {
+	if source.Kind != downloadpkg.SourceURL && source.Kind != downloadpkg.SourceTorrent {
+		return downloadpkg.OfflineOperation{}
+	}
+	return downloadpkg.OfflineOperation{Kind: downloadpkg.OfflineOperationCloud, AccountNamespace: c.namespace, KeepOutputStop: true}
+}
+func (c *sourceAwareNativeStub) ObserveOffline(ctx context.Context, id string) (downloadpkg.Task, error) {
+	return c.Get(ctx, id)
 }
 
 type downloadProviderDiagnosticError struct{}
@@ -262,6 +320,552 @@ func downloadFixture(t *testing.T) (*DownloadService, *DownloaderService, *Queue
 	downloads := NewDownloadService(queue.db, queue.audit, store, downloaders, settings, queue, zerolog.Nop())
 	downloads.SetSeedingSettings(NewSeedingSettingsService(queue.db, queue.audit))
 	return downloads, downloaders, queue, actor, client
+}
+
+type offlineLifecycleFixtureState struct {
+	mu                   sync.Mutex
+	clock                *fakeQueueClock
+	starts               map[string]time.Time
+	ids                  map[string]string
+	writes, reads, stops int
+	ready                bool
+	stopErr              error
+	reject, terminal     bool
+	removed              map[string]bool
+}
+type offlineLifecycleFixtureClient struct {
+	state     *offlineLifecycleFixtureState
+	namespace string
+	plan      *downloadpkg.OfflineRequiredPlan
+}
+
+func (c *offlineLifecycleFixtureClient) Test(context.Context) (downloadpkg.Health, error) {
+	return downloadpkg.Health{Version: "fixture"}, nil
+}
+func (c *offlineLifecycleFixtureClient) OfflineOperation(source downloadpkg.Source) downloadpkg.OfflineOperation {
+	if source.Kind != downloadpkg.SourceURL && source.Kind != downloadpkg.SourceTorrent {
+		return downloadpkg.OfflineOperation{}
+	}
+	return downloadpkg.OfflineOperation{Kind: downloadpkg.OfflineOperationCloud, AccountNamespace: c.namespace, KeepOutputStop: true, RequiredFileCompletion: true}
+}
+func (c *offlineLifecycleFixtureClient) BindOfflineRequired(plan downloadpkg.OfflineRequiredPlan) error {
+	c.plan = &plan
+	return nil
+}
+func (c *offlineLifecycleFixtureClient) Submit(ctx context.Context, r downloadpkg.SubmitRequest) (downloadpkg.Task, error) {
+	if err := cloudpkg.RecordOfflineDispatch(ctx, c.state.clock.Now()); err != nil {
+		return downloadpkg.Task{}, err
+	}
+	c.state.mu.Lock()
+	rejected := c.state.reject
+	c.state.mu.Unlock()
+	if rejected {
+		recorded, err := cloudpkg.RecordOfflineNonAcceptance(ctx)
+		if err != nil {
+			return downloadpkg.Task{}, err
+		}
+		if !recorded {
+			return downloadpkg.Task{}, downloadpkg.Error("downloader_submit_unknown", true, nil)
+		}
+		return downloadpkg.Task{}, downloadpkg.WithDefiniteSubmissionNonAcceptance(downloadpkg.Error("downloader_provider_rejected", false, nil))
+	}
+
+	c.state.mu.Lock()
+	defer c.state.mu.Unlock()
+	id := "native:" + r.Tag
+	c.state.writes++
+	c.state.starts[id] = c.state.clock.Now()
+	c.state.ids[r.Tag] = id
+	return downloadpkg.Task{ID: id, Status: "running"}, nil
+}
+func (c *offlineLifecycleFixtureClient) ReconcileSubmission(ctx context.Context, r downloadpkg.SubmitRequest) (downloadpkg.Task, error) {
+	c.state.mu.Lock()
+	id := c.state.ids[r.Tag]
+	c.state.mu.Unlock()
+	if id == "" {
+		return downloadpkg.Task{}, downloadpkg.Error("downloader_submit_unknown", true, nil)
+	}
+	return c.Get(ctx, id)
+}
+func (c *offlineLifecycleFixtureClient) Get(_ context.Context, id string) (downloadpkg.Task, error) {
+	c.state.mu.Lock()
+	defer c.state.mu.Unlock()
+	if c.state.removed[id] {
+		return downloadpkg.Task{}, downloadpkg.Error("downloader_task_not_found", false, nil)
+	}
+	c.state.reads++
+	started := c.state.starts[id]
+	ready := c.state.ready
+	progress := 75.0
+	o := &downloadpkg.OfflineObservation{Version: 1, Kind: downloadpkg.OfflineOperationCloud, OperationID: id, AccountNamespace: c.namespace, StartedAt: &started, StartProvenance: downloadpkg.OfflineStartDispatch, Ready: ready, CompletionMode: downloadpkg.OfflineCompletionAggregate, KeepOutputStop: true}
+	out := downloadpkg.Task{ID: id, Status: "running", Progress: &progress, Completed: ready, Offline: o}
+	if c.state.terminal {
+		o.Ready = false
+		o.TerminalFailure = true
+		out.Completed = false
+		out.Failed = true
+		out.ErrorCode = "downloader_provider_failed"
+		return out, nil
+	}
+
+	if c.plan != nil && ready {
+		digest, _ := c.plan.Digest()
+		manifest := c.fixtureManifest(id)
+		o.RequiredDigest, o.CompletionMode, o.ReadyManifest = digest, downloadpkg.OfflineCompletionRequiredFiles, &manifest
+		out.Completed = false
+	}
+	return out, nil
+}
+func (c *offlineLifecycleFixtureClient) ObserveOffline(ctx context.Context, id string) (downloadpkg.Task, error) {
+	return c.Get(ctx, id)
+}
+func (c *offlineLifecycleFixtureClient) Manifest(_ context.Context, id string) (downloadpkg.Manifest, error) {
+	c.state.mu.Lock()
+	removed := c.state.removed[id]
+	c.state.mu.Unlock()
+	if removed {
+		return downloadpkg.Manifest{}, downloadpkg.Error("downloader_task_not_found", false, nil)
+	}
+	return c.fixtureManifest(id), nil
+}
+func (c *offlineLifecycleFixtureClient) fixtureManifest(id string) downloadpkg.Manifest {
+	m := downloadpkg.Manifest{Name: "Feature", Complete: true}
+	if c.plan != nil {
+		m.Name = c.plan.RootName
+		for _, f := range c.plan.Files {
+			m.Files = append(m.Files, downloadpkg.File{RelativePath: f.RelativePath, Size: f.Size, ProviderItemID: id + ":" + f.RelativePath, ProviderParentID: "owned-root"})
+		}
+	}
+	return m
+}
+func (c *offlineLifecycleFixtureClient) Cancel(_ context.Context, id string, deleteData bool) error {
+	if deleteData {
+		return errors.New("fixture forbids deleting cloud output")
+	}
+	c.state.mu.Lock()
+	defer c.state.mu.Unlock()
+	c.state.stops++
+	if c.state.stopErr == nil {
+		if c.state.removed == nil {
+			c.state.removed = map[string]bool{}
+		}
+		c.state.removed[id] = true
+	}
+	return c.state.stopErr
+}
+
+func (c *offlineLifecycleFixtureClient) StopOfflineKeepOutput(ctx context.Context, id string) error {
+	return c.Cancel(ctx, id, false)
+}
+
+func TestCloudOfflineDeadlineHistoryAndRequiredGoalLifecycle(t *testing.T) {
+	downloads, downloaders, queue, actor, _ := downloadFixture(t)
+	clock := queue.clock.(*fakeQueueClock)
+	state := &offlineLifecycleFixtureState{clock: clock, starts: map[string]time.Time{}, ids: map[string]string{}}
+	const providerType = models.DownloaderTypeFake
+	if err := downloaders.registry.Register(providerType, downloadpkg.Capabilities{NativeOffline: true, Cancel: true}, func(config downloadpkg.Config) (downloadpkg.Client, error) {
+		return &offlineLifecycleFixtureClient{state: state, namespace: config.OfflineAccountNamespace}, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	connection := models.Connection{Name: "offline scope", NameNormalized: "offline-scope", Provider: "fixture-cloud", AccountID: "account-a", Enabled: true}
+	if err := queue.db.Create(&connection).Error; err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	storage := models.Storage{Name: "offline source", NameNormalized: "offline-source", Type: models.StorageTypeLocal, RootPath: root, RootPathNormalized: strings.ToLower(root), ConnectionID: &connection.ID, Enabled: true, Capabilities: "{}"}
+	if err := queue.db.Create(&storage).Error; err != nil {
+		t.Fatal(err)
+	}
+	configureDownloadStaging(t, queue, storage.ID)
+	downloader := models.Downloader{ID: "offline-fixture", OwnerID: actor.User.ID, Name: "cloud", NameNormalized: "cloud", Type: providerType, Enabled: true, StorageID: &storage.ID, ProviderDirectoryID: "owned", CapabilitiesJSON: `{"native_offline":true}`, MaxConcurrentDownloads: 2}
+	if err := queue.db.Create(&downloader).Error; err != nil {
+		t.Fatal(err)
+	}
+	plan := downloadpkg.OfflineRequiredPlan{Version: 1, RootName: "Feature", MultiFile: true, Files: []downloadpkg.OfflineRequiredFile{{RelativePath: "Feature.mkv", Size: 20 << 20}}}
+	input := SubmitDownloadInput{DownloaderID: downloader.ID, DisplayName: "Feature", Source: DownloadSourceInput{Kind: downloadpkg.SourceURL, URL: "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&tr=https://tracker-a.invalid", offlineRequired: &plan}}
+	site := models.Site{Name: "Verified BT", NameNormalized: "verified-bt", Kind: "nyaa", BaseURL: "https://nyaa.si", Enabled: true, Revision: 1}
+	if err := queue.db.Create(&site).Error; err != nil {
+		t.Fatal(err)
+	}
+	actor.Permissions[authz.PermissionDiscoveryRead] = struct{}{}
+	persistFixtureAuthority(t, queue.db, actor)
+	publicIntake := SiteDownloadInput{ResultToken: strings.Repeat("r", 43), ContentMode: "all", DownloaderID: downloader.ID}
+	input.SourceSiteID = site.ID
+	input.offlineIntakeDigest = offlineSiteIntakeDigest(publicIntake)
+
+	created, err := downloads.Submit(context.Background(), actor, input, RequestContext{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := queue.Claim([]string{"download"})
+	if err != nil || claim == nil {
+		t.Fatalf("claim=%+v %v", claim, err)
+	}
+	worker := NewDownloadWorker(downloads)
+	result := worker.Run(context.Background(), workerRuntime{queue: queue, job: *claim}, *claim)
+	if result.RetryAt == nil || result.ErrorCode != "" {
+		t.Fatalf("first observation=%+v", result)
+	}
+	var original models.DownloadTask
+	if err := queue.db.First(&original, "id = ?", created.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if original.OfflineStartedAt == nil || original.OfflineDeadlineAt == nil || original.OfflineDeadlineAt.Sub(*original.OfflineStartedAt) != 30*time.Minute || original.OfflineStartProvenance != "dispatch" {
+		t.Fatalf("clock=%+v", original)
+	}
+	start, deadline := *original.OfflineStartedAt, *original.OfflineDeadlineAt
+	if err := queue.RetryLater(claim.Job.ID, claim.LeaseToken, "", "", *result.RetryAt); err != nil {
+		t.Fatal(err)
+	}
+	clock.now = start.Add(12 * time.Minute)
+	if err := queue.PromoteDueRetries(); err != nil {
+		t.Fatal(err)
+	}
+	claim, err = queue.Claim([]string{"download"})
+	if err != nil || claim == nil {
+		t.Fatal(err)
+	}
+	// A new worker instance continues the same operation, clock and failure budget.
+	worker = NewDownloadWorker(downloads)
+	result = worker.Run(context.Background(), workerRuntime{queue: queue, job: *claim}, *claim)
+	if result.RetryAt == nil || result.ErrorCode != "" {
+		t.Fatalf("continued observation=%+v", result)
+	}
+	if err := queue.RetryLater(claim.Job.ID, claim.LeaseToken, "", "", *result.RetryAt); err != nil {
+		t.Fatal(err)
+	}
+	if err := queue.db.First(&original, "id = ?", created.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if !original.OfflineStartedAt.Equal(start) || !original.OfflineDeadlineAt.Equal(deadline) || state.writes != 1 {
+		t.Fatal("observation renewed or resubmitted original acquisition")
+	}
+	clock.now = deadline
+	if err := worker.ExpireOfflineDeadlines(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := queue.db.First(&original, "id = ?", created.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if original.Phase != models.DownloadTaskStatusCancelled || original.LastErrorCode != CodeOfflineDeadlineExceeded || !original.OfflineStopPending || original.ProviderTaskID == "" {
+		t.Fatalf("timeout=%+v", original)
+	}
+	var failures []models.OfflineFailure
+	if err := queue.db.Find(&failures).Error; err != nil || len(failures) != 1 {
+		t.Fatalf("history=%+v %v", failures, err)
+	}
+	// Clearing the display remains available while the physical stop is unknown.
+	state.stopErr = errors.New("unconfirmed original stop")
+	if err := downloads.Delete(context.Background(), actor, created.ID, false, RequestContext{}); err != nil {
+		t.Fatal(err)
+	}
+	claim, err = queue.Claim([]string{"download"})
+	if err != nil || claim == nil {
+		t.Fatal(err)
+	}
+	result = worker.Run(context.Background(), workerRuntime{queue: queue, job: *claim}, *claim)
+	if result.RetryAt == nil || result.ErrorCode != downloadCancellationPending {
+		t.Fatalf("pending stop=%+v", result)
+	}
+	if err := queue.RetryLater(claim.Job.ID, claim.LeaseToken, result.ErrorCode, result.ErrorMessage, *result.RetryAt); err != nil {
+		t.Fatal(err)
+	}
+	var admission models.DownloadAdmission
+	if err := queue.db.First(&admission, "acquisition_key = ?", "task:"+created.ID).Error; err != nil || admission.State != "held" {
+		t.Fatal("unknown stop freed acquisition")
+	}
+	state.stopErr = nil
+	clock.now = clock.now.Add(2 * time.Minute)
+	if err := queue.PromoteDueRetries(); err != nil {
+		t.Fatal(err)
+	}
+	claim, err = queue.Claim([]string{"download"})
+	if err != nil || claim == nil {
+		t.Fatal(err)
+	}
+	result = worker.Run(context.Background(), workerRuntime{queue: queue, job: *claim}, *claim)
+	if result.ErrorCode != "" || result.RetryAt != nil {
+		t.Fatalf("settled stop=%+v", result)
+	}
+	if err := queue.Complete(claim.Job.ID, claim.LeaseToken); err != nil {
+		t.Fatal(err)
+	}
+	if err := queue.db.First(&original, "id = ?", created.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if original.LastErrorCode != CodeOfflineDeadlineExceeded || original.OfflineStopPending || original.HistoryClearedAt == nil || state.writes != 1 {
+		t.Fatalf("stop lost timeout or replayed write: %+v", original)
+	}
+	if err := downloads.deleteLocalRecord(original.ID, original.JobID, &actor.User.ID, "download.delete", "confirmed_keep_output", RequestContext{}); err != nil {
+		t.Fatal(err)
+	}
+	// Reopened SQLite keeps policy history after physical display-row deletion.
+	var dbFiles []struct{ File string }
+	if err := queue.db.Raw("PRAGMA database_list").Scan(&dbFiles).Error; err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := database.Open(dbFiles[0].File)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sqlDB, _ := reopened.DB()
+	defer sqlDB.Close()
+	newQueue := NewQueueService(reopened, NewAuditService(reopened))
+	newQueue.SetClock(clock)
+	newDownloaders := NewDownloaderService(reopened, NewAuditService(reopened), downloads.credentials, downloaders.registry)
+	restarted := NewDownloadService(reopened, NewAuditService(reopened), downloads.credentials, newDownloaders, NewDownloadSettingsService(reopened, NewAuditService(reopened)), newQueue, zerolog.Nop())
+	// This scope has two older failures before the revision the user confirms.
+	olderFailure := failures[0]
+	olderFailure.ID, olderFailure.TaskID = 0, "older-offline-timeout"
+	if err := reopened.Create(&olderFailure).Error; err != nil {
+		t.Fatal(err)
+	}
+	confirmedFailure := olderFailure
+	confirmedFailure.ID, confirmedFailure.TaskID = 0, "confirmed-offline-timeout"
+	if err := reopened.Create(&confirmedFailure).Error; err != nil {
+		t.Fatal(err)
+	}
+	input.Source.URL = "magnet:?xt=urn:btih:0123456789ABCDEF0123456789ABCDEF01234567&tr=https://different.invalid"
+	_, err = restarted.Submit(context.Background(), actor, input, RequestContext{})
+	var warning *AppError
+	if !errors.As(err, &warning) || warning.Code != CodeOfflineConfirmationRequired || warning.OfflineFailureWarning == nil {
+		t.Fatalf("missing scoped warning: %v", err)
+	}
+	token := warning.OfflineFailureWarning.ConfirmationToken
+	changed := input
+	changed.Priority = 1
+	changed.OfflineFailureOverrideToken = token
+	if _, err := restarted.Submit(context.Background(), actor, changed, RequestContext{}); ErrorCode(err) != CodeConflict {
+		t.Fatalf("changed request reused confirmation: %v", err)
+	}
+	automatic := input
+	automatic.FollowSubscriptionID = "follow-fixture"
+	automatic.FollowResourceFingerprint = strings.Repeat("a", 64)
+	if _, err := restarted.Submit(context.Background(), actor, automatic, RequestContext{}); ErrorCode(err) != CodeOfflineConfirmationRequired {
+		t.Fatalf("automatic intake bypassed history: %v", err)
+	}
+	input.OfflineFailureOverrideToken = token
+	accepted, err := restarted.Submit(context.Background(), actor, input, RequestContext{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	replayed, err := restarted.Submit(context.Background(), actor, input, RequestContext{})
+	if err != nil || replayed.ID != accepted.ID {
+		t.Fatalf("confirmation replay=%+v %v", replayed, err)
+	}
+	// A consumed/missing Site claim is never restored for a lost HTTP reply.
+	sites := &SiteService{db: reopened, downloads: restarted}
+	publicIntake.OfflineFailureOverrideToken = token
+	fromSite, err := sites.Download(context.Background(), actor, publicIntake, RequestContext{})
+	if err != nil || fromSite.ID != accepted.ID {
+		t.Fatalf("accepted Site replay=%+v %v", fromSite, err)
+	}
+	changedSite := publicIntake
+	changedSite.ResultToken = strings.Repeat("s", 43)
+	if _, err := sites.Download(context.Background(), actor, changedSite, RequestContext{}); ErrorCode(err) != CodeConflict {
+		t.Fatalf("changed Site request replayed=%v", err)
+	}
+	deny := models.UserAuthorizationRule{UserID: actor.User.ID, PermissionCode: authz.PermissionDiscoveryRead, Effect: models.AuthorizationEffectDeny, ResourceType: models.AuthorizationResourceSite, ResourceID: uintID(site.ID), CreatedBy: actor.User.ID}
+	if err := reopened.Create(&deny).Error; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sites.Download(context.Background(), actor, publicIntake, RequestContext{}); ErrorCode(err) != CodePermissionDenied {
+		t.Fatalf("revoked Site replay=%v", err)
+	}
+	if err := reopened.Delete(&deny).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	var jobs int64
+	if err := reopened.Model(&models.DownloadTask{}).Where("id = ?", accepted.ID).Count(&jobs).Error; err != nil || jobs != 1 {
+		t.Fatal("confirmation created duplicates")
+	}
+	// A later failure was not covered by that confirmation and must survive
+	// this attempt's success, while all older same-scope audit rows are retained.
+	newerFailure := confirmedFailure
+	newerFailure.ID, newerFailure.TaskID = 0, "newer-offline-timeout"
+	if err := reopened.Create(&newerFailure).Error; err != nil {
+		t.Fatal(err)
+	}
+	// Required files can finish while extras remain. Their proof ends the timer
+	// before recognition and preserves completed output plus a durable stop receipt.
+	state.ready = false
+	state.stopErr = errors.New("lost stop ack")
+	claim, err = newQueue.Claim([]string{"download"})
+	if err != nil || claim == nil {
+		t.Fatal(err)
+	}
+	result = NewDownloadWorker(restarted).Run(context.Background(), workerRuntime{queue: newQueue, job: *claim}, *claim)
+	if result.RetryAt == nil || result.ErrorCode != "" {
+		t.Fatalf("required observation=%+v", result)
+	}
+	if err := newQueue.RetryLater(claim.Job.ID, claim.LeaseToken, "", "", *result.RetryAt); err != nil {
+		t.Fatal(err)
+	}
+	var due models.DownloadTask
+	if err := reopened.First(&due, "id = ?", accepted.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if due.OfflineHistoryRevision != confirmedFailure.ID {
+		t.Fatalf("confirmed history revision=%d, want %d", due.OfflineHistoryRevision, confirmedFailure.ID)
+	}
+	clock.now = *due.OfflineDeadlineAt
+	state.ready = true
+	originalProviderID := due.ProviderTaskID
+	if err := reopened.Model(&due).Update("provider_task_id", "").Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := NewDownloadWorker(restarted).ExpireOfflineDeadlines(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := reopened.First(&due, "id = ?", accepted.ID).Error; err != nil || due.OfflineReadyAt == nil || due.Phase == models.DownloadTaskStatusCancelled || due.ProviderTaskID != originalProviderID {
+		t.Fatalf("fresh ready lost to expiry: %+v %v", due, err)
+	}
+
+	state.stopErr = nil
+	if err := NewDownloadWorker(restarted).RecoverOfflineStops(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !state.removed[due.ProviderTaskID] {
+		t.Fatal("successful keep-output stop did not remove the fixture native task")
+	}
+	// Only the persisted required manifest remains; Get/Manifest now return not-found.
+	if err := newQueue.PromoteDueRetries(); err != nil {
+		t.Fatal(err)
+	}
+	claim, err = newQueue.Claim([]string{"download"})
+	if err != nil || claim == nil {
+		t.Fatal(err)
+	}
+	result = NewDownloadWorker(restarted).Run(context.Background(), workerRuntime{queue: newQueue, job: *claim}, *claim)
+	if result.ErrorCode != "" || result.RetryAt != nil {
+		t.Fatalf("required goal=%+v", result)
+	}
+	var complete models.DownloadTask
+	if err := reopened.First(&complete, "id = ?", accepted.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if complete.OfflineReadyAt == nil || complete.OfflineCompletionMode != downloadpkg.OfflineCompletionRequiredFiles || complete.OfflineStopPending || complete.Phase != models.DownloadTaskStatusCompleted {
+		t.Fatalf("required readiness=%+v", complete)
+	}
+	for _, id := range []uint64{failures[0].ID, olderFailure.ID, confirmedFailure.ID} {
+		var resolved models.OfflineFailure
+		if err := reopened.First(&resolved, "id = ?", id).Error; err != nil || resolved.ResolvedAt == nil {
+			t.Fatalf("successful retry did not retain and settle confirmed history through revision %d: %+v %v", confirmedFailure.ID, resolved, err)
+		}
+	}
+	if err := reopened.First(&newerFailure, "id = ?", newerFailure.ID).Error; err != nil || newerFailure.ResolvedAt != nil {
+		t.Fatalf("successful retry cleared a newer unconfirmed failure: %+v %v", newerFailure, err)
+	}
+	var remainingFailures []models.OfflineFailure
+	if err := offlineFailureQuery(reopened, complete).Find(&remainingFailures).Error; err != nil || len(remainingFailures) != 1 || remainingFailures[0].ID != newerFailure.ID {
+		t.Fatalf("old history resurfaced after success: %+v %v", remainingFailures, err)
+	}
+	if err := newQueue.Complete(claim.Job.ID, claim.LeaseToken); err != nil {
+		t.Fatal(err)
+	}
+	clock.now = complete.OfflineDeadlineAt.Add(time.Hour)
+	if err := NewDownloadWorker(restarted).ExpireOfflineDeadlines(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := reopened.First(&complete, "id = ?", accepted.ID).Error; err != nil || complete.LastErrorCode == CodeOfflineDeadlineExceeded {
+		t.Fatal("later transport/stop wait renewed cloud timeout")
+	}
+	// Explicit no-task receipt and actual native terminal failure end maintenance
+	// without fake ready or a later timeout history for those outcomes.
+	for n := 0; n < 2; n++ {
+		state.reject, state.terminal = n == 0, n == 1
+		state.ready = false
+		nextInput := input
+		nextInput.OfflineFailureOverrideToken = ""
+		nextInput.Source.URL = "magnet:?xt=urn:btih:" + strings.Repeat(map[int]string{0: "a", 1: "b"}[n], 40)
+		nextInput.Source.offlineRequired = nil
+		next, err := restarted.Submit(context.Background(), actor, nextInput, RequestContext{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		nextClaim, err := newQueue.Claim([]string{"download"})
+		if err != nil || nextClaim == nil {
+			t.Fatal(err)
+		}
+		failed := NewDownloadWorker(restarted).Run(context.Background(), workerRuntime{queue: newQueue, job: *nextClaim}, *nextClaim)
+		if failed.ErrorCode == "" {
+			t.Fatalf("missing settled failure: %+v", failed)
+		}
+		if err := newQueue.Fail(nextClaim.Job.ID, nextClaim.LeaseToken, failed.ErrorCode, failed.ErrorMessage); err != nil {
+			t.Fatal(err)
+		}
+		var rejected models.DownloadTask
+		if err := reopened.First(&rejected, "id = ?", next.ID).Error; err != nil || rejected.OfflineSettledAt == nil || rejected.OfflineReadyAt != nil {
+			t.Fatalf("terminal evidence=%+v %v", rejected, err)
+		}
+		clock.now = rejected.OfflineDeadlineAt.Add(time.Minute)
+		if err := NewDownloadWorker(restarted).ExpireOfflineDeadlines(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		var history int64
+		if err := reopened.Model(&models.OfflineFailure{}).Where("task_id = ?", next.ID).Count(&history).Error; err != nil || history != 0 {
+			t.Fatal("settled no-task/failed operation became timeout history")
+		}
+		if n == 0 {
+			// Explicit user retry creates one distinct acquisition and preserves
+			// the no-task receipt/clock, including Follow and Player backlinks.
+			followID, fingerprint := "no-task-follow", strings.Repeat("e", 64)
+			if err := reopened.Create(&models.FollowSubscription{ID: followID, OwnerID: actor.User.ID, MediaType: "tv", TMDBID: 999, Title: "Feature", Status: models.FollowStatusActive, Revision: 1, LifecycleRevision: 1, ExecutionSnapshotJSON: "{}"}).Error; err != nil {
+				t.Fatal(err)
+			}
+			if err := reopened.Model(&rejected).Updates(map[string]any{"follow_subscription_id": followID, "follow_resource_fingerprint": fingerprint}).Error; err != nil {
+				t.Fatal(err)
+			}
+			if err := reopened.Create(&models.FollowEpisodeClaim{SubscriptionID: followID, SeasonNumber: 1, EpisodeNumber: 2, State: "failed", ResourceFingerprint: fingerprint, UpdatedAt: clock.now}).Error; err != nil {
+				t.Fatal(err)
+			}
+			acquisition := models.MediaAcquisition{ID: "no-task-acquisition", OwnerID: actor.User.ID, MediaType: "tv", TMDBID: 999, Stage: "download", Status: models.DownloadTaskStatusFailed, DownloadTaskID: rejected.ID, Revision: 1}
+			if err := reopened.Create(&acquisition).Error; err != nil {
+				t.Fatal(err)
+			}
+			denied := models.UserAuthorizationRule{UserID: actor.User.ID, PermissionCode: authz.PermissionDownloadsCreate, Effect: models.AuthorizationEffectDeny, ResourceType: models.AuthorizationResourceDownloader, ResourceID: downloader.ID, CreatedBy: actor.User.ID}
+			if err := reopened.Create(&denied).Error; err != nil {
+				t.Fatal(err)
+			}
+			if _, err := newQueue.Control(actor, rejected.JobID, "retry", RequestContext{}); ErrorCode(err) != CodePermissionDenied {
+				t.Fatalf("revoked no-task retry=%v", err)
+			}
+			if err := reopened.Delete(&denied).Error; err != nil {
+				t.Fatal(err)
+			}
+			nextJob, err := newQueue.Control(actor, rejected.JobID, "retry", RequestContext{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var replacement models.DownloadTask
+			if err := reopened.First(&replacement, "job_id = ?", nextJob.ID).Error; err != nil || replacement.ID == rejected.ID || replacement.OfflineStartedAt != nil || replacement.OfflineSettledAt != nil || replacement.ProviderTag == rejected.ProviderTag || replacement.SourceCiphertext == rejected.SourceCiphertext {
+				t.Fatalf("no-task retry did not create distinct acquisition: %+v %v", replacement, err)
+			}
+			again, err := newQueue.Control(actor, rejected.JobID, "retry", RequestContext{})
+			if err != nil || again.ID != nextJob.ID {
+				t.Fatalf("no-task retry duplicated=%+v %v", again, err)
+			}
+			var old models.DownloadTask
+			if err := reopened.First(&old, "id = ?", rejected.ID).Error; err != nil || old.OfflineSettledAt == nil || !old.OfflineStartedAt.Equal(*rejected.OfflineStartedAt) || old.ProviderTaskID != rejected.ProviderTaskID || old.Phase != models.DownloadTaskStatusFailed {
+				t.Fatalf("original no-task receipt changed: %+v %v", old, err)
+			}
+			var claim models.FollowEpisodeClaim
+			if err := reopened.First(&claim, "subscription_id = ?", followID).Error; err != nil || claim.DownloadTaskID == nil || *claim.DownloadTaskID != replacement.ID || claim.State != "downloading" {
+				t.Fatalf("retry lost Follow ownership: %+v %v", claim, err)
+			}
+			if err := reopened.First(&acquisition, "id = ?", acquisition.ID).Error; err != nil || acquisition.DownloadTaskID != replacement.ID || acquisition.Status != models.DownloadTaskStatusQueued {
+				t.Fatalf("retry lost acquisition projection: %+v %v", acquisition, err)
+			}
+			if err := restarted.CancelPipeline(context.Background(), actor, replacement.ID, RequestContext{}); err != nil {
+				t.Fatal(err)
+			}
+		} else if _, err := newQueue.Control(actor, rejected.JobID, "retry", RequestContext{}); ErrorCode(err) != CodeQueueStateConflict {
+			t.Fatalf("accepted terminal failure cloned a fresh clock: %v", err)
+		}
+	}
+
 }
 
 func TestPan115DownloadWaitBroadcastsLifeEventToAllWorkers(t *testing.T) {
@@ -1082,6 +1686,19 @@ func TestDownloaderRejectsAmbiguousCredentialClearAndOversizedConfig(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
+	if created.MaxConcurrentDownloads != 2 {
+		t.Fatalf("default concurrency=%d", created.MaxConcurrentDownloads)
+	}
+	for _, limit := range []int{0, -1, 65} {
+		if _, err := downloaders.Update(actor, created.ID, UpdateDownloaderInput{MaxConcurrentDownloads: &limit}, RequestContext{}); ErrorCode(err) != CodeInvalidRequest {
+			t.Fatalf("invalid limit %d=%v", limit, err)
+		}
+	}
+	limit := 64
+	if changed, err := downloaders.Update(actor, created.ID, UpdateDownloaderInput{MaxConcurrentDownloads: &limit}, RequestContext{}); err != nil || changed.MaxConcurrentDownloads != 64 {
+		t.Fatalf("updated concurrency=%+v %v", changed, err)
+	}
+
 	password := "replacement"
 	if _, err := downloaders.Update(actor, created.ID, UpdateDownloaderInput{Password: &password, ClearPassword: true}, RequestContext{}); ErrorCode(err) != CodeInvalidRequest {
 		t.Fatalf("clear+password error=%v", err)
@@ -1113,7 +1730,7 @@ func TestDownloadWorkerPersistsTelemetryAndCancelRetainsProviderData(t *testing.
 	}
 	worker := NewDownloadWorker(downloads)
 	worker.pollInterval = time.Millisecond
-	result := worker.Run(context.Background(), workerRuntime{queue: queue, job: *claimed}, *claimed)
+	result := finishScheduledDownload(t, worker, queue, claimed)
 	if result.ErrorCode != "" || result.RetryAt != nil {
 		t.Fatalf("result=%+v", result)
 	}
@@ -1687,7 +2304,7 @@ func TestDownloadWorkerReconcilesExistingProviderTaskWithoutResubmit(t *testing.
 	}
 }
 
-func TestDownloadWorkerWaitsForEstablishedQBittorrentWithoutNewAttempt(t *testing.T) {
+func TestDownloadWorkerScheduledReconnectKeepsOriginalAcquisition(t *testing.T) {
 	downloads, downloaders, queue, actor, client := downloadFixture(t)
 	var businessLog bytes.Buffer
 	downloads.log = zerolog.New(zerolog.SyncWriter(&businessLog)).With().Timestamp().Logger()
@@ -1721,7 +2338,7 @@ func TestDownloadWorkerWaitsForEstablishedQBittorrentWithoutNewAttempt(t *testin
 	worker := NewDownloadWorker(downloads)
 	worker.pollInterval = time.Millisecond
 	worker.reconnectInterval = time.Millisecond
-	result := worker.Run(context.Background(), workerRuntime{queue: queue, job: *claimed}, *claimed)
+	result := finishScheduledDownload(t, worker, queue, claimed)
 	if result.ErrorCode != "" || result.RetryAt != nil {
 		t.Fatalf("result=%+v", result)
 	}
@@ -1743,7 +2360,7 @@ func TestDownloadWorkerWaitsForEstablishedQBittorrentWithoutNewAttempt(t *testin
 	client.mu.Lock()
 	submits := client.submits
 	client.mu.Unlock()
-	if job.AttemptCount != 1 || attempts != 1 || submits != 0 || task.LastErrorCode != "" || task.LastErrorMessage != "" {
+	if job.AttemptCount != 1 || attempts != 1 || job.FailureRetryCount != 0 || submits != 0 || task.LastErrorCode != "" || task.LastErrorMessage != "" {
 		t.Fatalf("job=%+v attempts=%d submits=%d task=%+v", job, attempts, submits, task)
 	}
 	if len(businessRecords(t, &businessLog, "event_code", "download.reconnect_wait")) != 1 || len(businessRecords(t, &businessLog, "event_code", "download.reconnected")) != 1 {
@@ -1788,43 +2405,53 @@ func TestDownloadWorkerReconnectWaitStopsWithContext(t *testing.T) {
 	}
 	worker := NewDownloadWorker(downloads)
 	worker.reconnectInterval = time.Hour
+	result := worker.Run(context.Background(), workerRuntime{queue: queue, job: *claimed}, *claimed)
+	if result.ErrorCode != "" || result.RetryAt == nil {
+		t.Fatalf("bounded reconnect=%+v", result)
+	}
+	if err := queue.RetryLater(created.JobID, claimed.LeaseToken, "", "", *result.RetryAt); err != nil {
+		t.Fatal(err)
+	}
+	var saved models.Job
+	if err := queue.db.First(&saved, "id = ?", created.JobID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if saved.Status != models.JobStatusRetryWait || saved.FailureRetryCount != 0 || saved.LeaseTokenHash != "" {
+		t.Fatalf("reconnect retained execution capacity: %+v", saved)
+	}
+	var admission models.DownloadAdmission
+	if err := queue.db.First(&admission, "acquisition_key = ?", "task:"+created.ID).Error; err != nil || admission.State != "held" {
+		t.Fatalf("original acquisition lost: %+v %v", admission, err)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
-	resultCh := make(chan WorkerResult, 1)
-	go func() { resultCh <- worker.Run(ctx, workerRuntime{queue: queue, job: *claimed}, *claimed) }()
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		var task models.DownloadTask
-		if err := queue.db.First(&task, "id = ?", created.ID).Error; err != nil {
-			t.Fatal(err)
-		}
-		if task.ProviderStatus == "unavailable" && task.LastErrorCode == "downloader_unavailable" {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("worker did not persist reconnect wait: task=%+v", task)
-		}
-		time.Sleep(time.Millisecond)
-	}
-	var runningJob models.Job
-	if err := queue.db.First(&runningJob, "id = ?", created.JobID).Error; err != nil {
-		t.Fatal(err)
-	}
-	var attempts int64
-	if err := queue.db.Model(&models.JobAttempt{}).Where("job_id = ?", created.JobID).Count(&attempts).Error; err != nil {
-		t.Fatal(err)
-	}
-	if runningJob.Status != models.JobStatusRunning || runningJob.AttemptCount != 1 || attempts != 1 {
-		t.Fatalf("reconnect wait changed job attempt: job=%+v attempts=%d", runningJob, attempts)
-	}
 	cancel()
-	select {
-	case result := <-resultCh:
-		if result.ErrorCode != "" || result.RetryAt != nil {
-			t.Fatalf("result=%+v", result)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("reconnect wait ignored cancellation")
+	if result := worker.Run(ctx, workerRuntime{queue: queue, job: *claimed}, *claimed); result.RetryAt != nil || result.ErrorCode != "" {
+		t.Fatalf("cancelled observation=%+v", result)
 	}
+	// An old terminal tracking Job is independently observed, not restarted.
+	if err := queue.db.Model(&models.Job{}).Where("id = ?", created.JobID).Updates(map[string]any{"status": models.JobStatusFailed, "last_error_code": "old_tracking_failed"}).Error; err != nil {
+		t.Fatal(err)
+	}
+	client.mu.Lock()
+	client.getErr = nil
+	client.seedTask = &downloadpkg.Task{ID: "provider-hash", Status: "completed", Completed: true}
+	client.mu.Unlock()
+	if err := worker.RecoverOfflineStops(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := queue.db.First(&admission, "acquisition_key = ?", "task:"+created.ID).Error; err != nil || admission.State != "released" {
+		t.Fatalf("legacy completed native task retained capacity: %+v %v", admission, err)
+	}
+	if err := queue.db.First(&saved, "id = ?", created.JobID).Error; err != nil || saved.Status != models.JobStatusFailed {
+		t.Fatal("admission observation revived the old Job")
+	}
+	client.mu.Lock()
+	writes := client.submits
+	client.mu.Unlock()
+	if writes != 0 {
+		t.Fatal("legacy admission reconciliation submitted native work")
+	}
+
 }
 
 func TestManagedQBittorrentTagCleanupIsDurableAndRetryable(t *testing.T) {
@@ -1945,7 +2572,7 @@ func TestDownloadWorkerRecoversLegacyLeaseFailureWithoutResubmit(t *testing.T) {
 	}
 	worker := NewDownloadWorker(downloads)
 	worker.pollInterval = time.Millisecond
-	result := worker.Run(context.Background(), workerRuntime{queue: queue, job: *claimed}, *claimed)
+	result := finishScheduledDownload(t, worker, queue, claimed)
 	if result.ErrorCode != "" || result.RetryAt != nil {
 		t.Fatalf("result=%+v", result)
 	}
@@ -2110,7 +2737,7 @@ func TestDownloadWorkerAutomaticallyRoutesUnrecognizedWithoutTMDBCredential(t *t
 	}
 	worker := NewDownloadWorker(downloads)
 	worker.pollInterval = time.Millisecond
-	result := worker.Run(context.Background(), workerRuntime{queue: queue, job: *claimed}, *claimed)
+	result := finishScheduledDownload(t, worker, queue, claimed)
 	if result.Wait != nil || result.ErrorCode != "" || !client.metadataOnly || !client.paused || !client.resumed {
 		t.Fatalf("result=%+v metadataOnly=%v paused=%v", result, client.metadataOnly, client.paused)
 	}

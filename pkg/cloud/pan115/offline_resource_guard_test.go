@@ -101,7 +101,16 @@ func TestOrdinaryOfflineUnknownNeverReplaysOrReleasesOnAbsence(t *testing.T) {
 	for _, kind := range []string{"submit-absent", "cancel-absent", "cancel-present"} {
 		t.Run(kind, func(t *testing.T) {
 			c, s, store, r, uri := guardedFixture(t)
-			ctx := ordinaryTestContext(kind)
+			started := time.Date(2026, 11, 13, 10, 0, 0, 0, time.UTC)
+			c.now = func() time.Time { return started }
+			dispatches := 0
+			ctx := cloud.WithOfflineDispatchRecorder(ordinaryTestContext(kind), func(at time.Time) error {
+				if !at.Equal(started) {
+					t.Fatal("wrong original dispatch clock")
+				}
+				dispatches++
+				return nil
+			})
 			if kind == "submit-absent" {
 				s.applyAdd, s.addErr = false, errors.New("lost ACK")
 				if _, err := c.SubmitOffline(ctx, uri, "ordinary"); err == nil {
@@ -127,6 +136,9 @@ func TestOrdinaryOfflineUnknownNeverReplaysOrReleasesOnAbsence(t *testing.T) {
 			}
 			if _, err := c.SubmitSelectedOffline(context.Background(), r); err == nil {
 				t.Fatal("selected overlapped unknown ordinary")
+			}
+			if dispatches != 1 {
+				t.Fatalf("observation/recovery renewed cloud start %d", dispatches)
 			}
 			if s.adds > 1 || s.cancels > 1 || s.submits != 0 {
 				t.Fatal("unknown request replayed")
@@ -305,6 +317,11 @@ func TestOrdinaryOfflineTypedRejectionReleasesAndCredentialRefreshCanRetry(t *te
 			s.applyAdd, s.addErr = false, fmt.Errorf("typed SDK rejection: %w", rejection)
 			if _, err := c.SubmitOffline(ctx, uri, "ordinary"); !errors.Is(err, rejection) {
 				t.Fatal("SDK rejection classification lost", err)
+			} else {
+				var proof interface{ SubmissionNotAccepted() bool }
+				if !errors.As(err, &proof) || !proof.SubmissionNotAccepted() {
+					t.Fatal("durable native no-task rejection lost its typed proof")
+				}
 			}
 			if _, err := store.ResourceClaim(context.Background(), offlineResourceKey(r.Authority.Selection.Identity.V1)); !errors.Is(err, cloud.ErrOperationNotFound) {
 				t.Fatal("typed refusal pinned resource", err)
@@ -346,6 +363,11 @@ func TestOrdinaryOfflineDoesNotGuessDefiniteRejectionFromErrorText(t *testing.T)
 	ctx := ordinaryTestContext("opaque-error")
 	if _, err := c.SubmitOffline(ctx, uri, "ordinary"); err == nil {
 		t.Fatal("opaque error accepted")
+	} else {
+		var proof interface{ SubmissionNotAccepted() bool }
+		if errors.As(err, &proof) {
+			t.Fatal("opaque error invented no-task proof")
+		}
 	}
 	if _, err := store.ResourceClaim(context.Background(), offlineResourceKey(r.Authority.Selection.Identity.V1)); err != nil {
 		t.Fatal("string guessed as explicit rejection", err)
@@ -450,5 +472,36 @@ func TestOrdinaryOfflinePendingSDKCallKeepsResourceUntilPhysicalReturn(t *testin
 				t.Fatal("pending operation submitted twice")
 			}
 		})
+	}
+}
+
+func TestOrdinaryOfflineRemoteStopSettlesOnlyOriginalInactiveClaim(t *testing.T) {
+	c, s, store, r, uri := guardedFixture(t)
+	ctx := ordinaryTestContext("remote-stop")
+	access := cloud.OfflineAccess{OperationID: "node:task:original", URI: uri, DirectoryID: "ordinary", Remote: true}
+	if err := c.SettleStoppedOfflineAccess(ctx, access); err == nil {
+		t.Fatal("missing original claim was invented")
+	}
+	if err := c.BeginOfflineAccess(ctx, access); err != nil {
+		t.Fatal(err)
+	}
+	s.task = &sdk.OfflineTask{InfoHash: r.Authority.Selection.Identity.V1, DirId: "ordinary", Status: 1}
+	if err := c.SettleStoppedOfflineAccess(ctx, access); err == nil {
+		t.Fatal("live native operation released remote claim")
+	}
+	other := access
+	other.OperationID = "node:other"
+	if err := c.SettleStoppedOfflineAccess(ctx, other); err == nil {
+		t.Fatal("another original scope settled remote claim")
+	}
+	s.task = nil
+	if err := c.SettleStoppedOfflineAccess(ctx, access); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ResourceClaim(ctx, offlineResourceKey(r.Authority.Selection.Identity.V1)); !errors.Is(err, cloud.ErrOperationNotFound) {
+		t.Fatal("stopped original claim remained physically owned", err)
+	}
+	if err := c.SettleStoppedOfflineAccess(ctx, access); err != nil || s.adds != 0 || s.cancels != 0 {
+		t.Fatal("read-only stop settlement repeated a native write", err)
 	}
 }

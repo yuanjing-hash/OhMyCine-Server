@@ -248,6 +248,9 @@ func (s *TransferService) cleanupTransferStaging(ctx context.Context, task model
 		delete(fields, "new_name")
 		serverlog.RecordBusiness(ctx, s.log, serverlog.OperationDownloadStagingCleanup, serverlog.BusinessEvent{Code: "cleanup.file", Stage: "cleanup", Outcome: outcome, Message: message + "：" + firstNonEmpty(display.source, serverlog.BusinessDisplayName(display.oldName)), Fields: fields})
 	}))
+	if download.OfflineCompletionMode == downloadpkg.OfflineCompletionRequiredFiles {
+		return 0, s.db.Model(&models.TransferTask{}).Where("id = ?", task.ID).Updates(map[string]any{"cleanup_status": models.TransferCleanupSkipped, "cleanup_error_code": "required_scope_retained", "updated_at": time.Now().UTC()}).Error
+	}
 	extras, err := transferCleanupDifference(task)
 	if err != nil {
 		return 0, s.persistTransferCleanupFailure(task.ID, "download_staging_manifest_invalid", err)
