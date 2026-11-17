@@ -14,7 +14,11 @@ for arch in amd64 arm64; do
   for component in server node; do
     image="${registry}/ohmycine-${component}:v${VERSION}"
     docker pull --platform "linux/${arch}" "$image"
-    [[ "$(docker image inspect --format '{{.Architecture}}' "$image")" == "$arch" ]]
+    actual_arch="$(docker image inspect --platform "linux/${arch}" --format '{{.Architecture}}' "$image")"
+    if [[ "$actual_arch" != "$arch" ]]; then
+      printf '::error::Docker smoke architecture mismatch for %s: expected %s, got %s\n' "$image" "$arch" "$actual_arch" >&2
+      exit 1
+    fi
   done
   server="${registry}/ohmycine-server:v${VERSION}"
   node="${registry}/ohmycine-node:v${VERSION}"
