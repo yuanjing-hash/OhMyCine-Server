@@ -116,6 +116,7 @@ func NewDownloadService(db *gorm.DB, audit *AuditService, credentials *credentia
 	service := &DownloadService{db: db, audit: audit, credentials: credentials, downloader: downloader, settings: settings, queue: queue, log: log, providerEvents: newProviderEventWakeHub()}
 	queue.SetInterruptAcknowledged(service.finalizeInterrupt)
 	queue.SetRetryAccepted(service.acceptRetry)
+	queue.SetRetryReplacement(service.replaceRejectedOfflineRetry)
 	return service
 }
 
@@ -127,6 +128,16 @@ func NewDownloadService(db *gorm.DB, audit *AuditService, credentials *credentia
 func (s *DownloadService) acceptRetry(tx *gorm.DB, job models.Job, now time.Time) error {
 	if job.JobType != "download" {
 		return nil
+	}
+	var original models.DownloadTask
+	if err := tx.First(&original, "job_id = ?", job.ID).Error; err != nil {
+		return err
+	}
+	if original.LastErrorCode == CodeOfflineDeadlineExceeded {
+		return appError(CodeQueueStateConflict, "原离线任务已超时，请通过重新选择资源确认本次下载", nil)
+	}
+	if original.OfflineSettledAt != nil && original.OfflineReadyAt == nil {
+		return appError(CodeQueueStateConflict, "原云端获取已结束，请重新选择资源后提交", nil)
 	}
 	result := tx.Model(&models.DownloadTask{}).Where("job_id = ?", job.ID).Updates(map[string]any{
 		"last_error_code":    "",
@@ -171,11 +182,28 @@ func (s *DownloadService) SetSeedingSettings(settings *SeedingSettingsService) {
 func (s *DownloadService) ProviderEventsChanged(_ context.Context, connectionID uint, events []models.ProviderEvent) error {
 	if connectionID != 0 && len(events) > 0 && s.providerEvents != nil {
 		s.providerEvents.publish(connectionID)
+		if s.db == nil || s.queue == nil {
+			return nil
+		}
+		now := s.queue.clock.Now()
+		var ids []string
+		if err := s.db.Table("download_tasks AS t").Select("t.job_id").Joins("JOIN storages AS st ON st.id = t.staging_storage_id").Joins("JOIN jobs AS j ON j.id = t.job_id").Where("st.connection_id = ? AND t.provider_task_id <> '' AND t.phase NOT IN (?,?) AND j.status = ? AND j.last_error_code = ''", connectionID, models.DownloadTaskStatusCancelled, models.DownloadTaskStatusCompleted, models.JobStatusRetryWait).Order("j.next_attempt_at,t.id").Limit(500).Pluck("t.job_id", &ids).Error; err != nil {
+			return err
+		}
+		if len(ids) > 0 {
+			if err := s.db.Model(&models.Job{}).Where("id IN ? AND status = ? AND last_error_code = ''", ids, models.JobStatusRetryWait).Updates(map[string]any{"status": models.JobStatusQueued, "next_attempt_at": nil, "updated_at": now, "revision": gorm.Expr("revision+1")}).Error; err != nil {
+				return err
+			}
+			s.queue.wake()
+		}
 	}
 	return nil
 }
 
 type DownloadSourceInput struct {
+	// Derived only from verified complete content facts at an internal handoff.
+	// This goal is observation authority; it never changes ContentSelection.
+	offlineRequired *downloadpkg.OfflineRequiredPlan
 	// Admission-only authority minted by verified content selection. It cannot
 	// be deserialized from HTTP or reconstructed from a stored source string.
 	selectionOrigin  *selectedSourceOrigin
@@ -189,6 +217,8 @@ type DownloadSourceInput struct {
 }
 
 type SubmitDownloadInput struct {
+	offlineIntakeDigest         string
+	OfflineFailureOverrideToken string
 	// Internal replacement acquisition: never recycle a conflicting old version.
 	PreserveExistingVersions bool
 	// SourceSiteID is set only by SiteService after validating its actor-bound claim.
@@ -222,20 +252,22 @@ type SubmitDownloadInput struct {
 const maxBatchDownloadSources = 50
 
 type SubmitDownloadBatchInput struct {
-	DownloaderID   string
-	MediaLibraryID *uint
-	ProfileID      uint
-	DisplayName    string
-	Priority       int
-	SourceKind     string
-	Sources        []string
+	OfflineFailureOverrides []OfflineFailureOverride
+	DownloaderID            string
+	MediaLibraryID          *uint
+	ProfileID               uint
+	DisplayName             string
+	Priority                int
+	SourceKind              string
+	Sources                 []string
 }
 
 type SubmitDownloadBatchItem struct {
-	Index     int                  `json:"index"`
-	Task      *DownloadTaskSummary `json:"task,omitempty"`
-	ErrorCode string               `json:"error_code,omitempty"`
-	Message   string               `json:"message,omitempty"`
+	OfflineFailureWarning *OfflineFailureWarning `json:"offline_failure_warning,omitempty"`
+	Index                 int                    `json:"index"`
+	Task                  *DownloadTaskSummary   `json:"task,omitempty"`
+	ErrorCode             string                 `json:"error_code,omitempty"`
+	Message               string                 `json:"message,omitempty"`
 }
 
 type SubmitDownloadBatchResult struct {
@@ -255,6 +287,13 @@ func (s *DownloadService) SubmitBatch(ctx context.Context, actor Actor, input Su
 	if len(input.Sources) == 0 || len(input.Sources) > maxBatchDownloadSources {
 		return SubmitDownloadBatchResult{}, appError(CodeDownloadSourceInvalid, "一次可提交 1 到 50 个链接", nil)
 	}
+	overrides := make(map[int]string, len(input.OfflineFailureOverrides))
+	for _, override := range input.OfflineFailureOverrides {
+		if override.Index < 0 || override.Index >= len(input.Sources) || len(override.ConfirmationToken) != 64 || overrides[override.Index] != "" {
+			return SubmitDownloadBatchResult{}, appError(CodeInvalidRequest, "批量离线确认索引无效", nil)
+		}
+		overrides[override.Index] = override.ConfirmationToken
+	}
 	result := SubmitDownloadBatchResult{Results: make([]SubmitDownloadBatchItem, 0, len(input.Sources))}
 	seen := make(map[string]struct{}, len(input.Sources))
 	for index, raw := range input.Sources {
@@ -273,12 +312,16 @@ func (s *DownloadService) SubmitBatch(ctx context.Context, actor Actor, input Su
 			if displayName != "" && len(input.Sources) > 1 {
 				displayName = fmt.Sprintf("%s #%d", displayName, index+1)
 			}
-			created, err := s.Submit(ctx, actor, SubmitDownloadInput{DownloaderID: input.DownloaderID, MediaLibraryID: input.MediaLibraryID, ProfileID: input.ProfileID, DisplayName: displayName, Priority: input.Priority, Source: DownloadSourceInput{Kind: input.SourceKind, URL: source}}, request)
+			created, err := s.Submit(ctx, actor, SubmitDownloadInput{OfflineFailureOverrideToken: overrides[index], DownloaderID: input.DownloaderID, MediaLibraryID: input.MediaLibraryID, ProfileID: input.ProfileID, DisplayName: displayName, Priority: input.Priority, Source: DownloadSourceInput{Kind: input.SourceKind, URL: source}}, request)
 			if err == nil {
 				item.Task = &created
 				result.Submitted++
 			} else {
 				item.ErrorCode, item.Message = ErrorCode(err), ErrorMessage(err)
+				var application *AppError
+				if errors.As(err, &application) && application.Code == CodeOfflineConfirmationRequired {
+					item.OfflineFailureWarning = application.OfflineFailureWarning
+				}
 			}
 		}
 		if item.Task == nil {
@@ -300,20 +343,21 @@ type DownloadRecognitionIdentity struct {
 }
 
 type downloadSourceEnvelope struct {
-	ContentSelection       *resourcecontent.Selection `json:"content_selection,omitempty"`
-	ContentSelectionDigest string                     `json:"content_selection_digest,omitempty"`
-	SelectionMode          string                     `json:"selection_mode,omitempty"`
-	ShareSelection         *cloud.ShareSelection      `json:"share_selection,omitempty"`
-	Kind                   string                     `json:"kind"`
-	URL                    string                     `json:"url,omitempty"`
-	Torrent                []byte                     `json:"torrent,omitempty"`
-	Filename               string                     `json:"filename,omitempty"`
-	ProviderItemID         string                     `json:"provider_item_id,omitempty"`
-	PluginConnectionID     string                     `json:"plugin_connection_id,omitempty"`
-	PluginItemID           string                     `json:"plugin_item_id,omitempty"`
-	PluginSegmentID        string                     `json:"plugin_segment_id,omitempty"`
-	PluginVersionID        string                     `json:"plugin_version_id,omitempty"`
-	PluginVariantID        string                     `json:"plugin_variant_id,omitempty"`
+	OfflineRequired        *downloadpkg.OfflineRequiredPlan `json:"offline_required,omitempty"`
+	ContentSelection       *resourcecontent.Selection       `json:"content_selection,omitempty"`
+	ContentSelectionDigest string                           `json:"content_selection_digest,omitempty"`
+	SelectionMode          string                           `json:"selection_mode,omitempty"`
+	ShareSelection         *cloud.ShareSelection            `json:"share_selection,omitempty"`
+	Kind                   string                           `json:"kind"`
+	URL                    string                           `json:"url,omitempty"`
+	Torrent                []byte                           `json:"torrent,omitempty"`
+	Filename               string                           `json:"filename,omitempty"`
+	ProviderItemID         string                           `json:"provider_item_id,omitempty"`
+	PluginConnectionID     string                           `json:"plugin_connection_id,omitempty"`
+	PluginItemID           string                           `json:"plugin_item_id,omitempty"`
+	PluginSegmentID        string                           `json:"plugin_segment_id,omitempty"`
+	PluginVersionID        string                           `json:"plugin_version_id,omitempty"`
+	PluginVariantID        string                           `json:"plugin_variant_id,omitempty"`
 }
 
 type downloadJobPayload struct {
@@ -324,6 +368,11 @@ type downloadJobPayload struct {
 }
 
 type DownloadTaskSummary struct {
+	AcquisitionState       string     `json:"acquisition_state,omitempty"`
+	OfflineStartedAt       *time.Time `json:"offline_started_at,omitempty"`
+	OfflineDeadlineAt      *time.Time `json:"offline_deadline_at,omitempty"`
+	OfflineReadyAt         *time.Time `json:"offline_ready_at,omitempty"`
+	OfflineStartProvenance string     `json:"offline_start_provenance,omitempty"`
 	// Internal observation from the actual insert/idempotency branch. Never sent
 	// to clients or inferred from a successful return/time-based heuristic.
 	submissionOutcome string
@@ -686,6 +735,16 @@ func (s *DownloadService) submit(ctx context.Context, ownerID uint, input Submit
 		}
 		record.RoutePlanRevision, record.RoutePlanDigest = revision, digest
 	}
+	if err := s.freezeOfflineAcquisition(ctx, &record, downloaderRecord, source); err != nil {
+		return DownloadTaskSummary{}, err
+	}
+	confirmation, replay, err := s.prepareOfflineConfirmation(ctx, &record, input)
+	if err != nil {
+		return DownloadTaskSummary{}, err
+	}
+	if replay != nil {
+		return *replay, nil
+	}
 	job, err := s.queue.EnqueueWith(EnqueueJobInput{OwnerID: ownerID, JobType: "download", Priority: input.Priority, DisplayName: displayName, Provider: downloaderRecord.Type, ResourceKey: downloadQueueResourceKey(downloaderRecord), Payload: downloadJobPayload{DownloadTaskID: taskID, SourceSiteID: input.SourceSiteID, ResourceAccessVersion: 1}}, func(tx *gorm.DB, job models.Job) error {
 		current, err := NewAuthorizationService(tx).Resolve(ownerID)
 		if err != nil {
@@ -720,6 +779,9 @@ func (s *DownloadService) submit(ctx context.Context, ownerID uint, input Submit
 				return appError(CodeConflict, "下载器的传输节点或路径映射已变化，请重新提交任务", nil)
 			}
 		}
+		if err := consumeOfflineConfirmationTx(tx, record, input, confirmation, current.User.AuthzVersion, s.queue.clock.Now(), s.downloader); err != nil {
+			return err
+		}
 		record.JobID = job.ID
 		if input.FollowSubscriptionID != "" {
 			// Releasing the failed occurrence and accepting its replacement are
@@ -728,7 +790,7 @@ func (s *DownloadService) submit(ctx context.Context, ownerID uint, input Submit
 			var previous models.DownloadTask
 			err := tx.Where("follow_subscription_id = ? AND follow_resource_fingerprint = ?", input.FollowSubscriptionID, input.FollowResourceFingerprint).First(&previous).Error
 			if err == nil {
-				if replacingFollowTask == nil || previous.ID != replacingFollowTask.ID || previous.OwnerID != ownerID || previous.LastErrorCode == downloadCancellationPending || downloadCompletionPending(previous) || previous.Phase != models.DownloadTaskStatusFailed && previous.Phase != models.DownloadTaskStatusCancelled {
+				if replacingFollowTask == nil || previous.ID != replacingFollowTask.ID || previous.OwnerID != ownerID || (previous.LastErrorCode == downloadCancellationPending || previous.OfflineStopPending) && !(previous.LastErrorCode == CodeOfflineDeadlineExceeded && (record.OfflineKind == "" || record.OfflineAccountNamespace != previous.OfflineAccountNamespace)) || downloadCompletionPending(previous) || previous.Phase != models.DownloadTaskStatusFailed && previous.Phase != models.DownloadTaskStatusCancelled {
 					return appError(CodeConflict, "原追更下载任务状态已变化，请重试", nil)
 				}
 				release := downloadIdentityObservedQuery(tx, *replacingFollowTask).Where("phase = ?", replacingFollowTask.Phase).Updates(map[string]any{"follow_subscription_id": "", "follow_resource_fingerprint": ""})
@@ -1171,6 +1233,17 @@ func (s *DownloadService) ListScoped(actor Actor, scope string, limit int) ([]Do
 	for _, record := range records {
 		item := downloadTaskSummary(record, jobs[record.JobID])
 		item.WaitReason = waitReasons[record.JobID]
+		if blocked, err := downloadCapacityBlocked(s.db, record); err != nil {
+			return nil, 0, err
+		} else if blocked {
+			item.AcquisitionState = "waiting_capacity"
+			if item.WaitReason == nil {
+				item.WaitReason = &JobWaitReasonDTO{Code: "downloader_capacity", Message: "等待所选下载器的并发名额，已有任务继续运行"}
+			}
+		}
+		if item.AcquisitionState == "observing" && (item.WaitReason == nil || item.WaitReason.Code == "retry_at") {
+			item.WaitReason = &JobWaitReasonDTO{Code: "download_observation_pending", Message: "原下载仍在进行，等待下一次状态核对"}
+		}
 		if transfer, ok := transfers[record.ID]; ok {
 			item.TransferPhase = transfer.Phase
 			item.TransferTaskID = transfer.ID
@@ -1230,7 +1303,7 @@ func (s *DownloadService) Delete(ctx context.Context, actor Actor, id string, de
 	if !actor.Can(authz.PermissionDownloadsManageAll) && !actor.Can(authz.PermissionJobsControlAll) && (task.OwnerID != actor.User.ID || !actor.Can(authz.PermissionJobsControlOwn)) {
 		return appError(CodePermissionDenied, "无权删除该下载任务", nil)
 	}
-	if downloadSubmissionUnconfirmed(task) || task.LastErrorCode == downloadCancellationPending {
+	if downloadSubmissionUnconfirmed(task) || task.LastErrorCode == downloadCancellationPending || task.OfflineStopPending {
 		if deleteData {
 			return appError("downloader_submission_unconfirmed", "原云端操作尚在核对，可先移除记录并保留文件；确认原操作后才能删除数据", nil)
 		}
@@ -1278,7 +1351,7 @@ func (s *DownloadService) cancelPipeline(ctx context.Context, actor Actor, id st
 	if !actor.Can(authz.PermissionDownloadsManageAll) && !actor.Can(authz.PermissionJobsControlAll) && (task.OwnerID != actor.User.ID || !actor.Can(authz.PermissionJobsControlOwn)) {
 		return appError(CodePermissionDenied, "无权取消该下载流水线", nil)
 	}
-	if downloadSubmissionUnconfirmed(task) || task.LastErrorCode == downloadCancellationPending {
+	if downloadSubmissionUnconfirmed(task) || task.LastErrorCode == downloadCancellationPending || task.OfflineStopPending {
 		err := s.requestPendingDownloadControl(actor, task.ID, false, request)
 		if errors.Is(err, errDownloadProviderIdentityChanged) {
 			if providerIdentityRetries >= 3 {
@@ -1388,6 +1461,9 @@ func (s *DownloadService) cancelPipeline(ctx context.Context, actor Actor, id st
 		if err := syncFailedFollowClaims(tx, task.ID, now); err != nil {
 			return err
 		}
+		if err := releaseDownloadAdmissionTx(tx, task, now); err != nil {
+			return err
+		}
 		return s.audit.Record(tx, &actor.User.ID, "download.pipeline_cancel", "download_task", task.ID, "success", map[string]any{"provider_cleanup": providerCleanup}, request)
 	})
 	if errors.Is(err, errDownloadProviderIdentityChanged) {
@@ -1446,6 +1522,9 @@ func (s *DownloadService) preflightCompletedHistoryDelete(taskID string) error {
 }
 
 func (s *DownloadService) removeProviderTask(ctx context.Context, task models.DownloadTask, deleteData bool) (string, error) {
+	if deleteData && task.OfflineCompletionMode == downloadpkg.OfflineCompletionRequiredFiles {
+		return "", appError(CodeQueueStateConflict, "原下载只确认了所需文件范围，不能据此删除整包云端输出", nil)
+	}
 	if strings.TrimSpace(task.ProviderTaskID) == "" {
 		if downloadSubmissionUnconfirmed(task) {
 			return "", pendingDownloadSubmissionControl()
@@ -1464,7 +1543,7 @@ func (s *DownloadService) removeProviderTask(ctx context.Context, task models.Do
 	if task.DownloaderID == nil {
 		return "", appError(CodeDownloaderUnavailable, "原下载器配置已不存在，无法确认删除下载器任务", nil)
 	}
-	_, client, err := s.downloader.client(*task.DownloaderID)
+	client, err := s.downloader.clientForDownloadTask(ctx, task)
 	if err != nil {
 		return "", appError(CodeDownloaderUnavailable, "无法连接原下载器，本地任务记录已保留", nil)
 	}
@@ -1584,6 +1663,9 @@ func (s *DownloadService) deleteCompletedHistoryRecord(actor Actor, taskID, prov
 			}
 			deletedJobs = append(deletedJobs, seedingJob)
 		}
+		if err := releaseDownloadAdmissionTx(tx, task, time.Now().UTC()); err != nil {
+			return err
+		}
 		if err := tx.Delete(&task).Error; err != nil {
 			return err
 		}
@@ -1655,6 +1737,9 @@ func (s *DownloadService) deleteLocalRecord(taskID, jobID string, actorID *uint,
 		if err := s.audit.Record(tx, actorID, action, "download_task", taskID, "success", map[string]any{"provider_cleanup": providerCleanup}, request); err != nil {
 			return err
 		}
+		if err := releaseDownloadAdmissionTx(tx, task, time.Now().UTC()); err != nil {
+			return err
+		}
 		if err := tx.Delete(&task).Error; err != nil {
 			return err
 		}
@@ -1677,6 +1762,14 @@ func downloadTaskNotFound(err error) error {
 func normalizeDownloadSource(input DownloadSourceInput, requestedName string) (downloadSourceEnvelope, string, error) {
 	kind := strings.ToLower(strings.TrimSpace(input.Kind))
 	source := downloadSourceEnvelope{Kind: kind}
+	if input.offlineRequired != nil {
+		plan := *input.offlineRequired
+		plan.Files = append([]downloadpkg.OfflineRequiredFile(nil), plan.Files...)
+		if _, err := plan.Digest(); err != nil {
+			return source, "", appError(CodeDownloadSourceInvalid, "离线所需内容意图无效", err)
+		}
+		source.OfflineRequired = &plan
+	}
 	if input.ShareSelection != nil {
 		if !isCloudShareSource(kind) {
 			return source, "", appError(CodeDownloadSourceInvalid, "文件选择只适用于分享转存", nil)
@@ -1796,7 +1889,7 @@ func downloadProgressPercent(record models.DownloadTask) *float64 {
 }
 
 func downloadTaskSummary(record models.DownloadTask, jobStatus string) DownloadTaskSummary {
-	return DownloadTaskSummary{ID: record.ID, JobID: record.JobID, OwnerID: record.OwnerID, DownloaderID: record.DownloaderID, DownloaderName: record.DownloaderName, ProviderType: record.ProviderType, DisplayName: record.DisplayName, JobStatus: jobStatus, ProviderStatus: record.ProviderStatus, Phase: record.Phase, ControlPending: record.Phase == models.DownloadTaskStatusCancelled && record.LastErrorCode == downloadCancellationPending, Progress: downloadProgressPercent(record), BytesCompleted: record.BytesCompleted, BytesTotal: record.BytesTotal, DownloadSpeed: record.DownloadSpeed, UploadSpeed: record.UploadSpeed, ETASeconds: record.ETASeconds, LastSampledAt: record.LastSampledAt, LastErrorCode: record.LastErrorCode, LastErrorMessage: record.LastErrorMessage, CreatedAt: record.CreatedAt, UpdatedAt: record.UpdatedAt, FinishedAt: record.FinishedAt, ProfileID: record.ProfileID, ProfileRevision: record.ProfileRevision, ScrapeStatus: record.ScrapeStatus, ScrapeTitle: record.ScrapeTitle, ScrapeMediaType: record.ScrapeMediaType, ScrapeCategory: record.ScrapeCategory, ScrapeTMDBID: record.ScrapeTMDBID, ScrapeConfidence: record.ScrapeConfidence, ScrapeSeason: cloneInt(record.ScrapeSeason), ScrapeEpisode: cloneInt(record.ScrapeEpisode), IdentitySource: record.IdentitySource, IdentityStatus: record.IdentityStatus, IdentityLocked: record.IdentityLocked, IdentityRevision: record.IdentityRevision, ManifestFiles: record.ManifestFileCount, TargetLibraryID: record.TargetLibraryID, TargetLibraryName: record.TargetLibraryName, TransferMode: record.TransferMode, ConflictPolicy: record.ConflictPolicy, RouteKind: record.TransferRouteKind, ExecutionLocation: normalizeExecutionLocation(record.ExecutionLocation), NodeID: record.NodeID, NodeName: record.NodeName}
+	return DownloadTaskSummary{AcquisitionState: downloadAcquisitionState(record, jobStatus), OfflineStartedAt: record.OfflineStartedAt, OfflineDeadlineAt: record.OfflineDeadlineAt, OfflineReadyAt: record.OfflineReadyAt, OfflineStartProvenance: record.OfflineStartProvenance, ID: record.ID, JobID: record.JobID, OwnerID: record.OwnerID, DownloaderID: record.DownloaderID, DownloaderName: record.DownloaderName, ProviderType: record.ProviderType, DisplayName: record.DisplayName, JobStatus: jobStatus, ProviderStatus: record.ProviderStatus, Phase: record.Phase, ControlPending: record.OfflineStopPending || record.Phase == models.DownloadTaskStatusCancelled && record.LastErrorCode == downloadCancellationPending, Progress: downloadProgressPercent(record), BytesCompleted: record.BytesCompleted, BytesTotal: record.BytesTotal, DownloadSpeed: record.DownloadSpeed, UploadSpeed: record.UploadSpeed, ETASeconds: record.ETASeconds, LastSampledAt: record.LastSampledAt, LastErrorCode: record.LastErrorCode, LastErrorMessage: record.LastErrorMessage, CreatedAt: record.CreatedAt, UpdatedAt: record.UpdatedAt, FinishedAt: record.FinishedAt, ProfileID: record.ProfileID, ProfileRevision: record.ProfileRevision, ScrapeStatus: record.ScrapeStatus, ScrapeTitle: record.ScrapeTitle, ScrapeMediaType: record.ScrapeMediaType, ScrapeCategory: record.ScrapeCategory, ScrapeTMDBID: record.ScrapeTMDBID, ScrapeConfidence: record.ScrapeConfidence, ScrapeSeason: cloneInt(record.ScrapeSeason), ScrapeEpisode: cloneInt(record.ScrapeEpisode), IdentitySource: record.IdentitySource, IdentityStatus: record.IdentityStatus, IdentityLocked: record.IdentityLocked, IdentityRevision: record.IdentityRevision, ManifestFiles: record.ManifestFileCount, TargetLibraryID: record.TargetLibraryID, TargetLibraryName: record.TargetLibraryName, TransferMode: record.TransferMode, ConflictPolicy: record.ConflictPolicy, RouteKind: record.TransferRouteKind, ExecutionLocation: normalizeExecutionLocation(record.ExecutionLocation), NodeID: record.NodeID, NodeName: record.NodeName}
 }
 
 func requestedTargetID(value *uint) uint {
@@ -1820,6 +1913,9 @@ func NewDownloadWorker(service *DownloadService) *DownloadWorker {
 }
 
 func (w *DownloadWorker) Run(ctx context.Context, runtime JobRuntime, job ClaimedJob) (result WorkerResult) {
+	if ctx.Err() != nil {
+		return WorkerResult{}
+	}
 	started := time.Now()
 	var observedTask models.DownloadTask
 	defer func() {
@@ -1889,6 +1985,13 @@ func (w *DownloadWorker) Run(ctx context.Context, runtime JobRuntime, job Claime
 	if task.Phase == models.DownloadTaskStatusCancelled {
 		return WorkerResult{}
 	}
+	if err := w.recoverOfflinePolicy(ctx, job, &task, downloaderRecord, client, source); err != nil {
+		return w.failure(task, err)
+	}
+	if task.OfflineSettledAt != nil && task.OfflineReadyAt == nil {
+		return WorkerResult{ErrorCode: firstNonEmpty(task.LastErrorCode, "offline_submission_not_accepted"), ErrorMessage: firstNonEmpty(task.LastErrorMessage, "原云端获取已结束，请重新选择资源后提交")}
+	}
+	ctx = w.offlineDispatchContext(ctx, job, &task)
 	operation := downloadOperation(downloaderRecord.Type, task.SourceOrigin)
 	if isCompletedRecognitionRecovery(task) {
 		manifestClient, ok := client.(downloadpkg.ManifestClient)
@@ -1927,8 +2030,23 @@ func (w *DownloadWorker) Run(ctx context.Context, runtime JobRuntime, job Claime
 		}
 		task.Phase = models.DownloadTaskStatusSubmitting
 		metadataOnly := downloaderRecord.Type == models.DownloaderTypeQBittorrent && source.Kind == downloadpkg.SourceURL && strings.HasPrefix(strings.ToLower(strings.TrimSpace(source.URL)), "magnet:")
-		providerTask, err := client.Submit(ctx, downloadpkg.SubmitRequest{Source: source, SavePath: savePath, Tag: task.ProviderTag, MetadataOnly: metadataOnly, ProviderDirectoryID: task.StagingProviderDirectoryID})
+		var providerTask downloadpkg.Task
+		submitRequest := downloadpkg.SubmitRequest{Source: source, SavePath: savePath, Tag: task.ProviderTag, MetadataOnly: metadataOnly, ProviderDirectoryID: task.StagingProviderDirectoryID}
+		if task.OfflineClockState == "legacy_unavailable" || task.OfflineKind != "" && (task.OfflineStartedAt != nil || normalizeExecutionLocation(task.ExecutionLocation) == models.NodeLocationRemote && job.Job.AttemptCount > 1 && downloadSubmissionUnconfirmed(task)) {
+			resolver, ok := client.(downloadpkg.SubmissionReconciler)
+			if !ok {
+				return offlineClockWait(task)
+			}
+			providerTask, err = resolver.ReconcileSubmission(ctx, submitRequest)
+		} else {
+			providerTask, err = client.Submit(ctx, submitRequest)
+		}
 		if err != nil {
+			if task.OfflineKind != "" && downloadpkg.DefiniteSubmissionNonAcceptance(err) {
+				if settleErr := w.settleOfflineNonAcceptance(ctx, job, &task); settleErr != nil {
+					return w.telemetryPersistenceFailure(task, task.ProviderTaskID, settleErr)
+				}
+			}
 			if diagnostic, ok := downloadpkg.FailureDiagnosticFromError(err); ok {
 				code, retryable := downloadpkg.ErrorInfo(err)
 				outcome := "failed"
@@ -1970,6 +2088,9 @@ func (w *DownloadWorker) Run(ctx context.Context, runtime JobRuntime, job Claime
 			}
 			return WorkerResult{}
 		}
+		if _, observeErr := w.observeOffline(ctx, job, &task, providerTask); observeErr != nil {
+			return w.failure(task, observeErr)
+		}
 		w.recordDownload(ctx, task, "download.provider_accepted", "submit", "accepted", "下载器已返回任务身份并完成持久保存；继续跟踪原任务，尚未确认下载完成", nil)
 	} else {
 		w.recordDownload(ctx, task, "download.provider_reused", "tracking", "reused", "已有持久保存的下载器任务身份，继续核对原任务状态，本次不重新提交下载", nil)
@@ -1980,14 +2101,22 @@ func (w *DownloadWorker) Run(ctx context.Context, runtime JobRuntime, job Claime
 			return *result
 		}
 	}
-	connectionID, eventDriven := w.pan115ConnectionID(ctx, downloaderRecord)
-	var eventGeneration uint64
-	if eventDriven {
-		eventGeneration, _ = w.service.providerEvents.snapshot(connectionID)
-	}
+	_, eventDriven := w.pan115ConnectionID(ctx, downloaderRecord)
 	var nextTagCleanupAt time.Time
 	for {
 		providerTask, err := client.Get(ctx, task.ProviderTaskID)
+		if err != nil && task.OfflineKind != "" && (downloadpkg.DefiniteSubmissionNonAcceptance(err) || downloadpkg.OfflineTerminalFailure(err)) {
+			var settleErr error
+			if downloadpkg.DefiniteSubmissionNonAcceptance(err) {
+				settleErr = w.settleOfflineNonAcceptance(ctx, job, &task)
+			} else {
+				settleErr = w.settleOfflineTerminalFailureOwned(ctx, &job, &task)
+			}
+			if settleErr != nil {
+				return w.telemetryPersistenceFailure(task, task.ProviderTaskID, settleErr)
+			}
+			return w.failure(task, err)
+		}
 		if err != nil {
 			if ctx.Err() != nil {
 				return WorkerResult{}
@@ -1995,7 +2124,7 @@ func (w *DownloadWorker) Run(ctx context.Context, runtime JobRuntime, job Claime
 			if code, _ := downloadpkg.ErrorInfo(err); code == "downloader_task_not_found" && strings.HasPrefix(task.ProviderTaskID, "tag:") {
 				return w.failureRetryable(task, err)
 			}
-			if code, retryable := downloadpkg.ErrorInfo(err); retryable && downloaderRecord.Type == models.DownloaderTypeQBittorrent && isEstablishedProviderTask(task.ProviderTaskID) {
+			if code, retryable := downloadpkg.ErrorInfo(err); retryable && isEstablishedProviderTask(task.ProviderTaskID) {
 				message := qBittorrentReconnectMessage(code)
 				if task.LastErrorCode != code || task.LastErrorMessage != message || task.ProviderStatus != "unavailable" {
 					if persistErr := w.markProviderReconnectWait(&task, code, message); persistErr != nil {
@@ -2003,10 +2132,7 @@ func (w *DownloadWorker) Run(ctx context.Context, runtime JobRuntime, job Claime
 					}
 					w.recordDownload(ctx, task, "download.reconnect_wait", "tracking", "waiting", "下载器连接暂时不可用，保留原任务等待连接恢复，不重复提交下载", map[string]any{"error_code": code})
 				}
-				if waitErr := w.waitForProviderReconnect(ctx); waitErr != nil {
-					return WorkerResult{}
-				}
-				continue
+				return w.observationResult(task, w.reconnectInterval)
 			}
 			return w.failure(task, err)
 		}
@@ -2052,7 +2178,36 @@ func (w *DownloadWorker) Run(ctx context.Context, runtime JobRuntime, job Claime
 			}
 			return w.telemetryPersistenceFailure(task, task.ProviderTaskID, err)
 		}
-		if providerTask.Completed {
+		goalReady, offlineErr := w.observeOffline(ctx, job, &task, providerTask)
+		if offlineErr != nil {
+			return w.failure(task, offlineErr)
+		}
+		if task.OfflineKind != "" && task.OfflineReadyAt == nil {
+			expired, expiryErr := w.service.expireOfflineTask(ctx, task, &job)
+			if expiryErr != nil {
+				return w.failure(task, expiryErr)
+			}
+			if expired {
+				return w.controlPendingResult()
+			}
+			if task.OfflineStartedAt == nil && !offlineDispatchWaiting(providerTask.Status) {
+				return offlineClockWait(task)
+			}
+		}
+		if task.OfflineStopPending && task.OfflineReadyAt != nil {
+			_ = w.stopOfflineExtras(ctx, &task, client)
+		}
+		requiredManifest := (*downloadpkg.Manifest)(nil)
+		if goalReady && providerTask.Offline != nil && providerTask.Offline.CompletionMode == downloadpkg.OfflineCompletionRequiredFiles && normalizeExecutionLocation(task.ExecutionLocation) == models.NodeLocationServer {
+			requiredManifest = providerTask.Offline.ReadyManifest
+			providerTask.Completed = requiredManifest != nil
+		}
+		if providerTask.Completed && (task.OfflineKind == "" || task.OfflineReadyAt != nil) {
+			if task.OfflineKind == "" {
+				if err := w.service.releaseDownloadAdmission(task); err != nil {
+					return w.telemetryPersistenceFailure(task, task.ProviderTaskID, err)
+				}
+			}
 			active, persistErr := w.updateActiveTask(&task, map[string]any{"phase": models.DownloadTaskStatusVerifying, "scrape_status": "completed_unverified", "updated_at": time.Now().UTC()})
 			if persistErr != nil {
 				return w.telemetryPersistenceFailure(task, task.ProviderTaskID, persistErr)
@@ -2066,7 +2221,13 @@ func (w *DownloadWorker) Run(ctx context.Context, runtime JobRuntime, job Claime
 			var completedSourceManifest *downloadpkg.Manifest
 			if manifestClient, ok := client.(downloadpkg.ManifestClient); ok {
 				_, _ = w.updateActiveTask(&task, map[string]any{"phase": models.DownloadTaskStatusVerifying, "updated_at": time.Now().UTC()})
-				manifest, manifestErr := manifestClient.Manifest(ctx, task.ProviderTaskID)
+				var manifest downloadpkg.Manifest
+				var manifestErr error
+				if requiredManifest != nil {
+					manifest = *requiredManifest
+				} else {
+					manifest, manifestErr = manifestClient.Manifest(ctx, task.ProviderTaskID)
+				}
 				if manifestErr != nil {
 					if _, retryable := downloadpkg.ErrorInfo(manifestErr); retryable {
 						return w.failureRetryable(task, manifestErr)
@@ -2111,6 +2272,11 @@ func (w *DownloadWorker) Run(ctx context.Context, runtime JobRuntime, job Claime
 			return WorkerResult{}
 		}
 		if providerTask.Failed {
+			if task.OfflineKind == "" || providerTask.Offline != nil && providerTask.Offline.TerminalFailure {
+				if err := w.service.releaseDownloadAdmission(task); err != nil {
+					return w.telemetryPersistenceFailure(task, task.ProviderTaskID, err)
+				}
+			}
 			code := providerTask.ErrorCode
 			if code == "" {
 				code = "downloader_provider_failed"
@@ -2119,20 +2285,11 @@ func (w *DownloadWorker) Run(ctx context.Context, runtime JobRuntime, job Claime
 			operation.Event(w.service.log.Error()).Str("task_id", task.ID).Str("downloader_id", downloaderRecord.ID).Str("error_code", code).Int64("duration_ms", time.Since(started).Milliseconds()).Msg(operation.Message("下载器报告任务失败"))
 			return WorkerResult{ErrorCode: code, ErrorMessage: "下载器报告任务失败"}
 		}
+		interval := w.pollInterval
 		if eventDriven {
-			if err := w.waitForPan115Poll(ctx, runtime, connectionID, &eventGeneration, task.ID); err != nil {
-				if ctx.Err() != nil {
-					return WorkerResult{}
-				}
-				return WorkerResult{ErrorCode: CodeQueueLeaseInvalid, ErrorMessage: "下载任务租约已失效"}
-			}
-			continue
+			interval = w.pan115PollInterval
 		}
-		select {
-		case <-ctx.Done():
-			return WorkerResult{}
-		case <-time.After(w.pollInterval):
-		}
+		return w.observationResult(task, interval)
 	}
 }
 
@@ -2207,7 +2364,7 @@ func isCompletedRecognitionRecovery(task models.DownloadTask) bool {
 		return false
 	}
 	if task.TargetLibraryID == nil {
-		return false
+		return task.OfflineReadyAt != nil && task.OfflineCompletionMode == downloadpkg.OfflineCompletionRequiredFiles && strings.TrimSpace(task.CompletedManifestJSON) != "" && strings.TrimSpace(task.CompletedManifestJSON) != "{}"
 	}
 	if task.ProviderTaskID != "" {
 		return true
@@ -2237,6 +2394,24 @@ func (w *DownloadWorker) completedRecognitionManifestClient(ctx context.Context,
 }
 
 func (w *DownloadWorker) runCompletedRecognitionRecovery(ctx context.Context, runtime JobRuntime, task models.DownloadTask, manifest downloadpkg.Manifest) WorkerResult {
+	if err := runtime.Heartbeat(task.Progress, task.BytesCompleted, task.BytesTotal, nil, nil); err != nil {
+		return WorkerResult{ErrorCode: CodeQueueLeaseInvalid, ErrorMessage: "下载任务租约已失效"}
+	}
+	if ctx.Err() != nil {
+		return WorkerResult{}
+	}
+
+	if task.TargetLibraryID == nil {
+		if _, err := encodeCompletedDownloadManifest(manifest); err != nil {
+			return w.failure(task, err)
+		}
+		now := w.service.queue.clock.Now()
+		if _, err := w.updateActiveTask(&task, map[string]any{"phase": models.DownloadTaskStatusCompleted, "finished_at": now, "updated_at": now}); err != nil {
+			return w.failure(task, err)
+		}
+		return WorkerResult{}
+	}
+
 	if task.StagingCategory == "" && strings.TrimSpace(task.ScrapeCategory) != "" {
 		task.StagingCategory = task.ScrapeCategory
 		active, err := w.updateActiveTask(&task, map[string]any{"staging_category": task.StagingCategory, "updated_at": time.Now().UTC()})
@@ -2246,9 +2421,6 @@ func (w *DownloadWorker) runCompletedRecognitionRecovery(ctx context.Context, ru
 		if !active {
 			return WorkerResult{}
 		}
-	}
-	if err := runtime.Heartbeat(task.Progress, task.BytesCompleted, task.BytesTotal, nil, nil); err != nil {
-		return WorkerResult{ErrorCode: CodeQueueLeaseInvalid, ErrorMessage: "下载任务租约已失效"}
 	}
 	selected, err := w.verifyCompleted(ctx, &task, manifest)
 	if err != nil {
@@ -2342,7 +2514,7 @@ func completedDownloadManifest(raw string) (downloadpkg.Manifest, bool, error) {
 }
 
 func (w *DownloadWorker) resetFailedPan115ForExplicitRetry(ctx context.Context, task *models.DownloadTask, client downloadpkg.Client, providerType string) error {
-	if providerType != models.DownloaderTypePan115Offline || task.Phase != models.DownloadTaskStatusFailed || task.ProviderTaskID == "" {
+	if task.OfflineKind != "" || providerType != models.DownloaderTypePan115Offline || task.Phase != models.DownloadTaskStatusFailed || task.ProviderTaskID == "" {
 		return nil
 	}
 	providerTask, err := client.Get(ctx, task.ProviderTaskID)
@@ -2457,6 +2629,14 @@ func (w *DownloadWorker) prepareClassification(ctx context.Context, runtime JobR
 				result := w.failureRetryable(*task, reconcileErr)
 				return &result
 			}
+			if code, retryable := downloadpkg.ErrorInfo(err); retryable && isEstablishedProviderTask(task.ProviderTaskID) {
+				if persistErr := w.markProviderReconnectWait(task, code, "下载器文件清单暂时不可用，保留原任务等待状态恢复"); persistErr != nil {
+					result := WorkerResult{ErrorCode: "download_state_persist_failed", ErrorMessage: "下载器连接状态保存失败"}
+					return &result
+				}
+				result := w.observationResult(*task, w.reconnectInterval)
+				return &result
+			}
 			result := w.failure(*task, err)
 			return &result
 		}
@@ -2517,12 +2697,8 @@ func (w *DownloadWorker) prepareClassification(ctx context.Context, runtime JobR
 			result := WorkerResult{ErrorCode: CodeQueueLeaseInvalid, ErrorMessage: "下载任务租约已失效"}
 			return &result
 		}
-		select {
-		case <-ctx.Done():
-			result := WorkerResult{}
-			return &result
-		case <-time.After(w.pollInterval):
-		}
+		result := w.observationResult(*task, w.pollInterval)
+		return &result
 	}
 }
 
@@ -2949,7 +3125,7 @@ func (w *DownloadWorker) Interrupt(ctx context.Context, job ClaimedJob, action s
 	if task.ProviderType == models.DownloaderTypePluginHTTP && w.service.pluginDownloads != nil {
 		return w.service.pluginDownloads.Interrupt(ctx, job, action)
 	}
-	if action != "cancel" && task.LastErrorCode == downloadCancellationPending {
+	if action != "cancel" && task.LastErrorCode == downloadCancellationPending || task.OfflineStopPending {
 		return appError(CodeQueueStateConflict, "原云端操作正在取消收尾", nil)
 	}
 	if task.ProviderTaskID == "" {
@@ -3051,7 +3227,11 @@ func (w *DownloadWorker) load(ctx context.Context, job ClaimedJob) (models.Downl
 	if err := validateStoredContentSelection(source); err != nil {
 		return task, record, nil, downloadpkg.Source{}, "", err
 	}
-	return task, record, client, downloadpkg.Source{Kind: source.Kind, URL: source.URL, Torrent: source.Torrent, Filename: source.Filename, ProviderItemID: source.ProviderItemID, ShareSelection: source.ShareSelection, ContentSelection: source.ContentSelection, AllFilesVerified: source.SelectionMode == "verified_all"}, savePath, nil
+	executable := offlineSource(source, task)
+	if err := downloadpkg.BindOfflineRequired(client, executable.OfflineRequired); err != nil {
+		return task, record, nil, executable, savePath, err
+	}
+	return task, record, client, executable, savePath, nil
 }
 
 func (w *DownloadWorker) taskDownloaderClient(ctx context.Context, task *models.DownloadTask) (models.Downloader, downloadpkg.Client, string, error) {
@@ -3254,6 +3434,10 @@ func (w *DownloadWorker) failure(task models.DownloadTask, err error) WorkerResu
 	if errors.As(err, &applicationError) {
 		code, retryable = ErrorCode(err), false
 	}
+	if code == "node_execution_control_upgrade_required" || code == "offline_clock_unknown" {
+		next := w.service.queue.clock.Now().Add(time.Minute)
+		return WorkerResult{RetryAt: &next, ErrorCode: code, ErrorMessage: ErrorMessage(err)}
+	}
 	if retryable {
 		return w.failureRetryable(task, err)
 	}
@@ -3290,6 +3474,9 @@ func (w *DownloadWorker) failureRetryable(task models.DownloadTask, err error) W
 	next := time.Now().UTC().Add(10 * time.Second)
 	if unconfirmedDownloadCode(code) {
 		next = time.Now().UTC().Add(time.Minute)
+	}
+	if task.OfflineReadyAt == nil && task.OfflineDeadlineAt != nil && task.OfflineDeadlineAt.Before(next) {
+		next = *task.OfflineDeadlineAt
 	}
 	operation := downloadOperation(task.ProviderType, task.SourceOrigin)
 	event := operation.Event(w.service.log.Warn()).Str("task_id", task.ID).Str("error_code", code).Time("retry_at", next)

@@ -368,6 +368,7 @@ export interface DownloaderOption {
   execution_location: 'server' | 'node'
 }
 export interface DownloaderSummary {
+  max_concurrent_downloads?: number
   id: string; name: string; type: 'fake' | 'qbittorrent' | 'pan115_offline' | 'quark_share'; base_url: string; enabled: boolean
   sort_order: number
   execution_location: 'server' | 'node'; node_id?: string; node_name?: string
@@ -415,6 +416,9 @@ export interface AIRecognitionSettings {
 }
 export interface AIProviderModel { id: string; display_name: string }
 export interface DownloadTaskSummary {
+  acquisition_state?: 'waiting_capacity' | 'active' | 'observing' | 'reconnecting' | 'cloud_ready' | 'cancelled_stop_pending' | 'clock_unknown'
+  offline_started_at?: string; offline_deadline_at?: string; offline_ready_at?: string
+  offline_start_provenance?: 'dispatch' | 'accepted' | 'provider_added'
   wait_reason?: { code: string; message: string }
   control_pending?: boolean
   id: string; job_id: string; owner_id: number; downloader_id: string | null; downloader_name: string; provider_type: string

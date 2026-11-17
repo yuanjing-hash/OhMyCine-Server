@@ -20,18 +20,20 @@ const (
 )
 
 type Client struct {
-	scopeMu        sync.Mutex
-	operationScope string
-	driver         cloud.NativeOfflineDriver
-	rootID         string
-	directoryID    string
+	accountNamespace string
+	required         *downloader.OfflineRequiredPlan
+	scopeMu          sync.Mutex
+	operationScope   string
+	driver           cloud.NativeOfflineDriver
+	rootID           string
+	directoryID      string
 }
 
 func New(config downloader.Config) (downloader.Client, error) {
 	if config.CloudDriver == nil || strings.TrimSpace(config.ProviderStorageRootID) == "" || strings.TrimSpace(config.ProviderDirectoryID) == "" {
 		return nil, errors.New("115 offline downloader requires a provider storage")
 	}
-	return &Client{driver: config.CloudDriver, rootID: strings.TrimSpace(config.ProviderStorageRootID), directoryID: strings.TrimSpace(config.ProviderDirectoryID)}, nil
+	return &Client{accountNamespace: config.OfflineAccountNamespace, driver: config.CloudDriver, rootID: strings.TrimSpace(config.ProviderStorageRootID), directoryID: strings.TrimSpace(config.ProviderDirectoryID)}, nil
 }
 
 func (c *Client) Test(ctx context.Context) (downloader.Health, error) {
@@ -45,6 +47,9 @@ func (c *Client) Test(ctx context.Context) (downloader.Health, error) {
 }
 
 func (c *Client) Submit(ctx context.Context, request downloader.SubmitRequest) (downloader.Task, error) {
+	if err := downloader.BindOfflineRequired(c, request.Source.OfflineRequired); err != nil {
+		return downloader.Task{}, err
+	}
 	if request.Source.ContentSelection != nil {
 		return c.submitSelected(ctx, request)
 	}
@@ -88,12 +93,38 @@ func (c *Client) Submit(ctx context.Context, request downloader.SubmitRequest) (
 	if err != nil {
 		return downloader.Task{}, downloader.WithFailureStage(mapError(err), downloader.FailureOfflineSubmission)
 	}
-	return mapTask(task), nil
+	return c.observeOffline(ctx, task), nil
 }
 
 // ReconcileSubmission inspects the original task directory and operation only.
 // Missing/unsupported evidence remains pending; it never enters Submit.
 func (c *Client) ReconcileSubmission(ctx context.Context, request downloader.SubmitRequest) (downloader.Task, error) {
+	if request.Source.ContentSelection != nil {
+		if !c.SupportsSelectiveFiles() || !validTaskTag(request.Tag) || request.MetadataOnly {
+			return downloader.Task{}, downloader.Error("downloader_selection_invalid", false, nil)
+		}
+		manifest, err := downloader.ValidateContentSource(request.Source)
+		if err != nil {
+			return downloader.Task{}, err
+		}
+		resolver, ok := c.driver.(cloud.SelectiveOfflineSubmissionReconciler)
+		if !ok {
+			return downloader.Task{}, downloader.Error("downloader_submission_reconcile_unsupported", true, nil)
+		}
+		directory := strings.TrimSpace(request.ProviderDirectoryID)
+		if directory == "" {
+			directory = c.directoryID
+		}
+		binding := downloader.SelectionContext{Tag: request.Tag, Selection: *request.Source.ContentSelection, RootName: manifest.Name, MultiFile: manifest.MultiFile}
+		snapshot, err := resolver.ReconcileSelectedOffline(ctx, cloud.SelectiveOfflineRequest{Authority: c.selectedAuthority(binding), ParentID: directory, Torrent: append([]byte(nil), request.Source.Torrent...)})
+		if err != nil {
+			return downloader.Task{}, selectedAdapterError(err)
+		}
+		if err := selectedSnapshot(snapshot, snapshot.Task.ID, binding); err != nil {
+			return downloader.Task{}, err
+		}
+		return c.observeOffline(ctx, snapshot.Task), nil
+	}
 	resolver, ok := c.driver.(cloud.OfflineSubmissionReconciler)
 	if !ok || request.Source.Kind != downloader.SourceURL || request.Source.ContentSelection != nil || !validTaskTag(request.Tag) {
 		return downloader.Task{}, downloader.Error("downloader_submission_reconcile_unsupported", true, nil)
@@ -109,7 +140,10 @@ func (c *Client) ReconcileSubmission(ctx context.Context, request downloader.Sub
 	// The original receipt supplies the exact submitted directory. Looking up
 	// today's configured parent could attach cleanup to a different namespace.
 	task, err := resolver.ReconcileOfflineSubmission(ctx, sourceURL, "")
-	return mapTask(task), mapError(err)
+	if err != nil {
+		return downloader.Task{}, mapError(err)
+	}
+	return c.observeOffline(ctx, task), nil
 }
 
 const (
@@ -383,7 +417,7 @@ func (c *Client) Get(ctx context.Context, id string) (downloader.Task, error) {
 	if err != nil {
 		return downloader.Task{}, mapError(err)
 	}
-	return mapTask(task), nil
+	return c.observeOffline(ctx, task), nil
 }
 
 func (c *Client) Manifest(ctx context.Context, id string) (downloader.Manifest, error) {
@@ -529,7 +563,11 @@ func mapTask(task cloud.OfflineTask) downloader.Task {
 		value := 100.0
 		progress = &value
 	}
-	return downloader.Task{ID: task.ID, Name: task.Name, Status: task.Status, Progress: progress, BytesCompleted: completed, BytesTotal: task.BytesTotal, ETASeconds: task.ETASeconds, Completed: task.Completed, Failed: task.Failed, OutputItemID: task.OutputItemID}
+	mode := downloader.OfflineCompletionUnknown
+	if task.Completed && !task.Failed {
+		mode = downloader.OfflineCompletionAggregate
+	}
+	return downloader.Task{Offline: &downloader.OfflineObservation{Version: 1, Kind: downloader.OfflineOperationCloud, OperationID: task.ID, OutputRootID: task.OutputItemID, StartedAt: task.StartedAt, StartProvenance: task.StartProvenance, Ready: task.Completed && !task.Failed, CompletionMode: mode, KeepOutputStop: true, UpstreamStopped: task.Completed && !task.Failed}, ID: task.ID, Name: task.Name, Status: task.Status, Progress: progress, BytesCompleted: completed, BytesTotal: task.BytesTotal, ETASeconds: task.ETASeconds, Completed: task.Completed, Failed: task.Failed, OutputItemID: task.OutputItemID}
 }
 
 func mapError(err error) error {

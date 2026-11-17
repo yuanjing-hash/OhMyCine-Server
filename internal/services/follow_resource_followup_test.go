@@ -157,7 +157,9 @@ func newFollowPreviewFixture(t *testing.T) (*followCoverageFixture, *followPrevi
 		t.Fatalf("cloud-source fixture lacks complete current evidence: %+v %v", coverage, err)
 	}
 	caps := downloadpkg.Capabilities{ShareReceive: true, NativeOffline: true, OutputConstraint: downloadpkg.OutputConstraintProviderStorage}
-	if err := sites.downloads.downloader.registry.Register(models.DownloaderTypePan115Offline, caps, func(downloadpkg.Config) (downloadpkg.Client, error) { return &stubDownloadClient{}, nil }); err != nil {
+	if err := sites.downloads.downloader.registry.Register(models.DownloaderTypePan115Offline, caps, func(config downloadpkg.Config) (downloadpkg.Client, error) {
+		return &sourceAwareNativeStub{&stubDownloadClient{}, config.OfflineAccountNamespace}, nil
+	}); err != nil {
 		t.Fatal(err)
 	}
 	capsRaw, _ := json.Marshal(caps)

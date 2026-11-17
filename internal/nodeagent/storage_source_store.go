@@ -8,24 +8,27 @@ import (
 	"strings"
 	"time"
 
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/downloader"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/nodeprotocol"
 )
 
 type StorageSourceRun struct {
-	OperationKey    string
-	ServerID        string
-	TaskID          string
-	PlanDigest      string
-	StorageID       string
-	Status          string
-	ProviderTaskID  string
-	OutputRootID    string
-	ManifestDigest  string
-	ManifestReady   bool
-	TotalFiles      int64
-	TotalBytes      int64
-	DownloadedFiles int64
-	DownloadedBytes int64
+	Offline          *downloader.OfflineObservation
+	OfflineStopState string
+	OperationKey     string
+	ServerID         string
+	TaskID           string
+	PlanDigest       string
+	StorageID        string
+	Status           string
+	ProviderTaskID   string
+	OutputRootID     string
+	ManifestDigest   string
+	ManifestReady    bool
+	TotalFiles       int64
+	TotalBytes       int64
+	DownloadedFiles  int64
+	DownloadedBytes  int64
 }
 
 type StorageSourceFile struct {
@@ -58,9 +61,17 @@ func (s *Store) PrepareStorageSourceRun(ctx context.Context, serverID string, re
 func (s *Store) StorageSourceRun(ctx context.Context, serverID, operationKey string) (StorageSourceRun, error) {
 	var result StorageSourceRun
 	var ready int
-	err := s.db.QueryRowContext(ctx, `SELECT operation_key,paired_server_id,task_id,plan_digest,storage_id,status,provider_task_id,output_root_id,manifest_digest,manifest_ready,total_files,total_bytes,downloaded_files,downloaded_bytes FROM storage_source_runs WHERE operation_key=? AND paired_server_id=?`, operationKey, serverID).Scan(&result.OperationKey, &result.ServerID, &result.TaskID, &result.PlanDigest, &result.StorageID, &result.Status, &result.ProviderTaskID, &result.OutputRootID, &result.ManifestDigest, &ready, &result.TotalFiles, &result.TotalBytes, &result.DownloadedFiles, &result.DownloadedBytes)
+	var offlineJSON string
+	err := s.db.QueryRowContext(ctx, `SELECT operation_key,paired_server_id,task_id,plan_digest,storage_id,status,provider_task_id,output_root_id,manifest_digest,manifest_ready,total_files,total_bytes,downloaded_files,downloaded_bytes,cloud_offline_json,offline_stop_state FROM storage_source_runs WHERE operation_key=? AND paired_server_id=?`, operationKey, serverID).Scan(&result.OperationKey, &result.ServerID, &result.TaskID, &result.PlanDigest, &result.StorageID, &result.Status, &result.ProviderTaskID, &result.OutputRootID, &result.ManifestDigest, &ready, &result.TotalFiles, &result.TotalBytes, &result.DownloadedFiles, &result.DownloadedBytes, &offlineJSON, &result.OfflineStopState)
 	if errors.Is(err, sql.ErrNoRows) {
 		return StorageSourceRun{}, ErrOperationNotFound
+	}
+	if err == nil && offlineJSON != "" {
+		var observation downloader.OfflineObservation
+		if json.Unmarshal([]byte(offlineJSON), &observation) != nil {
+			return StorageSourceRun{}, ErrPlanConflict
+		}
+		result.Offline = &observation
 	}
 	result.ManifestReady = ready != 0
 	return result, err
@@ -261,7 +272,11 @@ func (s *Store) CompleteStorageSourceAction(ctx context.Context, serverID, reque
 		return ErrOperationNotFound
 	}
 	one := float64(1)
-	result, err = tx.ExecContext(ctx, `UPDATE operations SET status=?,phase=?,error_code='',progress=?,revision=revision+1,updated_at=? WHERE operation_key=? AND paired_server_id=? AND plan_digest=? AND status NOT IN (?,?)`, nodeprotocol.OperationCompleted, nodeprotocol.PhaseCompleted, one, now.UTC(), operationKey, serverID, planDigest, nodeprotocol.OperationCompleted, nodeprotocol.OperationCancelled)
+	operationStatus, operationPhase := nodeprotocol.OperationCompleted, nodeprotocol.PhaseCompleted
+	if response.Offline != nil && response.Offline.StopPending {
+		operationStatus, operationPhase = nodeprotocol.OperationRunning, nodeprotocol.PhaseWaitingDownload
+	}
+	result, err = tx.ExecContext(ctx, `UPDATE operations SET status=?,phase=?,error_code='',progress=?,revision=revision+1,updated_at=? WHERE operation_key=? AND paired_server_id=? AND plan_digest=? AND status NOT IN (?,?)`, operationStatus, operationPhase, one, now.UTC(), operationKey, serverID, planDigest, nodeprotocol.OperationCompleted, nodeprotocol.OperationCancelled)
 	if err != nil {
 		return err
 	}

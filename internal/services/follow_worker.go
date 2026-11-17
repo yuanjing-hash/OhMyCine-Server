@@ -512,6 +512,11 @@ func (w *FollowSearchWorker) Run(ctx context.Context, runtime JobRuntime, job Cl
 			if ctx.Err() != nil {
 				return w.stopRun(run, models.FollowRunCancelled, "follow_cancelled", "追更任务已取消")
 			}
+			if ErrorCode(err) == CodeOfflineConfirmationRequired {
+				filterSummary["offline_history_skipped"]++
+				w.record(candidateCtx, "follow.offline_history_skipped", "route", "skipped", "这个离线路线此前在 30 分钟内未完成，继续其他资源或兼容路线", nil)
+				continue
+			}
 			filterSummary["submit_failed"]++
 			submitFailures++
 			lastSubmitMessage = safeErrorMessage(err, "资源提交失败")
@@ -575,7 +580,7 @@ func (w *FollowSearchWorker) Run(ctx context.Context, runtime JobRuntime, job Cl
 
 func isDefinitiveNoTaskRouteError(code string) bool {
 	switch code {
-	case CodeDownloaderUnavailable, CodeDownloaderStorageUnavailable, CodeDownloadSourceInvalid, CodeDownloadStagingRequired, CodeDownloadStagingUnavailable, CodeMediaLibraryStorageUnavailable, CodeMediaLibraryProfileUnavailable, CodeMediaLibraryPathInvalid, CodeTransferRouteUnsupported:
+	case CodeOfflineConfirmationRequired, CodeDownloaderUnavailable, CodeDownloaderStorageUnavailable, CodeDownloadSourceInvalid, CodeDownloadStagingRequired, CodeDownloadStagingUnavailable, CodeMediaLibraryStorageUnavailable, CodeMediaLibraryProfileUnavailable, CodeMediaLibraryPathInvalid, CodeTransferRouteUnsupported:
 		return true
 	default:
 		return false

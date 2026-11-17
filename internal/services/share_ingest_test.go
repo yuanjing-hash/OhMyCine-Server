@@ -114,7 +114,9 @@ func newShareIngestFixture(t *testing.T) shareIngestFixture {
 	}
 	downloadRegistry := downloadpkg.NewRegistry()
 	client := &stubDownloadClient{}
-	if err := downloadRegistry.Register(models.DownloaderTypePan115Offline, capabilities, func(downloadpkg.Config) (downloadpkg.Client, error) { return client, nil }); err != nil {
+	if err := downloadRegistry.Register(models.DownloaderTypePan115Offline, capabilities, func(config downloadpkg.Config) (downloadpkg.Client, error) {
+		return &sourceAwareNativeStub{client, config.OfflineAccountNamespace}, nil
+	}); err != nil {
 		t.Fatal(err)
 	}
 	downloaders := NewDownloaderService(db, audit, store, downloadRegistry)
@@ -264,8 +266,8 @@ func TestOrdinaryPan115OfflineDownloadKeepsDownloaderStagingDirectory(t *testing
 	if err := fixture.db.First(&task, "id = ?", created.ID).Error; err != nil {
 		t.Fatal(err)
 	}
-	if task.StagingProviderDirectoryID != "" {
-		t.Fatalf("ordinary 115 offline task unexpectedly overrides staging directory with %q", task.StagingProviderDirectoryID)
+	if task.StagingProviderDirectoryID != fixture.downloader.ProviderDirectoryID || task.OfflineAccountNamespace == "" || task.OfflineStartedAt != nil {
+		t.Fatalf("ordinary offline task did not freeze its downloader directory/account before dispatch: %q", task.StagingProviderDirectoryID)
 	}
 }
 

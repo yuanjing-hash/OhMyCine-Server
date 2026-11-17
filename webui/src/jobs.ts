@@ -82,6 +82,11 @@ export const statusLabels: Record<JobStatus, string> = {
   failed: "失败",
   cancelled: "已取消",
 };
+export function jobStatusLabel(job: Pick<Job, 'status' | 'wait_reason'>): string {
+  if (job.wait_reason?.code === 'download_observation_pending') return '等待下次状态核对';
+  if (job.wait_reason?.code === 'downloader_capacity') return '等待下载器空位';
+  return statusLabels[job.status];
+}
 const jobTypeLabels: Record<string, string> = {
   download: '下载', transfer: '整理入库', 'follow-search': '订阅搜索',
   unified_schedule: '计划任务', media_library_recognition: '识别媒体',

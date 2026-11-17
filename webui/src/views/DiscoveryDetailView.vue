@@ -8,8 +8,10 @@ import { notify } from '@/toast'
 import FollowEditorDialog from '@/components/FollowEditorDialog.vue'
 import type { FollowSummary } from '@/follows'
 import { useAuthStore } from '@/stores/auth'
+import { acquisitionStateLabel, offlineTimingLabel } from '@/downloads'
+import type { DownloadTaskSummary } from '@/types/api'
 
-interface AcquisitionStatus {
+interface AcquisitionStatus extends Pick<DownloadTaskSummary, 'acquisition_state' | 'offline_started_at' | 'offline_deadline_at' | 'offline_ready_at' | 'offline_start_provenance'> {
   stage: string
   status: string
   transfer_task_id?: string
@@ -41,6 +43,8 @@ const identity = computed(() => ({
 const acquisitionLabel = computed(() => {
   const current = acquisition.value
   if (!current || current.stage === 'idle') return '尚未创建入库任务'
+  if (current.stage === 'download' && current.acquisition_state === 'cancelled_stop_pending') return acquisitionStateLabel(current.acquisition_state)
+  if (current.stage === 'download' && current.acquisition_state && !['failed', 'cancelled', 'canceled', 'paused', 'completed', 'unavailable'].includes(current.status)) return acquisitionStateLabel(current.acquisition_state)
   const stages: Record<string, string> = { subscription: '自动追更', download: '下载', organize: '整理', import: '入库', library: '已入库' }
   return `${stages[current.stage] ?? current.stage} · ${current.status}`
 })
@@ -105,7 +109,7 @@ watch(() => route.fullPath, load)
         <div class="grid gap-6 p-6 md:grid-cols-[11rem_minmax(0,1fr)]">
           <div class="detail-poster"><img v-if="detail.work.poster_url" :src="detail.work.poster_url" :alt="`${detail.work.title} 海报`" /><span v-else>暂无海报</span></div>
           <div class="min-w-0 self-end">
-            <div class="flex flex-wrap gap-2"><span class="status-chip">{{ providerLabel(detail.work.provider) }}</span><span class="status-chip">{{ detail.work.media_type === 'tv' ? '剧集' : '电影' }}</span><span v-if="detail.work.rating != null" class="status-chip status-chip--ready">{{ detail.work.rating.toFixed(1) }}</span><span v-if="detail.work.tmdb_id" :class="acquisition?.stage === 'library' ? 'status-chip status-chip--ready' : acquisition?.last_error_code ? 'status-chip status-chip--warning' : 'status-chip'">{{ acquisitionLoading ? '正在读取入库状态…' : acquisitionLabel }}</span></div>
+            <div class="flex flex-wrap gap-2"><span class="status-chip">{{ providerLabel(detail.work.provider) }}</span><span class="status-chip">{{ detail.work.media_type === 'tv' ? '剧集' : '电影' }}</span><span v-if="detail.work.rating != null" class="status-chip status-chip--ready">{{ detail.work.rating.toFixed(1) }}</span><span v-if="detail.work.tmdb_id" :class="acquisition?.stage === 'library' ? 'status-chip status-chip--ready' : acquisition?.last_error_code ? 'status-chip status-chip--warning' : 'status-chip'">{{ acquisitionLoading ? '正在读取入库状态…' : acquisitionLabel }}</span></div><p v-if="acquisition && offlineTimingLabel(acquisition)" class="text-subtle mt-2 text-xs">{{ offlineTimingLabel(acquisition) }}</p>
             <h1 class="mb-0 mt-3 text-3xl font-850">{{ detail.work.title }}</h1>
             <p v-if="detail.work.original_title" class="mb-0 mt-1 text-sm text-muted">{{ detail.work.original_title }}</p>
             <p class="mb-0 mt-3 text-sm text-muted">{{ [detail.work.year, detail.runtime_minutes ? `${detail.runtime_minutes} 分钟` : '', ...detail.genres].filter(Boolean).join(' · ') }}</p>

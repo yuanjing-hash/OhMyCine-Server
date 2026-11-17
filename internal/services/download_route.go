@@ -233,6 +233,9 @@ func isPreviewSourceKind(kind string) bool {
 }
 
 func (s *DownloadService) validatePreviewSource(downloader models.Downloader, sourceKind string, siteID *uint) error {
+	if err := s.validateOfflineSourcePreview(downloader, sourceKind); err != nil {
+		return err
+	}
 	if sourceKind == downloadpkg.SourceQuarkShare && downloader.Type != models.DownloaderTypeQuarkShare || downloader.Type == models.DownloaderTypeQuarkShare && sourceKind != downloadpkg.SourceQuarkShare {
 		return appError(CodeDownloadSourceInvalid, "夸克分享只能通过夸克分享接收器转存，不支持离线下载", nil)
 	}
@@ -288,6 +291,9 @@ func validateSiteDownloadSource(downloader models.Downloader, sourceKind string,
 }
 
 func (s *DownloadService) previewDownloadTarget(ctx context.Context, downloader models.Downloader, library models.MediaLibrary, sourceKind string) (*downloadTargetSnapshot, models.MediaClassificationProfile, error) {
+	if err := s.validateOfflineSourcePreview(downloader, sourceKind); err != nil {
+		return nil, models.MediaClassificationProfile{}, err
+	}
 	return s.buildDownloadTargetSnapshot(ctx, downloader, library, sourceKind, false)
 }
 

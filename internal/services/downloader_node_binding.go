@@ -218,7 +218,7 @@ func (s *DownloaderService) clientForTask(ctx context.Context, record models.Dow
 		}
 		return remote, err
 	}
-	if record.Type == models.DownloaderTypeQuarkShare && task.StagingProviderDirectoryID != "" {
+	if (record.Type == models.DownloaderTypeQuarkShare || task.OfflineKind != "") && task.StagingProviderDirectoryID != "" {
 		if task.StagingStorageID == nil || record.StorageID == nil || *task.StagingStorageID != *record.StorageID {
 			return nil, appError(CodeDownloaderUnavailable, "下载任务冻结的夸克接收 Storage 已变化", nil)
 		}

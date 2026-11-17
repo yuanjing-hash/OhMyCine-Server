@@ -13,6 +13,24 @@ func TestStorageSourcePlanRequiresDifferentStableIdentities(t *testing.T) {
 	if err := plan.Validate(); err != nil {
 		t.Fatal(err)
 	}
+	v1 := plan
+	v1.CloudOfflineLifecycleVersion = 1
+	if err := v1.Validate(); err == nil {
+		t.Fatal("new cloud lifecycle accepted missing account namespace")
+	}
+	v1.OfflineAccountNamespace = strings.Repeat("d", 64)
+	if err := v1.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	share := v1
+	share.SourceKind = StorageSourceKindPan115Share
+	if err := share.Validate(); err == nil {
+		t.Fatal("share acquired cloud offline lifecycle")
+	}
+	v1.OfflineRequiredDigest = "invented"
+	if err := v1.Validate(); err == nil {
+		t.Fatal("unsealed required intent digest was accepted")
+	}
 	plan.TargetIdentityDigest = plan.SourceIdentityDigest
 	if err := plan.Validate(); err == nil {
 		t.Fatal("same-identity source route was accepted")

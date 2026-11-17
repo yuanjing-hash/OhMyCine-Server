@@ -51,6 +51,9 @@ func (s *DownloadService) observedSubmission(ctx context.Context, task models.Do
 }
 
 func (w *DownloadWorker) recordDownload(ctx context.Context, task models.DownloadTask, code, stage, outcome, message string, additional map[string]any) {
+	if code == "download.metadata_wait" || task.ProviderTaskID != "" && (code == "download.start" || code == "download.provider_reused") {
+		return
+	}
 	fields := downloadBusinessFields(task)
 	fields["job_id"] = task.JobID
 	for key, value := range additional {
@@ -60,6 +63,9 @@ func (w *DownloadWorker) recordDownload(ctx context.Context, task models.Downloa
 }
 
 func (w *DownloadWorker) recordDownloadEnd(ctx context.Context, task models.DownloadTask, started time.Time, result WorkerResult) {
+	if result.RetryAt != nil && result.ErrorCode == "" {
+		return
+	}
 	var persisted models.DownloadTask
 	if w.service.db.First(&persisted, "id = ?", task.ID).Error == nil {
 		task = persisted

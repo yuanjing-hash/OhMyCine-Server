@@ -763,3 +763,7 @@ ports:
 ## 原生在线离线传输边界
 
 原生私有计划每次要求当前设备 read + download 和插件当前下载授权。敏感 Header 留在 Host，短期 CDN URL/密钥只在 no-store 原生响应内使用，禁止写日志和任务持久状态；OfflineOnly 引用不能从普通播放网关重放。重定向按 scheme/host/port 判断 origin，跨 origin 去掉认证 Header；所有子资产保持 owner/package/generation 和网络校验。详见 [插件原生离线下载](28-plugin-native-offline.md)。
+
+## 离线失败历史与单次确认边界
+
+离线策略只消费工厂确认的账号 namespace 与实际操作能力；厂商凭据解析及既有 UID/profile 一致性校验留在 downloader/account resolver。历史按原 owner、账号、规范资源与 required scope 隔离，不能用标题、共享显示名或单个 downloader ID 代替账号。原始来源继续加密，HTTP 错误只 allowlist 固定 warning 字段。确认 token 保存随机摘要、授权版本、opaque 入口/选集/目标/路线及失败版本绑定，接受回执只读重放不恢复消费 claim，不绕过未知原写入或扩大 Node grant。超时/required-goal 均保留云文件和原 stop receipt；未证实的 extras 不能被整包清理。详见 [离线获取安全合同](../api/offline-acquisition.md)。

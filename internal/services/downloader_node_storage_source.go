@@ -19,8 +19,17 @@ import (
 )
 
 type nodeStorageProbe struct {
-	node  *nodeclient.Client
-	quark bool
+	offline          bool
+	accountNamespace string
+	node             *nodeclient.Client
+	quark            bool
+}
+
+func (client nodeStorageProbe) OfflineOperation(source downloadpkg.Source) downloadpkg.OfflineOperation {
+	if !client.offline || source.Kind != downloadpkg.SourceURL && source.Kind != downloadpkg.SourceTorrent {
+		return downloadpkg.OfflineOperation{}
+	}
+	return downloadpkg.OfflineOperation{Kind: downloadpkg.OfflineOperationCloud, AccountNamespace: client.accountNamespace, KeepOutputStop: true}
 }
 
 func (client nodeStorageProbe) Test(ctx context.Context) (downloadpkg.Health, error) {
@@ -59,7 +68,12 @@ func (s *DownloaderService) nodeStorageProbeClient(record models.Downloader) (do
 	if err != nil {
 		return nil, err
 	}
-	return nodeStorageProbe{node: client, quark: record.Type == models.DownloaderTypeQuarkShare}, nil
+	namespace, namespaceErr := s.verifiedOfflineAccount(record)
+	if namespaceErr != nil {
+		return nil, namespaceErr
+	}
+	caps, _ := s.registry.Capabilities(record.Type)
+	return nodeStorageProbe{node: client, quark: record.Type == models.DownloaderTypeQuarkShare, offline: caps.NativeOffline, accountNamespace: namespace}, nil
 }
 
 func (s *DownloaderService) nodeStorageSourceClient(ctx context.Context, record models.Downloader, task models.DownloadTask) (*nodeclient.StorageSourceClient, error) {
@@ -118,8 +132,14 @@ func (s *DownloaderService) nodeStorageSourceClient(ctx context.Context, record 
 			if err := s.observeNodeStorageSource(callCtx, task.ID, remote, action); err != nil {
 				return err
 			}
-			if sourceKind == nodeprotocol.StorageSourceKindPan115OfflineMagnet && action != nil && action.Status == nodeprotocol.StorageSourceCompleted {
-				return s.completeNodeOfflineAccess(callCtx, sourceStorage, task.ID, remote.OperationKey, sourceURI)
+			if sourceKind == nodeprotocol.StorageSourceKindPan115OfflineMagnet && action != nil {
+				if plan.CloudOfflineLifecycleVersion == 1 {
+					if action.Offline != nil && action.Offline.UpstreamStopped && !action.Offline.StopPending {
+						return s.settleStoppedNodeOfflineAccess(callCtx, sourceStorage, task, remote, sourceURI, plan.OfflineDestinationID)
+					}
+				} else if action.Status == nodeprotocol.StorageSourceCompleted {
+					return s.completeNodeOfflineAccess(callCtx, sourceStorage, task.ID, remote.OperationKey, sourceURI)
+				}
 			}
 			return nil
 		})
@@ -196,6 +216,13 @@ func buildNodeStorageSourcePlan(sourceStorage models.Storage, task models.Downlo
 			plan.DestinationRelativePath = "/"
 		}
 	}
+	if task.OfflineKind == string(downloadpkg.OfflineOperationCloud) {
+		plan.CloudOfflineLifecycleVersion = 1
+		plan.OfflineAccountNamespace = task.OfflineAccountNamespace
+		if task.OfflineRequiredIntentJSON != "" && task.OfflineRequiredIntentJSON != "{}" {
+			plan.OfflineRequiredDigest = task.OfflineRequiredDigest
+		}
+	}
 	if err := plan.Validate(); err != nil {
 		return nodeprotocol.StorageSourcePlan{}, appError(CodeTransferRouteUnsupported, "节点 115 来源计划无效", err)
 	}
@@ -241,6 +268,9 @@ func (s *DownloaderService) ensureNodeStorageSourceDirectory(ctx context.Context
 		return cloudpkg.Item{}, appError(CodeDownloaderStorageUnavailable, "无法检查节点 115 任务目录", findErr)
 	} else if exists {
 		return item, nil
+	}
+	if ctx.Value(readOnlyDownloadObservationKey{}) == true {
+		return cloudpkg.Item{}, appError(CodeDownloaderStorageUnavailable, "原节点下载目录尚未确认，只读核对不会新建目录", nil)
 	}
 	created, err := mutations.CreateDirectory(ctx, parentID, name)
 	if err == nil && created.ParentID == parentID && created.Name == name && created.IsDir && strings.TrimSpace(created.ID) != "" {
@@ -344,7 +374,17 @@ func (s *TransferNodeService) sealStorageSourceGrant(ctx context.Context, node m
 	if storage.Type != models.StorageTypePan115 || storage.ConnectionID == nil || storage.ID == 0 {
 		return nodeprotocol.CredentialGrantEnvelope{}, appError(CodeTransferRouteUnsupported, "来源存储不支持节点读取", nil)
 	}
+	var offlineTask models.DownloadTask
+	if err := s.db.WithContext(ctx).First(&offlineTask, "id = ?", taskID).Error; err != nil {
+		return nodeprotocol.CredentialGrantEnvelope{}, err
+	}
+	if operationKey != nodeclient.StorageSourceOperationKey(taskID) || offlineTask.NodeID == nil || *offlineTask.NodeID != node.ID || offlineTask.StagingStorageID == nil || *offlineTask.StagingStorageID != storage.ID {
+		return nodeprotocol.CredentialGrantEnvelope{}, appError(CodeConflict, "原节点来源授权范围不匹配", nil)
+	}
 	allowed := map[string]struct{}{nodeprotocol.StorageSourceGrantOfflineSubmit: {}, nodeprotocol.StorageSourceGrantOfflineStatus: {}, nodeprotocol.StorageSourceGrantShareInspect: {}, nodeprotocol.StorageSourceGrantShareReceive: {}, nodeprotocol.StorageSourceGrantRead: {}}
+	if offlineTask.OfflineKind == string(downloadpkg.OfflineOperationCloud) {
+		allowed[nodeprotocol.StorageSourceGrantOfflineStop] = struct{}{}
+	}
 	seen := map[string]struct{}{}
 	normalized := make([]string, 0, len(actions))
 	for _, action := range actions {
@@ -384,7 +424,28 @@ func (s *TransferNodeService) sealStorageSourceGrant(ctx context.Context, node m
 			return nodeprotocol.CredentialGrantEnvelope{}, err
 		}
 	}
-	raw, err := json.Marshal(nodeprotocol.StorageSourceCredential{ProviderType: nodeprotocol.StorageProviderPan115, Cookie: cookie, SourceURI: sourceURI})
+	var required *downloadpkg.OfflineRequiredPlan
+	if offlineTask.OfflineKind != "" {
+		account, accountErr := credentialOfflineAccount(connection, cookie)
+		if accountErr != nil {
+			return nodeprotocol.CredentialGrantEnvelope{}, accountErr
+		}
+		if offlineAccountNamespace(connection.Provider, account) != offlineTask.OfflineAccountNamespace {
+			return nodeprotocol.CredentialGrantEnvelope{}, appError(CodeConnectionUnavailable, "原节点离线账号已变化", nil)
+		}
+		if offlineTask.OfflineRequiredIntentJSON != "" && offlineTask.OfflineRequiredIntentJSON != "{}" {
+			var plan downloadpkg.OfflineRequiredPlan
+			if json.Unmarshal([]byte(offlineTask.OfflineRequiredIntentJSON), &plan) != nil {
+				return nodeprotocol.CredentialGrantEnvelope{}, appError(CodeDownloadSourceInvalid, "所需文件意图不可用", nil)
+			}
+			digest, err := plan.Digest()
+			if err != nil || digest != offlineTask.OfflineRequiredDigest {
+				return nodeprotocol.CredentialGrantEnvelope{}, appError(CodeDownloadSourceInvalid, "所需文件意图已变化", nil)
+			}
+			required = &plan
+		}
+	}
+	raw, err := json.Marshal(nodeprotocol.StorageSourceCredential{OfflineRequired: required, ProviderType: nodeprotocol.StorageProviderPan115, Cookie: cookie, SourceURI: sourceURI})
 	if err != nil {
 		return nodeprotocol.CredentialGrantEnvelope{}, err
 	}

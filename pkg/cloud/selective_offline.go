@@ -39,6 +39,13 @@ type SelectiveOfflineDriver interface {
 	CancelSelectedOffline(context.Context, string, SelectiveOfflineAuthority, bool) error
 }
 
+// SelectiveOfflineSubmissionReconciler reconstructs only an existing immutable
+// wanted operation after a lost acknowledgement. It cannot create a plan,
+// directory or seed, or submit/extend a native wanted set.
+type SelectiveOfflineSubmissionReconciler interface {
+	ReconcileSelectedOffline(context.Context, SelectiveOfflineRequest) (SelectiveOfflineSnapshot, error)
+}
+
 // ExclusiveOperationStore adds an account-wide resource claim. Native
 // single-plan executors use it when the provider cannot atomically extend or
 // share wanted sets. A conflict is not evidence of absence or permission to

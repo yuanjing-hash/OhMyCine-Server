@@ -126,11 +126,47 @@ func TestNewUses115BrowserUserAgentForCookieAPIs(t *testing.T) {
 		if ordinaryWireOperation(r) != "reconcile" {
 			t.Fatal("wrong reconciliation request")
 		}
-		return &http.Response{StatusCode: 200, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{"state":true,"page":1,"page_count":1,"tasks":[]}`)), Request: r}, nil
+		return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(`{"state":true,"page":1,"page_count":1,"tasks":[]}`)), Request: r}, nil
 	})}
 	if page, err := adapter.ListOfflineTask(1); err != nil || page.Page != 1 || page.PageCount != 1 {
 		t.Fatal("successful SDK response was not restored", err)
 	}
+	for _, kind := range []string{"ordinary", "wanted"} {
+		t.Run("native-clock-after-identity-"+kind, func(t *testing.T) {
+			adapter.UserID = 0
+			reads, writes, dispatches := 0, 0, 0
+			adapter.Client.GetClient().Transport = selectedRoundTrip(func(r *http.Request) (*http.Response, error) {
+				if r.URL.Host == "my.115.com" {
+					reads++
+					if dispatches != 0 {
+						t.Fatal("identity preflight started the cloud clock")
+					}
+					return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(`{"state":true,"data":{"user_id":1}}`)), Request: r}, nil
+				}
+				writes++
+				if dispatches != 1 || reads != 1 {
+					t.Fatal("native write lacks original dispatch boundary")
+				}
+				return &http.Response{StatusCode: 400, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{"state":false,"errno":10004}`)), Request: r}, nil
+			})
+			ctx := cloud.WithOfflineDispatchRecorder(context.Background(), func(time.Time) error {
+				dispatches++
+				if reads != 1 || writes != 0 {
+					t.Fatal("clock does not name native Add boundary")
+				}
+				return nil
+			})
+			if kind == "ordinary" {
+				_, _ = adapter.AddOfflineTaskURIsContext(ctx, []string{"https://example.test/file"}, "root")
+			} else {
+				_ = adapter.AddOfflineWanted(ctx, selectedWantedRequest{InfoHash: testOfflineHash, DirectoryID: "root", SavePath: "Pack", Wanted: []int{0}})
+			}
+			if reads != 1 || writes != 1 || dispatches != 1 {
+				t.Fatal("native dispatch fixture did not cover identity plus write")
+			}
+		})
+	}
+
 }
 
 type offlineTestBody struct {
@@ -270,6 +306,62 @@ func TestMapOfflineSubmissionErrorsKeepsPermanentFailuresOutOfRetryQueue(t *test
 		code, retryable := cloud.ErrorInfo(mapError(item.err))
 		if code != item.code || retryable {
 			t.Fatalf("mapError(%v) = %q, %t", item.err, code, retryable)
+		}
+	}
+	for _, durable := range []bool{false, true} {
+		sdk := &offlineRecoverySDK{bulkSDK: &bulkSDK{}, addErr: pan115sdk.ErrOfflineNoTimes}
+		client := newOfflineTestClient(sdk)
+		recorded := 0
+		ctx := context.Background()
+		if durable {
+			ctx = cloud.WithOfflineNonAcceptanceRecorder(ctx, func() error { recorded++; return nil })
+		}
+		_, err := client.SubmitOffline(ctx, "https://example.test/source.bin", "root")
+		if downloader.DefiniteSubmissionNonAcceptance(err) != durable || sdk.addCalls != 1 || recorded != map[bool]int{false: 0, true: 1}[durable] {
+			t.Fatal("non-hash submission inferred non-acceptance without durable original proof", err)
+		}
+	}
+
+}
+
+func TestAppFileFinalizationRequiresExplicitSchemaAndDoesNotInvalidateWebCookie(t *testing.T) {
+	for _, test := range []struct {
+		name, fields string
+		want         cloud.OfflineFinalization
+		valid        bool
+	}{
+		{"complete", `"fta":"1"`, cloud.OfflineFinalizationComplete, true}, {"pending0", `"fta":0`, cloud.OfflineFinalizationPending, true}, {"pending2", `"fta":"2"`, cloud.OfflineFinalizationPending, true}, {"missing", `"sta":1`, cloud.OfflineFinalizationUnknown, true}, {"null", `"fta":null`, cloud.OfflineFinalizationUnknown, true}, {"unknown", `"fta":3`, cloud.OfflineFinalizationUnknown, true}, {"boolean", `"fta":true`, cloud.OfflineFinalizationUnknown, true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			raw := []byte(`{"state":true,"count":1,"data":[{"fid":"leaf","pid":"root","fn":"movie.mkv","fc":"1","fs":"10","aid":"1",` + test.fields + `}]}`)
+			rows, _, valid := parseFinalizedAppPage(raw, "root")
+			if valid != test.valid || len(rows) != 1 || rows[0].State != test.want {
+				t.Fatalf("schema proof=%v rows=%+v", valid, rows)
+			}
+		})
+	}
+	for _, raw := range []string{`{"state":true,"count":1,"data":[{"fid":"leaf","pid":"other","fn":"a","fc":"1","fs":10,"aid":1,"fta":1}]}`, `{"state":true,"data":[]}`, `{"state":false,"count":0,"data":[]}`} {
+		if _, _, ok := parseFinalizedAppPage([]byte(raw), "root"); ok {
+			t.Fatal("unproven App response accepted")
+		}
+	}
+	driver, err := New(cloud.Config{Cookie: "UID=1; CID=cid; SEID=seid"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := driver.(*Client)
+	client.listRate = rate.NewLimiter(rate.Inf, 1)
+	adapter := client.sdk.(*sdkAdapter)
+	for _, status := range []int{http.StatusUnauthorized, http.StatusOK} {
+		adapter.Client.GetClient().Transport = selectedRoundTrip(func(r *http.Request) (*http.Response, error) {
+			if r.URL.String() == "" || r.URL.Host != "proapi.115.com" || r.URL.Path != "/android/2.0/ufile/files" || r.URL.Query().Get("cur") != "1" || r.URL.Query().Get("cid") != "root" {
+				t.Fatal("wrong App endpoint/schema")
+			}
+			return &http.Response{StatusCode: status, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{"state":false,"errno":99}`)), Request: r}, nil
+		})
+		result, err := client.FinalizedFiles(context.Background(), []cloud.Item{{ID: "leaf", ParentID: "root", Name: "movie.mkv", Size: 10}})
+		if err != nil || len(result) != 0 || client.authExpired {
+			t.Fatal("optional App proof failure poisoned usable offline Cookie", err)
 		}
 	}
 }

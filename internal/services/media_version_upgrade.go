@@ -67,13 +67,14 @@ type MediaVersionUpgradeDTO struct {
 	NextAttemptAt    *time.Time         `json:"next_attempt_at,omitempty"`
 }
 type SubmitMediaVersionUpgradeInput struct {
-	ContentSelectionToken string   `json:"content_selection_token,omitempty"`
-	ResultToken           string   `json:"result_token"`
-	DownloaderID          string   `json:"downloader_id"`
-	PreviewToken          string   `json:"preview_token,omitempty"`
-	SelectedEntryTokens   []string `json:"selected_entry_tokens,omitempty"`
-	Priority              int      `json:"priority"`
-	Revision              uint64   `json:"revision"`
+	OfflineFailureOverrideToken string   `json:"offline_failure_override_token,omitempty"`
+	ContentSelectionToken       string   `json:"content_selection_token,omitempty"`
+	ResultToken                 string   `json:"result_token"`
+	DownloaderID                string   `json:"downloader_id"`
+	PreviewToken                string   `json:"preview_token,omitempty"`
+	SelectedEntryTokens         []string `json:"selected_entry_tokens,omitempty"`
+	Priority                    int      `json:"priority"`
+	Revision                    uint64   `json:"revision"`
 }
 
 type mediaUpgradeSnapshot struct {
@@ -394,7 +395,7 @@ func (s *MediaVersionUpgradeService) Submit(ctx context.Context, actor Actor, id
 		return MediaVersionUpgradeDTO{}, appError(CodeQueueWorkerUnavailable, "洗版服务尚未就绪", nil)
 	}
 	entry := snapshot.Entry
-	internal := SiteDownloadInput{ContentSelectionToken: input.ContentSelectionToken, ResultToken: input.ResultToken, DownloaderID: input.DownloaderID, PreviewToken: input.PreviewToken, SelectedEntryTokens: input.SelectedEntryTokens, MediaLibraryID: &row.LibraryID, Priority: input.Priority, Season: cloneInt(entry.Season), Episode: cloneInt(entry.Episode), PreserveExistingVersions: true, ReplacementIdentity: &DownloadRecognitionIdentity{TMDBID: *entry.TMDBID, MediaType: entry.MediaType, Source: mediaIdentitySourceDirectID, Status: mediaIdentityStatusVerified, Season: cloneInt(entry.Season), Episode: cloneInt(entry.Episode)}}
+	internal := SiteDownloadInput{offlineIntakeContext: fmt.Sprintf("upgrade:%s:%d", row.ID, input.Revision), OfflineFailureOverrideToken: input.OfflineFailureOverrideToken, ContentSelectionToken: input.ContentSelectionToken, ResultToken: input.ResultToken, DownloaderID: input.DownloaderID, PreviewToken: input.PreviewToken, SelectedEntryTokens: input.SelectedEntryTokens, MediaLibraryID: &row.LibraryID, Priority: input.Priority, Season: cloneInt(entry.Season), Episode: cloneInt(entry.Episode), PreserveExistingVersions: true, ReplacementIdentity: &DownloadRecognitionIdentity{TMDBID: *entry.TMDBID, MediaType: entry.MediaType, Source: mediaIdentitySourceDirectID, Status: mediaIdentityStatusVerified, Season: cloneInt(entry.Season), Episode: cloneInt(entry.Episode)}}
 	internal.BeforePersist = func(tx *gorm.DB) error {
 		var locked models.MediaVersionUpgrade
 		if err := tx.First(&locked, "id=?", row.ID).Error; err != nil {

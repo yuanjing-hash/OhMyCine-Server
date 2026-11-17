@@ -150,6 +150,58 @@ func TestStorageSourceClientRenewsLeaseBeforeAction(t *testing.T) {
 	if leaseCalls != 1 || renewed.LeaseEpoch != operation.Plan.LeaseEpoch+1 || !renewed.LeaseExpiresAt.After(operation.Plan.LeaseExpiresAt) {
 		t.Fatalf("lease was not renewed: calls=%d lease=%+v", leaseCalls, renewed)
 	}
+	t.Run("read-only cloud control renews only original lease", func(t *testing.T) {
+		controlOperation := testStorageSourceOperation(t, time.Now().UTC().Add(30*time.Second))
+		var payload nodeprotocol.StorageSourcePlan
+		_ = json.Unmarshal(controlOperation.Plan.Payload, &payload)
+		payload.CloudOfflineLifecycleVersion = 1
+		payload.OfflineAccountNamespace = strings.Repeat("a", 64)
+		controlOperation.Plan.Payload, _ = json.Marshal(payload)
+		started := time.Now().UTC().Add(-31 * time.Minute)
+		controls, leases, puts := 0, 0, 0
+		controlServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/node/v1/operations/"):
+				_ = json.NewEncoder(w).Encode(nodeprotocol.OperationResponse{OperationKey: controlOperation.Plan.OperationKey, PlanDigest: controlOperation.PlanDigest, Status: nodeprotocol.OperationRunning, LeaseEpoch: 1, LeaseExpiresAt: time.Now().UTC().Add(-time.Minute)})
+			case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/lease"):
+				leases++
+				var lease nodeprotocol.LeaseRequest
+				_ = json.NewDecoder(r.Body).Decode(&lease)
+				_ = json.NewEncoder(w).Encode(nodeprotocol.OperationResponse{OperationKey: controlOperation.Plan.OperationKey, PlanDigest: controlOperation.PlanDigest, Status: nodeprotocol.OperationRunning, LeaseEpoch: lease.LeaseEpoch, LeaseExpiresAt: lease.LeaseExpiresAt})
+			case r.Method == http.MethodPut && strings.Contains(r.URL.Path, "/credential-grants/"):
+				w.WriteHeader(http.StatusNoContent)
+			case r.Method == http.MethodPost && r.URL.Path == "/node/v1/storage-source/actions":
+				var input nodeprotocol.StorageSourceActionRequest
+				_ = json.NewDecoder(r.Body).Decode(&input)
+				if input.Action != nodeprotocol.StorageSourceActionOfflineStatus {
+					t.Fatal("deadline observer entered materialization")
+				}
+				controls++
+				response := testStorageSourceResponse(controlOperation, nodeprotocol.StorageSourceWaiting)
+				response.RequestID = input.RequestID
+				response.Offline = &downloadpkg.OfflineObservation{Version: 1, Kind: downloadpkg.OfflineOperationCloud, OperationID: input.OperationKey, AccountNamespace: payload.OfflineAccountNamespace, StartedAt: &started, StartProvenance: downloadpkg.OfflineStartDispatch, CompletionMode: downloadpkg.OfflineCompletionUnknown, KeepOutputStop: true}
+				_ = json.NewEncoder(w).Encode(response)
+			case r.Method == http.MethodPut:
+				puts++
+				http.NotFound(w, r)
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		defer controlServer.Close()
+		controlClient := testStorageSourceClient(t, controlServer, controlOperation, nil)
+		for _, status := range []string{nodeprotocol.StorageSourceAccepted, nodeprotocol.StorageSourceSubmitting, nodeprotocol.StorageSourceWaiting} {
+			queued := controlClient.storageSourceTask(testStorageSourceResponse(controlOperation, status))
+			if queued.Status != "queued" || queued.Offline != nil || queued.Completed {
+				t.Fatal("pre-dispatch Node queue invented a cloud clock or lost its queue state", queued)
+			}
+		}
+		observed, err := controlClient.ObserveOffline(context.Background(), controlOperation.Plan.OperationKey)
+		if err != nil || observed.Offline == nil || !observed.Offline.StartedAt.Equal(started) || controls != 1 || leases != 1 || puts != 0 {
+			t.Fatal("deadline observation lost native clock or changed original operation", err, controls, leases, puts)
+		}
+	})
+
 }
 
 func TestStorageSourceClientReadsCompletedFileExport(t *testing.T) {
@@ -192,31 +244,68 @@ func TestStorageSourceClientReadsCompletedFileExport(t *testing.T) {
 }
 
 func TestStorageSourceClientCancelAlsoCleansManagedSource(t *testing.T) {
-	operation := testStorageSourceOperation(t, time.Now().UTC().Add(5*time.Minute))
-	cancelCalls, cleanupCalls := 0, 0
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/cancel"):
-			cancelCalls++
-			_ = json.NewEncoder(w).Encode(nodeprotocol.OperationResponse{OperationKey: operation.Plan.OperationKey, PlanDigest: operation.PlanDigest, Status: nodeprotocol.OperationCancelled, LeaseEpoch: operation.Plan.LeaseEpoch, LeaseExpiresAt: operation.Plan.LeaseExpiresAt})
-		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/cleanup"):
-			cleanupCalls++
-			var request nodeprotocol.StorageSourceCleanupRequest
-			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
-				t.Fatalf("decode cleanup: %v", err)
+	for _, kind := range []string{"lifecycle", "legacy-share", "legacy-offline"} {
+		t.Run(kind, func(t *testing.T) {
+			operation := testStorageSourceOperation(t, time.Now().UTC().Add(5*time.Minute))
+			var plan nodeprotocol.StorageSourcePlan
+			_ = json.Unmarshal(operation.Plan.Payload, &plan)
+			if kind == "lifecycle" {
+				plan.CloudOfflineLifecycleVersion = 1
+				plan.OfflineAccountNamespace = strings.Repeat("a", 64)
+			} else if kind == "legacy-share" {
+				plan.SourceKind = nodeprotocol.StorageSourceKindPan115Share
 			}
-			_ = json.NewEncoder(w).Encode(nodeprotocol.StorageSourceCleanupResponse{RequestID: request.RequestID, OperationKey: request.OperationKey, TaskID: request.TaskID, Status: "completed", Cleaned: true})
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer server.Close()
-	client := testStorageSourceClient(t, server, operation, nil)
-	if err := client.Cancel(context.Background(), operation.Plan.OperationKey, false); err != nil {
-		t.Fatal(err)
-	}
-	if cancelCalls != 1 || cleanupCalls != 1 {
-		t.Fatalf("cancel=%d cleanup=%d", cancelCalls, cleanupCalls)
+			operation.Plan.Payload, _ = json.Marshal(plan)
+			cancelCalls, cleanupCalls, stopCalls := 0, 0, 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.URL.Path == "/node/v1/health":
+					_ = json.NewEncoder(w).Encode(nodeprotocol.HealthResponse{Capabilities: nodeprotocol.Capabilities{Codes: []string{nodeprotocol.CapabilityCloudOfflineLifecycleV1}}})
+				case r.Method == http.MethodPut && strings.Contains(r.URL.Path, "/credential-grants/"):
+					w.WriteHeader(http.StatusNoContent)
+				case r.Method == http.MethodPost && r.URL.Path == "/node/v1/storage-source/actions":
+					var input nodeprotocol.StorageSourceActionRequest
+					_ = json.NewDecoder(r.Body).Decode(&input)
+					if input.Action != nodeprotocol.StorageSourceActionOfflineStop {
+						t.Fatal("cancel triggered materialization")
+					}
+					stopCalls++
+					response := testStorageSourceResponse(operation, nodeprotocol.StorageSourceWaiting)
+					response.RequestID = input.RequestID
+					response.Offline = &downloadpkg.OfflineObservation{Version: 1, Kind: downloadpkg.OfflineOperationCloud, AccountNamespace: plan.OfflineAccountNamespace, OperationID: operation.Plan.OperationKey, UpstreamStopped: true, KeepOutputStop: true}
+					_ = json.NewEncoder(w).Encode(response)
+				case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/node/v1/operations/"):
+					_ = json.NewEncoder(w).Encode(nodeprotocol.OperationResponse{OperationKey: operation.Plan.OperationKey, PlanDigest: operation.PlanDigest, Status: nodeprotocol.OperationRunning, LeaseEpoch: operation.Plan.LeaseEpoch, LeaseExpiresAt: operation.Plan.LeaseExpiresAt})
+				case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/cancel"):
+					cancelCalls++
+					_ = json.NewEncoder(w).Encode(nodeprotocol.OperationResponse{OperationKey: operation.Plan.OperationKey, PlanDigest: operation.PlanDigest, Status: nodeprotocol.OperationCancelled, LeaseEpoch: operation.Plan.LeaseEpoch, LeaseExpiresAt: operation.Plan.LeaseExpiresAt})
+				case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/cleanup"):
+					cleanupCalls++
+					var input nodeprotocol.StorageSourceCleanupRequest
+					_ = json.NewDecoder(r.Body).Decode(&input)
+					_ = json.NewEncoder(w).Encode(nodeprotocol.StorageSourceCleanupResponse{RequestID: input.RequestID, OperationKey: input.OperationKey, TaskID: input.TaskID, Status: "completed", Cleaned: true})
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer server.Close()
+			client := testStorageSourceClient(t, server, operation, nil)
+			if kind == "lifecycle" {
+				if err := client.StopOfflineKeepOutput(context.Background(), operation.Plan.OperationKey); err != nil || cancelCalls != 0 || cleanupCalls != 0 {
+					t.Fatal("cloud stop canceled Node transport or cleaned scratch", err)
+				}
+			}
+			err := client.Cancel(context.Background(), operation.Plan.OperationKey, false)
+			if kind == "legacy-offline" {
+				if code, _ := downloadpkg.ErrorInfo(err); code != nodeprotocol.ErrorCapabilityMissing || cancelCalls != 0 || cleanupCalls != 0 || stopCalls != 0 {
+					t.Fatal("legacy Node cancel pretended to stop cloud or widened grant", err)
+				}
+				return
+			}
+			if err != nil || cancelCalls != 1 || cleanupCalls != 1 || kind == "lifecycle" && stopCalls != 2 {
+				t.Fatal("parent cancellation did not converge cloud plus separate scratch cleanup", err, cancelCalls, cleanupCalls, stopCalls)
+			}
+		})
 	}
 }
 
@@ -259,9 +348,15 @@ func TestStorageSourceCleanupRetryDoesNotReplayMaterialization(t *testing.T) {
 
 func TestStorageSourceClientRejectsPlanAndHTTPSourceDrift(t *testing.T) {
 	operation := testStorageSourceOperation(t, time.Now().UTC().Add(5*time.Minute))
-	grantCalls := 0
+	grantCalls, planPuts := 0, 0
+	capabilities := []string{nodeprotocol.CapabilityPan115Offline, nodeprotocol.CapabilityPan115Read, nodeprotocol.CapabilityRangeExport}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/node/v1/health" {
+			_ = json.NewEncoder(w).Encode(nodeprotocol.HealthResponse{Capabilities: nodeprotocol.Capabilities{Codes: capabilities}})
+			return
+		}
 		if r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/node/v1/operations/") {
+			planPuts++
 			response := nodeprotocol.OperationResponse{OperationKey: operation.Plan.OperationKey, PlanDigest: strings.Repeat("f", 64), Status: nodeprotocol.OperationPending, LeaseEpoch: operation.Plan.LeaseEpoch, LeaseExpiresAt: operation.Plan.LeaseExpiresAt}
 			_ = json.NewEncoder(w).Encode(response)
 			return
@@ -279,6 +374,18 @@ func TestStorageSourceClientRejectsPlanAndHTTPSourceDrift(t *testing.T) {
 	}
 	if grantCalls != 0 {
 		t.Fatal("plan drift reached credential boundary")
+	}
+
+	client.basePlan.CloudOfflineLifecycleVersion = 1
+	client.basePlan.OfflineAccountNamespace = strings.Repeat("a", 64)
+	if _, err := client.Submit(context.Background(), downloadpkg.SubmitRequest{Source: downloadpkg.Source{Kind: downloadpkg.SourceURL, URL: testStorageSourceMagnet}}); err == nil {
+		t.Fatal("new offline operation accepted a Node without lifecycle control")
+	} else if code, _ := downloadpkg.ErrorInfo(err); code != nodeprotocol.ErrorCapabilityMissing || planPuts != 1 || grantCalls != 0 {
+		t.Fatalf("old Node must fail before plan/credential writes: code=%s puts=%d grants=%d", code, planPuts, grantCalls)
+	}
+	capabilities = append(capabilities, nodeprotocol.CapabilityCloudOfflineLifecycleV1)
+	if _, err := client.Test(context.Background()); err != nil {
+		t.Fatal("negotiated v1 Node was rejected", err)
 	}
 
 	basePlan := nodeprotocol.StorageSourcePlan{StorageID: "1", ProviderType: nodeprotocol.StorageProviderPan115, SourceKind: nodeprotocol.StorageSourceKindPan115OfflineURL, TargetKind: nodeprotocol.StorageSourceTargetLocal, SourceIdentityDigest: strings.Repeat("a", 64), SourceContentDigest: strings.Repeat("b", 64), OfflineDestinationID: "dir-1"}

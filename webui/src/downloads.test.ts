@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
-import { beginDownloadRetry, downloadSourceKind, cloudShareDownloaderType, isCloudDownloader, canCancelDownloadPipeline, downloadErrorMessage, downloadProviderStatusLabel, downloadStatusClass, downloadStatusLabel, formatBytes, formatETA, formatProgress, isDownloadHistoryTask, nodePan115UnsupportedSource, parseDownloadSourceLines, reconcileDownloadRetries, summarizeDownloaderTasks, torrentToBase64 } from '@/downloads'
+import { beginDownloadRetry, downloadSourceKind, cloudShareDownloaderType, isCloudDownloader, canCancelDownloadPipeline, downloadErrorMessage, downloadProviderStatusLabel, downloadStatusClass, downloadStatusLabel, offlineTimingLabel, formatBytes, formatETA, formatProgress, isDownloadHistoryTask, nodePan115UnsupportedSource, parseDownloadSourceLines, reconcileDownloadRetries, summarizeDownloaderTasks, torrentToBase64 } from '@/downloads'
 import type { DownloadTaskSummary } from '@/types/api'
 
 const task = { job_status: 'queued' } as DownloadTaskSummary
@@ -73,8 +73,29 @@ describe('download presentation', () => {
 
     expect(downloadStatusLabel(waiting)).toBe('等待下载器恢复')
     expect(downloadStatusClass(waiting)).toBe('status-chip status-chip--warning')
-    expect(downloadProviderStatusLabel(waiting.provider_status)).toBe('等待 qBittorrent 恢复')
+    expect(downloadProviderStatusLabel(waiting.provider_status)).toBe('等待下载器恢复')
     expect(downloadErrorMessage(waiting)).toBe(waiting.last_error_message)
+  })
+  it('renders durable acquisition observations, capacity, ready output and pending timeout distinctly', () => {
+    const observed = { job_status: 'retry_wait', acquisition_state: 'observing', last_error_code: 'download_observation_pending', last_error_message: 'old error' } as DownloadTaskSummary
+    expect(downloadStatusLabel(observed)).toBe('正在获取 · 定期核对')
+    expect(downloadErrorMessage(observed)).toBe('')
+    expect(downloadStatusClass(observed)).toBe('status-chip status-chip--planned')
+    const failedAfterReady = { ...observed, job_status: 'failed', acquisition_state: 'cloud_ready', last_error_code: 'transfer_media_unrecognized', last_error_message: '下载完成，但媒体未识别' } as DownloadTaskSummary
+    expect(downloadStatusLabel(failedAfterReady)).toBe('失败')
+    expect(downloadStatusClass(failedAfterReady)).toBe('status-chip status-chip--error')
+    expect(downloadErrorMessage(failedAfterReady)).toBe('下载完成，但媒体未识别')
+    expect(downloadStatusLabel({ ...failedAfterReady, scrape_status: 'completed_unverified' })).toBe('文件核对失败')
+    expect(downloadStatusLabel({ ...observed, job_status: 'paused', acquisition_state: 'cloud_ready' })).toBe('已暂停')
+    expect(downloadErrorMessage({ ...observed, scrape_status: 'fallback_unrecognized', last_error_code: 'tmdb_no_match', last_error_message: '已自动归入未识别' })).toBe('已自动归入未识别')
+    expect(downloadStatusLabel({ ...observed, acquisition_state: 'waiting_capacity' })).toBe('等待下载器空位')
+    expect(downloadStatusLabel({ ...observed, acquisition_state: 'reconnecting' })).toBe('等待下载器恢复')
+    const pending = { ...observed, acquisition_state: 'cancelled_stop_pending', control_pending: true, last_error_code: 'offline_deadline_exceeded' } as DownloadTaskSummary
+    expect(downloadStatusLabel(pending)).toBe('已取消 · 云端收尾中')
+    expect(downloadErrorMessage(pending)).toContain('超过 30 分钟')
+    expect(offlineTimingLabel(observed)).toBe('')
+    expect(offlineTimingLabel({ ...observed, offline_started_at: '2026-11-13T00:00:00Z', offline_deadline_at: '2026-11-13T00:30:00Z', offline_start_provenance: 'dispatch' })).toContain('云端提交')
+    expect(offlineTimingLabel({ ...observed, offline_ready_at: '2026-11-13T00:29:00Z', offline_deadline_at: '2026-11-13T00:30:00Z' })).toContain('后续传输与入库继续处理')
   })
   it('replaces a stale failure with a neutral retry presentation', () => {
     const failed = { id: 'download-1', job_status: 'failed', lifecycle_scope: 'active', updated_at: '2026-08-25T05:00:00Z', last_error_code: 'downloader_rejected', last_error_message: '下载器拒绝了下载链接' } as DownloadTaskSummary
@@ -98,9 +119,9 @@ describe('download presentation', () => {
   })
   it('aggregates only active tasks for downloader card telemetry', () => {
     const tasks = [
-      { downloader_id: 'a', job_status: 'running', progress: 25, download_speed: 100, upload_speed: null },
+      { downloader_id: 'a', job_status: 'retry_wait', acquisition_state: 'observing', progress: 25, download_speed: 100, upload_speed: null },
       { downloader_id: 'a', job_status: 'paused', progress: 75, download_speed: 50, upload_speed: 5 },
-      { downloader_id: 'a', job_status: 'completed', progress: 100, download_speed: 0, upload_speed: 0 },
+      { downloader_id: 'a', job_status: 'completed', lifecycle_scope: 'history', acquisition_state: 'cloud_ready', progress: 100, download_speed: 0, upload_speed: 0 },
       { downloader_id: 'b', job_status: 'running', progress: 10, download_speed: 999, upload_speed: 1 },
     ] as DownloadTaskSummary[]
     expect(summarizeDownloaderTasks(tasks, 'a')).toEqual({ active: 1, total: 3, downloadSpeed: 100, uploadSpeed: null, averageProgress: 25 })
@@ -173,7 +194,6 @@ describe('115 offline downloader directory selection', () => {
     expect(source).toContain("source_kind: selectedSourceKind.value")
     expect(source).toContain("? '离线下载' : '磁力 / URL'")
     expect(source).toContain('分享转存')
-    expect(source).toContain('selectedDownloader?.provider_directory_path')
     expect(source).toContain('createForm.autoListenLifeEvents')
     expect(source).toContain('editForm.autoListenLifeEvents')
   })

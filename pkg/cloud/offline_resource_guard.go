@@ -51,3 +51,10 @@ type OfflineFactReader interface {
 type OfflineSubmissionReconciler interface {
 	ReconcileOfflineSubmission(context.Context, string, string) (OfflineTask, error)
 }
+
+// OfflineStoppedAccessGuard settles the original remote resource claim only
+// after its authenticated lifecycle proves keep-output stop. It never mutates a
+// native task or creates/rearms missing ownership evidence.
+type OfflineStoppedAccessGuard interface {
+	SettleStoppedOfflineAccess(context.Context, OfflineAccess) error
+}

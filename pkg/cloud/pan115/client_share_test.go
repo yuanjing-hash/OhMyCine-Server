@@ -203,7 +203,7 @@ func TestShareReadAdapterUsesSafeRequestAndTypedErrors(t *testing.T) {
 		}
 		return &http.Response{StatusCode: 200, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{"state":false,"errno":4100010,"error":"private upstream body"}`)), Request: r}, nil
 	}))
-	_, err := (&sdkAdapter{sdk}).GetShareSnapWithUA(downloadBrowserUserAgent, "example", "abcd", "0")
+	_, err := (&sdkAdapter{Pan115Client: sdk}).GetShareSnapWithUA(downloadBrowserUserAgent, "example", "abcd", "0")
 	if code, _ := cloud.ErrorInfo(err); code != cloud.CodeShareExpired {
 		t.Fatal(err)
 	}

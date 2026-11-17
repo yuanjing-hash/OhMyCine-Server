@@ -40,7 +40,9 @@ func TestFollowTransferFirstUsesVerifiedShareThenOnlyRemainingTorrentLeaf(t *tes
 			// executor the exact-file capability before route preflight; no worker or
 			// physical download is started by the acquisition plan assertions below.
 			registry := downloadpkg.NewRegistry()
-			if err := registry.Register(models.DownloaderTypePan115Offline, downloadpkg.Capabilities{CanTryWithoutSeeders: mode != "live-zero" && mode != "live-unknown", ShareReceive: true, NativeOffline: true, SelectiveFiles: true, Pause: true, Resume: true, OutputConstraint: downloadpkg.OutputConstraintProviderStorage}, func(downloadpkg.Config) (downloadpkg.Client, error) { return &stubDownloadClient{}, nil }); err != nil {
+			if err := registry.Register(models.DownloaderTypePan115Offline, downloadpkg.Capabilities{CanTryWithoutSeeders: mode != "live-zero" && mode != "live-unknown", ShareReceive: true, NativeOffline: true, SelectiveFiles: true, Pause: true, Resume: true, OutputConstraint: downloadpkg.OutputConstraintProviderStorage}, func(config downloadpkg.Config) (downloadpkg.Client, error) {
+				return &sourceAwareNativeStub{&stubDownloadClient{}, config.OfflineAccountNamespace}, nil
+			}); err != nil {
 				t.Fatal(err)
 			}
 			if strings.HasPrefix(mode, "offline-") || strings.HasPrefix(mode, "live-") {

@@ -584,6 +584,16 @@
                 }
               }
             }
+          },
+          "409": {
+            "description": "Exact offline route previously exceeded its absolute 30-minute budget; no new task was accepted.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OfflineConfirmationRequiredResponse"
+                }
+              }
+            }
           }
         },
         "requestBody": {
@@ -629,6 +639,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Exact offline route previously exceeded its absolute 30-minute budget; no new task was accepted.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OfflineConfirmationRequiredResponse"
                 }
               }
             }
@@ -1205,6 +1225,13 @@
           },
           "priority": {
             "type": "integer"
+          },
+          "offline_failure_override_token": {
+            "type": "string",
+            "minLength": 64,
+            "maxLength": 64,
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "One accepted request only; omitted against older Server. Never changes source ownership, authorization or unknown-write control."
           }
         },
         "required": [
@@ -1467,6 +1494,13 @@
               "tv"
             ],
             "description": "Must be paired with expected_tmdb_id; revalidated by Server."
+          },
+          "offline_failure_override_token": {
+            "type": "string",
+            "minLength": 64,
+            "maxLength": 64,
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "One accepted request only; omitted against older Server. Never changes source ownership, authorization or unknown-write control."
           }
         },
         "required": [
@@ -1478,7 +1512,41 @@
       "DownloadResult": {
         "type": "object",
         "description": "Existing DownloadTaskSummary contract, including optional SelectionTasks for accepted selected outputs; task acceptance is not import completion.",
-        "additionalProperties": true
+        "additionalProperties": true,
+        "properties": {
+          "acquisition_state": {
+            "type": "string",
+            "enum": [
+              "waiting_capacity",
+              "active",
+              "observing",
+              "reconnecting",
+              "cloud_ready",
+              "cancelled_stop_pending",
+              "clock_unknown"
+            ]
+          },
+          "offline_started_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "offline_deadline_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "offline_ready_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "offline_start_provenance": {
+            "type": "string",
+            "enum": [
+              "dispatch",
+              "accepted",
+              "provider_added"
+            ]
+          }
+        }
       },
       "FollowPolicyDefaultsResponse": {
         "type": "object",
@@ -1622,6 +1690,100 @@
               "expires_at": {
                 "type": "string",
                 "format": "date-time"
+              }
+            }
+          }
+        }
+      },
+      "OfflineFailureWarning": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "version",
+          "reason",
+          "timeout_minutes",
+          "confirmation_token"
+        ],
+        "properties": {
+          "version": {
+            "type": "integer",
+            "enum": [
+              1
+            ]
+          },
+          "reason": {
+            "type": "string",
+            "enum": [
+              "offline_deadline_exceeded"
+            ]
+          },
+          "timeout_minutes": {
+            "type": "integer",
+            "enum": [
+              30
+            ]
+          },
+          "confirmation_token": {
+            "type": "string",
+            "minLength": 64,
+            "maxLength": 64,
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "One accepted request only; omitted against older Server. Never changes source ownership, authorization or unknown-write control."
+          }
+        }
+      },
+      "OfflineFailureOverride": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "index",
+          "confirmation_token"
+        ],
+        "properties": {
+          "index": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 49
+          },
+          "confirmation_token": {
+            "type": "string",
+            "minLength": 64,
+            "maxLength": 64,
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "One accepted request only; omitted against older Server. Never changes source ownership, authorization or unknown-write control."
+          }
+        }
+      },
+      "OfflineConfirmationRequiredResponse": {
+        "type": "object",
+        "required": [
+          "code",
+          "message",
+          "data"
+        ],
+        "properties": {
+          "code": {
+            "type": "integer"
+          },
+          "message": {
+            "type": "string"
+          },
+          "data": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "error_code",
+              "offline_failure_warning"
+            ],
+            "properties": {
+              "error_code": {
+                "type": "string",
+                "enum": [
+                  "offline_resource_confirmation_required"
+                ]
+              },
+              "offline_failure_warning": {
+                "$ref": "#/components/schemas/OfflineFailureWarning"
               }
             }
           }

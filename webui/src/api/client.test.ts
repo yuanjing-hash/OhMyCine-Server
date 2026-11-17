@@ -99,3 +99,17 @@ it('preserves safe share validation details without treating account errors as a
  await expect(api('/api/v1/discovery/share-preview')).rejects.toMatchObject({ errorCode: validation.error_code, shareValidation: validation })
  expect(dispatchEvent).not.toHaveBeenCalled()
 })
+
+it('projects only the supported offline-history challenge and never arbitrary error data', async () => {
+  const warning = { version: 1, reason: 'offline_deadline_exceeded', timeout_minutes: 30, confirmation_token: 'a'.repeat(64) }
+  const fetchMock = vi.spyOn(globalThis, 'fetch')
+  for (const payload of [warning, { ...warning, version: 2 }, { ...warning, confirmation_token: 'https://private.example/secret' }]) {
+    fetchMock.mockResolvedValueOnce(envelope(409, 40901, { error_code: 'offline_resource_confirmation_required', offline_failure_warning: { ...payload, owner_id: 99, private_url: 'secret' }, private_url: 'secret' }))
+    const error = await api('/api/v1/discovery/downloads').catch(error => error) as APIError
+    expect(error).toBeInstanceOf(APIError)
+    expect(error.offlineFailureWarning).toEqual(payload === warning ? warning : undefined)
+    expect(JSON.stringify(error)).not.toContain('secret')
+    expect(error).not.toHaveProperty('data')
+  }
+  expect(fetchMock).toHaveBeenCalledTimes(3)
+})

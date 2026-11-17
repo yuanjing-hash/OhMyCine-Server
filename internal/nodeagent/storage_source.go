@@ -68,6 +68,10 @@ func (a *Agent) storageSourceAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	serverID := r.Header.Get("X-OhMyCine-Verified-Server-ID")
+	if input.Action == nodeprotocol.StorageSourceActionOfflineStatus || input.Action == nodeprotocol.StorageSourceActionOfflineStop {
+		a.cloudOfflineControl(w, r, serverID, input)
+		return
+	}
 	if receipt, getErr := a.store.ProviderReceipt(r.Context(), serverID, input.RequestID); getErr == nil {
 		if receipt.RequestDigest != digest || receipt.OperationKey != input.OperationKey || receipt.Action != input.Action {
 			writeError(w, http.StatusConflict, nodeprotocol.ErrorPlanConflict, "相同操作编号对应了不同请求")
@@ -213,6 +217,15 @@ func (a *Agent) storageSourceCredential(ctx context.Context, serverID string, in
 	default:
 		return nodeprotocol.CredentialGrant{}, nodeprotocol.StorageSourceCredential{}, errors.New(nodeprotocol.ErrorCapabilityMissing)
 	}
+	if plan.CloudOfflineLifecycleVersion == 1 {
+		if input.Action == nodeprotocol.StorageSourceActionOfflineStop {
+			requiredActions = []string{nodeprotocol.StorageSourceGrantOfflineStatus, nodeprotocol.StorageSourceGrantOfflineStop}
+		} else if input.Action == nodeprotocol.StorageSourceActionOfflineStatus {
+			requiredActions = []string{nodeprotocol.StorageSourceGrantOfflineStatus}
+		} else {
+			requiredActions = append(requiredActions, nodeprotocol.StorageSourceGrantOfflineStop)
+		}
+	}
 	for _, action := range requiredActions {
 		if !containsAction(grant.AllowedActions, action) {
 			return nodeprotocol.CredentialGrant{}, nodeprotocol.StorageSourceCredential{}, errors.New("node_credential_binding_mismatch")
@@ -223,6 +236,12 @@ func (a *Agent) storageSourceCredential(ctx context.Context, serverID string, in
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&credential); err != nil || nodeprotocol.ValidateStorageSourceCredential(credential, requireURI) != nil {
 		return nodeprotocol.CredentialGrant{}, nodeprotocol.StorageSourceCredential{}, errors.New("node_credential_payload_invalid")
+	}
+	if credential.OfflineRequired != nil {
+		digest, e := credential.OfflineRequired.Digest()
+		if e != nil || plan.CloudOfflineLifecycleVersion != 1 || digest != plan.OfflineRequiredDigest {
+			return nodeprotocol.CredentialGrant{}, nodeprotocol.StorageSourceCredential{}, ErrPlanConflict
+		}
 	}
 	if credential.ProviderType != plan.ProviderType {
 		return nodeprotocol.CredentialGrant{}, nodeprotocol.StorageSourceCredential{}, ErrPlanConflict
@@ -288,6 +307,15 @@ func (a *Agent) runStorageSource(ctx context.Context, serverID string, input nod
 		if errors.Is(err, ErrLeaseConflict) {
 			return cloud.Error(cloud.CodeUnavailable, true, errors.New(nodeprotocol.ErrorLeaseExpired))
 		}
+		if err == nil && plan.CloudOfflineLifecycleVersion == 1 {
+			var stop string
+			if e := a.store.db.QueryRowContext(callCtx, `SELECT offline_stop_state FROM storage_source_runs WHERE operation_key=? AND paired_server_id=?`, input.OperationKey, serverID).Scan(&stop); e != nil {
+				return e
+			}
+			if stop != "" && !strings.HasPrefix(stop, "goal:") {
+				return context.Canceled
+			}
+		}
 		return err
 	}
 	guard := func(callCtx context.Context, action string) error {
@@ -315,6 +343,34 @@ func (a *Agent) runStorageSource(ctx context.Context, serverID string, input nod
 			if err != nil {
 				return
 			}
+		}
+	} else if plan.CloudOfflineLifecycleVersion == 1 {
+		ready, progressErr := a.progressCloudOffline(ctx, serverID, input, plan, grant, credential, driver, true)
+		if progressErr != nil {
+			a.pauseStorageSource(ctx, serverID, input, response, progressErr)
+			return
+		}
+		run, err = a.store.StorageSourceRun(ctx, serverID, input.OperationKey)
+		if err != nil {
+			return
+		}
+		response = sourceResponse(input, run)
+		if !ready {
+			return
+		}
+		if run.Offline != nil && run.Offline.CompletionMode == "required_files" && !run.Offline.UpstreamStopped {
+			stopInput := input
+			stopInput.Action = nodeprotocol.StorageSourceActionOfflineStop
+			stopInput.KeepMaterialization = true
+			if err := a.stopCloudOffline(ctx, serverID, stopInput, plan, credential, driver); err != nil {
+				a.pauseStorageSource(ctx, serverID, input, response, err)
+				return
+			}
+			run, err = a.store.StorageSourceRun(ctx, serverID, input.OperationKey)
+			if err != nil {
+				return
+			}
+			response = sourceResponse(input, run)
 		}
 	} else if run.ProviderTaskID == "" {
 		providerID, parseErr := offlineSourceTaskID(credential.SourceURI)
@@ -353,7 +409,7 @@ func (a *Agent) runStorageSource(ctx context.Context, serverID string, input nod
 			return
 		}
 	}
-	if plan.SourceKind == nodeprotocol.StorageSourceKindPan115OfflineMagnet && run.OutputRootID == "" {
+	if plan.SourceKind == nodeprotocol.StorageSourceKindPan115OfflineMagnet && plan.CloudOfflineLifecycleVersion == 0 && run.OutputRootID == "" {
 		if err := guard(ctx, nodeprotocol.StorageSourceGrantOfflineStatus); err != nil {
 			a.pauseStorageSource(ctx, serverID, input, response, err)
 			return
@@ -628,6 +684,24 @@ func (a *Agent) enumerateStorageSource(ctx context.Context, serverID string, inp
 	if err := validateStorageSourceRoot(plan, run, root); err != nil {
 		return err
 	}
+	var intended *nativeOfflineLifecycle
+	if plan.CloudOfflineLifecycleVersion == 1 && plan.OfflineRequiredDigest != "" {
+		var e error
+		intended, e = a.readOfflineMaterializationIntent(ctx, serverID, input.OperationKey, plan)
+		if e == nil && intended.Required.RootName != root.Name {
+			return ErrPlanConflict
+		}
+		if e != nil {
+			return e
+		}
+	}
+	var missing map[string]int64
+	if intended != nil {
+		missing = map[string]int64{}
+		for _, file := range intended.Required.Files {
+			missing[file.RelativePath] = file.Size
+		}
+	}
 	hasher := sha256.New()
 	var ordinal, totalBytes int64
 	save := func(entries []cloud.TreeEntry) error {
@@ -637,6 +711,18 @@ func (a *Agent) enumerateStorageSource(ctx context.Context, serverID string, inp
 				continue
 			}
 			relative := normalizedExportPath(strings.TrimPrefix(entry.RelativePath, "/"))
+			if intended != nil {
+				key := relative
+
+				size, wanted := missing[key]
+				if !wanted {
+					continue
+				}
+				if size != entry.Size {
+					return ErrPlanConflict
+				}
+				delete(missing, key)
+			}
 			if relative == "" || entry.ID == "" || entry.Size <= 0 || !validSHA1(entry.SHA1) || totalBytes > int64(^uint64(0)>>1)-entry.Size {
 				return errors.New("node_storage_source_manifest_invalid")
 			}
@@ -648,8 +734,21 @@ func (a *Agent) enumerateStorageSource(ctx context.Context, serverID string, inp
 		}
 		return a.store.SaveStorageSourceFileBatch(ctx, input.OperationKey, files, a.now())
 	}
-	if root.IsDir {
+	if intended != nil && intended.ReadyManifest != nil {
+		var entries []cloud.TreeEntry
+		for _, file := range intended.ReadyManifest.Files {
+			leaf, e := driver.Stat(ctx, file.ProviderItemID)
+			if e != nil || leaf.IsDir || leaf.ID != file.ProviderItemID || leaf.ParentID != file.ProviderParentID || leaf.Size != file.Size {
+				return ErrPlanConflict
+			}
+			entries = append(entries, cloud.TreeEntry{Item: leaf, RelativePath: file.RelativePath})
+		}
+		err = save(entries)
+	} else if root.IsDir {
 		maxEntries := int(^uint(0) >> 1)
+		if intended != nil {
+			maxEntries = 5000
+		}
 		err = driver.StreamTree(ctx, run.OutputRootID, maxEntries, func(batch cloud.TreeBatch) error {
 			if batch.Partial {
 				return errors.New("node_storage_source_manifest_incomplete")
@@ -664,6 +763,9 @@ func (a *Agent) enumerateStorageSource(ctx context.Context, serverID string, inp
 	}
 	if err != nil {
 		return err
+	}
+	if len(missing) > 0 {
+		return errors.New("node_storage_source_manifest_incomplete")
 	}
 	if ordinal == 0 {
 		return errors.New("node_storage_source_manifest_empty")
@@ -1057,7 +1159,7 @@ func manifestHashFile(writer io.Writer, file StorageSourceFile) {
 }
 
 func sourceResponse(input nodeprotocol.StorageSourceActionRequest, run StorageSourceRun) nodeprotocol.StorageSourceActionResponse {
-	return nodeprotocol.StorageSourceActionResponse{RequestID: input.RequestID, OperationKey: input.OperationKey, PlanDigest: input.PlanDigest, Status: run.Status, OutputRootID: run.OutputRootID, TotalFiles: run.TotalFiles, DownloadedFiles: run.DownloadedFiles, TotalBytes: run.TotalBytes, DownloadedBytes: run.DownloadedBytes, Progress: sourceProgress(run)}
+	return nodeprotocol.StorageSourceActionResponse{Offline: run.Offline, OfflineStopState: run.OfflineStopState, RequestID: input.RequestID, OperationKey: input.OperationKey, PlanDigest: input.PlanDigest, Status: run.Status, OutputRootID: run.OutputRootID, TotalFiles: run.TotalFiles, DownloadedFiles: run.DownloadedFiles, TotalBytes: run.TotalBytes, DownloadedBytes: run.DownloadedBytes, Progress: sourceProgress(run)}
 }
 
 func sourceProgress(run StorageSourceRun) *float64 {
@@ -1069,8 +1171,15 @@ func sourceProgress(run StorageSourceRun) *float64 {
 }
 
 func (a *Agent) pauseStorageSource(ctx context.Context, serverID string, input nodeprotocol.StorageSourceActionRequest, response nodeprotocol.StorageSourceActionResponse, err error) {
+	if run, e := a.store.StorageSourceRun(ctx, serverID, input.OperationKey); e == nil {
+		response.Offline = run.Offline
+		response.OfflineStopState = run.OfflineStopState
+	}
 	code := storageSourceErrorCode(err)
 	response.ErrorCode = code
+	if response.Offline != nil && response.Offline.TerminalFailure {
+		response.Status = nodeprotocol.StorageSourceFailed
+	}
 	if code == nodeprotocol.ErrorCredentialExpired {
 		response.Status = nodeprotocol.StorageSourceWaitingCredentials
 	}
@@ -1096,7 +1205,7 @@ func storageSourceErrorCode(err error) string {
 	if errors.Is(err, ErrPlanConflict) || strings.Contains(err.Error(), nodeprotocol.ErrorPlanConflict) {
 		return nodeprotocol.ErrorPlanConflict
 	}
-	for _, code := range []string{nodeprotocol.ErrorCredentialExpired, nodeprotocol.ErrorReconciliationNeeded, nodeprotocol.ErrorChecksumMismatch, nodeprotocol.ErrorCapabilityMissing} {
+	for _, code := range []string{"node_source_offline_failed", nodeprotocol.ErrorCredentialExpired, nodeprotocol.ErrorReconciliationNeeded, nodeprotocol.ErrorChecksumMismatch, nodeprotocol.ErrorCapabilityMissing} {
 		if strings.Contains(err.Error(), code) {
 			return code
 		}

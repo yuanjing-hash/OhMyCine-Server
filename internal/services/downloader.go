@@ -14,6 +14,7 @@ import (
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
 	cloudpkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud"
 	downloadpkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/downloader"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/nodeprotocol"
 	"gorm.io/gorm"
 	"modernc.org/sqlite"
 	sqlite3 "modernc.org/sqlite/lib"
@@ -41,6 +42,7 @@ func NewDownloaderService(db *gorm.DB, audit *AuditService, credentials *credent
 }
 
 type DownloaderInput struct {
+	MaxConcurrentDownloads *int
 	Name                   string
 	Type                   string
 	BaseURL                string
@@ -57,6 +59,7 @@ type DownloaderInput struct {
 }
 
 type UpdateDownloaderInput struct {
+	MaxConcurrentDownloads *int
 	Name                   *string
 	BaseURL                *string
 	Username               *string
@@ -81,6 +84,7 @@ type DownloaderHealth struct {
 }
 
 type DownloaderSummary struct {
+	MaxConcurrentDownloads      int                      `json:"max_concurrent_downloads"`
 	ID                          string                   `json:"id"`
 	SortOrder                   int                      `json:"sort_order"`
 	Name                        string                   `json:"name"`
@@ -164,6 +168,10 @@ func (s *DownloaderService) CreateContext(ctx context.Context, actor Actor, inpu
 	if !actor.Can(authz.PermissionDownloadersCreate) {
 		return DownloaderSummary{}, appError(CodePermissionDenied, "无权创建下载器", nil)
 	}
+	limit, err := validateDownloaderConcurrency(input.MaxConcurrentDownloads, 2)
+	if err != nil {
+		return DownloaderSummary{}, err
+	}
 	name, normalized, err := normalizeDownloaderName(input.Name)
 	if err != nil {
 		return DownloaderSummary{}, err
@@ -244,6 +252,7 @@ func (s *DownloaderService) CreateContext(ctx context.Context, actor Actor, inpu
 	capabilitiesJSON, _ := json.Marshal(capabilities)
 	now := time.Now().UTC()
 	record := models.Downloader{ID: id, OwnerID: actor.User.ID, Name: name, NameNormalized: normalized, Type: providerType, ExecutionLocation: executionLocation, BaseURL: baseURL, UsernameCiphertext: username, PasswordCiphertext: password, StorageID: storage, ProviderDirectoryID: providerDirectoryID, ProviderDirectoryPath: providerDirectoryPath, AutoListenLifeEvents: autoListen, Enabled: input.Enabled, CapabilitiesJSON: string(capabilitiesJSON), LastHealthStatus: "unknown", CreatedAt: now, UpdatedAt: now}
+	record.MaxConcurrentDownloads = limit
 	if binding != nil {
 		record.NodeID = &binding.NodeID
 		var node models.TransferNode
@@ -312,6 +321,11 @@ func (s *DownloaderService) UpdateContext(ctx context.Context, actor Actor, id s
 	if input.Enabled != nil {
 		record.Enabled = *input.Enabled
 	}
+	limit, err := validateDownloaderConcurrency(input.MaxConcurrentDownloads, record.MaxConcurrentDownloads)
+	if err != nil {
+		return DownloaderSummary{}, err
+	}
+	record.MaxConcurrentDownloads = limit
 	if normalizeExecutionLocation(record.ExecutionLocation) == models.NodeLocationRemote {
 		return s.updateNodeDownloader(ctx, actor, record, input, request)
 	}
@@ -484,6 +498,13 @@ func (s *DownloaderService) clientFor(record models.Downloader) (downloadpkg.Cli
 		return s.nodeDownloaderClient(record, "", "")
 	}
 	config := downloadpkg.Config{BaseURL: record.BaseURL}
+	if caps, known := s.registry.Capabilities(record.Type); known && caps.NativeOffline {
+		namespace, err := s.verifiedOfflineAccount(record)
+		if err != nil {
+			return nil, err
+		}
+		config.OfflineAccountNamespace = namespace
+	}
 	if record.Type == models.DownloaderTypeQuarkShare {
 		if record.StorageID == nil || s.connections == nil {
 			return nil, appError(CodeDownloaderStorageUnavailable, "夸克分享接收目录不可用", nil)
@@ -531,6 +552,11 @@ func (s *DownloaderService) clientFor(record models.Downloader) (downloadpkg.Cli
 		if directoryID == "" {
 			directoryID = storage.RootPath
 		}
+		namespace, namespaceErr := s.verifiedOfflineAccount(record)
+		if namespaceErr != nil {
+			return nil, namespaceErr
+		}
+		config.OfflineAccountNamespace = namespace
 		config.CloudDriver, config.ProviderStorageRootID, config.ProviderDirectoryID = native, strings.TrimSpace(storage.RootPath), directoryID
 		client, err := s.registry.Build(record.Type, config)
 		if err != nil {
@@ -735,7 +761,7 @@ func (s *DownloaderService) summary(actor Actor, record models.Downloader) Downl
 		downloaderSaveRoot, nodeMountRoot = binding.DownloaderSaveRoot, binding.NodeMountRoot
 	}
 	location := normalizeExecutionLocation(record.ExecutionLocation)
-	return DownloaderSummary{ID: record.ID, SortOrder: record.SortOrder, Name: record.Name, Type: record.Type, BaseURL: baseURL, Enabled: record.Enabled, UsernameConfigured: usernameConfigured, PasswordConfigured: passwordConfigured, Capabilities: capabilities, Health: DownloaderHealth{Status: record.LastHealthStatus, Version: record.LastHealthVersion, ErrorCode: record.LastHealthErrorCode, LastChecked: record.LastHealthCheckedAt}, CreatedAt: record.CreatedAt, UpdatedAt: record.UpdatedAt, StorageID: record.StorageID, StorageName: name, ProviderDirectoryPath: record.ProviderDirectoryPath, AutoListenLifeEvents: record.AutoListenLifeEvents, LifeEventDefaultLibraryID: defaultLibraryID, LifeEventDefaultLibraryName: defaultLibraryName, ExecutionLocation: location, NodeID: record.NodeID, NodeName: record.NodeName, DownloaderSaveRoot: downloaderSaveRoot, NodeMountRoot: nodeMountRoot}
+	return DownloaderSummary{MaxConcurrentDownloads: record.MaxConcurrentDownloads, ID: record.ID, SortOrder: record.SortOrder, Name: record.Name, Type: record.Type, BaseURL: baseURL, Enabled: record.Enabled, UsernameConfigured: usernameConfigured, PasswordConfigured: passwordConfigured, Capabilities: capabilities, Health: DownloaderHealth{Status: record.LastHealthStatus, Version: record.LastHealthVersion, ErrorCode: record.LastHealthErrorCode, LastChecked: record.LastHealthCheckedAt}, CreatedAt: record.CreatedAt, UpdatedAt: record.UpdatedAt, StorageID: record.StorageID, StorageName: name, ProviderDirectoryPath: record.ProviderDirectoryPath, AutoListenLifeEvents: record.AutoListenLifeEvents, LifeEventDefaultLibraryID: defaultLibraryID, LifeEventDefaultLibraryName: defaultLibraryName, ExecutionLocation: location, NodeID: record.NodeID, NodeName: record.NodeName, DownloaderSaveRoot: downloaderSaveRoot, NodeMountRoot: nodeMountRoot}
 }
 
 // Reorder replaces the complete global order so an actor cannot silently move
@@ -832,4 +858,84 @@ func downloaderConstraintError(err error) error {
 		return appError(CodeDownloaderNameConflict, "下载器名称已存在", err)
 	}
 	return appError(CodeConflict, "下载器配置冲突", err)
+}
+
+func validateDownloaderConcurrency(input *int, current int) (int, error) {
+	if input != nil {
+		current = *input
+	} else if current == 0 {
+		current = 2
+	}
+	if current < 1 || current > 64 {
+		return 0, appError(CodeInvalidRequest, "下载器并发数必须为 1 到 64", nil)
+	}
+	return current, nil
+}
+
+func (s *DownloaderService) requireOfflineLifecycleNode(record models.Downloader) error {
+	if normalizeExecutionLocation(record.ExecutionLocation) != models.NodeLocationRemote {
+		return nil
+	}
+	if record.NodeID == nil {
+		return appError(CodeDownloaderUnavailable, "节点离线来源不可用", nil)
+	}
+	var node models.TransferNode
+	if err := s.db.Select("id", "capabilities_json").First(&node, "id = ?", *record.NodeID).Error; err != nil {
+		return err
+	}
+	var caps nodeprotocol.Capabilities
+	if json.Unmarshal([]byte(node.CapabilitiesJSON), &caps) != nil || !caps.Has(nodeprotocol.CapabilityCloudOfflineLifecycleV1) {
+		return appError(CodeTransferRouteUnsupported, "请先升级传输节点：当前节点缺少云端离线限时与保留文件取消能力", nil)
+	}
+	return nil
+}
+
+func (s *DownloadService) validateOfflineSourcePreview(record models.Downloader, kind string) error {
+	if kind != downloadpkg.SourceURL && kind != downloadpkg.SourceTorrent || s.downloader == nil {
+		return nil
+	}
+	caps, known := s.downloader.registry.Capabilities(record.Type)
+	if !known || !caps.NativeOffline {
+		return nil
+	}
+	return s.downloader.requireOfflineLifecycleNode(record)
+}
+
+// verifiedOfflineAccount is the downloader factory account resolver. Provider
+// credential semantics stay at this boundary; shared offline policy consumes
+// only the stable namespace and rechecks the same factory authority.
+func (s *DownloaderService) verifiedOfflineAccount(record models.Downloader) (string, error) {
+	if record.StorageID == nil {
+		return "", nil
+	}
+	var storage models.Storage
+	if err := s.db.First(&storage, *record.StorageID).Error; err != nil {
+		return "", err
+	}
+	if storage.ConnectionID == nil {
+		return "", nil
+	}
+	var connection models.Connection
+	if err := s.db.First(&connection, *storage.ConnectionID).Error; err != nil {
+		return "", err
+	}
+	account := connection.AccountID
+	if connection.Provider == cloudpkg.ProviderPan115 {
+		secrets := s.credentials
+		if s.connections != nil && s.connections.credentials != nil {
+			secrets = s.connections.credentials
+		}
+		if secrets == nil {
+			return "", appError(CodeConnectionUnavailable, "离线来源凭据不可用", nil)
+		}
+		cookie, err := secrets.Decrypt(connectionPurpose(connection.ID, connection.Provider), connection.CredentialCiphertext)
+		if err != nil {
+			return "", err
+		}
+		account, err = credentialOfflineAccount(connection, cookie)
+		if err != nil {
+			return "", err
+		}
+	}
+	return offlineAccountNamespace(connection.Provider, account), nil
 }

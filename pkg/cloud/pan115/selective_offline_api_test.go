@@ -45,7 +45,7 @@ func TestSelectedCookieWireUsesDocumentedEndpointsAndEncryptedSingleSubmit(t *te
 	})
 	client := sdk.New(sdk.WithClient(&http.Client{Transport: transport}), sdk.UA(sdk.UA115Browser))
 	client.UserID = 1
-	adapter := &sdkAdapter{client}
+	adapter := &sdkAdapter{Pan115Client: client}
 	info, err := adapter.ParseOfflineTorrent(context.Background(), strings.Repeat("b", 40))
 	if err != nil || len(info.Files) != 2 || info.Files[1].Size != 10 {
 		t.Fatal("table", err)

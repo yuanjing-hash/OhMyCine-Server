@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import type { DashboardSection } from './activity'
-import { jobTypeLabel, progressPercent, statusLabels, type Job } from '@/jobs'
+import { jobTypeLabel, progressPercent, jobStatusLabel, type Job } from '@/jobs'
 defineProps<{ section?: DashboardSection<Job>; empty: string; error?: string }>()
 </script>
 <template>
@@ -9,7 +9,7 @@ defineProps<{ section?: DashboardSection<Job>; empty: string; error?: string }>(
   <p v-else-if="section.status === 'unavailable'" class="dashboard-empty semantic-error" role="alert">任务暂时无法读取，请稍后刷新。</p>
   <ul v-else-if="section.list.length" class="task-list">
     <li v-for="task in section.list" :key="task.id">
-      <div class="task-row"><RouterLink :to="{ path: '/automation/tasks', query: { job_id: task.id } }" class="task-title">{{ task.display_name }}</RouterLink><span class="status-chip">{{ statusLabels[task.status] }}</span></div>
+      <div class="task-row"><RouterLink :to="{ path: '/automation/tasks', query: { job_id: task.id } }" class="task-title">{{ task.display_name }}</RouterLink><span class="status-chip">{{ jobStatusLabel(task) }}</span></div>
       <div class="task-meta"><span>{{ jobTypeLabel(task) }}</span><span v-if="task.progress != null">{{ progressPercent(task.progress) }}</span><span v-if="task.processed_items != null && task.total_items != null">{{ task.processed_items }} / {{ task.total_items }}</span></div>
       <p v-if="task.wait_reason?.message || task.last_error_message" class="task-message">{{ task.wait_reason?.message || task.last_error_message }}</p>
     </li>

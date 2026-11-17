@@ -141,6 +141,137 @@ func TestDownloadQueueAllowsUnkeyedQBittorrentJobsWhileSerializingProviderKey(t 
 	}
 }
 
+func TestDownloadAcquisitionAdmissionSurvivesYieldsAndKeepsDownloaderFairness(t *testing.T) {
+	queue, actor, clock := queueFixture(t)
+	for _, record := range []models.Downloader{{ID: "capacity-a", Name: "A", NameNormalized: "a", Type: models.DownloaderTypeFake, Enabled: true, MaxConcurrentDownloads: 2, CapabilitiesJSON: "{}"}, {ID: "capacity-b", Name: "B", NameNormalized: "b", Type: models.DownloaderTypeFake, Enabled: true, MaxConcurrentDownloads: 1, CapabilitiesJSON: "{}"}} {
+		if err := queue.db.Create(&record).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	enqueue := func(id, downloader, group, control string, priority int) models.DownloadTask {
+		task := models.DownloadTask{ID: id, OwnerID: actor.User.ID, DownloaderID: &downloader, DownloaderName: downloader, ProviderType: models.DownloaderTypeFake, SourceCiphertext: "encrypted-fixture", DisplayName: id, Phase: models.DownloadTaskStatusQueued, BTSelectionGroupID: group}
+		if control != "" {
+			task.Phase = models.DownloadTaskStatusCancelled
+		}
+		_, err := queue.EnqueueWith(EnqueueJobInput{OwnerID: actor.User.ID, JobType: "download", DisplayName: id, ResourceKey: "downloader:" + downloader, Priority: priority, Payload: downloadJobPayload{DownloadTaskID: id, ControlIntent: control}}, func(tx *gorm.DB, job models.Job) error {
+			task.JobID = job.ID
+			if err := tx.Create(&task).Error; err != nil {
+				return err
+			}
+			if group != "" {
+				return tx.Create(&models.BTSelectionRef{TaskID: id, GroupID: group, OwnDigest: "fixture", State: "queued", Revision: 1}).Error
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return task
+	}
+	var a []models.DownloadTask
+	for n := 0; n < 72; n++ {
+		a = append(a, enqueue(fmt.Sprintf("capacity-a-%02d", n), "capacity-a", "", "", 0))
+	}
+	b := enqueue("capacity-b-0", "capacity-b", "", "", 0)
+	yield := func(claim *ClaimedJob) {
+		t.Helper()
+		if err := queue.RetryLater(claim.Job.ID, claim.LeaseToken, "", "", clock.Now().Add(10*time.Minute)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for n := 0; n < 2; n++ {
+		claim, err := queue.Claim([]string{"download"})
+		if err != nil || claim == nil || claim.Job.ID != a[n].JobID {
+			t.Fatalf("A%d=%+v %v", n, claim, err)
+		}
+		if err := queue.db.Model(&models.DownloadTask{}).Where("id = ?", a[n].ID).Updates(map[string]any{"provider_task_id": "native-" + a[n].ID, "phase": models.DownloadTaskStatusDownloading}).Error; err != nil {
+			t.Fatal(err)
+		}
+		yield(claim)
+	}
+	claim, err := queue.Claim([]string{"download"})
+	if err != nil || claim == nil || claim.Job.ID != b.JobID {
+		t.Fatalf("B starved behind over 64 full A rows: %+v %v", claim, err)
+	}
+	if err := queue.Complete(claim.Job.ID, claim.LeaseToken); err != nil {
+		t.Fatal(err)
+	}
+	var count int64
+	if err := queue.db.Model(&models.DownloadAdmission{}).Where("downloader_id = ? AND state = 'held'", "capacity-a").Count(&count).Error; err != nil || count != 2 {
+		t.Fatalf("A durable usage=%d %v", count, err)
+	}
+	if next, err := queue.Claim([]string{"download"}); err != nil || next != nil {
+		t.Fatalf("yield freed physical slots: %+v %v", next, err)
+	}
+	// A group is one native acquisition even with multiple exact logical refs.
+	if err := queue.db.Model(&models.Downloader{}).Where("id = ?", "capacity-a").Update("max_concurrent_downloads", 3).Error; err != nil {
+		t.Fatal(err)
+	}
+	group := models.BTSelectionGroup{ID: "capacity-group", OwnerID: actor.User.ID, DownloaderID: "capacity-a", ScopeDigest: "scope", Workspace: t.TempDir(), Revision: 1, Generation: 1}
+	if err := queue.db.Create(&group).Error; err != nil {
+		t.Fatal(err)
+	}
+	g1 := enqueue("capacity-group-1", "capacity-a", group.ID, "", 1)
+	g2 := enqueue("capacity-group-2", "capacity-a", group.ID, "", 1)
+	for _, task := range []models.DownloadTask{g1, g2} {
+		next, err := queue.Claim([]string{"download"})
+		if err != nil || next == nil || next.Job.ID != task.JobID {
+			t.Fatalf("group ref=%+v %v", next, err)
+		}
+		yield(next)
+	}
+	if err := queue.db.Model(&models.DownloadAdmission{}).Where("downloader_id = ? AND state = 'held'", "capacity-a").Count(&count).Error; err != nil || count != 3 {
+		t.Fatalf("group was charged twice: %d %v", count, err)
+	}
+	control := enqueue("capacity-control", "capacity-a", "", "cancel", 2)
+	if next, err := queue.Claim([]string{"download"}); err != nil || next == nil || next.Job.ID != control.JobID {
+		t.Fatalf("full downloader blocked control: %+v %v", next, err)
+	}
+	if err := queue.db.Model(&models.DownloadTask{}).Where("id = ?", g1.ID).Update("phase", models.DownloadTaskStatusCompleted).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := queue.db.Model(&models.DownloadTask{}).Where("id = ?", g2.ID).Updates(map[string]any{"phase": models.DownloadTaskStatusCancelled, "offline_stop_pending": true, "last_error_code": downloadCancellationPending}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := queue.db.Model(&models.BTSelectionRef{}).Where("task_id = ?", g2.ID).Update("state", "released").Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := queue.db.Transaction(func(tx *gorm.DB) error { return releaseDownloadAdmissionTx(tx, g1, clock.Now()) }); err != nil {
+		t.Fatal(err)
+	}
+	var held models.DownloadAdmission
+	if err := queue.db.First(&held, "acquisition_key = ?", "bt:"+group.ID).Error; err != nil || held.State != "held" {
+		t.Fatal("another cancelled unknown ref freed the group")
+	}
+	if err := queue.db.Model(&models.DownloadTask{}).Where("id = ?", g2.ID).Updates(map[string]any{"offline_stop_pending": false, "last_error_code": ""}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := queue.db.Transaction(func(tx *gorm.DB) error { return releaseDownloadAdmissionTx(tx, g1, clock.Now()) }); err != nil {
+		t.Fatal(err)
+	}
+	if err := queue.db.First(&held, "acquisition_key = ?", "bt:"+group.ID).Error; err != nil || held.State != "released" {
+		t.Fatal("settled group did not release admission")
+	}
+	// Lowering affects future admission; original observations remain eligible.
+	if err := queue.db.Model(&models.Job{}).Where("id IN ?", []string{g1.JobID, g2.JobID}).Updates(map[string]any{"status": models.JobStatusCompleted, "next_attempt_at": nil}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := queue.db.Model(&models.Job{}).Where("id = ?", control.JobID).Updates(map[string]any{"status": models.JobStatusCancelled, "lease_token_hash": "", "lease_expires_at": nil}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := queue.db.Model(&models.Downloader{}).Where("id = ?", "capacity-a").Update("max_concurrent_downloads", 1).Error; err != nil {
+		t.Fatal(err)
+	}
+	clock.now = clock.now.Add(11 * time.Minute)
+	if err := queue.PromoteDueRetries(); err != nil {
+		t.Fatal(err)
+	}
+	next, err := queue.Claim([]string{"download"})
+	if err != nil || next == nil || next.Job.ID != a[0].JobID && next.Job.ID != a[1].JobID {
+		t.Fatalf("lower limit blocked admitted observations: %+v %v", next, err)
+	}
+}
+
 func TestQueueActionRetryRecoveryCoalescingAndPrivateState(t *testing.T) {
 	service, actor, clock := queueFixture(t)
 	if _, err := service.Enqueue(EnqueueJobInput{OwnerID: actor.User.ID, JobType: "fake", DisplayName: "Unsafe", Payload: map[string]any{"nested": map[string]any{"api_token": "secret"}}}); ErrorCode(err) != CodeInvalidRequest {

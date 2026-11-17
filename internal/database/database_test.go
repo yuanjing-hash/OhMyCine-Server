@@ -16,6 +16,71 @@ import (
 	"gorm.io/gorm"
 )
 
+func TestOfflineAcquisitionMigrationRetainsLegacyWorkAndPolicy(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "offline-upgrade.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sqlDB, _ := db.DB()
+	defer sqlDB.Close()
+	applyMigrationsThrough(t, db, 128)
+	user := models.User{Username: "offline-upgrade", UsernameNormalized: "offline-upgrade", DisplayName: "owner", PasswordHash: "fixture", Status: models.UserStatusActive}
+	if err := db.Create(&user).Error; err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if err := db.Exec(`INSERT INTO downloaders(id,name,name_normalized,type,enabled,capabilities_json,created_at,updated_at) VALUES ('legacy-downloader','legacy','legacy','qbittorrent',1,'{}',?,?)`, now, now).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Where("job_type = ?", "download").FirstOrCreate(&models.QueuePolicy{JobType: "download", Concurrency: 3, ResourceConcurrency: 1, MaxAttempts: 5, LeaseSeconds: 30}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Exec(`UPDATE queue_policies SET concurrency=3,resource_concurrency=1 WHERE job_type='download'`).Error; err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"legacy-active", "legacy-queued"} {
+		status, phase, provider := "failed", "failed", "original-native-id"
+		if id == "legacy-queued" {
+			status, phase, provider = "queued", "queued", ""
+		}
+		if err := db.Create(&models.Job{ID: id + "-job", OwnerID: &user.ID, CreatedByKind: "user", JobType: "download", Status: status, DisplayName: "legacy", PayloadJSON: "{}", CheckpointJSON: "{}", Revision: 1, Generation: 1, CreatedAt: now, UpdatedAt: now}).Error; err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Exec(`INSERT INTO download_tasks(id,owner_id,job_id,downloader_id,downloader_name,provider_type,provider_task_id,source_ciphertext,display_name,phase,created_at,updated_at) VALUES (?,?,?,'legacy-downloader','legacy','qbittorrent',?,'preserved-ciphertext','legacy',?,?,?)`, id, user.ID, id+"-job", provider, phase, now, now).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := Migrate(db); err != nil {
+		t.Fatal(err)
+	}
+	if err := Migrate(db); err != nil {
+		t.Fatal(err)
+	}
+	var downloader models.Downloader
+	if err := db.First(&downloader, "id = ?", "legacy-downloader").Error; err != nil || downloader.MaxConcurrentDownloads != 2 {
+		t.Fatalf("concurrency migration=%+v %v", downloader, err)
+	}
+	var policy models.QueuePolicy
+	if err := db.First(&policy, "job_type = ?", "download").Error; err != nil || policy.Concurrency != 3 || policy.ResourceConcurrency != 1 {
+		t.Fatal("migration changed administrator QueuePolicy", err)
+	}
+	var task models.DownloadTask
+	if err := db.First(&task, "id = ?", "legacy-active").Error; err != nil {
+		t.Fatal(err)
+	}
+	if task.SourceCiphertext != "preserved-ciphertext" || task.ProviderTaskID != "original-native-id" || task.Phase != "failed" || task.OfflineKind != "" || task.OfflineStartedAt != nil || task.OfflineDeadlineAt != nil || task.OfflineSettledAt != nil {
+		t.Fatal("migration invented clock/settlement or changed old source")
+	}
+	var admissions []models.DownloadAdmission
+	if err := db.Find(&admissions).Error; err != nil || len(admissions) != 1 || admissions[0].AcquisitionKey != "task:legacy-active" || admissions[0].State != "held" {
+		t.Fatalf("legacy admission=%+v %v", admissions, err)
+	}
+	var histories int64
+	if err := db.Model(&models.OfflineFailure{}).Count(&histories).Error; err != nil || histories != 0 {
+		t.Fatal("old failed rows became offline failure history")
+	}
+}
+
 func TestOpenUsesImmediateTransactionsToPreventBusySnapshot(t *testing.T) {
 	db, err := Open(filepath.Join(t.TempDir(), "immediate-transaction.db"))
 	if err != nil {

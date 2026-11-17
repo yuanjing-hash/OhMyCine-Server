@@ -82,7 +82,7 @@ func writeError(c *gin.Context, log zerolog.Logger, err error) {
 		status = http.StatusForbidden
 	case services.CodeNotFound, services.CodeFollowNotFound, services.CodePluginAssetExpired, tmdb.ErrorNoMatch:
 		status = http.StatusNotFound
-	case services.CodeConflict, services.CodeFollowConflict, services.CodeFollowRevisionConflict, services.CodeReorganizationBoundaryChanged, services.CodeReorganizationConflict, services.CodeSetupComplete, services.CodeRoleInUse, services.CodeRecoveryRequired, services.CodeConnectionNameConflict, services.CodeConnectionInUse, services.CodeStorageNameConflict, services.CodeStoragePathConflict, services.CodeProfileNameConflict, services.CodeProfileRevisionConflict, services.CodeProfileInUse, services.CodeMediaLibraryNameConflict, services.CodeMediaLibraryOverlap, services.CodeMediaLibraryBusy, services.CodeDownloaderNameConflict, services.CodeDownloaderInUse, services.CodePluginRepositoryConflict, services.CodePluginRepositoryRevision, services.CodePluginAlreadyInstalled, services.CodePluginPreviewExpired, services.CodePluginPermissionChanged, services.CodePluginRevisionConflict, services.CodePluginRollbackUnavailable, services.CodePluginPackageConflict, services.CodePluginSourceChange, services.CodeSiteNameConflict:
+	case services.CodeOfflineConfirmationRequired, services.CodeConflict, services.CodeFollowConflict, services.CodeFollowRevisionConflict, services.CodeReorganizationBoundaryChanged, services.CodeReorganizationConflict, services.CodeSetupComplete, services.CodeRoleInUse, services.CodeRecoveryRequired, services.CodeConnectionNameConflict, services.CodeConnectionInUse, services.CodeStorageNameConflict, services.CodeStoragePathConflict, services.CodeProfileNameConflict, services.CodeProfileRevisionConflict, services.CodeProfileInUse, services.CodeMediaLibraryNameConflict, services.CodeMediaLibraryOverlap, services.CodeMediaLibraryBusy, services.CodeDownloaderNameConflict, services.CodeDownloaderInUse, services.CodePluginRepositoryConflict, services.CodePluginRepositoryRevision, services.CodePluginAlreadyInstalled, services.CodePluginPreviewExpired, services.CodePluginPermissionChanged, services.CodePluginRevisionConflict, services.CodePluginRollbackUnavailable, services.CodePluginPackageConflict, services.CodePluginSourceChange, services.CodeSiteNameConflict:
 		status = http.StatusConflict
 	case services.CodeQueueOrderConflict, services.CodeQueueStateConflict, services.CodeQueueLeaseInvalid, services.CodeQueueActionStale, services.CodeQueuePolicyConflict:
 		status = http.StatusConflict
@@ -127,6 +127,9 @@ func writeError(c *gin.Context, log zerolog.Logger, err error) {
 	data := gin.H{"error_code": code}
 	if appErr != nil && appErr.ShareValidation != nil {
 		data["share_validation"] = appErr.ShareValidation
+	}
+	if appErr != nil && appErr.Code == services.CodeOfflineConfirmationRequired && appErr.OfflineFailureWarning != nil {
+		data["offline_failure_warning"] = appErr.OfflineFailureWarning
 	}
 	c.JSON(status, response{Code: appCode, Message: services.ErrorMessage(err), Data: data})
 }

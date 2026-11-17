@@ -25,6 +25,11 @@ import (
 )
 
 type Agent struct {
+	offlineStopMu      sync.Mutex
+	offlineStopRuns    map[string]struct{}
+	offlineStopWG      sync.WaitGroup
+	offlineLockOnce    sync.Once
+	offlineLocks       [64]chan struct{}
 	admissionOnce      sync.Once
 	admission          *operationAdmission
 	config             Config

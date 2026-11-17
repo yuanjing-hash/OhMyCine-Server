@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	sdk "github.com/SheltonZhu/115driver/pkg/driver"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud"
@@ -142,6 +143,7 @@ type selectedTestSDK struct {
 	wanted                                []int
 	seedBody                              []byte
 	loseDirectory, loseUpload, loseSubmit bool
+	submitErr                             error
 	applyUpload, applySubmit              bool
 	parseErr                              error
 }
@@ -214,10 +216,16 @@ func (s *selectedTestSDK) ParseOfflineTorrent(context.Context, string) (selected
 	defer s.mu.Unlock()
 	return s.info, s.parseErr
 }
-func (s *selectedTestSDK) AddOfflineWanted(_ context.Context, r selectedWantedRequest) error {
+func (s *selectedTestSDK) AddOfflineWanted(ctx context.Context, r selectedWantedRequest) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := cloud.RecordOfflineDispatch(ctx, time.Now().UTC()); err != nil {
+		return err
+	}
 	s.submits++
+	if s.submitErr != nil {
+		return s.submitErr
+	}
 	s.wanted = append([]int(nil), r.Wanted...)
 	if s.applySubmit {
 		s.task = &sdk.OfflineTask{InfoHash: r.InfoHash, Name: r.SavePath, DirId: r.DirectoryID, Status: 1, Size: 30}
@@ -281,7 +289,17 @@ func completedSelected(state *selectedTestSDK, extra bool) {
 }
 func TestSelectedOfflinePreservesMetainfoAndNativeWantedMapping(t *testing.T) {
 	c, s, store, request := selectedFixture(t)
-	result, err := c.SubmitSelectedOffline(context.Background(), request)
+	started := time.Date(2026, 11, 13, 10, 0, 0, 0, time.UTC)
+	c.now = func() time.Time { return started }
+	dispatches := 0
+	ctx := cloud.WithOfflineDispatchRecorder(context.Background(), func(at time.Time) error {
+		if !at.Equal(started) || s.creates != 1 || s.uploads != 1 || s.submits != 0 {
+			t.Fatal("clock started outside native wanted add")
+		}
+		dispatches++
+		return nil
+	})
+	result, err := c.SubmitSelectedOffline(ctx, request)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -300,12 +318,15 @@ func TestSelectedOfflinePreservesMetainfoAndNativeWantedMapping(t *testing.T) {
 	if _, err = cold.SubmitSelectedOffline(context.Background(), request); err != nil {
 		t.Fatal(err)
 	}
+	if dispatches != 1 || result.Task.StartedAt == nil || !result.Task.StartedAt.Equal(started) || result.Task.StartProvenance != "dispatch" {
+		t.Fatal("selected restart lost original cloud clock")
+	}
 	if s.creates != 1 || s.uploads != 1 || s.submits != 1 {
 		t.Fatal("confirmed operation replayed", s.creates, s.uploads, s.submits)
 	}
 }
 func TestSelectedOfflineLostRepliesReconcileWithoutAnotherMutation(t *testing.T) {
-	for _, stage := range []string{"directory", "seed", "submit", "seed-not-applied", "submit-not-applied", "checkpoint-directory", "checkpoint-seed", "checkpoint-submit"} {
+	for _, stage := range []string{"directory", "seed", "submit", "seed-not-applied", "submit-not-applied", "checkpoint-directory", "checkpoint-seed", "checkpoint-submit", "definite-submit"} {
 		t.Run(stage, func(t *testing.T) {
 			c, s, store, request := selectedFixture(t)
 			switch stage {
@@ -318,6 +339,8 @@ func TestSelectedOfflineLostRepliesReconcileWithoutAnotherMutation(t *testing.T)
 			case "seed-not-applied":
 				s.loseUpload = true
 				s.applyUpload = false
+			case "definite-submit":
+				s.submitErr = sdk.ErrOfflineNoTimes
 			case "submit-not-applied":
 				s.loseSubmit = true
 				s.applySubmit = false
@@ -329,12 +352,21 @@ func TestSelectedOfflineLostRepliesReconcileWithoutAnotherMutation(t *testing.T)
 				t.Fatal("expected interrupted operation")
 			}
 			cold := selectedClient(s, store)
-			_, err = cold.SubmitSelectedOffline(context.Background(), request)
-			if strings.HasSuffix(stage, "not-applied") {
+			recoverOriginal := cold.SubmitSelectedOffline
+			if stage == "submit" || stage == "checkpoint-submit" || stage == "submit-not-applied" || stage == "definite-submit" {
+				recoverOriginal = cold.ReconcileSelectedOffline
+			}
+			_, err = recoverOriginal(context.Background(), request)
+			if stage == "definite-submit" {
+				var proof interface{ SubmissionNotAccepted() bool }
+				if !errors.As(err, &proof) || s.submits != 1 {
+					t.Fatal("cold native wanted rejection lost original no-task proof", err)
+				}
+			} else if strings.HasSuffix(stage, "not-applied") {
 				if code, _ := cloud.ErrorInfo(err); code != cloud.CodeMutationUnknown {
 					t.Fatal("uncertain operation changed", err)
 				}
-				_, _ = cold.SubmitSelectedOffline(context.Background(), request)
+				_, _ = recoverOriginal(context.Background(), request)
 			} else if err != nil {
 				t.Fatal(err)
 			}

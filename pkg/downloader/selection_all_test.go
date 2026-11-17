@@ -20,6 +20,12 @@ func (c *allNativeFixture) Submit(_ context.Context, r SubmitRequest) (Task, err
 	}
 	return Task{ID: "native"}, nil
 }
+func (c *allNativeFixture) OfflineOperation(Source) OfflineOperation {
+	return OfflineOperation{Kind: OfflineOperationCloud, KeepOutputStop: true}
+}
+func (c *allNativeFixture) ObserveOffline(context.Context, string) (Task, error) {
+	return Task{ID: "native", Offline: &OfflineObservation{Version: 1, Kind: OfflineOperationCloud, Ready: true, CompletionMode: OfflineCompletionAggregate}}, nil
+}
 func (c *allNativeFixture) Manifest(context.Context, string) (Manifest, error) {
 	return Manifest{Complete: true}, nil
 }
@@ -41,9 +47,42 @@ func TestVerifiedAllRequiresEveryLeafAndPreservesPrivateProof(t *testing.T) {
 		t.Fatal("complete proven source rejected")
 	}
 	native := &allNativeFixture{}
+	registry := NewRegistry()
+	if err := registry.Register("declared-native", Capabilities{NativeOffline: true}, func(Config) (Client, error) { return native, nil }); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := registry.Build("declared-native", Config{}); err != nil {
+		t.Fatal("explicit lifecycle adapter was rejected", err)
+	}
+	if err := registry.Register("missing-lifecycle", Capabilities{NativeOffline: true}, func(Config) (Client, error) { return struct{ Client }{native}, nil }); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := registry.Build("missing-lifecycle", Config{}); err == nil {
+		t.Fatal("declared native capability silently bypassed the mandatory source contract")
+	} else if code, _ := ErrorInfo(err); code != "downloader_offline_lifecycle_unsupported" {
+		t.Fatal("missing lifecycle contract did not fail explicitly", err)
+	}
+	if err := registry.Register("missing-observer", Capabilities{NativeOffline: true}, func(Config) (Client, error) {
+		return struct {
+			Client
+			OfflineLifecycleClient
+		}{native, native}, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := registry.Build("missing-observer", Config{}); err == nil {
+		t.Fatal("declared native executor omitted the read-only deadline observer")
+	}
 	bound, err := BindVerifiedAll(native, source)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if operation := ResolveOfflineOperation(bound, source); operation.Kind != OfflineOperationCloud {
+		t.Fatal("verified_all lost lifecycle capability")
+	}
+	observed, e := ObserveOffline(context.Background(), bound, "native")
+	if e != nil || observed.Offline == nil || !observed.Offline.Ready {
+		t.Fatal("wrapper discarded task cloud observation")
 	}
 	if _, ok := bound.(MetadataClient); ok {
 		t.Fatal("native provider acquired fabricated metadata routing")

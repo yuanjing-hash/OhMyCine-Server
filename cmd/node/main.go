@@ -44,6 +44,10 @@ func run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	maintenanceCtx, stopMaintenance := context.WithCancel(ctx)
+	maintenanceDone := make(chan struct{})
+	go func() { defer close(maintenanceDone); agent.RunCloudOfflineMaintenance(maintenanceCtx) }()
+	defer func() { stopMaintenance(); <-maintenanceDone }()
 	server := &http.Server{Addr: cfg.ListenAddress, Handler: agent.Handler(), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 32 << 10}
 	if !cfg.AllowInsecureDevelopment && cfg.Transport == "https" {
 		tlsConfig, err := tlsConfig(cfg)

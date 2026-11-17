@@ -211,16 +211,19 @@ type TemporaryURL struct {
 }
 
 type OfflineTask struct {
-	ID             string
-	Name           string
-	Status         string
-	Progress       *float64
-	BytesTotal     *int64
-	ETASeconds     *int64
-	OutputItemID   string
-	Completed      bool
-	Failed         bool
-	ProviderStatus int
+	DirectoryID     string
+	StartedAt       *time.Time
+	StartProvenance string
+	ID              string
+	Name            string
+	Status          string
+	Progress        *float64
+	BytesTotal      *int64
+	ETASeconds      *int64
+	OutputItemID    string
+	Completed       bool
+	Failed          bool
+	ProviderStatus  int
 }
 
 const (

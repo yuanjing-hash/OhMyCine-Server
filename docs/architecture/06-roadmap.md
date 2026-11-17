@@ -84,3 +84,7 @@ PanSou 接入 TG 与实例启用的插件，提供默认频道追加／仅自定
 
 - [x] op20 和私有 Player 离线计划、独立下载授权网关、VOD HLS 控制展开、只读扫码账号及时间戳会员摘要。SDK/Go/Web 检查和构建已验证。
 - [ ] 真实会员扫码与 Windows/Android 真机播放、视频完整下载和封装验收；本地控制 fixture 不替代这些验收。详见 [合同与边界](28-plugin-native-offline.md)。
+
+## 云端离线可靠性
+
+- [~] 统一 source-aware 30 分钟绝对限时、required-goal 证明、保留文件取消、历史路线跳过/单次手动确认、独立 downloader admission 与有界观察已在隔离源码实施；本地业务/SQLite/协议检查与真实账号、Node 升级、媒体输出保留及部署验收分别记录。旧 accepted Node plan0 保持原权限和自然结算，不伪造自动停止。见 [合同](../api/offline-acquisition.md)。

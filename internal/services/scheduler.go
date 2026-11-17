@@ -36,6 +36,11 @@ type InterruptibleWorker interface {
 type StoppedWorkRecovery interface {
 	RecoverStoppedWork(context.Context, uint64) (uint64, error)
 }
+
+// DeadlineMaintenance performs bounded original-operation observations outside
+// transactions, then serializes a local decision independently of worker capacity.
+type DeadlineMaintenance interface{ ExpireOfflineDeadlines(context.Context) error }
+type OfflineStopRecovery interface{ RecoverOfflineStops(context.Context) error }
 type WorkerFunc func(context.Context, JobRuntime, ClaimedJob) WorkerResult
 
 func (f WorkerFunc) Run(ctx context.Context, runtime JobRuntime, job ClaimedJob) WorkerResult {
@@ -168,6 +173,45 @@ func (s *Scheduler) Start(parent context.Context) error {
 	go s.loop(ctx)
 	for _, kind := range s.registry.Types() {
 		worker, _ := s.registry.Get(kind)
+		if maintenance, ok := worker.(DeadlineMaintenance); ok {
+			s.wg.Add(1)
+			go func() {
+				defer s.wg.Done()
+				ticker := time.NewTicker(time.Second)
+				defer ticker.Stop()
+				for {
+					batch, stop := context.WithTimeout(ctx, 5*time.Second)
+					err := maintenance.ExpireOfflineDeadlines(batch)
+					stop()
+					if err != nil && ctx.Err() == nil {
+						s.log.Warn().Str("error_code", "offline_deadline_maintenance_failed").Msg("离线限时状态维护暂未完成，将重试原任务")
+					}
+					select {
+					case <-ctx.Done():
+						return
+					case <-ticker.C:
+					}
+				}
+			}()
+		}
+		if recovery, ok := worker.(OfflineStopRecovery); ok {
+			s.wg.Add(1)
+			go func() {
+				defer s.wg.Done()
+				ticker := time.NewTicker(15 * time.Second)
+				defer ticker.Stop()
+				for {
+					batch, stop := context.WithTimeout(ctx, 30*time.Second)
+					_ = recovery.RecoverOfflineStops(batch)
+					stop()
+					select {
+					case <-ctx.Done():
+						return
+					case <-ticker.C:
+					}
+				}
+			}()
+		}
 		if recovery, ok := worker.(StoppedWorkRecovery); ok {
 			s.wg.Add(1)
 			go s.recoverStoppedLoop(ctx, recovery)
@@ -307,7 +351,7 @@ func (s *Scheduler) dispatch(ctx context.Context) {
 			fields["user_id"] = *claimed.Job.OwnerID
 		}
 		workerCtx = serverlog.WithBusinessFields(workerCtx, fields)
-		serverlog.OperationTaskQueue.Event(s.log.Info()).Str("job_id", claimed.Job.ID).Str("job_type", claimed.Job.JobType).Int("attempt", claimed.Job.AttemptCount).Msg(serverlog.OperationTaskQueue.Message("任务开始执行"))
+		serverlog.OperationTaskQueue.Event(queueExecutionLog(s.log, *claimed)).Str("job_id", claimed.Job.ID).Str("job_type", claimed.Job.JobType).Int("attempt", claimed.Job.AttemptCount).Msg(serverlog.OperationTaskQueue.Message("任务开始执行"))
 		s.runningMu.Lock()
 		s.running[claimed.Job.ID] = runningWork{cancel: cancel, worker: worker, job: *claimed}
 		s.runningMu.Unlock()
@@ -442,6 +486,13 @@ func (s *Scheduler) dispatch(ctx context.Context) {
 type workerRuntime struct {
 	queue *QueueService
 	job   ClaimedJob
+}
+
+func queueExecutionLog(log zerolog.Logger, claim ClaimedJob) *zerolog.Event {
+	if claim.ObservationContinuation {
+		return log.Debug()
+	}
+	return log.Info()
 }
 
 func (r workerRuntime) Heartbeat(progress *float64, processed, total *int64, speed *float64, eta *int64) error {
