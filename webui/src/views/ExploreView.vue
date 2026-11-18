@@ -21,7 +21,7 @@ import { searchDuration, searchIssueLabel, searchPhaseLabel } from '@/search-pro
 import { useAuthStore } from '@/stores/auth'
 import { notify } from '@/toast'
 import { buildDiscoveryMediaSearchPath, discoveryDetailRoute, mediaIdentitySearchURL, type DiscoveryMediaSearch, type DiscoveryMediaSearchFilter, type DiscoveryMediaType, type DiscoverySearchName, type DiscoveryWork } from '@/discovery'
-import { discoveryDownloadsPath, discoverySearchOptionsPath, filterAndSortTorrentResults, ptRecognitionEpisodeLabel, ptRecognitionErrorLabel, ptRecognitionSpecLabels, readTorrentSearchSession, readTorrentSearchSiteSelection, saveTorrentSearchSession, saveTorrentSearchSiteSelection, sitesPath, torrentRecognitionCandidatesPath, torrentRecognitionOverridePath, torrentSearchPath, torrentSearchStreamPath, torrentSearchURL, torrentSearchSessionKey, type PTRecognitionCandidate, type SearchSiteOption, type SiteSummary, type TorrentRecognitionResult, type TorrentResultDirection, type TorrentSearchGroup, type TorrentSearchProgress, type TorrentSearchResult, type TorrentSearchSession } from '@/sites'
+import { discoveryDownloadsPath, discoverySearchOptionsPath, filterAndSortTorrentResults, ptRecognitionEpisodeLabel, ptRecognitionErrorLabel, ptRecognitionSpecLabels, readTorrentSearchSession, readTorrentSearchSiteSelection, saveTorrentSearchSession, saveTorrentSearchSiteSelection, sitesPath, torrentRecognitionCandidatesPath, torrentRecognitionOverridePath, torrentSearchPath, torrentSearchStreamPath, torrentSearchURL, torrentSearchSessionKey, type PTRecognitionCandidate, type SearchSiteOption, type SiteSummary, type TorrentRecognitionResult, type TorrentResultDirection, type TorrentResultSort, type TorrentSearchGroup, type TorrentSearchProgress, type TorrentSearchResult, type TorrentSearchSession } from '@/sites'
 import type { DownloaderOption, ListResponse, MediaLibraryDetail } from '@/types/api'
 import { discoveryOrigins, discoveryResultLinkPath, discoveryTypeOptions, resultPayloadKind, resultPreviewSourceKind, resultSiteType, resultTypeLabel, safeDiscoveryLink, torrentResourceTypeOptions, type DiscoveryTypePolicy } from '@/sites'
 
@@ -178,7 +178,24 @@ const enabledResultTypes = ref<string[]>([])
 const resolutionFilter = ref('')
 const promotionFilter = ref('')
 const minimumSeeders = ref<number | undefined>()
-const resultSort = ref<'seeders' | 'published' | 'size'>(lockedSiteID.value ? 'published' : 'seeders')
+const submittedSearchInput = ref<TorrentSearchSession['input'] | null>(null)
+const submittedIdentity = ref<{ mediaType: DiscoveryMediaType; tmdbID: number } | null>(null)
+const resultRelevance = computed(() => {
+  if (lockedSiteID.value) return undefined
+  if (submittedIdentity.value) return 'identity' as const
+  const submitted = submittedSearchInput.value
+  return submitted?.searchBy === 'title' && submitted.keyword ? { keyword: submitted.keyword } : undefined
+})
+const selectedResultSort = ref<TorrentResultSort>()
+const resultSort = computed<TorrentResultSort>({
+  get: () => {
+    const selected = selectedResultSort.value
+    if (selected && (selected !== 'relevance' || resultRelevance.value)) return selected
+    if (lockedSiteID.value) return 'published'
+    return resultRelevance.value ? 'relevance' : 'seeders'
+  },
+  set: value => { selectedResultSort.value = value },
+})
 const resultDirection = ref<TorrentResultDirection>('desc')
 
 const orderedGroups = computed(() => [...groups.value].sort((left, right) => left.site_id - right.site_id))
@@ -198,6 +215,7 @@ const visibleResults = computed(() => filterAndSortTorrentResults(groups.value, 
   resolution: resolutionFilter.value,
   promotion: promotionFilter.value,
   minimumSeeders: minimumSeeders.value,
+  relevance: resultRelevance.value,
   sort: resultSort.value,
   direction: resultDirection.value,
 }))
@@ -213,8 +231,6 @@ const trustedIdentity = computed(() => mode.value === 'resources' && boundIdenti
   ? { mediaType: boundIdentity.value.mediaType, tmdbID: boundIdentity.value.tmdbID }
   : null)
 const initialResourceSearch = Boolean(trustedIdentity.value || keyword.value.trim() || searchBy.value === 'tmdb_id' && tmdbID.value)
-let submittedSearchInput: TorrentSearchSession['input'] | null = null
-let submittedIdentity: { mediaType: DiscoveryMediaType; tmdbID: number } | null = null
 const submittedDraft = ref<ResourceSearchDraft | null>(null)
 const submittedLabel = ref('')
 const draftChanged = computed(() => submittedDraft.value !== null && !sameResourceSearchDraft(currentResourceDraft(), submittedDraft.value))
@@ -236,7 +252,7 @@ const searchRunner = useSiteSearch({
   scope: () => lockedSiteID.value ? [lockedSiteID.value] : activeSearchSiteIDs.value,
   siteName: id => groups.value.find(group => group.site_id === id)?.site_name || lockedSite.value?.name || siteOptions.value.find(site => site.id === id)?.name || `站点 #${id}`,
   url: (stream, scope, page, refresh) => {
-    const identity = submittedIdentity
+    const identity = submittedIdentity.value
     const siteID = scope.length === 1 ? scope[0] : undefined
     const input = { ...searchInput(siteID, page, refresh), siteID, siteIDs: siteID ? undefined : scope }
     if (identity) return mediaIdentitySearchURL(identity.mediaType, identity.tmdbID, input, stream)
@@ -309,7 +325,7 @@ function switchMode(value: 'media' | 'resources') {
 
 function searchInput(siteID?: number, page = 1, refresh = false) {
   const fixedSiteID = lockedSiteID.value ?? siteID
-  const input = submittedSearchInput ?? currentSearchInput()
+  const input = submittedSearchInput.value ?? currentSearchInput()
   return { keyword: input.keyword, mediaType: input.mediaType || undefined, year: input.year, tmdbID: input.tmdbID, searchBy: input.searchBy, page, siteID: fixedSiteID, siteIDs: fixedSiteID ? undefined : activeSearchSiteIDs.value, typePolicy: input.typePolicy, cloudTypes: input.cloudTypes, snapshotID: !refresh && fixedSiteID ? groups.value.find(group => group.site_id === fixedSiteID)?.snapshot_id : undefined, refresh }
 }
 
@@ -363,10 +379,10 @@ function executeSearch(siteIDs: number[]) {
   searchRunner.reset()
   retireResultInteractions()
   activeSearchSiteIDs.value = [...siteIDs]
-  submittedSearchInput = currentSearchInput()
-  submittedIdentity = trustedIdentity.value ? { ...trustedIdentity.value } : null
+  submittedSearchInput.value = currentSearchInput()
+  submittedIdentity.value = trustedIdentity.value ? { ...trustedIdentity.value } : null
   submittedDraft.value = currentResourceDraft()
-  submittedLabel.value = selectedTitle.value || submittedSearchInput.keyword || `TMDB ${submittedSearchInput.tmdbID}`
+  submittedLabel.value = selectedTitle.value || submittedSearchInput.value.keyword || `TMDB ${submittedSearchInput.value.tmdbID}`
   groups.value = []
   restoredResults.value = false
   void refreshSourceAvailability()
@@ -740,7 +756,7 @@ function clearSearchForActorChange() {
   searchRunner.reset()
   retireResultInteractions()
   availabilityRequest?.abort(); availabilityRequest = null; sourceStatusReady.value = false; siteOptions.value = []
-  submittedSearchInput = null; submittedIdentity = null; submittedDraft.value = null; submittedLabel.value = ''
+  submittedSearchInput.value = null; submittedIdentity.value = null; submittedDraft.value = null; submittedLabel.value = ''
   groups.value = []; searchProgress.value = null; searching.value = false; searched.value = false
   activeSearchSiteIDs.value = []; identityNames.value = []; searchError.value = ''
   resultRecognition.reset()
@@ -773,7 +789,7 @@ watch(() => resourceSearchRouteKey(route.query), () => {
   boundIdentity.value = intent.identity
   applyingRouteDraft = false
   lockedSite.value = null; activeChannel.value = lockedSiteID.value ?? 'all'
-  resultSort.value = lockedSiteID.value ? 'published' : 'seeders'
+  selectedResultSort.value = undefined
   void refreshSourceAvailability()
   if (trustedIdentity.value || keyword.value.trim() || searchBy.value === 'tmdb_id' && tmdbID.value) search()
 })
@@ -781,7 +797,7 @@ watch(() => resourceSearchRouteKey(route.query), () => {
 watch([groups, recognitions, searched], () => {
   if (upgradeID.value) return
   saveTorrentSearchSession(typeof sessionStorage === 'undefined' ? undefined : sessionStorage, {
-    actorID: auth.user?.id, input: submittedSearchInput ?? currentSearchInput(), groups: groups.value, recognitions: recognitions.value, searched: searched.value, savedAt: Date.now(),
+    actorID: auth.user?.id, input: submittedSearchInput.value ?? currentSearchInput(), groups: groups.value, recognitions: recognitions.value, searched: searched.value, savedAt: Date.now(),
   })
 }, { deep: true })
 
@@ -813,8 +829,8 @@ onMounted(async () => {
     searchBy.value = cached.input.searchBy
     applyingRouteDraft = false
     activeSearchSiteIDs.value = cached.input.siteIDs ?? []
-    submittedSearchInput = cached.input
-    submittedIdentity = trustedIdentity.value ? { ...trustedIdentity.value } : null
+    submittedSearchInput.value = cached.input
+    submittedIdentity.value = trustedIdentity.value ? { ...trustedIdentity.value } : null
     submittedDraft.value = currentResourceDraft()
     submittedLabel.value = selectedTitle.value || cached.input.keyword || `TMDB ${cached.input.tmdbID}`
     groups.value = cached.groups
@@ -927,7 +943,7 @@ onBeforeUnmount(() => {
           <label><span class="label">分辨率</span><select v-model="resolutionFilter" class="input"><option value="">全部</option><option v-for="value in resolutionOptions" :key="value" :value="value">{{ value }}</option></select></label>
           <label><span class="label">优惠</span><select v-model="promotionFilter" class="input"><option value="">全部</option><option value="free">FREE</option><option value="2xfree">2X FREE</option><option value="2x">2X</option></select></label>
           <label><span class="label">最低做种</span><input v-model.number="minimumSeeders" class="input" type="number" min="0" placeholder="不限" /></label>
-          <label><span class="label">排序字段</span><select v-model="resultSort" class="input"><option value="seeders">做种数</option><option value="published">发布时间</option><option value="size">体积</option></select></label>
+          <label><span class="label">排序字段</span><select v-model="resultSort" class="input"><option v-if="resultRelevance" value="relevance">相关度</option><option value="seeders">做种数</option><option value="published">发布时间</option><option value="size">体积</option></select></label>
           <label><span class="label">排序方向</span><select v-model="resultDirection" class="input"><option value="desc">降序</option><option value="asc">升序</option></select></label>
           <p class="text-subtle mb-0 text-xs xl:col-span-2">不同筛选项之间为 AND；同类标签按任一匹配。排序只针对已经取回的当前页结果。</p>
         </form>

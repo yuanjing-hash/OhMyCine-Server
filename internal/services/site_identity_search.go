@@ -212,14 +212,11 @@ func (s *SiteService) searchMediaIdentitySitePage(ctx context.Context, actor Act
 				continue
 			}
 			cloudShare := isCloudShareSource(item.SourceKind)
-			titleMatched := mediaIdentityResultMatches(item.Title, names, input.MediaType, verified.ReleaseYear, input.Season)
-			matches := titleMatched
-			if item.ContentInspection {
-				// An inspectable collection may omit season/episode facts in its
-				// post title. A plausible work name only admits a bounded read;
-				// actual selected leaves must still prove the requested identity.
-				matches = mediaIdentityInspectionPlausible(item.Title, names, input.MediaType, verified.ReleaseYear, input.Season)
-			}
+			matchedName, titleMatched := mediaIdentityResultEvidence(item.Title, claim.Subtitle, names, input.MediaType, verified.ReleaseYear, input.Season)
+			// A matching subtitle or a title without the requested season can
+			// surface an inspectable candidate. Actual selected leaves still
+			// have to establish the work and season before acquisition.
+			matches := titleMatched || item.ContentInspection && matchedName != ""
 			if contentSearchIdentityConflict(claim, input.TMDBID, input.MediaType) || !cloudShare && !matches {
 				s.deleteClaim(item.Token)
 				target.Skipped++
@@ -230,6 +227,7 @@ func (s *SiteService) searchMediaIdentitySitePage(ctx context.Context, actor Act
 				s.deleteClaim(item.Token)
 				continue
 			}
+			item.MatchedName = matchedName
 			identity := claim.TorrentID
 			if (isCloudShareSource(item.SourceKind) || item.SourceKind == RouteSourceBT) && item.ResourceFingerprint != "" {
 				identity = item.ResourceFingerprint
@@ -249,9 +247,6 @@ func (s *SiteService) searchMediaIdentitySitePage(ctx context.Context, actor Act
 				s.deleteClaim(item.Token)
 				rejections.add("identity_bind_failed", item.Title)
 				continue
-			}
-			if name.Kind != panSouQueryVariant {
-				item.MatchedName = name.Value
 			}
 			item.ResourceFingerprint = privateResultFingerprint(group.SiteID, identity)
 			if duplicate {
@@ -310,6 +305,9 @@ func preferIdentityObservation(input MediaIdentitySearchInput, next, previous Si
 	if input.preferResult != nil {
 		return input.preferResult(next, previous)
 	}
+	if (next.MatchedName != "") != (previous.MatchedName != "") {
+		return next.MatchedName != ""
+	}
 	if isCloudShareSource(next.SourceKind) {
 		return compareOptionalTime(next.Published, previous.Published) > 0
 	}
@@ -335,6 +333,9 @@ func sortIdentitySearchItems(items []SiteSearchResult, sharesFirst ...bool) {
 		if len(sharesFirst) > 0 && sharesFirst[0] && isCloudShareSource(items[left].SourceKind) != isCloudShareSource(items[right].SourceKind) {
 			return isCloudShareSource(items[left].SourceKind)
 		}
+		if (items[left].MatchedName != "") != (items[right].MatchedName != "") {
+			return items[left].MatchedName != ""
+		}
 		leftSeeders, rightSeeders := intValue(items[left].Seeders), intValue(items[right].Seeders)
 		if leftSeeders != rightSeeders {
 			return leftSeeders > rightSeeders
@@ -357,41 +358,60 @@ func identitySearchYear(mediaType string, year *int) *int {
 }
 
 func mediaIdentityResultMatches(title string, names []tmdb.SearchName, mediaType string, year, season *int) bool {
+	_, titleMatched := mediaIdentityResultEvidence(title, "", names, mediaType, year, season)
+	return titleMatched
+}
+
+// Only a release title with the expected coordinates can bind recognition.
+// Subtitle evidence and missing season data can help find inspectable files.
+func mediaIdentityResultEvidence(title, subtitle string, names []tmdb.SearchName, mediaType string, year, season *int) (matchedName string, titleMatched bool) {
 	parsed, err := mediarecognition.Parse(mediarecognition.InputFacts{PackageName: title, SourceKind: mediarecognition.SourceDownload})
-	if err != nil {
-		return false
-	}
-	candidate := identitySearchKey(parsed.CanonicalTitle)
-	if candidate == "" {
-		return false
-	}
-	matched := false
-	for _, name := range names {
-		key := identitySearchKey(name.Value)
-		if key != "" && (candidate == key || strings.Contains(candidate, key) || strings.Contains(key, candidate)) {
-			matched = true
-			break
-		}
-	}
-	if !matched {
-		return false
+	if err != nil || parsed.CanonicalTitle == "" || season != nil && parsed.Season != nil && *season != *parsed.Season {
+		return "", false
 	}
 	// For TV, TMDB supplies the work's first-air year while release titles may
 	// contain a season year, episode year, encode year, or no year at all. It is
 	// useful metadata for display but cannot be a hard identity gate. Movie
 	// release years remain a bounded disambiguator.
 	if strings.EqualFold(strings.TrimSpace(mediaType), "movie") && year != nil && parsed.Year != nil && absInt(*year-*parsed.Year) > 1 {
-		return false
+		return "", false
 	}
-	return season == nil || parsed.Season != nil && *season == *parsed.Season
+	if name := exactIdentitySearchName(parsed, names); name != "" {
+		return name, season == nil || parsed.Season != nil
+	}
+	if subtitle == "" {
+		return "", false
+	}
+	parsedSubtitle, err := mediarecognition.Parse(mediarecognition.InputFacts{PackageName: subtitle, SourceKind: mediarecognition.SourceDownload})
+	if err != nil {
+		return "", false
+	}
+	return exactIdentitySearchName(parsedSubtitle, names), false
 }
 
-func mediaIdentityInspectionPlausible(title string, names []tmdb.SearchName, mediaType string, year, season *int) bool {
-	if !mediaIdentityResultMatches(title, names, mediaType, year, nil) {
-		return false
+func exactIdentitySearchName(parsed mediarecognition.ParsedFacts, names []tmdb.SearchName) string {
+	// Language variants can describe complete bilingual release names. For
+	// a single-script name they may be fragments separated by punctuation.
+	bilingual := strings.ContainsFunc(parsed.CanonicalTitle, func(r rune) bool { return unicode.Is(unicode.Latin, r) }) &&
+		strings.ContainsFunc(parsed.CanonicalTitle, func(r rune) bool { return unicode.IsLetter(r) && !unicode.Is(unicode.Latin, r) })
+	for _, variant := range parsed.Queries {
+		switch variant.Reason {
+		case "canonical", "multilingual_alias":
+		case "han_title", "latin_title":
+			if !bilingual {
+				continue
+			}
+		default:
+			continue
+		}
+		key := identitySearchKey(variant.Title)
+		for _, name := range names {
+			if key != "" && key == identitySearchKey(name.Value) {
+				return name.Value
+			}
+		}
 	}
-	parsed, err := mediarecognition.Parse(mediarecognition.InputFacts{PackageName: title, SourceKind: mediarecognition.SourceDownload})
-	return err == nil && (season == nil || parsed.Season == nil || *parsed.Season == *season)
+	return ""
 }
 
 func contentSearchIdentityConflict(claim siteResultClaim, tmdbID int64, mediaType string) bool {

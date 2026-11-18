@@ -766,8 +766,19 @@ func TestBindExpectedIdentityFreezesMatchingClaimAndRejectsMismatchBeforeDownloa
 	if err != nil || claim.ManualTMDBID == nil || *claim.ManualTMDBID != 346 || claim.ManualMediaType != "movie" || claim.RecognitionSource != mediaIdentitySourceDirectID || claim.RecognitionStatus != mediaIdentityStatusVerified {
 		t.Fatalf("bound claim=%+v err=%v", claim, err)
 	}
+	if err := service.bindClaimRecognition(matchingToken, actor.User.ID, 347, "movie", mediaIdentitySourceDirectID, mediaIdentityStatusVerified, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.BindExpectedIdentity(context.Background(), actor, matchingToken, "movie", 346); ErrorCode(err) != CodeSiteResultIdentityMismatch {
+		t.Fatalf("release title replaced a conflicting verified claim: %v", err)
+	}
+	claim, err = service.resolveClaim(matchingToken, actor.User.ID)
+	if err != nil || claim.ManualTMDBID == nil || *claim.ManualTMDBID != 347 {
+		t.Fatal("conflicting verified claim changed", err)
+	}
 
-	adapter.searchTitle = "Completely.Unrelated.Movie.2024.1080p.WEB-DL"
+	adapter.searchTitle = "Completely.Unrelated.Movie.1954.1080p.WEB-DL"
+	adapter.searchSubtitle = "Seven Samurai"
 	groups, err = service.Search(context.Background(), actor, SiteSearchInput{Keyword: "Unrelated", SiteID: &created.ID, Page: 1})
 	if err != nil || len(groups) != 1 || len(groups[0].Items) != 1 {
 		t.Fatalf("mismatch groups=%+v err=%v", groups, err)
@@ -811,6 +822,35 @@ func TestMediaIdentityResultMatchesMultilingualReleaseTitle(t *testing.T) {
 	}
 	if mediaIdentityResultMatches("Ultraman Tiga 2026 1080p WEB-DL", names, "movie", &firstAirYear, nil) {
 		t.Fatal("movie identity search accepted a conflicting release year")
+	}
+}
+
+func TestMediaIdentityEvidenceUsesWholeNames(t *testing.T) {
+	names := []tmdb.SearchName{{Value: "鬼怪"}, {Value: "Goblin"}}
+	season := 1
+	for _, tc := range []struct {
+		title, subtitle string
+		name            string
+		matchesTitle    bool
+	}{
+		{title: "鬼怪.S01E05.1080p.WEB-DL", name: "鬼怪", matchesTitle: true},
+		{title: "鬼怪 (粤配) S01E05 1080p", name: "鬼怪", matchesTitle: true},
+		{title: "鬼怪 / Goblin S01E05 1080p", name: "鬼怪", matchesTitle: true},
+		{title: "鬼怪 Goblin S01E05 1080p", name: "鬼怪", matchesTitle: true},
+		{title: "魔鬼怪医 S01E05 1080p"},
+		{title: "纯白鬼怪 S01E05 1080p"},
+		{title: "鬼怪？纯白 S01E05 1080p"},
+		{title: "The Goblin Hunter S01E05 1080p"},
+		{title: "Series pack S01E05 1080p", subtitle: "鬼怪 | Goblin", name: "鬼怪"},
+		{title: "Series pack S01E05 1080p", subtitle: "影视推荐：纯白鬼怪"},
+		{title: "Series pack S02E05 1080p", subtitle: "鬼怪"},
+	} {
+		t.Run(tc.title+tc.subtitle, func(t *testing.T) {
+			name, matchesTitle := mediaIdentityResultEvidence(tc.title, tc.subtitle, names, "tv", nil, &season)
+			if name != tc.name || matchesTitle != tc.matchesTitle {
+				t.Fatalf("evidence = %q/%t, want %q/%t", name, matchesTitle, tc.name, tc.matchesTitle)
+			}
+		})
 	}
 }
 

@@ -1079,7 +1079,7 @@ func (s *SiteService) BindExpectedIdentity(ctx context.Context, actor Actor, res
 		}
 		return s.bindClaimRecognition(token, actor.User.ID, tmdbID, mediaType, mediaIdentitySourceDirectID, mediaIdentityStatusVerified, false)
 	}
-	if len(names) == 0 || !mediaIdentityResultMatches(claim.Title, names, mediaType, verified.ReleaseYear, nil) {
+	if contentSearchIdentityConflict(claim, tmdbID, mediaType) || !mediaIdentityResultMatches(claim.Title, names, mediaType, verified.ReleaseYear, nil) {
 		return appError(CodeSiteResultIdentityMismatch, "所选资源与当前海报作品不匹配，请更换资源或使用 Server 手动识别", nil)
 	}
 	return s.bindClaimRecognition(token, actor.User.ID, tmdbID, mediaType, mediaIdentitySourceDirectID, mediaIdentityStatusVerified, false)

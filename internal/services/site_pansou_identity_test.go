@@ -21,6 +21,7 @@ func TestPanSouIdentitySnapshotFreezesAliasesAndPages(t *testing.T) {
 	const fullTitle = "孤单又灿烂的神：鬼怪"
 	const officialAlias = "鬼怪"
 	const shortQuery = "孤单灿烂的神"
+	const releaseFromShortQuery = fullTitle + ".S01E62.1080p.WEB-DL"
 	metadataServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/tv/346" {
 			http.NotFound(w, r)
@@ -38,10 +39,24 @@ func TestPanSouIdentitySnapshotFreezesAliasesAndPages(t *testing.T) {
 		searchKeywords = append(searchKeywords, request.Keyword)
 		items := []any{}
 		if request.Keyword == shortQuery {
-			items = append(items, map[string]any{"unique_id": "only-short-query", "title": shortQuery, "datetime": "2026-10-30T00:00:00Z", "links": []any{map[string]string{"type": "115", "url": "https://115.com/s/fixture?password=abcd"}}})
+			items = append(items,
+				map[string]any{"unique_id": "only-short-query", "title": shortQuery, "datetime": "2026-11-18T00:00:00Z", "links": []any{map[string]string{"type": "115", "url": "https://115.com/s/fixture?password=abcd"}}},
+				map[string]any{"unique_id": "fixture-short-query-release", "title": releaseFromShortQuery, "datetime": "2026-11-17T00:00:00Z", "links": []any{map[string]string{"type": "magnet", "url": fmt.Sprintf("magnet:?xt=urn:btih:%040x", 62)}}},
+			)
 		} else {
 			for i := 0; i < 61; i++ {
-				items = append(items, map[string]any{"unique_id": fmt.Sprintf("fixture-%d", i), "title": fmt.Sprintf("%s.S01.1080p.%03d", officialAlias, i), "links": []any{map[string]string{"type": "magnet", "url": fmt.Sprintf("magnet:?xt=urn:btih:%040x", i+1)}}})
+				items = append(items, map[string]any{"unique_id": fmt.Sprintf("fixture-%d", i), "title": fmt.Sprintf("%s.S01E%02d.1080p.WEB-DL", officialAlias, i+1), "links": []any{map[string]string{"type": "magnet", "url": fmt.Sprintf("magnet:?xt=urn:btih:%040x", i+1)}}})
+			}
+			if request.Keyword == officialAlias {
+				for i := range 6 {
+					items = append(items, map[string]any{"unique_id": fmt.Sprintf("fixture-share-%d", i), "title": fmt.Sprintf("%s.S01E%02d.2160p.WEB-DL", officialAlias, i+1), "datetime": "2026-11-16T00:00:00Z", "links": []any{map[string]string{"type": "115", "url": fmt.Sprintf("https://115.com/s/episode%d?password=abcd", i+1)}}})
+				}
+				// Newer, unrelated magnets may fill an entire first page when a
+				// short verified alias occurs inside a different work's title.
+				unrelated := []string{"魔鬼怪医", "纯白鬼怪"}
+				for i := range 52 {
+					items = append(items, map[string]any{"unique_id": fmt.Sprintf("fixture-unrelated-%d", i), "title": fmt.Sprintf("%s.S01E%02d.1080p.WEB-DL", unrelated[i%len(unrelated)], i+1), "datetime": "2026-11-18T00:00:00Z", "links": []any{map[string]string{"type": "magnet", "url": fmt.Sprintf("magnet:?xt=urn:btih:%040x", i+1000)}}})
+				}
 			}
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{"code": 0, "data": map[string]any{"total": len(items), "results": items}})
@@ -86,14 +101,25 @@ func TestPanSouIdentitySnapshotFreezesAliasesAndPages(t *testing.T) {
 	if progressEvents == 0 {
 		t.Fatal("frozen PanSou search omitted detailed progress")
 	}
-	share := first.Groups[0].Items[0]
-	if share.SourceKind != "115_share" || share.Title != shortQuery || share.MatchedName != "" {
-		t.Fatalf("short-query share missing from the first page or presented as verified: source=%s title=%q", share.SourceKind, share.Title)
+	shares := 0
+	shortQueryReleaseFound := false
+	for _, item := range first.Groups[0].Items {
+		if item.MatchedName != fullTitle && item.MatchedName != officialAlias {
+			t.Fatalf("unrelated or unverified result displaced related first-page results: %q (matched %q)", item.Title, item.MatchedName)
+		}
+		if item.SourceKind == "115_share" {
+			shares++
+			claim, err := s.resolveAvailableClaim(item.Token, actor.User.ID)
+			if err != nil || claim.ManualTMDBID != nil {
+				t.Fatal("matching a share title bypassed actual file inspection", err)
+			}
+		}
+		if item.Title == releaseFromShortQuery {
+			shortQueryReleaseFound = item.MatchedName == fullTitle
+		}
 	}
-	claim, err := s.resolveAvailableClaim(share.Token, actor.User.ID)
-	if err != nil || claim.SearchIdentity == nil || claim.SearchIdentity.TMDBID != 346 || claim.ManualTMDBID != nil ||
-		!slices.Equal(claim.SearchIdentity.Names, first.QueryNames) || slices.ContainsFunc(first.QueryNames, func(name tmdb.SearchName) bool { return name.Value == shortQuery }) {
-		t.Fatal("short query changed the trusted identity names or bypassed share inspection", err)
+	if shares != 6 || !shortQueryReleaseFound {
+		t.Fatalf("first-page shares=%d, exact match from compact query=%t, top=%q", shares, shortQueryReleaseFound, first.Groups[0].Items[0].Title)
 	}
 	requests := len(searchKeywords)
 	if requests != tmdb.DefaultIdentitySearchNameLimit || first.Groups[0].QueriesTotal != requests || first.Groups[0].QueriesCompleted != requests ||
@@ -113,7 +139,7 @@ func TestPanSouIdentitySnapshotFreezesAliasesAndPages(t *testing.T) {
 	input.Page = 2
 	input.SnapshotID = first.Groups[0].SnapshotID
 	second, err := s.SearchMediaIdentity(context.Background(), actor, input)
-	if err != nil || len(second.Groups) != 1 || len(second.Groups[0].Items) != 12 || second.Groups[0].HasNext || second.Groups[0].QueryAttempted || len(searchKeywords) != requests {
+	if err != nil || len(second.Groups) != 1 || len(second.Groups[0].Items) != 19 || second.Groups[0].HasNext || second.Groups[0].QueryAttempted || len(searchKeywords) != requests {
 		t.Fatalf("second=%+v searches=%d err=%v", second, len(searchKeywords), err)
 	}
 	input.Page = 1
@@ -126,14 +152,26 @@ func TestPanSouIdentitySnapshotFreezesAliasesAndPages(t *testing.T) {
 	for _, item := range first.Groups[0].Items {
 		seen[item.Title] = true
 	}
+	unknownShareFound := false
 	for _, item := range second.Groups[0].Items {
 		if seen[item.Title] {
 			t.Fatal("row repeated across pages", item.Title)
 		}
 		claim, err := s.resolveAvailableClaim(item.Token, actor.User.ID)
+		if item.Title == shortQuery {
+			if err != nil || item.SourceKind != "115_share" || item.MatchedName != "" || claim.ManualTMDBID != nil || claim.SearchIdentity == nil || claim.SearchIdentity.TMDBID != 346 ||
+				!slices.Equal(claim.SearchIdentity.Names, first.QueryNames) || slices.ContainsFunc(first.QueryNames, func(name tmdb.SearchName) bool { return name.Value == shortQuery }) {
+				t.Fatal("short query changed trusted identity names or bypassed share inspection", err)
+			}
+			unknownShareFound = true
+			continue
+		}
 		if err != nil || claim.ManualTMDBID == nil || *claim.ManualTMDBID != 346 {
 			t.Fatal("snapshot lost actor identity claim", err)
 		}
+	}
+	if !unknownShareFound {
+		t.Fatal("unverified share disappeared instead of remaining available to inspect")
 	}
 	input.TypePolicy = "manual"
 	input.CloudTypes = []string{"magnet"}

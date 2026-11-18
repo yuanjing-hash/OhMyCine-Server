@@ -330,7 +330,7 @@ export interface PTRecognitionCandidate {
 
 export interface PTSearchResponse { groups: PTSearchGroup[] }
 
-export type TorrentResultSort = 'seeders' | 'published' | 'size'
+export type TorrentResultSort = 'relevance' | 'seeders' | 'published' | 'size'
 export type TorrentResultDirection = 'asc' | 'desc'
 export interface TorrentResultFilters {
   activeChannel: 'all' | number
@@ -339,6 +339,7 @@ export interface TorrentResultFilters {
   resolution?: string
   promotion?: string
   minimumSeeders?: number
+  relevance?: { keyword: string } | 'identity'
   sort: TorrentResultSort
   direction: TorrentResultDirection
 }
@@ -497,6 +498,22 @@ export interface TorrentSearchSession {
   savedAt: number
 }
 
+function titleWords(value: string) {
+  return value.normalize('NFKC').toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim()
+}
+
+function matchesHanTitleVariant(title: string, query: readonly string[]) {
+  return title.split(' ').some(segment => {
+    if (!/^\p{Script=Han}+$/u.test(segment)) return false
+    const characters = Array.from(segment)
+    const [longer, shorter] = characters.length > query.length ? [characters, query] : [query, characters]
+    if (shorter.length < 6 || longer.length !== shorter.length + 1) return false
+    const extraIndex = longer.findIndex((character, index) => character !== shorter[index])
+    return extraIndex > 0 && extraIndex < shorter.length
+      && longer.slice(extraIndex + 1).every((character, offset) => character === shorter[extraIndex + offset])
+  })
+}
+
 export function filterAndSortTorrentResults(groups: readonly PTSearchGroup[], filters: TorrentResultFilters): TorrentResultEntry[] {
   const scoped = filters.activeChannel === 'all'
     ? [...groups].sort((left, right) => left.site_id - right.site_id)
@@ -520,21 +537,48 @@ export function filterAndSortTorrentResults(groups: readonly PTSearchGroup[], fi
   const stableTieBreak = (left: TorrentResultEntry, right: TorrentResultEntry) => left.group.site_id - right.group.site_id
     || left.item.title.localeCompare(right.item.title)
     || left.item.token.localeCompare(right.item.token)
-  return scoped
+  const entries = scoped
     .flatMap(group => group.items.map(item => ({ item, group })))
     .filter(({ group, item }) => filters.enabledSiteTypes.includes(resultSiteType(item, group.site_type)))
     .filter(({ item, group }) => resultMatchesResourceTypes(item, group.site_type, filters.resultTypes ?? []))
     .filter(({ item }) => !resolution || item.specifications?.resolution === resolution || item.quality === resolution)
     .filter(({ item, group }) => resultSiteType(item, group.site_type) === 'cloud_share' || !promotion || item.promotion?.toLowerCase() === promotion)
     .filter(({ item, group }) => resultSiteType(item, group.site_type) === 'cloud_share' || filters.minimumSeeders == null || (item.seeders ?? -1) >= filters.minimumSeeders)
-    .sort((left, right) => {
-      if (filters.sort === 'published') return compareOptionalNumber(timestamp(left.item.published_at), timestamp(right.item.published_at)) || left.group.site_id - right.group.site_id
-      if (filters.sort === 'size') return compareOptionalNumber(left.item.size_bytes, right.item.size_bytes) || stableTieBreak(left, right)
-      return compareOptionalNumber(left.item.seeders, right.item.seeders)
-        || compareOptionalNumber(left.item.completed, right.item.completed)
-        || compareOptionalNumber(timestamp(left.item.published_at), timestamp(right.item.published_at))
-        || stableTieBreak(left, right)
-    })
+
+  const relevance = filters.sort === 'relevance' ? filters.relevance : undefined
+  const keyword = relevance && relevance !== 'identity' ? titleWords(relevance.keyword) : ''
+  const compactKeyword = keyword.replaceAll(' ', '')
+  const hanKeyword = /^\p{Script=Han}{6,}$/u.test(compactKeyword) ? Array.from(compactKeyword) : []
+  const ranks = keyword || relevance === 'identity' ? new Map(entries.map(entry => {
+    const { item, group } = entry
+    let titleMatch = item.matched_name ? 3 : 0
+    if (keyword) {
+      const title = titleWords(item.title)
+      if (` ${title} `.includes(` ${keyword} `)) titleMatch = 3
+      else if (hanKeyword.length && matchesHanTitleVariant(title, hanKeyword)) titleMatch = 2
+      else titleMatch = Number(title.replaceAll(' ', '').includes(compactKeyword))
+    }
+    let sourcePriority = 0
+    if (titleMatch >= 2 && item.acquisition_available !== false) {
+      const isShare = resultMatchesResourceTypes(item, group.site_type, ['115', 'quark'])
+      sourcePriority = (item.seeders ?? 0) > 0 ? 2 : Number(isShare)
+    }
+    return [entry, { titleMatch, sourcePriority }] as const
+  })) : null
+  return entries.sort((left, right) => {
+    if (ranks) {
+      const a = ranks.get(left)!
+      const b = ranks.get(right)!
+      const comparison = compareOptionalNumber(a.titleMatch, b.titleMatch) || compareOptionalNumber(a.sourcePriority, b.sourcePriority)
+      if (comparison) return comparison
+    }
+    if (filters.sort === 'published') return compareOptionalNumber(timestamp(left.item.published_at), timestamp(right.item.published_at)) || left.group.site_id - right.group.site_id
+    if (filters.sort === 'size') return compareOptionalNumber(left.item.size_bytes, right.item.size_bytes) || stableTieBreak(left, right)
+    return compareOptionalNumber(left.item.seeders, right.item.seeders)
+      || compareOptionalNumber(left.item.completed, right.item.completed)
+      || compareOptionalNumber(timestamp(left.item.published_at), timestamp(right.item.published_at))
+      || stableTieBreak(left, right)
+  })
 }
 
 type SiteSelectionStorage = Pick<Storage, 'getItem' | 'setItem'>
