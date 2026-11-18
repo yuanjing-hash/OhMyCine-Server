@@ -22,6 +22,9 @@ func downloadAcquisitionKey(task models.DownloadTask) string {
 // whose Job will never be claimed again. This maintenance only observes the
 // original operation and never resumes a paused Job or submits/reapplies files.
 func (w *DownloadWorker) reconcileDownloadAdmissions(ctx context.Context) error {
+	if err := w.releaseDormantDownloadAdmissions(ctx); err != nil {
+		return err
+	}
 	var tasks []models.DownloadTask
 	if err := w.service.db.WithContext(ctx).Table("download_tasks AS t").Select("t.*").Joins("JOIN download_admissions a ON a.task_id = t.id AND a.state = 'held'").Joins("JOIN jobs j ON j.id = t.job_id").Where("j.status IN ? AND t.provider_task_id <> ''", []string{models.JobStatusFailed, models.JobStatusPaused, models.JobStatusCancelled, models.JobStatusCompleted}).Order("a.updated_at,a.acquisition_key").Limit(4).Find(&tasks).Error; err != nil {
 		return err
@@ -101,6 +104,82 @@ func (w *DownloadWorker) reconcileDownloadAdmissions(ctx context.Context) error 
 	return nil
 }
 
+// A cancelled control or terminal legacy job can retain its unconfirmed receipt
+// without counting as an active acquisition. Recheck these conditions under
+// the writer transaction after checking the original source or stop intent.
+func dormantDownloadAdmissions(db *gorm.DB) *gorm.DB {
+	return db.Table("download_tasks AS t").
+		Joins("JOIN download_admissions a ON a.acquisition_key = 'task:' || t.id AND a.task_id = t.id AND a.downloader_id = t.downloader_id AND a.state = 'held'").
+		Joins("JOIN jobs j ON j.id = t.job_id AND j.owner_id = t.owner_id AND j.job_type = 'download'").
+		Where("j.status <> ? AND j.lease_token_hash = '' AND j.lease_expires_at IS NULL AND j.interrupt_status = ''", models.JobStatusRunning).
+		Where("t.bt_selection_group_id = '' AND t.provider_task_id = '' AND t.provider_output_id = '' AND t.last_sampled_at IS NULL").
+		Where("t.completed_manifest_json IN ('','{}') AND t.offline_ready_at IS NULL AND t.offline_settled_at IS NULL").
+		Where(`((t.offline_kind = ? AND t.phase = ? AND t.last_error_code = ? AND t.offline_stop_pending = 1 AND t.offline_start_provenance NOT IN ?) OR
+ (t.offline_kind IN ? AND t.provider_type = ? AND t.execution_location IN ? AND t.offline_started_at IS NULL AND t.offline_deadline_at IS NULL AND t.phase IN ? AND j.status IN ?))`,
+			string(downloadpkg.OfflineOperationCloud), models.DownloadTaskStatusCancelled, CodeOfflineDeadlineExceeded, []string{downloadpkg.OfflineStartAccepted, downloadpkg.OfflineStartProviderAdded},
+			[]string{"", string(downloadpkg.OfflineOperationCloud)}, models.DownloaderTypePan115Offline, []string{"", models.NodeLocationServer}, []string{models.DownloadTaskStatusSubmitting, models.DownloadTaskStatusFailed, models.DownloadTaskStatusCancelled}, []string{models.JobStatusFailed, models.JobStatusCancelled})
+}
+
+func (w *DownloadWorker) releaseDormantDownloadAdmissions(ctx context.Context) error {
+	var candidates []struct {
+		models.DownloadTask
+		JobPayload string
+	}
+	db := w.service.db.WithContext(ctx)
+	if err := dormantDownloadAdmissions(db).Select("t.*, j.payload_json AS job_payload").Order("a.updated_at,a.acquisition_key").Limit(16).Find(&candidates).Error; err != nil {
+		return err
+	}
+	for _, candidate := range candidates {
+		task := candidate.DownloadTask
+		var payload downloadJobPayload
+		eligible := json.Unmarshal([]byte(candidate.JobPayload), &payload) == nil && payload.DownloadTaskID == task.ID
+		if eligible {
+			if task.OfflineStopPending && task.LastErrorCode == CodeOfflineDeadlineExceeded {
+				eligible = payload.ControlIntent == "cancel" || payload.ControlIntent == "remove"
+			} else {
+				eligible = w.isStoredNative115Source(task)
+			}
+		}
+		released := false
+		if err := db.Transaction(func(tx *gorm.DB) error {
+			var matches int64
+			if err := dormantDownloadAdmissions(tx).Where("t.id = ? AND t.job_id = ? AND t.source_ciphertext = ? AND j.payload_json = ?", task.ID, task.JobID, task.SourceCiphertext, candidate.JobPayload).Count(&matches).Error; err != nil || matches != 1 {
+				return err
+			}
+			now := w.service.queue.clock.Now()
+			if eligible {
+				released = true
+				return releaseDownloadCapacityTx(tx, task, now)
+			}
+			// Keep unsupported or unreadable historical records from starving
+			// later candidates in the bounded maintenance scan.
+			return tx.Model(&models.DownloadAdmission{}).Where("acquisition_key = ?", downloadAcquisitionKey(task)).Update("updated_at", now).Error
+		}); err != nil {
+			return err
+		}
+		if released {
+			w.service.queue.wake()
+		}
+	}
+	return nil
+}
+
+func (w *DownloadWorker) isStoredNative115Source(task models.DownloadTask) bool {
+	plain, err := w.service.credentials.Decrypt(downloadSourcePurpose(task.ID), task.SourceCiphertext)
+	if err != nil {
+		return false
+	}
+	var source downloadSourceEnvelope
+	if json.Unmarshal([]byte(plain), &source) != nil || validateStoredContentSelection(source) != nil {
+		return false
+	}
+	if source.Kind == downloadpkg.SourceURL {
+		_, _, err := normalizeDownloadSource(DownloadSourceInput{Kind: source.Kind, URL: source.URL}, task.DisplayName)
+		return err == nil
+	}
+	return source.Kind == downloadpkg.SourceTorrent && source.ContentSelection != nil && len(source.Torrent) > 0
+}
+
 // Called inside Claim's writer transaction; external work and lease lifetimes
 // cannot race the physical acquisition count. Controls never need a new slot.
 type downloadAdmissionCapacity struct {
@@ -124,7 +203,7 @@ func admitDownloadJobTx(tx *gorm.DB, job models.Job, now time.Time, cache downlo
 	}
 	// Selection/admission decisions need no source ciphertext, original torrent
 	// bytes, identity JSON or full completed manifests inside this writer scan.
-	columns := "id,job_id,owner_id,downloader_id,bt_selection_group_id,provider_task_id,phase,offline_stop_pending,offline_settled_at,offline_ready_at,scrape_status,target_library_id,last_error_code,CASE WHEN completed_manifest_json <> '' AND completed_manifest_json <> '{}' THEN 1 ELSE 0 END AS has_completed_manifest"
+	columns := "id,job_id,owner_id,downloader_id,provider_type,bt_selection_group_id,provider_task_id,phase,offline_stop_pending,offline_settled_at,offline_ready_at,scrape_status,target_library_id,last_error_code,CASE WHEN completed_manifest_json <> '' AND completed_manifest_json <> '{}' THEN 1 ELSE 0 END AS has_completed_manifest"
 	if err := tx.Model(&models.DownloadTask{}).Select(columns).First(&candidate, "id = ? AND job_id = ?", payload.DownloadTaskID, job.ID).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return true, nil
@@ -177,6 +256,11 @@ func admitDownloadJobTx(tx *gorm.DB, job models.Job, now time.Time, cache downlo
 		if admission.DownloaderID != *task.DownloaderID {
 			return false, errDownloadIdentityChanged
 		}
+		// An explicit retry of a reclaimed legacy reservation must wait for
+		// room unless it already has a confirmed provider task.
+		if admission.State == "released" && task.ProviderType == models.DownloaderTypePan115Offline && task.BTSelectionGroupID == "" && task.ProviderTaskID == "" && len(snapshot.Held) >= snapshot.Limit {
+			return false, nil
+		}
 		return true, tx.Model(&admission).Updates(map[string]any{"state": "held", "released_at": nil, "updated_at": now}).Error
 	}
 	if !errors.Is(err, gorm.ErrRecordNotFound) {
@@ -210,7 +294,21 @@ func releaseDownloadAdmissionTx(tx *gorm.DB, task models.DownloadTask, now time.
 			return nil
 		}
 	}
+	return releaseDownloadCapacityTx(tx, task, now)
+}
+
+// Quota release alone must not claim that an ambiguous operation settled.
+func releaseDownloadCapacityTx(tx *gorm.DB, task models.DownloadTask, now time.Time) error {
 	return tx.Model(&models.DownloadAdmission{}).Where("acquisition_key = ? AND state = 'held'", downloadAcquisitionKey(task)).Updates(map[string]any{"state": "released", "released_at": now, "updated_at": now}).Error
+}
+
+func restoreDownloadCapacityTx(tx *gorm.DB, task models.DownloadTask, now time.Time) error {
+	if task.DownloaderID == nil || task.BTSelectionGroupID != "" || task.OfflineKind != string(downloadpkg.OfflineOperationCloud) && task.ProviderType != models.DownloaderTypePan115Offline {
+		return nil
+	}
+	return tx.Model(&models.DownloadAdmission{}).
+		Where("acquisition_key = ? AND task_id = ? AND downloader_id = ? AND state = 'released'", downloadAcquisitionKey(task), task.ID, *task.DownloaderID).
+		Updates(map[string]any{"state": "held", "released_at": nil, "updated_at": now}).Error
 }
 
 func (s *DownloadService) releaseDownloadAdmission(task models.DownloadTask) error {

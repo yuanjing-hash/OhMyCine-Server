@@ -6,7 +6,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"sort"
 	"strings"
 	"time"
 	"unicode"
@@ -190,22 +189,7 @@ func (s *SiteService) searchPanSouIdentitySite(ctx context.Context, actor Actor,
 	if all == nil {
 		return failure
 	}
-	sort.SliceStable(all.Items, func(i, j int) bool {
-		a, b := all.Items[i], all.Items[j]
-		if input.preferShares && isCloudShareSource(a.SourceKind) != isCloudShareSource(b.SourceKind) {
-			return isCloudShareSource(a.SourceKind)
-		}
-		if intValue(a.Seeders) != intValue(b.Seeders) {
-			return intValue(a.Seeders) > intValue(b.Seeders)
-		}
-		if compared := compareOptionalTime(a.Published, b.Published); compared != 0 {
-			return compared > 0
-		}
-		if a.SizeBytes != b.SizeBytes {
-			return a.SizeBytes > b.SizeBytes
-		}
-		return a.Title < b.Title
-	})
+	sortIdentitySearchItems(all.Items, input.preferShares)
 	if all.Truncated {
 		all.Warnings = append(all.Warnings, sitepkg.SearchWarning{Code: "pansou_identity_snapshot_truncated", Message: "作品搜索已达到本批1000条上限，请缩小搜索范围"})
 	}

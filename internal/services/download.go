@@ -3292,10 +3292,15 @@ func (w *DownloadWorker) persistSubmittedTask(task *models.DownloadTask, phase, 
 		}
 		return active, err
 	}
-	result := w.service.db.Model(&models.DownloadTask{}).
-		Where("id = ? AND phase = ?", task.ID, models.DownloadTaskStatusCancelled).
-		Updates(map[string]any{"provider_task_id": task.ProviderTaskID, "provider_status": providerStatus, "updated_at": now})
-	return false, result.Error
+	return false, w.service.db.Transaction(func(tx *gorm.DB) error {
+		result := tx.Model(&models.DownloadTask{}).
+			Where("id = ? AND job_id = ? AND phase = ? AND (provider_task_id = '' OR provider_task_id = ?)", task.ID, task.JobID, models.DownloadTaskStatusCancelled, task.ProviderTaskID).
+			Updates(map[string]any{"provider_task_id": task.ProviderTaskID, "provider_status": providerStatus, "updated_at": now})
+		if result.Error != nil || result.RowsAffected == 0 {
+			return result.Error
+		}
+		return restoreDownloadCapacityTx(tx, *task, now)
+	})
 }
 
 func (w *DownloadWorker) cancelLateSubmittedProvider(ctx context.Context, task *models.DownloadTask, client downloadpkg.Client) error {

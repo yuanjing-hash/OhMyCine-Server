@@ -77,6 +77,60 @@ function button(wrapper: VueWrapper, text: string) {
 beforeEach(() => { fixture(); sessionStorage.clear(); localStorage.clear(); vi.stubGlobal('EventSource', undefined) })
 afterEach(() => { for (const wrapper of wrappers.splice(0)) wrapper.unmount(); request.mockReset(); notify.mockReset(); vi.unstubAllGlobals() })
 
+it.each([
+  { query: '孤单又灿烂的神', stem: '孤单又灿烂的神' },
+  { query: '孤单灿烂的神', stem: '孤单又灿烂的神' },
+  { query: '孤单又灿烂的神', stem: '孤单灿烂的神' },
+])('prioritizes $stem for $query while retaining raw candidates and explicit sorting', async ({ query, stem }) => {
+  const shareTitle = `${stem}：鬼怪（２０１６）`
+  const btTitle = `${stem}：鬼怪`
+  const unrelatedTitle = 'The Odyssey (2026)'
+  const cloud = group()
+  cloud.items = [
+    { ...result('ghost-magnet'), title: btTitle },
+    { ...result('ghost-share'), title: shareTitle, source_kind: '115_share', result_type: '115', acquisition_available: true },
+  ]
+  const jackett = { ...group(), site_id: 8, site_name: 'Jackett', site_type: 'bt' as const }
+  jackett.items = [{ ...result('odyssey'), title: unrelatedTitle, seeders: 10189 }]
+  fixture(() => ({ groups: [cloud, jackett] }))
+  const fallback = request.getMockImplementation()!
+  request.mockImplementation((path: string, options?: RequestInit) => path === '/api/v1/discovery/search-options'
+    ? Promise.resolve({ list: [
+      { id: 7, name: cloud.site_name, site_type: cloud.site_type, searchable: true, health_status: 'online' },
+      { id: 8, name: jackett.site_name, site_type: jackett.site_type, searchable: true, health_status: 'online' },
+    ] })
+    : fallback(path, options))
+  const { wrapper } = await render({ mode: 'resources' })
+  await submit(wrapper, query)
+  const selector = wrapper.get('[aria-labelledby="search-site-selector-title"]')
+  await selector.get('button.btn-primary').trigger('click')
+  await flushPromises()
+
+  const titles = () => wrapper.findAll('article h2').map(card => card.text())
+  expect(new URL(String(searches()[0]![0]), 'https://server.test').searchParams.get('keyword')).toBe(query)
+  expect(titles()).toEqual([shareTitle, btTitle, unrelatedTitle])
+
+  await wrapper.get('#discovery-keyword').setValue(unrelatedTitle)
+  expect(titles()).toEqual([shareTitle, btTitle, unrelatedTitle])
+  const sort = wrapper.findAll('select').find(select => select.element.querySelector('option[value="seeders"]'))!
+  await sort.setValue('seeders')
+  expect(titles()[0]).toBe(unrelatedTitle)
+})
+
+it('orders detail results using the server work match before acquisition priorities', async () => {
+  const share = { ...result('detail-share'), title: '第 1 季收藏版', matched_name: '鬼怪', source_kind: '115_share', result_type: '115', acquisition_available: true }
+  const bt = { ...result('detail-bt'), title: 'GOBLIN.S01.1080p', matched_name: '鬼怪' }
+  const unknown = { ...result('detail-unknown'), title: '鬼怪 未确认', seeders: 10189 }
+  fixture(() => ({ groups: [{ ...group(), items: [unknown, bt, share] }] }))
+  const { wrapper } = await render({ mode: 'resources', title: '鬼怪', identity: 'tmdb', tmdb_id: '67915', media_type: 'tv' })
+  const selector = wrapper.get('[aria-labelledby="search-site-selector-title"]')
+  await selector.get('button.btn-primary').trigger('click')
+  await flushPromises()
+
+  expect(searches()[0]![0]).toContain('/media/tv/67915/torrent-search?')
+  expect(wrapper.findAll('article h2').map(card => card.text())).toEqual([share.title, bt.title, unknown.title])
+})
+
 it('drops a routed work identity and derived year when a different title is submitted', async () => {
   const { wrapper } = await render()
   expect(searches()[0]![0]).toContain('/media/tv/111/torrent-search?')
