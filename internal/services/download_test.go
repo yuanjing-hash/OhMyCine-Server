@@ -458,6 +458,147 @@ func (c *offlineLifecycleFixtureClient) StopOfflineKeepOutput(ctx context.Contex
 	return c.Cancel(ctx, id, false)
 }
 
+func TestDormantNativeDownloadAdmissionsUnblockDistinctQueuedWork(t *testing.T) {
+	downloads, _, queue, actor, _ := downloadFixture(t)
+	worker := NewDownloadWorker(downloads)
+	clock := queue.clock.(*fakeQueueClock)
+	ctx := context.Background()
+	const pan115ID, btID = "capacity-115", "capacity-bt"
+	for _, record := range []models.Downloader{
+		{ID: pan115ID, Name: "115", NameNormalized: "115", Type: models.DownloaderTypePan115Offline, Enabled: true, MaxConcurrentDownloads: 2},
+		{ID: btID, Name: "BT", NameNormalized: "bt", Type: models.DownloaderTypeQBittorrent, Enabled: true, MaxConcurrentDownloads: 2},
+	} {
+		if err := queue.db.Create(&record).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	enqueue := func(task models.DownloadTask, control string, hash string) models.DownloadTask {
+		t.Helper()
+		task.OwnerID, task.DisplayName = actor.User.ID, task.ID
+		if task.DownloaderID == nil {
+			id := pan115ID
+			task.DownloaderID, task.ProviderType = &id, models.DownloaderTypePan115Offline
+		}
+		source := downloadSourceEnvelope{Kind: downloadpkg.SourceURL, URL: "magnet:?xt=urn:btih:" + hash}
+		encoded, err := json.Marshal(source)
+		if err != nil {
+			t.Fatal(err)
+		}
+		task.SourceCiphertext, err = downloads.credentials.Encrypt(downloadSourcePurpose(task.ID), string(encoded))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = queue.EnqueueWith(EnqueueJobInput{OwnerID: actor.User.ID, JobType: "download", DisplayName: task.ID, Payload: downloadJobPayload{DownloadTaskID: task.ID, ControlIntent: control}}, func(tx *gorm.DB, job models.Job) error {
+			task.JobID = job.ID
+			return tx.Create(&task).Error
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return task
+	}
+	seedHeld := func(task models.DownloadTask, updates map[string]any) models.Job {
+		t.Helper()
+		if err := queue.db.Model(&models.Job{}).Where("id = ?", task.JobID).Updates(updates).Error; err != nil {
+			t.Fatal(err)
+		}
+		admission := models.DownloadAdmission{AcquisitionKey: downloadAcquisitionKey(task), DownloaderID: *task.DownloaderID, TaskID: task.ID, State: "held", CreatedAt: clock.Now(), UpdatedAt: clock.Now()}
+		if err := queue.db.Create(&admission).Error; err != nil {
+			t.Fatal(err)
+		}
+		var job models.Job
+		if err := queue.db.First(&job, "id = ?", task.JobID).Error; err != nil {
+			t.Fatal(err)
+		}
+		return job
+	}
+	assertAdmission := func(task models.DownloadTask, state string) {
+		t.Helper()
+		var admission models.DownloadAdmission
+		if err := queue.db.First(&admission, "acquisition_key = ?", downloadAcquisitionKey(task)).Error; err != nil || admission.State != state {
+			t.Fatalf("%s admission=%+v, want %s: %v", task.ID, admission, state, err)
+		}
+	}
+	start, deadline := clock.Now().Add(-40*time.Minute), clock.Now().Add(-10*time.Minute)
+	ghost := enqueue(models.DownloadTask{
+		ID: "expired-native", Phase: models.DownloadTaskStatusCancelled, LastErrorCode: CodeOfflineDeadlineExceeded,
+		OfflineKind: string(downloadpkg.OfflineOperationCloud), OfflineStopPending: true, OfflineStartedAt: &start, OfflineDeadlineAt: &deadline,
+		OfflineStartProvenance: downloadpkg.OfflineStartDispatch, OfflineAccountNamespace: "original-account", OfflineResourceDigest: "original-resource",
+	}, "cancel", strings.Repeat("1", 40))
+	controlDue := clock.Now().Add(time.Minute)
+	ghostJob := seedHeld(ghost, map[string]any{"status": models.JobStatusRetryWait, "next_attempt_at": controlDue, "attempt_count": 95})
+	legacy := enqueue(models.DownloadTask{ID: "failed-legacy", Phase: models.DownloadTaskStatusSubmitting, LastErrorCode: CodeDownloaderStorageUnavailable}, "", strings.Repeat("2", 40))
+	legacyJob := seedHeld(legacy, map[string]any{"status": models.JobStatusFailed, "last_error_code": CodeDownloaderStorageUnavailable, "attempt_count": 1970})
+	btDownloader := btID
+	activeBT := enqueue(models.DownloadTask{ID: "active-bt", DownloaderID: &btDownloader, ProviderType: models.DownloaderTypeQBittorrent, Phase: models.DownloadTaskStatusDownloading, ProviderTaskID: strings.Repeat("3", 40)}, "", strings.Repeat("3", 40))
+	seedHeld(activeBT, map[string]any{"status": models.JobStatusRetryWait, "next_attempt_at": clock.Now().Add(time.Hour)})
+	newPan := enqueue(models.DownloadTask{ID: "new-115", Phase: models.DownloadTaskStatusQueued}, "", strings.Repeat("4", 40))
+	other := enqueue(models.DownloadTask{ID: "new-bt", DownloaderID: &btDownloader, ProviderType: models.DownloaderTypeQBittorrent, Phase: models.DownloadTaskStatusQueued}, "", strings.Repeat("5", 40))
+	claim, err := queue.Claim([]string{"download"})
+	if err != nil || claim == nil || claim.Job.ID != other.JobID {
+		t.Fatalf("other downloader did not advance while 115 was full: %+v %v", claim, err)
+	}
+	if err := queue.RetryLater(claim.Job.ID, claim.LeaseToken, "", "", clock.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if next, err := queue.Claim([]string{"download"}); err != nil || next != nil {
+		t.Fatalf("the two pending records did not occupy both old 115 units: %+v %v", next, err)
+	}
+	if err := worker.RecoverOfflineStops(ctx); err != nil {
+		t.Fatal(err)
+	}
+	assertAdmission(ghost, "released")
+	assertAdmission(legacy, "released")
+	assertAdmission(activeBT, "held")
+	for _, before := range []models.DownloadTask{ghost, legacy} {
+		var task models.DownloadTask
+		if err := queue.db.First(&task, "id = ?", before.ID).Error; err != nil || task.Phase != before.Phase || task.LastErrorCode != before.LastErrorCode || task.OfflineStopPending != before.OfflineStopPending || task.OfflineSettledAt != nil || task.SourceCiphertext != before.SourceCiphertext || task.ProviderTaskID != "" {
+			t.Fatalf("retired acquisition facts changed for %s: %v", before.ID, err)
+		}
+	}
+	for _, before := range []models.Job{ghostJob, legacyJob} {
+		var job models.Job
+		if err := queue.db.First(&job, "id = ?", before.ID).Error; err != nil || job.Status != before.Status || job.PayloadJSON != before.PayloadJSON || job.AttemptCount != before.AttemptCount {
+			t.Fatalf("old Job was changed or resubmitted: %s %v", before.ID, err)
+		}
+	}
+	claim, err = queue.Claim([]string{"download"})
+	if err != nil || claim == nil || claim.Job.ID != newPan.JobID {
+		t.Fatalf("existing distinct 115 magnet did not advance: %+v %v", claim, err)
+	}
+	assertAdmission(newPan, "held")
+	if err := queue.RetryLater(claim.Job.ID, claim.LeaseToken, "", "", clock.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	clock.now = controlDue
+	if err := queue.PromoteDueRetries(); err != nil {
+		t.Fatal(err)
+	}
+	claim, err = queue.Claim([]string{"download"})
+	if err != nil || claim == nil || claim.Job.ID != ghost.JobID {
+		t.Fatalf("original stop did not remain runnable: %+v %v", claim, err)
+	}
+	// The required output can be ready while a native stop is still pending.
+	native := downloadpkg.Task{ID: "late-native", Status: "running", Completed: true, Offline: &downloadpkg.OfflineObservation{
+		Version: 1, Kind: downloadpkg.OfflineOperationCloud, Ready: true, StopPending: true,
+	}}
+	if err := worker.recordPendingControlProvider(ctx, *claim, ghost, native); err != nil {
+		t.Fatal(err)
+	}
+	assertAdmission(ghost, "held")
+	if err := queue.RetryLater(claim.Job.ID, claim.LeaseToken, downloadCancellationPending, downloadCancellationMessage, clock.Now().Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err := worker.RecoverOfflineStops(ctx); err != nil {
+		t.Fatal(err)
+	}
+	assertAdmission(ghost, "held")
+	enqueue(models.DownloadTask{ID: "over-capacity-115", Phase: models.DownloadTaskStatusQueued}, "", strings.Repeat("6", 40))
+	if next, err := queue.Claim([]string{"download"}); err != nil || next != nil {
+		t.Fatalf("confirmed acquisition bypassed 115 capacity: %+v %v", next, err)
+	}
+}
+
 func TestCloudOfflineDeadlineHistoryAndRequiredGoalLifecycle(t *testing.T) {
 	downloads, downloaders, queue, actor, _ := downloadFixture(t)
 	clock := queue.clock.(*fakeQueueClock)

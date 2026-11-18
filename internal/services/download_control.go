@@ -168,8 +168,7 @@ func (w *DownloadWorker) pendingControl(ctx context.Context, claimed ClaimedJob)
 			if strings.TrimSpace(found.ID) == "" || task.ProviderTaskID != "" && task.ProviderTaskID != found.ID {
 				return &result, nil
 			}
-			changed := w.service.db.Model(&models.DownloadTask{}).Where("id = ? AND job_id = ? AND phase = ? AND (provider_task_id = '' OR provider_task_id = ?)", task.ID, job.ID, models.DownloadTaskStatusCancelled, found.ID).Updates(map[string]any{"provider_task_id": found.ID, "provider_status": found.Status, "updated_at": time.Now().UTC()})
-			if changed.Error != nil || changed.RowsAffected != 1 {
+			if err := w.recordPendingControlProvider(cleanupCtx, claimed, task, found); err != nil {
 				return &result, nil
 			}
 			task.ProviderTaskID = found.ID
@@ -185,6 +184,34 @@ func (w *DownloadWorker) pendingControl(ctx context.Context, claimed ClaimedJob)
 		return &result, nil
 	}
 	return &WorkerResult{}, nil
+}
+
+func (w *DownloadWorker) recordPendingControlProvider(ctx context.Context, claim ClaimedJob, original models.DownloadTask, found downloadpkg.Task) error {
+	return w.service.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		job, err := w.service.queue.verifyLease(tx, claim.Job.ID, claim.LeaseToken)
+		if err != nil {
+			return err
+		}
+		task, pending, err := pendingDownloadControlTask(tx, job)
+		if err != nil {
+			return err
+		}
+		if !pending || task.ID != original.ID || task.SourceCiphertext != original.SourceCiphertext || task.OfflineAccountNamespace != original.OfflineAccountNamespace || task.OfflineResourceDigest != original.OfflineResourceDigest || task.ProviderTaskID != "" && task.ProviderTaskID != found.ID {
+			return errDownloadProviderIdentityChanged
+		}
+		now := w.service.queue.clock.Now()
+		if err := tx.Model(&task).Updates(map[string]any{"provider_task_id": found.ID, "provider_status": found.Status, "updated_at": now}).Error; err != nil {
+			return err
+		}
+		stopped := found.Completed || found.Failed
+		if offline := found.Offline; offline != nil && offline.Version == 1 && offline.Kind == downloadpkg.OfflineOperationCloud {
+			stopped = !offline.StopPending && (offline.UpstreamStopped || offline.TerminalFailure)
+		}
+		if !stopped {
+			return restoreDownloadCapacityTx(tx, task, now)
+		}
+		return nil
+	})
 }
 
 func (s *DownloadService) settlePendingDownloadControl(original models.DownloadTask) error {
