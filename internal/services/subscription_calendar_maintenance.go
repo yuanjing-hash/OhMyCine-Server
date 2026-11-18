@@ -57,7 +57,7 @@ func (s *SubscriptionCalendarService) enqueueDueRoundRobin(ctx context.Context, 
 	}()
 	var seasons []models.FollowSubscriptionSeason
 	query := s.db.WithContext(ctx).Model(&models.FollowSubscriptionSeason{}).
-		Where("EXISTS (SELECT 1 FROM follow_subscriptions f WHERE f.id = follow_subscription_seasons.subscription_id)")
+		Where("EXISTS (SELECT 1 FROM follow_subscriptions f WHERE f.id = follow_subscription_seasons.subscription_id AND (f.status <> ? OR f.next_run_at IS NOT NULL))", models.FollowStatusCompleted)
 	if bookmark.SubscriptionID != "" {
 		query = query.Where("subscription_id > ? OR (subscription_id = ? AND season_number > ?)", bookmark.SubscriptionID, bookmark.SubscriptionID, bookmark.SeasonNumber)
 	}
@@ -104,12 +104,12 @@ func (s *SubscriptionCalendarService) enqueueDueRoundRobin(ctx context.Context, 
 				break
 			}
 		}
-		if ok && selected && sub.TMDBID == item.TMDBID {
+		if ok && selected && sub.TMDBID == item.TMDBID && !calendarSubscriptionCompleted(sub) {
 			key := calendarSeasonKey(generation, item.TMDBID, item.SeasonNumber)
 			if !seenKeys[key] {
 				seenKeys[key] = true
 				sub.Snapshot.Seasons = []int{item.SeasonNumber}
-				result, err := s.enqueueRows(ctx, []FollowSummary{sub}, false, min(limit, 50)-queued)
+				result, err := s.enqueueRows(ctx, []FollowSummary{sub}, calendarRefreshRequest{}, min(limit, 50)-queued)
 				if err != nil {
 					return err
 				}

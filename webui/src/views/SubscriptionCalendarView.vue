@@ -69,6 +69,19 @@ function dayKey(event: KeyboardEvent, day: string) {
   if (!days.value.includes(selected.value)) month.value = selected.value.slice(0, 7)
   void nextTick(() => document.querySelector<HTMLButtonElement>(`[data-calendar-day="${selected.value}"]`)?.focus())
 }
+function scheduleIssueLabel(reason: string) {
+  switch (reason) {
+    case 'schedule_credentials': return 'TMDB 凭据或接口配置不可用'
+    case 'schedule_network': return '暂时无法连接 TMDB'
+    case 'schedule_provider_rejected': return 'TMDB 未接受排期请求'
+    case 'schedule_invalid_response': return 'TMDB 返回的季集排期无法核验'
+    case 'schedule_storage_unavailable': return '本地排期保存失败'
+    default: return '播出计划暂时无法更新'
+  }
+}
+function scheduleRetryTime(value: string) {
+  return new Date(value).toLocaleString(undefined, { timeZone: timezone, dateStyle: 'short', timeStyle: 'short' })
+}
 function statusLabel(value: string) { return followStatusLabel(value as FollowStatus) }
 watch([month, status, subscription], () => {
   refreshOwner.cancel(); refreshing.value = false; refreshMessage.value = ''; data.value = null
@@ -96,7 +109,7 @@ onBeforeUnmount(() => { requestOwner.cancel(); refreshOwner.cancel() })
     <p v-if="refreshMessage" class="calendar-notice" role="status">{{ refreshMessage }}</p>
     <section class="panel calendar-toolbar">
       <div class="month-navigation"><button class="secondary-button" aria-label="上个月" @click="changeMonth(-1)">‹</button><h2>{{ monthLabel }}</h2><button class="secondary-button" aria-label="下个月" @click="changeMonth(1)">›</button><button class="secondary-button" @click="goToday">今天</button></div>
-      <div class="calendar-filters"><label>订阅状态<select v-model="status"><option value="">全部状态</option><option value="active">追更中</option><option value="paused">已暂停</option><option value="completed">当前已补齐</option><option value="blocked">需要处理</option></select></label><label>订阅<select v-model="subscription"><option value="">全部可见订阅</option><option v-for="item in data?.subscriptions ?? []" :key="item.id" :value="item.id">{{ item.title }}</option></select></label></div>
+      <div class="calendar-filters"><label>订阅状态<select v-model="status"><option value="">全部状态</option><option value="active">追更中</option><option value="paused">已暂停</option><option value="completed">已完成</option><option value="blocked">需要处理</option></select></label><label>订阅<select v-model="subscription"><option value="">全部可见订阅</option><option v-for="item in data?.subscriptions ?? []" :key="item.id" :value="item.id">{{ item.title }}</option></select></label></div>
       <div class="calendar-mode" role="group" aria-label="日历视图"><button class="secondary-button" :aria-pressed="mode === 'month'" @click="mode = 'month'">月历</button><button class="secondary-button" :aria-pressed="mode === 'agenda'" @click="mode = 'agenda'">日程</button></div>
     </section>
     <div class="calendar-meta text-muted"><span>{{ data?.scope === 'all' ? '全部获权订阅' : '我的订阅' }} · {{ timezone }}</span><span v-if="data?.generated_at">更新于 {{ new Date(data.generated_at).toLocaleTimeString() }}</span></div>
@@ -104,7 +117,14 @@ onBeforeUnmount(() => { requestOwner.cancel(); refreshOwner.cancel() })
     <div v-if="data" class="calendar-notices">
       <p v-if="data.missing_seasons" class="calendar-notice">{{ data.missing_seasons }} 个季的排期待更新。可点击“更新播出计划”，后台也会自动补齐。</p>
       <p v-if="data.stale_seasons" class="calendar-notice">{{ data.stale_seasons }} 个季正在显示之前保存的排期，播出日期可能调整。</p>
-      <p v-if="data.reasons.includes('schedule_unavailable')" class="calendar-notice">部分播出计划暂时更新失败，之前保存的排期仍可查看。系统稍后会重试。</p>
+      <p v-if="data.archived_missing_seasons" class="calendar-notice">有 {{ data.archived_missing_seasons }} 个历史季暂无已保存的排期，可选择具体订阅后手动更新。</p>
+      <template v-if="data.schedule_issues?.length">
+        <p v-for="issue in data.schedule_issues" :key="issue.reason" class="calendar-notice" role="status">
+          {{ scheduleIssueLabel(issue.reason) }}，涉及 {{ issue.seasons }} 个季。
+          <span v-if="issue.retry_at">最早可于 {{ scheduleRetryTime(issue.retry_at) }} 重试。</span>
+        </p>
+      </template>
+      <p v-else-if="data.reasons.includes('schedule_unavailable')" class="calendar-notice">部分播出计划暂时无法更新。</p>
       <p v-if="data.refreshing_seasons" class="calendar-notice" role="status">正在后台更新 {{ data.refreshing_seasons }} 个季的播出计划。</p>
       <p v-if="data.reasons.some(reason => reason.endsWith('_budget'))" class="calendar-notice">当前范围内容较多，部分信息尚未显示。请选择具体订阅查看。</p>
     </div>

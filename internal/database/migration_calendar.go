@@ -25,3 +25,7 @@ func migrateSubscriptionCalendar(db *gorm.DB) error {
 	}
 	return nil
 }
+
+func migrateCalendarAiringFinished(db *gorm.DB) error {
+	return db.Exec(`ALTER TABLE calendar_seasons ADD COLUMN airing_finished INTEGER NOT NULL DEFAULT 0`).Error
+}

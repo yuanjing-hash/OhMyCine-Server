@@ -62,23 +62,25 @@ type CalendarSubscription struct {
 	Seasons   []int  `json:"seasons"`
 }
 type CalendarPage struct {
-	Events            []CalendarEvent        `json:"events"`
-	Undated           []CalendarEvent        `json:"undated"`
-	Subscriptions     []CalendarSubscription `json:"subscriptions"`
-	HasMore           bool                   `json:"has_more"`
-	NextCursor        string                 `json:"next_cursor,omitempty"`
-	Partial           bool                   `json:"partial"`
-	Reasons           []string               `json:"reasons"`
-	MissingSeasons    int                    `json:"missing_seasons"`
-	StaleSeasons      int                    `json:"stale_seasons"`
-	RefreshingSeasons int                    `json:"refreshing_seasons"`
-	UndatedCount      int                    `json:"undated_count"`
-	DateBasis         string                 `json:"date_basis"`
-	Scope             string                 `json:"scope"`
-	GeneratedAt       time.Time              `json:"generated_at"`
-	Timezone          string                 `json:"timezone"`
-	Start             string                 `json:"start"`
-	End               string                 `json:"end"`
+	Events                 []CalendarEvent         `json:"events"`
+	Undated                []CalendarEvent         `json:"undated"`
+	Subscriptions          []CalendarSubscription  `json:"subscriptions"`
+	HasMore                bool                    `json:"has_more"`
+	NextCursor             string                  `json:"next_cursor,omitempty"`
+	Partial                bool                    `json:"partial"`
+	Reasons                []string                `json:"reasons"`
+	MissingSeasons         int                     `json:"missing_seasons"`
+	StaleSeasons           int                     `json:"stale_seasons"`
+	RefreshingSeasons      int                     `json:"refreshing_seasons"`
+	ArchivedMissingSeasons int                     `json:"archived_missing_seasons,omitempty"`
+	ScheduleIssues         []CalendarScheduleIssue `json:"schedule_issues,omitempty"`
+	UndatedCount           int                     `json:"undated_count"`
+	DateBasis              string                  `json:"date_basis"`
+	Scope                  string                  `json:"scope"`
+	GeneratedAt            time.Time               `json:"generated_at"`
+	Timezone               string                  `json:"timezone"`
+	Start                  string                  `json:"start"`
+	End                    string                  `json:"end"`
 }
 type CalendarRefreshResult struct {
 	Queued        int  `json:"queued"`
@@ -87,11 +89,13 @@ type CalendarRefreshResult struct {
 	Partial       bool `json:"partial"`
 }
 type calendarJobPayload struct {
-	Key        string `json:"key"`
-	Generation uint64 `json:"generation"`
-	TMDBID     int64  `json:"tmdb_id"`
-	Season     int    `json:"season"`
-	Revision   uint64 `json:"revision"`
+	Key                   string `json:"key"`
+	Generation            uint64 `json:"generation"`
+	TMDBID                int64  `json:"tmdb_id"`
+	Season                int    `json:"season"`
+	Revision              uint64 `json:"revision"`
+	Manual                bool   `json:"manual,omitempty"`
+	HistorySubscriptionID string `json:"history_subscription_id,omitempty"`
 }
 type calendarCursor struct {
 	Scope    string `json:"s"`
@@ -106,6 +110,7 @@ type SubscriptionCalendarService struct {
 	coverage      *MediaCoverageService
 	now           func() time.Time
 	load          func(context.Context, int64, int) (tmdb.SeasonSchedule, error)
+	loadSeries    func(context.Context, int64) (tmdb.Snapshot, error)
 	enqueueMu     sync.Mutex
 	maintenanceMu sync.Mutex
 	refreshSlots  chan struct{}
@@ -123,6 +128,16 @@ func NewSubscriptionCalendarService(db *gorm.DB, queue *QueueService, metadata *
 			return tmdb.SeasonSchedule{}, err
 		}
 		return client.GetTVSeasonSchedule(ctx, id, season, calendarLanguage)
+	}
+	if metadata != nil {
+		s.loadSeries = func(ctx context.Context, id int64) (tmdb.Snapshot, error) {
+			client, err := metadata.Client()
+			if err != nil {
+				return tmdb.Snapshot{}, err
+			}
+			match, err := client.GetByID(ctx, "tv", id, calendarLanguage)
+			return match.Snapshot, err
+		}
 	}
 	return s
 }
@@ -151,7 +166,13 @@ func (s *SubscriptionCalendarService) subscriptionRows(ctx context.Context, acto
 	if !actor.Can(authz.PermissionFollowsReadAll) {
 		q = q.Where("owner_id = ?", actor.User.ID)
 	}
-	if query.Status != "" {
+	switch query.Status {
+	case models.FollowStatusCompleted:
+		q = q.Where("status = ? AND next_run_at IS NULL", models.FollowStatusCompleted)
+	case models.FollowStatusActive:
+		q = q.Where("(status = ? OR (status = ? AND next_run_at IS NOT NULL))", models.FollowStatusActive, models.FollowStatusCompleted)
+	case "":
+	default:
 		q = q.Where("status = ?", query.Status)
 	}
 	if query.SubscriptionID != "" {
@@ -175,6 +196,9 @@ func (s *SubscriptionCalendarService) subscriptionRows(ctx context.Context, acto
 		// Never rehydrate its title or episode facts from the shared cache.
 		if item.Snapshot.MediaLibraryID == 0 {
 			continue
+		}
+		if item.Status == models.FollowStatusCompleted && item.NextRunAt != nil {
+			item.Status = models.FollowStatusActive
 		}
 		result = append(result, item)
 	}
@@ -220,6 +244,8 @@ func (s *SubscriptionCalendarService) Read(ctx context.Context, actor Actor, que
 		return CalendarPage{}, err
 	}
 	now := s.now()
+	location, _ := time.LoadLocation(q.Timezone) // validateCalendarQuery checked the timezone.
+	historicalRange := q.Start < now.In(location).Format(time.DateOnly)
 	page := CalendarPage{Events: []CalendarEvent{}, Undated: []CalendarEvent{}, Subscriptions: []CalendarSubscription{}, Reasons: []string{}, Partial: partial, DateBasis: "expected_air_date", Scope: "own", GeneratedAt: now, Timezone: q.Timezone, Start: q.Start, End: q.End}
 	if actor.Can(authz.PermissionFollowsReadAll) {
 		page.Scope = "all"
@@ -301,6 +327,8 @@ func (s *SubscriptionCalendarService) Read(ctx context.Context, actor Actor, que
 		page.Partial = true
 		page.Reasons = appendUniqueString(page.Reasons, "activity_budget")
 	}
+	issued := make(map[string]bool)
+	issueByReason := make(map[string]CalendarScheduleIssue)
 projection:
 	for _, sub := range rows {
 		wf := facts[sub.TMDBID]
@@ -321,24 +349,41 @@ projection:
 			if running[key] {
 				page.RefreshingSeasons++
 			}
-			cached, found := heads[key]
-			if !found || !cached.Complete || cached.FetchedAt == nil || now.Sub(*cached.FetchedAt) > 30*24*time.Hour {
-				page.MissingSeasons++
+			cached := heads[key]
+			archived := calendarSubscriptionCompleted(sub) || cached.AiringFinished
+			if cached.LastErrorCode != "" && (!archived || q.SubscriptionID != "") && !issued[key] {
+				issued[key] = true
+				reason := calendarSafeIssueReason(cached.LastErrorCode)
+				issue := issueByReason[reason]
+				issue.Reason = reason
+				issue.Seasons++
+				if cached.RetryAt != nil && (issue.RetryAt == nil || cached.RetryAt.Before(*issue.RetryAt)) {
+					issue.RetryAt = cached.RetryAt
+				}
+				issueByReason[reason] = issue
 				page.Partial = true
-				page.Reasons = appendUniqueString(page.Reasons, "schedule_pending")
+				page.Reasons = appendUniqueString(page.Reasons, "schedule_unavailable")
+			}
+			if !cached.Complete || cached.FetchedAt == nil || (!archived && now.Sub(*cached.FetchedAt) > 30*24*time.Hour) {
+				if !archived {
+					page.MissingSeasons++
+					page.Partial = true
+					page.Reasons = appendUniqueString(page.Reasons, "schedule_pending")
+				} else if historicalRange {
+					page.ArchivedMissingSeasons++
+					page.Partial = true
+					page.Reasons = appendUniqueString(page.Reasons, "schedule_history_unavailable")
+				}
 				versions = append(versions, key+":missing")
 				continue
 			}
 			versions = append(versions, fmt.Sprintf("%s:%d", key, cached.Revision))
 			state := "fresh"
-			if cached.FreshUntil == nil || !now.Before(*cached.FreshUntil) {
+			if !archived && (cached.FreshUntil == nil || !now.Before(*cached.FreshUntil)) {
 				state = "stale"
 				page.StaleSeasons++
 				page.Partial = true
 				page.Reasons = appendUniqueString(page.Reasons, "schedule_stale")
-			}
-			if cached.LastErrorCode != "" {
-				page.Reasons = appendUniqueString(page.Reasons, "schedule_unavailable")
 			}
 			for _, episode := range episodeRows[key] {
 				if len(events)+page.UndatedCount >= maxCalendarProjectedEvents {
@@ -371,6 +416,12 @@ projection:
 			}
 		}
 	}
+	for _, issue := range issueByReason {
+		page.ScheduleIssues = append(page.ScheduleIssues, issue)
+	}
+	sort.Slice(page.ScheduleIssues, func(i, j int) bool {
+		return page.ScheduleIssues[i].Reason < page.ScheduleIssues[j].Reason
+	})
 	if page.UndatedCount > len(page.Undated) {
 		page.Partial = true
 		page.Reasons = appendUniqueString(page.Reasons, "undated_budget")
@@ -437,7 +488,7 @@ func (s *SubscriptionCalendarService) scheduleFacts(ctx context.Context, keys []
 				heads[head.Key] = head
 			}
 			var active []string
-			if err := tx.Model(&models.Job{}).Where("job_type = ? AND resource_key IN ? AND status IN ?", JobTypeSubscriptionCalendar, chunk, activeJobStatuses()).Distinct("resource_key").Pluck("resource_key", &active).Error; err != nil {
+			if err := tx.Model(&models.Job{}).Where("job_type = ? AND resource_key IN ? AND status IN ?", JobTypeSubscriptionCalendar, chunk, []string{models.JobStatusQueued, models.JobStatusRunning}).Distinct("resource_key").Pluck("resource_key", &active).Error; err != nil {
 				return err
 			}
 			for _, key := range active {
@@ -472,7 +523,7 @@ func (s *SubscriptionCalendarService) RequestRefresh(ctx context.Context, actor 
 	if err != nil {
 		return CalendarRefreshResult{}, err
 	}
-	result, err := s.enqueueRows(ctx, rows, true, 50)
+	result, err := s.enqueueRows(ctx, rows, calendarRefreshRequest{manual: true, historySubscriptionID: subscriptionID}, 50)
 	result.Partial = result.Partial || partial
 	return result, err
 }
@@ -482,7 +533,7 @@ func (s *SubscriptionCalendarService) RequestRefresh(ctx context.Context, actor 
 func (s *SubscriptionCalendarService) EnqueueDue(ctx context.Context, limit int) error {
 	return s.enqueueDueRoundRobin(ctx, limit)
 }
-func (s *SubscriptionCalendarService) enqueueRows(ctx context.Context, rows []FollowSummary, force bool, limit int) (CalendarRefreshResult, error) {
+func (s *SubscriptionCalendarService) enqueueRows(ctx context.Context, rows []FollowSummary, refresh calendarRefreshRequest, limit int) (CalendarRefreshResult, error) {
 	result := CalendarRefreshResult{}
 	if s.queue == nil {
 		return result, appError(CodeQueueWorkerUnavailable, "排期更新服务暂不可用", nil)
@@ -496,6 +547,9 @@ func (s *SubscriptionCalendarService) enqueueRows(ctx context.Context, rows []Fo
 	now := s.now()
 	seen := map[string]bool{}
 	for _, sub := range rows {
+		if calendarSubscriptionCompleted(sub) && refresh.historySubscriptionID != sub.ID {
+			continue
+		}
 		for _, season := range sub.Snapshot.Seasons {
 			key := calendarSeasonKey(generation, sub.TMDBID, season)
 			if seen[key] {
@@ -507,8 +561,25 @@ func (s *SubscriptionCalendarService) enqueueRows(ctx context.Context, rows []Fo
 			if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
 				return result, err
 			}
-			if !force && cached.FreshUntil != nil && now.Before(*cached.FreshUntil) {
+			if cached.AiringFinished && refresh.historySubscriptionID == "" {
 				continue
+			}
+			if !refresh.manual {
+				if cached.FreshUntil != nil && now.Before(*cached.FreshUntil) {
+					continue
+				}
+				quietUntil, err := calendarLegacyQuietUntil(s.db.WithContext(ctx), cached, now)
+				if err != nil {
+					return result, err
+				}
+				if !quietUntil.IsZero() {
+					if err := s.db.WithContext(ctx).Model(&models.CalendarSeason{}).
+						Where("key = ? AND generation = ? AND revision = ?", cached.Key, cached.Generation, cached.Revision).
+						UpdateColumn("fresh_until", quietUntil).Error; err != nil {
+						return result, err
+					}
+					continue
+				}
 			}
 			if (cached.RetryAt != nil && now.Before(*cached.RetryAt)) || (cached.LastRequestedAt != nil && now.Sub(*cached.LastRequestedAt) < time.Minute) {
 				result.CoolingDown++
@@ -536,7 +607,7 @@ func (s *SubscriptionCalendarService) enqueueRows(ctx context.Context, rows []Fo
 					continue
 				}
 				cached = models.CalendarSeason{Key: key, Generation: generation, TMDBID: sub.TMDBID, SeasonNumber: season, Language: calendarLanguage, UpdatedAt: now}
-				if err := s.db.Clauses(clause.OnConflict{DoNothing: true}).Create(&cached).Error; err != nil {
+				if err := s.db.WithContext(ctx).Clauses(clause.OnConflict{DoNothing: true}).Create(&cached).Error; err != nil {
 					return result, err
 				}
 			}
@@ -544,9 +615,16 @@ func (s *SubscriptionCalendarService) enqueueRows(ctx context.Context, rows []Fo
 			if len(title) > 50 {
 				title = append(title[:50], '…')
 			}
-			_, err = s.queue.EnqueueWith(EnqueueJobInput{System: true, JobType: JobTypeSubscriptionCalendar, Priority: -20, DisplayName: fmt.Sprintf("更新播出计划 · %s S%02d", string(title), season), Provider: "metadata", ResourceKey: key, Payload: calendarJobPayload{Key: key, Generation: generation, TMDBID: sub.TMDBID, Season: season, Revision: cached.Revision}}, func(tx *gorm.DB, _ models.Job) error {
+			payload := calendarJobPayload{Key: key, Generation: generation, TMDBID: sub.TMDBID, Season: season, Revision: cached.Revision, Manual: refresh.manual, HistorySubscriptionID: refresh.historySubscriptionID}
+			_, err = s.queue.EnqueueWith(EnqueueJobInput{System: true, JobType: JobTypeSubscriptionCalendar, Priority: -20, DisplayName: fmt.Sprintf("更新播出计划 · %s S%02d", string(title), season), Provider: "metadata", ResourceKey: key, Payload: payload}, func(tx *gorm.DB, _ models.Job) error {
+				if _, err := s.currentPublication(tx, payload, nil); err != nil {
+					return err
+				}
 				return tx.Model(&models.CalendarSeason{}).Where("key = ?", key).Updates(map[string]any{"last_requested_at": now, "updated_at": now}).Error
 			})
+			if errors.Is(err, errCalendarSuperseded) {
+				continue
+			}
 			if err != nil {
 				return result, err
 			}
@@ -558,7 +636,8 @@ func (s *SubscriptionCalendarService) enqueueRows(ctx context.Context, rows []Fo
 
 func (s *SubscriptionCalendarService) Run(ctx context.Context, _ JobRuntime, claimed ClaimedJob) WorkerResult {
 	var payload calendarJobPayload
-	if json.Unmarshal([]byte(claimed.Job.PayloadJSON), &payload) != nil || payload.Key != calendarSeasonKey(payload.Generation, payload.TMDBID, payload.Season) {
+	if json.Unmarshal([]byte(claimed.Job.PayloadJSON), &payload) != nil || payload.Key != calendarSeasonKey(payload.Generation, payload.TMDBID, payload.Season) ||
+		len(payload.HistorySubscriptionID) > 36 || (payload.HistorySubscriptionID != "" && !payload.Manual) {
 		return WorkerResult{ErrorCode: CodeInvalidRequest, ErrorMessage: "排期更新参数无效"}
 	}
 	select {
@@ -567,45 +646,53 @@ func (s *SubscriptionCalendarService) Run(ctx context.Context, _ JobRuntime, cla
 	case <-ctx.Done():
 		return WorkerResult{ErrorCode: "calendar_cancelled", ErrorMessage: "排期更新已取消"}
 	}
-	generation, err := s.generation()
+	head, err := s.currentPublication(s.db.WithContext(ctx), payload, &claimed)
+	if errors.Is(err, errCalendarSuperseded) {
+		return WorkerResult{}
+	}
 	if err != nil {
 		return WorkerResult{ErrorCode: "calendar_storage_failed", ErrorMessage: "排期状态读取失败"}
 	}
-	if generation != payload.Generation {
-		return WorkerResult{}
+	now := s.now()
+	if head.RetryAt != nil && now.Before(*head.RetryAt) {
+		return WorkerResult{RetryAt: head.RetryAt}
 	}
-	var referenced int64
-	if err := s.db.WithContext(ctx).Model(&models.FollowSubscriptionSeason{}).Where("tmdb_id = ? AND season_number = ?", payload.TMDBID, payload.Season).Count(&referenced).Error; err != nil {
-		return WorkerResult{ErrorCode: "calendar_storage_failed", ErrorMessage: "排期范围读取失败"}
-	}
-	if referenced == 0 {
-		return WorkerResult{}
+	if !payload.Manual {
+		if head.FreshUntil != nil && now.Before(*head.FreshUntil) {
+			return WorkerResult{}
+		}
+		quietUntil, err := calendarLegacyQuietUntil(s.db.WithContext(ctx), head, now)
+		if err != nil {
+			return WorkerResult{ErrorCode: "calendar_storage_failed", ErrorMessage: "排期状态读取失败"}
+		}
+		if !quietUntil.IsZero() {
+			return WorkerResult{}
+		}
 	}
 	readCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	fields := map[string]any{"job_id": claimed.Job.ID, "display_name": claimed.Job.DisplayName, "season": payload.Season}
 	serverlog.RecordBusiness(ctx, s.log, serverlog.OperationMetadataSnapshot, serverlog.BusinessEvent{Code: "calendar.refresh.start", Stage: "metadata", Outcome: "started", Message: "开始更新" + serverlog.BusinessDisplayName(claimed.Job.DisplayName), Fields: fields})
 	schedule, err := s.load(readCtx, payload.TMDBID, payload.Season)
+	if ctx.Err() != nil {
+		return WorkerResult{}
+	}
 	if err != nil {
-		if saveErr := s.recordFailure(ctx, claimed, payload, "schedule_unavailable", 15*time.Minute); saveErr != nil {
-			if errors.Is(saveErr, errCalendarSuperseded) {
-				return WorkerResult{}
-			}
-			return WorkerResult{ErrorCode: "calendar_storage_failed", ErrorMessage: "排期更新状态保存失败"}
-		}
-		serverlog.RecordBusiness(ctx, s.log, serverlog.OperationMetadataSnapshot, serverlog.BusinessEvent{Code: "calendar.refresh.failed", Stage: "metadata", Outcome: "failed", Message: "播出计划更新暂未完成，已保留之前保存的排期并安排稍后重试", Fields: fields})
-		return WorkerResult{ErrorCode: "calendar_schedule_unavailable", ErrorMessage: "播出计划暂时无法更新，已保留之前的排期"}
+		return s.refreshFailed(ctx, claimed, payload, calendarLoadFailure(err), fields)
 	}
 	if len(schedule.Episodes) > tmdb.MaxCalendarEpisodes || schedule.SeasonNumber != payload.Season {
-		return WorkerResult{ErrorCode: "calendar_response_invalid", ErrorMessage: "播出计划响应不完整"}
+		return s.refreshFailed(ctx, claimed, payload, calendarIssueResponse, fields)
 	}
-	if err := s.publish(ctx, payload, schedule, &claimed); err != nil {
+	finished, checked := s.confirmAiringFinished(readCtx, payload.TMDBID, schedule)
+	if !checked && head.AiringFinished {
+		finished = calendarEpisodeDatesUnchanged(s.db.WithContext(ctx), payload.Key, schedule.Episodes)
+	}
+	if err := s.publish(ctx, payload, schedule, finished, &claimed); err != nil {
 		if errors.Is(err, errCalendarSuperseded) {
 			serverlog.RecordBusiness(ctx, s.log, serverlog.OperationMetadataSnapshot, serverlog.BusinessEvent{Code: "calendar.refresh.superseded", Stage: "publish", Outcome: "skipped", Message: "播出计划的配置或缓存版本已更新，本次旧结果未发布", Fields: fields})
 			return WorkerResult{}
 		}
-		_ = s.recordFailure(ctx, claimed, payload, "schedule_storage_unavailable", time.Hour)
-		return WorkerResult{ErrorCode: "calendar_storage_failed", ErrorMessage: "播出计划保存失败，已保留之前的排期"}
+		return s.refreshFailed(ctx, claimed, payload, calendarIssueStorage, fields)
 	}
 	fields["episode_count"] = len(schedule.Episodes)
 	serverlog.RecordBusiness(ctx, s.log, serverlog.OperationMetadataSnapshot, serverlog.BusinessEvent{Code: "calendar.refresh.completed", Stage: "publish", Outcome: "completed", Message: fmt.Sprintf("播出计划已更新，共核对%d集；入库状态继续以当前媒体库为准", len(schedule.Episodes)), Fields: fields})
@@ -614,72 +701,65 @@ func (s *SubscriptionCalendarService) Run(ctx context.Context, _ JobRuntime, cla
 
 // currentPublication fences both successful and failed observations in the
 // same short write transaction. A retired attempt cannot change the cache.
-func (s *SubscriptionCalendarService) currentPublication(tx *gorm.DB, payload calendarJobPayload, claimed *ClaimedJob) error {
+func (s *SubscriptionCalendarService) currentPublication(tx *gorm.DB, payload calendarJobPayload, claimed *ClaimedJob) (models.CalendarSeason, error) {
+	var current models.CalendarSeason
 	if claimed != nil {
 		if s.queue == nil {
-			return errCalendarSuperseded
+			return current, errCalendarSuperseded
 		}
 		job, err := s.queue.verifyLease(tx, claimed.Job.ID, claimed.LeaseToken)
 		if ErrorCode(err) == CodeQueueLeaseInvalid || ErrorCode(err) == CodeNotFound {
-			return errCalendarSuperseded
+			return current, errCalendarSuperseded
 		}
 		if err != nil {
-			return err
+			return current, err
 		}
 		if job.Generation != claimed.Job.Generation || job.StartedGeneration != claimed.Job.StartedGeneration {
-			return errCalendarSuperseded
+			return current, errCalendarSuperseded
 		}
 	}
 	var settings models.MetadataSettings
 	if err := tx.Select("revision").First(&settings, 1).Error; err != nil {
-		return err
+		return current, err
 	}
 	if settings.Revision != payload.Generation {
-		return errCalendarSuperseded
+		return current, errCalendarSuperseded
 	}
-	var references int64
-	if err := tx.Model(&models.FollowSubscriptionSeason{}).Where("tmdb_id = ? AND season_number = ?", payload.TMDBID, payload.Season).Count(&references).Error; err != nil {
-		return err
+	referenced, err := calendarRefreshReferenced(tx, payload)
+	if err != nil {
+		return current, err
 	}
-	if references == 0 {
-		return errCalendarSuperseded
+	if !referenced {
+		return current, errCalendarSuperseded
 	}
-	var current models.CalendarSeason
 	if err := tx.First(&current, "key = ?", payload.Key).Error; err != nil {
-		return err
-	}
-	if current.Revision != payload.Revision || current.Generation != payload.Generation {
-		return errCalendarSuperseded
-	}
-	return nil
-}
-func (s *SubscriptionCalendarService) recordFailure(ctx context.Context, claimed ClaimedJob, payload calendarJobPayload, code string, delay time.Duration) error {
-	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if err := s.currentPublication(tx, payload, &claimed); err != nil {
-			return err
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return current, errCalendarSuperseded
 		}
-		return tx.Model(&models.CalendarSeason{}).Where("key = ? AND generation = ? AND revision = ?", payload.Key, payload.Generation, payload.Revision).Updates(map[string]any{"retry_at": s.now().Add(delay), "last_error_code": code, "updated_at": s.now()}).Error
-	})
+		return current, err
+	}
+	if current.Revision != payload.Revision || current.Generation != payload.Generation ||
+		(current.AiringFinished && payload.HistorySubscriptionID == "") {
+		return current, errCalendarSuperseded
+	}
+	return current, nil
 }
-func (s *SubscriptionCalendarService) publish(ctx context.Context, payload calendarJobPayload, schedule tmdb.SeasonSchedule, claimed *ClaimedJob) error {
+
+func (s *SubscriptionCalendarService) publish(ctx context.Context, payload calendarJobPayload, schedule tmdb.SeasonSchedule, airingFinished bool, claimed *ClaimedJob) error {
 	rows := make([]models.CalendarEpisode, 0, len(schedule.Episodes))
 	payloadBytes := int64(0)
 	now := s.now()
-	old := len(schedule.Episodes) > 0
 	for _, episode := range schedule.Episodes {
 		rows = append(rows, models.CalendarEpisode{SeasonKey: payload.Key, EpisodeNumber: episode.EpisodeNumber, TMDBID: episode.TMDBID, Name: episode.Name, AirDate: episode.AirDate})
 		payloadBytes += int64(len(episode.Name) + len(episode.AirDate) + 40)
-		if episode.AirDate == "" || episode.AirDate >= now.AddDate(0, 0, -30).Format("2006-01-02") {
-			old = false
-		}
 	}
 	ttl := 6 * time.Hour
-	if old {
-		ttl = 7 * 24 * time.Hour
+	if calendarPastOnly(schedule.Episodes, now.Add(-calendarQuietAge)) {
+		ttl = calendarQuietInterval
 	}
 	fresh := now.Add(ttl)
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if err := s.currentPublication(tx, payload, claimed); err != nil {
+		if _, err := s.currentPublication(tx, payload, claimed); err != nil {
 			return err
 		}
 		var heads int64
@@ -705,7 +785,7 @@ func (s *SubscriptionCalendarService) publish(ctx context.Context, payload calen
 				return err
 			}
 		}
-		return tx.Model(&models.CalendarSeason{}).Where("key = ? AND generation = ? AND revision = ?", payload.Key, payload.Generation, payload.Revision).Updates(map[string]any{"revision": gorm.Expr("revision + 1"), "fetched_at": now, "fresh_until": fresh, "retry_at": nil, "last_error_code": "", "complete": true, "episode_count": len(rows), "payload_bytes": payloadBytes, "updated_at": now}).Error
+		return tx.Model(&models.CalendarSeason{}).Where("key = ? AND generation = ? AND revision = ?", payload.Key, payload.Generation, payload.Revision).Updates(map[string]any{"revision": gorm.Expr("revision + 1"), "fetched_at": now, "fresh_until": fresh, "retry_at": nil, "last_error_code": "", "complete": true, "airing_finished": airingFinished, "episode_count": len(rows), "payload_bytes": payloadBytes, "updated_at": now}).Error
 	})
 }
 

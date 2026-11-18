@@ -5,21 +5,25 @@
 ## HTTP合同
 
 - `GET /api/v1/follows/calendar?start=YYYY-MM-DD&end=YYYY-MM-DD&timezone=IANA`：Session认证、`follows.read_own/read_all`、`Cache-Control: no-store`。end为开区间，最多42天；可选`status`、`subscription_id`、`page_size`（1–500，默认200）、`cursor`。
-- `POST /api/v1/follows/calendar/refresh`：同一读取权限、Session/CSRF、no-store；JSON为`{}`或`{"subscription_id":"..."}`。仅为当前获权季排队更新公共排期；相同缓存键60秒冷却，已有活动任务不递增其generation。
-- GET返回`events`、`undated`、`subscriptions`、`has_more/next_cursor`、`partial/reasons`、缺排期/过期/更新中季数、`undated_count`、范围与显示时区。日期为全天字符串，不转成UTC午夜再平移。
+- `POST /api/v1/follows/calendar/refresh`：同一读取权限、Session/CSRF、no-store；JSON为`{}`或`{"subscription_id":"..."}`。仅为当前获权季排队更新公共排期；相同缓存键至少60秒冷却，保留已有失败的重试期限与活动任务。批量刷新跳过已完成订阅和已证实播完的季，按订阅定向刷新可校对历史。
+- GET返回`events`、`undated`、`subscriptions`、`has_more/next_cursor`、`partial/reasons`、缺排期/过期/更新中季数、`undated_count`、范围与显示时区。日期为全天字符串，不转成UTC午夜再平移。可选的 `schedule_issues` 按安全原因汇总当前失败的不同季，附最早可重试的时间。历史时段另行返回 `archived_missing_seasons` 表示未保存的历史排期。
 - 事件包含稳定的订阅/季/集身份、标题/海报引用、订阅状态、`library_status: present|missing|unknown`、`activity: none|downloading|organizing|needs_attention|unknown`和排期新鲜度。当前有效目录存在优先于活动状态，旧claim的imported标签不代表当前存在。任务状态从一个query-only快照批量读取，累计最多5,000个claim；超预算的未确认状态返回unknown及activity_budget，不冒充无活动。
 - 限制或撤销目标库权限时，沿用Follow安全投影，不从公共缓存重新补出隐藏作品。任务状态需对应自己的/全部下载、整理权限和资源访问范围。
 - 游标绑定当前账号权限、范围、筛选与返回事实版本；期间内容变更返回409，需重新读取，不能拼接不同快照。
 
 ## 缓存与后台刷新
 
-迁移122增加公共`calendar_seasons`与`calendar_episodes`、私密维护游标`calendar_refresh_cursors`，以及7个独立容量采样字段；不重写媒体、用户历史或任务。容量采样字段仅由显式更新写入，普通Storage创建不污染旧版本schema。季集外键级联归属缓存头。键由元数据配置revision、语言、TV ID、季与格式版本组成，公共缓存不保存订阅、账号状态、凭据、原始上游正文或临时URL。
+迁移122增加公共`calendar_seasons`与`calendar_episodes`、私密维护游标`calendar_refresh_cursors`，以及7个独立容量采样字段；不重写媒体、用户历史或任务。容量采样字段仅由显式更新写入，普通Storage创建不污染旧版本schema。季集外键级联归属缓存头。键由元数据配置revision、语言、TV ID、季与格式版本组成，公共缓存不保存订阅、账号状态、凭据、原始上游正文或临时URL。迁移130为公共缓存追加 `airing_finished`，默认未确认，保留原有排期。
 
 日历专用TMDB读取复用配置化传输、HTTP/HTTPS、凭据和取消，限制8MiB正文、5,000集/季。完整读取后按集号排序；无效、重复、超限或缺少episodes字段不发布为空季。原Player/Follow普通接口继续保持原1,000集/2MiB上限。
 
 现有UnifiedScheduleService轮询附加独立有界缓存维护钩子，没有另起Cron或无限后台goroutine。每轮最多256个季、最多3秒，持久保存最后处理的订阅与季；大订阅可让出并从中间恢复，删除书签订阅仍能前进，坏快照独立跳过，完成一轮或更换元数据配置后重置。根据持久TTL和RetryAt生成`subscription_calendar_refresh`系统任务；维护失败不阻断原有计划派发。系统任务无用户owner，默认并发2。手动刷新只提交同类任务，翻月和首页轮询只读本地数据。
 
-当前/未来、空或含未知日期的季默认6小时；全部已知日期早于30天的非空季7天；旧成功快照最多保留30天供展示。失败保留成功内容与实际成功时间，15分钟后可重新安排；配置、缓存revision、作业代次或租约变化拒绝旧结果及失败写入。发布为短事务，外部请求在事务外；目录事实复用既有query-only池和有效Catalog读取，缓存头与集行从一致只读快照读取。缓存清理也在同一短事务内选择并删除，避免过期候选删除已经重新被引用的排期。
+仍需追踪未来播出、空或含未知日期的季默认6小时。连续集号、排期完整且所有日期早于7天的季，从最后一次实际成功读取计7天低频复查。旧6小时缓存符合条件时可在本地延长到同一截止时间。经 TMDB 作品状态或后续季证明本季已结束，并且集号、总集数和日期均能核实后，停止定期刷新。补充作品详情不可用时仍可保存有效排期，历史校对中完整集号、ID 和日期未变会保留已有的结束证明。
+
+已完成订阅的历史排期可继续查看。无其它订阅需要该季时，已排队的自动任务在请求上游前重新确认范围。库内缺集继续按原 Follow 规则补齐。仍需自动追踪的季可在明确标记过期的情况下使用30天内的上次排期。
+
+失败保留最后成功的排期、成功时间和当前安全原因。暂时无法连接时首次间隔15分钟，重复失败和无效响应等待至少1小时，凭据或接口配置问题间隔6小时。优先通过原任务按现有尝试上限重试，成功后清除当前失败。历史尝试仍可在任务和日志中核查。配置、缓存revision、作业代次或租约变化拒绝旧结果及失败写入。发布为短事务，外部请求在事务外；目录事实复用既有query-only池和有效Catalog读取，缓存头与集行从一致只读快照读取。缓存清理也在同一短事务内选择并删除，避免过期候选删除已经重新被引用的排期。
 
 缓存上限2,048季、500,000集、128MiB安全有效载荷。每次维护最多清理50个已无订阅引用或旧配置代际的公共缓存；不清理业务数据。投影最多2,000订阅、4,000季、10,000事件，读取缓存和当前目录各有50,000行预算；日期未定明细最多100条并提供已读取事实中的计数与partial提示。partial时该计数不代表全量范围，页面显示“已确认”；超过预算需按具体订阅筛选，不把截断当空日历。
 

@@ -8,10 +8,16 @@ export interface CalendarEvent {
   schedule_state: 'fresh' | 'stale'
 }
 export interface CalendarSubscription { id: string; title: string; poster_ref?: string; status: string; seasons: number[] }
+export interface CalendarScheduleIssue {
+  reason: string
+  seasons: number
+  retry_at?: string
+}
 export interface CalendarPage {
   events: CalendarEvent[]; undated: CalendarEvent[]; subscriptions: CalendarSubscription[]
   has_more: boolean; next_cursor?: string; partial: boolean; reasons: string[]
   missing_seasons: number; stale_seasons: number; refreshing_seasons: number; undated_count: number
+  archived_missing_seasons?: number; schedule_issues?: CalendarScheduleIssue[]
   date_basis: 'expected_air_date'; scope: 'own' | 'all'; generated_at: string; timezone: string; start: string; end: string
 }
 export interface CalendarQuery {

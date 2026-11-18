@@ -359,6 +359,8 @@ type JobListFilter struct {
 	CreatedTo   *time.Time
 	Page        int
 	PageSize    int
+
+	excludedJobType string
 }
 type JobPage struct {
 	List     []JobDTO `json:"list"`
@@ -396,6 +398,9 @@ func (s *QueueService) List(actor Actor, filter JobListFilter) (JobPage, error) 
 	}
 	if filter.JobType != "" {
 		query = query.Where("job_type = ?", filter.JobType)
+	}
+	if filter.excludedJobType != "" {
+		query = query.Where("job_type <> ?", filter.excludedJobType)
 	}
 	if filter.Provider != "" {
 		query = query.Where("provider = ?", filter.Provider)

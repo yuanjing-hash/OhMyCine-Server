@@ -16,6 +16,7 @@ type CalendarSeason struct {
 	RetryAt         *time.Time `gorm:"index"`
 	LastRequestedAt *time.Time
 	LastErrorCode   string `gorm:"size:64;not null;default:''"`
+	AiringFinished  bool   `gorm:"<-:update;not null;default:false"`
 	Complete        bool   `gorm:"not null;default:false"`
 	EpisodeCount    int    `gorm:"not null;default:0"`
 	PayloadBytes    int64  `gorm:"not null;default:0"`

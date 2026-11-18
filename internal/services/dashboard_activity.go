@@ -26,12 +26,14 @@ func (s *AdminService) DashboardActivity(ctx context.Context, actor Actor) (Dash
 	}
 	result := DashboardActivity{GeneratedAt: time.Now().UTC()}
 	queue := NewQueueService(s.db.WithContext(ctx), nil)
-	tasks := func(statuses []string) PlayerOverviewSection[JobDTO] {
+	tasks := func(filter JobListFilter, statuses ...string) PlayerOverviewSection[JobDTO] {
+		filter.Page, filter.PageSize = 1, 8
 		return loadPlayerOverviewSection(func() ([]JobDTO, bool, error) {
 			items := make([]JobDTO, 0, 8)
 			var total int64
 			for _, status := range statuses {
-				page, err := queue.List(actor, JobListFilter{Status: status, Page: 1, PageSize: 8})
+				filter.Status = status
+				page, err := queue.List(actor, filter)
 				if err != nil {
 					return nil, false, err
 				}
@@ -50,9 +52,11 @@ func (s *AdminService) DashboardActivity(ctx context.Context, actor Actor) (Dash
 			return items, total > int64(len(items)), nil
 		})
 	}
-	result.Active = tasks([]string{models.JobStatusRunning})
-	result.Waiting = tasks([]string{models.JobStatusQueued, models.JobStatusRetryWait, models.JobStatusPaused})
-	result.Attention = tasks([]string{models.JobStatusFailed, models.JobStatusWaitingUserAction})
+	result.Active = tasks(JobListFilter{}, models.JobStatusRunning)
+	result.Waiting = tasks(JobListFilter{}, models.JobStatusQueued, models.JobStatusRetryWait, models.JobStatusPaused)
+	// Calendar refresh status belongs to the calendar. Keep its individual
+	// attempts in the task center and exclude them before counting and paging.
+	result.Attention = tasks(JobListFilter{excludedJobType: JobTypeSubscriptionCalendar}, models.JobStatusFailed, models.JobStatusWaitingUserAction)
 	result.Recent = loadPlayerOverviewSection(func() ([]BrowserMediaItem, bool, error) {
 		libraries := &MediaLibraryService{db: s.db.WithContext(ctx), catalogStore: s.catalogStore, metadata: s.metadata}
 		visible, err := libraries.PlayerLibraries(actor)

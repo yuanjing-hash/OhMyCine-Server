@@ -1,9 +1,10 @@
 package database
 
 import (
-	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
 	"testing"
 	"time"
+
+	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
 )
 
 func TestMigrationV122CalendarAndCapacityAreAdditiveAndRepeatable(t *testing.T) {
@@ -72,6 +73,38 @@ func TestMigrationV122CalendarAndCapacityAreAdditiveAndRepeatable(t *testing.T) 
 				t.Fatal("migration overwrote administrator queue policy")
 			}
 		})
+	}
+}
+
+func TestMigrationV130CalendarAiringFinishedPreservesLegacyRows(t *testing.T) {
+	db, err := Open(t.TempDir() + "/legacy-calendar.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool, _ := db.DB()
+	t.Cleanup(func() { _ = pool.Close() })
+	applyMigrationsThrough(t, db, 129)
+	now := time.Date(2026, 11, 6, 7, 8, 9, 0, time.UTC)
+	season := models.CalendarSeason{Key: "legacy", Generation: 1, TMDBID: 100, SeasonNumber: 1, Language: "zh-CN", Revision: 2, Complete: true, FetchedAt: &now, EpisodeCount: 1}
+	if err := db.Create(&season).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Create(&models.CalendarEpisode{SeasonKey: season.Key, TMDBID: 200, EpisodeNumber: 1, AirDate: "2026-10-25"}).Error; err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if err := Migrate(db); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var saved models.CalendarSeason
+	if err := db.First(&saved, "key = ?", season.Key).Error; err != nil || saved.AiringFinished || !saved.Complete ||
+		saved.FetchedAt == nil || !saved.FetchedAt.Equal(now) || saved.Revision != season.Revision || saved.EpisodeCount != season.EpisodeCount {
+		t.Fatalf("calendar migration changed the saved observation: %+v, err=%v", saved, err)
+	}
+	var episode models.CalendarEpisode
+	if err := db.First(&episode, "season_key = ?", season.Key).Error; err != nil || episode.TMDBID != 200 || episode.AirDate != "2026-10-25" {
+		t.Fatalf("calendar migration lost the saved episode: %+v, err=%v", episode, err)
 	}
 }
 

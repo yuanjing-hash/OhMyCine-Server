@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { api, clearCSRFToken } from '@/api/client'
+import { api, APIError, clearCSRFToken } from '@/api/client'
 import { Permissions } from '@/auth/generated-permissions'
 import SecretInput from '@/components/SecretInput.vue'
 import UserResourceAccessPanel from '@/components/UserResourceAccessPanel.vue'
@@ -18,17 +18,21 @@ const resourceOptions = ref<ResourceAccessOptions | null>(null); const resourceR
 const selfPasswordSaved = ref(false)
 const selectionVersion = ref(0)
 const passwordSavingVersion = ref<number | null>(null)
+const passwordError = ref('')
 let disposed = false
 const selected = computed(() => users.value.find(user => user.id === selectedID.value) ?? null)
 const canEditAuthorization = computed(() => auth.can(Permissions.RolesAssign) && Boolean(selected.value) && !selected.value?.is_owner && selected.value?.id !== auth.user?.id)
 const canResetPassword = computed(() => auth.can(Permissions.UsersUpdate) && Boolean(selected.value) && (!selected.value?.is_owner || selected.value.id === auth.user?.id))
 const passwordInputsLocked = computed(() => saving.value && passwordSavingVersion.value === selectionVersion.value)
+const passwordFormComplete = computed(() => Boolean(resetPassword.value && currentPassword.value))
 const authorizationReadOnlyReason = computed(() => selected.value?.is_owner ? 'Owner 的授权受到保护，此处仅供查看。' : selected.value?.id === auth.user?.id ? '不能修改自己的授权，请由其他管理员调整。' : !auth.can(Permissions.RolesAssign) ? '当前账户仅可查看用户权限。' : '')
 
 watch(selected, user => { editDisplayName.value = user?.display_name ?? ''; editRoleIDs.value = user?.roles.map(role => role.id) ?? []; editRules.value = (user?.authorization_rules ?? []).map(rule => ({ ...rule })); if (!user) clearPasswordDraft() }, { immediate: true })
 watch(selectedID, () => { selectionVersion.value++; clearPasswordDraft(); resourceOptions.value = null; error.value = ''; notice.value = '' }, { flush: 'sync' })
 
-function clearPasswordDraft() { resetPassword.value = ''; currentPassword.value = '' }
+watch([resetPassword, currentPassword], () => { passwordError.value = '' })
+
+function clearPasswordDraft() { resetPassword.value = ''; currentPassword.value = ''; passwordError.value = '' }
 function roleLabel(role: RoleSummary) { return `${role.name} · ${role.kind === 'system' ? '系统模板' : '自定义模板'}` }
 
 async function load() {
@@ -68,10 +72,10 @@ function changeRuleResourceType(rule: AuthorizationRule) { rule.resource_id = ''
 function canChooseRuleResource(rule: AuthorizationRule, id: string, deleted: boolean, status: string) { return id === rule.resource_id || (!deleted && !['restricted', 'unavailable'].includes(status)) }
 async function toggleEnabled() { if (!selected.value) return; const action = selected.value.status === 'active' ? 'disable' : 'enable'; await run(async () => { await api(`/api/v1/users/${selected.value?.id}/${action}`, { method: 'POST', body: '{}' }); notice.value = action === 'disable' ? '用户已停用' : '用户已启用' }) }
 async function resetUserPassword() {
-  if (!selected.value || !canResetPassword.value || saving.value || !resetPassword.value || !currentPassword.value) return
+  if (!selected.value || !canResetPassword.value || saving.value || !passwordFormComplete.value) return
   const userID = selected.value.id; const version = selectionVersion.value; const actorID = auth.user?.id
   const isCurrentTarget = () => !disposed && selectedID.value === userID && version === selectionVersion.value
-  saving.value = true; passwordSavingVersion.value = version; error.value = ''; notice.value = ''
+  saving.value = true; passwordSavingVersion.value = version; passwordError.value = ''; error.value = ''; notice.value = ''
   try {
     await api(`/api/v1/users/${userID}/reset-password`, { method: 'POST', body: JSON.stringify({ password: resetPassword.value, current_password: currentPassword.value }) })
     if (userID === actorID && (!auth.user || auth.user.id === actorID)) {
@@ -83,7 +87,13 @@ async function resetUserPassword() {
       clearPasswordDraft()
       notice.value = '新密码已保存，目标用户现有会话已撤销'
     }
-  } catch (reason) { if (isCurrentTarget()) error.value = message(reason) }
+  } catch (reason) {
+    if (isCurrentTarget()) {
+      passwordError.value = reason instanceof APIError && reason.errorCode === 'INVALID_CREDENTIALS'
+        ? '当前登录账号的 Server 密码不正确，请重新输入。'
+        : message(reason)
+    }
+  }
   finally { passwordSavingVersion.value = null; if (!disposed) saving.value = false }
 }
 async function deleteUser() { if (!selected.value || !window.confirm(`确认删除用户 ${selected.value.username}？此操作不可撤销。`)) return; const id = selected.value.id; await run(async () => { await api(`/api/v1/users/${id}`, { method: 'DELETE', body: '{}' }); selectedID.value = null; notice.value = '用户已删除' }) }
@@ -118,13 +128,24 @@ onBeforeUnmount(() => { disposed = true; selectionVersion.value++; clearPassword
         </div>
         <form v-if="canResetPassword" class="semantic-divider mt-6 border-t pt-5" aria-labelledby="user-password-title" @submit.prevent="resetUserPassword">
           <h3 id="user-password-title" class="mt-0 text-sm">修改密码</h3>
-          <p class="text-subtle text-xs">请输入当前操作者自己的密码完成认证。保存后，该用户的现有登录会话会被撤销。</p>
+          <p class="text-subtle text-xs">保存后，{{ selected.username }} 的现有登录会话会被撤销。</p>
           <div class="grid gap-3 md:grid-cols-2">
-            <div><label class="label" for="user-new-password">新密码</label><SecretInput id="user-new-password" v-model="resetPassword" class="input" minlength="8" maxlength="128" required autocomplete="new-password" placeholder="至少 8 位新密码" :disabled="passwordInputsLocked" :reset-key="selectionVersion" /></div>
-            <div><label class="label" for="user-current-password">当前操作者密码（重新认证）</label><SecretInput id="user-current-password" v-model="currentPassword" class="input" required autocomplete="current-password" :disabled="passwordInputsLocked" :reset-key="selectionVersion" /></div>
+            <div>
+              <label class="label" for="user-new-password">账号 {{ selected.username }} 的新密码</label>
+              <SecretInput id="user-new-password" v-model="resetPassword" class="input" minlength="8" maxlength="128" required autocomplete="new-password" placeholder="输入至少 8 位的新密码" :disabled="passwordInputsLocked" :reset-key="selectionVersion" />
+            </div>
+            <div>
+              <label class="label" for="user-current-password">当前登录账号<template v-if="auth.user?.username">（{{ auth.user.username }}）</template>的 Server 密码</label>
+              <SecretInput id="user-current-password" v-model="currentPassword" class="input" required autocomplete="current-password" placeholder="输入你登录 OhMyCine Server 用的密码" aria-describedby="user-password-feedback" :disabled="passwordInputsLocked" :reset-key="selectionVersion" />
+            </div>
           </div>
-          <p v-if="resetPassword || currentPassword" class="text-muted mb-0 mt-3 text-xs" role="status">新密码尚未保存，请点击“保存新密码”。</p>
-          <button class="btn-primary mt-3" :disabled="saving">保存新密码</button>
+          <p v-if="passwordError" id="user-password-feedback" class="semantic-error mb-0 mt-3 p-3 text-sm" role="alert">{{ passwordError }}</p>
+          <p v-else id="user-password-feedback" class="text-muted mb-0 mt-3 text-xs" role="status">
+            <template v-if="!currentPassword">请填写你登录 OhMyCine Server 使用的密码，以确认这次修改。</template>
+            <template v-else-if="!resetPassword">请填写所选账号的新密码。</template>
+            <template v-else>新密码尚未保存，请点击“保存新密码”。</template>
+          </p>
+          <button type="submit" class="btn-primary mt-3" :disabled="saving || !passwordFormComplete">保存新密码</button>
         </form>
         <section class="semantic-divider mt-6 border-t pt-5" aria-labelledby="user-permissions-title">
           <h3 id="user-permissions-title" class="mb-4 mt-0 text-lg">权限设置</h3>

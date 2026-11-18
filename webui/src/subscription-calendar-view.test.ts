@@ -51,6 +51,27 @@ describe('subscription calendar mounted behavior', () => {
     expect(wrapper.text()).toContain('已安排更新 1 个季')
     wrapper.unmount()
   })
+  it('shows one scoped schedule failure and clears it after a successful calendar read', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(envelope({
+        ...page(),
+        events: [],
+        missing_seasons: 1,
+        partial: true,
+        reasons: ['schedule_pending', 'schedule_unavailable'],
+        schedule_issues: [{ reason: 'schedule_network', seasons: 1, retry_at: '2026-10-26T12:15:00Z' }],
+      }))
+      .mockResolvedValueOnce(envelope(page()))
+    vi.stubGlobal('fetch', fetchMock)
+    const wrapper = mount(SubscriptionCalendarView, { global: { stubs } }); await flushPromises()
+    expect(wrapper.text()).toContain('暂时无法连接 TMDB，涉及 1 个季')
+    expect(wrapper.text()).toContain('最早可于')
+    expect(wrapper.text()).not.toContain('之前保存的排期仍可查看')
+    await wrapper.findAll('button').find(button => button.text() === '刷新日历')!.trigger('click'); await flushPromises()
+    expect(wrapper.text()).not.toContain('暂时无法连接 TMDB')
+    expect(wrapper.text()).toContain('已入库')
+    wrapper.unmount()
+  })
   it('clears old account facts and rejects a late response after account replacement', async () => {
     let resolveOld!: (value: ReturnType<typeof envelope>) => void
     let calls = 0

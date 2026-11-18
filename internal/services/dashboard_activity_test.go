@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/authz"
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
@@ -11,11 +12,12 @@ import (
 )
 
 func TestDashboardActivityNamesOnlyCurrentWorkAndSeparatesAttention(t *testing.T) {
-	queue, actor, _ := queueFixture(t)
+	queue, actor, clock := queueFixture(t)
 	running := enqueueFake(t, queue, actor, "入库：测试电视剧 S01E08", "r")
 	done := enqueueFake(t, queue, actor, "已经完成的旧入库", "done")
 	failed := enqueueFake(t, queue, actor, "等待修复的下载", "failed")
-	for id, status := range map[string]string{running.ID: models.JobStatusRunning, done.ID: models.JobStatusCompleted, failed.ID: models.JobStatusFailed} {
+	waiting := enqueueFake(t, queue, actor, "等待选择的整理", "waiting")
+	for id, status := range map[string]string{running.ID: models.JobStatusRunning, done.ID: models.JobStatusCompleted, failed.ID: models.JobStatusFailed, waiting.ID: models.JobStatusWaitingUserAction} {
 		if err := queue.db.Model(&models.Job{}).Where("id=?", id).Update("status", status).Error; err != nil {
 			t.Fatal(err)
 		}
@@ -35,8 +37,45 @@ func TestDashboardActivityNamesOnlyCurrentWorkAndSeparatesAttention(t *testing.T
 	if err != nil || view.Active.Status != "ok" || len(view.Active.List) != 1 || view.Active.List[0].DisplayName != running.DisplayName {
 		t.Fatalf("active=%+v err=%v", view.Active, err)
 	}
-	if len(view.Attention.List) != 1 || view.Attention.List[0].ID != failed.ID {
-		t.Fatalf("attention=%+v", view.Attention)
+	checkAttention := func(section PlayerOverviewSection[JobDTO]) {
+		t.Helper()
+		present := map[string]bool{}
+		for _, job := range section.List {
+			present[job.ID] = true
+		}
+		if section.Status != "ok" || section.HasMore || len(section.List) != 2 || !present[failed.ID] || !present[waiting.ID] {
+			t.Fatalf("attention=%+v", section)
+		}
+	}
+	checkAttention(view.Attention)
+
+	// Newer calendar attempts exceed the dashboard page even after a successful
+	// refresh. Use all-user scope so ownership alone cannot hide these rows.
+	const failedRefreshes = 10
+	for attempt := 0; attempt <= failedRefreshes; attempt++ {
+		clock.now = clock.now.Add(time.Minute)
+		job, err := queue.Enqueue(EnqueueJobInput{System: true, JobType: JobTypeSubscriptionCalendar, DisplayName: "更新播出计划 · 同一剧集 S01", ResourceKey: "calendar-season"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		status := models.JobStatusFailed
+		if attempt == failedRefreshes {
+			status = models.JobStatusCompleted
+		}
+		if err := queue.db.Model(&models.Job{}).Where("id = ?", job.ID).Update("status", status).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	allReader := actor
+	allReader.Permissions = map[string]struct{}{authz.PermissionDashboardRead: {}, authz.PermissionJobsReadAll: {}}
+	allView, err := admin.DashboardActivity(context.Background(), allReader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkAttention(allView.Attention)
+	calendarHistory, err := queue.List(allReader, JobListFilter{Status: models.JobStatusFailed, JobType: JobTypeSubscriptionCalendar})
+	if err != nil || calendarHistory.Total != failedRefreshes || len(calendarHistory.List) != failedRefreshes {
+		t.Fatalf("calendar job history=%+v err=%v", calendarHistory, err)
 	}
 	if view.Recent.Status != "unavailable" || view.Capacities.Status != "unavailable" {
 		t.Fatal("domain permissions widened")

@@ -51,7 +51,7 @@ func calendarSeed(t *testing.T, s *SubscriptionCalendarService, id int64, season
 	if err := s.db.Create(&models.CalendarSeason{Key: key, Generation: generation, TMDBID: id, SeasonNumber: season, Language: calendarLanguage}).Error; err != nil {
 		t.Fatal(err)
 	}
-	if err := s.publish(context.Background(), calendarJobPayload{Key: key, Generation: generation, TMDBID: id, Season: season}, tmdb.SeasonSchedule{SeasonNumber: season, Episodes: episodes}, nil); err != nil {
+	if err := s.publish(context.Background(), calendarJobPayload{Key: key, Generation: generation, TMDBID: id, Season: season}, tmdb.SeasonSchedule{SeasonNumber: season, Episodes: episodes}, false, nil); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -137,7 +137,7 @@ func TestSubscriptionCalendarPublicationRollsBackAndLostACKDoesNotReplaceAgain(t
 	var payload calendarJobPayload
 	_ = json.Unmarshal([]byte(claimed.Job.PayloadJSON), &payload)
 	invalid := tmdb.SeasonSchedule{SeasonNumber: 1, Episodes: []tmdb.EpisodeSnapshot{{EpisodeNumber: 2, Name: "未提交"}, {EpisodeNumber: 2}}}
-	if err := s.publish(context.Background(), payload, invalid, claimed); err == nil {
+	if err := s.publish(context.Background(), payload, invalid, false, claimed); err == nil {
 		t.Fatal("duplicate episode fixture must fail publication")
 	}
 	var previous models.CalendarEpisode
@@ -274,7 +274,7 @@ func TestSubscriptionCalendarFailureKeepsSnapshotAndRejectsOldGeneration(t *test
 	calendarSeed(t, s, 100, 1, tmdb.EpisodeSnapshot{EpisodeNumber: 1, AirDate: "2026-08-13"})
 	clock.now = clock.now.Add(7 * time.Hour)
 	s.load = func(context.Context, int64, int) (tmdb.SeasonSchedule, error) {
-		return tmdb.SeasonSchedule{}, errors.New("private upstream detail")
+		return tmdb.SeasonSchedule{}, &tmdb.ClientError{Code: tmdb.ErrorNetworkUnavailable}
 	}
 	if _, err := s.RequestRefresh(context.Background(), actor, ""); err != nil {
 		t.Fatal(err)
@@ -283,19 +283,46 @@ func TestSubscriptionCalendarFailureKeepsSnapshotAndRejectsOldGeneration(t *test
 	if err != nil || claimed == nil {
 		t.Fatalf("claim=%+v %v", claimed, err)
 	}
-	if result := s.Run(context.Background(), nil, *claimed); result.ErrorCode != "calendar_schedule_unavailable" {
+	result := s.Run(context.Background(), nil, *claimed)
+	if result.ErrorCode != "calendar_schedule_network" || result.RetryAt == nil || !result.RetryAt.Equal(clock.now.Add(15*time.Minute)) {
 		t.Fatalf("result=%+v", result)
 	}
 	page, err := s.Read(context.Background(), actor, calendarMonthQuery())
-	if err != nil || len(page.Events) != 1 || page.StaleSeasons != 1 {
+	if err != nil || len(page.Events) != 1 || page.StaleSeasons != 1 ||
+		len(page.ScheduleIssues) != 1 || page.ScheduleIssues[0].Reason != calendarIssueNetwork ||
+		page.ScheduleIssues[0].Seasons != 1 || page.ScheduleIssues[0].RetryAt == nil || !page.ScheduleIssues[0].RetryAt.Equal(*result.RetryAt) {
 		t.Fatalf("page=%+v err=%v", page, err)
+	}
+	if err := s.queue.RetryLater(claimed.Job.ID, claimed.LeaseToken, result.ErrorCode, result.ErrorMessage, *result.RetryAt); err != nil {
+		t.Fatal(err)
+	}
+	clock.now = *result.RetryAt
+	if err := s.queue.PromoteDueRetries(); err != nil {
+		t.Fatal(err)
+	}
+	retry, err := s.queue.Claim([]string{JobTypeSubscriptionCalendar})
+	if err != nil || retry == nil || retry.Job.ID != claimed.Job.ID {
+		t.Fatalf("retry did not reuse the original job: %+v %v", retry, err)
+	}
+	s.load = func(context.Context, int64, int) (tmdb.SeasonSchedule, error) {
+		return tmdb.SeasonSchedule{SeasonNumber: 1, Episodes: []tmdb.EpisodeSnapshot{{EpisodeNumber: 1, AirDate: "2026-08-13"}}}, nil
+	}
+	s.loadSeries = func(context.Context, int64) (tmdb.Snapshot, error) {
+		return tmdb.Snapshot{}, errors.New("optional series details unavailable")
+	}
+	if result := s.Run(context.Background(), nil, *retry); result.ErrorCode != "" {
+		t.Fatalf("optional detail failure lost a valid schedule: %+v", result)
+	}
+	page, err = s.Read(context.Background(), actor, calendarMonthQuery())
+	if err != nil || len(page.Events) != 1 || len(page.ScheduleIssues) != 0 {
+		t.Fatalf("recovered schedule retained its old failure: %+v %v", page, err)
 	}
 	var payload calendarJobPayload
 	_ = json.Unmarshal([]byte(claimed.Job.PayloadJSON), &payload)
 	if err := s.db.Model(&models.MetadataSettings{}).Where("id = ?", 1).Update("revision", payload.Generation+1).Error; err != nil {
 		t.Fatal(err)
 	}
-	if err := s.publish(context.Background(), payload, tmdb.SeasonSchedule{SeasonNumber: 1, Episodes: []tmdb.EpisodeSnapshot{{EpisodeNumber: 2, AirDate: "2026-08-14"}}}, nil); !errors.Is(err, errCalendarSuperseded) {
+	if err := s.publish(context.Background(), payload, tmdb.SeasonSchedule{SeasonNumber: 1, Episodes: []tmdb.EpisodeSnapshot{{EpisodeNumber: 2, AirDate: "2026-08-14"}}}, false, nil); !errors.Is(err, errCalendarSuperseded) {
 		t.Fatalf("old publication err=%v", err)
 	}
 	var episode models.CalendarEpisode
@@ -357,4 +384,62 @@ func TestSubscriptionCalendarUsesCurrentCatalogPresenceWithoutMetadataRequests(t
 	if err != nil || len(page.Events) != 2 || page.Events[0].LibraryStatus != "present" || page.Events[1].LibraryStatus != "unknown" {
 		t.Fatalf("current facts=%+v err=%v", page, err)
 	}
+}
+
+func TestSubscriptionCalendarRetainsFinishedAiringWhileFollowCanStillFillGaps(t *testing.T) {
+	s, actor, clock := calendarFixture(t)
+	ctx := context.Background()
+	calendarSubscription(t, s, actor, "missing", 100, 1)
+	knownDate := clock.now.AddDate(0, 0, -8).Format(time.DateOnly)
+	nextDate := ""
+	s.load = func(context.Context, int64, int) (tmdb.SeasonSchedule, error) {
+		episodes := []tmdb.EpisodeSnapshot{{EpisodeNumber: 1, TMDBID: 200, AirDate: knownDate}}
+		if nextDate != "" {
+			episodes = append(episodes, tmdb.EpisodeSnapshot{EpisodeNumber: 2, TMDBID: 201, AirDate: nextDate})
+		}
+		return tmdb.SeasonSchedule{SeasonNumber: 1, Episodes: episodes}, nil
+	}
+	s.loadSeries = func(context.Context, int64) (tmdb.Snapshot, error) {
+		return tmdb.Snapshot{TMDBID: 100, MediaType: "tv", Status: "Ended", Seasons: []tmdb.SeasonSnapshot{{SeasonNumber: 1, EpisodeCount: 1}}}, nil
+	}
+	refresh := func(id string, wantFinished bool) {
+		t.Helper()
+		result, err := s.RequestRefresh(ctx, actor, id)
+		if err != nil || result.Queued != 1 {
+			t.Fatalf("refresh=%+v %v", result, err)
+		}
+		job, err := s.queue.Claim([]string{JobTypeSubscriptionCalendar})
+		if err != nil || job == nil {
+			t.Fatalf("claim=%+v %v", job, err)
+		}
+		if result := s.Run(ctx, nil, *job); result.ErrorCode != "" {
+			t.Fatalf("refresh run=%+v", result)
+		}
+		if err := s.queue.Complete(job.Job.ID, job.LeaseToken); err != nil {
+			t.Fatal(err)
+		}
+		var head models.CalendarSeason
+		if err := s.db.First(&head).Error; err != nil || head.AiringFinished != wantFinished {
+			t.Fatalf("finished=%v want=%v err=%v", head.AiringFinished, wantFinished, err)
+		}
+	}
+	refresh("", true)
+	var sub models.FollowSubscription
+	if err := s.db.First(&sub, "id = ?", "missing").Error; err != nil || sub.Status != models.FollowStatusActive {
+		t.Fatalf("airing completion must not change follow lifecycle: %+v %v", sub, err)
+	}
+	clock.now = clock.now.AddDate(0, 0, 40)
+	if err := s.EnqueueDue(ctx, 50); err != nil {
+		t.Fatal(err)
+	}
+	if next, err := s.queue.Claim([]string{JobTypeSubscriptionCalendar}); err != nil || next != nil {
+		t.Fatalf("finished airing was queued again: %+v %v", next, err)
+	}
+	s.loadSeries = func(context.Context, int64) (tmdb.Snapshot, error) {
+		return tmdb.Snapshot{}, errors.New("optional proof temporarily unavailable")
+	}
+	refresh("missing", true)
+	clock.now = clock.now.Add(2 * time.Minute)
+	nextDate = clock.now.AddDate(0, 0, 3).Format(time.DateOnly)
+	refresh("missing", false) // New future evidence invalidates the archived snapshot.
 }
