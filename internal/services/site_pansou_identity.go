@@ -7,12 +7,47 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"sort"
+	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/metadata/tmdb"
 	sitepkg "github.com/yuanjing-hash/OhMyCine-Server/pkg/site"
+	"golang.org/x/text/unicode/norm"
 )
+
+const panSouQueryVariant = "pansou_query_variant"
+
+// Some PanSou posts omit both the subtitle and an internal 又 in the title.
+// Reserve one query for that compact form without promoting it to a TMDB name.
+func panSouIdentityQueries(names []tmdb.SearchName) []tmdb.SearchName {
+	if len(names) == 0 || names[0].Kind != "localized" || names[0].Locale != "zh-CN" {
+		return names
+	}
+	prefix, subtitle, hasSubtitle := strings.Cut(norm.NFKC.String(names[0].Value), ":")
+	prefix = strings.TrimSpace(prefix)
+	if !hasSubtitle || strings.TrimSpace(subtitle) == "" || strings.ContainsFunc(prefix, func(r rune) bool { return !unicode.Is(unicode.Han, r) }) {
+		return names
+	}
+	left, right, hasConjunction := strings.Cut(prefix, "又")
+	if !hasConjunction || strings.Contains(right, "又") || utf8.RuneCountInString(left) < 2 || utf8.RuneCountInString(right) < 2 {
+		return names
+	}
+	variant := left + right
+	for _, name := range names {
+		if identitySearchKey(name.Value) == variant {
+			return names
+		}
+	}
+	kept := min(len(names), tmdb.DefaultIdentitySearchNameLimit-1)
+	insertion := min(2, kept)
+	queries := make([]tmdb.SearchName, 0, kept+1)
+	queries = append(queries, names[:insertion]...)
+	queries = append(queries, tmdb.SearchName{Value: variant, Locale: "zh-CN", Kind: panSouQueryVariant})
+	return append(queries, names[insertion:kept]...)
+}
 
 type identitySearchSnapshot struct {
 	key     string
@@ -58,17 +93,19 @@ func (s *SiteService) searchPanSouIdentitySite(ctx context.Context, actor Actor,
 		failure.ErrorCode = ErrorCode(policyErr)
 		return failure
 	}
+	queries := panSouIdentityQueries(names)
 	raw, _ := json.Marshal(struct {
 		Actor          string
 		Site           uint
 		Revision       uint64
 		Input          MediaIdentitySearchInput
 		Names          []tmdb.SearchName
+		Queries        []tmdb.SearchName
 		Policy         string
 		Types          []string
 		ReceivingScope string
 		ResultPolicy   string
-	}{discoveryAuthorizationScope(actor), record.ID, record.Revision, keyInput, names, policy.TypePolicy, policy.CloudTypes, policy.ScopeKey, input.resultPolicy})
+	}{discoveryAuthorizationScope(actor), record.ID, record.Revision, keyInput, names, queries, policy.TypePolicy, policy.CloudTypes, policy.ScopeKey, input.resultPolicy})
 	sum := sha256.Sum256(raw)
 	key := hex.EncodeToString(sum[:])
 	s.vaultMu.Lock()
@@ -107,7 +144,7 @@ func (s *SiteService) searchPanSouIdentitySite(ctx context.Context, actor Actor,
 		partInput.Page = page
 		partInput.SnapshotID = ""
 		partInput.Refresh = input.Refresh && page == 1
-		part := s.searchMediaIdentitySitePage(ctx, actor, partInput, verified, names, record)
+		part := s.searchMediaIdentitySitePage(ctx, actor, partInput, verified, names, queries, record)
 		if all == nil {
 			copy := part
 			copy.Items = []SiteSearchResult{}

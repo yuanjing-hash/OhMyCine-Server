@@ -112,13 +112,13 @@ function rememberShareValidation(token: string, validation: ShareValidation) {
 function shareValidation(item: TorrentSearchResult) { return shareValidations.value[item.token] ?? item.share_validation }
 const shareSelection = ref<ShareSelection | null>(null)
 const contentSelection = ref<{ resultToken: string; selection: ResourceContentSelection } | null>(null)
-const modernSelectionRequired = computed(() => !!downloadDialog.value?.content_inspection && !contentSelection.value && !shareSelection.value && (!!upgradeID.value || isCloudShareSource(downloadDialog.value?.source_kind)))
 const downloadForm = ref({ downloaderID: '', mediaLibraryID: 0, priority: 0 })
 const downloadSiteID = ref<number | undefined>()
 const routePreview = ref<DownloadRoutePreview | null>(null)
 const routePreviewLoading = ref(false)
 let routePreviewRequest: AbortController | null = null
 const routeRecommendation = ref<DownloadRouteRecommendation | null>(null)
+const cloudShareDownload = computed(() => isCloudShareSource(routeRecommendation.value?.source_kind ?? downloadDialog.value?.source_kind))
 const routeChoices = ref<DownloadRouteChoice[]>([])
 const routeRecommendationLoading = ref(false)
 let routeRecommendationRequest: AbortController | null = null
@@ -141,6 +141,7 @@ let previewOpenGeneration = 0
 let downloadOpenGeneration = 0
 const downloadOptionRequests = new Set<AbortController>()
 let mediaSearchRequest: AbortController | null = null
+let submittedMediaSearch: { query: string; filter: DiscoveryMediaSearchFilter } | null = null
 
 const enabledDownloaders = computed(() => {
   const compatible = new Set(routeChoices.value.filter(choice => choice.media_library_id === downloadForm.value.mediaLibraryID && choice.enabled).map(choice => choice.downloader_id))
@@ -160,6 +161,10 @@ const targetChoices = computed(() => {
   return [...byLibrary.values()].filter(choice => !upgradeID.value || choice.media_library_id === upgradeContext.value?.library_id)
 })
 const selectedRoute = computed(() => routeTargetByID(routePreview.value, downloadForm.value.mediaLibraryID))
+const selectionRequired = computed(() => !contentSelection.value && !shareSelection.value && (
+  (upgradeID.value && downloadDialog.value?.content_inspection) ||
+  (routeRecommendation.value?.source_kind === 'quark_share' && selectedRoute.value?.execution_location === 'node')
+))
 const selectedChoice = computed(() => routeChoices.value.find(choice => choice.media_library_id === downloadForm.value.mediaLibraryID && choice.downloader_id === downloadForm.value.downloaderID))
 const routeFailure = computed(() => {
   if (!routeRecommendation.value || selectedRoute.value?.enabled) return ''
@@ -259,20 +264,25 @@ function activityLabel(siteID: number, phase: string) {
 async function searchMedia(page = 1) {
   const query = mediaQuery.value.trim()
   if (!query) { notify('请输入电影或剧集名称', 'warning'); return }
+  const filter = mediaFilter.value
   mediaSearchRequest?.abort()
   const controller = new AbortController()
   mediaSearchRequest = controller
+  submittedMediaSearch = { query, filter }
   mediaSearching.value = true
   mediaError.value = ''
   try {
-    const result = await api<DiscoveryMediaSearch>(buildDiscoveryMediaSearchPath(query, mediaFilter.value, page), { signal: controller.signal })
+    const result = await api<DiscoveryMediaSearch>(buildDiscoveryMediaSearchPath(query, filter, page), { signal: controller.signal })
     mediaResults.value = result.items
     mediaPage.value = result.page
     mediaTotalPages.value = result.total_pages
     mediaSearched.value = true
-    await router.replace({ path: '/discovery/explore', query: { query, media_type: mediaFilter.value === 'all' ? undefined : mediaFilter.value } })
+    await router.replace({ path: '/discovery/explore', query: { query, media_type: filter === 'all' ? undefined : filter } })
   } catch (reason) {
-    if (!controller.signal.aborted) mediaError.value = message(reason)
+    if (!controller.signal.aborted) {
+      submittedMediaSearch = null
+      mediaError.value = message(reason)
+    }
   } finally {
     if (mediaSearchRequest === controller) {
       mediaSearchRequest = null
@@ -503,11 +513,15 @@ async function submitDownload() {
   if (shareSelection.value && (shareSelection.value.downloaderID !== downloadForm.value.downloaderID || Date.parse(shareSelection.value.expiresAt) <= Date.now())) { notify('预览已过期或下载器已变化，请重新预览分享', 'warning'); return }
   if (contentSelection.value && contentSelection.value.resultToken !== item.token) { notify('文件选择与当前结果不一致，请重新读取', 'warning'); return }
   if (upgradeID.value && (!upgradeContext.value || !isPreparedMediaUpgrade(upgradeContext.value) || downloadForm.value.mediaLibraryID !== upgradeContext.value.library_id)) { notify('洗版目标已变化，请返回所选版本重新开始', 'warning'); return }
-  if (modernSelectionRequired.value) { notify('请先选择本次需要入库的实际文件', 'warning'); return }
+  if (selectionRequired.value) { notify('请先选择本次需要入库的实际文件', 'warning'); return }
+  const hasSelection = Boolean(contentSelection.value || shareSelection.value)
+  // Whole shares use the existing native receive contract. The explicit `all`
+  // mode is the BT/PT whole-resource contract.
+  const contentMode = item.content_inspection && (hasSelection || !cloudShareDownload.value) ? (hasSelection ? 'files' : 'all') : undefined
   const payload = { content_selection_token: contentSelection.value?.selection.selection_token, preview_token: shareSelection.value?.previewToken, selected_entry_tokens: shareSelection.value ? [...shareSelection.value.entryTokens] : undefined, result_token: item.token, downloader_id: downloadForm.value.downloaderID, priority: downloadForm.value.priority }
   await sendDiscoveryDownload(upgradeID.value && upgradeContext.value
     ? { kind: 'upgrade', path: `${mediaVersionUpgradePath(upgradeContext.value.id)}/submit`, payload: { ...payload, revision: upgradeContext.value.revision } }
-    : { kind: 'download', path: discoveryDownloadsPath, payload: { ...payload, content_mode: item.content_inspection ? contentSelection.value || shareSelection.value ? 'files' : 'all' : undefined, media_library_id: downloadForm.value.mediaLibraryID } })
+    : { kind: 'download', path: discoveryDownloadsPath, payload: { ...payload, content_mode: contentMode, media_library_id: downloadForm.value.mediaLibraryID } })
 }
 
 async function continueOfflineDownload() {
@@ -739,13 +753,16 @@ watch(() => auth.can(Permissions.DownloadsCreate), (allowed, previous) => { if (
 
 watch(() => resourceSearchRouteKey(route.query), () => {
   const resourceMode = route.query.mode === 'resources' || typeof route.query.site_id === 'string'
-  if (!resourceMode && mode.value === 'media' && mediaQuery.value === (typeof route.query.query === 'string' ? route.query.query : '') && mediaFilter.value === (route.query.media_type === 'movie' || route.query.media_type === 'tv' ? route.query.media_type : 'all')) return
+  const query = typeof route.query.query === 'string' ? route.query.query : ''
+  const filter = route.query.media_type === 'movie' || route.query.media_type === 'tv' ? route.query.media_type : 'all'
+  if (!resourceMode && mode.value === 'media' && submittedMediaSearch?.query === query && submittedMediaSearch.filter === filter) return
   clearSearchForActorChange()
   mediaSearchRequest?.abort(); mediaSearchRequest = null; mediaSearching.value = false
+  submittedMediaSearch = null
   mode.value = resourceMode ? 'resources' : 'media'
   if (!resourceMode) {
-    mediaQuery.value = typeof route.query.query === 'string' ? route.query.query : ''
-    mediaFilter.value = route.query.media_type === 'movie' || route.query.media_type === 'tv' ? route.query.media_type : 'all'
+    mediaQuery.value = query
+    mediaFilter.value = filter
     if (mediaQuery.value.trim()) void searchMedia()
     return
   }
@@ -1003,7 +1020,7 @@ onBeforeUnmount(() => {
     <SharePreviewDialog v-if="sharePreviewDialog" :result-token="sharePreviewDialog.token" :title="sharePreviewDialog.title" :source-kind="sharePreviewDialog.source_kind" :downloaders="downloaders" @close="sharePreviewDialog = null" @select="acceptShareSelection" @validation="rememberShareValidation" @analysis="resultRecognition.acceptShareAnalysis" />
     <div v-if="downloadDialog" class="modal-backdrop fixed inset-0 z-50 flex items-center justify-center p-4" @click.self="!submitting && (downloadDialog = null)">
       <form class="panel max-h-[90vh] w-full max-w-xl overflow-y-auto" role="dialog" aria-modal="true" aria-labelledby="pt-download-title" @submit.prevent="submitDownload">
-        <div class="flex items-start justify-between gap-3"><div><h2 id="pt-download-title" class="m-0 text-xl">{{ isCloudShareSource(downloadDialog.source_kind) ? '转存到媒体库' : '创建下载任务' }}</h2><p class="page-description mt-1 line-clamp-2 text-sm">{{ downloadDialog.title }}</p></div><button v-if="!offlineDownload" class="btn-secondary" type="button" :disabled="submitting" @click="downloadDialog = null">关闭</button></div>
+        <div class="flex items-start justify-between gap-3"><div><h2 id="pt-download-title" class="m-0 text-xl">{{ cloudShareDownload ? '转存到媒体库' : '创建下载任务' }}</h2><p class="page-description mt-1 line-clamp-2 text-sm">{{ downloadDialog.title }}</p></div><button v-if="!offlineDownload" class="btn-secondary" type="button" :disabled="submitting" @click="downloadDialog = null">关闭</button></div>
         <p v-if="upgradeContext" class="semantic-warning mt-4 p-3 text-sm">洗版仅替换《{{ upgradeContext.title }}》当前所选版本。新版本完成前保留旧文件，成功后回收旧版本及其独占字幕；目标媒体库已固定。</p>
         <div class="mt-5 grid gap-4 sm:grid-cols-2">
           <div><label class="label">下载器</label><select v-model="downloadForm.downloaderID" class="input" required :disabled="!!shareSelection || routeRecommendationLoading" @change="loadRoutePreview"><option value="" disabled>请选择可执行的下载器</option><option v-for="item in enabledDownloaders" :key="item.id" :value="item.id">{{ item.name }} · {{ item.type === 'pan115_offline' ? '115 网盘' : item.type === 'quark_share' ? '夸克分享转存' : item.type }}</option></select><p class="text-subtle mb-0 mt-2 text-xs">按资源来源和全局下载器顺序推荐；可手动改选兼容的下载器。</p></div>
@@ -1014,10 +1031,11 @@ onBeforeUnmount(() => {
         <div v-if="selectedLibrary && selectedRoute" class="semantic-inset mt-4 grid gap-3 p-4 text-sm sm:grid-cols-2"><div><span class="text-subtle block text-xs">最终媒体库</span><strong>{{ selectedLibrary.name }}</strong></div><div><span class="text-subtle block text-xs">分类与入库</span><strong>{{ selectedRoute.route_label }} · {{ selectedLibrary.profile_name }} · {{ selectedLibrary.transfer_mode }}</strong></div></div>
         <p v-if="shareSelection" class="semantic-inset mt-4 p-3 text-sm">本次仅转存所选 {{ shareSelection.fileCount }} 个文件 · {{ formatBytes(shareSelection.totalSize) }}。更换账号或文件范围请重新预览。</p>
         <p v-if="contentSelection" class="semantic-inset mt-4 p-3 text-sm">本次仅获取所选 {{ contentSelection.selection.file_count }} 个实际文件 · {{ formatBytes(contentSelection.selection.selected_bytes) }}。更换下载器只重新核对执行能力，不扩大文件范围。</p>
-        <div v-else-if="modernSelectionRequired" class="semantic-warning mt-4 p-3 text-sm"><p>{{ upgradeID ? '洗版需要先读取实际文件，并在卡片中选择对应版本。' : '请在卡片中选择实际文件后转存，尚未取得清单时不能提交。' }}</p></div>
-        <p class="text-subtle mt-4 text-xs">{{ isCloudShareSource(downloadDialog.source_kind) ? '分享内容将转存到对应网盘的下载器目录，随后自动识别、整理并入库。' : '确认后获取资源，自动识别、整理并入库。' }}</p>
+        <p v-else-if="selectionRequired" class="semantic-warning mt-4 p-3 text-sm">{{ upgradeID ? '洗版需要先读取实际文件，并在卡片中选择对应版本。' : '当前夸克接收器运行在传输节点上，请返回卡片选择文件，或改用主 Server 的夸克接收器。' }}</p>
+        <p v-else-if="cloudShareDownload && !shareSelection && !upgradeID" class="text-subtle mt-4 text-xs">确认后转存分享内的全部内容，自动识别、整理并入库。</p>
+        <p v-else class="text-subtle mt-4 text-xs">确认后获取资源，自动识别、整理并入库。</p>
         <OfflineFailureConfirmation v-if="offlineDownload" :busy="submitting" @continue="continueOfflineDownload" @choose-other="chooseAnotherResource" />
-        <div v-else class="mt-5 flex justify-end gap-3"><button class="btn-secondary" type="button" :disabled="submitting" @click="downloadDialog = null">取消</button><button class="btn-primary" :disabled="submitting || routeRecommendationLoading || routePreviewLoading || !downloadForm.downloaderID || !selectedRoute?.enabled || !selectedLibrary || modernSelectionRequired">{{ submitting ? '正在提交…' : isCloudShareSource(downloadDialog.source_kind) ? '确认转存' : '确认并入队' }}</button></div>
+        <div v-else class="mt-5 flex justify-end gap-3"><button class="btn-secondary" type="button" :disabled="submitting" @click="downloadDialog = null">取消</button><button class="btn-primary" :disabled="submitting || routeRecommendationLoading || routePreviewLoading || !downloadForm.downloaderID || !selectedRoute?.enabled || !selectedLibrary || selectionRequired">{{ submitting ? '正在提交…' : cloudShareDownload ? '确认转存' : '确认并入队' }}</button></div>
       </form>
     </div>
   </section>

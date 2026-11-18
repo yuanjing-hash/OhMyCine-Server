@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"testing"
 	"time"
 
@@ -17,20 +18,31 @@ import (
 )
 
 func TestPanSouIdentitySnapshotFreezesAliasesAndPages(t *testing.T) {
+	const fullTitle = "孤单又灿烂的神：鬼怪"
+	const officialAlias = "鬼怪"
+	const shortQuery = "孤单灿烂的神"
 	metadataServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/movie/346" {
+		if r.URL.Path != "/tv/346" {
 			http.NotFound(w, r)
 			return
 		}
-		fmt.Fprint(w, `{"id":346,"title":"七武士","original_title":"Seven Samurai","original_language":"ja","release_date":"1954-04-26","alternative_titles":{"titles":[{"iso_3166_1":"US","title":"Seven Samurai"}]},"translations":{"translations":[]}}`)
+		fmt.Fprintf(w, `{"id":346,"name":%q,"original_name":"Goblin","original_language":"ko","first_air_date":"2016-12-02","alternative_titles":{"results":[{"iso_3166_1":"CN","title":%q},{"iso_3166_1":"TW","title":"孤單又燦爛的神"},{"iso_3166_1":"TW","title":"燦爛的鬼怪"},{"iso_3166_1":"HK","title":"孤單的神"},{"iso_3166_1":"HK","title":"孤單鬼怪"}]},"translations":{"translations":[]}}`, fullTitle, officialAlias)
 	}))
 	defer metadataServer.Close()
-	searches := 0
+	var searchKeywords []string
 	panSou := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		searches++
+		var request struct {
+			Keyword string `json:"kw"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&request)
+		searchKeywords = append(searchKeywords, request.Keyword)
 		items := []any{}
-		for i := 0; i < 61; i++ {
-			items = append(items, map[string]any{"unique_id": fmt.Sprintf("fixture-%d", i), "title": fmt.Sprintf("Seven.Samurai.1954.1080p.%03d", i), "links": []any{map[string]string{"type": "magnet", "url": fmt.Sprintf("magnet:?xt=urn:btih:%040x", i+1)}}})
+		if request.Keyword == shortQuery {
+			items = append(items, map[string]any{"unique_id": "only-short-query", "title": shortQuery, "datetime": "2026-10-30T00:00:00Z", "links": []any{map[string]string{"type": "115", "url": "https://115.com/s/fixture?password=abcd"}}})
+		} else {
+			for i := 0; i < 61; i++ {
+				items = append(items, map[string]any{"unique_id": fmt.Sprintf("fixture-%d", i), "title": fmt.Sprintf("%s.S01.1080p.%03d", officialAlias, i), "links": []any{map[string]string{"type": "magnet", "url": fmt.Sprintf("magnet:?xt=urn:btih:%040x", i+1)}}})
+			}
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{"code": 0, "data": map[string]any{"total": len(items), "results": items}})
 	}))
@@ -38,7 +50,7 @@ func TestPanSouIdentitySnapshotFreezesAliasesAndPages(t *testing.T) {
 	s, _, actor, store, _, _ := siteFixture(t)
 	now := time.Now().UTC()
 	s.now = func() time.Time { return now }
-	receiver, _, _ := seedPanSouReceiver(t, s, models.ConnectionProviderQuark)
+	receiver, _, _ := seedPanSouReceiver(t, s, models.ConnectionProviderPan115)
 	metadata := NewMetadataSettingsService(s.db, s.audit, store, tmdb.Credential{Kind: tmdb.CredentialKindReadAccessToken, Value: "fixture"})
 	metadata.clientFactory = func(tmdb.Credential, string, string) (*tmdb.Client, error) {
 		return tmdb.NewForTest("fixture", metadataServer.URL, metadataServer.Client())
@@ -49,8 +61,8 @@ func TestPanSouIdentitySnapshotFreezesAliasesAndPages(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	searches = 0
-	input := MediaIdentitySearchInput{MediaType: "movie", TMDBID: 346, Page: 1, SiteID: &created.ID, ClientCapabilities: []string{MixedDiscoveryCapability}, TypePolicy: "all", ProgressVersion: 2}
+	searchKeywords = nil
+	input := MediaIdentitySearchInput{MediaType: "tv", TMDBID: 346, Page: 1, SiteID: &created.ID, ClientCapabilities: []string{MixedDiscoveryCapability}, TypePolicy: "all", ProgressVersion: 2}
 	first := MediaIdentitySearchResult{}
 	progressEvents := 0
 	err = s.SearchMediaIdentityEachProgress(context.Background(), actor, input, func(metadata MediaIdentitySearchResult) {
@@ -74,9 +86,19 @@ func TestPanSouIdentitySnapshotFreezesAliasesAndPages(t *testing.T) {
 	if progressEvents == 0 {
 		t.Fatal("frozen PanSou search omitted detailed progress")
 	}
-	requests := searches
-	if requests != len(first.QueryNames) {
-		t.Fatalf("search requests=%d aliases=%d", requests, len(first.QueryNames))
+	share := first.Groups[0].Items[0]
+	if share.SourceKind != "115_share" || share.Title != shortQuery || share.MatchedName != "" {
+		t.Fatalf("short-query share missing from the first page or presented as verified: source=%s title=%q", share.SourceKind, share.Title)
+	}
+	claim, err := s.resolveAvailableClaim(share.Token, actor.User.ID)
+	if err != nil || claim.SearchIdentity == nil || claim.SearchIdentity.TMDBID != 346 || claim.ManualTMDBID != nil ||
+		!slices.Equal(claim.SearchIdentity.Names, first.QueryNames) || slices.ContainsFunc(first.QueryNames, func(name tmdb.SearchName) bool { return name.Value == shortQuery }) {
+		t.Fatal("short query changed the trusted identity names or bypassed share inspection", err)
+	}
+	requests := len(searchKeywords)
+	if requests != tmdb.DefaultIdentitySearchNameLimit || first.Groups[0].QueriesTotal != requests || first.Groups[0].QueriesCompleted != requests ||
+		!slices.Equal(searchKeywords[:3], []string{fullTitle, officialAlias, shortQuery}) {
+		t.Fatalf("query count or order changed: %v", searchKeywords)
 	}
 	// All subsequent pages are local projections. Even an exhausted shared
 	// upstream allowance must not turn them into a timeout or a new search.
@@ -91,13 +113,13 @@ func TestPanSouIdentitySnapshotFreezesAliasesAndPages(t *testing.T) {
 	input.Page = 2
 	input.SnapshotID = first.Groups[0].SnapshotID
 	second, err := s.SearchMediaIdentity(context.Background(), actor, input)
-	if err != nil || len(second.Groups) != 1 || len(second.Groups[0].Items) != 11 || second.Groups[0].HasNext || second.Groups[0].QueryAttempted || searches != requests {
-		t.Fatalf("second=%+v searches=%d err=%v", second, searches, err)
+	if err != nil || len(second.Groups) != 1 || len(second.Groups[0].Items) != 12 || second.Groups[0].HasNext || second.Groups[0].QueryAttempted || len(searchKeywords) != requests {
+		t.Fatalf("second=%+v searches=%d err=%v", second, len(searchKeywords), err)
 	}
 	input.Page = 1
 	back, err := s.SearchMediaIdentity(context.Background(), actor, input)
-	if err != nil || len(back.Groups) != 1 || back.Groups[0].SnapshotID != first.Groups[0].SnapshotID || searches != requests {
-		t.Fatal("return to first identity page refreshed upstream", err, searches)
+	if err != nil || len(back.Groups) != 1 || back.Groups[0].SnapshotID != first.Groups[0].SnapshotID || len(searchKeywords) != requests {
+		t.Fatal("return to first identity page refreshed upstream", err, len(searchKeywords))
 	}
 	input.Page = 2
 	seen := map[string]bool{}
@@ -116,7 +138,7 @@ func TestPanSouIdentitySnapshotFreezesAliasesAndPages(t *testing.T) {
 	input.TypePolicy = "manual"
 	input.CloudTypes = []string{"magnet"}
 	changed, err := s.SearchMediaIdentity(context.Background(), actor, input)
-	if err != nil || len(changed.Groups) != 1 || changed.Groups[0].ErrorCode != CodeSiteResultExpired || searches != requests {
+	if err != nil || len(changed.Groups) != 1 || changed.Groups[0].ErrorCode != CodeSiteResultExpired || len(searchKeywords) != requests {
 		t.Fatalf("scope drift accepted: %+v err=%v", changed, err)
 	}
 	input.TypePolicy, input.CloudTypes = "all", nil
@@ -124,7 +146,7 @@ func TestPanSouIdentitySnapshotFreezesAliasesAndPages(t *testing.T) {
 		t.Fatal(err)
 	}
 	changed, err = s.SearchMediaIdentity(context.Background(), actor, input)
-	if err != nil || len(changed.Groups) != 1 || changed.Groups[0].ErrorCode != CodeSiteResultExpired || searches != requests {
+	if err != nil || len(changed.Groups) != 1 || changed.Groups[0].ErrorCode != CodeSiteResultExpired || len(searchKeywords) != requests {
 		t.Fatalf("receiver change reused identity snapshot: %+v err=%v", changed, err)
 	}
 }

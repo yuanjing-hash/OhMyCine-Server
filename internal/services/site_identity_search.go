@@ -140,10 +140,10 @@ func (s *SiteService) searchMediaIdentitySite(ctx context.Context, actor Actor, 
 	if record.Kind == pansou.Kind {
 		return s.searchPanSouIdentitySite(ctx, actor, input, verified, names, record)
 	}
-	return s.searchMediaIdentitySitePage(ctx, actor, input, verified, names, record)
+	return s.searchMediaIdentitySitePage(ctx, actor, input, verified, names, names, record)
 }
 
-func (s *SiteService) searchMediaIdentitySitePage(ctx context.Context, actor Actor, input MediaIdentitySearchInput, verified tmdb.Match, names []tmdb.SearchName, record models.Site) SiteSearchGroup {
+func (s *SiteService) searchMediaIdentitySitePage(ctx context.Context, actor Actor, input MediaIdentitySearchInput, verified tmdb.Match, names, queries []tmdb.SearchName, record models.Site) SiteSearchGroup {
 	var target *SiteSearchGroup
 	privateKeys := make(map[string]int)
 	ctx = serverlog.WithBusinessFields(ctx, map[string]any{"site_id": record.ID, "site_name": record.Name, "user_id": actor.User.ID})
@@ -151,13 +151,13 @@ func (s *SiteService) searchMediaIdentitySitePage(ctx context.Context, actor Act
 		ctx = serverlog.WithBusinessFields(ctx, map[string]any{"season": *input.Season})
 	}
 	if err := s.prepareSiteSearch(ctx, record); err != nil {
-		return searchPreparationFailure(record, input.Page, len(names), err)
+		return searchPreparationFailure(record, input.Page, len(queries), err)
 	}
-	for queryIndex, name := range names {
+	for queryIndex, name := range queries {
 		if ctx.Err() != nil {
 			break
 		}
-		reportSearchQuery(ctx, queryIndex+1, len(names), name.Value)
+		reportSearchQuery(ctx, queryIndex+1, len(queries), name.Value)
 		group := s.searchSite(ctx, actor, record, SiteSearchInput{ClientCapabilities: input.ClientCapabilities, TypePolicy: input.TypePolicy, CloudTypes: input.CloudTypes, Refresh: input.Refresh, ProgressVersion: input.ProgressVersion, Keyword: name.Value, MediaType: input.MediaType, SearchBy: "title", Year: identitySearchYear(input.MediaType, verified.ReleaseYear), TMDBID: &input.TMDBID, Page: input.Page, SiteID: &record.ID})
 		aliasCtx := serverlog.WithBusinessFields(ctx, map[string]any{"query_name": name.Value})
 		rejections := newFollowRejections()
@@ -167,7 +167,7 @@ func (s *SiteService) searchMediaIdentitySitePage(ctx context.Context, actor Act
 			copy.Items = []SiteSearchResult{}
 			copy.Skipped = 0
 			copy.HasNext = false
-			copy.QueriesTotal = len(names)
+			copy.QueriesTotal = len(queries)
 			target = &copy
 		}
 		target.HasNext = target.HasNext || group.HasNext
@@ -250,7 +250,9 @@ func (s *SiteService) searchMediaIdentitySitePage(ctx context.Context, actor Act
 				rejections.add("identity_bind_failed", item.Title)
 				continue
 			}
-			item.MatchedName = name.Value
+			if name.Kind != panSouQueryVariant {
+				item.MatchedName = name.Value
+			}
 			item.ResourceFingerprint = privateResultFingerprint(group.SiteID, identity)
 			if duplicate {
 				// A later alias can carry a better eligible observation of the same
