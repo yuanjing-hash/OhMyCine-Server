@@ -217,6 +217,9 @@ type DownloadSourceInput struct {
 }
 
 type SubmitDownloadInput struct {
+	// Only a successful read made by this request may be reused by selected
+	// share children. Public handlers never deserialize inspection evidence.
+	shareValidation             *siteShareValidationEntry
 	offlineIntakeDigest         string
 	OfflineFailureOverrideToken string
 	// Internal replacement acquisition: never recycle a conflicting old version.
@@ -585,6 +588,19 @@ func (s *DownloadService) submit(ctx context.Context, ownerID uint, input Submit
 			return DownloadTaskSummary{}, appError(CodeMediaLibraryProfileUnavailable, "媒体分类规则不存在", err)
 		}
 	}
+	shareValidation := input.shareValidation
+	if isCloudShareSource(source.Kind) {
+		if shareValidation == nil {
+			var err error
+			shareValidation, err = s.validateShareSubmission(ctx, ownerID, downloaderRecord.ID, source.Kind, source.URL)
+			if err != nil {
+				return DownloadTaskSummary{}, err
+			}
+		}
+		if err := shareValidation.guard(s.db.WithContext(ctx), ownerID, downloaderRecord.ID, source.URL); err != nil {
+			return DownloadTaskSummary{}, err
+		}
+	}
 	rules, err := classification.DecodeStrict([]byte(profile.RulesJSON))
 	if err != nil {
 		return DownloadTaskSummary{}, appError(CodeProfileValidation, "媒体分类规则无效", err)
@@ -753,6 +769,11 @@ func (s *DownloadService) submit(ctx context.Context, ownerID uint, input Submit
 		}
 		if !current.CanResource(authz.PermissionDownloadsCreate, models.AuthorizationResourceDownloader, downloaderRecord.ID) || (input.MediaLibraryID != nil && !current.CanIngestLibrary(uintID(*input.MediaLibraryID))) || (input.SourceSiteID != 0 && !current.CanResource(authz.PermissionDiscoveryRead, models.AuthorizationResourceSite, uintID(input.SourceSiteID))) {
 			return appError(CodePermissionDenied, "当前权限不允许创建这个下载或入库任务", nil)
+		}
+		if isCloudShareSource(source.Kind) {
+			if err := shareValidation.guard(tx, ownerID, downloaderRecord.ID, source.URL); err != nil {
+				return err
+			}
 		}
 		if input.BeforePersist != nil {
 			if err := input.BeforePersist(tx); err != nil {

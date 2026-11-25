@@ -256,7 +256,7 @@ func sharePreviewProviderError(err error) error {
 	message := "暂时无法读取网盘分享，请稍后重试"
 	switch code {
 	case cloud.CodeShareExpired:
-		message = "分享已失效或已被取消"
+		message = "分享已过期、失效或被取消，请更换有效分享后重新入库"
 	case cloud.CodeSharePassword:
 		message = "分享提取码有误，请核对原帖后重新搜索"
 	case cloud.CodeAuthExpired, cloud.CodeCookieInvalid:
@@ -426,6 +426,16 @@ func selectedSharePackages(selection cloud.ShareSelection) []cloud.ShareSelectio
 	return groups
 }
 func (s *SiteService) submitShareSelection(ctx context.Context, actor Actor, previewToken string, input SubmitDownloadInput, request RequestContext) (DownloadTaskSummary, error) {
+	if input.shareValidation == nil {
+		var err error
+		input.shareValidation, err = s.downloads.validateShareSubmission(ctx, actor.User.ID, input.DownloaderID, input.Source.Kind, input.Source.URL)
+		if err != nil {
+			return DownloadTaskSummary{}, err
+		}
+	}
+	if err := input.shareValidation.guard(s.db.WithContext(ctx), actor.User.ID, input.DownloaderID, input.Source.URL); err != nil {
+		return DownloadTaskSummary{}, err
+	}
 	packages := selectedSharePackages(*input.Source.ShareSelection)
 	// A follow claim covers precisely these episode files in one resumable
 	// package. Splitting it would attach every episode to only the first child.

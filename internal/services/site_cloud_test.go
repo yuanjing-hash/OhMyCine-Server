@@ -485,8 +485,9 @@ func TestCloudSharePreviewSelectionAuthorizationAndPersistence(t *testing.T) {
 
 type validationFixtureDriver struct {
 	*previewFixtureDriver
-	failure error
-	reads   int
+	failure   error
+	reads     int
+	afterRead func()
 }
 
 func (d *validationFixtureDriver) InspectShare(ctx context.Context, raw string) (cloud.ShareSnapshot, error) {
@@ -494,6 +495,9 @@ func (d *validationFixtureDriver) InspectShare(ctx context.Context, raw string) 
 }
 func (d *validationFixtureDriver) InspectShareDirectory(ctx context.Context, raw, id string) (cloud.ShareSnapshot, error) {
 	d.reads++
+	if d.afterRead != nil {
+		d.afterRead()
+	}
 	if d.failure != nil {
 		return cloud.ShareSnapshot{}, d.failure
 	}
@@ -554,6 +558,49 @@ func TestCloudShareValidationIsolationExpiryAndFailedPreflight(t *testing.T) {
 	}
 	if preview.ShareValidation.ExpiresAt.Sub(preview.ShareValidation.CheckedAt) != 5*time.Minute {
 		t.Fatal("wrong success ttl")
+	}
+	// A preview may become stale before the user confirms selected files.
+	// Reject before reserving the fanout or accepting even its first child.
+	library := f.createLibrary(t, "selection-validation", "library", "intake", "/中转")
+	if err := f.db.Model(&models.MediaLibrary{}).Where("id = ?", library.ID).Update("enabled", true).Error; err != nil {
+		t.Fatal(err)
+	}
+	selectedTokens := []string{}
+	for _, entry := range preview.Entries {
+		if !entry.IsDir {
+			selectedTokens = append(selectedTokens, entry.Token)
+		}
+	}
+	var beforeSubmit bool
+	selectedInput := SiteDownloadInput{ResultToken: token, DownloaderID: f.downloader.ID, MediaLibraryID: &library.ID, PreviewToken: preview.Token, SelectedEntryTokens: selectedTokens, BeforeSubmit: func() error { beforeSubmit = true; return nil }}
+	var beforeJobs, beforeAdmissions int64
+	if err := f.db.Model(&models.Job{}).Count(&beforeJobs).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := f.db.Model(&models.DownloadAdmission{}).Count(&beforeAdmissions).Error; err != nil {
+		t.Fatal(err)
+	}
+	driver.failure = cloud.Error(cloud.CodeShareExpired, false, nil)
+	before = driver.reads
+	if _, err := service.Download(context.Background(), f.actor, selectedInput, RequestContext{}); ErrorCode(err) != cloud.CodeShareExpired {
+		t.Fatalf("expired selected share was accepted: %v", err)
+	}
+	if beforeSubmit || driver.reads != before+1 || service.sharePreviews[preview.Token].SubmissionDigest != "" {
+		t.Fatal("expired selected share reached fanout or reused cached validity")
+	}
+	for _, item := range []struct {
+		model any
+		want  int64
+	}{{&models.DownloadTask{}, 0}, {&models.Job{}, beforeJobs}, {&models.DownloadAdmission{}, beforeAdmissions}} {
+		if err := f.db.Model(item.model).Count(&count).Error; err != nil || count != item.want {
+			t.Fatalf("expired selected share created durable work: count=%d want=%d error=%v", count, item.want, err)
+		}
+	}
+	driver.failure = nil
+	before = driver.reads
+	accepted, err := service.Download(context.Background(), f.actor, selectedInput, RequestContext{})
+	if err != nil || len(accepted.SelectionTasks) != 2 || accepted.SelectionPending != 0 || !beforeSubmit || driver.reads != before+1 {
+		t.Fatalf("selected fanout repeated root read or failed: reads=%d want=%d result=%+v error=%v", driver.reads, before+1, accepted, err)
 	}
 	another := f.actor
 	another.User.ID++

@@ -3,11 +3,13 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { flushPromises, mount, type VueWrapper } from '@vue/test-utils'
 import DownloadsView from '@/views/DownloadsView.vue'
 import { api } from '@/api/client'
+import { notify } from '@/toast'
 import { nodeSupportsDownloader } from '@/downloads'
 import { Permissions } from '@/auth/generated-permissions'
 import type { DownloaderSummary, TransferNodeSummary } from '@/types/api'
 
 vi.mock('@/api/client', async importOriginal => ({ ...await importOriginal<typeof import('@/api/client')>(), api: vi.fn() }))
+vi.mock('@/toast', () => ({ notify: vi.fn() }))
 vi.mock('vue-router', () => ({ RouterLink: { template: '<a><slot /></a>' }, useRoute: () => ({ query: { section: 'downloaders' } }), useRouter: () => ({ replace: vi.fn() }) }))
 const access = vi.hoisted(() => ({ current: null as null | { user: { id: number; permissions: string[] } } }))
 vi.mock('@/stores/auth', async () => {
@@ -142,7 +144,7 @@ it('lets a use-only actor confirm exact warned batch items without replaying acc
         if (++continued === 1) throw new Error('reply lost')
         return new Promise(resolve => { finish = resolve })
       }
-      return { submitted: body.sources.includes('magnet:accepted') ? 1 : 0, failed: body.sources.length - (body.sources.includes('magnet:accepted') ? 1 : 0), results: body.sources.map((source: string, index: number) => source === 'magnet:accepted' ? { index, task: { id: 'accepted' } } : source === 'magnet:warned' ? { index, error_code: 'offline_resource_confirmation_required', offline_failure_warning: { version: 1, reason: 'offline_deadline_exceeded', timeout_minutes: 30, confirmation_token: token } } : { index, error_code: 'invalid_source' }) }
+      return { submitted: body.sources.includes('magnet:accepted') ? 1 : 0, failed: body.sources.length - (body.sources.includes('magnet:accepted') ? 1 : 0), results: body.sources.map((source: string, index: number) => source === 'magnet:accepted' ? { index, task: { id: 'accepted' } } : source === 'magnet:warned' ? { index, error_code: 'offline_resource_confirmation_required', offline_failure_warning: { version: 1, reason: 'offline_deadline_exceeded', timeout_minutes: 30, confirmation_token: token } } : { index, error_code: 'invalid_source', message: '链接无效，请更换链接' }) }
     }
     throw new Error(`management request forbidden ${path}`)
   })
@@ -152,6 +154,7 @@ it('lets a use-only actor confirm exact warned batch items without replaying acc
   await wrapper.get('textarea').setValue('magnet:accepted\nmagnet:warned\nmagnet:invalid')
   await wrapper.get('#download-panel-create').trigger('submit'); await flushPromises()
   expect(wrapper.get('textarea').element).toHaveProperty('value', 'magnet:warned\nmagnet:invalid')
+  expect(notify).toHaveBeenCalledWith('已入队 1 个，1 个资源需要确认；未入队链接已保留。第 3 个链接：链接无效，请更换链接', 'warning')
   await wrapper.get('[aria-label="历史离线超时提示"] .btn-secondary').trigger('click')
   expect(submitted).toHaveLength(1)
   expect(wrapper.find('[aria-label="历史离线超时提示"]').exists()).toBe(false)
@@ -166,4 +169,42 @@ it('lets a use-only actor confirm exact warned batch items without replaying acc
   finish({ submitted: 1, failed: 0, results: [{ index: 0, task: { id: 'same-accepted' } }] }); await flushPromises()
   expect(wrapper.find('[aria-label="历史离线超时提示"]').exists()).toBe(false)
   expect(vi.mocked(api).mock.calls.some(([path]) => path === '/api/v1/downloaders')).toBe(false)
+})
+
+it.each([false, true])('shows authoritative share rejection reasons and preserves only unaccepted input (mixed=%s)', async mixed => {
+  access.current!.user = { id: 2, permissions: [Permissions.DownloadsCreate, Permissions.MediaLibrariesRead] }
+  const expired = 'https://115.com/s/expired'
+  const unavailable = 'https://115.com/s/temporarily-unavailable'
+  const sources = mixed ? ['https://115.com/s/accepted', expired, unavailable] : [expired]
+  const expiryMessage = '115 分享已过期或失效，请更换有效分享链接'
+  const unavailableMessage = '115 分享暂时无法读取，请稍后重试'
+  let finish!: (value: unknown) => void
+  vi.mocked(api).mockImplementation(async (path) => {
+    if (path === '/api/v1/downloaders/options') return { list: [{ id: 'receiver', name: '115 receiver', type: 'pan115_offline', execution_location: 'server', capabilities: { share_receive: true } }] }
+    if (path === '/api/v1/media-libraries') return { list: [{ id: 1, name: 'Allowed library', enabled: true }] }
+    if (path === '/api/v1/download-routes/preview') return { options: [{ media_library_id: 1, library_name: 'Allowed library', enabled: true }] }
+    if (path === '/api/v1/downloads/batch') return new Promise(resolve => { finish = resolve })
+    throw new Error(`unexpected request ${path}`)
+  })
+  wrapper = mount(DownloadsView, { global: { stubs: { DirectoryPickerDialog: true, TransferNodesPanel: true, SecretInput: true, ClearHistoryButton: true } } })
+  await flushPromises()
+  await wrapper.get('input[type="radio"][value="share"]').setValue(true); await flushPromises()
+  await wrapper.get('input[name="download-route-target"][value="1"]').setValue(true)
+  await wrapper.get('textarea').setValue(sources.join('\n'))
+  await wrapper.get('#download-panel-create').trigger('submit'); await flushPromises()
+  expect(notify).not.toHaveBeenCalled()
+  expect(wrapper.get('textarea').element).toHaveProperty('value', sources.join('\n'))
+  finish({ submitted: mixed ? 1 : 0, failed: mixed ? 2 : 1, results: sources.map((source, index) => source === expired ? { index, error_code: 'pan115_share_expired', message: expiryMessage } : source === unavailable ? { index, error_code: 'pan115_unavailable', message: unavailableMessage } : { index, task: { id: 'accepted' } }) })
+  await flushPromises()
+  expect(wrapper.get('textarea').element).toHaveProperty('value', mixed ? `${expired}\n${unavailable}` : expired)
+  const expected = mixed
+    ? `已入队 1 个，失败 2 个；失败链接已保留。第 2 个链接：${expiryMessage}；第 3 个链接：${unavailableMessage}`
+    : `已入队 0 个，失败 1 个；失败链接已保留。第 1 个链接：${expiryMessage}`
+  expect(notify).toHaveBeenCalledExactlyOnceWith(expected, mixed ? 'warning' : 'error')
+  const mutations = vi.mocked(api).mock.calls.filter(([, options]) => options?.method === 'POST')
+  expect(mutations.filter(([path]) => path !== '/api/v1/download-routes/preview')).toHaveLength(1)
+  const submitted = mutations.find(([path]) => path === '/api/v1/downloads/batch')!
+  expect(JSON.parse(String(submitted[1]?.body))).toMatchObject({ source_kind: '115_share', sources })
+  expect(wrapper.find('[aria-label="历史离线超时提示"]').exists()).toBe(false)
+  expect(wrapper.find('#download-panel-create').exists()).toBe(true)
 })

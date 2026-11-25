@@ -3,6 +3,7 @@ package services
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -23,6 +24,12 @@ type shareIngestDriver struct{ *fakeCloudDriver }
 
 func (d *shareIngestDriver) Capabilities() cloudpkg.Capabilities {
 	return cloudpkg.Capabilities{NetworkDrive: true, DirectoryList: true, NativeOfflineDownload: true, ShareReceive: true, CreateDirectory: true, Move: true, Copy: true, Rename: true, Recycle: true}
+}
+func (d *shareIngestDriver) InspectShare(context.Context, string) (cloudpkg.ShareSnapshot, error) {
+	return cloudpkg.ShareSnapshot{ShareCode: "fixture-share", Items: []cloudpkg.ShareItem{{ID: "fixture-video", Name: "Feature.mkv", Size: 1024}}}, nil
+}
+func (d *shareIngestDriver) ReceiveShare(context.Context, cloudpkg.ShareSnapshot, string) error {
+	return nil
 }
 func (d *shareIngestDriver) CreateDirectory(context.Context, string, string) (cloudpkg.Item, error) {
 	return cloudpkg.Item{}, nil
@@ -242,6 +249,108 @@ func TestShareAndProviderAdoptionUseEncryptedImmutableIntakeSnapshot(t *testing.
 	if strings.Contains(job.PayloadJSON, "manual") || strings.Contains(job.PayloadJSON, "intake") || strings.Contains(job.PayloadJSON, "115.com") {
 		t.Fatalf("private provider facts leaked into job payload: %s", job.PayloadJSON)
 	}
+}
+
+type admissionShareDriver struct{ *validationFixtureDriver }
+
+func (*admissionShareDriver) CreateDirectory(context.Context, string, string) (cloudpkg.Item, error) {
+	panic("share validation must not create a provider workspace")
+}
+
+func TestShareSubmissionRejectsUnreadableSourceBeforeQueue(t *testing.T) {
+	f := newShareIngestFixture(t)
+	driver := &admissionShareDriver{&validationFixtureDriver{previewFixtureDriver: &previewFixtureDriver{f.driver}}}
+	f.downloads.downloader.connections.drivers[*f.storage.ConnectionID] = driver
+	library := f.createLibrary(t, "电影", "library", "intake", "/中转")
+	if err := f.db.Model(&models.MediaLibrary{}).Where("id = ?", library.ID).Update("enabled", true).Error; err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	raw := "https://115.com/s/example?password=abcd"
+	input := SubmitDownloadInput{DownloaderID: f.downloader.ID, MediaLibraryID: &library.ID, Source: DownloadSourceInput{Kind: downloadpkg.SourcePan115Share, URL: raw}}
+	count := func(model any) int64 {
+		t.Helper()
+		var result int64
+		if err := f.db.Model(model).Count(&result).Error; err != nil {
+			t.Fatal(err)
+		}
+		return result
+	}
+	beforeTasks, beforeJobs, beforeAdmissions := count(&models.DownloadTask{}), count(&models.Job{}), count(&models.DownloadAdmission{})
+	assertNoWork := func() {
+		t.Helper()
+		if count(&models.DownloadTask{}) != beforeTasks || count(&models.Job{}) != beforeJobs || count(&models.DownloadAdmission{}) != beforeAdmissions {
+			t.Fatal("failed share validation created task, job or acquisition admission")
+		}
+	}
+	var persisted bool
+	input.BeforePersist = func(*gorm.DB) error { persisted = true; return nil }
+	for _, tc := range []struct {
+		code, status string
+		failure      error
+	}{
+		{cloudpkg.CodeShareExpired, "expired", cloudpkg.Error(cloudpkg.CodeShareExpired, false, errors.New("private provider body password=abcd"))},
+		{cloudpkg.CodeShareInvalid, "unavailable", cloudpkg.Error(cloudpkg.CodeShareInvalid, false, nil)},
+		{cloudpkg.CodeSharePassword, "password_required", cloudpkg.Error(cloudpkg.CodeSharePassword, false, nil)},
+		{cloudpkg.CodeRateLimited, "unavailable", cloudpkg.Error(cloudpkg.CodeRateLimited, true, nil)},
+		{cloudpkg.CodeUnavailable, "unavailable", cloudpkg.Error(cloudpkg.CodeUnavailable, true, context.DeadlineExceeded)},
+		{cloudpkg.CodeResponseInvalid, "unavailable", cloudpkg.Error(cloudpkg.CodeResponseInvalid, false, nil)},
+	} {
+		t.Run(tc.code, func(t *testing.T) {
+			driver.failure = tc.failure
+			for _, selected := range []bool{false, true} {
+				request := input
+				if selected {
+					request.Source.ShareSelection = &cloudpkg.ShareSelection{Version: 1, Files: []cloudpkg.ShareTreeItem{{ID: "private-one", RelativePath: "Movies/Seven.Samurai.1954.mkv", Size: 100}}}
+				}
+				_, err := f.downloads.Submit(ctx, f.actor, request, RequestContext{})
+				var app *AppError
+				if !errors.As(err, &app) || app.Code != tc.code || app.ShareValidation == nil || app.ShareValidation.Status != tc.status || strings.Contains(app.Message, "abcd") || strings.Contains(app.Message, "private provider") {
+					t.Fatalf("selected=%t error=%v", selected, err)
+				}
+				if persisted {
+					t.Fatal("failed inspection reached persistence callback")
+				}
+				assertNoWork()
+			}
+			batch, err := f.downloads.SubmitBatch(ctx, f.actor, SubmitDownloadBatchInput{DownloaderID: f.downloader.ID, MediaLibraryID: &library.ID, SourceKind: downloadpkg.SourcePan115Share, Sources: []string{raw}}, RequestContext{})
+			if err != nil || batch.Submitted != 0 || batch.Failed != 1 || len(batch.Results) != 1 || batch.Results[0].ErrorCode != tc.code || batch.Results[0].Message != ErrorMessage(sharePreviewProviderError(tc.failure)) || batch.Results[0].Task != nil {
+				t.Fatalf("batch=%+v error=%v", batch, err)
+			}
+			assertNoWork()
+		})
+	}
+	beforeReads := driver.reads
+	denied := f.actor
+	denied.ResourceAccessPolicies = map[string]ResourceAccessPolicy{models.ResourceAccessScopeDownloaderUse: {Mode: models.ResourceAccessModeAllowlist}}
+	if _, err := f.downloads.Submit(ctx, denied, input, RequestContext{}); ErrorCode(err) != CodePermissionDenied || driver.reads != beforeReads {
+		t.Fatalf("unauthorized request contacted share provider: %v", err)
+	}
+	assertNoWork()
+	driver.failure = nil
+	for _, selected := range []bool{false, true} {
+		request := input
+		if selected {
+			request.Source.ShareSelection = &cloudpkg.ShareSelection{Version: 1, Files: []cloudpkg.ShareTreeItem{{ID: "private-one", RelativePath: "Movies/Seven.Samurai.1954.mkv", Size: 100}}}
+		}
+		if _, err := f.downloads.Submit(ctx, f.actor, request, RequestContext{}); err != nil {
+			t.Fatalf("valid selected=%t share rejected: %v", selected, err)
+		}
+	}
+	if !persisted || count(&models.DownloadTask{}) != beforeTasks+2 || count(&models.Job{}) != beforeJobs+2 || count(&models.DownloadAdmission{}) != beforeAdmissions {
+		t.Fatal("valid whole or selected share was not queued normally")
+	}
+	beforeTasks, beforeJobs = beforeTasks+2, beforeJobs+2
+	persisted = false
+	driver.afterRead = func() {
+		if err := f.db.Model(&models.Connection{}).Where("id = ?", *f.storage.ConnectionID).Update("revision", gorm.Expr("revision + 1")).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := f.downloads.Submit(ctx, f.actor, input, RequestContext{}); ErrorCode(err) != CodeSiteResultExpired || persisted {
+		t.Fatalf("share evidence survived receiving-account change: %v", err)
+	}
+	assertNoWork()
 }
 
 func TestOrdinaryPan115OfflineDownloadKeepsDownloaderStagingDirectory(t *testing.T) {

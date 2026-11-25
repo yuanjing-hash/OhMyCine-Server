@@ -29,7 +29,8 @@ import (
 
 type selectedIdentityDriver struct {
 	routerCloudDriver
-	mixed bool
+	mixed   bool
+	expired bool
 }
 
 func (d *selectedIdentityDriver) Capabilities() cloud.Capabilities {
@@ -41,6 +42,9 @@ func (d *selectedIdentityDriver) InspectShare(ctx context.Context, raw string) (
 	return d.InspectShareDirectory(ctx, raw, "0")
 }
 func (d *selectedIdentityDriver) InspectShareDirectory(_ context.Context, _ string, parent string) (cloud.ShareSnapshot, error) {
+	if d.expired {
+		return cloud.ShareSnapshot{}, cloud.Error(cloud.CodeShareExpired, false, nil)
+	}
 	items := []cloud.ShareItem{{ID: "target-folder", Name: "Fixture Show", IsDir: true}}
 	if d.mixed && parent == "0" {
 		items = append(items, cloud.ShareItem{ID: "foreign-folder", Name: "Other Work", IsDir: true})
@@ -91,7 +95,7 @@ func TestDiscoveryExpectedIdentityPreservesExactSelectedShare(t *testing.T) {
 	mode := gin.Mode()
 	gin.SetMode(gin.TestMode)
 	t.Cleanup(func() { gin.SetMode(mode) })
-	for _, mode := range []string{"season_context", "mixed_target", "mixed_folder", "mixed_foreign", "mixed_both", "forged_entry", "changed_config"} {
+	for _, mode := range []string{"season_context", "mixed_target", "mixed_folder", "mixed_foreign", "mixed_both", "forged_entry", "changed_config", "expired_share"} {
 		t.Run(mode, func(t *testing.T) {
 			driver := &selectedIdentityDriver{mixed: mode != "season_context"}
 			client := newTestClient(t, driver)
@@ -112,7 +116,7 @@ func TestDiscoveryExpectedIdentityPreservesExactSelectedShare(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			connection, err := client.connections.Create(actor, services.ConnectionInput{Name: "Selected share", Provider: "pan115", Cookie: "UID=fixture_A1; CID=fixture-cid; SEID=fixture-only", Enabled: true}, services.RequestContext{})
+			connection, err := client.connections.Create(actor, services.ConnectionInput{Name: "Selected share", Provider: "pan115", Cookie: "UID=100_A1; CID=fixture-cid; SEID=fixture-only", Enabled: true}, services.RequestContext{})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -176,6 +180,9 @@ func TestDiscoveryExpectedIdentityPreservesExactSelectedShare(t *testing.T) {
 			if mode == "changed_config" {
 				client.db.Model(&receiver).Update("provider_directory_id", "outside-root")
 			}
+			// A successful preview is not submission authority. The released
+			// Player must receive a failed envelope if the share expires next.
+			driver.expired = mode == "expired_share"
 			api := handlers.NewAPI(config.Config{}, nil, nil, audit, nil, nil, nil, zerolog.Nop())
 			api.SetSiteService(sites)
 			router := gin.New()
@@ -193,6 +200,20 @@ func TestDiscoveryExpectedIdentityPreservesExactSelectedShare(t *testing.T) {
 			}
 			if !good && (response.Code < 400 || count != 0) {
 				t.Fatalf("foreign/stale selection accepted: status=%d count=%d", response.Code, count)
+			}
+			if mode == "expired_share" {
+				var envelope struct {
+					Data struct {
+						ErrorCode       string                       `json:"error_code"`
+						ShareValidation services.SiteShareValidation `json:"share_validation"`
+					} `json:"data"`
+				}
+				if err := json.Unmarshal(response.Body.Bytes(), &envelope); err != nil {
+					t.Fatal(err)
+				}
+				if response.Code != http.StatusGone || envelope.Data.ErrorCode != cloud.CodeShareExpired || envelope.Data.ShareValidation.Status != "expired" || strings.Contains(response.Body.String(), "selection_pending") || strings.Contains(response.Body.String(), "selection_tasks") {
+					t.Fatalf("expired share did not reject initial selection: status=%d response=%s", response.Code, response.Body.String())
+				}
 			}
 			if mode == "mixed_foreign" || mode == "mixed_both" {
 				if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), services.CodeSiteResultIdentityMismatch) {

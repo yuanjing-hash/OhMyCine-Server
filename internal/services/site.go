@@ -1933,12 +1933,14 @@ func (s *SiteService) Download(ctx context.Context, actor Actor, input SiteDownl
 	}
 
 	var shareValidation *SiteShareValidation
+	var shareAdmission *siteShareValidationEntry
 	if isCloudShareSource(source.Kind) {
 		_, digest, validation, checkErr := s.inspectResultShare(ctx, actor, claim, source.URL, selectedDownloader.ID, false, request)
 		if checkErr != nil {
 			return DownloadTaskSummary{}, checkErr
 		}
 		shareValidation = &validation
+		shareAdmission = &siteShareValidationEntry{ActorID: actor.User.ID, SourceDigest: shareSourceDigest(source.URL), ConfigDigest: digest, Validation: validation}
 		upstreamGuard := previewGuard
 		previewGuard = func(tx *gorm.DB) error {
 			if upstreamGuard != nil {
@@ -2032,7 +2034,7 @@ func (s *SiteService) Download(ctx context.Context, actor Actor, input SiteDownl
 			return nil
 		}
 	}
-	submitInput := SubmitDownloadInput{offlineIntakeDigest: intakeDigest, OfflineFailureOverrideToken: input.OfflineFailureOverrideToken, SourceSiteID: claimedSite.ID, DownloaderID: input.DownloaderID, MediaLibraryID: input.MediaLibraryID, ProfileID: input.ProfileID, DisplayName: claim.Title, Priority: input.Priority, Source: source, PluginID: pluginID, PluginVersion: pluginVersion, PluginConnectionID: pluginConnectionID, PluginResourceClaimID: resourceClaimID, RecognitionOverride: recognitionOverride, FollowSubscriptionID: input.FollowSubscriptionID, FollowResourceFingerprint: input.FollowResourceFingerprint, ForceRecognitionOverride: input.FollowSubscriptionID != "" || input.ReplacementIdentity != nil, BeforePersist: beforePersist, AfterPersist: input.AfterPersist, PreserveExistingVersions: input.PreserveExistingVersions}
+	submitInput := SubmitDownloadInput{shareValidation: shareAdmission, offlineIntakeDigest: intakeDigest, OfflineFailureOverrideToken: input.OfflineFailureOverrideToken, SourceSiteID: claimedSite.ID, DownloaderID: input.DownloaderID, MediaLibraryID: input.MediaLibraryID, ProfileID: input.ProfileID, DisplayName: claim.Title, Priority: input.Priority, Source: source, PluginID: pluginID, PluginVersion: pluginVersion, PluginConnectionID: pluginConnectionID, PluginResourceClaimID: resourceClaimID, RecognitionOverride: recognitionOverride, FollowSubscriptionID: input.FollowSubscriptionID, FollowResourceFingerprint: input.FollowResourceFingerprint, ForceRecognitionOverride: input.FollowSubscriptionID != "" || input.ReplacementIdentity != nil, BeforePersist: beforePersist, AfterPersist: input.AfterPersist, PreserveExistingVersions: input.PreserveExistingVersions}
 	stage = "enqueue"
 	if source.ShareSelection != nil {
 		previewToken := input.PreviewToken
