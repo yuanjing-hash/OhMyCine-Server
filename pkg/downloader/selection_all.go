@@ -82,3 +82,25 @@ func (c *verifiedAllClient) ReconcileSubmission(ctx context.Context, r SubmitReq
 	}
 	return resolver.ReconcileSubmission(ctx, r)
 }
+
+func (c *verifiedAllClient) AbandonPreparation(ctx context.Context, r SubmitRequest, deleteData bool) (bool, error) {
+	r, err := c.ordinaryRequest(r)
+	if err != nil {
+		return false, err
+	}
+	if controller, ok := c.Client.(PreparationController); ok {
+		return controller.AbandonPreparation(ctx, r, deleteData)
+	}
+	return false, nil
+}
+
+func (c *verifiedAllClient) ReleasePreparation(ctx context.Context, r SubmitRequest) error {
+	r, err := c.ordinaryRequest(r)
+	if err != nil {
+		return err
+	}
+	if releaser, ok := c.Client.(PreparationReleaser); ok {
+		return releaser.ReleasePreparation(ctx, r)
+	}
+	return nil
+}

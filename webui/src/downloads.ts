@@ -192,8 +192,7 @@ export function torrentToBase64(bytes: Uint8Array): string {
 export function summarizeDownloaderTasks(tasks: DownloadTaskSummary[], downloaderID: string): DownloaderTaskStats {
   const own = tasks.filter(task => task.downloader_id === downloaderID)
   const active = own.filter(task => {
-    if (task.acquisition_state === 'cancelled_stop_pending') return true
-    if (isDownloadHistoryTask(task) || ['failed', 'cancelled', 'paused', 'waiting_user_action'].includes(task.job_status)) return false
+    if (task.control_pending || isDownloadHistoryTask(task) || ['failed', 'cancelled', 'paused', 'waiting_user_action'].includes(task.job_status)) return false
     return task.acquisition_state ? ['active', 'observing', 'reconnecting', 'cloud_ready', 'clock_unknown'].includes(task.acquisition_state) : task.job_status === 'running'
   })
   const knownProgress = active.flatMap(task => task.progress === null ? [] : [task.progress])
@@ -217,7 +216,9 @@ export function canCancelDownloadPipeline(task: DownloadTaskSummary): boolean {
 }
 
 export function isDownloadSubmissionPending(task: DownloadTaskSummary): boolean {
-  return task.control_pending === true || ['downloader_submission_unconfirmed', 'downloader_submit_unknown', 'downloader_selection_result_unknown', 'downloader_share_result_unknown'].includes(task.last_error_code)
+  if (task.control_pending) return true
+  if (task.phase === 'cancelled' || ['cancelled', 'completed'].includes(task.job_status)) return false
+  return ['downloader_submission_unconfirmed', 'downloader_submit_unknown', 'downloader_selection_result_unknown', 'downloader_share_result_unknown'].includes(task.last_error_code)
 }
 
 export function formatSampleTime(value: string | null): string {

@@ -165,7 +165,7 @@ func (c *Client) submitShare(ctx context.Context, request downloader.SubmitReque
 		directoryID = c.directoryID
 	}
 	if _, err := c.validateDirectory(ctx, directoryID); err != nil {
-		return downloader.Task{}, err
+		return downloader.Task{}, downloader.WithFailureStage(err, downloader.FailureTargetValidation)
 	}
 	tag := strings.TrimSpace(request.Tag)
 	if !validTaskTag(tag) {
@@ -173,7 +173,7 @@ func (c *Client) submitShare(ctx context.Context, request downloader.SubmitReque
 	}
 	taskRoot, err := c.ensureTaskDirectory(ctx, mutations, directoryID, tag)
 	if err != nil {
-		return downloader.Task{}, err
+		return downloader.Task{}, downloader.WithFailureStage(err, downloader.FailureTaskDirectory)
 	}
 	if request.Source.ShareSelection != nil {
 		browse, ok := c.driver.(cloud.ShareBrowseDriver)
@@ -181,7 +181,7 @@ func (c *Client) submitShare(ctx context.Context, request downloader.SubmitReque
 			return downloader.Task{}, downloader.Error("downloader_share_selection_unsupported", false, nil)
 		}
 		if err := cloud.ReceiveSelectedShare(ctx, browse, request.Source.URL, *request.Source.ShareSelection, taskRoot.ID); err != nil {
-			return downloader.Task{}, mapError(err)
+			return downloader.Task{}, downloader.WithFailureStage(mapError(err), downloader.FailureShareReceive)
 		}
 		return completedDirectoryTask(shareTaskPrefix, taskRoot), nil
 	}
@@ -192,7 +192,7 @@ func (c *Client) submitShare(ctx context.Context, request downloader.SubmitReque
 	if !hasOutput {
 		snapshot, inspectErr := share.InspectShare(ctx, request.Source.URL)
 		if inspectErr != nil {
-			return downloader.Task{}, mapError(inspectErr)
+			return downloader.Task{}, downloader.WithFailureStage(mapError(inspectErr), downloader.FailureShareReceive)
 		}
 		receiveErr := share.ReceiveShare(ctx, snapshot, taskRoot.ID)
 		if receiveErr != nil {
@@ -201,7 +201,7 @@ func (c *Client) submitShare(ctx context.Context, request downloader.SubmitReque
 			if output, checkErr := c.waitForTaskOutput(ctx, taskRoot.ID); checkErr == nil && output {
 				return completedDirectoryTask(shareTaskPrefix, taskRoot), nil
 			}
-			return downloader.Task{}, mapError(receiveErr)
+			return downloader.Task{}, downloader.WithFailureStage(mapError(receiveErr), downloader.FailureShareReceive)
 		}
 		if output, waitErr := c.waitForTaskOutput(ctx, taskRoot.ID); waitErr != nil {
 			return downloader.Task{}, waitErr

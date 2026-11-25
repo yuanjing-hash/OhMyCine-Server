@@ -3,8 +3,8 @@ package cloud
 import "context"
 
 // ResourceOperationStore extends the same private receipt ledger. A released
-// temporary guard retains its receipt; selected exclusive claims are never
-// releasable through this interface.
+// temporary guard retains its receipt. A selected exclusive claim is releasable
+// only after its original plan is retired and no native submit was dispatched.
 type ResourceOperationStore interface {
 	ExclusiveOperationStore
 	ResourceClaim(context.Context, string) (OperationReceipt, error)

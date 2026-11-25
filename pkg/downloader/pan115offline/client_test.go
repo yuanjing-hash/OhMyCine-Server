@@ -353,6 +353,41 @@ func TestShareSubmissionUsesStableTaskDirectoryAndReconcilesRetry(t *testing.T) 
 	}
 }
 
+func TestSharePreparationCancellationDoesNotRequireProviderAndCleanupIsTaskScoped(t *testing.T) {
+	driver := newFakeShareDriver()
+	client, _ := New(downloader.Config{CloudDriver: driver, ProviderStorageRootID: "root", ProviderDirectoryID: "intake"})
+	request := downloader.SubmitRequest{Source: downloader.Source{Kind: downloader.SourcePan115Share, URL: "https://115.com/s/share-code?password=abcd"}, Tag: "omc-failed-share", ProviderDirectoryID: "intake"}
+	controller := client.(downloader.PreparationController)
+	driver.statErr = cloud.Error(cloud.CodeUnavailable, true, nil)
+	if prepared, err := controller.AbandonPreparation(context.Background(), request, false); err != nil || !prepared || driver.recycled != "" || driver.receiveCalls != 0 {
+		t.Fatal("share cancellation depended on cloud health", prepared, err)
+	}
+	driver.statErr = nil
+	workspace, _ := driver.CreateDirectory(context.Background(), "intake", request.Tag)
+	sibling := cloud.Item{ID: "sibling", ParentID: "intake", Name: "omc-sibling", IsDir: true}
+	driver.items[sibling.ID] = sibling
+	driver.children["intake"] = append(driver.children["intake"], sibling)
+	unfrozen := request
+	unfrozen.ProviderDirectoryID = ""
+	if prepared, err := controller.AbandonPreparation(context.Background(), unfrozen, true); err == nil || prepared || driver.recycled != "" {
+		t.Fatal("current downloader default became cleanup authority", prepared, err)
+	}
+	if prepared, err := controller.AbandonPreparation(context.Background(), unfrozen, false); err != nil || !prepared {
+		t.Fatal("record-only share cancellation needed a cleanup parent", prepared, err)
+	}
+	if prepared, err := controller.AbandonPreparation(context.Background(), request, true); err != nil || !prepared || driver.recycled != workspace.ID || driver.receiveCalls != 0 {
+		t.Fatal("cleanup failed or replayed receive", prepared, err)
+	}
+	if _, exists := driver.items[sibling.ID]; !exists {
+		t.Fatal("sibling was changed")
+	}
+	request.Source = downloader.Source{Kind: downloader.SourceURL, URL: "magnet:?xt=urn:btih:" + strings.Repeat("a", 40)}
+	driver.recycled = ""
+	if prepared, err := controller.AbandonPreparation(context.Background(), request, true); err != nil || prepared || driver.recycled != "" {
+		t.Fatal("ordinary native operation treated as share preparation")
+	}
+}
+
 func TestProviderItemAdoptionRevalidatesIdentityAndDestructiveCancel(t *testing.T) {
 	driver := newFakeShareDriver()
 	manual := cloud.Item{ID: "manual", ParentID: "intake", Name: "Seven.Samurai.1954", IsDir: true}

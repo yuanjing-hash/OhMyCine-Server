@@ -130,6 +130,36 @@ func (c *selectionClient) ReconcileSubmission(ctx context.Context, r SubmitReque
 	return resolver.ReconcileSubmission(ctx, r)
 }
 
+func (c *selectionClient) AbandonPreparation(ctx context.Context, r SubmitRequest, deleteData bool) (bool, error) {
+	if r.Source.ContentSelection == nil || r.Tag != c.binding.Tag || c.binding.Group != nil {
+		return false, Error("downloader_selection_invalid", false, nil)
+	}
+	left, err := r.Source.ContentSelection.Digest()
+	right, _ := c.binding.Selection.Digest()
+	if err != nil || left != right {
+		return false, Error("downloader_selection_invalid", false, err)
+	}
+	if controller, ok := c.Client.(PreparationController); ok {
+		return controller.AbandonPreparation(ctx, r, deleteData)
+	}
+	return false, nil
+}
+
+func (c *selectionClient) ReleasePreparation(ctx context.Context, r SubmitRequest) error {
+	if r.Source.ContentSelection == nil || r.Tag != c.binding.Tag || c.binding.Group != nil {
+		return Error("downloader_selection_invalid", false, nil)
+	}
+	left, err := r.Source.ContentSelection.Digest()
+	right, _ := c.binding.Selection.Digest()
+	if err != nil || left != right {
+		return Error("downloader_selection_invalid", false, err)
+	}
+	if releaser, ok := c.Client.(PreparationReleaser); ok {
+		return releaser.ReleasePreparation(ctx, r)
+	}
+	return nil
+}
+
 func (c *selectionClient) Get(ctx context.Context, id string) (Task, error) {
 	return c.selected.GetSelected(ctx, id, c.binding)
 }

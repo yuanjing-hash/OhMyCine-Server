@@ -563,14 +563,13 @@ function deleteDownload(task: DownloadTaskSummary) {
 
 async function confirmDeleteDownload() {
   const task = deletingTask.value
-  if (!task) return
+  if (!task || saving.value) return
   saving.value = true
   try {
-    const pending = isDownloadSubmissionPending(task)
-    const deleteData = !pending && deleteSourceData.value
+    const deleteData = deleteSourceData.value
     await api(`/api/v1/downloads/${task.id}?delete_data=${deleteData}`, { method: 'DELETE', body: '{}' })
     tasks.value = tasks.value.filter(item => item.id !== task.id)
-    notify(pending ? '记录已移除，后续入库已停止。' : deleteData ? '下载器任务、源文件和 OhMyCine 记录已删除' : '下载器任务和 OhMyCine 记录已删除，源文件已保留', 'success')
+    notify(deleteData ? '记录已移除，源文件清理请求已提交。' : '记录已移除，后续入库已停止，源文件保留。', 'success')
     deletingTask.value = null
   } catch (reason) { notify(message(reason), 'error') } finally { saving.value = false; await load(false, true) }
 }
@@ -735,14 +734,14 @@ onBeforeUnmount(() => { intakeRequestSequence++; offlineIntake.value = null; if 
     <DirectoryPickerDialog :open="downloaderPickerOpen" :storage-id="downloaderPickerStorageID" :restrict-to-storage="true" @close="downloaderPickerOpen = false" @select="chooseDownloaderDirectory" />
     <div v-if="deletingTask" class="modal-backdrop fixed inset-0 z-60 flex items-center justify-center p-4" @click.self="!saving && (deletingTask = null)">
       <form class="panel w-full max-w-lg" role="dialog" aria-modal="true" aria-labelledby="download-delete-title" @submit.prevent="confirmDeleteDownload">
-        <h2 id="download-delete-title" class="m-0 text-xl">{{ isDownloadSubmissionPending(deletingTask) ? '移除下载记录' : '删除下载任务' }}</h2>
+        <h2 id="download-delete-title" class="m-0 text-xl">移除下载任务</h2>
         <p class="page-description mt-2">{{ deletingTask.display_name }}</p>
-        <p v-if="isDownloadSubmissionPending(deletingTask)" class="semantic-warning mt-4 p-3 text-sm">移除后停止后续入库，并从任务列表隐藏。原云端任务的核对与收尾继续进行，文件保留。</p><p v-else class="semantic-warning mt-4 p-3 text-sm">默认会从下载器删除任务并保留已下载文件，然后清理 OhMyCine 执行记录。下载器暂时不可用时不会删除本地记录。</p>
-        <label v-if="!isDownloadSubmissionPending(deletingTask)" class="semantic-inset mt-4 flex items-start gap-3 p-3 text-sm">
-          <input v-model="deleteSourceData" class="mt-1" type="checkbox" />
-          <span><strong>完全删除下载任务及源/临时文件</strong><small class="text-subtle mt-1 block">高风险操作。勾选后 Server 会要求下载器同时删除数据；默认不勾选。</small></span>
+        <p class="text-subtle mt-4 text-sm">移除记录并停止后续入库，默认保留源文件。需要停止的原下载器任务会继续收尾，不影响移除记录。</p>
+        <label class="semantic-inset mt-4 flex items-start gap-3 p-3 text-sm">
+          <input v-model="deleteSourceData" class="mt-1" type="checkbox" :disabled="saving" />
+          <span><strong>同时删除本任务的源／临时文件</strong><small class="text-subtle mt-1 block">仅清理原下载任务的源／临时文件。删除文件不可撤销。</small></span>
         </label>
-        <div class="mt-5 flex justify-end gap-3"><button class="btn-secondary" type="button" :disabled="saving" @click="deletingTask = null">取消</button><button class="btn-danger" :disabled="saving">{{ saving ? '正在处理…' : isDownloadSubmissionPending(deletingTask) ? '确认移除记录' : '确认删除' }}</button></div>
+        <div class="mt-5 flex justify-end gap-3"><button class="btn-secondary" type="button" :disabled="saving" @click="deletingTask = null">取消</button><button class="btn-danger" :disabled="saving">{{ saving ? '正在处理…' : deleteSourceData ? '移除并清理源文件' : '确认移除记录' }}</button></div>
       </form>
     </div>
     <div v-if="retargetTask" class="modal-backdrop fixed inset-0 z-60 flex items-center justify-center p-4" @click.self="!saving && (retargetTask = null)"><form class="panel w-full max-w-lg" role="dialog" aria-modal="true" aria-labelledby="download-retarget-title" @submit.prevent="confirmRetarget"><h2 id="download-retarget-title" class="m-0 text-xl">修改入库目标</h2><p class="page-description mt-2">{{ retargetTask.scrape_title || retargetTask.display_name }}</p><p class="semantic-warning mt-4 p-3 text-sm">复用已完成文件，只重建目标媒体库、分类与命名快照后继续入库。已发生任何部分写入时会安全拒绝。</p><label class="mt-4 block"><span class="label">新的目标媒体库</span><select v-model.number="retargetLibraryID" class="input" required><option :value="0" disabled>请选择</option><option v-for="library in mediaLibraries.filter(item => item.enabled && item.id !== retargetTask?.target_library_id)" :key="library.id" :value="library.id">{{ library.name }} · {{ library.storage_name }} · {{ library.transfer_mode }}</option></select></label><div class="mt-5 flex justify-end gap-3"><button class="btn-secondary" type="button" :disabled="saving" @click="retargetTask = null">取消</button><button class="btn-primary" :disabled="saving || !retargetLibraryID">{{ saving ? '正在校验并重排…' : '确认修改并重试入库' }}</button></div></form></div>

@@ -96,10 +96,62 @@ it('accepts cancellation of an unconfirmed submission and removes its history re
   expect(wrapper.findAll('button').some(button => button.text() === '重试下载')).toBe(false)
   await wrapper.findAll('button').find(button => button.text() === '移除记录')!.trigger('click'); await flushPromises()
   const dialog = wrapper.get('[role="dialog"]')
-  expect(dialog.text()).toContain('核对与收尾继续进行，文件保留')
-  expect(dialog.find('input[type="checkbox"]').exists()).toBe(false)
+  expect(dialog.text()).toContain('默认保留源文件')
+  expect((dialog.get('input[type="checkbox"]').element as HTMLInputElement).checked).toBe(false)
   await dialog.trigger('submit'); await flushPromises()
   expect(vi.mocked(api).mock.calls.some(([path, options]) => path === '/api/v1/downloads/pending?delete_data=false' && options?.method === 'DELETE')).toBe(true)
   expect(wrapper.text()).not.toContain('原云端任务')
-  expect(notify).toHaveBeenCalledWith('记录已移除，后续入库已停止。', 'success')
+  expect(notify).toHaveBeenCalledWith('记录已移除，后续入库已停止，源文件保留。', 'success')
+})
+
+it('removes failed preparation records independently and preserves an explicit source-cleanup choice on rejection', async () => {
+  vi.useFakeTimers()
+  let tasks = [
+    { id: 'failed-preparation', job_id: 'failed-preparation-job', owner_id: 7, display_name: '准备失败任务', job_status: 'failed', phase: 'submitting', lifecycle_scope: 'active', acquisition_state: 'active', last_error_code: 'downloader_unavailable', last_error_message: '下载准备失败，自动重试已结束' },
+    { id: 'cancelled-preparation', job_id: 'cancelled-preparation-job', owner_id: 7, display_name: '已取消准备任务', job_status: 'retry_wait', phase: 'cancelled', lifecycle_scope: 'history', control_pending: true, last_error_code: 'downloader_cancellation_pending', last_error_message: '' },
+  ] as DownloadTaskSummary[]
+  let rejectCleanup = true
+  vi.mocked(api).mockImplementation(async (path, options) => {
+    if (path === '/api/v1/downloads?scope=active&limit=200' || path === '/api/v1/downloads?scope=history&limit=200') {
+      const list = tasks.filter(task => path.includes(`scope=${task.lifecycle_scope}`))
+      return { list, total: list.length }
+    }
+    if (path === '/api/v1/seeding-tasks?limit=100') return { list: [], total: 0 }
+    if (path === '/api/v1/downloads/failed-preparation?delete_data=false' && options?.method === 'DELETE') {
+      tasks = tasks.filter(task => task.id !== 'failed-preparation')
+      return { deleted: true }
+    }
+    if (path === '/api/v1/downloads/cancelled-preparation?delete_data=true' && options?.method === 'DELETE') {
+      if (rejectCleanup) throw new Error('源文件暂时无法清理，请重试')
+      tasks = tasks.filter(task => task.id !== 'cancelled-preparation')
+      return { deleted: true }
+    }
+    throw new Error(`unexpected offline request ${path}`)
+  })
+  wrapper = mount(DownloadsView, { global: { stubs: { DirectoryPickerDialog: true, DownloadRouteTargetPicker: true, MediaReorganizationDialog: true, TransferNodesPanel: true, SecretInput: true, ClearHistoryButton: true } } })
+  await flushPromises()
+  await wrapper.findAll('button').find(button => button.text().startsWith('进行中'))!.trigger('click'); await flushPromises()
+  const failedRow = wrapper.findAll('tr').find(row => row.text().includes('准备失败任务'))!
+  expect(failedRow.text()).toContain('失败')
+  expect(failedRow.text()).not.toContain('正在获取资源')
+  await failedRow.findAll('button').find(button => button.text() === '删除')!.trigger('click'); await flushPromises()
+  let dialog = wrapper.get('[role="dialog"]')
+  expect((dialog.get('input[type="checkbox"]').element as HTMLInputElement).checked).toBe(false)
+  await dialog.trigger('submit'); await flushPromises()
+  expect(wrapper.text()).not.toContain('准备失败任务')
+
+  await wrapper.findAll('button').find(button => button.text().startsWith('历史记录'))!.trigger('click'); await flushPromises()
+  await wrapper.findAll('button').find(button => button.text() === '移除记录')!.trigger('click'); await flushPromises()
+  dialog = wrapper.get('[role="dialog"]')
+  await dialog.get('input[type="checkbox"]').setValue(true)
+  await dialog.trigger('submit'); await flushPromises()
+  expect(notify).toHaveBeenCalledWith('源文件暂时无法清理，请重试', 'error')
+  expect((wrapper.get('[role="dialog"] input[type="checkbox"]').element as HTMLInputElement).checked).toBe(true)
+  expect(wrapper.text()).toContain('已取消准备任务')
+  expect(vi.mocked(api).mock.calls.some(([path]) => path === '/api/v1/downloads/cancelled-preparation?delete_data=false')).toBe(false)
+  rejectCleanup = false
+  await wrapper.get('[role="dialog"]').trigger('submit'); await flushPromises()
+  expect(wrapper.text()).not.toContain('已取消准备任务')
+  expect(notify).toHaveBeenCalledWith('记录已移除，源文件清理请求已提交。', 'success')
+  expect(vi.mocked(api).mock.calls.filter(([path]) => path === '/api/v1/downloads/cancelled-preparation?delete_data=true')).toHaveLength(2)
 })

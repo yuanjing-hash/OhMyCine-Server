@@ -365,6 +365,7 @@ type downloadJobPayload struct {
 	SourceSiteID          uint   `json:"source_site_id,omitempty"`
 	ResourceAccessVersion int    `json:"resource_access_version,omitempty"`
 	ControlIntent         string `json:"control_intent,omitempty"`
+	ControlDeleteData     bool   `json:"control_delete_data,omitempty"`
 }
 
 type DownloadTaskSummary struct {
@@ -1284,10 +1285,9 @@ func downloadLifecycleScope(item DownloadTaskSummary) string {
 	return DownloadListScopeHistory
 }
 
-// Delete removes a terminal OhMyCine record. The provider task must be removed
-// first; deleteData controls whether its source/temporary files are removed as
-// well. A later database failure leaves the terminal local fact available for
-// an idempotent retry.
+// Delete removes a terminal OhMyCine record. Default record removal retains
+// private control state when the provider is unavailable. deleteData requests
+// cleanup of the original task-owned source/temporary files as well.
 func (s *DownloadService) Delete(ctx context.Context, actor Actor, id string, deleteData bool, request RequestContext) error {
 	var task models.DownloadTask
 	if err := s.db.First(&task, "id = ?", strings.TrimSpace(id)).Error; err != nil {
@@ -1303,11 +1303,18 @@ func (s *DownloadService) Delete(ctx context.Context, actor Actor, id string, de
 	if !actor.Can(authz.PermissionDownloadsManageAll) && !actor.Can(authz.PermissionJobsControlAll) && (task.OwnerID != actor.User.ID || !actor.Can(authz.PermissionJobsControlOwn)) {
 		return appError(CodePermissionDenied, "无权删除该下载任务", nil)
 	}
-	if downloadSubmissionUnconfirmed(task) || task.LastErrorCode == downloadCancellationPending || task.OfflineStopPending {
-		if deleteData {
+	preparationCleanup := false
+	if deleteData && downloadPreparationCandidate(task) {
+		// Eligibility is a read-only check. Actual cleanup runs under the queued
+		// control lease after the original submission has exited, then checks
+		// these same immutable source/receipt facts again.
+		preparationCleanup, _ = s.abandonDownloadPreparation(ctx, task, false)
+	}
+	if preparationCleanup || downloadSubmissionUnconfirmed(task) || downloadPreparationNeedsControl(task) || task.LastErrorCode == downloadCancellationPending || task.OfflineStopPending {
+		if deleteData && !preparationCleanup {
 			return appError("downloader_submission_unconfirmed", "原云端操作尚在核对，可先移除记录并保留文件；确认原操作后才能删除数据", nil)
 		}
-		return s.requestPendingDownloadControl(actor, task.ID, true, request)
+		return s.requestPendingDownloadControl(actor, task.ID, true, request, deleteData)
 	}
 	if task.HistoryClearedAt != nil {
 		return nil
@@ -1327,6 +1334,11 @@ func (s *DownloadService) Delete(ctx context.Context, actor Actor, id string, de
 	}
 	providerCleanup, err := s.removeProviderTask(ctx, task, deleteData)
 	if err != nil {
+		if !deleteData {
+			// Display removal does not require a reachable provider. Keep the
+			// original identity privately for keep-file cancellation instead.
+			return s.requestPendingDownloadControl(actor, task.ID, true, request)
+		}
 		return err
 	}
 	if completedHistory {
@@ -1351,7 +1363,7 @@ func (s *DownloadService) cancelPipeline(ctx context.Context, actor Actor, id st
 	if !actor.Can(authz.PermissionDownloadsManageAll) && !actor.Can(authz.PermissionJobsControlAll) && (task.OwnerID != actor.User.ID || !actor.Can(authz.PermissionJobsControlOwn)) {
 		return appError(CodePermissionDenied, "无权取消该下载流水线", nil)
 	}
-	if downloadSubmissionUnconfirmed(task) || task.LastErrorCode == downloadCancellationPending || task.OfflineStopPending {
+	if downloadSubmissionUnconfirmed(task) || downloadPreparationNeedsControl(task) || task.LastErrorCode == downloadCancellationPending || task.OfflineStopPending {
 		err := s.requestPendingDownloadControl(actor, task.ID, false, request)
 		if errors.Is(err, errDownloadProviderIdentityChanged) {
 			if providerIdentityRetries >= 3 {
@@ -1889,6 +1901,12 @@ func downloadProgressPercent(record models.DownloadTask) *float64 {
 }
 
 func downloadTaskSummary(record models.DownloadTask, jobStatus string) DownloadTaskSummary {
+	// Older queue exhaustion only finalized Job, leaving a submitting task and
+	// an obsolete automatic-retry message. Project that terminal fact too.
+	if jobStatus == models.JobStatusFailed && record.Phase != models.DownloadTaskStatusCancelled && record.Phase != models.DownloadTaskStatusCompleted {
+		record.Phase = models.DownloadTaskStatusFailed
+		record.LastErrorMessage = terminalDownloadFailureMessage(record.LastErrorCode, record.LastErrorMessage)
+	}
 	return DownloadTaskSummary{AcquisitionState: downloadAcquisitionState(record, jobStatus), OfflineStartedAt: record.OfflineStartedAt, OfflineDeadlineAt: record.OfflineDeadlineAt, OfflineReadyAt: record.OfflineReadyAt, OfflineStartProvenance: record.OfflineStartProvenance, ID: record.ID, JobID: record.JobID, OwnerID: record.OwnerID, DownloaderID: record.DownloaderID, DownloaderName: record.DownloaderName, ProviderType: record.ProviderType, DisplayName: record.DisplayName, JobStatus: jobStatus, ProviderStatus: record.ProviderStatus, Phase: record.Phase, ControlPending: record.OfflineStopPending || record.Phase == models.DownloadTaskStatusCancelled && record.LastErrorCode == downloadCancellationPending, Progress: downloadProgressPercent(record), BytesCompleted: record.BytesCompleted, BytesTotal: record.BytesTotal, DownloadSpeed: record.DownloadSpeed, UploadSpeed: record.UploadSpeed, ETASeconds: record.ETASeconds, LastSampledAt: record.LastSampledAt, LastErrorCode: record.LastErrorCode, LastErrorMessage: record.LastErrorMessage, CreatedAt: record.CreatedAt, UpdatedAt: record.UpdatedAt, FinishedAt: record.FinishedAt, ProfileID: record.ProfileID, ProfileRevision: record.ProfileRevision, ScrapeStatus: record.ScrapeStatus, ScrapeTitle: record.ScrapeTitle, ScrapeMediaType: record.ScrapeMediaType, ScrapeCategory: record.ScrapeCategory, ScrapeTMDBID: record.ScrapeTMDBID, ScrapeConfidence: record.ScrapeConfidence, ScrapeSeason: cloneInt(record.ScrapeSeason), ScrapeEpisode: cloneInt(record.ScrapeEpisode), IdentitySource: record.IdentitySource, IdentityStatus: record.IdentityStatus, IdentityLocked: record.IdentityLocked, IdentityRevision: record.IdentityRevision, ManifestFiles: record.ManifestFileCount, TargetLibraryID: record.TargetLibraryID, TargetLibraryName: record.TargetLibraryName, TransferMode: record.TransferMode, ConflictPolicy: record.ConflictPolicy, RouteKind: record.TransferRouteKind, ExecutionLocation: normalizeExecutionLocation(record.ExecutionLocation), NodeID: record.NodeID, NodeName: record.NodeName}
 }
 
@@ -1924,7 +1942,7 @@ func (w *DownloadWorker) Run(ctx context.Context, runtime JobRuntime, job Claime
 		}
 	}()
 	if pending, pendingErr := w.pendingControl(ctx, job); pendingErr != nil {
-		return w.controlPendingResult()
+		return w.controlPendingResult(job.Job.PayloadJSON)
 	} else if pending != nil {
 		return *pending
 	}
@@ -2188,7 +2206,7 @@ func (w *DownloadWorker) Run(ctx context.Context, runtime JobRuntime, job Claime
 				return w.failure(task, expiryErr)
 			}
 			if expired {
-				return w.controlPendingResult()
+				return w.controlPendingResult(job.Job.PayloadJSON)
 			}
 			if task.OfflineStartedAt == nil && !offlineDispatchWaiting(providerTask.Status) {
 				return offlineClockWait(task)
@@ -3129,7 +3147,7 @@ func (w *DownloadWorker) Interrupt(ctx context.Context, job ClaimedJob, action s
 		return appError(CodeQueueStateConflict, "原云端操作正在取消收尾", nil)
 	}
 	if task.ProviderTaskID == "" {
-		if action == "cancel" && (downloadSubmissionUnconfirmed(task) || task.LastErrorCode == downloadCancellationPending) {
+		if action == "cancel" && (downloadSubmissionUnconfirmed(task) || downloadPreparationNeedsControl(task) || task.LastErrorCode == downloadCancellationPending) {
 			return w.service.db.Transaction(func(tx *gorm.DB) error {
 				var fresh models.Job
 				if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&fresh, "id = ?", job.Job.ID).Error; err != nil {
@@ -3533,6 +3551,12 @@ func downloadFailureDescription(err error, code string, retryable bool) string {
 		label = "提交或核对原离线任务"
 	case downloadpkg.FailureSelectionSubmission:
 		label = "提交或核对原精准选集任务"
+	case downloadpkg.FailurePreparation:
+		label = "准备下载"
+	case downloadpkg.FailureSeedUpload:
+		label = "上传种子文件"
+	case downloadpkg.FailureShareReceive:
+		label = "接收分享文件"
 	}
 	if diagnostic.Timeout {
 		message = "请求超时；" + message
@@ -3543,7 +3567,7 @@ func downloadFailureDescription(err error, code string, retryable bool) string {
 		message += "（提供方错误码：" + diagnostic.ProviderCode + "）"
 	}
 	if diagnostic.ProviderOperation != "" {
-		label := map[string]string{"submit": "提交响应", "reconcile": "原任务核对", "cancel": "取消响应"}[diagnostic.ProviderOperation]
+		label := map[string]string{"submit": "提交响应", "reconcile": "原任务核对", "cancel": "取消响应", "share_receive": "转存响应"}[diagnostic.ProviderOperation]
 		message += "；" + label
 	}
 	if diagnostic.ProviderHTTPStatus != 0 {
@@ -3614,7 +3638,15 @@ func downloadFailureMessage(code string, retryable bool) string {
 	case "downloader_auth_failed":
 		return "下载器认证已失效，请更新连接凭据后重试"
 	case "downloader_rate_limited":
-		return "下载器请求受到限速，任务将延后重试"
+		if retryable {
+			return "下载器请求受到限速，任务将延后重试"
+		}
+		return "下载器请求受到限速，本次重试已结束"
+	case "downloader_preparation_failed":
+		if retryable {
+			return "下载准备失败，尚未提交离线下载；将有限次重试准备步骤"
+		}
+		return "下载准备失败，尚未提交离线下载；请检查错误后重试"
 	case "downloader_unavailable":
 		if retryable {
 			return "下载器暂时不可用，任务将按原状态自动重试"
@@ -3679,6 +3711,48 @@ func downloadOperation(providerType, sourceOrigin string) serverlog.Operation {
 		return serverlog.OperationPan115OfflineDownload
 	}
 	return serverlog.OperationDownloadTask
+}
+
+// Queue owns retry exhaustion, so its terminal decision must finalize the
+// domain projection in the same transaction rather than leave it submitting.
+func finalizeFailedDownloadTx(tx *gorm.DB, job models.Job, code, message string, now time.Time) error {
+	if job.JobType != "download" {
+		return nil
+	}
+	var task models.DownloadTask
+	if err := tx.First(&task, "job_id = ?", job.ID).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil
+		}
+		return err
+	}
+	if task.Phase == models.DownloadTaskStatusCancelled || task.Phase == models.DownloadTaskStatusCompleted {
+		return nil
+	}
+	if err := tx.Model(&task).Updates(map[string]any{
+		"phase": models.DownloadTaskStatusFailed, "last_error_code": code,
+		"last_error_message": message, "finished_at": now, "updated_at": now,
+	}).Error; err != nil {
+		return err
+	}
+	if code == "downloader_preparation_failed" && downloadPreparationCandidate(task) {
+		if err := releaseDownloadCapacityTx(tx, task, now); err != nil {
+			return err
+		}
+		return syncFailedFollowClaims(tx, task.ID, now)
+	}
+	return nil
+}
+
+func terminalDownloadFailureMessage(code, message string) string {
+	// Reconstruct finite public wording from the error contract. Detailed
+	// provider stage/HTTP/errno evidence remains in the execution log.
+	switch code {
+	case "downloader_unavailable", "downloader_rate_limited", "downloader_preparation_failed", "downloader_category_update_failed":
+		return downloadFailureMessage(code, false)
+	default:
+		return message
+	}
 }
 
 func (w *DownloadWorker) markFailure(task models.DownloadTask, code, message string, finished bool) error {

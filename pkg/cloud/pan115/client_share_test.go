@@ -11,6 +11,7 @@ import (
 
 	pan115sdk "github.com/SheltonZhu/115driver/pkg/driver"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud"
+	"github.com/yuanjing-hash/OhMyCine-Server/pkg/downloader"
 )
 
 type shareTestSDK struct {
@@ -206,5 +207,39 @@ func TestShareReadAdapterUsesSafeRequestAndTypedErrors(t *testing.T) {
 	_, err := (&sdkAdapter{Pan115Client: sdk}).GetShareSnapWithUA(downloadBrowserUserAgent, "example", "abcd", "0")
 	if code, _ := cloud.ErrorInfo(err); code != cloud.CodeShareExpired {
 		t.Fatal(err)
+	}
+}
+
+func TestShareReceiveRetainsRequestLocalFailureCodesWithoutSecrets(t *testing.T) {
+	for _, fixture := range []struct {
+		status, errno int
+		body, kind    string
+	}{
+		{503, 0, "private-response-secret", "http_error"},
+		{200, 12345, `{"state":false,"errno":12345,"error":"private-response-secret"}`, "provider_error"},
+		{200, 0, "private-response-secret", "invalid_response"},
+	} {
+		driver, err := New(cloud.Config{Cookie: "UID=1; CID=cid; SEID=seid"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		adapter := driver.(*Client).sdk.(*sdkAdapter)
+		calls := 0
+		adapter.Client.SetTransport(offlineDiagnosticTransport{base: shareReadTransport(func(r *http.Request) (*http.Response, error) {
+			calls++
+			if ordinaryWireOperation(r) != "share_receive" || r.UserAgent() != pan115sdk.UA115Browser || r.ParseForm() != nil || r.PostForm.Get("share_code") != "private-share" || r.PostForm.Get("cid") != "owned-workspace" {
+				t.Fatal("share receive changed its provider request")
+			}
+			return &http.Response{StatusCode: fixture.status, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(fixture.body)), Request: r}, nil
+		})})
+		wireErr := adapter.ReceiveShare("private-share", "private-code", []string{"original-leaf"}, "owned-workspace")
+		err = downloader.WithFailureStage(mapError(wireErr), downloader.FailureShareReceive)
+		diagnostic, ok := downloader.FailureDiagnosticFromError(err)
+		if !ok || calls != 1 || diagnostic.ProviderHTTPStatus != fixture.status || diagnostic.ProviderErrno != fixture.errno || diagnostic.ProviderOperation != "share_receive" || diagnostic.ProviderResponseKind != fixture.kind {
+			t.Fatal("share write lost observed diagnostic", diagnostic, err)
+		}
+		if strings.Contains(wireErr.Error()+err.Error(), "private-response-secret") || strings.Contains(err.Error(), "private-share") {
+			t.Fatal("share secrets escaped the request boundary")
+		}
 	}
 }

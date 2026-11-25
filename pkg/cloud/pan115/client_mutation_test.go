@@ -3,8 +3,10 @@ package pan115
 import (
 	"context"
 	"errors"
+	"os"
 	"reflect"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -167,6 +169,113 @@ func TestBatchMutationAdapterDoesNotStartAfterContextCancellation(t *testing.T) 
 	}
 	if got := timings.Snapshot(); got.ProviderWaitCalls != 1 || got.ProviderCallCalls != 0 {
 		t.Fatalf("cancelled timing=%+v", got)
+	}
+}
+
+type blockingPreparationSDK struct {
+	*selectedTestSDK
+	operation string
+	entered   chan struct{}
+	release   chan struct{}
+}
+
+func (s *blockingPreparationSDK) block(operation string) {
+	if s.operation == operation {
+		close(s.entered)
+		<-s.release
+	}
+}
+func (s *blockingPreparationSDK) Mkdir(parentID, name string) (string, error) {
+	s.block("directory")
+	return s.selectedTestSDK.Mkdir(parentID, name)
+}
+func (s *blockingPreparationSDK) UploadFastOrByMultipart(parent, name string, size int64, file *os.File, options ...pan115sdk.UploadMultipartOption) error {
+	s.block("seed")
+	return s.selectedTestSDK.UploadFastOrByMultipart(parent, name, size, file, options...)
+}
+func (s *blockingPreparationSDK) GetShareSnapWithUA(string, string, string, string, ...pan115sdk.Query) (*pan115sdk.ShareSnapResp, error) {
+	return nil, errors.New("share lookup is not used by this test")
+}
+func (s *blockingPreparationSDK) ReceiveShare(string, string, []string, string) error {
+	s.block("share")
+	return nil
+}
+func (s *blockingPreparationSDK) Delete(ids ...string) error {
+	s.block("recycle")
+	return s.selectedTestSDK.Delete(ids...)
+}
+func (s *blockingPreparationSDK) DeleteOfflineTasks(ids []string, deleteData bool) error {
+	s.block("cancel")
+	return s.selectedTestSDK.DeleteOfflineTasks(ids, deleteData)
+}
+
+func TestPreparationMutationCancellationWaitsForPhysicalSDKReturn(t *testing.T) {
+	for _, operation := range []string{"directory", "share", "recycle", "selected-directory", "selected-seed", "selected-cancel"} {
+		t.Run(operation, func(t *testing.T) {
+			client, state, _, request := selectedFixture(t)
+			var selectedID string
+			if operation == "selected-cancel" {
+				snapshot, err := client.SubmitSelectedOffline(context.Background(), request)
+				if err != nil {
+					t.Fatal(err)
+				}
+				selectedID = snapshot.Task.ID
+			}
+			wireOperation := operation
+			switch operation {
+			case "selected-directory":
+				wireOperation = "directory"
+			case "selected-seed":
+				wireOperation = "seed"
+			case "selected-cancel":
+				wireOperation = "cancel"
+			}
+			wire := &blockingPreparationSDK{selectedTestSDK: state, operation: wireOperation, entered: make(chan struct{}), release: make(chan struct{})}
+			client.sdk = wire
+			release := sync.OnceFunc(func() { close(wire.release) })
+			t.Cleanup(release)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			done := make(chan error, 1)
+			go func() {
+				var err error
+				switch operation {
+				case "directory":
+					_, err = client.CreateDirectory(ctx, "intake", "own-preparation")
+				case "share":
+					err = client.ReceiveShare(ctx, cloud.ShareSnapshot{ShareCode: "share-code", ReceiveCode: "abcd", Items: []cloud.ShareItem{{ID: "movie"}}}, "intake-task-root")
+				case "recycle":
+					err = client.RecycleMany(ctx, []string{"own-preparation"})
+				case "selected-cancel":
+					err = client.CancelSelectedOffline(ctx, selectedID, request.Authority, false)
+				default:
+					_, err = client.SubmitSelectedOffline(ctx, request)
+				}
+				done <- err
+			}()
+			select {
+			case <-wire.entered:
+			case err := <-done:
+				t.Fatalf("operation returned before its SDK write: %v", err)
+			case <-time.After(2 * time.Second):
+				t.Fatal("SDK write was not entered")
+			}
+			cancel()
+			select {
+			case err := <-done:
+				t.Fatalf("cancelled worker released before physical SDK write returned: %v", err)
+			case <-time.After(30 * time.Millisecond):
+			}
+			release()
+			select {
+			case <-done:
+			case <-time.After(2 * time.Second):
+				t.Fatal("operation did not settle after its SDK write returned")
+			}
+			if (operation == "selected-directory" || operation == "selected-seed") && state.submits != 0 {
+				t.Fatalf("cancelled preparation submitted native download: %d", state.submits)
+			}
+		})
 	}
 }
 
