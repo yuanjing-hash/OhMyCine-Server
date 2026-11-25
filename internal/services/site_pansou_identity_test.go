@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -16,6 +17,116 @@ import (
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/site/pansou"
 	"golang.org/x/time/rate"
 )
+
+func TestPanSouIdentityPreservesNumericTitlesAndMixedResources(t *testing.T) {
+	const title = "寒战1994"
+	const alias = "Cold War 1994"
+	metadataServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/movie/1994" {
+			http.NotFound(w, r)
+			return
+		}
+		fmt.Fprintf(w, `{"id":1994,"title":%q,"original_title":%q,"original_language":"zh","release_date":"2026-05-01","alternative_titles":{"titles":[]},"translations":{"translations":[]}}`, title, alias)
+	}))
+	defer metadataServer.Close()
+	releases := []string{title, title + ".2160p.WEB-DL.H265", title + " (2026)", title + ".2026.2160p.WEB-DL.H265", "Cold.War.1994.1080p.WEB-DL"}
+	var keywords []string
+	panSou := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request struct {
+			Keyword string `json:"kw"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Error(err)
+			return
+		}
+		keywords = append(keywords, request.Keyword)
+		items := []any{}
+		add := func(source, value, kind, resource string) {
+			items = append(items, map[string]any{"source": "plugin:" + source, "title": value, "links": []any{map[string]string{"type": kind, "url": resource}}})
+		}
+		for i := range 2 {
+			add("5266ys", title, "115", fmt.Sprintf("https://115.com/s/numeric%d?password=abcd", i+1))
+		}
+		for i, release := range releases {
+			add("5266ys", release, "magnet", fmt.Sprintf("magnet:?xt=urn:btih:%040x", i+1))
+		}
+		// This is the same magnet from another plugin, not a sixth resource.
+		add("dygang", releases[0], "magnet", fmt.Sprintf("magnet:?xt=urn:btih:%040x", 1))
+		for i, wrong := range []string{title + " (2012)", title + "续集.2160p", "新" + title + ".2160p"} {
+			add("dygang", wrong, "magnet", fmt.Sprintf("magnet:?xt=urn:btih:%040x", i+100))
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"code": 0, "data": map[string]any{"total": len(items), "results": items}})
+	}))
+	defer panSou.Close()
+	s, _, actor, store, _, _ := siteFixture(t)
+	_, _, _ = seedPanSouReceiver(t, s, models.ConnectionProviderPan115)
+	metadata := NewMetadataSettingsService(s.db, s.audit, store, tmdb.Credential{Kind: tmdb.CredentialKindReadAccessToken, Value: "fixture"})
+	metadata.clientFactory = func(tmdb.Credential, string, string) (*tmdb.Client, error) {
+		return tmdb.NewForTest("fixture", metadataServer.URL, metadataServer.Client())
+	}
+	s.SetMetadataSettings(metadata)
+	s.adapters[pansou.Kind] = pansou.NewForTest(panSou.Client())
+	created, err := s.Create(context.Background(), actor, SiteInput{Name: "Numeric PanSou", Kind: pansou.Kind, BaseURL: panSou.URL, CloudConfig: &sitepkg.CloudConfig{SourceScope: "plugin"}, Enabled: true, Priority: 100, TimeoutSeconds: 10, RateLimitPerMinute: 120}, RequestContext{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	keywords = nil
+	result, err := s.SearchMediaIdentity(context.Background(), actor, MediaIdentitySearchInput{MediaType: "movie", TMDBID: 1994, SiteID: &created.ID, Page: 1, ClientCapabilities: []string{MixedDiscoveryCapability}, TypePolicy: "all"})
+	if err != nil || len(result.Groups) != 1 || len(result.Groups[0].Items) != 7 {
+		t.Fatalf("mixed detail search = %+v, err=%v", result, err)
+	}
+	if !slices.Equal(keywords, []string{title, alias}) {
+		t.Fatalf("identity query names were widened: %v", keywords)
+	}
+	shares, magnets := 0, 0
+	seen := map[string]bool{}
+	for _, item := range result.Groups[0].Items {
+		if item.MatchedName != title && item.MatchedName != alias || seen[item.ResourceFingerprint] {
+			t.Fatalf("unmatched or duplicated result: %+v", item)
+		}
+		seen[item.ResourceFingerprint] = true
+		claim, err := s.resolveAvailableClaim(item.Token, actor.User.ID)
+		if err != nil || claim.SearchIdentity == nil || claim.SearchIdentity.TMDBID != 1994 {
+			t.Fatalf("actor-bound detail identity lost: %+v, err=%v", claim.SearchIdentity, err)
+		}
+		switch item.SourceKind {
+		case RouteSource115Share:
+			shares++
+			if claim.ManualTMDBID != nil {
+				t.Fatal("numeric title matching bypassed actual share-file inspection")
+			}
+		case RouteSourceBT:
+			magnets++
+			if !slices.Contains(releases, item.Title) || claim.ManualTMDBID == nil || *claim.ManualTMDBID != 1994 {
+				t.Fatalf("wrong release or missing recognition identity: %+v", item)
+			}
+			if item.Title == releases[0] && (len(item.Origins) != 2 || item.Origins[0].Name != "5266ys" || item.Origins[1].Name != "dygang") {
+				t.Fatalf("duplicate plugin origins were not merged: %+v", item.Origins)
+			}
+		default:
+			t.Fatalf("unexpected source kind %q", item.SourceKind)
+		}
+	}
+	if shares != 2 || magnets != 5 {
+		t.Fatalf("mixed detail results: shares=%d magnets=%d", shares, magnets)
+	}
+	public, err := json.Marshal(result)
+	if err != nil || strings.Contains(string(public), "magnet:?") || strings.Contains(string(public), "115.com/s/") {
+		t.Fatal("private resource links escaped in the search response", err)
+	}
+	keywords = nil
+	rawQuery := "寒战1994 自定义关键词"
+	raw, err := s.Search(context.Background(), actor, SiteSearchInput{Keyword: rawQuery, SiteID: &created.ID, Page: 1, ClientCapabilities: []string{MixedDiscoveryCapability}, TypePolicy: "all"})
+	if err != nil || !slices.Equal(keywords, []string{rawQuery}) || len(raw) != 1 || len(raw[0].Items) != 10 {
+		t.Fatalf("raw keyword search changed: queries=%v groups=%+v err=%v", keywords, raw, err)
+	}
+	for _, item := range raw[0].Items {
+		claim, err := s.resolveAvailableClaim(item.Token, actor.User.ID)
+		if err != nil || item.MatchedName != "" || claim.SearchIdentity != nil || claim.ManualTMDBID != nil {
+			t.Fatal("raw keyword search fabricated a media identity", err)
+		}
+	}
+}
 
 func TestPanSouIdentitySnapshotFreezesAliasesAndPages(t *testing.T) {
 	const fullTitle = "孤单又灿烂的神：鬼怪"
