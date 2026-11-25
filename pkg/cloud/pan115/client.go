@@ -348,7 +348,13 @@ func (t offlineDiagnosticTransport) RoundTrip(request *http.Request) (*http.Resp
 }
 
 func ordinaryWireOperation(request *http.Request) string {
-	if request.Method != http.MethodPost || request.URL.Scheme != "https" || request.URL.Host != "lixian.115.com" {
+	if request.Method != http.MethodPost || request.URL.Scheme != "https" {
+		return ""
+	}
+	if request.URL.Host == "webapi.115.com" && request.URL.Path == "/share/receive" {
+		return "share_receive"
+	}
+	if request.URL.Host != "lixian.115.com" {
 		return ""
 	}
 	q := request.URL.Query()
@@ -529,7 +535,7 @@ func (c *Client) ReceiveShare(ctx context.Context, snapshot cloud.ShareSnapshot,
 	if !ok {
 		return cloud.Error(cloud.CodeUnavailable, false, errors.New("115 share API is unavailable"))
 	}
-	if err := c.waitAndCall(ctx, c.offlineRate, func() error {
+	if err := c.waitAndCallOwned(ctx, c.offlineRate, func() error {
 		return sdk.ReceiveShare(snapshot.ShareCode, snapshot.ReceiveCode, ids, directoryID)
 	}); err != nil {
 		return mapError(err)
@@ -548,7 +554,7 @@ func (c *Client) CreateDirectory(ctx context.Context, parentID, name string) (cl
 		return cloud.Item{}, cloud.Error(cloud.CodeUnavailable, false, errors.New("115 mutation API is unavailable"))
 	}
 	var itemID string
-	if err := c.waitAndCall(ctx, c.mkdirRate, func() error {
+	if err := c.waitAndCallOwned(ctx, c.mkdirRate, func() error {
 		var callErr error
 		itemID, callErr = sdk.Mkdir(parentID, name)
 		return callErr
@@ -697,7 +703,7 @@ func (c *Client) RecycleMany(ctx context.Context, itemIDs []string) error {
 	if !ok {
 		return cloud.Error(cloud.CodeUnavailable, false, errors.New("115 mutation API is unavailable"))
 	}
-	if err := c.waitAndCall(ctx, c.recycleRate, func() error { return sdk.Delete(items...) }); err != nil {
+	if err := c.waitAndCallOwned(ctx, c.recycleRate, func() error { return sdk.Delete(items...) }); err != nil {
 		return mapError(err)
 	}
 	return nil
@@ -1601,8 +1607,8 @@ func (c *Client) waitAndCall(ctx context.Context, limiter *rate.Limiter, call fu
 }
 
 // A durable resource-operation owner must not classify or release an SDK
-// write while its context-less call still runs. The outer operation keeps
-// original operation owns this finite physical completion join, so a confirmed
+// write while its context-less call still runs. The original operation owns
+// this finite physical completion join, so a confirmed
 // late identity can still reach the worker's existing cancellation cleanup.
 func (c *Client) waitAndCallOwned(ctx context.Context, limiter *rate.Limiter, call func() error) error {
 	return c.waitAndCallMode(ctx, limiter, call, true)

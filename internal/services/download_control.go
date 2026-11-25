@@ -17,6 +17,18 @@ import (
 const downloadCancellationPending = "downloader_cancellation_pending"
 const downloadCancellationMessage = "已取消后续下载和入库，正在后台核对并收尾原云端操作；源文件保留"
 
+func downloadControlDeletesData(payloadJSON string) bool {
+	var payload downloadJobPayload
+	return json.Unmarshal([]byte(payloadJSON), &payload) == nil && payload.ControlDeleteData
+}
+
+func downloadControlMessage(payloadJSON string) string {
+	if downloadControlDeletesData(payloadJSON) {
+		return "已取消后续下载和入库，正在清理本任务的源／临时文件"
+	}
+	return downloadCancellationMessage
+}
+
 func unconfirmedDownloadCode(code string) bool {
 	switch code {
 	case "downloader_submission_unconfirmed", "downloader_submit_unknown", "downloader_selection_result_unknown", "downloader_share_result_unknown":
@@ -25,8 +37,13 @@ func unconfirmedDownloadCode(code string) bool {
 	return false
 }
 
+func downloadPreparationNeedsControl(task models.DownloadTask) bool {
+	return task.LastErrorCode == "downloader_preparation_failed" && downloadPreparationCandidate(task)
+}
+
 // Only a backend-created intent paired with its original owner can bypass the
-// library intake gate. It grants read-only reconciliation and Cancel(false).
+// library intake gate. It grants original-operation cancellation or explicitly
+// requested cleanup of its proven preparation workspace.
 func pendingDownloadControlTask(db *gorm.DB, job models.Job) (models.DownloadTask, bool, error) {
 	var payload downloadJobPayload
 	if job.JobType != "download" || json.Unmarshal([]byte(job.PayloadJSON), &payload) != nil || (payload.ControlIntent != "cancel" && payload.ControlIntent != "remove") {
@@ -42,10 +59,13 @@ func pendingDownloadControlTask(db *gorm.DB, job models.Job) (models.DownloadTas
 	return task, true, nil
 }
 
-func savePendingDownloadControlTx(tx *gorm.DB, task *models.DownloadTask, job *models.Job, remove bool, actorID uint, now time.Time) error {
+func savePendingDownloadControlTx(tx *gorm.DB, task *models.DownloadTask, job *models.Job, remove bool, actorID uint, now time.Time, deleteData ...bool) error {
 	var payload downloadJobPayload
 	if json.Unmarshal([]byte(job.PayloadJSON), &payload) != nil || payload.DownloadTaskID != task.ID || task.JobID != job.ID || job.OwnerID == nil || *job.OwnerID != task.OwnerID {
 		return errDownloadIdentityChanged
+	}
+	if len(deleteData) > 0 && deleteData[0] {
+		payload.ControlDeleteData = true
 	}
 	payload.ControlIntent = "cancel"
 	if remove || task.HistoryClearedAt != nil {
@@ -55,11 +75,12 @@ func savePendingDownloadControlTx(tx *gorm.DB, task *models.DownloadTask, job *m
 	if err != nil {
 		return err
 	}
-	taskUpdates := map[string]any{"phase": models.DownloadTaskStatusCancelled, "last_error_code": downloadCancellationPending, "last_error_message": downloadCancellationMessage, "finished_at": now, "updated_at": now}
+	message := downloadControlMessage(string(encoded))
+	taskUpdates := map[string]any{"phase": models.DownloadTaskStatusCancelled, "last_error_code": downloadCancellationPending, "last_error_message": message, "finished_at": now, "updated_at": now}
 	if task.LastErrorCode == CodeOfflineDeadlineExceeded {
 		taskUpdates["last_error_code"], taskUpdates["last_error_message"] = CodeOfflineDeadlineExceeded, offlineTimeoutMessage
 	}
-	jobUpdates := map[string]any{"payload_json": string(encoded), "last_error_code": downloadCancellationPending, "last_error_message": downloadCancellationMessage, "revision": job.Revision + 1, "updated_at": now}
+	jobUpdates := map[string]any{"payload_json": string(encoded), "last_error_code": downloadCancellationPending, "last_error_message": message, "revision": job.Revision + 1, "updated_at": now}
 	// An entered Submit retains its lease until it returns. Its late identity
 	// meets the cancelled phase barrier and is handed to the same cleanup.
 	if job.Status != models.JobStatusRunning {
@@ -81,12 +102,12 @@ func savePendingDownloadControlTx(tx *gorm.DB, task *models.DownloadTask, job *m
 	if err := tx.Model(&models.JobActionRequest{}).Where("job_id = ? AND response = ''", job.ID).Updates(map[string]any{"response": "closed_by_control", "responded_by": actorID, "responded_at": now}).Error; err != nil {
 		return err
 	}
-	job.PayloadJSON, job.LastErrorCode, job.LastErrorMessage = string(encoded), downloadCancellationPending, downloadCancellationMessage
+	job.PayloadJSON, job.LastErrorCode, job.LastErrorMessage = string(encoded), downloadCancellationPending, message
 	job.Revision++
 	return recordJobEvent(tx, job.ID, "control.cancel_reconcile", "", job.Status, &actorID, downloadCancellationPending, now)
 }
 
-func (s *DownloadService) requestPendingDownloadControl(actor Actor, taskID string, remove bool, request RequestContext) error {
+func (s *DownloadService) requestPendingDownloadControl(actor Actor, taskID string, remove bool, request RequestContext, deleteData ...bool) error {
 	var task models.DownloadTask
 	if err := s.db.First(&task, "id = ?", taskID).Error; err != nil {
 		return downloadTaskNotFound(err)
@@ -102,13 +123,14 @@ func (s *DownloadService) requestPendingDownloadControl(actor Actor, taskID stri
 		if !actor.Can(authz.PermissionDownloadsManageAll) && !actor.Can(authz.PermissionJobsControlAll) && (task.OwnerID != actor.User.ID || !actor.Can(authz.PermissionJobsControlOwn)) {
 			return appError(CodePermissionDenied, "无权控制该下载任务", nil)
 		}
-		if !downloadSubmissionUnconfirmed(task) && task.LastErrorCode != downloadCancellationPending && !task.OfflineStopPending {
+		terminalRemoval := remove && (job.Status == models.JobStatusFailed || job.Status == models.JobStatusCancelled || job.Status == models.JobStatusCompleted)
+		if !terminalRemoval && !downloadSubmissionUnconfirmed(task) && !downloadPreparationNeedsControl(task) && task.LastErrorCode != downloadCancellationPending && !task.OfflineStopPending && !(len(deleteData) > 0 && deleteData[0] && downloadPreparationCandidate(task)) {
 			return errDownloadProviderIdentityChanged
 		}
-		if err := savePendingDownloadControlTx(tx, &task, &job, remove, actor.User.ID, time.Now().UTC()); err != nil {
+		if err := savePendingDownloadControlTx(tx, &task, &job, remove, actor.User.ID, time.Now().UTC(), deleteData...); err != nil {
 			return err
 		}
-		return s.audit.Record(tx, &actor.User.ID, "download.control_accepted", "download_task", task.ID, "success", map[string]any{"control_pending": true, "record_removed": remove, "provider_data_retained": true}, request)
+		return s.audit.Record(tx, &actor.User.ID, "download.control_accepted", "download_task", task.ID, "success", map[string]any{"control_pending": true, "record_removed": remove, "provider_data_retained": !downloadControlDeletesData(job.PayloadJSON)}, request)
 	})
 	if err == nil && s.queue != nil {
 		event := "job.status_changed"
@@ -126,9 +148,86 @@ func (s *DownloadService) ControlPending(taskID string) bool {
 	return s.db.Select("phase", "last_error_code", "offline_stop_pending").First(&task, "id = ?", taskID).Error == nil && (task.OfflineStopPending || task.Phase == models.DownloadTaskStatusCancelled && task.LastErrorCode == downloadCancellationPending)
 }
 
-func (w *DownloadWorker) controlPendingResult() WorkerResult {
+func (w *DownloadWorker) controlPendingResult(payloadJSON string) WorkerResult {
 	next := time.Now().UTC().Add(time.Minute)
-	return WorkerResult{RetryAt: &next, ErrorCode: downloadCancellationPending, ErrorMessage: downloadCancellationMessage}
+	return WorkerResult{RetryAt: &next, ErrorCode: downloadCancellationPending, ErrorMessage: downloadControlMessage(payloadJSON)}
+}
+
+// Empty local evidence only makes the adapter's exact original preparation
+// eligible for inspection; the adapter's durable receipt must still prove that
+// native acquisition has never dispatched. It is not inferred from task age.
+func downloadPreparationCandidate(task models.DownloadTask) bool {
+	return task.BTSelectionGroupID == "" && task.ProviderTaskID == "" && task.ProviderOutputID == "" &&
+		task.LastSampledAt == nil && task.OfflineStartedAt == nil && task.OfflineDeadlineAt == nil &&
+		task.OfflineReadyAt == nil && task.OfflineSettledAt == nil &&
+		(task.CompletedManifestJSON == "" || task.CompletedManifestJSON == "{}")
+}
+
+func (s *DownloadService) abandonDownloadPreparation(ctx context.Context, task models.DownloadTask, deleteData bool) (bool, error) {
+	if !downloadPreparationCandidate(task) {
+		return false, nil
+	}
+	plain, err := s.credentials.Decrypt(downloadSourcePurpose(task.ID), task.SourceCiphertext)
+	if err != nil {
+		return false, err
+	}
+	var source downloadSourceEnvelope
+	if err := json.Unmarshal([]byte(plain), &source); err != nil {
+		return false, err
+	}
+	if err := validateStoredContentSelection(source); err != nil {
+		return false, err
+	}
+	// Local synchronous share receive cannot leave a long-lived native
+	// downloader task. Its original Submit has returned before this is used
+	// for settlement; an expired provider credential must not block that fact.
+	if !deleteData && source.Kind == downloadpkg.SourcePan115Share && task.ProviderType == models.DownloaderTypePan115Offline && normalizeExecutionLocation(task.ExecutionLocation) == models.NodeLocationServer {
+		if _, _, err := normalizeDownloadSource(DownloadSourceInput{Kind: source.Kind, URL: source.URL}, task.DisplayName); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	client, err := s.downloader.clientForDownloadTask(ctx, task)
+	if err != nil {
+		return false, err
+	}
+	controller, ok := client.(downloadpkg.PreparationController)
+	if !ok {
+		return false, nil
+	}
+	return controller.AbandonPreparation(ctx, downloadpkg.SubmitRequest{
+		Source: offlineSource(source, task), SavePath: task.StagingAbsolutePath,
+		Tag: task.ProviderTag, ProviderDirectoryID: task.StagingProviderDirectoryID,
+	}, deleteData)
+}
+
+// Called only from the exclusive cancellation worker, never from admission
+// inspection. Retiring the original plan prevents stale Submit replay after
+// its resource owner becomes available to a different request.
+func (s *DownloadService) releasePreparationOwnership(ctx context.Context, task models.DownloadTask) error {
+	plain, err := s.credentials.Decrypt(downloadSourcePurpose(task.ID), task.SourceCiphertext)
+	if err != nil {
+		return err
+	}
+	var source downloadSourceEnvelope
+	if err := json.Unmarshal([]byte(plain), &source); err != nil {
+		return err
+	}
+	if source.ContentSelection == nil {
+		return nil
+	}
+	client, err := s.downloader.clientForDownloadTask(ctx, task)
+	if err != nil {
+		return err
+	}
+	releaser, ok := client.(downloadpkg.PreparationReleaser)
+	if !ok {
+		return downloadpkg.Error("downloader_action_unsupported", false, nil)
+	}
+	return releaser.ReleasePreparation(ctx, downloadpkg.SubmitRequest{
+		Source: offlineSource(source, task), SavePath: task.StagingAbsolutePath,
+		Tag: task.ProviderTag, ProviderDirectoryID: task.StagingProviderDirectoryID,
+	})
 }
 
 func (w *DownloadWorker) pendingControl(ctx context.Context, claimed ClaimedJob) (*WorkerResult, error) {
@@ -140,12 +239,36 @@ func (w *DownloadWorker) pendingControl(ctx context.Context, claimed ClaimedJob)
 	if err != nil || !pending {
 		return nil, err
 	}
-	result := w.controlPendingResult()
+	result := w.controlPendingResult(job.PayloadJSON)
 	if job.LeaseTokenHash != leaseHash(claimed.LeaseToken) || job.Status != models.JobStatusRunning || claimed.Job.OwnerID == nil || *claimed.Job.OwnerID != task.OwnerID {
 		return &result, nil
 	}
 	cleanupCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
+	var control downloadJobPayload
+	if json.Unmarshal([]byte(job.PayloadJSON), &control) != nil {
+		return &result, nil
+	}
+	if downloadPreparationCandidate(task) {
+		prepared, prepErr := w.service.abandonDownloadPreparation(cleanupCtx, task, control.ControlDeleteData)
+		if prepErr == nil && prepared {
+			if err := w.service.releasePreparationOwnership(cleanupCtx, task); err != nil {
+				return &result, nil
+			}
+			if err := w.service.settlePreparationControl(claimed, task, job.PayloadJSON); err == nil {
+				return &WorkerResult{}, nil
+			}
+			return &result, nil
+		}
+		if control.ControlDeleteData {
+			// The explicit request applies only to the proven original preparation
+			// workspace. Never broaden it to a later native task or library output.
+			return &result, nil
+		}
+	}
+	if control.ControlDeleteData {
+		return &result, nil
+	}
 	original := claimed
 	original.Job = job
 	loaded, _, client, source, savePath, err := w.load(cleanupCtx, original)
@@ -215,6 +338,14 @@ func (w *DownloadWorker) recordPendingControlProvider(ctx context.Context, claim
 }
 
 func (s *DownloadService) settlePendingDownloadControl(original models.DownloadTask) error {
+	return s.settleDownloadControl(original, nil, "")
+}
+
+func (s *DownloadService) settlePreparationControl(claim ClaimedJob, original models.DownloadTask, payload string) error {
+	return s.settleDownloadControl(original, &claim, payload)
+}
+
+func (s *DownloadService) settleDownloadControl(original models.DownloadTask, preparationClaim *ClaimedJob, expectedPayload string) error {
 	return s.db.Transaction(func(tx *gorm.DB) error {
 		var job models.Job
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&job, "id = ?", original.JobID).Error; err != nil {
@@ -224,7 +355,17 @@ func (s *DownloadService) settlePendingDownloadControl(original models.DownloadT
 		if err != nil || !pending {
 			return err
 		}
-		if task.ProviderTaskID == "" || task.ProviderTaskID != original.ProviderTaskID {
+		if task.SourceCiphertext != original.SourceCiphertext || !sameOptional(task.DownloaderID, original.DownloaderID) {
+			return errDownloadProviderIdentityChanged
+		}
+		if preparationClaim != nil {
+			if _, err := s.queue.verifyLease(tx, preparationClaim.Job.ID, preparationClaim.LeaseToken); err != nil {
+				return err
+			}
+			if job.PayloadJSON != expectedPayload || !downloadPreparationCandidate(task) {
+				return errDownloadProviderIdentityChanged
+			}
+		} else if task.ProviderTaskID == "" || task.ProviderTaskID != original.ProviderTaskID {
 			return errDownloadProviderIdentityChanged
 		}
 		var payload downloadJobPayload
@@ -232,6 +373,7 @@ func (s *DownloadService) settlePendingDownloadControl(original models.DownloadT
 			return err
 		}
 		payload.ControlIntent = ""
+		payload.ControlDeleteData = false
 		encoded, err := json.Marshal(payload)
 		if err != nil {
 			return err

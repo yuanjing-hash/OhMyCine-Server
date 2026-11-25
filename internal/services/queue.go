@@ -650,7 +650,7 @@ func (s *QueueService) Control(actor Actor, id, action string, request RequestCo
 			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&task, "job_id = ?", job.ID).Error; err != nil {
 				return err
 			}
-			if downloadSubmissionUnconfirmed(task) || task.LastErrorCode == downloadCancellationPending {
+			if downloadSubmissionUnconfirmed(task) || downloadPreparationNeedsControl(task) || task.LastErrorCode == downloadCancellationPending {
 				if err := savePendingDownloadControlTx(tx, &task, &job, false, actor.User.ID, now); err != nil {
 					return err
 				}
@@ -1391,7 +1391,7 @@ func (s *QueueService) finishLease(id, token, status, code, message string, next
 			return controlErr
 		}
 		if pendingControl {
-			status, code, message = models.JobStatusRetryWait, downloadCancellationPending, downloadCancellationMessage
+			status, code, message = models.JobStatusRetryWait, downloadCancellationPending, downloadControlMessage(job.PayloadJSON)
 			retry := now.Add(time.Minute)
 			next = &retry
 		} else if cancelled {
@@ -1423,6 +1423,12 @@ func (s *QueueService) finishLease(id, token, status, code, message string, next
 			finalStatus = models.JobStatusQueued
 			finished = nil
 			failureRetryCount = 0
+		}
+		if finalStatus == models.JobStatusFailed && job.JobType == "download" {
+			message = terminalDownloadFailureMessage(code, message)
+			if err := finalizeFailedDownloadTx(tx, job, code, message, now); err != nil {
+				return err
+			}
 		}
 		var observationPosition int64
 		if job.JobType == "download" && finalStatus == models.JobStatusRetryWait && code == "" {
@@ -1477,12 +1483,13 @@ func (s *QueueService) acknowledgeInterruptTx(tx *gorm.DB, job models.Job, now t
 	if _, pending, err := pendingDownloadControlTask(tx, job); err != nil {
 		return err
 	} else if pending {
-		updates := map[string]any{"status": models.JobStatusRetryWait, "interrupt_status": "", "cancellation_asked": false, "revision": job.Revision + 1, "next_attempt_at": now.Add(time.Minute), "finished_at": nil, "last_error_code": downloadCancellationPending, "last_error_message": downloadCancellationMessage, "updated_at": now}
+		message := downloadControlMessage(job.PayloadJSON)
+		updates := map[string]any{"status": models.JobStatusRetryWait, "interrupt_status": "", "cancellation_asked": false, "revision": job.Revision + 1, "next_attempt_at": now.Add(time.Minute), "finished_at": nil, "last_error_code": downloadCancellationPending, "last_error_message": message, "updated_at": now}
 		releaseLease(updates)
 		if err := tx.Model(&job).Updates(updates).Error; err != nil {
 			return err
 		}
-		return closeAttempt(tx, job, models.JobStatusRetryWait, downloadCancellationPending, downloadCancellationMessage, now)
+		return closeAttempt(tx, job, models.JobStatusRetryWait, downloadCancellationPending, message, now)
 	}
 
 	updates := map[string]any{"status": job.InterruptStatus, "interrupt_status": "", "cancellation_asked": false, "revision": job.Revision + 1, "checkpoint_json": clearProviderControlOrigin(job.CheckpointJSON), "last_error_code": "", "last_error_message": "", "updated_at": now}
@@ -1556,7 +1563,7 @@ func (s *QueueService) RecoverExpiredLeases() error {
 				return controlErr
 			}
 			if controlPending {
-				status, next, code, message = models.JobStatusQueued, nil, downloadCancellationPending, downloadCancellationMessage
+				status, next, code, message = models.JobStatusQueued, nil, downloadCancellationPending, downloadControlMessage(job.PayloadJSON)
 			} else if pendingInterrupt {
 				status = models.JobStatusQueued
 				next = nil

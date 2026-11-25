@@ -70,7 +70,17 @@ func (s *selectedMemoryStore) ReleaseResourceClaim(_ context.Context, key string
 	var rejection struct{ DefiniteRejection bool }
 	_ = json.Unmarshal(r.Payload, &rejection)
 	failed := r.State == "failed" && (old.State == "prepared" || old.State == "submitting" && rejection.DefiniteRejection)
-	if !ok || old.Revision != version || r.Revision != version+1 || s.resources[resource] != r.ID || old.Kind != cloud.OfflineResourceGuardKind || r.Kind != old.Kind || (r.State != "confirmed" && !failed) {
+	selected := false
+	if old.Kind == "selective_offline_owner" && old.State == "prepared" && r.State == "failed" && string(old.Payload) == string(r.Payload) {
+		var authority selectedOwnerPayload
+		if json.Unmarshal(old.Payload, &authority) == nil {
+			plan := s.rows[authority.PlanID]
+			submit, exists := s.rows[authority.PlanID+"/submit"]
+			var stage selectedStage
+			selected = plan.State == "abandoned" && (!exists || submit.State == "prepared" && json.Unmarshal(submit.Payload, &stage) == nil && stage.DispatchedAt == nil && len(stage.Result) == 0)
+		}
+	}
+	if !ok || old.Revision != version || r.Revision != version+1 || s.resources[resource] != r.ID || (old.Kind != cloud.OfflineResourceGuardKind && !selected) || r.Kind != old.Kind || (r.State != "confirmed" && !failed) {
 		return errors.New("resource cas")
 	}
 	r.Payload = append([]byte(nil), r.Payload...)
@@ -92,6 +102,9 @@ func (s *selectedMemoryStore) ReclaimResourceClaim(_ context.Context, key string
 func (s *selectedMemoryStore) Create(_ context.Context, r cloud.OperationReceipt) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if r.State != "prepared" || r.Revision != 1 {
+		return errors.New("invalid initial receipt")
+	}
 	if s.rows == nil {
 		s.rows = map[string]cloud.OperationReceipt{}
 	}
@@ -366,12 +379,124 @@ func TestSelectedOfflineLostRepliesReconcileWithoutAnotherMutation(t *testing.T)
 				if code, _ := cloud.ErrorInfo(err); code != cloud.CodeMutationUnknown {
 					t.Fatal("uncertain operation changed", err)
 				}
+				_, preparation := cloud.PreparationFailureStage(err)
+				if preparation != (stage == "seed-not-applied") {
+					t.Fatal("unsubmitted seed confused with a native offline transfer", err)
+				}
 				_, _ = recoverOriginal(context.Background(), request)
 			} else if err != nil {
 				t.Fatal(err)
 			}
 			if s.creates > 1 || s.uploads > 1 || s.submits > 1 {
 				t.Fatal("unknown mutation replayed", s.creates, s.uploads, s.submits)
+			}
+		})
+	}
+}
+
+func TestSelectedOfflinePreparationCanEndWithoutNativeReconciliation(t *testing.T) {
+	for _, scenario := range []string{"missing-seed", "confirmed-seed", "foreign-file", "native-unknown", "directory-replaced"} {
+		t.Run(scenario, func(t *testing.T) {
+			c, s, store, request := selectedFixture(t)
+			s.applyUpload = scenario != "missing-seed"
+			if scenario == "native-unknown" {
+				s.loseSubmit, s.applySubmit = true, false
+			} else {
+				s.loseUpload = true
+			}
+			if _, err := c.SubmitSelectedOffline(context.Background(), request); err == nil {
+				t.Fatal("fixture must stop before completion")
+			}
+			cold := selectedClient(s, store)
+			cold.beforeCall = func(context.Context) error {
+				t.Fatal("local cancellation queried the cloud despite durable dispatch evidence")
+				return nil
+			}
+			prepared, err := cold.AbandonSelectedOfflinePreparation(context.Background(), request, false)
+			if err != nil || prepared != (scenario != "native-unknown") {
+				t.Fatal("wrong native dispatch classification", prepared, err)
+			}
+			cold.beforeCall = nil
+			if scenario == "foreign-file" {
+				s.add(sdk.File{FileID: "foreign", ParentID: "owned-task", Name: "keep.mkv", Size: 99})
+			}
+			if scenario == "directory-replaced" {
+				s.children["intake"] = nil
+				s.add(sdk.File{FileID: "replacement", ParentID: "intake", Name: request.Authority.Tag, IsDirectory: true})
+			}
+			prepared, err = cold.AbandonSelectedOfflinePreparation(context.Background(), request, true)
+			if scenario == "foreign-file" || scenario == "directory-replaced" {
+				if err == nil || prepared || len(s.deleted) != 0 {
+					t.Fatal("cleanup crossed original preparation ownership", prepared, err, s.deleted)
+				}
+			} else if scenario == "native-unknown" {
+				if err != nil || prepared || len(s.deleted) != 0 {
+					t.Fatal("native unknown treated as abandoned preparation", err)
+				}
+			} else if err != nil || !prepared || fmt.Sprint(s.deleted) != "[owned-task]" {
+				t.Fatal("owned preparation did not clean", prepared, err, s.deleted)
+			}
+			if s.uploads != 1 || s.cancels != 0 || s.submits != map[bool]int{false: 0, true: 1}[scenario == "native-unknown"] {
+				t.Fatal("cleanup replayed a download or seed write")
+			}
+		})
+	}
+}
+
+func TestSelectedPreparationReleaseAllowsSuccessorAndRetiresOriginal(t *testing.T) {
+	for _, scenario := range []string{"current", "legacy", "orphan-owner"} {
+		t.Run(scenario, func(t *testing.T) {
+			c, s, store, original := selectedFixture(t)
+			s.loseUpload, s.applyUpload = true, false
+			plan, _, _ := c.selectedPlanForRequest(original)
+			if scenario == "orphan-owner" {
+				if err := c.claimSelectedOwner(context.Background(), plan); err != nil {
+					t.Fatal(err)
+				}
+			} else if _, err := c.SubmitSelectedOffline(context.Background(), original); err == nil {
+				t.Fatal("expected interrupted seed preparation")
+			}
+			resource := offlineResourceKey(plan.InfoHash)
+			owner, err := store.ResourceClaim(context.Background(), resource)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if scenario == "legacy" {
+				delete(store.rows, owner.ID)
+				owner.ID = "omc-selected-owner-" + resource
+				store.rows[owner.ID] = owner
+				store.resources[owner.Provider+"/"+owner.AccountID+"/"+resource] = owner.ID
+			}
+			if err := c.ReleaseSelectedOfflinePreparation(context.Background(), original); err != nil {
+				t.Fatal("unsubmitted resource remained reserved", err)
+			}
+			if _, err := store.ResourceClaim(context.Background(), resource); !errors.Is(err, cloud.ErrOperationNotFound) {
+				t.Fatal("resource was not released", err)
+			}
+			retained, err := store.Load(context.Background(), owner.ID)
+			if err != nil || retained.State != "failed" || store.rows[selectedID(plan)].State != "abandoned" {
+				t.Fatal("cancellation destroyed original receipts", err)
+			}
+			s.loseUpload, s.applyUpload = false, true
+			successor := original
+			successor.Authority.Tag = "omc-successor"
+			if _, err := c.SubmitSelectedOffline(context.Background(), successor); err != nil || s.submits != 1 {
+				t.Fatal("new same-hash task blocked by cancelled preparation", err)
+			}
+			current, _ := store.ResourceClaim(context.Background(), resource)
+			creates, uploads := s.creates, s.uploads
+			if _, err := c.SubmitSelectedOffline(context.Background(), original); err == nil || s.submits != 1 || s.creates != creates || s.uploads != uploads {
+				t.Fatal("cancelled original preparation replayed", err)
+			}
+			if err := c.ReleaseSelectedOfflinePreparation(context.Background(), original); err != nil {
+				t.Fatal("late cancellation could not settle original", err)
+			}
+			after, _ := store.ResourceClaim(context.Background(), resource)
+			if after.ID != current.ID || after.Revision != current.Revision {
+				t.Fatal("late cancellation changed successor ownership")
+			}
+			if err := c.ReleaseSelectedOfflinePreparation(context.Background(), successor); err == nil {
+				t.Fatal("dispatched native owner was released")
 			}
 		})
 	}

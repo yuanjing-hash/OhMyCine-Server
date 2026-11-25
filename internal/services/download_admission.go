@@ -115,9 +115,9 @@ func dormantDownloadAdmissions(db *gorm.DB) *gorm.DB {
 		Where("t.bt_selection_group_id = '' AND t.provider_task_id = '' AND t.provider_output_id = '' AND t.last_sampled_at IS NULL").
 		Where("t.completed_manifest_json IN ('','{}') AND t.offline_ready_at IS NULL AND t.offline_settled_at IS NULL").
 		Where(`((t.offline_kind = ? AND t.phase = ? AND t.last_error_code = ? AND t.offline_stop_pending = 1 AND t.offline_start_provenance NOT IN ?) OR
- (t.offline_kind IN ? AND t.provider_type = ? AND t.execution_location IN ? AND t.offline_started_at IS NULL AND t.offline_deadline_at IS NULL AND t.phase IN ? AND j.status IN ?))`,
+ (t.offline_started_at IS NULL AND t.offline_deadline_at IS NULL AND t.phase IN ? AND (j.status IN ? OR (t.phase = ? AND t.last_error_code = ?))))`,
 			string(downloadpkg.OfflineOperationCloud), models.DownloadTaskStatusCancelled, CodeOfflineDeadlineExceeded, []string{downloadpkg.OfflineStartAccepted, downloadpkg.OfflineStartProviderAdded},
-			[]string{"", string(downloadpkg.OfflineOperationCloud)}, models.DownloaderTypePan115Offline, []string{"", models.NodeLocationServer}, []string{models.DownloadTaskStatusSubmitting, models.DownloadTaskStatusFailed, models.DownloadTaskStatusCancelled}, []string{models.JobStatusFailed, models.JobStatusCancelled})
+			[]string{models.DownloadTaskStatusSubmitting, models.DownloadTaskStatusFailed, models.DownloadTaskStatusCancelled}, []string{models.JobStatusFailed, models.JobStatusCancelled}, models.DownloadTaskStatusCancelled, downloadCancellationPending)
 }
 
 func (w *DownloadWorker) releaseDormantDownloadAdmissions(ctx context.Context) error {
@@ -137,7 +137,12 @@ func (w *DownloadWorker) releaseDormantDownloadAdmissions(ctx context.Context) e
 			if task.OfflineStopPending && task.LastErrorCode == CodeOfflineDeadlineExceeded {
 				eligible = payload.ControlIntent == "cancel" || payload.ControlIntent == "remove"
 			} else {
-				eligible = w.isStoredNative115Source(task)
+				// Preparation is not a running cloud acquisition. Only a declared
+				// adapter with original receipt proof may make that distinction.
+				call, cancel := context.WithTimeout(ctx, 2*time.Second)
+				prepared, _ := w.service.abandonDownloadPreparation(call, task, false)
+				cancel()
+				eligible = prepared || task.ProviderType == models.DownloaderTypePan115Offline && normalizeExecutionLocation(task.ExecutionLocation) == models.NodeLocationServer && w.isStored115AcquisitionSource(task)
 			}
 		}
 		released := false
@@ -164,7 +169,7 @@ func (w *DownloadWorker) releaseDormantDownloadAdmissions(ctx context.Context) e
 	return nil
 }
 
-func (w *DownloadWorker) isStoredNative115Source(task models.DownloadTask) bool {
+func (w *DownloadWorker) isStored115AcquisitionSource(task models.DownloadTask) bool {
 	plain, err := w.service.credentials.Decrypt(downloadSourcePurpose(task.ID), task.SourceCiphertext)
 	if err != nil {
 		return false
@@ -173,7 +178,7 @@ func (w *DownloadWorker) isStoredNative115Source(task models.DownloadTask) bool 
 	if json.Unmarshal([]byte(plain), &source) != nil || validateStoredContentSelection(source) != nil {
 		return false
 	}
-	if source.Kind == downloadpkg.SourceURL {
+	if source.Kind == downloadpkg.SourceURL || source.Kind == downloadpkg.SourcePan115Share {
 		_, _, err := normalizeDownloadSource(DownloadSourceInput{Kind: source.Kind, URL: source.URL}, task.DisplayName)
 		return err == nil
 	}
@@ -258,7 +263,7 @@ func admitDownloadJobTx(tx *gorm.DB, job models.Job, now time.Time, cache downlo
 		}
 		// An explicit retry of a reclaimed legacy reservation must wait for
 		// room unless it already has a confirmed provider task.
-		if admission.State == "released" && task.ProviderType == models.DownloaderTypePan115Offline && task.BTSelectionGroupID == "" && task.ProviderTaskID == "" && len(snapshot.Held) >= snapshot.Limit {
+		if admission.State == "released" && task.BTSelectionGroupID == "" && task.ProviderTaskID == "" && len(snapshot.Held) >= snapshot.Limit {
 			return false, nil
 		}
 		return true, tx.Model(&admission).Updates(map[string]any{"state": "held", "released_at": nil, "updated_at": now}).Error

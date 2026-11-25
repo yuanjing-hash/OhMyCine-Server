@@ -46,6 +46,17 @@ type SelectiveOfflineSubmissionReconciler interface {
 	ReconcileSelectedOffline(context.Context, SelectiveOfflineRequest) (SelectiveOfflineSnapshot, error)
 }
 
+// SelectiveOfflinePreparationController reads the original plan/dispatch
+// receipts, without creating or submitting a native operation. Cleanup is
+// limited to the original preparation workspace, never published media.
+type SelectiveOfflinePreparationController interface {
+	AbandonSelectedOfflinePreparation(context.Context, SelectiveOfflineRequest, bool) (bool, error)
+}
+
+type SelectiveOfflinePreparationReleaser interface {
+	ReleaseSelectedOfflinePreparation(context.Context, SelectiveOfflineRequest) error
+}
+
 // ExclusiveOperationStore adds an account-wide resource claim. Native
 // single-plan executors use it when the provider cannot atomically extend or
 // share wanted sets. A conflict is not evidence of absence or permission to

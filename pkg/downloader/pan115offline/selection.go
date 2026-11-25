@@ -22,6 +22,16 @@ func selectedAdapterError(err error) error {
 	if err == nil {
 		return nil
 	}
+	if stage, preparation := cloud.PreparationFailureStage(err); preparation {
+		_, retryable := cloud.ErrorInfo(err)
+		diagnosticStage := downloader.FailurePreparation
+		if stage == "selective_offline_seed" {
+			diagnosticStage = downloader.FailureSeedUpload
+		} else if stage == "selective_offline_directory" {
+			diagnosticStage = downloader.FailureTaskDirectory
+		}
+		return downloader.WithFailureStage(downloader.Error("downloader_preparation_failed", retryable, err), diagnosticStage)
+	}
 	if code, _ := cloud.ErrorInfo(err); code == cloud.CodeMutationUnknown {
 		return downloader.Error("downloader_selection_result_unknown", true, err)
 	}
@@ -84,7 +94,11 @@ func (c *Client) submitSelected(ctx context.Context, request downloader.SubmitRe
 	}
 	snapshot, err := c.driver.(cloud.SelectiveOfflineDriver).SubmitSelectedOffline(ctx, cloud.SelectiveOfflineRequest{Authority: cloud.SelectiveOfflineAuthority{Tag: request.Tag, StorageRootID: c.rootID, Selection: *request.Source.ContentSelection}, ParentID: directory, Torrent: append([]byte(nil), request.Source.Torrent...)})
 	if err != nil {
-		return downloader.Task{}, downloader.WithFailureStage(selectedAdapterError(err), downloader.FailureSelectionSubmission)
+		mapped := selectedAdapterError(err)
+		if downloader.PreparationFailed(mapped) {
+			return downloader.Task{}, mapped
+		}
+		return downloader.Task{}, downloader.WithFailureStage(mapped, downloader.FailureSelectionSubmission)
 	}
 	if err = selectedSnapshot(snapshot, snapshot.Task.ID, downloader.SelectionContext{Tag: request.Tag, Selection: *request.Source.ContentSelection, RootName: manifest.Name, MultiFile: manifest.MultiFile}); err != nil {
 		return downloader.Task{}, downloader.WithFailureStage(err, downloader.FailureSelectionSubmission)

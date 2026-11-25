@@ -77,6 +77,8 @@ func (s *providerOperationStore) valid(r cloud.OperationReceipt) bool {
 	switch r.State {
 	case "prepared", "submitting", "unknown", "confirmed", "failed":
 		return true
+	case "abandoned":
+		return r.Kind == "selective_offline_plan"
 	}
 	return false
 }
@@ -187,8 +189,14 @@ func (s *providerOperationStore) Update(ctx context.Context, revision uint64, r 
 		if old.Revision != revision || old.Route != r.Route || old.Kind != r.Kind || old.AccountID != r.AccountID || old.Provider != r.Provider {
 			return ErrProviderOperationConflict
 		}
-		allowed := old.State == r.State || old.State == "prepared" && (r.State == "submitting" || r.State == "confirmed" || r.State == "failed") || old.State == "submitting" && (r.State == "unknown" || r.State == "confirmed" || r.State == "failed") || old.State == "unknown" && (r.State == "confirmed" || r.State == "failed")
-		if !allowed || old.State == "confirmed" && string(old.Payload) != string(r.Payload) || old.State == "failed" && string(old.Payload) != string(r.Payload) {
+		abandonPreparation := old.Kind == "selective_offline_plan" && old.State == "prepared" && r.State == "abandoned" && string(old.Payload) == string(r.Payload)
+		if abandonPreparation {
+			if err := scoped.verifySelectedPreparationUndispatched(ctx, old); err != nil {
+				return err
+			}
+		}
+		allowed := abandonPreparation || old.State == r.State || old.State == "prepared" && (r.State == "submitting" || r.State == "confirmed" || r.State == "failed") || old.State == "submitting" && (r.State == "unknown" || r.State == "confirmed" || r.State == "failed") || old.State == "unknown" && (r.State == "confirmed" || r.State == "failed")
+		if !allowed || (old.State == "confirmed" || old.State == "failed" || old.State == "abandoned") && string(old.Payload) != string(r.Payload) {
 			return ErrProviderOperationConflict
 		}
 		var currentRow models.ProviderOperationReceipt
@@ -262,7 +270,8 @@ func (s *providerOperationStore) ReleaseResourceClaim(ctx context.Context, resou
 	if scoped != s {
 		return scoped.ReleaseResourceClaim(ctx, resourceKey, revision, r)
 	}
-	if revision == 0 || revision >= math.MaxInt64 || r.Revision != revision+1 || r.Kind != cloud.OfflineResourceGuardKind || (r.State != "confirmed" && r.State != "failed") || len(resourceKey) != 64 {
+	selectedPreparation := r.Kind == "selective_offline_owner" && r.State == "failed"
+	if revision == 0 || revision >= math.MaxInt64 || r.Revision != revision+1 || (!selectedPreparation && r.Kind != cloud.OfflineResourceGuardKind) || (r.State != "confirmed" && r.State != "failed") || len(resourceKey) != 64 {
 		return ErrProviderOperationConflict
 	}
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
@@ -274,6 +283,11 @@ func (s *providerOperationStore) ReleaseResourceClaim(ctx context.Context, resou
 		}
 		if old.Revision != revision || old.Kind != r.Kind || old.Route != r.Route || old.AccountID != r.AccountID || old.Provider != r.Provider || old.State == "confirmed" || old.State == "failed" {
 			return ErrProviderOperationConflict
+		}
+		if selectedPreparation {
+			if err := local.verifyAbandonedSelectedOwner(ctx, old, r); err != nil {
+				return err
+			}
 		}
 		if r.State == "failed" && old.State != "prepared" {
 			var rejection struct{ DefiniteRejection bool }
@@ -296,6 +310,44 @@ func (s *providerOperationStore) ReleaseResourceClaim(ctx context.Context, resou
 		}
 		return nil
 	})
+}
+
+// A selected owner normally remains permanent. Only an abandoned, never
+// dispatched preparation may relinquish its hash, preserving both receipts.
+func (s *providerOperationStore) verifyAbandonedSelectedOwner(ctx context.Context, old, next cloud.OperationReceipt) error {
+	var owner struct {
+		PlanID string `json:"plan_id"`
+		Digest string `json:"digest"`
+	}
+	if old.State != "prepared" || string(old.Payload) != string(next.Payload) || json.Unmarshal(old.Payload, &owner) != nil || owner.PlanID == "" || owner.Digest == "" {
+		return ErrProviderOperationConflict
+	}
+	plan, err := s.Load(ctx, owner.PlanID)
+	if err != nil {
+		return err
+	}
+	if plan.Kind != "selective_offline_plan" || plan.State != "abandoned" || plan.Provider != old.Provider || plan.AccountID != old.AccountID || plan.Route != old.Route || providerReceiptHash(string(plan.Payload)) != owner.Digest {
+		return ErrProviderOperationConflict
+	}
+	return s.verifySelectedPreparationUndispatched(ctx, plan)
+}
+
+func (s *providerOperationStore) verifySelectedPreparationUndispatched(ctx context.Context, plan cloud.OperationReceipt) error {
+	submit, err := s.Load(ctx, plan.ID+"/submit")
+	if errors.Is(err, cloud.ErrOperationNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var stage struct {
+		DispatchedAt *time.Time      `json:"dispatched_at"`
+		Result       json.RawMessage `json:"result"`
+	}
+	if submit.Kind != "selective_offline_submit" || submit.State != "prepared" || submit.Provider != plan.Provider || submit.AccountID != plan.AccountID || submit.Route != plan.Route || json.Unmarshal(submit.Payload, &stage) != nil || stage.DispatchedAt != nil || len(stage.Result) != 0 {
+		return ErrProviderOperationConflict
+	}
+	return nil
 }
 
 func (s *providerOperationStore) ReclaimResourceClaim(ctx context.Context, resourceKey string, revision uint64, r cloud.OperationReceipt) error {

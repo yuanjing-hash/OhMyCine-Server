@@ -225,7 +225,12 @@ func (c *Client) selectedCheckpoint(ctx context.Context, r *cloud.OperationRecei
 // The checkpoint callback runs INSIDE the existing account guard/rate/slot
 // boundary and immediately before provider I/O. Preflight failure consumes no
 // dispatch. An unknown stage can only query its original operation.
-func (c *Client) selectedStep(ctx context.Context, id, kind string, input any, limiter *rate.Limiter, call func(context.Context) (any, error), recover func() (any, bool, error)) (json.RawMessage, error) {
+func (c *Client) selectedStep(ctx context.Context, id, kind string, input any, limiter *rate.Limiter, call func(context.Context) (any, error), recover func() (any, bool, error)) (out json.RawMessage, resultErr error) {
+	defer func() {
+		if resultErr != nil && (kind == "selective_offline_directory" || kind == "selective_offline_seed") {
+			resultErr = cloud.WithPreparationFailure(resultErr, kind)
+		}
+	}()
 	encoded, _ := json.Marshal(input)
 	stage := selectedStage{Input: encoded}
 	r, err := c.selective.store.Load(ctx, id)
@@ -279,10 +284,6 @@ func (c *Client) selectedStep(ctx context.Context, id, kind string, input any, l
 	}
 	dispatched := false
 	var result any
-	invoke := c.waitAndCall
-	if kind == "selective_offline_submit" {
-		invoke = c.waitAndCallOwned
-	}
 	callCtx := ctx
 	if kind == "selective_offline_submit" {
 		callCtx = cloud.WithOfflineDispatchRecorder(ctx, func(_ time.Time) error {
@@ -300,7 +301,7 @@ func (c *Client) selectedStep(ctx context.Context, id, kind string, input any, l
 			return nil
 		})
 	}
-	err = invoke(ctx, limiter, func() error {
+	err = c.waitAndCallOwned(ctx, limiter, func() error {
 		if kind != "selective_offline_submit" {
 			if err := c.selectedCheckpoint(ctx, &r, "submitting", saved); err != nil {
 				return err
@@ -328,7 +329,10 @@ func (c *Client) selectedStep(ctx context.Context, id, kind string, input any, l
 		reconcile, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer cancel()
 		_ = c.selectedCheckpoint(reconcile, &r, "unknown", saved)
-		return nil, selectedUnknown()
+		if kind == "selective_offline_directory" || kind == "selective_offline_seed" {
+			return nil, mapError(err)
+		}
+		return nil, errors.Join(selectedUnknown(), mapError(err))
 	}
 	if result == nil {
 		value, found, e := recover()
@@ -336,7 +340,7 @@ func (c *Client) selectedStep(ctx context.Context, id, kind string, input any, l
 			reconcile, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 			defer cancel()
 			_ = c.selectedCheckpoint(reconcile, &r, "unknown", saved)
-			return nil, selectedUnknown()
+			return nil, errors.Join(selectedUnknown(), e)
 		}
 		result = value
 	}
@@ -416,6 +420,21 @@ func (c *Client) selectedNativeTask(ctx context.Context, hash, dir string) (*sdk
 }
 
 func (c *Client) selectedRequestPlan(ctx context.Context, request cloud.SelectiveOfflineRequest) (selectedPlan, resourcecontent.Manifest, error) {
+	plan, manifest, err := c.selectedPlanForRequest(request)
+	if err != nil {
+		return plan, manifest, err
+	}
+	dir, err := c.selectedRoot(ctx, request.ParentID, request.Authority.StorageRootID)
+	if err != nil || !dir.IsDir {
+		if err == nil {
+			err = selectedError(cloud.CodeResponseInvalid)
+		}
+		return selectedPlan{}, resourcecontent.Manifest{}, err
+	}
+	return plan, manifest, nil
+}
+
+func (c *Client) selectedPlanForRequest(request cloud.SelectiveOfflineRequest) (selectedPlan, resourcecontent.Manifest, error) {
 	if !c.SupportsSelectiveOffline() {
 		return selectedPlan{}, resourcecontent.Manifest{}, selectedError(cloud.CodeUnavailable)
 	}
@@ -428,35 +447,36 @@ func (c *Client) selectedRequestPlan(ctx context.Context, request cloud.Selectiv
 			return selectedPlan{}, resourcecontent.Manifest{}, selectedError(cloud.CodeUnavailable)
 		}
 	}
-	dir, err := c.selectedRoot(ctx, request.ParentID, request.Authority.StorageRootID)
-	if err != nil || !dir.IsDir {
-		if err == nil {
-			err = selectedError(cloud.CodeResponseInvalid)
-		}
-		return selectedPlan{}, resourcecontent.Manifest{}, err
+	if !selectedScalar(request.ParentID) || !selectedScalar(request.Authority.StorageRootID) {
+		return selectedPlan{}, resourcecontent.Manifest{}, selectedError(cloud.CodeResponseInvalid)
 	}
 	sum := sha1.Sum(request.Torrent)
 	return selectedPlan{Version: 1, Tag: request.Authority.Tag, StorageRootID: request.Authority.StorageRootID, ParentID: request.ParentID, MetainfoSHA1: hex.EncodeToString(sum[:]), MetainfoSize: int64(len(request.Torrent)), InfoHash: m.Identity.V1, Name: m.Name, MultiFile: m.MultiFile, FileCount: len(m.Files), Selection: request.Authority.Selection}, m, nil
 }
 
 // ReconcileSelectedOffline reads only the existing account/plan receipt and
-// original native task. A missing preparation stage remains unknown; it never
-// enters SubmitSelectedOffline or repairs a seed/wanted mutation.
+// original native task. Missing native dispatch is a preparation failure, not
+// an indefinitely running offline task. It never creates a seed/wanted mutation.
 func (c *Client) ReconcileSelectedOffline(ctx context.Context, request cloud.SelectiveOfflineRequest) (cloud.SelectiveOfflineSnapshot, error) {
-	plan, _, err := c.selectedRequestPlan(ctx, request)
+	plan, _, err := c.selectedPlanForRequest(request)
 	if err != nil {
 		return cloud.SelectiveOfflineSnapshot{}, err
 	}
 	id := selectedID(plan)
 	saved, err := c.loadSelectedPlan(ctx, id, request.Authority)
 	if errors.Is(err, cloud.ErrOperationNotFound) {
-		return cloud.SelectiveOfflineSnapshot{}, selectedUnknown()
+		return cloud.SelectiveOfflineSnapshot{}, cloud.WithPreparationFailure(selectedUnknown(), "selective_offline_preparation")
 	}
 	if err != nil {
 		return cloud.SelectiveOfflineSnapshot{}, err
 	}
 	if selectedDigest(saved) != selectedDigest(plan) {
 		return cloud.SelectiveOfflineSnapshot{}, selectedError(cloud.CodeResponseInvalid)
+	}
+	if prepared, err := c.selectedPreparationOnly(ctx, id); err != nil {
+		return cloud.SelectiveOfflineSnapshot{}, err
+	} else if prepared {
+		return cloud.SelectiveOfflineSnapshot{}, cloud.WithPreparationFailure(selectedUnknown(), "selective_offline_preparation")
 	}
 	return c.ObserveSelectedOffline(ctx, id, request.Authority)
 }
@@ -469,30 +489,13 @@ func (c *Client) SubmitSelectedOffline(ctx context.Context, request cloud.Select
 		return cloud.SelectiveOfflineSnapshot{}, err
 	}
 	id := selectedID(plan)
-	resourceKey := selectedDigest([]string{"native-bt-v1", plan.InfoHash})
-	ownerID := "omc-selected-owner-" + resourceKey
-	owner := selectedReceipt(c, ownerID, "selective_offline_owner", struct {
-		PlanID string `json:"plan_id"`
-		Digest string `json:"digest"`
-	}{id, selectedDigest(plan)})
-	existing, e := c.selective.store.Load(ctx, ownerID)
-	if errors.Is(e, cloud.ErrOperationNotFound) {
-		if _, exists, readErr := c.selectedNativeTask(ctx, plan.InfoHash, ""); readErr != nil {
-			return cloud.SelectiveOfflineSnapshot{}, readErr
-		} else if exists {
-			return cloud.SelectiveOfflineSnapshot{}, selectedError(cloud.CodeOfflineTaskExists)
-		}
-		if e = c.selective.store.(cloud.ExclusiveOperationStore).Claim(ctx, resourceKey, owner); e != nil {
-			existing, e = c.selective.store.Load(ctx, ownerID)
-		} else {
-			existing = owner
-		}
+	if previous, err := c.selective.store.Load(ctx, id); err == nil && previous.State == "abandoned" {
+		return cloud.SelectiveOfflineSnapshot{}, cloud.WithPreparationFailure(selectedError(cloud.CodeUnavailable), "selective_offline_preparation")
+	} else if err != nil && !errors.Is(err, cloud.ErrOperationNotFound) {
+		return cloud.SelectiveOfflineSnapshot{}, err
 	}
-	if e != nil {
-		return cloud.SelectiveOfflineSnapshot{}, selectedError(cloud.CodeOfflineTaskExists)
-	}
-	if existing.Provider != owner.Provider || existing.AccountID != owner.AccountID || existing.Kind != owner.Kind || string(existing.Payload) != string(owner.Payload) {
-		return cloud.SelectiveOfflineSnapshot{}, selectedError(cloud.CodeOfflineTaskExists)
+	if err := c.claimSelectedOwner(ctx, plan); err != nil {
+		return cloud.SelectiveOfflineSnapshot{}, err
 	}
 
 	r, err := c.selective.store.Load(ctx, id)
@@ -513,6 +516,13 @@ func (c *Client) SubmitSelectedOffline(ctx context.Context, request cloud.Select
 	var saved selectedPlan
 	if json.Unmarshal(r.Payload, &saved) != nil || selectedDigest(saved) != selectedDigest(plan) {
 		return cloud.SelectiveOfflineSnapshot{}, selectedError(cloud.CodeResponseInvalid)
+	}
+	// Recover an entered native submit before touching preparatory files. A
+	// missing seed after dispatch must never be mislabeled a preparation error.
+	if prepared, err := c.selectedPreparationOnly(ctx, id); err != nil {
+		return cloud.SelectiveOfflineSnapshot{}, err
+	} else if !prepared {
+		return c.ObserveSelectedOffline(ctx, id, request.Authority)
 	}
 	mutation, ok := c.sdk.(mutationSDK)
 	if !ok {
@@ -634,6 +644,9 @@ func (c *Client) selectedSubmission(ctx context.Context, id string, plan selecte
 	var evidence wantedEvidence
 	r, err := c.selective.store.Load(ctx, id+"/submit")
 	if err != nil {
+		if errors.Is(err, cloud.ErrOperationNotFound) {
+			return evidence, cloud.WithPreparationFailure(selectedUnknown(), "selective_offline_preparation")
+		}
 		return evidence, selectedUnknown()
 	}
 	var stage selectedStage
@@ -667,7 +680,7 @@ func (c *Client) selectedSubmission(ctx context.Context, id string, plan selecte
 		return evidence, nil
 	}
 	if r.State == "prepared" {
-		return evidence, selectedUnknown()
+		return evidence, cloud.WithPreparationFailure(selectedUnknown(), "selective_offline_preparation")
 	}
 	if r.State != "submitting" && r.State != "unknown" {
 		return evidence, selectedError(cloud.CodeResponseInvalid)

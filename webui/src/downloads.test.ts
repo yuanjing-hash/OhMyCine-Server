@@ -86,6 +86,7 @@ describe('download presentation', () => {
     expect(downloadStatusClass(failedAfterReady)).toBe('status-chip status-chip--error')
     expect(downloadErrorMessage(failedAfterReady)).toBe('下载完成，但媒体未识别')
     expect(downloadStatusLabel({ ...failedAfterReady, scrape_status: 'completed_unverified' })).toBe('文件核对失败')
+    expect(downloadStatusLabel({ ...failedAfterReady, phase: 'submitting', acquisition_state: 'active', last_error_code: 'downloader_unavailable' })).toBe('失败')
     expect(downloadStatusLabel({ ...observed, job_status: 'paused', acquisition_state: 'cloud_ready' })).toBe('已暂停')
     expect(downloadErrorMessage({ ...observed, scrape_status: 'fallback_unrecognized', last_error_code: 'tmdb_no_match', last_error_message: '已自动归入未识别' })).toBe('已自动归入未识别')
     expect(downloadStatusLabel({ ...observed, acquisition_state: 'waiting_capacity' })).toBe('等待下载器空位')
@@ -122,9 +123,10 @@ describe('download presentation', () => {
       { downloader_id: 'a', job_status: 'retry_wait', acquisition_state: 'observing', progress: 25, download_speed: 100, upload_speed: null },
       { downloader_id: 'a', job_status: 'paused', progress: 75, download_speed: 50, upload_speed: 5 },
       { downloader_id: 'a', job_status: 'completed', lifecycle_scope: 'history', acquisition_state: 'cloud_ready', progress: 100, download_speed: 0, upload_speed: 0 },
+      { downloader_id: 'a', job_status: 'retry_wait', phase: 'cancelled', lifecycle_scope: 'history', control_pending: true, acquisition_state: 'cancelled_stop_pending', progress: 0, download_speed: 500, upload_speed: 500 },
       { downloader_id: 'b', job_status: 'running', progress: 10, download_speed: 999, upload_speed: 1 },
     ] as DownloadTaskSummary[]
-    expect(summarizeDownloaderTasks(tasks, 'a')).toEqual({ active: 1, total: 3, downloadSpeed: 100, uploadSpeed: null, averageProgress: 25 })
+    expect(summarizeDownloaderTasks(tasks, 'a')).toEqual({ active: 1, total: 4, downloadSpeed: 100, uploadSpeed: null, averageProgress: 25 })
   })
   it('uses the server lifecycle scope instead of guessing from qBittorrent telemetry', () => {
     expect(isDownloadHistoryTask({ lifecycle_scope: 'history' } as DownloadTaskSummary)).toBe(true)
@@ -143,6 +145,8 @@ describe('download presentation', () => {
     expect(downloadStatusClass(pending)).toBe('status-chip status-chip--warning')
     expect(downloadErrorMessage(pending)).toContain('后续入库已取消')
     expect(downloadStatusLabel({ job_status: 'retry_wait', last_error_code: 'downloader_submission_unconfirmed' } as DownloadTaskSummary)).toBe('核对原任务')
+    expect(downloadStatusLabel({ ...pending, control_pending: false, job_status: 'cancelled', last_error_code: 'downloader_selection_result_unknown' })).toBe('已取消')
+    expect(downloadStatusLabel({ job_status: 'completed', last_error_code: 'downloader_submission_unconfirmed' } as DownloadTaskSummary)).toBe('已完成')
   })
 
   it('uses the authoritative route preview and disables life-event listening without a default library', () => {

@@ -287,6 +287,63 @@ func TestProviderOperationTemporaryResourceCASReleasePreservesReceiptAndSelected
 	if owner, e := right.ResourceClaim(ctx, key); e != nil || owner.ID != selected.ID {
 		t.Fatal("late release lost successor", e)
 	}
+
+	prepKey := providerReceiptHash("never dispatched selected preparation")
+	plan := cloud.OperationReceipt{ID: "prep-plan", Provider: "pan115", AccountID: "100", Route: "cookie", Kind: "selective_offline_plan", State: "prepared", Revision: 1, Payload: json.RawMessage(`{"original":"plan"}`)}
+	invalidInitial := plan
+	invalidInitial.State = "abandoned"
+	if err := left.Create(ctx, invalidInitial); err == nil {
+		t.Fatal("retirement bypassed the real store's prepared initial state")
+	}
+	if err := left.Create(ctx, plan); err != nil {
+		t.Fatal(err)
+	}
+	ownerPayload, _ := json.Marshal(map[string]string{"plan_id": plan.ID, "digest": providerReceiptHash(string(plan.Payload))})
+	prepOwner := cloud.OperationReceipt{ID: "prep-owner", Provider: "pan115", AccountID: "100", Route: "cookie", Kind: "selective_offline_owner", State: "prepared", Revision: 1, Payload: ownerPayload}
+	if err := left.Claim(ctx, prepKey, prepOwner); err != nil {
+		t.Fatal(err)
+	}
+	released := prepOwner
+	released.State, released.Revision = "failed", 2
+	if err := left.ReleaseResourceClaim(ctx, prepKey, 1, released); err == nil {
+		t.Fatal("live preparation owner released before abandonment")
+	}
+	plan.State, plan.Revision = "abandoned", 2
+	if err := left.Update(ctx, 1, plan); err != nil {
+		t.Fatal(err)
+	}
+	if err := left.ReleaseResourceClaim(ctx, prepKey, 1, released); err != nil {
+		t.Fatal("abandoned never-native preparation remained blocked", err)
+	}
+	if owner, err := left.Load(ctx, prepOwner.ID); err != nil || owner.State != "failed" || string(owner.Payload) != string(prepOwner.Payload) {
+		t.Fatal("abandoned owner receipt lost", err)
+	}
+	if err := right.Claim(ctx, prepKey, cloud.OperationReceipt{ID: "next-plan-owner", Provider: "pan115", AccountID: "100", Route: "cookie", Kind: "selective_offline_owner", State: "prepared", Revision: 1, Payload: ownerPayload}); err != nil {
+		t.Fatal("new same-resource acquisition blocked", err)
+	}
+	if err := left.ReleaseResourceClaim(ctx, prepKey, 1, released); err == nil {
+		t.Fatal("old preparation released successor")
+	}
+	nativePlan := plan
+	nativePlan.ID, nativePlan.State, nativePlan.Revision = "already-dispatched-plan", "prepared", 1
+	if err := left.Create(ctx, nativePlan); err != nil {
+		t.Fatal(err)
+	}
+	submit := cloud.OperationReceipt{ID: nativePlan.ID + "/submit", Provider: "pan115", AccountID: "100", Route: "cookie", Kind: "selective_offline_submit", State: "prepared", Revision: 1, Payload: json.RawMessage(`{"input":"original"}`)}
+	if err := left.Create(ctx, submit); err != nil {
+		t.Fatal(err)
+	}
+	submit.State, submit.Revision = "submitting", 2
+	if err := left.Update(ctx, 1, submit); err != nil {
+		t.Fatal(err)
+	}
+	nativePlan.State, nativePlan.Revision = "abandoned", 2
+	if err := left.Update(ctx, 1, nativePlan); err == nil {
+		t.Fatal("dispatched native plan was retired as preparation")
+	}
+	if kept, err := left.Load(ctx, nativePlan.ID); err != nil || kept.State != "prepared" || kept.Revision != 1 {
+		t.Fatal("failed retirement changed original native plan", kept, err)
+	}
 }
 
 func TestProviderOperationUndispatchedFailureCanRearmButStaleWaiterCannotDispatch(t *testing.T) {

@@ -599,6 +599,224 @@ func TestDormantNativeDownloadAdmissionsUnblockDistinctQueuedWork(t *testing.T) 
 	}
 }
 
+type preparationControlFixture struct {
+	*stubDownloadClient
+	cleaned []string
+}
+
+func (c *preparationControlFixture) AbandonPreparation(_ context.Context, request downloadpkg.SubmitRequest, deleteData bool) (bool, error) {
+	if request.Tag == "" {
+		return false, errors.New("missing original workspace tag")
+	}
+	if deleteData {
+		c.cleaned = append(c.cleaned, request.Tag)
+	}
+	return true, nil
+}
+
+func TestPreparationCancellationReclaimsCapacityAndSourceCleanupUsesControlLease(t *testing.T) {
+	downloads, downloaders, queue, actor, stub := downloadFixture(t)
+	actor.Permissions[authz.PermissionJobsControlOwn] = struct{}{}
+	clock := queue.clock.(*fakeQueueClock)
+	client := &preparationControlFixture{stubDownloadClient: stub}
+	if err := downloaders.registry.Register(models.DownloaderTypeFake, downloadpkg.Capabilities{Cancel: true}, func(downloadpkg.Config) (downloadpkg.Client, error) { return client, nil }); err != nil {
+		t.Fatal(err)
+	}
+	provider := models.Downloader{ID: "preparation-provider", Name: "Preparation", NameNormalized: "preparation", Type: models.DownloaderTypeFake, Enabled: true, MaxConcurrentDownloads: 2}
+	if err := queue.db.Create(&provider).Error; err != nil {
+		t.Fatal(err)
+	}
+	create := func(id, phase, status, kind string, held bool) models.DownloadTask {
+		t.Helper()
+		task := models.DownloadTask{ID: id, OwnerID: actor.User.ID, DownloaderID: &provider.ID, ProviderType: provider.Type, ProviderTag: "omc-" + id, DisplayName: id, Phase: phase, LastErrorCode: "downloader_unavailable", LastErrorMessage: downloadFailureMessage("downloader_unavailable", true)}
+		source, err := json.Marshal(downloadSourceEnvelope{Kind: kind, URL: "https://115.com/s/original"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		task.SourceCiphertext, err = downloads.credentials.Encrypt(downloadSourcePurpose(id), string(source))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = queue.EnqueueWith(EnqueueJobInput{OwnerID: actor.User.ID, JobType: "download", DisplayName: id, Payload: downloadJobPayload{DownloadTaskID: id}}, func(tx *gorm.DB, job models.Job) error {
+			task.JobID = job.ID
+			return tx.Create(&task).Error
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := queue.db.Model(&models.Job{}).Where("id = ?", task.JobID).Update("status", status).Error; err != nil {
+			t.Fatal(err)
+		}
+		if held {
+			if err := queue.db.Create(&models.DownloadAdmission{AcquisitionKey: downloadAcquisitionKey(task), DownloaderID: provider.ID, TaskID: id, State: "held", CreatedAt: clock.Now(), UpdatedAt: clock.Now()}).Error; err != nil {
+				t.Fatal(err)
+			}
+		}
+		return task
+	}
+	share := create("cancelled-share-preparation", models.DownloadTaskStatusSubmitting, models.JobStatusFailed, downloadpkg.SourcePan115Share, true)
+	seed := create("cancelled-seed-preparation", models.DownloadTaskStatusSubmitting, models.JobStatusRetryWait, downloadpkg.SourceTorrent, true)
+	fresh := create("new-distinct-download", models.DownloadTaskStatusQueued, models.JobStatusQueued, downloadpkg.SourceURL, false)
+	for _, task := range []models.DownloadTask{share, seed} {
+		if err := downloads.CancelPipeline(context.Background(), actor, task.ID, RequestContext{}); err != nil {
+			t.Fatal(err)
+		}
+		if err := queue.db.Model(&models.Job{}).Where("id = ?", task.JobID).Updates(map[string]any{"status": models.JobStatusRetryWait, "next_attempt_at": clock.Now().Add(time.Minute)}).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if claim, err := queue.Claim([]string{"download"}); err != nil || claim != nil {
+		t.Fatalf("old cancellation holds not reproduced: %+v %v", claim, err)
+	}
+	worker := NewDownloadWorker(downloads)
+	if err := worker.RecoverOfflineStops(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	claim, err := queue.Claim([]string{"download"})
+	if err != nil || claim == nil || claim.Job.ID != fresh.JobID {
+		t.Fatalf("cancelled preparation blocked new acquisition: %+v %v", claim, err)
+	}
+	if err := queue.RetryLater(claim.Job.ID, claim.LeaseToken, "", "", clock.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	clock.now = clock.Now().Add(2 * time.Minute)
+	if err := queue.PromoteDueRetries(); err != nil {
+		t.Fatal(err)
+	}
+	for n := 0; n < 2; n++ {
+		claim, err = queue.Claim([]string{"download"})
+		if err != nil || claim == nil {
+			t.Fatalf("control claim=%+v %v", claim, err)
+		}
+		result := worker.Run(context.Background(), workerRuntime{queue: queue, job: *claim}, *claim)
+		if result.RetryAt != nil || result.ErrorCode != "" {
+			t.Fatalf("preparation kept looping: %+v", result)
+		}
+		if err := queue.Complete(claim.Job.ID, claim.LeaseToken); err != nil {
+			t.Fatal(err)
+		}
+		var job models.Job
+		if err := queue.db.First(&job, "id = ?", claim.Job.ID).Error; err != nil || job.Status != models.JobStatusCancelled || job.NextAttemptAt != nil {
+			t.Fatalf("control did not terminate: %+v %v", job, err)
+		}
+	}
+	if client.reconciles != 0 || client.submits != 0 || client.cancelled {
+		t.Fatalf("preparation touched native task: reconciles=%d submits=%d cancel=%v", client.reconciles, client.submits, client.cancelled)
+	}
+	// A removed downloader config does not change the original share's lack of
+	// native dispatch. Its cancellation must still reach a terminal state.
+	orphan := create("share-with-removed-config", models.DownloadTaskStatusSubmitting, models.JobStatusFailed, downloadpkg.SourcePan115Share, false)
+	if err := queue.db.Model(&models.DownloadTask{}).Where("id = ?", orphan.ID).Updates(map[string]any{"downloader_id": nil, "provider_type": models.DownloaderTypePan115Offline}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := downloads.CancelPipeline(context.Background(), actor, orphan.ID, RequestContext{}); err != nil {
+		t.Fatal(err)
+	}
+	claim, err = queue.Claim([]string{"download"})
+	if err != nil || claim == nil || claim.Job.ID != orphan.JobID {
+		t.Fatalf("removed-config control claim=%+v %v", claim, err)
+	}
+	result := worker.Run(context.Background(), workerRuntime{queue: queue, job: *claim}, *claim)
+	if result.RetryAt != nil || result.ErrorCode != "" {
+		t.Fatalf("removed config kept unsubmitted share pending: %+v", result)
+	}
+	if err := queue.Complete(claim.Job.ID, claim.LeaseToken); err != nil {
+		t.Fatal(err)
+	}
+	cleanup := create("failed-owned-preparation", models.DownloadTaskStatusFailed, models.JobStatusFailed, downloadpkg.SourcePan115Share, true)
+	if err := queue.db.Model(&models.DownloadTask{}).Where("id = ?", cleanup.ID).Update("last_error_code", "downloader_preparation_failed").Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := downloads.Delete(context.Background(), actor, cleanup.ID, true, RequestContext{}); err != nil {
+		t.Fatal(err)
+	}
+	// A repeated record-only request cannot silently clear a previously accepted
+	// cleanup intent or claim that its files will be retained.
+	if err := downloads.Delete(context.Background(), actor, cleanup.ID, false, RequestContext{}); err != nil {
+		t.Fatal(err)
+	}
+	var cleanupJob models.Job
+	if err := queue.db.First(&cleanupJob, "id = ?", cleanup.JobID).Error; err != nil || !downloadControlDeletesData(cleanupJob.PayloadJSON) || strings.Contains(cleanupJob.LastErrorMessage, "源文件保留") {
+		t.Fatalf("cleanup intent/message lost: %+v %v", cleanupJob, err)
+	}
+	if len(client.cleaned) != 0 {
+		t.Fatal("HTTP deletion cleaned source outside a control lease")
+	}
+	claim, err = queue.Claim([]string{"download"})
+	if err != nil || claim == nil || claim.Job.ID != cleanup.JobID {
+		t.Fatalf("source cleanup was blocked by acquisition capacity: %+v %v", claim, err)
+	}
+	result = worker.Run(context.Background(), workerRuntime{queue: queue, job: *claim}, *claim)
+	if result.RetryAt != nil || result.ErrorCode != "" {
+		t.Fatalf("source cleanup failed: %+v", result)
+	}
+	if err := queue.Complete(claim.Job.ID, claim.LeaseToken); err != nil {
+		t.Fatal(err)
+	}
+	if len(client.cleaned) != 1 || client.cleaned[0] != cleanup.ProviderTag {
+		t.Fatalf("source cleanup scope=%v", client.cleaned)
+	}
+	var stored models.DownloadTask
+	if err := queue.db.First(&stored, "id = ?", cleanup.ID).Error; err != nil || stored.HistoryClearedAt == nil || stored.LastErrorCode != "" {
+		t.Fatalf("cleanup receipt/display state=%+v %v", stored, err)
+	}
+}
+
+func TestDownloadRetryExhaustionFinalizesDomainAndPreservesPreparationEvidence(t *testing.T) {
+	downloads, _, queue, actor, _ := downloadFixture(t)
+	clock := queue.clock.(*fakeQueueClock)
+	if err := queue.db.Model(&models.QueuePolicy{}).Where("job_type = ?", "download").Update("max_attempts", 2).Error; err != nil {
+		t.Fatal(err)
+	}
+	provider := models.Downloader{ID: "bounded-preparation-provider", OwnerID: actor.User.ID, Name: "Preparation", NameNormalized: "bounded-preparation", Type: models.DownloaderTypeFake, Enabled: true, MaxConcurrentDownloads: 2}
+	if err := queue.db.Create(&provider).Error; err != nil {
+		t.Fatal(err)
+	}
+	task := models.DownloadTask{ID: "bounded-preparation", OwnerID: actor.User.ID, DownloaderID: &provider.ID, ProviderType: provider.Type, DisplayName: "Bounded preparation", Phase: models.DownloadTaskStatusSubmitting, LastErrorCode: "downloader_preparation_failed"}
+	_, err := queue.EnqueueWith(EnqueueJobInput{OwnerID: actor.User.ID, JobType: "download", DisplayName: task.DisplayName, Payload: downloadJobPayload{DownloadTaskID: task.ID}}, func(tx *gorm.DB, job models.Job) error {
+		task.JobID = job.ID
+		return tx.Create(&task).Error
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for n := 0; n < 2; n++ {
+		claim, err := queue.Claim([]string{"download"})
+		if err != nil || claim == nil {
+			t.Fatalf("claim=%+v %v", claim, err)
+		}
+		if err := queue.RetryLater(claim.Job.ID, claim.LeaseToken, "downloader_preparation_failed", downloadFailureMessage("downloader_preparation_failed", true), clock.Now().Add(time.Minute)); err != nil {
+			t.Fatal(err)
+		}
+		clock.now = clock.Now().Add(time.Minute)
+		if err := queue.PromoteDueRetries(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var job models.Job
+	if err := queue.db.First(&job, "id = ?", task.JobID).Error; err != nil || job.Status != models.JobStatusFailed || job.FailureRetryCount != 2 || job.NextAttemptAt != nil {
+		t.Fatalf("preparation retries not bounded: %+v %v", job, err)
+	}
+	if err := queue.db.First(&task, "id = ?", task.ID).Error; err != nil || task.Phase != models.DownloadTaskStatusFailed || task.FinishedAt == nil || task.LastErrorMessage != job.LastErrorMessage || task.OfflineStartedAt != nil || task.OfflineSettledAt != nil {
+		t.Fatalf("terminal preparation projection=%+v %v", task, err)
+	}
+	if next, err := queue.Claim([]string{"download"}); err != nil || next != nil {
+		t.Fatalf("failed preparation claimed again: %+v %v", next, err)
+	}
+	// Older failed Jobs with stale submitting snapshots have the same read model.
+	task.Phase, task.LastErrorCode, task.LastErrorMessage = models.DownloadTaskStatusSubmitting, "downloader_unavailable", downloadFailureMessage("downloader_unavailable", true)
+	if err := queue.db.Save(&task).Error; err != nil {
+		t.Fatal(err)
+	}
+	rows, _, err := downloads.ListScoped(actor, DownloadListScopeActive, 10)
+	if err != nil || len(rows) != 1 || rows[0].Phase != models.DownloadTaskStatusFailed || rows[0].AcquisitionState != "" {
+		t.Fatalf("legacy failed projection=%+v %v", rows, err)
+	}
+	if summary := downloadTaskSummary(task, models.JobStatusFailed); summary.LastErrorMessage != downloadFailureMessage("downloader_unavailable", false) {
+		t.Fatalf("legacy terminal message still promises retries: %q", summary.LastErrorMessage)
+	}
+}
+
 func TestCloudOfflineDeadlineHistoryAndRequiredGoalLifecycle(t *testing.T) {
 	downloads, downloaders, queue, actor, _ := downloadFixture(t)
 	clock := queue.clock.(*fakeQueueClock)
@@ -1719,7 +1937,7 @@ func TestDeleteTerminalDownloadWithoutProviderIdentityIsSafeByDefaultAndDestruct
 	}
 }
 
-func TestDeleteTerminalDownloadRetainsLocalRecordWhenProviderCleanupCannotBeConfirmed(t *testing.T) {
+func TestDeleteTerminalDownloadHidesRecordAndRetainsPrivateCleanupWhenProviderUnavailable(t *testing.T) {
 	downloads, downloaders, queue, actor, client := downloadFixture(t)
 	actor.Permissions[authz.PermissionJobsControlOwn] = struct{}{}
 	root := t.TempDir()
@@ -1743,8 +1961,12 @@ func TestDeleteTerminalDownloadRetainsLocalRecordWhenProviderCleanupCannotBeConf
 		t.Fatal(err)
 	}
 	client.cancelErr = downloadpkg.Error("downloader_unavailable", true, errors.New("offline"))
-	if err := downloads.Delete(context.Background(), actor, created.ID, false, RequestContext{}); ErrorCode(err) != CodeDownloaderUnavailable {
-		t.Fatalf("provider failure error=%v", err)
+	if err := downloads.Delete(context.Background(), actor, created.ID, false, RequestContext{}); err != nil {
+		t.Fatalf("provider outage blocked display removal: %v", err)
+	}
+	visible, total, err := downloads.ListScoped(actor, DownloadListScopeAll, 20)
+	if err != nil || total != 0 || len(visible) != 0 {
+		t.Fatalf("removed record visible: %+v %v", visible, err)
 	}
 	var count int64
 	if err := queue.db.Model(&models.DownloadTask{}).Where("id = ?", created.ID).Count(&count).Error; err != nil || count != 1 {
@@ -1753,8 +1975,8 @@ func TestDeleteTerminalDownloadRetainsLocalRecordWhenProviderCleanupCannotBeConf
 	if err := queue.db.Model(&models.DownloadTask{}).Where("id = ?", created.ID).Update("downloader_id", nil).Error; err != nil {
 		t.Fatal(err)
 	}
-	if err := downloads.Delete(context.Background(), actor, created.ID, false, RequestContext{}); ErrorCode(err) != CodeDownloaderUnavailable {
-		t.Fatalf("missing downloader reference should retain provider-backed record: %v", err)
+	if err := downloads.Delete(context.Background(), actor, created.ID, false, RequestContext{}); err != nil {
+		t.Fatalf("repeat removal required a reachable downloader: %v", err)
 	}
 	if err := queue.db.Model(&models.DownloadTask{}).Where("id = ?", created.ID).Update("downloader_id", provider.ID).Error; err != nil {
 		t.Fatal(err)

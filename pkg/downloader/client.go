@@ -318,6 +318,9 @@ const (
 	FailureTaskDirectory       = "task_directory"
 	FailureOfflineSubmission   = "offline_submission"
 	FailureSelectionSubmission = "selection_submission"
+	FailurePreparation         = "preparation"
+	FailureSeedUpload          = "seed_upload"
+	FailureShareReceive        = "share_receive"
 )
 
 // FailureDiagnostic is a finite observation of the adapter boundary. Reaching
@@ -356,7 +359,7 @@ func WithFailureStage(err error, stage string) error {
 		return nil
 	}
 	switch stage {
-	case FailureTargetValidation, FailureTaskDirectory, FailureOfflineSubmission, FailureSelectionSubmission:
+	case FailureTargetValidation, FailureTaskDirectory, FailureOfflineSubmission, FailureSelectionSubmission, FailurePreparation, FailureSeedUpload, FailureShareReceive:
 		return &failureStageError{stage: stage, cause: err}
 	default:
 		return err
@@ -387,7 +390,7 @@ func FailureDiagnosticFromError(err error) (FailureDiagnostic, bool) {
 	if errors.As(err, &detail) {
 		operation, status, errno, kind := detail.ProviderFailureDetails()
 		switch operation {
-		case "submit", "reconcile", "cancel":
+		case "submit", "reconcile", "cancel", "share_receive":
 			diagnostic.ProviderOperation = operation
 		}
 		if status >= 100 && status <= 599 {

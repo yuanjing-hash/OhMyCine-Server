@@ -17,6 +17,15 @@ type selectedCloudFixture struct {
 	submissions, observations, cancellations int
 	request                                  cloud.SelectiveOfflineRequest
 	result                                   cloud.SelectiveOfflineSnapshot
+	preparationChecks                        int
+}
+
+func (f *selectedCloudFixture) AbandonSelectedOfflinePreparation(_ context.Context, r cloud.SelectiveOfflineRequest, remove bool) (bool, error) {
+	f.preparationChecks++
+	if r.ParentID != f.request.ParentID || r.Authority.Tag != f.request.Authority.Tag || string(r.Torrent) != string(f.request.Torrent) || remove {
+		return false, cloud.Error(cloud.CodeResponseInvalid, false, nil)
+	}
+	return true, nil
 }
 
 func (f *selectedCloudFixture) SupportsSelectiveOffline() bool { return f.supported }
@@ -107,6 +116,19 @@ func TestSelectedAdapterUsesOptionalDriverAndOwnManifestThroughoutBinding(t *tes
 	}
 	if until, _, ok := cloud.RetryTiming(err); !ok || !until.Equal(deadline) {
 		t.Fatal("selected failure lost provider cooldown")
+	}
+	driver.submitErr = cloud.WithPreparationFailure(cloud.Error(cloud.CodeUnavailable, true, context.DeadlineExceeded), "selective_offline_seed")
+	_, err = bound.Submit(context.Background(), downloader.SubmitRequest{Source: source, Tag: "omc-plan", ProviderDirectoryID: "intake"})
+	code, retryable = downloader.ErrorInfo(err)
+	diagnostic, ok = downloader.FailureDiagnosticFromError(err)
+	if code != "downloader_preparation_failed" || !retryable || !downloader.PreparationFailed(err) || !ok || diagnostic.Stage != downloader.FailureSeedUpload || !diagnostic.Timeout {
+		t.Fatal("preparation escaped as native ambiguity or lost its original cause", code, diagnostic)
+	}
+	if prepared, err := bound.(downloader.PreparationController).AbandonPreparation(context.Background(), downloader.SubmitRequest{Source: source, Tag: "omc-plan", ProviderDirectoryID: "intake"}, false); err != nil || !prepared || driver.preparationChecks != 1 {
+		t.Fatal("selected wrapper lost original preparation authority", prepared, err)
+	}
+	if prepared, err := bound.(downloader.PreparationController).AbandonPreparation(context.Background(), downloader.SubmitRequest{Source: source, Tag: "omc-plan"}, false); err == nil || prepared || driver.preparationChecks != 1 {
+		t.Fatal("current downloader default replaced original selected plan parent", prepared, err)
 	}
 	submissions := driver.submissions
 	recovered, err := bound.(downloader.SubmissionReconciler).ReconcileSubmission(context.Background(), downloader.SubmitRequest{Source: source, Tag: "omc-plan", ProviderDirectoryID: "intake"})
