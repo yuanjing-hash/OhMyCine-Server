@@ -353,6 +353,72 @@ func TestShareSubmissionUsesStableTaskDirectoryAndReconcilesRetry(t *testing.T) 
 	}
 }
 
+type expiredShareDriver struct {
+	*fakeShareDriver
+	inspectExpired bool
+}
+
+func (f *expiredShareDriver) InspectShare(ctx context.Context, raw string) (cloud.ShareSnapshot, error) {
+	if f.inspectExpired {
+		return cloud.ShareSnapshot{}, cloud.Error(cloud.CodeShareExpired, false, nil)
+	}
+	snapshot, err := f.fakeShareDriver.InspectShare(ctx, raw)
+	snapshot.Items[0].Size = 1024
+	return snapshot, err
+}
+
+func (f *expiredShareDriver) InspectShareDirectory(ctx context.Context, raw, _ string) (cloud.ShareSnapshot, error) {
+	return f.InspectShare(ctx, raw)
+}
+
+func (f *expiredShareDriver) ReceiveShare(context.Context, cloud.ShareSnapshot, string) error {
+	f.receiveCalls++
+	return cloud.Error(cloud.CodeShareExpired, false, nil)
+}
+
+func TestShareExpiredInspectionOrReceiveRemainsTerminal(t *testing.T) {
+	for _, selected := range []bool{false, true} {
+		for _, inspectExpired := range []bool{false, true} {
+			name := "whole_share"
+			if selected {
+				name = "selected_files"
+			}
+			if inspectExpired {
+				name += "/inspection"
+			} else {
+				name += "/receive"
+			}
+			t.Run(name, func(t *testing.T) {
+				driver := &expiredShareDriver{fakeShareDriver: newFakeShareDriver(), inspectExpired: inspectExpired}
+				client, err := New(downloader.Config{CloudDriver: driver, ProviderStorageRootID: "root", ProviderDirectoryID: "intake"})
+				if err != nil {
+					t.Fatal(err)
+				}
+				request := downloader.SubmitRequest{Source: downloader.Source{Kind: downloader.SourcePan115Share, URL: "https://115.com/s/expired?password=abcd"}, Tag: "omc-expired-share", ProviderDirectoryID: "intake"}
+				if selected {
+					request.Source.ShareSelection = &cloud.ShareSelection{Version: 1, Files: []cloud.ShareTreeItem{{ID: "shared-movie", RelativePath: "Movie.mkv", Size: 1024}}}
+				}
+				_, err = client.Submit(context.Background(), request)
+				code, retryable := downloader.ErrorInfo(err)
+				if code != "downloader_share_expired" || retryable {
+					t.Fatalf("expired share code=%q retryable=%t err=%v", code, retryable, err)
+				}
+				diagnostic, ok := downloader.FailureDiagnosticFromError(err)
+				if !ok || diagnostic.Stage != downloader.FailureShareReceive || diagnostic.ProviderCode != cloud.CodeShareExpired {
+					t.Fatalf("expiry diagnostic=%+v exists=%t", diagnostic, ok)
+				}
+				wantReceives := 1
+				if inspectExpired {
+					wantReceives = 0
+				}
+				if driver.receiveCalls != wantReceives || driver.submittedURI != "" {
+					t.Fatalf("receive calls=%d want=%d native=%q", driver.receiveCalls, wantReceives, driver.submittedURI)
+				}
+			})
+		}
+	}
+}
+
 func TestSharePreparationCancellationDoesNotRequireProviderAndCleanupIsTaskScoped(t *testing.T) {
 	driver := newFakeShareDriver()
 	client, _ := New(downloader.Config{CloudDriver: driver, ProviderStorageRootID: "root", ProviderDirectoryID: "intake"})

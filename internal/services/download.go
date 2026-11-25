@@ -3632,7 +3632,7 @@ func downloadFailureMessage(code string, retryable bool) string {
 	case quark.CodeIncomplete, quark.CodeInvalid:
 		return "夸克返回的目录或文件信息不完整，已停止本次处理"
 	case "downloader_share_expired", "node_source_share_expired":
-		return "115 分享已失效或已被取消，请重新选择资源"
+		return "115 分享已过期、失效或被取消，请更换有效分享后重新入库"
 	case "downloader_share_password_invalid", "node_source_share_password_invalid":
 		return "115 分享提取码有误，请核对原帖后重新搜索"
 	case "downloader_auth_failed":
@@ -3735,7 +3735,14 @@ func finalizeFailedDownloadTx(tx *gorm.DB, job models.Job, code, message string,
 	}).Error; err != nil {
 		return err
 	}
-	if code == "downloader_preparation_failed" && downloadPreparationCandidate(task) {
+	// A definite rejection of a local share receive is not a live native
+	// download. Finish its slot in the same transaction as the failed Job;
+	// established provider/output/native evidence keeps its original owner.
+	preparationEnded := code == "downloader_preparation_failed" ||
+		code == "downloader_share_expired" && task.ProviderType == models.DownloaderTypePan115Offline &&
+			task.SourceOrigin == models.DownloadSourceOriginShare && task.OfflineKind == "" &&
+			normalizeExecutionLocation(task.ExecutionLocation) == models.NodeLocationServer
+	if preparationEnded && downloadPreparationCandidate(task) {
 		if err := releaseDownloadCapacityTx(tx, task, now); err != nil {
 			return err
 		}
