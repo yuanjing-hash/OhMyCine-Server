@@ -340,6 +340,12 @@ func (t offlineDiagnosticTransport) RoundTrip(request *http.Request) (*http.Resp
 		// neither the raw response nor its message becomes an error cause.
 		observed := pan115sdk.GetErr(failure.providerErrno, string(raw))
 		failure.risk, failure.transient = isRiskResponse(observed), isTransientResponse(observed)
+		// Share metadata can remain readable after expiration. This receive
+		// rejection is permanent, but only an explicit boolean failure and the
+		// exact business code prove it; a lost/malformed response does not.
+		if operation == "share_receive" && expiredShareReceiveResponse(raw) {
+			return fail("provider_error", cloud.Error(cloud.CodeShareExpired, false, nil))
+		}
 		return fail("provider_error", pan115sdk.GetErr(failure.providerErrno))
 	}
 	response.Body.Close()
@@ -378,7 +384,12 @@ func (c *Client) Capabilities() cloud.Capabilities {
 	return cloud.Capabilities{NetworkDrive: true, DirectoryList: true, Watch: true, NativeOfflineDownload: true, ShareReceive: true, TemporaryDirectURL: true, SignedProxy: true, FileUpload: true, ChangeCursor: true, CreateDirectory: true, Move: true, Copy: true, Rename: true, Recycle: true}
 }
 
-const maxShareTopLevelItems = 1000
+const (
+	maxShareTopLevelItems = 1000
+	// The official share page defines ShareState.Expired = 7. The outer
+	// response state only indicates that the metadata request succeeded.
+	shareStateExpired = 7
+)
 
 var shareCodePattern = regexp.MustCompile(`^[A-Za-z0-9_-]{4,128}$`)
 var shareItemIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
@@ -457,6 +468,9 @@ func (c *Client) InspectShareDirectory(ctx context.Context, raw, directoryID str
 		}
 		if page == nil {
 			return cloud.ShareSnapshot{}, cloud.Error(cloud.CodeResponseInvalid, true, errors.New("115 returned no share snapshot"))
+		}
+		if page.Data.ShareState == shareStateExpired || page.Data.Shareinfo.ShareState == shareStateExpired {
+			return cloud.ShareSnapshot{}, cloud.Error(cloud.CodeShareExpired, false, nil)
 		}
 		if page.Data.Count > maxShareTopLevelItems {
 			return cloud.ShareSnapshot{}, cloud.Error(cloud.CodeShareTooLarge, false, errors.New("share contains too many top-level items"))

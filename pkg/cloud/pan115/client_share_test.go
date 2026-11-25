@@ -19,6 +19,8 @@ type shareTestSDK struct {
 	snapshot       *pan115sdk.ShareSnapResp
 	snapshotErr    error
 	pages          map[string]*pan115sdk.ShareSnapResp
+	sequence       []*pan115sdk.ShareSnapResp
+	snapshotCalls  int
 	usedUA         string
 	receivedCode   string
 	receivedSecret string
@@ -28,6 +30,12 @@ type shareTestSDK struct {
 
 func (s *shareTestSDK) GetShareSnapWithUA(ua string, _ string, _ string, dir string, _ ...pan115sdk.Query) (*pan115sdk.ShareSnapResp, error) {
 	s.usedUA = ua
+	s.snapshotCalls++
+	if len(s.sequence) > 0 {
+		page := s.sequence[0]
+		s.sequence = s.sequence[1:]
+		return page, s.snapshotErr
+	}
 	if s.pages != nil {
 		return s.pages[dir], s.snapshotErr
 	}
@@ -101,6 +109,61 @@ func TestInspectShareRejectsOversizedProviderCountBeforePartialReceive(t *testin
 	_, err := newOfflineTestClient(sdk).InspectShare(context.Background(), "https://115.com/s/share-code?password=abcd")
 	if code, retryable := cloud.ErrorInfo(err); code != cloud.CodeShareTooLarge || retryable {
 		t.Fatalf("error code=%q retryable=%t err=%v", code, retryable, err)
+	}
+}
+
+func TestInspectShareRecognizesExpiredMetadataBeforeReceive(t *testing.T) {
+	for _, fixture := range []struct {
+		name, data string
+		expired    bool
+	}{
+		{"legacy-state-absent", ``, false},
+		{"normal", `"share_state":1,"shareinfo":{"share_state":1,"expire_time":1789268348},`, false},
+		{"data-expired", `"share_state":7,`, true},
+		{"shareinfo-expired", `"shareinfo":{"share_state":"7","expire_time":1789268348},`, true},
+		{"both-expired-readable", `"share_state":7,"shareinfo":{"share_state":7,"expire_time":1789268348},`, true},
+	} {
+		t.Run(fixture.name, func(t *testing.T) {
+			page, err := decodeShareResponse(200, strings.NewReader(`{"state":true,"errno":0,"data":{`+fixture.data+`"count":1,"list":[{"fid":"movie","cid":"parent","n":"Movie.mkv","s":"1024","fc":1}]}}`))
+			if err != nil {
+				t.Fatal(err)
+			}
+			sdk := &shareTestSDK{bulkSDK: &bulkSDK{}, snapshot: page}
+			client := newOfflineTestClient(sdk)
+			snapshot, err := client.InspectShare(context.Background(), "https://115.com/s/share-code?password=abcd")
+			if fixture.expired {
+				if code, retryable := cloud.ErrorInfo(err); code != cloud.CodeShareExpired || retryable || len(snapshot.Items) != 0 || sdk.receivedCode != "" {
+					t.Fatalf("expired share remained receivable: code=%q retryable=%t snapshot=%+v err=%v", code, retryable, snapshot, err)
+				}
+				return
+			}
+			if err != nil || len(snapshot.Items) != 1 {
+				t.Fatalf("normal/legacy share was rejected: %+v %v", snapshot, err)
+			}
+			if err := client.ReceiveShare(context.Background(), snapshot, "owned-target"); err != nil || !reflect.DeepEqual(sdk.receivedIDs, []string{"movie"}) {
+				t.Fatalf("normal share did not receive its original file: %v", err)
+			}
+		})
+	}
+}
+
+func TestInspectShareRejectsExpiryOnLaterPageAndSelectedDirectory(t *testing.T) {
+	first := shareSnapshot(2, pan115sdk.ShareFile{FileID: "first", FileName: "First.mkv", IsFile: 1})
+	first.Data.ShareState = 1
+	expired := shareSnapshot(2, pan115sdk.ShareFile{FileID: "second", FileName: "Second.mkv", IsFile: 1})
+	expired.Data.Shareinfo.ShareState = shareStateExpired
+	sdk := &shareTestSDK{bulkSDK: &bulkSDK{}, sequence: []*pan115sdk.ShareSnapResp{first, expired}}
+	snapshot, err := newOfflineTestClient(sdk).InspectShare(context.Background(), "https://115.com/s/share-code?password=abcd")
+	if code, retryable := cloud.ErrorInfo(err); code != cloud.CodeShareExpired || retryable || len(snapshot.Items) != 0 || sdk.snapshotCalls != 2 || sdk.receivedCode != "" {
+		t.Fatalf("later page expiration exposed a partial share: %+v %v", snapshot, err)
+	}
+	root := shareSnapshot(1, pan115sdk.ShareFile{CategoryID: "folder", FileName: "Season", IsFile: 0})
+	sdk = &shareTestSDK{bulkSDK: &bulkSDK{}, pages: map[string]*pan115sdk.ShareSnapResp{"0": root, "folder": expired}}
+	client := newOfflineTestClient(sdk)
+	client.listRate = client.offlineRate
+	err = cloud.ReceiveSelectedShare(context.Background(), client, "https://115.com/s/share-code?password=abcd", cloud.ShareSelection{Version: 1, Files: []cloud.ShareTreeItem{{ID: "second", RelativePath: "Season/Second.mkv"}}}, "owned-target")
+	if code, retryable := cloud.ErrorInfo(err); code != cloud.CodeShareExpired || retryable || sdk.snapshotCalls != 2 || sdk.receivedCode != "" {
+		t.Fatalf("expired selected child directory reached receive: %v", err)
 	}
 }
 
@@ -242,4 +305,67 @@ func TestShareReceiveRetainsRequestLocalFailureCodesWithoutSecrets(t *testing.T)
 			t.Fatal("share secrets escaped the request boundary")
 		}
 	}
+}
+
+func TestShareReceiveExpiryRequiresExactConfirmedResponse(t *testing.T) {
+	for _, fixture := range []struct {
+		name, endpoint, body string
+		status               int
+		expired              bool
+	}{
+		{"expired", shareReceiveEndpoint, `{"state":false,"errno":4100018,"error":"private-secret"}`, 200, true},
+		{"string-code", shareReceiveEndpoint, `{"state":false,"errno":"4100018"}`, 200, true},
+		{"alternate-code", shareReceiveEndpoint, `{"state":false,"errNo":4100018}`, 200, true},
+		{"missing-state", shareReceiveEndpoint, `{"errno":4100018}`, 200, false},
+		{"null-state", shareReceiveEndpoint, `{"state":null,"errno":4100018}`, 200, false},
+		{"invalid-code", shareReceiveEndpoint, `{"state":false,"errno":"invalid","errNo":4100018}`, 200, false},
+		{"other-business-code", shareReceiveEndpoint, `{"state":false,"errno":12345}`, 200, false},
+		{"http-error", shareReceiveEndpoint, `{"state":false,"errno":4100018}`, 503, false},
+		{"native-submit", "https://lixian.115.com/lixianssp/?ac=add_task_urls", `{"state":false,"errno":4100018}`, 200, false},
+	} {
+		t.Run(fixture.name, func(t *testing.T) {
+			calls := 0
+			transport := offlineDiagnosticTransport{base: shareReadTransport(func(r *http.Request) (*http.Response, error) {
+				calls++
+				return &http.Response{StatusCode: fixture.status, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(fixture.body)), Request: r}, nil
+			})}
+			request, _ := http.NewRequest(http.MethodPost, fixture.endpoint, nil)
+			_, wireErr := transport.RoundTrip(request)
+			err := mapError(wireErr)
+			code, retryable := cloud.ErrorInfo(err)
+			if calls != 1 || (code == cloud.CodeShareExpired) != fixture.expired || retryable == fixture.expired {
+				t.Fatalf("wrong receive classification: code=%q retryable=%t calls=%d err=%v", code, retryable, calls, err)
+			}
+			diagnostic, ok := downloader.FailureDiagnosticFromError(downloader.WithFailureStage(err, downloader.FailureShareReceive))
+			if !ok || diagnostic.ProviderHTTPStatus != fixture.status || strings.Contains(err.Error(), "private-secret") {
+				t.Fatalf("lost safe diagnostic: %+v %v", diagnostic, err)
+			}
+		})
+	}
+	t.Run("transport-timeout", func(t *testing.T) {
+		transport := offlineDiagnosticTransport{base: shareReadTransport(func(*http.Request) (*http.Response, error) {
+			return nil, context.DeadlineExceeded
+		})}
+		request, _ := http.NewRequest(http.MethodPost, shareReceiveEndpoint, nil)
+		_, wireErr := transport.RoundTrip(request)
+		err := mapError(wireErr)
+		if code, retryable := cloud.ErrorInfo(err); code != cloud.CodeUnavailable || !retryable || !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("uncertain write became a permanent refusal: %v", err)
+		}
+	})
+	t.Run("successful-receive", func(t *testing.T) {
+		transport := offlineDiagnosticTransport{base: shareReadTransport(func(r *http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: 200, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{"state":true,"errno":0}`)), Request: r}, nil
+		})}
+		request, _ := http.NewRequest(http.MethodPost, shareReceiveEndpoint, nil)
+		response, err := transport.RoundTrip(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer response.Body.Close()
+		body, err := io.ReadAll(response.Body)
+		if err != nil || string(body) != `{"state":true,"errno":0}` {
+			t.Fatalf("successful receive response changed: %q %v", body, err)
+		}
+	})
 }

@@ -101,3 +101,32 @@ func shareProviderErrorCode(code int) (string, bool) {
 	// Unknown provider codes do not prove that a share has expired.
 	return cloud.CodeUnavailable, true
 }
+
+// Keep this receive-only classification separate from share/snap and native
+// offline errors. In particular, a missing state is not a rejected write.
+func expiredShareReceiveResponse(raw []byte) bool {
+	var response struct {
+		State *bool       `json:"state"`
+		Errno json.Number `json:"errno"`
+		ErrNo json.Number `json:"errNo"`
+	}
+	if json.Unmarshal(raw, &response) != nil || response.State == nil || *response.State {
+		return false
+	}
+	code := int64(0)
+	if response.Errno != "" {
+		var err error
+		code, err = response.Errno.Int64()
+		if err != nil {
+			return false
+		}
+	}
+	if code == 0 && response.ErrNo != "" {
+		var err error
+		code, err = response.ErrNo.Int64()
+		if err != nil {
+			return false
+		}
+	}
+	return code == 4100018
+}
