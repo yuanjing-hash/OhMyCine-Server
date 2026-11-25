@@ -5,11 +5,13 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/authz"
 	serverlog "github.com/yuanjing-hash/OhMyCine-Server/internal/logging"
@@ -365,7 +367,7 @@ func mediaIdentityResultMatches(title string, names []tmdb.SearchName, mediaType
 // Only a release title with the expected coordinates can bind recognition.
 // Subtitle evidence and missing season data can help find inspectable files.
 func mediaIdentityResultEvidence(title, subtitle string, names []tmdb.SearchName, mediaType string, year, season *int) (matchedName string, titleMatched bool) {
-	parsed, err := mediarecognition.Parse(mediarecognition.InputFacts{PackageName: title, SourceKind: mediarecognition.SourceDownload})
+	parsed, err := parseIdentityResultTitle(title, names)
 	if err != nil || parsed.CanonicalTitle == "" || season != nil && parsed.Season != nil && *season != *parsed.Season {
 		return "", false
 	}
@@ -382,11 +384,92 @@ func mediaIdentityResultEvidence(title, subtitle string, names []tmdb.SearchName
 	if subtitle == "" {
 		return "", false
 	}
-	parsedSubtitle, err := mediarecognition.Parse(mediarecognition.InputFacts{PackageName: subtitle, SourceKind: mediarecognition.SourceDownload})
+	parsedSubtitle, err := parseIdentityResultTitle(subtitle, names)
 	if err != nil {
 		return "", false
 	}
 	return exactIdentitySearchName(parsedSubtitle, names), false
+}
+
+// A verified name such as 寒战1994 contains a number, not release-year
+// evidence. Protect complete official names while the existing parser removes
+// release metadata, then restore them before applying the same exact-name test.
+func parseIdentityResultTitle(title string, names []tmdb.SearchName) (mediarecognition.ParsedFacts, error) {
+	parsed, err := mediarecognition.Parse(mediarecognition.InputFacts{PackageName: title, SourceKind: mediarecognition.SourceDownload})
+	if err != nil {
+		return parsed, err
+	}
+	for _, name := range names {
+		key := identitySearchKey(name.Value)
+		if strings.ContainsFunc(key, unicode.IsDigit) && identitySearchKey(parsed.CanonicalTitle) == key {
+			// The parser already kept the entire numeric name. Its remaining
+			// year is separate evidence, including 1984 (1984).
+			return parsed, nil
+		}
+	}
+	normalized := cases.Fold().String(norm.NFKC.String(title))
+	protected := normalized
+	ordered := append([]tmdb.SearchName(nil), names...)
+	sort.SliceStable(ordered, func(i, j int) bool {
+		return len(identitySearchKey(ordered[i].Value)) > len(identitySearchKey(ordered[j].Value))
+	})
+	var replacements []string
+	for _, name := range ordered {
+		key := identitySearchKey(name.Value)
+		if !strings.ContainsFunc(key, unicode.IsDigit) {
+			continue
+		}
+		letters := strings.Split(key, "")
+		for i := range letters {
+			letters[i] = regexp.QuoteMeta(letters[i])
+		}
+		// Filename separators are interchangeable; brackets and alias
+		// separators are not: 寒战 (1994) is not the full name 寒战1994.
+		matches := regexp.MustCompile(strings.Join(letters, `[\p{Z}\s._+:·-]*`)).FindAllStringIndex(protected, -1)
+		for i := len(matches) - 1; i >= 0; i-- {
+			start, end := matches[i][0], matches[i][1]
+			before, _ := utf8.DecodeLastRuneInString(protected[:start])
+			after, _ := utf8.DecodeRuneInString(protected[end:])
+			if unicode.IsLetter(before) || unicode.IsNumber(before) || unicode.IsLetter(after) || unicode.IsNumber(after) {
+				continue
+			}
+			if !strings.ContainsFunc(key, unicode.IsLetter) {
+				prefix := strings.TrimSpace(protected[:start])
+				if strings.ContainsFunc(prefix, func(r rune) bool { return unicode.IsLetter(r) || unicode.IsNumber(r) }) &&
+					!strings.HasSuffix(prefix, "/") && !strings.HasSuffix(prefix, "|") {
+					// A number after another title is independent metadata unless
+					// an explicit alias boundary introduces this numeric name.
+					continue
+				}
+			}
+			original := protected[start:end]
+			prefix, suffix, extra := "ohmycinenumeric", "title", "a"
+			if strings.ContainsFunc(original, func(r rune) bool { return unicode.IsLetter(r) && !unicode.Is(unicode.Latin, r) }) {
+				prefix, suffix, extra = "片名数字", "占位", "甲"
+			}
+			// Each marker is absent from the original input and already inserted
+			// markers, so restoration never rewrites an upstream literal.
+			marker := prefix + strings.Repeat(extra, len(replacements)/2+1) + suffix
+			for strings.Contains(normalized, marker) || strings.Contains(protected, marker) {
+				marker = prefix + extra + strings.TrimPrefix(marker, prefix)
+			}
+			replacements = append(replacements, marker, original)
+			protected = protected[:start] + marker + protected[end:]
+		}
+	}
+	if len(replacements) == 0 {
+		return parsed, nil
+	}
+	parsed, err = mediarecognition.Parse(mediarecognition.InputFacts{PackageName: protected, SourceKind: mediarecognition.SourceDownload})
+	if err != nil {
+		return parsed, err
+	}
+	restore := strings.NewReplacer(replacements...)
+	parsed.CanonicalTitle = restore.Replace(parsed.CanonicalTitle)
+	for i := range parsed.Queries {
+		parsed.Queries[i].Title = restore.Replace(parsed.Queries[i].Title)
+	}
+	return parsed, nil
 }
 
 func exactIdentitySearchName(parsed mediarecognition.ParsedFacts, names []tmdb.SearchName) string {

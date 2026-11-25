@@ -854,6 +854,79 @@ func TestMediaIdentityEvidenceUsesWholeNames(t *testing.T) {
 	}
 }
 
+func TestMediaIdentityEvidencePreservesOfficialTitleNumbers(t *testing.T) {
+	names := []tmdb.SearchName{{Value: "寒战1994"}, {Value: "寒戰1994"}, {Value: "Cold War 1994"}}
+	year, season := 2026, 1
+	for _, tc := range []struct {
+		title, subtitle string
+		name            string
+		matchesTitle    bool
+	}{
+		{title: "寒战1994", name: "寒战1994", matchesTitle: true},
+		{title: "寒战1994.2160p.WEB-DL.H265", name: "寒战1994", matchesTitle: true},
+		{title: "寒战1994 (2026)", name: "寒战1994", matchesTitle: true},
+		{title: "寒战1994.2026.2160p.WEB-DL.H265", name: "寒战1994", matchesTitle: true},
+		{title: "寒戰1994.2026.1080p", name: "寒戰1994", matchesTitle: true},
+		{title: "Cold.War.1994.2160p.WEB-DL", name: "Cold War 1994", matchesTitle: true},
+		{title: "寒战1994 / Cold War 1994 (2026)", name: "寒战1994", matchesTitle: true},
+		{title: "寒战1994 Cold War 1994 2160p WEB-DL", name: "寒战1994", matchesTitle: true},
+		{title: "寒战１９９４.2026.2160p", name: "寒战1994", matchesTitle: true},
+		{title: "寒战1994 (2025)", name: "寒战1994", matchesTitle: true},
+		{title: "寒战1994 (2012)"},
+		{title: "寒战 (1994)"},
+		{title: "寒战[1994].2160p"},
+		{title: "寒战1994.2012.2160p.WEB-DL.H265"},
+		{title: "2012 寒战1994 2160p"},
+		{title: "寒战1994 / Cold War 1994 (2012)"},
+		{title: "寒战1994续集"},
+		{title: "寒战19940.2160p"},
+		{title: "新寒战1994.2160p"},
+		{title: "前传 寒战1994.2160p"},
+		{title: "寒战1994 续集.2160p"},
+		{title: "The Cold War 1994 Story.2160p"},
+		{title: "片名数字甲占位 寒战1994.2160p"},
+		{title: "ohmycinenumericatitle Cold War 1994.2160p"},
+		{title: "Movie pack", subtitle: "寒战1994 / Cold War 1994", name: "寒战1994"},
+	} {
+		t.Run(tc.title+tc.subtitle, func(t *testing.T) {
+			name, matchesTitle := mediaIdentityResultEvidence(tc.title, tc.subtitle, names, "movie", &year, nil)
+			if name != tc.name || matchesTitle != tc.matchesTitle {
+				t.Fatalf("evidence = %q/%t, want %q/%t", name, matchesTitle, tc.name, tc.matchesTitle)
+			}
+		})
+	}
+	for _, tc := range []struct {
+		name, title string
+		year        int
+		matches     bool
+	}{
+		{"1917", "1917.1080p.BluRay", 2019, true},
+		{"1917", "1917 (2019)", 2019, true},
+		{"1917", "1917 (2012)", 2019, false},
+		{"1917", "其他 1917.1080p", 2019, false},
+		{"1984", "1984", 1984, true},
+		{"1984", "1984.1984.1080p", 1984, true},
+		{"1984", "1984 (1984)", 2026, false},
+		{"1984", "1984 (2012)", 1984, false},
+		{"1984", "19840.1080p", 1984, false},
+	} {
+		t.Run(tc.title, func(t *testing.T) {
+			if got := mediaIdentityResultMatches(tc.title, []tmdb.SearchName{{Value: tc.name}}, "movie", &tc.year, nil); got != tc.matches {
+				t.Fatalf("matches = %t, want %t", got, tc.matches)
+			}
+		})
+	}
+	if mediaIdentityResultMatches("寒战1994 / Cold War 1994 (1984)", append(names, tmdb.SearchName{Value: "1984"}), "movie", &year, nil) {
+		t.Fatal("an independent release year was protected as another numeric alias")
+	}
+	for _, title := range []string{"寒战1994.S01E05.1080p", "寒战1994.S02E05.1080p", "寒战1994.1080p"} {
+		want := strings.Contains(title, "S01E05")
+		if got := mediaIdentityResultMatches(title, names, "tv", &year, &season); got != want {
+			t.Fatalf("season-scoped %q = %t, want %t", title, got, want)
+		}
+	}
+}
+
 func TestSiteResultRecognitionReturnsStructuredEpisodeFactsWithoutInventingSpecialEpisodes(t *testing.T) {
 	service, adapter, actor, _, _, _ := siteFixture(t)
 	created, err := service.Create(context.Background(), actor, validSiteInput("Episode facts", "https://episodes.example.test"), RequestContext{})
