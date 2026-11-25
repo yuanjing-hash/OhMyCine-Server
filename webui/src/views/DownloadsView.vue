@@ -377,7 +377,7 @@ async function sendIntake(request: IntakeRequest) {
   intakeSubmitting.value = true
   try {
     if (request.kind === 'batch') {
-      const response = await api<{ submitted: number; failed: number; results: Array<{ index: number; task?: DownloadTaskSummary; error_code?: string; offline_failure_warning?: unknown }> }>('/api/v1/downloads/batch', { method: 'POST', body: JSON.stringify({ ...request.payload, sources: request.sources, ...(request.overrides ? { offline_failure_overrides: request.overrides } : {}) }) })
+      const response = await api<{ submitted: number; failed: number; results: Array<{ index: number; task?: DownloadTaskSummary; error_code?: string; message?: string; offline_failure_warning?: unknown }> }>('/api/v1/downloads/batch', { method: 'POST', body: JSON.stringify({ ...request.payload, sources: request.sources, ...(request.overrides ? { offline_failure_overrides: request.overrides } : {}) }) })
       if (!current()) return
       const accepted = new Set(response.results.filter(item => item.task && Number.isInteger(item.index) && item.index >= 0 && item.index < request.sources.length).map(item => request.sources[item.index]!))
       const warnings = response.results.flatMap(item => {
@@ -385,16 +385,18 @@ async function sendIntake(request: IntakeRequest) {
         const source = Number.isInteger(item.index) && item.index >= 0 ? request.sources[item.index] : undefined
         return warning && source && !accepted.has(source) ? [{ source, warning }] : []
       })
+      const failureDetails = response.results.filter(item => !item.task && item.error_code !== offlineConfirmationCode).map(item => `第 ${item.index + 1} 个链接：${item.message || '提交失败'}`).join('；')
+      const failureSuffix = failureDetails ? `。${failureDetails}` : ''
       // Keep failed input, and never submit accepted items again while confirming a partial batch.
       const remaining = parseDownloadSourceLines(submitForm.value.sourceURL).sources.filter(source => !accepted.has(source))
       submitForm.value.sourceURL = remaining.join('\n')
       offlineIntake.value = warnings.length ? { key: intakeContext.value, count: warnings.length, sourceIndexes: warnings.map(item => remaining.indexOf(item.source) + 1), request: { kind: 'batch', payload: request.payload, sources: warnings.map(item => item.source), overrides: warnings.map((item, index) => ({ index, confirmation_token: item.warning.confirmation_token })) } } : null
       if (warnings.length) {
-        notify(`已入队 ${response.submitted} 个，${warnings.length} 个资源需要确认；未入队链接已保留`, 'warning')
+        notify(`已入队 ${response.submitted} 个，${warnings.length} 个资源需要确认；未入队链接已保留${failureSuffix}`, 'warning')
         await load(false, true)
         return
       }
-      if (response.failed > 0) { notify(`已入队 ${response.submitted} 个，失败 ${response.failed} 个；失败链接已保留`, response.submitted > 0 ? 'warning' : 'error'); await load(false, true); return }
+      if (response.failed > 0) { notify(`已入队 ${response.submitted} 个，失败 ${response.failed} 个；失败链接已保留${failureSuffix}`, response.submitted > 0 ? 'warning' : 'error'); await load(false, true); return }
       notify(`已入队 ${response.submitted} 个下载任务`, 'success')
     } else {
       await api<DownloadTaskSummary>('/api/v1/downloads', { method: 'POST', body: JSON.stringify(request.payload) })

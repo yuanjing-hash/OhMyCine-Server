@@ -12,6 +12,7 @@ import (
 	"github.com/yuanjing-hash/OhMyCine-Server/internal/models"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud"
 	"github.com/yuanjing-hash/OhMyCine-Server/pkg/cloud/pan115"
+	"gorm.io/gorm"
 )
 
 // Validity describes a read at a point in time, never a guarantee of transfer.
@@ -40,21 +41,7 @@ func shareSourceDigest(raw string) string {
 
 func (s *SiteService) rememberShareValidation(actor Actor, raw, downloaderID, config string, err error) SiteShareValidation {
 	now := s.now()
-	v := SiteShareValidation{Status: "valid", Message: "已验证可读取", CheckedAt: now, ExpiresAt: now.Add(5 * time.Minute), DownloaderID: downloaderID}
-	if err != nil {
-		v.Status = "unavailable"
-		v.ErrorCode, _ = cloud.ErrorInfo(err)
-		v.Message = ErrorMessage(sharePreviewProviderError(err))
-		v.ExpiresAt = now.Add(15 * time.Second)
-		switch v.ErrorCode {
-		case cloud.CodeShareExpired:
-			v.Status = "expired"
-			v.ExpiresAt = now.Add(2 * time.Minute)
-		case cloud.CodeSharePassword:
-			v.Status = "password_required"
-			v.ExpiresAt = now.Add(2 * time.Minute)
-		}
-	}
+	v := shareValidationResult(now, downloaderID, err)
 	source := shareSourceDigest(raw)
 	if source == "" {
 		return v
@@ -83,6 +70,55 @@ func (s *SiteService) rememberShareValidation(actor Actor, raw, downloaderID, co
 	}
 	s.shareValidations[key] = siteShareValidationEntry{ActorID: actor.User.ID, SourceDigest: source, ConfigDigest: config, Validation: v}
 	return v
+}
+
+func shareValidationResult(now time.Time, downloaderID string, err error) SiteShareValidation {
+	v := SiteShareValidation{Status: "valid", Message: "已验证可读取", CheckedAt: now, ExpiresAt: now.Add(5 * time.Minute), DownloaderID: downloaderID}
+	if err != nil {
+		v.Status = "unavailable"
+		v.ErrorCode, _ = cloud.ErrorInfo(err)
+		v.Message = ErrorMessage(sharePreviewProviderError(err))
+		v.ExpiresAt = now.Add(15 * time.Second)
+		switch v.ErrorCode {
+		case cloud.CodeShareExpired:
+			v.Status = "expired"
+			v.ExpiresAt = now.Add(2 * time.Minute)
+		case cloud.CodeSharePassword:
+			v.Status = "password_required"
+			v.ExpiresAt = now.Add(2 * time.Minute)
+		}
+	}
+	return v
+}
+
+func (v *siteShareValidationEntry) guard(db *gorm.DB, ownerID uint, downloaderID, raw string) error {
+	if v == nil || v.Validation.Status != "valid" || v.ActorID != ownerID || v.Validation.DownloaderID != downloaderID || v.SourceDigest == "" || v.SourceDigest != shareSourceDigest(raw) {
+		return sharePreviewExpired()
+	}
+	current, _, err := sharePreviewConfig(db, downloaderID)
+	if err != nil || current != v.ConfigDigest {
+		return sharePreviewExpired()
+	}
+	return nil
+}
+
+// New manual and selected child tasks use the same current read as site
+// submission. Display cache entries are never looked up to admit a task.
+func (s *DownloadService) validateShareSubmission(ctx context.Context, ownerID uint, downloaderID, kind, raw string) (*siteShareValidationEntry, error) {
+	_, digest, _, err := s.inspectConfiguredShare(ctx, downloaderID, kind, raw, false)
+	validation := shareValidationResult(time.Now().UTC(), downloaderID, err)
+	if err != nil {
+		var app *AppError
+		if errors.As(err, &app) || errors.Is(err, context.Canceled) {
+			return nil, err
+		}
+		safe := sharePreviewProviderError(err)
+		if errors.As(safe, &app) {
+			app.ShareValidation = &validation
+		}
+		return nil, safe
+	}
+	return &siteShareValidationEntry{ActorID: ownerID, SourceDigest: shareSourceDigest(raw), ConfigDigest: digest, Validation: validation}, nil
 }
 
 // Search only reads remembered evidence. It never contacts 115.
@@ -123,14 +159,6 @@ func (s *SiteService) inspectResultShare(ctx context.Context, actor Actor, claim
 	if !actor.CanResource(authz.PermissionDownloadsCreate, models.AuthorizationResourceDownloader, downloaderID) {
 		return nil, "", validation, appError(CodePermissionDenied, "无权使用这个下载器", nil)
 	}
-	digest, connectionID, err := sharePreviewConfig(s.db.WithContext(ctx), downloaderID)
-	if err != nil {
-		return nil, "", validation, err
-	}
-	var selected models.Downloader
-	if err := s.db.WithContext(ctx).First(&selected, "id = ?", downloaderID).Error; err != nil || !routeDownloaderApplicable(claimCloudSource(claim), selected) {
-		return nil, "", validation, appError(CodeDownloadSourceInvalid, "所选接收器与分享网盘不一致", nil)
-	}
 	if s.downloads == nil || s.downloads.downloader == nil || s.downloads.downloader.connections == nil {
 		return nil, "", validation, appError(CodeDownloaderUnavailable, "下载服务不可用", nil)
 	}
@@ -146,47 +174,8 @@ func (s *SiteService) inspectResultShare(ctx context.Context, actor Actor, claim
 	if full {
 		stage = "tree"
 	}
-	_, driver, err := s.downloads.downloader.connections.driver(connectionID)
-	if err == nil {
-		// Preserve the explicit operation's saved-authorization recovery before
-		// checking the current local root proof and receiving configuration.
-		if _, readinessErr := s.downloads.downloader.configuredShareReceiver(ctx, selected); readinessErr != nil {
-			return nil, "", validation, readinessErr
-		}
-	}
-	var entries []cloud.ShareTreeItem
-	if err == nil {
-		if full {
-			if browse, ok := driver.(cloud.ShareBrowseDriver); ok {
-				_, entries, err = cloud.InspectShareTree(ctx, browse, raw)
-			} else {
-				err = cloud.Error(cloud.CodeUnavailable, false, nil)
-			}
-		} else {
-			if share, ok := driver.(cloud.ShareReceiveDriver); ok {
-				_, err = share.InspectShare(ctx, raw)
-			} else {
-				err = cloud.Error(cloud.CodeUnavailable, false, nil)
-			}
-		}
-	}
-	if errors.Is(ctx.Err(), context.Canceled) {
-		return nil, "", validation, ctx.Err()
-	}
-	// A short local fence can outlive the read deadline; it must not turn a
-	// provider timeout into a misleading account-configuration error.
-	fenceCtx := ctx
-	if ctx.Err() != nil {
-		var fenceCancel context.CancelFunc
-		fenceCtx, fenceCancel = context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
-		defer fenceCancel()
-	}
-	// Never accept evidence after an account/configuration change during I/O.
-	current, _, configErr := sharePreviewConfig(s.db.WithContext(fenceCtx), downloaderID)
-	if configErr != nil || current != digest {
-		return nil, "", validation, sharePreviewExpired()
-	}
-	if errors.Is(err, context.Canceled) {
+	entries, digest, connectionID, err := s.downloads.inspectConfiguredShare(ctx, downloaderID, claimCloudSource(claim), raw, full)
+	if digest == "" && err != nil {
 		return nil, "", validation, err
 	}
 	validation = s.rememberShareValidation(actor, raw, downloaderID, digest, err)
@@ -214,4 +203,66 @@ func (s *SiteService) inspectResultShare(ctx context.Context, actor Actor, claim
 		return nil, digest, validation, safe
 	}
 	return entries, digest, validation, nil
+}
+
+// Reads only the original share; creating a provider workspace or receiving
+// files remains exclusively in the accepted task's worker.
+func (s *DownloadService) inspectConfiguredShare(ctx context.Context, downloaderID, kind, raw string, full bool) ([]cloud.ShareTreeItem, string, uint, error) {
+	if s.downloader == nil || s.downloader.connections == nil {
+		return nil, "", 0, appError(CodeDownloaderUnavailable, "下载服务不可用", nil)
+	}
+	ctx, cancel := context.WithTimeout(ctx, 45*time.Second)
+	defer cancel()
+	digest, connectionID, err := sharePreviewConfig(s.db.WithContext(ctx), downloaderID)
+	if err != nil {
+		return nil, "", 0, err
+	}
+	var selected models.Downloader
+	if err := s.db.WithContext(ctx).First(&selected, "id = ?", downloaderID).Error; err != nil || !routeDownloaderApplicable(kind, selected) {
+		return nil, "", 0, appError(CodeDownloadSourceInvalid, "所选接收器与分享网盘不一致", nil)
+	}
+	_, driver, err := s.downloader.connections.driver(connectionID)
+	if err == nil {
+		// Preserve the explicit operation's saved-authorization recovery before
+		// checking the current local root proof and receiving configuration.
+		if _, readinessErr := s.downloader.configuredShareReceiver(ctx, selected); readinessErr != nil {
+			return nil, "", 0, readinessErr
+		}
+	}
+	var entries []cloud.ShareTreeItem
+	if err == nil {
+		if full {
+			if browse, ok := driver.(cloud.ShareBrowseDriver); ok {
+				_, entries, err = cloud.InspectShareTree(ctx, browse, raw)
+			} else {
+				err = cloud.Error(cloud.CodeUnavailable, false, nil)
+			}
+		} else {
+			if share, ok := driver.(cloud.ShareReceiveDriver); ok {
+				_, err = share.InspectShare(ctx, raw)
+			} else {
+				err = cloud.Error(cloud.CodeUnavailable, false, nil)
+			}
+		}
+	}
+	if errors.Is(ctx.Err(), context.Canceled) {
+		return nil, "", 0, ctx.Err()
+	}
+	// A short local fence can outlive the read deadline; it must not turn a
+	// provider timeout into a misleading account-configuration error.
+	fenceCtx := ctx
+	if ctx.Err() != nil {
+		var fenceCancel context.CancelFunc
+		fenceCtx, fenceCancel = context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+		defer fenceCancel()
+	}
+	// Never accept evidence after an account/configuration change during I/O.
+	current, _, configErr := sharePreviewConfig(s.db.WithContext(fenceCtx), downloaderID)
+	if configErr != nil || current != digest {
+		return nil, "", 0, sharePreviewExpired()
+	}
+	if errors.Is(err, context.Canceled) {
+		return nil, "", 0, err
+	}
+	return entries, digest, connectionID, err
 }
