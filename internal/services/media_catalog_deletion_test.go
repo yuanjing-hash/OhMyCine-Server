@@ -27,9 +27,35 @@ type pan115CatalogDeletionFixture struct {
 	entries []models.MediaLibraryEntry
 }
 
+type catalogDeletionReadFixture struct {
+	*fakeMutationCloudDriver
+	t *testing.T
+}
+
+func (d *catalogDeletionReadFixture) Stat(ctx context.Context, id string) (cloudpkg.Item, error) {
+	d.t.Helper()
+	deadline, bounded := ctx.Deadline()
+	if cloudpkg.ReadClassFromContext(ctx) != cloudpkg.ReadClassInteractive || !bounded || time.Until(deadline) > transferDeletionTimeout {
+		d.t.Fatal("deletion must use bounded interactive provider reads")
+	}
+	return d.fakeMutationCloudDriver.Stat(ctx, id)
+}
+
 func newPan115CatalogDeletionFixture(t *testing.T, fileCount int) pan115CatalogDeletionFixture {
 	t.Helper()
 	cloudFixture := newCloudTransferFixture(t, models.MediaLibraryTransferMove, models.MediaLibraryConflictOverwrite, false)
+	secrets, err := credential.Open(filepath.Join(t.TempDir(), "credential.key"), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ciphertext, err := secrets.Encrypt(connectionPurpose(cloudFixture.connection, cloudpkg.ProviderPan115), testPan115Cookie)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cloudFixture.queue.db.Model(&models.Connection{}).Where("id = ?", cloudFixture.connection).Update("credential_ciphertext", ciphertext).Error; err != nil {
+		t.Fatal(err)
+	}
+	cloudFixture.service.connections.credentials = secrets
 	service := NewMediaLibraryService(cloudFixture.queue.db, cloudFixture.queue.audit, zerolog.Nop())
 	service.SetConnectionService(cloudFixture.service.connections)
 	var user models.User
@@ -105,14 +131,36 @@ func TestPan115CatalogDeletionRejectsProviderIdentityDrift(t *testing.T) {
 
 func TestPan115CatalogDeletionUsesExactRecycleAndConvergesMissing(t *testing.T) {
 	t.Run("recycle", func(t *testing.T) {
-		fixture := newPan115CatalogDeletionFixture(t, 1)
-		preview := fixture.preview(t)
-		result, err := fixture.service.ConfirmCatalogDeletion(context.Background(), fixture.actor, fixture.library.ID, fixture.work, preview.ConfirmationToken, RequestContext{})
+		fixture := newPan115CatalogDeletionFixture(t, 25)
+		for id := range fixture.service.connections.drivers {
+			fixture.service.connections.drivers[id] = &catalogDeletionReadFixture{fixture.driver, t}
+		}
+		fixture.driver.statErrors[fixture.entries[0].ProviderID] = context.DeadlineExceeded
+		if _, err := fixture.service.PreviewCatalogDeletionProgress(context.Background(), fixture.actor, fixture.library.ID, fixture.work, RequestContext{}, nil); ErrorCode(err) != CodeMediaCatalogDeletionUnavailable {
+			t.Fatalf("timeout must not report identity drift: %v", err)
+		}
+		delete(fixture.driver.statErrors, fixture.entries[0].ProviderID)
+		fixture.driver.statCalls = 0
+		var progress MediaCatalogDeletionProgress
+		report := func(value MediaCatalogDeletionProgress) { progress = value }
+		preview, err := fixture.service.PreviewCatalogDeletionProgress(context.Background(), fixture.actor, fixture.library.ID, fixture.work, RequestContext{}, report)
+		if err != nil || progress.ProcessedFiles != 25 || progress.Phase != "preparing" || fixture.driver.statCalls != 27 {
+			t.Fatalf("preview=%+v progress=%+v stat calls=%d err=%v", preview, progress, fixture.driver.statCalls, err)
+		}
+		result, err := fixture.service.ConfirmCatalogDeletionProgress(context.Background(), fixture.actor, fixture.library.ID, fixture.work, preview.ConfirmationToken, RequestContext{}, report)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !result.Deleted || result.RemovedFiles != 1 || result.MissingFiles != 0 || !slices.Equal(fixture.driver.recycled, []string{fixture.entries[0].ProviderID}) {
+		ids := make([]string, 0, len(fixture.entries))
+		for _, entry := range fixture.entries {
+			ids = append(ids, entry.ProviderID)
+		}
+		if !result.Deleted || result.RemovedFiles != 25 || result.MissingFiles != 0 || !slices.Equal(fixture.driver.recycled, ids) || progress.Phase != "completed" || fixture.driver.statCalls != 79 {
 			t.Fatalf("result=%+v recycled=%v", result, fixture.driver.recycled)
+		}
+		status, err := fixture.service.CatalogDeletionStatus(context.Background(), fixture.actor, fixture.library.ID, fixture.work, preview.DeletionID)
+		if err != nil || status.Phase != "completed" || status.ProcessedFiles != 25 || status.RemovedFiles != 25 {
+			t.Fatalf("saved result after catalog removal=%+v err=%v", status, err)
 		}
 	})
 

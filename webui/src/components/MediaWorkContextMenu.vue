@@ -1,11 +1,12 @@
 <script setup lang="ts">
 import { computed, nextTick, onUnmounted, ref, watch } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { api } from '@/api/client'
 import { Permissions } from '@/auth/generated-permissions'
 import { useAuthStore } from '@/stores/auth'
 import { notify } from '@/toast'
 import { createLatestRequest } from '@/latest-request'
+import MediaCatalogDeletionDialog from '@/components/MediaCatalogDeletionDialog.vue'
 import type { MediaCatalogLibraryWork } from '@/types/api'
 import type { UserCollectionSummary, UserMediaPage } from '@/user-media-overview'
 
@@ -20,7 +21,9 @@ export interface WorkMenuTarget {
   collectionId?: string
 }
 const emit = defineEmits<{ changed: [] }>()
+const props = withDefaults(defineProps<{ restoreDeletion?: boolean }>(), { restoreDeletion: true })
 const router = useRouter()
+const route = useRoute()
 const auth = useAuthStore()
 const target = ref<WorkMenuTarget | null>(null)
 const position = ref({ left: 0, top: 0 })
@@ -32,6 +35,17 @@ const chosenWork = ref<MediaCatalogLibraryWork | null>(null)
 const busy = ref(false)
 const historyActions = createLatestRequest()
 const origin = ref<HTMLElement | null>(null)
+type DeletionTarget = { libraryId: number; workId: string; title: string; deletionId?: string }
+const deleting = ref<(DeletionTarget & { onCompleted: (libraryId: number, workId: string) => void }) | null>(null)
+function openDeletion(work: DeletionTarget) {
+  const path = route.path; const userID = auth.user?.id
+  deleting.value = { ...work, onCompleted: () => { if (route.path === path && auth.user?.id === userID) emit('changed') } }
+}
+watch(() => [route.query.deletion, route.query.deletionLibrary, route.query.deletionWork, props.restoreDeletion], () => {
+  if (!props.restoreDeletion || deleting.value) return
+  const { deletion, deletionLibrary, deletionWork } = route.query
+  if (typeof deletion === 'string' && typeof deletionLibrary === 'string' && typeof deletionWork === 'string') openDeletion({ libraryId: Number(deletionLibrary), workId: deletionWork, title: '源文件删除', deletionId: deletion })
+}, { immediate: true })
 const actions = computed(() => {
   if (!target.value) return []
   const list: { id: WorkMenuAction; label: string }[] = []
@@ -137,7 +151,12 @@ async function execute(action: WorkMenuAction, work?: MediaCatalogLibraryWork) {
   if (!work) return
   if (action === 'play') return play(work)
   if (action === 'details') return routeTo(work)
-  if (action === 'metadata' || action === 'recognize' || action === 'rescrape' || action === 'delete-source') return routeTo(work, action)
+  if (action === 'delete-source') {
+    openDeletion({ libraryId: work.library_id, workId: work.work_id, title: item.title })
+    close(false)
+    return
+  }
+  if (action === 'metadata' || action === 'recognize' || action === 'rescrape') return routeTo(work, action)
   if (action === 'exclude') {
     if (!window.confirm(`从“${work.library_name}”移出《${item.title}》？源媒体文件不会删除，可在“已移出”中恢复。`)) return
     busy.value = true
@@ -189,12 +208,14 @@ async function selectCollection(collection: UserCollectionSummary) {
 function errorMessage(reason: unknown) { return reason instanceof Error ? reason.message : '操作失败' }
 window.addEventListener('pointerdown', outside)
 window.addEventListener('scroll', scroll, true)
-watch(() => auth.user, () => close(false))
+watch(() => auth.user?.id, () => { close(false); deleting.value = null })
+watch(() => route.path, () => { close(false); deleting.value = null })
 onUnmounted(() => { historyActions.cancel(); window.removeEventListener('pointerdown', outside); window.removeEventListener('scroll', scroll, true) })
 defineExpose({ open, close })
 </script>
 
 <template>
+  <MediaCatalogDeletionDialog v-if="deleting" :key="`${deleting.libraryId}:${deleting.workId}`" v-bind="deleting" @close="deleting = null" />
   <Teleport to="body">
     <div v-if="target" ref="menu" class="work-context-menu panel" role="menu" :aria-label="`${target.title} 操作`" :style="{ left: `${position.left}px`, top: `${position.top}px` }" @keydown="keydown">
       <button v-for="action in actions" :key="action.id" type="button" role="menuitem" :disabled="busy" class="work-context-menu__item" @click="execute(action.id)">{{ action.label }}</button>

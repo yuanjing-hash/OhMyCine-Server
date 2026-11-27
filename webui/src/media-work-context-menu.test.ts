@@ -5,13 +5,16 @@ import { flushPromises, mount } from '@vue/test-utils'
 import MediaWorkContextMenu, { type WorkMenuTarget } from './components/MediaWorkContextMenu.vue'
 
 const request = vi.hoisted(() => vi.fn())
+const progressRequest = vi.hoisted(() => vi.fn())
 const routePush = vi.hoisted(() => vi.fn())
+const routeReplace = vi.hoisted(() => vi.fn())
+const can = vi.hoisted(() => vi.fn(() => false))
 const notification = vi.hoisted(() => vi.fn())
-vi.mock('@/api/client', () => ({ api: request }))
-vi.mock('@/stores/auth', () => ({ useAuthStore: () => ({ can: () => false }) }))
+vi.mock('@/api/client', () => ({ api: request, apiProgress: progressRequest }))
+vi.mock('@/stores/auth', () => ({ useAuthStore: () => ({ can }) }))
 vi.mock('@/toast', () => ({ notify: notification }))
-vi.mock('vue-router', () => ({ useRouter: () => ({ push: routePush }) }))
-afterEach(() => { request.mockReset(); routePush.mockReset(); notification.mockReset(); document.body.innerHTML = '' })
+vi.mock('vue-router', () => ({ useRoute: () => ({ path: '/discovery/library', query: {} }), useRouter: () => ({ push: routePush, replace: routeReplace }) }))
+afterEach(() => { request.mockReset(); progressRequest.mockReset(); routePush.mockReset(); routeReplace.mockReset(); can.mockReturnValue(false); notification.mockReset(); document.body.innerHTML = '' })
 
 const history: WorkMenuTarget = {
   title: '历史电影', kind: 'movie', historyId: 'a'.repeat(64),
@@ -19,6 +22,65 @@ const history: WorkMenuTarget = {
 }
 
 describe('media work context menu', () => {
+  it.each([false, true])('prepares and deletes on the original page (close while deleting: %s)', async closeWhileDeleting => {
+    can.mockReturnValue(true)
+    let prepareDone!: (value: unknown) => void
+    let confirmDone!: (value: unknown) => void
+    const update = { phase: 'preparing', title: history.title, processed_files: 1, total_files: 25, removed_files: 0, missing_files: 0 }
+    progressRequest.mockImplementationOnce((_path, _options, progress) => {
+      progress(update)
+      return new Promise(resolve => { prepareDone = resolve })
+    })
+    const wrapper = mount(MediaWorkContextMenu, { attachTo: document.body })
+    const menu = wrapper.vm as unknown as { open: (event: KeyboardEvent, target: WorkMenuTarget) => Promise<void> }
+    await menu.open(new KeyboardEvent('keydown', { key: 'ContextMenu' }), history)
+    ;[...document.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')].find(button => button.textContent === '删除源文件…')!.click()
+    await flushPromises()
+    expect(routePush).not.toHaveBeenCalled()
+    expect(document.querySelector('[role="dialog"]')?.textContent).toContain('正在准备删除')
+    expect(document.querySelector('[role="status"]')?.textContent).toContain('1 / 25')
+    prepareDone({ deletion_id: 'record-id', title: history.title, library_name: '影视库', file_count: 25, total_bytes: 25, relative_paths: ['one.mkv'], warnings: [], confirmation_token: 'opaque-confirmation' })
+    await flushPromises()
+    const input = document.querySelector<HTMLInputElement>('[role="dialog"] input')!
+    input.value = history.title; input.dispatchEvent(new Event('input', { bubbles: true }))
+    progressRequest.mockImplementationOnce((_path, _options, progress) => {
+      progress({ ...update, phase: 'deleting', processed_files: 5, removed_files: 5 })
+      return new Promise(resolve => { confirmDone = resolve })
+    })
+    await flushPromises()
+    ;[...document.querySelectorAll<HTMLButtonElement>('[role="dialog"] button')].find(button => button.textContent === '确认删除源文件')!.click()
+    await flushPromises()
+    expect(routeReplace).toHaveBeenCalledWith({ query: { deletion: 'record-id', deletionLibrary: '1', deletionWork: 'movie-token' } })
+    expect(document.querySelector('[role="status"]')?.textContent).toContain('5 / 25')
+    expect(wrapper.emitted('changed')).toBeUndefined()
+    if (closeWhileDeleting) {
+      document.querySelector<HTMLButtonElement>('[aria-label="关闭删除窗口"]')!.click()
+      await flushPromises()
+      expect(document.querySelector('[role="dialog"]')).toBeNull()
+      await menu.open(new KeyboardEvent('keydown', { key: 'ContextMenu' }), { ...history, title: '另一部电影', works: [{ ...history.works[0]!, work_id: 'another-work' }] })
+      progressRequest.mockImplementationOnce((_path, _options, progress) => {
+        progress({ ...update, title: '另一部电影' })
+        return new Promise(() => {})
+      })
+      ;[...document.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')].find(button => button.textContent === '删除源文件…')!.click()
+      await flushPromises()
+    }
+    confirmDone({ deleted: true, removed_files: 25, missing_files: 0 })
+    await flushPromises()
+    expect(wrapper.emitted('changed')).toHaveLength(1)
+    if (closeWhileDeleting) {
+      expect(document.querySelector('[role="dialog"]')?.textContent).toContain('另一部电影')
+      expect(document.querySelector('[role="dialog"]')?.textContent).toContain('正在准备删除')
+      expect(document.querySelector('[role="status"]')?.textContent).toContain('1 / 25')
+    } else {
+      expect(document.querySelector('[role="dialog"]')?.textContent).toContain('删除完成')
+      expect(document.querySelector('[role="status"]')?.textContent).toContain('25 / 25')
+    }
+    expect(progressRequest.mock.calls.filter(([path]) => String(path).endsWith('/deletion-confirm'))).toHaveLength(1)
+    expect(routePush).not.toHaveBeenCalled()
+    wrapper.unmount()
+  })
+
   it('marks only the selected episode watched and supports the inverse', async () => {
     request.mockResolvedValue({ completed: true })
     const wrapper = mount(MediaWorkContextMenu, { attachTo: document.body })

@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -595,6 +596,13 @@ func (a *API) PreviewMediaLibraryCatalogDeletion(c *gin.Context) {
 	if !ok {
 		return
 	}
+	if strings.Contains(c.GetHeader("Accept"), "text/event-stream") {
+		stream := newCatalogDeletionStream(c)
+		defer stream.close()
+		result, err := a.libraries.PreviewCatalogDeletionProgress(c.Request.Context(), actor, id, c.Param("work"), middleware.RequestContextFrom(c), stream.progress)
+		stream.finish(result, err)
+		return
+	}
 	result, err := a.libraries.PreviewCatalogDeletion(c.Request.Context(), actor, id, c.Param("work"), middleware.RequestContextFrom(c))
 	if err != nil {
 		writeError(c, a.log, err)
@@ -613,6 +621,13 @@ func (a *API) ConfirmMediaLibraryCatalogDeletion(c *gin.Context) {
 	}
 	if err := strictJSON(c, &payload); err != nil {
 		writeError(c, a.log, invalid("删除确认参数无效", err))
+		return
+	}
+	if strings.Contains(c.GetHeader("Accept"), "text/event-stream") {
+		stream := newCatalogDeletionStream(c)
+		defer stream.close()
+		result, err := a.libraries.ConfirmCatalogDeletionProgress(c.Request.Context(), actor, id, c.Param("work"), payload.Token, middleware.RequestContextFrom(c), stream.progress)
+		stream.finish(result, err)
 		return
 	}
 	result, err := a.libraries.ConfirmCatalogDeletion(c.Request.Context(), actor, id, c.Param("work"), payload.Token, middleware.RequestContextFrom(c))
