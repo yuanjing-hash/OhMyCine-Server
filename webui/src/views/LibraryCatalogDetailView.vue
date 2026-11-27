@@ -1,35 +1,42 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api } from '@/api/client'
 import { Permissions } from '@/auth/generated-permissions'
 import MediaReorganizationDialog from '@/components/MediaReorganizationDialog.vue'
 import MediaMetadataEditorDialog from '@/components/MediaMetadataEditorDialog.vue'
 import MediaEntryContextMenu from '@/components/MediaEntryContextMenu.vue'
+import MediaCatalogDeletionDialog from '@/components/MediaCatalogDeletionDialog.vue'
+import { createLatestRequest } from '@/latest-request'
 import { mediaCatalogActionEndpoint, mediaCatalogDetailEndpoint, mediaCatalogOverrideEndpoint, normalizeMediaCatalogDetail } from '@/media-catalog'
 import { useAuthStore } from '@/stores/auth'
 import { notify } from '@/toast'
-import type { ListResponse, MediaCatalogDeletionPreview, MediaCatalogDeletionResult, MediaCatalogDetail, MediaCatalogManagedTransfer, TMDBCandidate } from '@/types/api'
+import type { ListResponse, MediaCatalogDetail, MediaCatalogManagedTransfer, TMDBCandidate } from '@/types/api'
 
 const route = useRoute(); const router = useRouter(); const auth = useAuthStore()
 const loading = ref(true); const error = ref(''); const detail = ref<MediaCatalogDetail | null>(null)
 const expanded = ref<number[]>([]); const actionBusy = ref(false); const metadataOpen = ref(false)
 const fullMetadataOpen = ref(false)
 const candidates = ref<TMDBCandidate[]>([]); const candidatesLoading = ref(false); const candidateError = ref('')
-const deletion = ref<MediaCatalogDeletionPreview | null>(null); const deletionPhrase = ref('')
+const deletionOpen = ref(false); const deletionID = ref(''); const sourceDeleted = ref(false)
+const detailRequests = createLatestRequest()
+let disposed = false
 const reorganizing = ref<MediaCatalogManagedTransfer | null>(null)
 const entryMenu = ref<InstanceType<typeof MediaEntryContextMenu> | null>(null)
 const canUpgrade = computed(() => auth.can(Permissions.DownloadsCreate) && auth.can(Permissions.MediaLibrariesRead) && auth.can(Permissions.MediaLibrariesMediaDelete))
 const libraryID = computed(() => Number(route.params.libraryID)); const workID = computed(() => String(route.params.workID))
 
-let handledPanelPath = ''
 async function load() {
+  const request = detailRequests.begin()
   loading.value = true; error.value = ''; expanded.value = []
   try {
-    detail.value = normalizeMediaCatalogDetail(await api<unknown>(mediaCatalogDetailEndpoint(libraryID.value, workID.value)))
+    const value = await api<unknown>(mediaCatalogDetailEndpoint(libraryID.value, workID.value), { signal: request.signal })
+    if (!request.isCurrent()) return
+    detail.value = normalizeMediaCatalogDetail(value)
     const panel = route.query.panel
-    if (typeof panel === 'string' && handledPanelPath !== route.fullPath) {
-      handledPanelPath = route.fullPath
+    if (typeof panel === 'string') {
+      const query = { ...route.query }; delete query.panel
+      void router.replace({ query })
       if (auth.can(Permissions.MediaLibrariesScan) && panel === 'metadata') {
         if (detail.value.work.match_status === 'matched') fullMetadataOpen.value = true
         else void loadCandidates()
@@ -39,11 +46,11 @@ async function load() {
         if (detail.value.work.manual_override) notify('请先清除人工匹配，再重新刮削。', 'error')
         else if (window.confirm(`重新刮削《${detail.value.work.title}》？`)) void rescrape()
       }
-      if (auth.can(Permissions.MediaLibrariesMediaDelete) && panel === 'delete-source') void previewDeletion()
+      if (auth.can(Permissions.MediaLibrariesMediaDelete) && panel === 'delete-source') previewDeletion()
     }
   }
-  catch (reason) { error.value = message(reason) }
-  finally { loading.value = false }
+  catch (reason) { if (request.isCurrent() && !sourceDeleted.value) error.value = message(reason) }
+  finally { if (request.isCurrent()) loading.value = false; request.finish() }
 }
 async function loadCandidates() {
   if (!detail.value) return; metadataOpen.value = true; candidatesLoading.value = true; candidateError.value = ''
@@ -77,33 +84,39 @@ function openInPlayer() {
   window.location.href = target.toString()
   notify(detail.value.work.kind === 'movie' ? '正在请求 Player 打开并播放…' : '正在请求 Player 打开剧集…', 'success')
 }
-async function previewDeletion() {
-  actionBusy.value = true; deletionPhrase.value = ''
-  try { deletion.value = await api<MediaCatalogDeletionPreview>(mediaCatalogActionEndpoint(libraryID.value, workID.value, 'deletion-preview'), { method: 'POST' }) }
-  catch (reason) { notify(message(reason), 'error') } finally { actionBusy.value = false }
-}
-async function confirmDeletion() {
-  if (!deletion.value || deletionPhrase.value !== deletion.value.title) return
-  actionBusy.value = true
-  try { const result = await api<MediaCatalogDeletionResult>(mediaCatalogActionEndpoint(libraryID.value, workID.value, 'deletion-confirm'), { method: 'POST', body: JSON.stringify({ token: deletion.value.confirmation_token }) }); notify(`已从数据源移除 ${result.removed_files} 个文件`, 'success'); deletion.value = null; await router.push('/discovery/library') }
-  catch (reason) { notify(message(reason), 'error'); deletion.value = null } finally { actionBusy.value = false }
+function previewDeletion() { deletionID.value = ''; deletionOpen.value = true }
+async function deletionCompleted(deletedLibraryID: number, deletedWorkID: string) {
+  if (disposed || deletedLibraryID !== libraryID.value || deletedWorkID !== workID.value) return
+  sourceDeleted.value = true; detail.value = null; await load()
 }
 function toggleSeason(value: number) { expanded.value = expanded.value.includes(value) ? expanded.value.filter(item => item !== value) : [...expanded.value, value] }
 async function reorganizationQueued() { reorganizing.value = null; await load() }
 async function metadataSaved() { fullMetadataOpen.value = false; await load() }
 function message(reason: unknown) { return reason instanceof Error ? reason.message : '操作失败' }
 function formatBytes(value: number) { if (value < 1024) return `${value} B`; const units = ['KB','MB','GB','TB']; let size = value / 1024; let index = 0; while (size >= 1024 && index < units.length-1) { size /= 1024; index++ }; return `${size.toFixed(1)} ${units[index]}` }
-onMounted(load); watch(() => route.fullPath, load)
+onMounted(load)
+watch(() => [libraryID.value, workID.value], () => {
+  deletionOpen.value = false; deletionID.value = ''; sourceDeleted.value = false; detail.value = null
+  actionBusy.value = false; metadataOpen.value = false; fullMetadataOpen.value = false; reorganizing.value = null
+  void load()
+})
+watch(() => route.query.panel, panel => { if (panel && detail.value) void load() })
+watch(() => [route.query.deletion, route.query.deletionLibrary, route.query.deletionWork], () => {
+  if (typeof route.query.deletion === 'string' && route.query.deletionLibrary === String(libraryID.value) && route.query.deletionWork === workID.value) { deletionID.value = route.query.deletion; deletionOpen.value = true }
+}, { immediate: true })
+onBeforeUnmount(() => { disposed = true; detailRequests.cancel() })
 </script>
 
 <template>
   <section class="space-y-5">
+    <MediaCatalogDeletionDialog v-if="deletionOpen" :key="`${libraryID}:${workID}`" :library-id="libraryID" :work-id="workID" :title="detail?.work.title || '源文件删除'" :deletion-id="deletionID" :on-completed="deletionCompleted" @close="deletionOpen = false" />
     <button class="btn-secondary" @click="router.push('/discovery/library')">返回媒体库</button>
     <div v-if="loading" class="panel py-14 text-center text-muted">正在读取作品与真实季集覆盖…</div>
     <div v-else-if="error" class="semantic-error p-4"><strong>作品详情暂时不可用</strong><p class="mt-1 text-sm">{{ error }}</p><button class="btn-secondary mt-3" @click="load">重试</button></div>
+    <div v-else-if="sourceDeleted && !detail" class="panel p-6">该作品的源文件已删除，当前媒体库目录已自动更新。</div>
     <template v-else-if="detail">
       <article class="detail-hero panel overflow-hidden p-0" :style="detail.work.backdrop_url ? { backgroundImage: `linear-gradient(90deg, var(--surface) 12%, color-mix(in srgb, var(--surface) 84%, transparent) 60%), url(${detail.work.backdrop_url})` } : undefined">
-        <div class="grid gap-6 p-6 md:grid-cols-[11rem_minmax(0,1fr)]"><div class="detail-poster"><img v-if="detail.work.poster_url" :src="detail.work.poster_url" :alt="`${detail.work.title} 海报`"><span v-else>暂无海报</span></div><div class="min-w-0 self-end"><div class="flex flex-wrap gap-2"><span class="status-chip">{{ detail.work.library_works[0]?.library_name || `媒体库 ${libraryID}` }}</span><span class="status-chip">{{ detail.work.kind === 'series' ? '电视剧' : '电影' }}</span><span :class="detail.work.match_status === 'matched' ? 'status-chip status-chip--ready' : 'status-chip status-chip--warning'">{{ detail.work.match_status === 'matched' ? '已匹配' : '待识别' }}</span></div><h1 class="mb-0 mt-3 text-3xl font-850">{{ detail.work.title }}</h1><p v-if="detail.work.original_title" class="mb-0 mt-1 text-sm text-muted">{{ detail.work.original_title }}</p><p class="mb-0 mt-3 max-w-3xl text-sm leading-6 text-muted">{{ detail.work.overview || '暂无简介。' }}</p><p class="mb-0 mt-3 text-sm text-muted">{{ detail.work.file_count }} 个文件 · {{ formatBytes(detail.work.size) }}<template v-if="detail.work.tmdb_id"> · TMDB {{ detail.work.tmdb_id }}</template></p><div class="mt-5 flex flex-wrap gap-2"><button class="btn-primary" type="button" @click="openInPlayer">使用 Player 打开</button><button v-if="auth.can(Permissions.MediaLibrariesScan) && detail.work.match_status === 'matched'" class="btn-secondary" :disabled="actionBusy" @click="fullMetadataOpen = true">编辑完整元数据</button><button v-if="auth.can(Permissions.MediaLibrariesScan)" class="btn-secondary" :disabled="actionBusy" @click="loadCandidates">手动识别</button><button v-if="auth.can(Permissions.MediaLibrariesScan)" class="btn-secondary" :disabled="actionBusy || detail.work.manual_override" @click="rescrape">重新刮削</button><button v-if="detail.work.manual_override && auth.can(Permissions.MediaLibrariesScan)" class="btn-secondary" :disabled="actionBusy" @click="clearOverride">清除人工匹配</button><button v-if="auth.can(Permissions.MediaLibrariesMediaDelete)" class="btn-danger" :disabled="actionBusy" @click="previewDeletion">从数据源删除</button></div></div></div>
+        <div class="grid gap-6 p-6 md:grid-cols-[11rem_minmax(0,1fr)]"><div class="detail-poster"><img v-if="detail.work.poster_url" :src="detail.work.poster_url" :alt="`${detail.work.title} 海报`"><span v-else>暂无海报</span></div><div class="min-w-0 self-end"><div class="flex flex-wrap gap-2"><span class="status-chip">{{ detail.work.library_works[0]?.library_name || `媒体库 ${libraryID}` }}</span><span class="status-chip">{{ detail.work.kind === 'series' ? '电视剧' : '电影' }}</span><span :class="detail.work.match_status === 'matched' ? 'status-chip status-chip--ready' : 'status-chip status-chip--warning'">{{ detail.work.match_status === 'matched' ? '已匹配' : '待识别' }}</span></div><h1 class="mb-0 mt-3 text-3xl font-850">{{ detail.work.title }}</h1><p v-if="detail.work.original_title" class="mb-0 mt-1 text-sm text-muted">{{ detail.work.original_title }}</p><p class="mb-0 mt-3 max-w-3xl text-sm leading-6 text-muted">{{ detail.work.overview || '暂无简介。' }}</p><p class="mb-0 mt-3 text-sm text-muted">{{ detail.work.file_count }} 个文件 · {{ formatBytes(detail.work.size) }}<template v-if="detail.work.tmdb_id"> · TMDB {{ detail.work.tmdb_id }}</template></p><div class="mt-5 flex flex-wrap gap-2"><button class="btn-primary" type="button" @click="openInPlayer">使用 Player 打开</button><button v-if="auth.can(Permissions.MediaLibrariesScan) && detail.work.match_status === 'matched'" class="btn-secondary" :disabled="actionBusy" @click="fullMetadataOpen = true">编辑完整元数据</button><button v-if="auth.can(Permissions.MediaLibrariesScan)" class="btn-secondary" :disabled="actionBusy" @click="loadCandidates">手动识别</button><button v-if="auth.can(Permissions.MediaLibrariesScan)" class="btn-secondary" :disabled="actionBusy || detail.work.manual_override" @click="rescrape">重新刮削</button><button v-if="detail.work.manual_override && auth.can(Permissions.MediaLibrariesScan)" class="btn-secondary" :disabled="actionBusy" @click="clearOverride">清除人工匹配</button><button v-if="auth.can(Permissions.MediaLibrariesMediaDelete)" class="btn-danger" @click="previewDeletion">从数据源删除</button></div></div></div>
       </article>
 
       <article class="panel"><header><h2 class="m-0 text-lg">真实入库覆盖</h2><p class="page-description mt-1 text-sm">以下季集和文件来自当前媒体库扫描事实，不会用 TMDB 总集数冒充已入库内容。</p></header>
@@ -114,7 +127,6 @@ onMounted(load); watch(() => route.fullPath, load)
 
       <div v-if="metadataOpen" class="modal-backdrop" @click.self="metadataOpen = false"><section class="panel modal-panel max-h-[85vh] overflow-y-auto" role="dialog" aria-modal="true" aria-labelledby="metadata-dialog-title"><header class="flex items-center justify-between gap-3"><div><h2 id="metadata-dialog-title" class="m-0 text-lg">修改元数据匹配</h2><p class="page-description mt-1 text-sm">选择经 TMDB 验证的作品身份；不会任意写入不可信字段。</p></div><button class="btn-secondary" aria-label="关闭元数据匹配" @click="metadataOpen = false">关闭</button></header><div v-if="candidatesLoading" class="py-10 text-center text-muted">正在搜索 TMDB 候选…</div><div v-else-if="candidateError" class="semantic-error mt-4 p-4">{{ candidateError }}</div><div v-else class="mt-4 space-y-2"><button v-for="candidate in candidates" :key="`${candidate.media_type}:${candidate.id}`" class="semantic-list-item flex w-full items-center justify-between gap-3 p-4 text-left" :disabled="actionBusy" @click="override(candidate)"><span><strong>{{ candidate.title }}</strong><small class="mt-1 block text-muted">{{ candidate.original_title || '—' }} · {{ candidate.release_year || '年份未知' }}</small></span><span class="status-chip">TMDB {{ candidate.id }}</span></button><p v-if="!candidates.length" class="text-sm text-muted">没有找到候选，可先在媒体库管理页检查识别输入。</p></div></section></div>
 
-      <div v-if="deletion" class="modal-backdrop" @click.self="deletion = null"><section class="panel modal-panel" role="dialog" aria-modal="true" aria-labelledby="deletion-dialog-title"><h2 id="deletion-dialog-title" class="m-0 text-lg text-[var(--danger)]">确认从数据源删除</h2><p class="mt-3 text-sm">将从“{{ deletion.library_name }}”删除《{{ deletion.title }}》的 {{ deletion.file_count }} 个文件（{{ formatBytes(deletion.total_bytes) }}）。该操作不会影响其它媒体库。</p><div class="semantic-warning mt-3 p-3"><p v-for="warning in deletion.warnings" :key="warning" class="mb-1 text-sm">{{ warning }}</p></div><ul class="mt-3 max-h-36 overflow-y-auto text-xs text-muted"><li v-for="path in deletion.relative_paths" :key="path" class="break-all">{{ path }}</li></ul><label class="mt-4 block text-sm">输入作品标题 <strong>{{ deletion.title }}</strong> 以确认<input v-model="deletionPhrase" class="input mt-2 w-full" autocomplete="off"></label><div class="mt-4 flex justify-end gap-2"><button class="btn-secondary" @click="deletion = null">取消</button><button class="btn-danger" :disabled="actionBusy || deletionPhrase !== deletion.title" @click="confirmDeletion">确认删除源文件</button></div></section></div>
       <MediaReorganizationDialog v-if="reorganizing" :open="true" :transfer-task-id="reorganizing.transfer_task_id" :download-task-id="reorganizing.download_task_id" :display-name="detail.work.title" :current-title="detail.work.title" :current-media-type="detail.work.kind === 'movie' ? 'movie' : 'tv'" @close="reorganizing = null" @queued="reorganizationQueued" />
       <MediaEntryContextMenu ref="entryMenu" :key="`${libraryID}:${workID}`" :library-id="libraryID" :work-id="workID" :title="detail.work.title" />
       <MediaMetadataEditorDialog :open="fullMetadataOpen" :library-id="libraryID" :work-id="workID" @close="fullMetadataOpen = false" @saved="metadataSaved" />

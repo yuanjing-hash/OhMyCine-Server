@@ -284,10 +284,15 @@ export interface MediaCatalogManagedTransfer { transfer_task_id: string; downloa
 export interface MediaCatalogDetail { work: MediaCatalogItem; seasons: MediaCatalogSeason[]; files: MediaCatalogEpisode[]; reorganizable_transfers: MediaCatalogManagedTransfer[] }
 export interface MediaCatalogPage extends PageResponse<MediaCatalogItem> { categories: string[] }
 export interface MediaCatalogDeletionPreview {
+  deletion_id: string
   library_id: number; library_name: string; storage_type: string; title: string; file_count: number; total_bytes: number
   relative_paths: string[]; strm_impact_count: number; missing_count: number; warnings: string[]; confirmation_token: string; expires_at: string
 }
 export interface MediaCatalogDeletionResult { deleted: boolean; removed_files: number; missing_files: number }
+export interface MediaCatalogDeletionProgress {
+  deletion_id?: string; phase: 'preparing' | 'ready' | 'deleting' | 'committing' | 'completed' | 'interrupted'; title: string
+  processed_files: number; total_files: number; removed_files: number; missing_files: number
+}
 export interface MediaLibraryStructureIssue { code: string; kind: 'video' | 'sidecar'; title?: string; current_path?: string; expected_path?: string; conflict_sources?: string[]; conflict_source_count?: number; repairable: boolean }
 export interface MediaLibraryStructureIssueMember { token: string; source_path: string; recommended: boolean }
 export interface MediaLibraryStructureIssueSummary {

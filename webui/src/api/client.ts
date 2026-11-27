@@ -54,3 +54,48 @@ export async function api<T>(path: string, options: RequestInit = {}, config: { 
   }
   return payload.data as T
 }
+
+// One authenticated POST owns the operation; a stream interruption never
+// resubmits it. Callers recover durable progress through their read-only route.
+export async function apiProgress<T, P>(path: string, options: RequestInit, progress: (value: P) => void): Promise<T> {
+  await ensureCSRF()
+  const requestCSRFToken = csrfToken
+  const headers = new Headers(options.headers)
+  headers.set('Content-Type', 'application/json')
+  headers.set('Accept', 'text/event-stream')
+  headers.set('X-CSRF-Token', requestCSRFToken)
+  const response = await fetch(path, { ...options, headers, credentials: 'include' })
+  if (!response.ok || !response.headers.get('Content-Type')?.includes('text/event-stream')) {
+    const payload: unknown = await response.json().catch(() => null)
+    if (isEnvelope(payload)) {
+      const data = payload.data as { error_code?: string } | null
+      // A later explicit action may obtain a fresh token; this POST is never replayed.
+      if (response.status === 403 && data?.error_code === 'CSRF_INVALID' && csrfToken === requestCSRFToken) clearCSRFToken()
+      throw new APIError(response.status, data?.error_code ?? 'REQUEST_FAILED', payload.message)
+    }
+    throw new APIError(response.status, 'INVALID_RESPONSE', '服务器返回了无效响应')
+  }
+  const reader = response.body!.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+  try {
+    for (;;) {
+      const chunk = await reader.read()
+      buffer += decoder.decode(chunk.value, { stream: !chunk.done })
+      let boundary: number
+      while ((boundary = buffer.indexOf('\n\n')) >= 0) {
+        const frame = buffer.slice(0, boundary)
+        buffer = buffer.slice(boundary + 2)
+        const lines = frame.split('\n')
+        const event = lines.find(line => line.startsWith('event:'))?.slice(6).trim()
+        const data = lines.filter(line => line.startsWith('data:')).map(line => line.slice(5).trimStart()).join('\n')
+        if (!event || !data) continue
+        const value = JSON.parse(data)
+        if (event === 'progress') progress(value as P)
+        else if (event === 'result') return value as T
+        else if (event === 'error') throw new APIError(500, value.code, value.message)
+      }
+      if (chunk.done) throw new Error('连接已中断，请查看已保存的删除进度')
+    }
+  } finally { reader.releaseLock() }
+}

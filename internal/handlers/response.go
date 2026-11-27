@@ -56,11 +56,11 @@ func writeError(c *gin.Context, log zerolog.Logger, err error) {
 		status = http.StatusBadRequest
 	case services.CodeHistoryArtworkQuota:
 		status = http.StatusTooManyRequests
-	case services.CodeTransferDeletionBoundaryChanged, services.CodeTransferDeletionPartial:
+	case services.CodeTransferDeletionBoundaryChanged, services.CodeTransferDeletionPartial, services.CodeMediaCatalogDeletionChanged, services.CodeMediaCatalogDeletionPartial:
 		status = http.StatusConflict
-	case services.CodeTransferDeletionUnavailable:
+	case services.CodeTransferDeletionUnavailable, services.CodeMediaCatalogDeletionUnavailable:
 		status = http.StatusServiceUnavailable
-	case services.CodeTransferDeletionPreviewExpired:
+	case services.CodeTransferDeletionPreviewExpired, services.CodeMediaCatalogDeletionExpired:
 		status = http.StatusGone
 	case services.CodeCookieCloudInvalid, services.CodeCookieCloudDisabled:
 		status = http.StatusBadRequest

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { APIError, api, clearCSRFToken, setCSRFToken } from '@/api/client'
+import { APIError, api, apiProgress, clearCSRFToken, setCSRFToken } from '@/api/client'
 
 function envelope(status: number, code: number, data: unknown, message = 'success') {
   return new Response(JSON.stringify({ code, message, data }), {
@@ -22,6 +22,23 @@ afterEach(() => {
 })
 
 describe('API CSRF recovery', () => {
+  it('clears rejected streaming CSRF for the next explicit action without replaying confirmation', async () => {
+    setCSRFToken('expired-token')
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(envelope(403, 40301, { error_code: 'CSRF_INVALID' }, 'CSRF 校验失败'))
+      .mockResolvedValueOnce(envelope(200, 0, { csrf_token: 'fresh-token' }))
+      .mockResolvedValueOnce(new Response('event: result\ndata: {"ready":true}\n\n', { headers: { 'Content-Type': 'text/event-stream' } }))
+    const progress = vi.fn()
+    await expect(apiProgress('/deletion-confirm', { method: 'POST', body: '{}' }, progress)).rejects.toMatchObject({ errorCode: 'CSRF_INVALID' })
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    await expect(apiProgress('/deletion-preview', { method: 'POST', body: '{}' }, progress)).resolves.toEqual({ ready: true })
+    expect(fetchMock).toHaveBeenCalledTimes(3)
+    expect(fetchMock.mock.calls.map(([path]) => path)).toEqual(['/deletion-confirm', '/api/v1/auth/csrf', '/deletion-preview'])
+    expect(new Headers(fetchMock.mock.calls[2]![1]?.headers).get('X-CSRF-Token')).toBe('fresh-token')
+    expect(fetchMock.mock.calls[2]![1]?.credentials).toBe('include')
+    expect(new Headers(fetchMock.mock.calls[2]![1]?.headers).get('Accept')).toBe('text/event-stream')
+  })
+
   it('refreshes an expired CSRF token and replays a mutation once', async () => {
     setCSRFToken('expired-token')
     const fetchMock = vi.spyOn(globalThis, 'fetch')

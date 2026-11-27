@@ -244,6 +244,7 @@ func New(cfg config.Config, api *handlers.API, auth *services.AuthService, log z
 	protected.POST("/media-upgrades/:upgrade/submit", middleware.NoStore(), middleware.RequirePermission(authz.PermissionDownloadsCreate), api.SubmitMediaVersionUpgrade)
 	protected.POST("/media-libraries/:id/catalog/:work/deletion-preview", middleware.NoStore(), middleware.RequirePermission(authz.PermissionMediaLibrariesMediaDelete), api.PreviewMediaLibraryCatalogDeletion)
 	protected.POST("/media-libraries/:id/catalog/:work/deletion-confirm", middleware.NoStore(), middleware.RequirePermission(authz.PermissionMediaLibrariesMediaDelete), api.ConfirmMediaLibraryCatalogDeletion)
+	protected.GET("/media-libraries/:id/catalog/:work/deletion-status/:deletion", middleware.NoStore(), middleware.RequirePermission(authz.PermissionMediaLibrariesMediaDelete), api.MediaLibraryCatalogDeletionStatus)
 	protected.GET("/media-libraries/:id/runs", middleware.RequirePermission(authz.PermissionMediaLibrariesRead), api.MediaLibraryRuns)
 	protected.GET("/media-libraries/:id/provider-events", middleware.NoStore(), middleware.RequirePermission(authz.PermissionMediaLibrariesRead), api.MediaLibraryProviderEventReviews)
 	protected.GET("/media-libraries/:id/structure", middleware.NoStore(), middleware.RequirePermission(authz.PermissionMediaLibrariesRead), api.MediaLibraryStructure)
